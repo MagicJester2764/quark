@@ -49,10 +49,6 @@ pub extern "C" fn kernel_main(multiboot_info: usize) -> ! {
         console::puts(b"FAT32 driver loaded.\n");
     }
 
-    // --- DEBUG: mount rootfs image and list contents ---
-    debug_list_rootfs();
-    // --- END DEBUG ---
-
     loop {
         core::hint::spin_loop();
     }
@@ -100,92 +96,6 @@ fn print_dec(val: usize) {
     }
     console::puts(&out[..i]);
 }
-
-// --- DEBUG: list files on rootfs FAT32 image ---
-fn debug_list_rootfs() {
-    if !fat32::is_loaded() {
-        return;
-    }
-
-    // Find rootfs image in boot modules
-    let rootfs = modules::find(b"ROOTFS.IMG")
-        .or_else(|| modules::find(b"rootfs.img"));
-    let rootfs = match rootfs {
-        Some(m) => m,
-        None => return,
-    };
-
-    let data = unsafe { modules::data(rootfs) };
-    if !fat32::mount(data.as_ptr(), data.len()) {
-        console::puts(b"[debug] Failed to mount rootfs\n");
-        return;
-    }
-
-    console::puts(b"[debug] rootfs contents:\n");
-    debug_list_dir(b"/", 1);
-}
-
-fn debug_list_dir(path: &[u8], depth: usize) {
-    let fd = match fat32::open(path) {
-        Some(fd) => fd,
-        None => return,
-    };
-
-    while let Some(entry) = fat32::readdir(fd) {
-        // Skip . and .. entries
-        if entry.name[0] == b'.' {
-            continue;
-        }
-
-        // Indent
-        for _ in 0..depth {
-            console::puts(b"  ");
-        }
-
-        // Format and print name
-        let mut name_buf = [0u8; 13];
-        let name_len = fat32::format_83_name(&entry.name, &mut name_buf);
-
-        let is_dir = entry.attr & 0x10 != 0;
-        if is_dir {
-            console::puts(&name_buf[..name_len]);
-            console::puts(b"/\n");
-
-            // Build child path for recursion
-            let mut child_path = [0u8; 128];
-            let mut pos = 0;
-            // Copy parent path
-            for &b in path.iter() {
-                if pos < child_path.len() - 1 {
-                    child_path[pos] = b;
-                    pos += 1;
-                }
-            }
-            // Add separator if needed
-            if pos > 0 && child_path[pos - 1] != b'/' && pos < child_path.len() - 1 {
-                child_path[pos] = b'/';
-                pos += 1;
-            }
-            // Copy child name
-            for i in 0..name_len {
-                if pos < child_path.len() - 1 {
-                    child_path[pos] = name_buf[i];
-                    pos += 1;
-                }
-            }
-
-            debug_list_dir(&child_path[..pos], depth + 1);
-        } else {
-            console::puts(&name_buf[..name_len]);
-            console::puts(b" (");
-            print_dec(entry.size as usize);
-            console::puts(b" bytes)\n");
-        }
-    }
-
-    fat32::close(fd);
-}
-// --- END DEBUG ---
 
 #[panic_handler]
 fn panic(_info: &PanicInfo) -> ! {
