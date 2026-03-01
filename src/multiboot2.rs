@@ -20,7 +20,87 @@ pub struct FramebufferInfo {
 }
 
 const TAG_TYPE_END: u32 = 0;
+const TAG_TYPE_MODULE: u32 = 3;
 const TAG_TYPE_FRAMEBUFFER: u32 = 8;
+
+/// Maximum number of boot modules we track.
+pub const MAX_MODULES: usize = 32;
+
+/// Information about a loaded boot module.
+#[derive(Debug, Clone, Copy)]
+pub struct ModuleInfo {
+    pub start: usize,
+    pub end: usize,
+    pub name: [u8; 64],
+}
+
+impl ModuleInfo {
+    pub const fn empty() -> Self {
+        ModuleInfo {
+            start: 0,
+            end: 0,
+            name: [0u8; 64],
+        }
+    }
+}
+
+/// Parse module tags (type 3) from the multiboot2 info structure.
+///
+/// # Safety
+/// `info_addr` must point to a valid multiboot2 boot information structure.
+pub unsafe fn parse_modules(info_addr: usize) -> (usize, [ModuleInfo; MAX_MODULES]) {
+    let ptr = info_addr as *const u8;
+    let total_size = (ptr as *const u32).read_unaligned() as usize;
+    let mut offset: usize = 8;
+    let mut count: usize = 0;
+    let mut modules = [ModuleInfo::empty(); MAX_MODULES];
+
+    loop {
+        if offset >= total_size {
+            break;
+        }
+
+        offset = (offset + 7) & !7;
+
+        let tag_ptr = ptr.add(offset);
+        let tag_type = (tag_ptr as *const u32).read_unaligned();
+        let tag_size = (tag_ptr.add(4) as *const u32).read_unaligned();
+
+        if tag_type == TAG_TYPE_END {
+            break;
+        }
+
+        if tag_type == TAG_TYPE_MODULE && count < MAX_MODULES {
+            let data = tag_ptr.add(8); // skip type + size
+            let mod_start = (data as *const u32).read_unaligned() as usize;
+            let mod_end = (data.add(4) as *const u32).read_unaligned() as usize;
+
+            // String starts at offset 8 from data (after mod_start + mod_end)
+            let string_ptr = data.add(8);
+            let string_len = (tag_size as usize).saturating_sub(16); // 8 (type+size) + 8 (start+end)
+            let mut name = [0u8; 64];
+            let copy_len = string_len.min(63);
+            for i in 0..copy_len {
+                let ch = *string_ptr.add(i);
+                if ch == 0 {
+                    break;
+                }
+                name[i] = ch;
+            }
+
+            modules[count] = ModuleInfo {
+                start: mod_start,
+                end: mod_end,
+                name,
+            };
+            count += 1;
+        }
+
+        offset += tag_size as usize;
+    }
+
+    (count, modules)
+}
 
 /// Parse the multiboot2 info structure and return framebuffer info if present.
 ///

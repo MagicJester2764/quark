@@ -3,13 +3,23 @@ TARGET := x86_64-unknown-none
 BINARY := target/$(TARGET)/release/quark
 GRUB_MKRESCUE := $(shell command -v grub-mkrescue 2>/dev/null || command -v grub2-mkrescue 2>/dev/null)
 
-.PHONY: all clean iso run run-uefi
+VGA_DRV_DIR := drivers/vga
+VGA_DRV_ELF := $(VGA_DRV_DIR)/target/$(TARGET)/release/vga-driver
+VGA_DRV_BIN := $(VGA_DRV_DIR)/vga.drv
 
-all: $(KERNEL)
+.PHONY: all clean iso run run-uefi drivers FORCE
+
+all: $(KERNEL) drivers
 
 $(KERNEL): FORCE
 	cargo build --release
 	cp $(BINARY) $(KERNEL)
+
+drivers: $(VGA_DRV_BIN)
+
+$(VGA_DRV_BIN): FORCE
+	cd $(VGA_DRV_DIR) && cargo build --release
+	objcopy -O binary $(VGA_DRV_ELF) $(VGA_DRV_BIN)
 
 iso: $(KERNEL)
 	@mkdir -p isodir/boot/grub
@@ -28,6 +38,7 @@ run-uefi: iso
 
 clean:
 	cargo clean
-	rm -rf $(KERNEL) quark.iso isodir
+	cd $(VGA_DRV_DIR) && cargo clean
+	rm -rf $(KERNEL) $(VGA_DRV_BIN) quark.iso isodir
 
 FORCE:

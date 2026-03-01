@@ -1,13 +1,22 @@
 mod framebuffer;
 mod vga;
 
+use crate::modules;
 use crate::multiboot2::FramebufferInfo;
 
-/// 0 = not initialized (default to VGA text), 1 = VGA text, 2 = pixel framebuffer
+/// 0 = not initialized, 1 = VGA text (driver), 2 = pixel framebuffer
 static mut MODE: u8 = 0;
 
 /// Initialize the console from multiboot2 framebuffer info.
+/// The module registry must be initialized before calling this.
 pub fn init(fb: Option<FramebufferInfo>) {
+    // Try to load VGA driver from boot modules
+    if let Some(m) = modules::find(b"VGA.DRV") {
+        unsafe { vga::init_from_driver(m.start) };
+    } else if let Some(m) = modules::find(b"vga.drv") {
+        unsafe { vga::init_from_driver(m.start) };
+    }
+
     unsafe {
         match fb {
             Some(info) if info.fb_type == 1 => {
@@ -24,14 +33,12 @@ pub fn init(fb: Option<FramebufferInfo>) {
                 );
                 MODE = 2;
             }
-            Some(info) if info.fb_type == 2 => {
-                // EGA text mode — use VGA backend with provided address
-                vga::init(info.addr, info.width, info.height);
-                MODE = 1;
-            }
             _ => {
-                // No framebuffer tag or unknown type — assume legacy VGA text
-                MODE = 1;
+                // VGA text mode — use driver if available
+                if vga::is_loaded() {
+                    MODE = 1;
+                }
+                // If no driver and no framebuffer, MODE stays 0 (no output)
             }
         }
     }
@@ -40,8 +47,9 @@ pub fn init(fb: Option<FramebufferInfo>) {
 pub fn clear() {
     unsafe {
         match MODE {
+            1 => vga::clear(),
             2 => framebuffer::clear(),
-            _ => vga::clear(),
+            _ => {}
         }
     }
 }
@@ -49,8 +57,9 @@ pub fn clear() {
 pub fn puts(s: &[u8]) {
     unsafe {
         match MODE {
+            1 => vga::puts(s),
             2 => framebuffer::puts(s),
-            _ => vga::puts(s),
+            _ => {}
         }
     }
 }
