@@ -4,7 +4,7 @@ A minimal x86-64 microkernel with loadable driver modules.
 
 ## What it does
 
-Quark boots via Multiboot2 (GRUB or the [Bang](https://github.com) UEFI bootloader), transitions from 32-bit protected mode to 64-bit long mode, and initializes a console for output. It supports loadable driver modules that are passed in as Multiboot2 boot modules by the bootloader.
+Quark boots via Multiboot2 (GRUB or the [Bang](https://github.com/MagicJester2764/bang) UEFI bootloader), transitions from 32-bit protected mode to 64-bit long mode, and initializes a console for output. It supports loadable driver modules that are passed in as Multiboot2 boot modules by the bootloader.
 
 Currently implemented:
 
