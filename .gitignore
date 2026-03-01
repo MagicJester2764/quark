@@ -2,3 +2,5 @@
 /kernel.bin
 /quark.iso
 /isodir
+/drivers/*/target
+/drivers/*/*.drv
