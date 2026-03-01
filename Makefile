@@ -7,6 +7,10 @@ VGA_DRV_DIR := drivers/vga
 VGA_DRV_ELF := $(VGA_DRV_DIR)/target/$(TARGET)/release/vga-driver
 VGA_DRV_BIN := $(VGA_DRV_DIR)/vga.drv
 
+FAT32_DRV_DIR := drivers/fat32
+FAT32_DRV_ELF := $(FAT32_DRV_DIR)/target/$(TARGET)/release/fat32-driver
+FAT32_DRV_BIN := $(FAT32_DRV_DIR)/fat32.drv
+
 .PHONY: all clean iso run run-uefi drivers FORCE
 
 all: $(KERNEL) drivers
@@ -15,11 +19,15 @@ $(KERNEL): FORCE
 	cargo build --release
 	cp $(BINARY) $(KERNEL)
 
-drivers: $(VGA_DRV_BIN)
+drivers: $(VGA_DRV_BIN) $(FAT32_DRV_BIN)
 
 $(VGA_DRV_BIN): FORCE
 	cd $(VGA_DRV_DIR) && cargo build --release
 	objcopy -O binary $(VGA_DRV_ELF) $(VGA_DRV_BIN)
+
+$(FAT32_DRV_BIN): FORCE
+	cd $(FAT32_DRV_DIR) && cargo build --release
+	objcopy -O binary $(FAT32_DRV_ELF) $(FAT32_DRV_BIN)
 
 iso: $(KERNEL)
 	@mkdir -p isodir/boot/grub
@@ -39,6 +47,7 @@ run-uefi: iso
 clean:
 	cargo clean
 	cd $(VGA_DRV_DIR) && cargo clean
-	rm -rf $(KERNEL) $(VGA_DRV_BIN) quark.iso isodir
+	cd $(FAT32_DRV_DIR) && cargo clean
+	rm -rf $(KERNEL) $(VGA_DRV_BIN) $(FAT32_DRV_BIN) quark.iso isodir
 
 FORCE:

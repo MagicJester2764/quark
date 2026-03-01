@@ -3,6 +3,8 @@
 
 mod console;
 #[allow(dead_code)]
+mod fat32;
+#[allow(dead_code)]
 mod modules;
 mod multiboot2;
 
@@ -39,6 +41,12 @@ pub extern "C" fn kernel_main(multiboot_info: usize) -> ! {
         }
     } else {
         console::puts(b"No boot modules loaded.\n");
+    }
+
+    // Initialize FAT32 driver
+    fat32::init();
+    if fat32::is_loaded() {
+        console::puts(b"FAT32 driver loaded.\n");
     }
 
     loop {
