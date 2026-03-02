@@ -5,6 +5,8 @@
 
 use core::ptr;
 
+use crate::services::{KernelServices, SERVICES};
+
 /// Driver vtable — filled by the driver's entry function. Must match the driver's layout.
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -22,11 +24,11 @@ static mut VTABLE: Option<ConsoleVtable> = None;
 /// # Safety
 /// `module_start` must point to a valid VGA driver flat binary.
 pub unsafe fn init_from_driver(module_start: usize) {
-    type EntryFn = unsafe extern "C" fn(*mut ConsoleVtable);
+    type EntryFn = unsafe extern "C" fn(*mut ConsoleVtable, *const KernelServices);
     let entry: EntryFn = core::mem::transmute(module_start);
 
     let mut vtable = core::mem::MaybeUninit::<ConsoleVtable>::uninit();
-    entry(vtable.as_mut_ptr());
+    entry(vtable.as_mut_ptr(), &SERVICES);
 
     let vt_ptr = &raw mut VTABLE;
     ptr::write(vt_ptr, Some(vtable.assume_init()));

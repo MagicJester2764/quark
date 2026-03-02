@@ -5,6 +5,7 @@
 use core::ptr;
 
 use crate::modules;
+use crate::services::{KernelServices, SERVICES};
 
 /// Directory entry returned by readdir.
 #[repr(C)]
@@ -35,11 +36,11 @@ static mut VTABLE: Option<Fat32Vtable> = None;
 /// # Safety
 /// `module_start` must point to a valid FAT32 driver flat binary.
 unsafe fn init_from_driver(module_start: usize) {
-    type EntryFn = unsafe extern "C" fn(*mut Fat32Vtable);
+    type EntryFn = unsafe extern "C" fn(*mut Fat32Vtable, *const KernelServices);
     let entry: EntryFn = core::mem::transmute(module_start);
 
     let mut vtable = core::mem::MaybeUninit::<Fat32Vtable>::uninit();
-    entry(vtable.as_mut_ptr());
+    entry(vtable.as_mut_ptr(), &SERVICES);
 
     let vt_ptr = &raw mut VTABLE;
     ptr::write(vt_ptr, Some(vtable.assume_init()));

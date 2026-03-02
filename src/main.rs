@@ -7,6 +7,11 @@ mod fat32;
 #[allow(dead_code)]
 mod modules;
 mod multiboot2;
+#[allow(dead_code)]
+mod paging;
+#[allow(dead_code)]
+mod pmm;
+mod services;
 
 use core::panic::PanicInfo;
 
@@ -14,15 +19,22 @@ core::arch::global_asm!(include_str!("boot.s"), options(att_syntax));
 
 #[no_mangle]
 pub extern "C" fn kernel_main(multiboot_info: usize) -> ! {
-    // Initialize module registry first — console::init needs it to find the VGA driver
+    // Parse multiboot2 info (modules list, memory map, framebuffer)
     unsafe { modules::init(multiboot_info) };
-
     let fb = unsafe { multiboot2::parse_framebuffer(multiboot_info) };
+    let (mmap_count, mmap_regions) = unsafe { multiboot2::parse_memory_map(multiboot_info) };
+
+    // Initialize PMM before drivers so they can allocate pages
+    let mb_info_size = unsafe { *(multiboot_info as *const u32) } as usize;
+    unsafe { pmm::init(&mmap_regions, mmap_count, multiboot_info, mb_info_size) };
+
+    // Initialize console (VGA driver receives kernel services)
     console::init(fb);
     console::clear();
     console::puts(b"Quark v0.1.0 - microkernel\n");
     console::puts(b"Booted successfully.\n");
 
+    // Print boot modules
     let mod_count = modules::count();
     if mod_count > 0 {
         console::puts(b"Boot modules:\n");
@@ -43,11 +55,33 @@ pub extern "C" fn kernel_main(multiboot_info: usize) -> ! {
         console::puts(b"No boot modules loaded.\n");
     }
 
-    // Initialize FAT32 driver
+    // Initialize FAT32 driver (receives kernel services)
     fat32::init();
     if fat32::is_loaded() {
         console::puts(b"FAT32 driver loaded.\n");
     }
+
+    // Print memory map
+    console::puts(b"Memory map:\n");
+    for i in 0..mmap_count {
+        let r = &mmap_regions[i];
+        console::puts(b"  ");
+        print_hex(r.base as usize);
+        console::puts(b" - ");
+        print_hex((r.base + r.length) as usize);
+        console::puts(b" (");
+        print_dec(r.length as usize / 1024);
+        console::puts(b" KiB) type=");
+        print_dec(r.region_type as usize);
+        console::puts(b"\n");
+    }
+
+    // Print PMM stats
+    console::puts(b"PMM initialized: ");
+    print_dec(pmm::free_count());
+    console::puts(b" free frames (");
+    print_dec(pmm::free_count() * 4);
+    console::puts(b" KiB)\n");
 
     loop {
         core::hint::spin_loop();

@@ -16,6 +16,15 @@ const ATTR: u8 = 0x0F; // white on black
 static mut COL: usize = 0;
 static mut ROW: usize = 0;
 
+/// Kernel services provided at init time.
+#[repr(C)]
+pub struct KernelServices {
+    pub alloc_page: extern "C" fn() -> usize,
+    pub free_page: extern "C" fn(addr: usize),
+}
+
+static mut SERVICES: *const KernelServices = core::ptr::null();
+
 /// Vtable returned to the kernel. Must match the kernel's definition exactly.
 #[repr(C)]
 pub struct ConsoleVtable {
@@ -28,11 +37,12 @@ pub struct ConsoleVtable {
 /// The kernel calls this once to initialize VGA state and obtain function pointers.
 #[no_mangle]
 #[link_section = ".text.entry"]
-pub extern "C" fn _entry(out: *mut ConsoleVtable) {
+pub extern "C" fn _entry(out: *mut ConsoleVtable, services: *const KernelServices) {
     // Explicitly initialize all state (BSS may not be zeroed by the bootloader)
     unsafe {
         COL = 0;
         ROW = 0;
+        SERVICES = services;
     }
 
     unsafe {

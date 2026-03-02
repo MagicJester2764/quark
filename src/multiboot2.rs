@@ -21,10 +21,42 @@ pub struct FramebufferInfo {
 
 const TAG_TYPE_END: u32 = 0;
 const TAG_TYPE_MODULE: u32 = 3;
+const TAG_TYPE_MMAP: u32 = 6;
 const TAG_TYPE_FRAMEBUFFER: u32 = 8;
 
 /// Maximum number of boot modules we track.
 pub const MAX_MODULES: usize = 32;
+
+/// Maximum number of memory regions we track.
+pub const MAX_MEMORY_REGIONS: usize = 64;
+
+#[allow(dead_code)]
+pub const MMAP_TYPE_AVAILABLE: u32 = 1;
+#[allow(dead_code)]
+pub const MMAP_TYPE_RESERVED: u32 = 2;
+#[allow(dead_code)]
+pub const MMAP_TYPE_ACPI_RECLAIMABLE: u32 = 3;
+#[allow(dead_code)]
+pub const MMAP_TYPE_ACPI_NVS: u32 = 4;
+#[allow(dead_code)]
+pub const MMAP_TYPE_BAD_MEMORY: u32 = 5;
+
+#[derive(Debug, Clone, Copy)]
+pub struct MemoryRegion {
+    pub base: u64,
+    pub length: u64,
+    pub region_type: u32,
+}
+
+impl MemoryRegion {
+    pub const fn empty() -> Self {
+        MemoryRegion {
+            base: 0,
+            length: 0,
+            region_type: 0,
+        }
+    }
+}
 
 /// Information about a loaded boot module.
 #[derive(Debug, Clone, Copy)]
@@ -100,6 +132,64 @@ pub unsafe fn parse_modules(info_addr: usize) -> (usize, [ModuleInfo; MAX_MODULE
     }
 
     (count, modules)
+}
+
+/// Parse memory map tags (type 6) from the multiboot2 info structure.
+///
+/// # Safety
+/// `info_addr` must point to a valid multiboot2 boot information structure.
+pub unsafe fn parse_memory_map(
+    info_addr: usize,
+) -> (usize, [MemoryRegion; MAX_MEMORY_REGIONS]) {
+    let ptr = info_addr as *const u8;
+    let total_size = (ptr as *const u32).read_unaligned() as usize;
+    let mut offset: usize = 8;
+    let mut count: usize = 0;
+    let mut regions = [MemoryRegion::empty(); MAX_MEMORY_REGIONS];
+
+    loop {
+        if offset >= total_size {
+            break;
+        }
+
+        offset = (offset + 7) & !7;
+
+        let tag_ptr = ptr.add(offset);
+        let tag_type = (tag_ptr as *const u32).read_unaligned();
+        let tag_size = (tag_ptr.add(4) as *const u32).read_unaligned() as usize;
+
+        if tag_type == TAG_TYPE_END {
+            break;
+        }
+
+        if tag_type == TAG_TYPE_MMAP {
+            let entry_size = (tag_ptr.add(8) as *const u32).read_unaligned() as usize;
+            // entry_version at +12 (unused)
+            // entries start at +16 from tag start
+            let entries_start = tag_ptr.add(16);
+            let entries_end = tag_ptr.add(tag_size);
+
+            let mut entry_ptr = entries_start;
+            while entry_ptr < entries_end && count < MAX_MEMORY_REGIONS {
+                let base = (entry_ptr as *const u64).read_unaligned();
+                let length = (entry_ptr.add(8) as *const u64).read_unaligned();
+                let region_type = (entry_ptr.add(16) as *const u32).read_unaligned();
+
+                regions[count] = MemoryRegion {
+                    base,
+                    length,
+                    region_type,
+                };
+                count += 1;
+
+                entry_ptr = entry_ptr.add(entry_size);
+            }
+        }
+
+        offset += tag_size;
+    }
+
+    (count, regions)
 }
 
 /// Parse the multiboot2 info structure and return framebuffer info if present.

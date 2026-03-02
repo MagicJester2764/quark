@@ -83,6 +83,15 @@ pub struct DirEntry {
     pub cluster: u32,
 }
 
+/// Kernel services provided at init time.
+#[repr(C)]
+pub struct KernelServices {
+    pub alloc_page: extern "C" fn() -> usize,
+    pub free_page: extern "C" fn(addr: usize),
+}
+
+static mut SERVICES: *const KernelServices = core::ptr::null();
+
 /// Vtable returned to the kernel.
 #[repr(C)]
 pub struct Fat32Vtable {
@@ -134,10 +143,11 @@ static mut FILES: [FileHandle; MAX_OPEN_FILES] = [FileHandle::empty(); MAX_OPEN_
 
 #[no_mangle]
 #[link_section = ".text.entry"]
-pub extern "C" fn _entry(out: *mut Fat32Vtable) {
+pub extern "C" fn _entry(out: *mut Fat32Vtable, services: *const KernelServices) {
     unsafe {
         MOUNTED = false;
         FILES = [FileHandle::empty(); MAX_OPEN_FILES];
+        SERVICES = services;
 
         (*out).mount = fat32_mount;
         (*out).open = fat32_open;
