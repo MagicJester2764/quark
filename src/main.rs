@@ -5,11 +5,14 @@ mod console;
 #[allow(dead_code)]
 mod fat32;
 mod idt;
+mod io;
 #[allow(dead_code)]
 mod modules;
 mod multiboot2;
 #[allow(dead_code)]
 mod paging;
+mod pic;
+mod pit;
 #[allow(dead_code)]
 mod pmm;
 mod services;
@@ -34,7 +37,16 @@ pub extern "C" fn kernel_main(multiboot_info: usize) -> ! {
     console::clear();
     console::puts(b"Quark v0.1.0 - microkernel\n");
     unsafe { idt::init() };
-    console::puts(b"Booted successfully.\n");
+
+    // Initialize hardware interrupts
+    unsafe {
+        pic::init();
+        pit::init(100); // 100 Hz timer
+        pic::enable_irq(0); // timer
+        pic::enable_irq(1); // keyboard
+        core::arch::asm!("sti", options(nostack, nomem));
+    }
+    console::puts(b"Interrupts enabled.\n");
 
     // Print boot modules
     let mod_count = modules::count();
@@ -86,7 +98,7 @@ pub extern "C" fn kernel_main(multiboot_info: usize) -> ! {
     console::puts(b" KiB)\n");
 
     loop {
-        core::hint::spin_loop();
+        unsafe { core::arch::asm!("hlt", options(nostack, nomem)) };
     }
 }
 

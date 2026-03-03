@@ -3,7 +3,7 @@
 //! Sets up handlers for all 32 CPU exceptions, a TSS for double-fault
 //! recovery, and the GDT changes to support the TSS.
 
-use crate::console;
+use crate::{console, io, pic, pit};
 
 // ---------------------------------------------------------------------------
 // Structures
@@ -191,6 +191,84 @@ exception_stub!(has_error, 29);
 exception_stub!(has_error, 30);
 exception_stub!(no_error, 31);
 
+// ---------------------------------------------------------------------------
+// IRQ stubs (assembly) — IRQ 0–15 → vectors 32–47
+// ---------------------------------------------------------------------------
+
+macro_rules! irq_stub {
+    ($n:literal) => {
+        core::arch::global_asm!(
+            concat!(
+                ".global irq_stub_", stringify!($n), "\n",
+                "irq_stub_", stringify!($n), ":\n",
+                "    pushq $0\n",           // dummy error code
+                "    pushq $", stringify!($n), "\n", // IRQ number (0–15)
+                "    jmp irq_common\n"
+            ),
+            options(att_syntax)
+        );
+    };
+}
+
+irq_stub!(0);
+irq_stub!(1);
+irq_stub!(2);
+irq_stub!(3);
+irq_stub!(4);
+irq_stub!(5);
+irq_stub!(6);
+irq_stub!(7);
+irq_stub!(8);
+irq_stub!(9);
+irq_stub!(10);
+irq_stub!(11);
+irq_stub!(12);
+irq_stub!(13);
+irq_stub!(14);
+irq_stub!(15);
+
+// IRQ common handler: save GPRs, call Rust handler, restore, iretq
+core::arch::global_asm!(
+    "irq_common:",
+    "    pushq %rax",
+    "    pushq %rbx",
+    "    pushq %rcx",
+    "    pushq %rdx",
+    "    pushq %rsi",
+    "    pushq %rdi",
+    "    pushq %rbp",
+    "    pushq %r8",
+    "    pushq %r9",
+    "    pushq %r10",
+    "    pushq %r11",
+    "    pushq %r12",
+    "    pushq %r13",
+    "    pushq %r14",
+    "    pushq %r15",
+    "",
+    "    movq %rsp, %rdi",
+    "    call irq_handler",
+    "",
+    "    popq %r15",
+    "    popq %r14",
+    "    popq %r13",
+    "    popq %r12",
+    "    popq %r11",
+    "    popq %r10",
+    "    popq %r9",
+    "    popq %r8",
+    "    popq %rbp",
+    "    popq %rdi",
+    "    popq %rsi",
+    "    popq %rdx",
+    "    popq %rcx",
+    "    popq %rbx",
+    "    popq %rax",
+    "    addq $16, %rsp",
+    "    iretq",
+    options(att_syntax)
+);
+
 // Common handler: save GPRs, call Rust handler, restore, iretq
 core::arch::global_asm!(
     "exception_common:",
@@ -299,6 +377,51 @@ extern "C" fn exception_handler(frame: &InterruptFrame) {
 }
 
 // ---------------------------------------------------------------------------
+// IRQ handler
+// ---------------------------------------------------------------------------
+
+#[no_mangle]
+extern "C" fn irq_handler(frame: &InterruptFrame) {
+    let irq = frame.vector as u8;
+
+    match irq {
+        0 => pit::tick(),
+        1 => {
+            // Read keyboard scancode for debugging
+            let scancode = unsafe { io::inb(0x60) };
+            console::puts(b"KEY:0x");
+            let hi = scancode >> 4;
+            let lo = scancode & 0x0F;
+            let hex = [
+                if hi < 10 { b'0' + hi } else { b'A' + hi - 10 },
+                if lo < 10 { b'0' + lo } else { b'A' + lo - 10 },
+            ];
+            console::puts(&hex);
+            console::puts(b" ");
+        }
+        7 => {
+            // Spurious IRQ check for master PIC
+            let isr = unsafe { pic::read_isr() };
+            if isr & (1 << 7) == 0 {
+                return; // spurious — no EOI
+            }
+        }
+        15 => {
+            // Spurious IRQ check for slave PIC
+            let isr = unsafe { pic::read_isr() };
+            if isr & (1 << 15) == 0 {
+                // Spurious from slave — still send EOI to master
+                unsafe { pic::send_eoi(0) };
+                return;
+            }
+        }
+        _ => {}
+    }
+
+    unsafe { pic::send_eoi(irq) };
+}
+
+// ---------------------------------------------------------------------------
 // Print helpers
 // ---------------------------------------------------------------------------
 
@@ -392,6 +515,23 @@ extern "C" {
     fn exception_stub_29();
     fn exception_stub_30();
     fn exception_stub_31();
+
+    fn irq_stub_0();
+    fn irq_stub_1();
+    fn irq_stub_2();
+    fn irq_stub_3();
+    fn irq_stub_4();
+    fn irq_stub_5();
+    fn irq_stub_6();
+    fn irq_stub_7();
+    fn irq_stub_8();
+    fn irq_stub_9();
+    fn irq_stub_10();
+    fn irq_stub_11();
+    fn irq_stub_12();
+    fn irq_stub_13();
+    fn irq_stub_14();
+    fn irq_stub_15();
 }
 
 // ---------------------------------------------------------------------------
@@ -495,6 +635,30 @@ unsafe fn setup_idt() {
     for i in 0..32 {
         let ist = if i == 8 { 1 } else { 0 };
         (*idt_ptr).entries[i].set_handler(stubs[i] as u64, 0x08, ist);
+    }
+
+    // IRQ stubs at vectors 32–47
+    let irq_stubs: [unsafe extern "C" fn(); 16] = [
+        irq_stub_0,
+        irq_stub_1,
+        irq_stub_2,
+        irq_stub_3,
+        irq_stub_4,
+        irq_stub_5,
+        irq_stub_6,
+        irq_stub_7,
+        irq_stub_8,
+        irq_stub_9,
+        irq_stub_10,
+        irq_stub_11,
+        irq_stub_12,
+        irq_stub_13,
+        irq_stub_14,
+        irq_stub_15,
+    ];
+
+    for i in 0..16 {
+        (*idt_ptr).entries[32 + i].set_handler(irq_stubs[i] as u64, 0x08, 0);
     }
 }
 
