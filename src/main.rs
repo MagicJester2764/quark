@@ -12,6 +12,7 @@ mod heap;
 mod idt;
 mod io;
 pub mod ipc;
+pub mod irq_dispatch;
 #[allow(dead_code)]
 mod modules;
 mod multiboot2;
@@ -23,6 +24,8 @@ mod pit;
 mod pmm;
 pub mod scheduler;
 mod syscall;
+#[allow(dead_code)]
+mod elf;
 mod services;
 mod task;
 #[allow(dead_code)]

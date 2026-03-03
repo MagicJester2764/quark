@@ -387,7 +387,12 @@ extern "C" fn irq_handler(frame: &InterruptFrame) {
     match irq {
         0 => pit::tick(),
         1 => {
-            // Read keyboard scancode for debugging
+            // Check if a user-space handler is registered
+            if crate::irq_dispatch::dispatch_irq(1) {
+                unsafe { pic::send_eoi(irq) };
+                return;
+            }
+            // Fallback: read keyboard scancode for debugging
             let scancode = unsafe { io::inb(0x60) };
             console::puts(b"KEY:0x");
             let hi = scancode >> 4;

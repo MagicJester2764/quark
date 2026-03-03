@@ -4,7 +4,7 @@
 /// Convention: RAX=nr, RDI=arg0, RSI=arg1, RDX=arg2, R10=arg3, R8=arg4, R9=arg5.
 /// Return value in RAX.
 
-use crate::{console, scheduler};
+use crate::{console, paging, scheduler};
 
 const MSR_STAR: u32 = 0xC000_0081;
 const MSR_LSTAR: u32 = 0xC000_0082;
@@ -21,6 +21,10 @@ pub const SYS_RECV: u64 = 11;
 pub const SYS_CALL: u64 = 12;
 pub const SYS_REPLY: u64 = 13;
 pub const SYS_GETPID: u64 = 21;
+pub const SYS_IRQ_REGISTER: u64 = 30;
+pub const SYS_IRQ_ACK: u64 = 31;
+pub const SYS_IOPORT: u64 = 32;
+pub const SYS_MAP_PHYS: u64 = 33;
 
 const SFMASK_VALUE: u64 = (1 << 9) | (1 << 10); // clear IF | DF
 
@@ -137,6 +141,46 @@ extern "C" fn syscall_dispatch(nr: u64, arg0: u64, arg1: u64, arg2: u64) -> u64 
                 Ok(()) => 0,
                 Err(_) => u64::MAX,
             }
+        }
+        SYS_IRQ_REGISTER => {
+            // arg0 = IRQ number
+            let irq = arg0 as u8;
+            let tid = scheduler::current_tid();
+            crate::irq_dispatch::register_irq_handler(irq, tid);
+            0
+        }
+        SYS_IRQ_ACK => {
+            // arg0 = IRQ number
+            let irq = arg0 as u8;
+            unsafe { crate::pic::send_eoi(irq) };
+            0
+        }
+        SYS_IOPORT => {
+            // arg0 = port, arg1 = 0 for read / 1 for write, arg2 = value (for write)
+            let port = arg0 as u16;
+            let is_write = arg1;
+            if is_write != 0 {
+                unsafe { crate::io::outb(port, arg2 as u8) };
+                0
+            } else {
+                unsafe { crate::io::inb(port) as u64 }
+            }
+        }
+        SYS_MAP_PHYS => {
+            // arg0 = phys addr, arg1 = virt addr, arg2 = num pages
+            let phys = arg0 as usize;
+            let virt = arg1 as usize;
+            let pages = arg2 as usize;
+            let pml4 = paging::read_cr3();
+            for i in 0..pages {
+                let p = phys + i * 4096;
+                let v = virt + i * 4096;
+                let flags = paging::PRESENT | paging::WRITABLE | paging::USER;
+                if unsafe { paging::map_page(pml4, v, p, flags) }.is_err() {
+                    return u64::MAX;
+                }
+            }
+            0
         }
         _ => u64::MAX,
     }
