@@ -16,6 +16,7 @@ pub mod irq_dispatch;
 #[allow(dead_code)]
 mod modules;
 mod multiboot2;
+pub mod nameserver;
 #[allow(dead_code)]
 pub mod paging;
 mod pic;
@@ -116,9 +117,14 @@ pub extern "C" fn kernel_main(multiboot_info: usize) -> ! {
     // Initialize syscall/sysret mechanism
     unsafe { syscall::init() };
 
-    // Initialize scheduler and spawn test tasks
+    // Initialize scheduler and nameserver
     scheduler::init();
     console::puts(b"Scheduler initialized.\n");
+
+    nameserver::init();
+    console::puts(b"Nameserver started (TID ");
+    print_dec(nameserver::tid());
+    console::puts(b").\n");
 
     scheduler::spawn(task_a);
     scheduler::spawn(task_b);
