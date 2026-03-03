@@ -1,9 +1,13 @@
 #![no_std]
 #![no_main]
+#![feature(alloc_error_handler)]
+
+extern crate alloc;
 
 mod console;
 #[allow(dead_code)]
 mod fat32;
+mod heap;
 mod idt;
 mod io;
 #[allow(dead_code)]
@@ -36,6 +40,8 @@ pub extern "C" fn kernel_main(multiboot_info: usize) -> ! {
     console::init(fb);
     console::clear();
     console::puts(b"Quark v0.1.0 - microkernel\n");
+    unsafe { heap::init() };
+    console::puts(b"Heap initialized.\n");
     unsafe { idt::init() };
 
     // Initialize hardware interrupts

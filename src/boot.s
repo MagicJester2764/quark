@@ -142,10 +142,10 @@ _start:
     or $(1 << 5), %eax
     mov %eax, %cr4
 
-    // Set long mode enable in EFER MSR
+    // Set long mode enable + NX enable in EFER MSR
     mov $0xC0000080, %ecx
     rdmsr
-    or $(1 << 8), %eax
+    or $((1 << 8) | (1 << 11)), %eax
     wrmsr
 
     // Enable paging (enters IA-32e compatibility mode)
