@@ -193,10 +193,12 @@ _start64:
 .global gdt64
 gdt64:
     .quad 0x0000000000000000    // [0x00] null
-    .quad 0x00AF9A000000FFFF    // [0x08] code64
-    .quad 0x00CF92000000FFFF    // [0x10] data64
+    .quad 0x00AF9A000000FFFF    // [0x08] kernel code64 (DPL=0)
+    .quad 0x00CF92000000FFFF    // [0x10] kernel data64 (DPL=0)
     .quad 0                     // [0x18] TSS low  (Rust fills)
     .quad 0                     // [0x20] TSS high (Rust fills)
+    .quad 0x00CFF2000000FFFF    // [0x28] user data64 (DPL=3) — must be before code for sysret
+    .quad 0x00AFFA000000FFFF    // [0x30] user code64 (DPL=3)
 gdt64_end:
 
 gdt64_ptr32:                    // 32-bit boot lgdt (6 bytes: 2+4)

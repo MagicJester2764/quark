@@ -11,18 +11,22 @@ mod fat32;
 mod heap;
 mod idt;
 mod io;
+pub mod ipc;
 #[allow(dead_code)]
 mod modules;
 mod multiboot2;
 #[allow(dead_code)]
-mod paging;
+pub mod paging;
 mod pic;
 mod pit;
 #[allow(dead_code)]
 mod pmm;
 pub mod scheduler;
+mod syscall;
 mod services;
 mod task;
+#[allow(dead_code)]
+mod userspace;
 
 use core::panic::PanicInfo;
 
@@ -105,6 +109,9 @@ pub extern "C" fn kernel_main(multiboot_info: usize) -> ! {
     console::puts(b" free frames (");
     print_dec(pmm::free_count() * 4);
     console::puts(b" KiB)\n");
+
+    // Initialize syscall/sysret mechanism
+    unsafe { syscall::init() };
 
     // Initialize scheduler and spawn test tasks
     scheduler::init();

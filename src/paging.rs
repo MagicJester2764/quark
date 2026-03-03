@@ -119,7 +119,7 @@ fn table_indices(vaddr: usize) -> (usize, usize, usize, usize) {
 ///
 /// # Safety
 /// The address must be identity-mapped and point to a valid PageTable.
-unsafe fn table_at(phys: usize) -> &'static mut PageTable {
+pub unsafe fn table_at(phys: usize) -> &'static mut PageTable {
     &mut *(phys as *mut PageTable)
 }
 
