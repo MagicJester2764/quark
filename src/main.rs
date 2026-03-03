@@ -5,6 +5,7 @@
 extern crate alloc;
 
 mod console;
+mod context;
 #[allow(dead_code)]
 mod fat32;
 mod heap;
@@ -19,7 +20,9 @@ mod pic;
 mod pit;
 #[allow(dead_code)]
 mod pmm;
+pub mod scheduler;
 mod services;
+mod task;
 
 use core::panic::PanicInfo;
 
@@ -103,9 +106,57 @@ pub extern "C" fn kernel_main(multiboot_info: usize) -> ! {
     print_dec(pmm::free_count() * 4);
     console::puts(b" KiB)\n");
 
+    // Initialize scheduler and spawn test tasks
+    scheduler::init();
+    console::puts(b"Scheduler initialized.\n");
+
+    scheduler::spawn(task_a);
+    scheduler::spawn(task_b);
+    scheduler::spawn(task_c);
+    console::puts(b"Spawned 3 test tasks.\n");
+
+    // Idle loop — the scheduler returns here when no tasks are ready
     loop {
         unsafe { core::arch::asm!("hlt", options(nostack, nomem)) };
+        scheduler::reap_dead();
     }
+}
+
+fn task_a() {
+    for i in 0..5u32 {
+        console::puts(b"[Task A] iteration ");
+        print_dec(i as usize);
+        console::puts(b"\n");
+        // Busy-wait a bit so we can see interleaving
+        for _ in 0..100_000 {
+            core::hint::spin_loop();
+        }
+    }
+    console::puts(b"[Task A] done.\n");
+}
+
+fn task_b() {
+    for i in 0..5u32 {
+        console::puts(b"[Task B] iteration ");
+        print_dec(i as usize);
+        console::puts(b"\n");
+        for _ in 0..100_000 {
+            core::hint::spin_loop();
+        }
+    }
+    console::puts(b"[Task B] done.\n");
+}
+
+fn task_c() {
+    for i in 0..5u32 {
+        console::puts(b"[Task C] iteration ");
+        print_dec(i as usize);
+        console::puts(b"\n");
+        for _ in 0..100_000 {
+            core::hint::spin_loop();
+        }
+    }
+    console::puts(b"[Task C] done.\n");
 }
 
 fn print_hex(val: usize) {

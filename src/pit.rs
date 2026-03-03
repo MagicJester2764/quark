@@ -18,9 +18,10 @@ pub unsafe fn init(hz: u32) {
     io::outb(PIT_CH0_DATA, ((divisor >> 8) & 0xFF) as u8);
 }
 
-/// Called from the IRQ 0 handler to bump the tick counter.
+/// Called from the IRQ 0 handler to bump the tick counter and trigger scheduling.
 pub fn tick() {
     TICKS.fetch_add(1, Ordering::Relaxed);
+    crate::scheduler::timer_tick();
 }
 
 /// Return the current tick count.
