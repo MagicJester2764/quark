@@ -63,39 +63,26 @@ pub extern "C" fn _start() -> ! {
     print_dec(mod_count);
     syscall::sys_write(b"\n");
 
-    // Load each module as a task, skipping init itself and non-ELF modules
+    // Pass 1: Spawn nameserver first so it gets a well-known TID (2)
+    for i in 0..mod_count {
+        let m = &info.modules[i];
+        let name = module_name(&m.name);
+        if starts_with(name, b"nameserver") {
+            try_spawn(m, name);
+            break;
+        }
+    }
+
+    // Pass 2: Spawn remaining modules (skip init and nameserver)
     for i in 0..mod_count {
         let m = &info.modules[i];
         let name = module_name(&m.name);
 
-        // Skip self (init)
-        if starts_with(name, b"init") {
+        if starts_with(name, b"init") || starts_with(name, b"nameserver") {
             continue;
         }
 
-        // Skip non-ELF modules (drivers, rootfs, etc.)
-        let phys_start = m.phys_start as usize;
-        let mod_size = (m.phys_end - m.phys_start) as usize;
-        if mod_size < 4 {
-            continue;
-        }
-        // Quick ELF magic check via first 4 bytes mapped temporarily
-        let temp_check: usize = 0x81_0000_0000;
-        if syscall::sys_map_phys(phys_start, temp_check, 1).is_err() {
-            continue;
-        }
-        let magic = unsafe { core::slice::from_raw_parts(temp_check as *const u8, 4) };
-        if magic != ELF_MAGIC {
-            continue;
-        }
-
-        syscall::sys_write(b"[init] Loading module: ");
-        syscall::sys_write(name);
-        syscall::sys_write(b"\n");
-
-        if let Err(()) = spawn_module(m) {
-            syscall::sys_write(b"[init]   FAILED to spawn module.\n");
-        }
+        try_spawn(m, name);
     }
 
     syscall::sys_write(b"[init] All modules loaded. Entering idle loop.\n");
@@ -106,8 +93,43 @@ pub extern "C" fn _start() -> ! {
     }
 }
 
+/// Check if a module is a valid ELF, spawn it, and grant capabilities as needed.
+fn try_spawn(m: &BootModuleDesc, name: &[u8]) {
+    let phys_start = m.phys_start as usize;
+    let mod_size = (m.phys_end - m.phys_start) as usize;
+    if mod_size < 4 {
+        return;
+    }
+    // Quick ELF magic check via first 4 bytes mapped temporarily
+    let temp_check: usize = 0x81_0000_0000;
+    if syscall::sys_map_phys(phys_start, temp_check, 1).is_err() {
+        return;
+    }
+    let magic = unsafe { core::slice::from_raw_parts(temp_check as *const u8, 4) };
+    if magic != ELF_MAGIC {
+        return;
+    }
+
+    syscall::sys_write(b"[init] Loading module: ");
+    syscall::sys_write(name);
+    syscall::sys_write(b"\n");
+
+    match spawn_module(m) {
+        Ok(tid) => {
+            // Grant I/O port and IRQ capabilities to keyboard driver
+            if starts_with(name, b"keyboard") {
+                let _ = syscall::sys_grant_ioport(tid);
+                let _ = syscall::sys_grant_irq(tid, 1);
+            }
+        }
+        Err(()) => {
+            syscall::sys_write(b"[init]   FAILED to spawn module.\n");
+        }
+    }
+}
+
 /// Spawn a user-space task from an ELF boot module.
-fn spawn_module(m: &BootModuleDesc) -> Result<(), ()> {
+fn spawn_module(m: &BootModuleDesc) -> Result<usize, ()> {
     let phys_start = m.phys_start as usize;
     let phys_end = m.phys_end as usize;
     let mod_size = phys_end - phys_start;
@@ -223,7 +245,7 @@ fn spawn_module(m: &BootModuleDesc) -> Result<(), ()> {
     print_dec(tid);
     syscall::sys_write(b"\n");
 
-    Ok(())
+    Ok(tid)
 }
 
 fn module_name(name: &[u8; 48]) -> &[u8] {

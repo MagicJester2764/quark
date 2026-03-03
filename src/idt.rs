@@ -392,17 +392,8 @@ extern "C" fn irq_handler(frame: &InterruptFrame) {
                 unsafe { pic::send_eoi(irq) };
                 return;
             }
-            // Fallback: read keyboard scancode for debugging
-            let scancode = unsafe { io::inb(0x60) };
-            console::puts(b"KEY:0x");
-            let hi = scancode >> 4;
-            let lo = scancode & 0x0F;
-            let hex = [
-                if hi < 10 { b'0' + hi } else { b'A' + hi - 10 },
-                if lo < 10 { b'0' + lo } else { b'A' + lo - 10 },
-            ];
-            console::puts(&hex);
-            console::puts(b" ");
+            // No user-space handler — consume and discard the scancode
+            unsafe { io::inb(0x60) };
         }
         7 => {
             // Spurious IRQ check for master PIC
