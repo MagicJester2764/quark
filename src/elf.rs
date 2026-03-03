@@ -1,5 +1,8 @@
 /// ELF64 loader for the Quark microkernel.
 ///
+/// BOOTSTRAP ONLY — used once to load init. After boot, user-space
+/// processes are responsible for ELF loading via microkernel syscalls.
+///
 /// Parses ELF headers from boot modules and maps PT_LOAD segments
 /// into a user address space.
 
@@ -114,31 +117,39 @@ pub fn load_elf(data: &[u8]) -> Result<(usize, u64, u64), ElfError> {
         let file_offset = phdr.p_offset as usize;
         let writable = phdr.p_flags & 2 != 0; // PF_W
 
-        // Map pages for this segment
-        let pages = (memsz + PAGE_SIZE - 1) / PAGE_SIZE;
+        // Correct page range: from page-aligned start to page-aligned end
+        let vaddr_page_start = vaddr & !0xFFF;
+        let vaddr_end = vaddr + memsz;
+        let pages = (vaddr_end - vaddr_page_start + PAGE_SIZE - 1) / PAGE_SIZE;
+
+        // File data range in virtual address space
+        let file_start = vaddr;
+        let file_end = vaddr + filesz;
+
         for p in 0..pages {
-            let page_vaddr = (vaddr & !0xFFF) + p * PAGE_SIZE;
+            let page_vaddr = vaddr_page_start + p * PAGE_SIZE;
             let frame = pmm::alloc().ok_or(ElfError::MapFailed)?;
             userspace::map_user_page(pml4, page_vaddr, frame.address(), writable)
                 .map_err(|_| ElfError::MapFailed)?;
-
-            // Copy file data to this page (via identity-mapped physical address)
-            let page_start_in_seg = page_vaddr.saturating_sub(vaddr);
-            let seg_offset_in_file = file_offset + page_start_in_seg;
-            let vaddr_offset = if p == 0 { vaddr & 0xFFF } else { 0 };
 
             unsafe {
                 // Zero the entire page first
                 core::ptr::write_bytes(frame.address() as *mut u8, 0, PAGE_SIZE);
 
-                // Copy file content
-                if page_start_in_seg < filesz {
-                    let copy_start = seg_offset_in_file;
-                    let copy_len = (filesz - page_start_in_seg).min(PAGE_SIZE - vaddr_offset);
-                    if copy_start + copy_len <= data.len() {
+                // Compute intersection of [page_vaddr, page_vaddr+PAGE_SIZE) and
+                // [file_start, file_end) for correct src/dst offsets
+                let page_end = page_vaddr + PAGE_SIZE;
+                if file_start < page_end && file_end > page_vaddr {
+                    let copy_vstart = file_start.max(page_vaddr);
+                    let copy_vend = file_end.min(page_end);
+                    let copy_len = copy_vend - copy_vstart;
+                    let dst_offset = copy_vstart - page_vaddr;
+                    let src_offset = file_offset + (copy_vstart - vaddr);
+
+                    if src_offset + copy_len <= data.len() {
                         core::ptr::copy_nonoverlapping(
-                            data.as_ptr().add(copy_start),
-                            (frame.address() + vaddr_offset) as *mut u8,
+                            data.as_ptr().add(src_offset),
+                            (frame.address() + dst_offset) as *mut u8,
                             copy_len,
                         );
                     }

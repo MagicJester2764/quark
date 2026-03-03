@@ -4,7 +4,7 @@
 /// to preempt the running task and switch to the next ready one.
 
 use crate::context;
-use crate::task::{Task, TaskState, MAX_TASKS};
+use crate::task::{Task, TaskState, KERNEL_STACK_SIZE, MAX_TASKS};
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 // Task table: fixed-size array of Option<Task>
@@ -35,6 +35,8 @@ pub fn init() {
             kernel_stack_base: core::ptr::null_mut(), // uses boot stack
             kernel_stack_size: 0,
             priority: 255, // lowest priority
+            cr3: crate::paging::read_cr3(),
+            caps: crate::task::CAP_ALL,
         });
     }
     CURRENT_TID.store(0, Ordering::SeqCst);
@@ -144,6 +146,22 @@ unsafe fn schedule_inner(from_irq: bool) {
     }
     CURRENT_TID.store(next_tid, Ordering::SeqCst);
 
+    // Switch CR3 if address spaces differ
+    let old_cr3 = TASKS[current_tid].as_ref().unwrap().cr3;
+    let new_cr3 = TASKS[next_tid].as_ref().unwrap().cr3;
+    if new_cr3 != 0 && new_cr3 != old_cr3 {
+        crate::paging::write_cr3(new_cr3);
+    }
+
+    // Update kernel RSP for syscall re-entry and TSS RSP0 for exceptions
+    let new_task = TASKS[next_tid].as_ref().unwrap();
+    if !new_task.kernel_stack_base.is_null() {
+        let kernel_stack_top =
+            new_task.kernel_stack_base as u64 + new_task.kernel_stack_size as u64;
+        crate::syscall::update_kernel_rsp(kernel_stack_top);
+        unsafe { crate::idt::update_tss_rsp0(kernel_stack_top); }
+    }
+
     // Get raw pointers to contexts
     let old_ctx = &raw mut TASKS[current_tid].as_mut().unwrap().context;
     let new_ctx = &raw const TASKS[next_tid].as_ref().unwrap().context;
@@ -237,6 +255,98 @@ pub fn reap_dead() {
                     TASKS[i] = None;
                 }
             }
+        }
+    }
+}
+
+/// Check if the current task has a given capability.
+pub fn current_task_has_cap(cap: u32) -> bool {
+    let tid = current_tid();
+    unsafe {
+        match TASKS[tid].as_ref() {
+            Some(task) => task.caps & cap != 0,
+            None => false,
+        }
+    }
+}
+
+/// Create an empty task slot (Blocked, cr3=0, caps=0). Returns TID.
+pub fn create_empty_task() -> Option<usize> {
+    let tid = NEXT_TID.fetch_add(1, Ordering::SeqCst);
+    if tid >= MAX_TASKS {
+        return None;
+    }
+
+    let layout = core::alloc::Layout::from_size_align(KERNEL_STACK_SIZE, 16)
+        .expect("scheduler: invalid stack layout");
+    let stack_base = unsafe { alloc::alloc::alloc(layout) };
+    if stack_base.is_null() {
+        return None;
+    }
+
+    unsafe {
+        TASKS[tid] = Some(Task {
+            tid,
+            state: TaskState::Blocked,
+            context: context::CpuContext::empty(),
+            kernel_stack_base: stack_base,
+            kernel_stack_size: KERNEL_STACK_SIZE,
+            priority: 0,
+            cr3: 0,
+            caps: 0,
+        });
+    }
+
+    Some(tid)
+}
+
+/// Configure and start a previously created empty task for userspace entry.
+pub fn start_task(tid: usize, rip: u64, rsp: u64, cr3: usize) -> Result<(), ()> {
+    unsafe {
+        let task = match TASKS[tid].as_mut() {
+            Some(t) => t,
+            None => return Err(()),
+        };
+        if task.state != TaskState::Blocked {
+            return Err(());
+        }
+
+        task.cr3 = cr3;
+
+        // Set up context so context_switch enters enter_user_trampoline
+        // with r12=rip, r13=rsp, r14=cr3
+        let stack_top = task.kernel_stack_base as usize + task.kernel_stack_size;
+        let stack_top = stack_top & !0xF;
+
+        let trampoline_addr =
+            crate::userspace::enter_user_trampoline as *const () as usize as u64;
+
+        // Write trampoline return address on kernel stack
+        let sp = stack_top as *mut u64;
+        core::ptr::write(sp.sub(1), crate::task::task_exit_trampoline as *const () as u64);
+
+        task.context.rip = trampoline_addr;
+        task.context.rsp = (stack_top - 8) as u64;
+        task.context.rbp = 0;
+        task.context.r12 = rip;
+        task.context.r13 = rsp;
+        task.context.r14 = cr3 as u64;
+
+        task.state = TaskState::Ready;
+        enqueue(tid);
+        Ok(())
+    }
+}
+
+/// Grant a capability to a task.
+pub fn grant_cap(tid: usize, cap: u32) -> Result<(), ()> {
+    unsafe {
+        match TASKS[tid].as_mut() {
+            Some(task) => {
+                task.caps |= cap;
+                Ok(())
+            }
+            None => Err(()),
         }
     }
 }

@@ -11,9 +11,19 @@ FAT32_DRV_DIR := drivers/fat32
 FAT32_DRV_ELF := $(FAT32_DRV_DIR)/target/$(TARGET)/release/fat32-driver
 FAT32_DRV_BIN := $(FAT32_DRV_DIR)/fat32.drv
 
-.PHONY: all clean iso run run-uefi drivers FORCE
+# User-space programs (ELF binaries, not flat)
+INIT_DIR := user/init
+INIT_ELF := $(INIT_DIR)/target/$(TARGET)/release/init
 
-all: $(KERNEL) drivers
+HELLO_DIR := user/hello
+HELLO_ELF := $(HELLO_DIR)/target/$(TARGET)/release/hello
+
+NS_DIR := user/nameserver
+NS_ELF := $(NS_DIR)/target/$(TARGET)/release/nameserver
+
+.PHONY: all clean iso run run-uefi drivers user FORCE
+
+all: $(KERNEL) drivers user
 
 $(KERNEL): FORCE
 	cargo build --release
@@ -28,6 +38,17 @@ $(VGA_DRV_BIN): FORCE
 $(FAT32_DRV_BIN): FORCE
 	cd $(FAT32_DRV_DIR) && cargo build --release
 	objcopy -O binary $(FAT32_DRV_ELF) $(FAT32_DRV_BIN)
+
+user: $(INIT_ELF) $(HELLO_ELF) $(NS_ELF)
+
+$(INIT_ELF): FORCE
+	cd $(INIT_DIR) && cargo build --release
+
+$(HELLO_ELF): FORCE
+	cd $(HELLO_DIR) && cargo build --release
+
+$(NS_ELF): FORCE
+	cd $(NS_DIR) && cargo build --release
 
 iso: $(KERNEL)
 	@mkdir -p isodir/boot/grub
@@ -48,6 +69,9 @@ clean:
 	cargo clean
 	cd $(VGA_DRV_DIR) && cargo clean
 	cd $(FAT32_DRV_DIR) && cargo clean
+	cd $(INIT_DIR) && cargo clean
+	cd $(HELLO_DIR) && cargo clean
+	cd $(NS_DIR) && cargo clean
 	rm -rf $(KERNEL) $(VGA_DRV_BIN) $(FAT32_DRV_BIN) quark.iso isodir
 
 FORCE:

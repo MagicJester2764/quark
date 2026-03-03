@@ -563,6 +563,18 @@ unsafe fn setup_tss() {
     core::ptr::write_unaligned(tss_ptr.add(102) as *mut u16, 104u16);
 }
 
+/// Update TSS RSP0 — the kernel stack used for ring 3→0 transitions on
+/// hardware exceptions and interrupts. Must be called whenever we switch
+/// to a user-mode task so the CPU can find a valid kernel stack.
+///
+/// # Safety
+/// `rsp0` must point to the top of a valid, mapped kernel stack.
+pub unsafe fn update_tss_rsp0(rsp0: u64) {
+    let tss_ptr = &tss as *const u8 as *mut u8;
+    // RSP0 is at offset 4 in the x86-64 TSS
+    core::ptr::write_unaligned(tss_ptr.add(4) as *mut u64, rsp0);
+}
+
 unsafe fn install_tss_in_gdt() {
     let base = &tss as *const u8 as u64;
     let limit: u64 = 103;

@@ -9,6 +9,14 @@ pub const MAX_TASKS: usize = 64;
 pub const KERNEL_STACK_SIZE: usize = 16384; // 16 KiB per task
 const STACK_ALIGN: usize = 16;
 
+// Capability bits
+pub const CAP_IOPORT: u32 = 1 << 0;
+pub const CAP_MAP_PHYS: u32 = 1 << 1;
+pub const CAP_IRQ: u32 = 1 << 2;
+pub const CAP_TASK_MGMT: u32 = 1 << 3;
+pub const CAP_PHYS_ALLOC: u32 = 1 << 4;
+pub const CAP_ALL: u32 = CAP_IOPORT | CAP_MAP_PHYS | CAP_IRQ | CAP_TASK_MGMT | CAP_PHYS_ALLOC;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TaskState {
     Ready,
@@ -25,6 +33,8 @@ pub struct Task {
     pub kernel_stack_base: *mut u8,
     pub kernel_stack_size: usize,
     pub priority: u8,
+    pub cr3: usize,
+    pub caps: u32,
 }
 
 unsafe impl Send for Task {}
@@ -76,6 +86,8 @@ impl Task {
             kernel_stack_base: stack_base,
             kernel_stack_size: KERNEL_STACK_SIZE,
             priority: 0,
+            cr3: crate::paging::read_cr3(),
+            caps: 0,
         }
     }
 
@@ -95,6 +107,6 @@ impl Task {
 
 /// Trampoline that runs when a task function returns.
 /// Marks the task as dead and yields to the scheduler.
-fn task_exit_trampoline() {
+pub fn task_exit_trampoline() {
     crate::scheduler::exit();
 }

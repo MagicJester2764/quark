@@ -65,6 +65,11 @@ impl PageTableEntry {
     pub fn raw(&self) -> u64 {
         self.0
     }
+
+    /// Return only the flag bits (low 12 bits + NX), excluding the address.
+    pub fn flags(&self) -> u64 {
+        self.0 & !ADDR_MASK
+    }
 }
 
 /// A page table: 512 entries, 4 KiB aligned.
@@ -80,6 +85,20 @@ impl PageTable {
             e.clear();
         }
     }
+}
+
+static mut KERNEL_CR3: usize = 0;
+
+/// Save the kernel's CR3 during boot. Must be called before creating
+/// any user address spaces so `create_address_space` can always copy
+/// from the kernel's clean page tables.
+pub fn save_kernel_cr3() {
+    unsafe { KERNEL_CR3 = read_cr3(); }
+}
+
+/// Return the kernel's CR3 (saved during boot).
+pub fn kernel_cr3() -> usize {
+    unsafe { KERNEL_CR3 }
 }
 
 /// Read the current CR3 value (physical address of PML4).
@@ -137,8 +156,12 @@ fn alloc_table() -> Result<usize, PagingError> {
 /// Map a 4 KiB virtual page to a physical frame.
 ///
 /// Walks the 4-level page table hierarchy, allocating intermediate tables
-/// as needed. Returns an error if a 2 MiB huge page is encountered in the
-/// page directory level (the first 4 GiB is huge-page mapped by boot.s).
+/// as needed. If a 2 MiB huge page is encountered at the PD level, it is
+/// split into 512 individual 4 KiB pages preserving the original mapping.
+/// 1 GiB huge pages at the PDPT level are not split (returns error).
+///
+/// When the requested flags include USER, intermediate entries are promoted
+/// to include USER so user-mode page walks succeed.
 ///
 /// # Safety
 /// `pml4_phys` must point to a valid, identity-mapped PML4 table.
@@ -149,12 +172,15 @@ pub unsafe fn map_page(
     flags: u64,
 ) -> Result<(), PagingError> {
     let (pml4i, pdpti, pdi, pti) = table_indices(virt_addr);
+    let user = flags & USER;
 
     // Level 4: PML4
     let pml4 = table_at(pml4_phys);
     if !pml4.entries[pml4i].is_present() {
         let new_table = alloc_table()?;
-        pml4.entries[pml4i].set(new_table, PRESENT | WRITABLE);
+        pml4.entries[pml4i].set(new_table, PRESENT | WRITABLE | user);
+    } else if user != 0 && pml4.entries[pml4i].raw() & USER == 0 {
+        pml4.entries[pml4i] = PageTableEntry(pml4.entries[pml4i].raw() | USER);
     }
 
     // Level 3: PDPT
@@ -165,18 +191,30 @@ pub unsafe fn map_page(
     }
     if !pdpt.entries[pdpti].is_present() {
         let new_table = alloc_table()?;
-        pdpt.entries[pdpti].set(new_table, PRESENT | WRITABLE);
+        pdpt.entries[pdpti].set(new_table, PRESENT | WRITABLE | user);
+    } else if user != 0 && pdpt.entries[pdpti].raw() & USER == 0 {
+        pdpt.entries[pdpti] = PageTableEntry(pdpt.entries[pdpti].raw() | USER);
     }
 
     // Level 2: PD
     let pd_phys = pdpt.entries[pdpti].frame_address();
     let pd = table_at(pd_phys);
     if pd.entries[pdi].is_present() && pd.entries[pdi].is_huge() {
-        return Err(PagingError::HugePageConflict);
+        // Split 2 MiB huge page into 512 × 4 KiB pages preserving the mapping
+        let huge_phys = pd.entries[pdi].frame_address();
+        let huge_flags = pd.entries[pdi].raw() & !ADDR_MASK & !HUGE_PAGE;
+        let new_pt = alloc_table()?;
+        let pt = table_at(new_pt);
+        for j in 0..512 {
+            pt.entries[j].set(huge_phys + j * PAGE_SIZE, huge_flags);
+        }
+        pd.entries[pdi].set(new_pt, PRESENT | WRITABLE | user);
     }
     if !pd.entries[pdi].is_present() {
         let new_table = alloc_table()?;
-        pd.entries[pdi].set(new_table, PRESENT | WRITABLE);
+        pd.entries[pdi].set(new_table, PRESENT | WRITABLE | user);
+    } else if user != 0 && pd.entries[pdi].raw() & USER == 0 {
+        pd.entries[pdi] = PageTableEntry(pd.entries[pdi].raw() | USER);
     }
 
     // Level 1: PT

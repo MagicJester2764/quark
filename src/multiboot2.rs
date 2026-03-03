@@ -245,14 +245,15 @@ pub unsafe fn parse_framebuffer(info_addr: usize) -> Option<FramebufferInfo> {
             let bpp = *data.add(20);
             let fb_type = *data.add(21);
 
+            // Color info starts at data+23 (tag+31) — reserved field is u8, not u16
             let (red_pos, red_mask, green_pos, green_mask, blue_pos, blue_mask) = if fb_type == 1 {
                 (
+                    *data.add(23),
                     *data.add(24),
                     *data.add(25),
                     *data.add(26),
                     *data.add(27),
                     *data.add(28),
-                    *data.add(29),
                 )
             } else {
                 (0, 0, 0, 0, 0, 0)

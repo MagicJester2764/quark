@@ -26,6 +26,15 @@ pub const SYS_IRQ_ACK: u64 = 31;
 pub const SYS_IOPORT: u64 = 32;
 pub const SYS_MAP_PHYS: u64 = 33;
 
+pub const SYS_TASK_CREATE: u64 = 40;
+pub const SYS_ADDRSPACE_CREATE: u64 = 41;
+pub const SYS_ADDRSPACE_MAP: u64 = 42;
+pub const SYS_TASK_START: u64 = 43;
+pub const SYS_PHYS_ALLOC: u64 = 44;
+pub const SYS_PHYS_FREE: u64 = 45;
+pub const SYS_GRANT_IOPORT: u64 = 46;
+pub const SYS_GRANT_IRQ: u64 = 47;
+
 const SFMASK_VALUE: u64 = (1 << 9) | (1 << 10); // clear IF | DF
 
 fn read_msr(msr: u32) -> u64 {
@@ -82,10 +91,23 @@ pub unsafe fn init() {
     console::puts(b"Syscall/sysret initialized.\n");
 }
 
-/// Called from assembly. Receives the syscall frame on the stack.
-/// Layout: rax, rdi, rsi, rdx, r10, r8 (pushed in that order, so rax is at top).
+const USER_ADDR_LIMIT: u64 = 0x0000_8000_0000_0000;
+
+/// Validate that a user pointer range is entirely in user space.
+fn validate_user_ptr(addr: u64, len: u64) -> bool {
+    addr < USER_ADDR_LIMIT && len <= USER_ADDR_LIMIT && addr + len <= USER_ADDR_LIMIT
+}
+
+/// Called from assembly with 6 args mapped from user registers.
 #[no_mangle]
-extern "C" fn syscall_dispatch(nr: u64, arg0: u64, arg1: u64, arg2: u64) -> u64 {
+extern "C" fn syscall_dispatch(
+    nr: u64,
+    arg0: u64,
+    arg1: u64,
+    arg2: u64,
+    arg3: u64,
+    arg4: u64,
+) -> u64 {
     match nr {
         SYS_EXIT => scheduler::exit(),
         SYS_YIELD => {
@@ -95,9 +117,11 @@ extern "C" fn syscall_dispatch(nr: u64, arg0: u64, arg1: u64, arg2: u64) -> u64 
         SYS_WRITE => {
             let ptr = arg0 as *const u8;
             let len = arg1 as usize;
-            if len > 0 && !ptr.is_null() {
+            if len > 0 && !ptr.is_null() && validate_user_ptr(arg0, arg1) {
                 let slice = unsafe { core::slice::from_raw_parts(ptr, len) };
                 console::puts(slice);
+            } else if !validate_user_ptr(arg0, arg1) {
+                return u64::MAX;
             }
             len as u64
         }
@@ -105,7 +129,8 @@ extern "C" fn syscall_dispatch(nr: u64, arg0: u64, arg1: u64, arg2: u64) -> u64 
         SYS_SEND => {
             let dest = arg0 as usize;
             let msg_ptr = arg1 as *const crate::ipc::Message;
-            if msg_ptr.is_null() { return u64::MAX; }
+            let msg_size = core::mem::size_of::<crate::ipc::Message>() as u64;
+            if msg_ptr.is_null() || !validate_user_ptr(arg1, msg_size) { return u64::MAX; }
             let msg = unsafe { &*msg_ptr };
             match crate::ipc::sys_send(dest, msg) {
                 Ok(()) => 0,
@@ -115,7 +140,8 @@ extern "C" fn syscall_dispatch(nr: u64, arg0: u64, arg1: u64, arg2: u64) -> u64 
         SYS_RECV => {
             let from = arg0 as usize;
             let msg_ptr = arg1 as *mut crate::ipc::Message;
-            if msg_ptr.is_null() { return u64::MAX; }
+            let msg_size = core::mem::size_of::<crate::ipc::Message>() as u64;
+            if msg_ptr.is_null() || !validate_user_ptr(arg1, msg_size) { return u64::MAX; }
             match crate::ipc::sys_recv(from) {
                 Ok(msg) => { unsafe { *msg_ptr = msg }; 0 }
                 Err(_) => u64::MAX,
@@ -125,7 +151,10 @@ extern "C" fn syscall_dispatch(nr: u64, arg0: u64, arg1: u64, arg2: u64) -> u64 
             let dest = arg0 as usize;
             let msg_ptr = arg1 as *const crate::ipc::Message;
             let reply_ptr = arg2 as *mut crate::ipc::Message;
-            if msg_ptr.is_null() || reply_ptr.is_null() { return u64::MAX; }
+            let msg_size = core::mem::size_of::<crate::ipc::Message>() as u64;
+            if msg_ptr.is_null() || reply_ptr.is_null()
+                || !validate_user_ptr(arg1, msg_size)
+                || !validate_user_ptr(arg2, msg_size) { return u64::MAX; }
             let msg = unsafe { &*msg_ptr };
             match crate::ipc::sys_call(dest, msg) {
                 Ok(reply) => { unsafe { *reply_ptr = reply }; 0 }
@@ -135,7 +164,8 @@ extern "C" fn syscall_dispatch(nr: u64, arg0: u64, arg1: u64, arg2: u64) -> u64 
         SYS_REPLY => {
             let dest = arg0 as usize;
             let msg_ptr = arg1 as *const crate::ipc::Message;
-            if msg_ptr.is_null() { return u64::MAX; }
+            let msg_size = core::mem::size_of::<crate::ipc::Message>() as u64;
+            if msg_ptr.is_null() || !validate_user_ptr(arg1, msg_size) { return u64::MAX; }
             let msg = unsafe { &*msg_ptr };
             match crate::ipc::sys_reply(dest, msg) {
                 Ok(()) => 0,
@@ -143,7 +173,9 @@ extern "C" fn syscall_dispatch(nr: u64, arg0: u64, arg1: u64, arg2: u64) -> u64 
             }
         }
         SYS_IRQ_REGISTER => {
-            // arg0 = IRQ number
+            if !scheduler::current_task_has_cap(crate::task::CAP_IRQ) {
+                return u64::MAX;
+            }
             let irq = arg0 as u8;
             let tid = scheduler::current_tid();
             crate::irq_dispatch::register_irq_handler(irq, tid);
@@ -156,7 +188,9 @@ extern "C" fn syscall_dispatch(nr: u64, arg0: u64, arg1: u64, arg2: u64) -> u64 
             0
         }
         SYS_IOPORT => {
-            // arg0 = port, arg1 = 0 for read / 1 for write, arg2 = value (for write)
+            if !scheduler::current_task_has_cap(crate::task::CAP_IOPORT) {
+                return u64::MAX;
+            }
             let port = arg0 as u16;
             let is_write = arg1;
             if is_write != 0 {
@@ -167,7 +201,9 @@ extern "C" fn syscall_dispatch(nr: u64, arg0: u64, arg1: u64, arg2: u64) -> u64 
             }
         }
         SYS_MAP_PHYS => {
-            // arg0 = phys addr, arg1 = virt addr, arg2 = num pages
+            if !scheduler::current_task_has_cap(crate::task::CAP_MAP_PHYS) {
+                return u64::MAX;
+            }
             let phys = arg0 as usize;
             let virt = arg1 as usize;
             let pages = arg2 as usize;
@@ -182,6 +218,124 @@ extern "C" fn syscall_dispatch(nr: u64, arg0: u64, arg1: u64, arg2: u64) -> u64 
             }
             0
         }
+        SYS_TASK_CREATE => {
+            if !scheduler::current_task_has_cap(crate::task::CAP_TASK_MGMT) {
+                return u64::MAX;
+            }
+            match scheduler::create_empty_task() {
+                Some(tid) => tid as u64,
+                None => u64::MAX,
+            }
+        }
+        SYS_ADDRSPACE_CREATE => {
+            if !scheduler::current_task_has_cap(crate::task::CAP_TASK_MGMT) {
+                return u64::MAX;
+            }
+            match crate::userspace::create_address_space() {
+                Some(cr3) => cr3 as u64,
+                None => u64::MAX,
+            }
+        }
+        SYS_ADDRSPACE_MAP => {
+            // arg0=cr3, arg1=virt, arg2=phys, arg3=pages, arg4=flags
+            if !scheduler::current_task_has_cap(crate::task::CAP_TASK_MGMT) {
+                return u64::MAX;
+            }
+            let cr3 = arg0 as usize;
+            let virt = arg1 as usize;
+            let phys = arg2 as usize;
+            let pages = arg3 as usize;
+            let flags = arg4;
+            let pte_flags = paging::PRESENT | paging::USER
+                | if flags & 1 != 0 { paging::WRITABLE } else { 0 };
+            for i in 0..pages {
+                let v = virt + i * 4096;
+                let p = phys + i * 4096;
+                if unsafe { paging::map_page(cr3, v, p, pte_flags) }.is_err() {
+                    return u64::MAX;
+                }
+            }
+            0
+        }
+        SYS_TASK_START => {
+            // arg0=tid, arg1=rip, arg2=rsp, arg3=cr3
+            if !scheduler::current_task_has_cap(crate::task::CAP_TASK_MGMT) {
+                return u64::MAX;
+            }
+            let tid = arg0 as usize;
+            let rip = arg1;
+            let rsp = arg2;
+            let cr3 = arg3 as usize;
+            match scheduler::start_task(tid, rip, rsp, cr3) {
+                Ok(()) => 0,
+                Err(()) => u64::MAX,
+            }
+        }
+        SYS_PHYS_ALLOC => {
+            // arg0 = number of contiguous pages to allocate
+            if !scheduler::current_task_has_cap(crate::task::CAP_PHYS_ALLOC) {
+                return u64::MAX;
+            }
+            let count = arg0 as usize;
+            if count == 0 {
+                return u64::MAX;
+            }
+            // For simplicity, allocate pages one at a time and return the first
+            // (Only single-page alloc is reliable with bitmap allocator)
+            if count == 1 {
+                match crate::pmm::alloc() {
+                    Some(frame) => frame.address() as u64,
+                    None => u64::MAX,
+                }
+            } else {
+                // Allocate count pages, return first address
+                // Caller must accept they may not be contiguous
+                let first = match crate::pmm::alloc() {
+                    Some(frame) => frame.address(),
+                    None => return u64::MAX,
+                };
+                for _ in 1..count {
+                    if crate::pmm::alloc().is_none() {
+                        return u64::MAX;
+                    }
+                }
+                first as u64
+            }
+        }
+        SYS_PHYS_FREE => {
+            // arg0 = phys addr, arg1 = count
+            if !scheduler::current_task_has_cap(crate::task::CAP_PHYS_ALLOC) {
+                return u64::MAX;
+            }
+            let addr = arg0 as usize;
+            let count = arg1 as usize;
+            for i in 0..count {
+                crate::pmm::free(crate::pmm::PhysFrame::from_address(addr + i * 4096));
+            }
+            0
+        }
+        SYS_GRANT_IOPORT => {
+            // arg0 = tid to grant CAP_IOPORT
+            if !scheduler::current_task_has_cap(crate::task::CAP_TASK_MGMT) {
+                return u64::MAX;
+            }
+            let tid = arg0 as usize;
+            match scheduler::grant_cap(tid, crate::task::CAP_IOPORT) {
+                Ok(()) => 0,
+                Err(()) => u64::MAX,
+            }
+        }
+        SYS_GRANT_IRQ => {
+            // arg0 = tid, arg1 = irq
+            if !scheduler::current_task_has_cap(crate::task::CAP_TASK_MGMT) {
+                return u64::MAX;
+            }
+            let tid = arg0 as usize;
+            match scheduler::grant_cap(tid, crate::task::CAP_IRQ) {
+                Ok(()) => 0,
+                Err(()) => u64::MAX,
+            }
+        }
         _ => u64::MAX,
     }
 }
@@ -194,8 +348,11 @@ extern "C" fn syscall_dispatch(nr: u64, arg0: u64, arg1: u64, arg2: u64) -> u64 
 // We use swapgs to access per-CPU data at %gs:0 (user RSP scratch)
 // and %gs:8 (kernel RSP).
 //
-// After saving user context, we shuffle registers to match the C ABI
-// for syscall_dispatch(nr, arg0, arg1, arg2), then sysret back.
+// After saving user context, we shuffle registers to match the C ABI for
+// syscall_dispatch(nr, arg0, arg1, arg2, arg3, arg4), then sysret back.
+//
+// User convention: RAX=nr, RDI=arg0, RSI=arg1, RDX=arg2, R10=arg3, R8=arg4
+// C ABI:          RDI=nr, RSI=arg0, RDX=arg1, RCX=arg2, R8=arg3,  R9=arg4
 core::arch::global_asm!(
     ".global syscall_entry",
     "syscall_entry:",
@@ -222,8 +379,11 @@ core::arch::global_asm!(
 
     "    sti",                          // enable interrupts in kernel
 
-    // Set up C ABI: syscall_dispatch(nr=rdi, arg0=rsi, arg1=rdx, arg2=rcx)
-    // Current registers: rax=nr, rdi=arg0, rsi=arg1, rdx=arg2
+    // Set up 6-arg C ABI: syscall_dispatch(nr, arg0, arg1, arg2, arg3, arg4)
+    // User regs: rax=nr, rdi=arg0, rsi=arg1, rdx=arg2, r10=arg3, r8=arg4
+    // Shuffle order matters — move destinations that overlap sources last
+    "    movq %r8, %r9",               // arg4 → r9 (6th C arg) — before r8 overwrite
+    "    movq %r10, %r8",              // arg3 → r8 (5th C arg)
     "    movq %rdx, %rcx",             // arg2 → rcx (4th C arg)
     "    movq %rsi, %rdx",             // arg1 → rdx (3rd C arg)
     "    movq %rdi, %rsi",             // arg0 → rsi (2nd C arg)
@@ -274,6 +434,13 @@ pub unsafe fn setup_percpu(kernel_stack_top: u64) {
     PER_CPU.kernel_rsp = kernel_stack_top;
     let addr = &raw const PER_CPU as u64;
     write_msr(0xC000_0101, addr); // IA32_KERNEL_GS_BASE (for swapgs)
+}
+
+/// Update the kernel RSP in per-CPU data (used by scheduler on context switch).
+pub fn update_kernel_rsp(rsp: u64) {
+    unsafe {
+        PER_CPU.kernel_rsp = rsp;
+    }
 }
 
 /// Enter user mode via iretq.

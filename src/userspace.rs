@@ -3,7 +3,7 @@
 /// Provides per-task address space creation, user page mapping,
 /// and user-mode task launching.
 
-use crate::{paging, pmm, scheduler, syscall};
+use crate::{elf, paging, pmm, scheduler, syscall};
 
 const PAGE_SIZE: usize = 4096;
 
@@ -11,7 +11,7 @@ const PAGE_SIZE: usize = 4096;
 /// User code/data lives in the lower half (below 0x0000_8000_0000_0000).
 pub const USER_STACK_TOP: u64 = 0x0000_7FFF_FFFF_F000;
 pub const USER_STACK_PAGES: usize = 4; // 16 KiB user stack
-pub const USER_CODE_BASE: u64 = 0x0000_0000_0040_0000; // 4 MiB
+pub const USER_CODE_BASE: u64 = 0x0000_0080_0000_0000; // 512 GiB (PML4[1])
 
 /// Create a new user address space.
 ///
@@ -28,20 +28,46 @@ pub fn create_address_space() -> Option<usize> {
         core::ptr::write_bytes(new_pml4_phys as *mut u8, 0, PAGE_SIZE);
     }
 
-    let current_pml4_phys = paging::read_cr3();
+    // Always copy from the kernel's page tables (not the current user's)
+    // so new address spaces get a clean identity mapping without any
+    // user-space page table entries from the caller.
+    let kernel_pml4_phys = paging::kernel_cr3();
 
     unsafe {
-        let current_pml4 = paging::table_at(current_pml4_phys);
+        let kernel_pml4 = paging::table_at(kernel_pml4_phys);
         let new_pml4 = paging::table_at(new_pml4_phys);
 
         // Copy kernel mappings (upper half: entries 256–511)
         for i in 256..512 {
-            new_pml4.entries[i] = current_pml4.entries[i];
+            new_pml4.entries[i] = kernel_pml4.entries[i];
         }
 
-        // Also copy entry 0 (identity-mapped first 4 GiB from boot)
-        // so kernel code can still access physical memory
-        new_pml4.entries[0] = current_pml4.entries[0];
+        // Deep-copy the PDPT for PML4[0] so user-space page tables
+        // (PDPT entries beyond the identity mapping) can be added
+        // per-address-space without modifying the kernel's shared PDPT.
+        // The PDs themselves are shared — user virtual addresses live
+        // above 4 GiB (PDPT[4+]) so the identity-mapped PDs (PDPT[0-3])
+        // are never modified.
+        if kernel_pml4.entries[0].is_present() {
+            let kernel_pdpt_phys = kernel_pml4.entries[0].frame_address();
+            let kernel_pdpt = paging::table_at(kernel_pdpt_phys);
+
+            let new_pdpt_phys = pmm::alloc()?.address();
+            core::ptr::write_bytes(new_pdpt_phys as *mut u8, 0, PAGE_SIZE);
+            let new_pdpt = paging::table_at(new_pdpt_phys);
+
+            // Copy identity mapping entries (shared PDs, no deep copy needed)
+            for i in 0..512 {
+                if kernel_pdpt.entries[i].is_present() {
+                    new_pdpt.entries[i] = kernel_pdpt.entries[i];
+                }
+            }
+
+            new_pml4.entries[0].set(
+                new_pdpt_phys,
+                kernel_pml4.entries[0].flags(),
+            );
+        }
     }
 
     Some(new_pml4_phys)
@@ -124,6 +150,7 @@ pub fn spawn_user_task(code: &[u8]) -> Option<usize> {
     // Patch the task to use the new address space and jump to usermode
     unsafe {
         let task = scheduler::get_task_mut(tid)?;
+        task.cr3 = pml4;
         task.context.rip = enter_user_trampoline as *const () as u64;
         // Store user entry and stack in callee-saved registers for the trampoline
         task.context.r12 = entry;
@@ -134,38 +161,110 @@ pub fn spawn_user_task(code: &[u8]) -> Option<usize> {
     Some(tid)
 }
 
-/// Trampoline that runs in kernel mode to set up and enter user mode.
-fn enter_user_trampoline() {
-    let entry: u64;
-    let stack: u64;
-    let pml4: u64;
-    unsafe {
-        core::arch::asm!(
-            "",
-            out("r12") entry,
-            out("r13") stack,
-            out("r14") pml4,
-            options(nomem, nostack)
-        );
-    }
+/// Naked trampoline stub: moves r12/r13/r14 into argument registers
+/// and calls enter_user_inner.
+#[unsafe(naked)]
+pub unsafe extern "C" fn enter_user_trampoline() {
+    core::arch::naked_asm!(
+        "mov rdi, r12",  // entry
+        "mov rsi, r13",  // stack
+        "mov rdx, r14",  // pml4
+        "call {inner}",
+        inner = sym enter_user_inner,
+    );
+}
 
+/// Inner function called by the trampoline with proper C ABI args.
+fn enter_user_inner(entry: u64, stack: u64, pml4: u64) {
     // Switch to the user's address space
     unsafe {
         paging::write_cr3(pml4 as usize);
     }
 
-    // Set up per-CPU kernel stack for syscall re-entry
-    // Use the current kernel RSP as the kernel stack
+    // Set up per-CPU kernel stack for syscall re-entry and TSS RSP0
+    // for hardware exception handling from ring 3
     let kernel_rsp: u64;
     unsafe {
         core::arch::asm!("mov {}, rsp", out(reg) kernel_rsp, options(nomem, nostack));
         syscall::setup_percpu(kernel_rsp);
+        crate::idt::update_tss_rsp0(kernel_rsp);
     }
 
     // Enter user mode
     unsafe {
         syscall::enter_usermode(entry, stack);
     }
+}
+
+/// Boot info page layout at 0x200000 in init's address space.
+/// Contains information about boot modules so init can load them.
+#[repr(C)]
+pub struct BootInfo {
+    pub module_count: u64,
+    pub modules: [BootModuleDesc; 32],
+}
+
+/// Descriptor for a single boot module.
+#[repr(C)]
+pub struct BootModuleDesc {
+    pub phys_start: u64,
+    pub phys_end: u64,
+    pub name: [u8; 48],
+}
+
+/// Boot info page address in user space (above 4 GiB identity mapping).
+pub const BOOT_INFO_ADDR: usize = 0x80_4000_0000;
+
+/// Spawn the init process from ELF data (bootstrap only).
+///
+/// Loads the ELF, creates a task with CAP_ALL, and maps a boot info page
+/// at BOOT_INFO_ADDR containing module descriptors.
+pub fn spawn_init(elf_data: &[u8]) -> Option<usize> {
+    let (pml4, entry, stack_top) = elf::load_elf(elf_data).ok()?;
+
+    // Spawn a kernel task that will transition to user mode
+    let tid = scheduler::spawn(idle_stub);
+
+    // Patch the task
+    unsafe {
+        let task = scheduler::get_task_mut(tid)?;
+        task.cr3 = pml4;
+        task.caps = crate::task::CAP_ALL;
+        task.context.rip = enter_user_trampoline as *const () as u64;
+        task.context.r12 = entry;
+        task.context.r13 = stack_top;
+        task.context.r14 = pml4 as u64;
+    }
+
+    // Map boot info page at BOOT_INFO_ADDR
+    let info_frame = pmm::alloc()?;
+    map_user_page(pml4, BOOT_INFO_ADDR, info_frame.address(), true).ok()?;
+
+    // Fill in boot info
+    unsafe {
+        let info = info_frame.address() as *mut BootInfo;
+        core::ptr::write_bytes(info, 0, 1);
+
+        let mod_count = crate::modules::count();
+        (*info).module_count = mod_count as u64;
+
+        for i in 0..mod_count.min(32) {
+            if let Some(m) = crate::modules::get(i) {
+                (*info).modules[i].phys_start = m.start as u64;
+                (*info).modules[i].phys_end = m.end as u64;
+                // Copy module name
+                let name_len = m.name.iter().position(|&b| b == 0).unwrap_or(m.name.len());
+                let copy_len = name_len.min(48);
+                core::ptr::copy_nonoverlapping(
+                    m.name.as_ptr(),
+                    (*info).modules[i].name.as_mut_ptr(),
+                    copy_len,
+                );
+            }
+        }
+    }
+
+    Some(tid)
 }
 
 fn idle_stub() {

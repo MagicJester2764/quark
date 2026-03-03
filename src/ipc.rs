@@ -120,10 +120,26 @@ pub fn sys_recv(from: usize) -> Result<Message, IpcError> {
             }
         }
 
+        // Before blocking, check for pending IRQ messages
+        // (from=0 means kernel, TID_ANY matches any)
+        if from == 0 || from == TID_ANY {
+            if let Some(msg) = crate::irq_dispatch::poll_irq_message(receiver) {
+                return Ok(msg);
+            }
+        }
+
         // No sender ready — block receiver
         TASK_IPC[receiver].state = IpcState::RecvBlocked(from);
         scheduler::block_task(receiver);
         scheduler::yield_now();
+
+        // When we wake up, check IRQ messages first (may have been unblocked by IRQ)
+        if from == 0 || from == TID_ANY {
+            if let Some(msg) = crate::irq_dispatch::poll_irq_message(receiver) {
+                TASK_IPC[receiver].state = IpcState::None;
+                return Ok(msg);
+            }
+        }
 
         // When we wake up, message was delivered to our pending slot
         let msg = TASK_IPC[receiver].pending_msg.take().unwrap();

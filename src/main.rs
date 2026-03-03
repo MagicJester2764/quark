@@ -6,30 +6,23 @@ extern crate alloc;
 
 mod console;
 mod context;
-#[allow(dead_code)]
 mod fat32;
 mod heap;
 mod idt;
 mod io;
 pub mod ipc;
 pub mod irq_dispatch;
-#[allow(dead_code)]
 mod modules;
 mod multiboot2;
-pub mod nameserver;
-#[allow(dead_code)]
 pub mod paging;
 mod pic;
 mod pit;
-#[allow(dead_code)]
 mod pmm;
 pub mod scheduler;
-mod syscall;
-#[allow(dead_code)]
+pub mod syscall;
 mod elf;
 mod services;
-mod task;
-#[allow(dead_code)]
+pub mod task;
 mod userspace;
 
 use core::panic::PanicInfo;
@@ -114,65 +107,41 @@ pub extern "C" fn kernel_main(multiboot_info: usize) -> ! {
     print_dec(pmm::free_count() * 4);
     console::puts(b" KiB)\n");
 
+    // Save kernel CR3 before any user address spaces are created
+    paging::save_kernel_cr3();
+
     // Initialize syscall/sysret mechanism
     unsafe { syscall::init() };
 
-    // Initialize scheduler and nameserver
+    // Initialize scheduler
     scheduler::init();
     console::puts(b"Scheduler initialized.\n");
 
-    nameserver::init();
-    console::puts(b"Nameserver started (TID ");
-    print_dec(nameserver::tid());
-    console::puts(b").\n");
-
-    scheduler::spawn(task_a);
-    scheduler::spawn(task_b);
-    scheduler::spawn(task_c);
-    console::puts(b"Spawned 3 test tasks.\n");
+    // Load init process from boot module named "init"
+    if let Some(m) = modules::find(b"init") {
+        let elf_data = unsafe { modules::data(m) };
+        console::puts(b"Loading init from module: ");
+        console::puts(modules::name_str(m));
+        console::puts(b"\n");
+        match userspace::spawn_init(elf_data) {
+            Some(tid) => {
+                console::puts(b"Init spawned (TID ");
+                print_dec(tid);
+                console::puts(b").\n");
+            }
+            None => {
+                console::puts(b"FATAL: Failed to load init!\n");
+            }
+        }
+    } else {
+        console::puts(b"No init module found.\n");
+    }
 
     // Idle loop — the scheduler returns here when no tasks are ready
     loop {
         unsafe { core::arch::asm!("hlt", options(nostack, nomem)) };
         scheduler::reap_dead();
     }
-}
-
-fn task_a() {
-    for i in 0..5u32 {
-        console::puts(b"[Task A] iteration ");
-        print_dec(i as usize);
-        console::puts(b"\n");
-        // Busy-wait a bit so we can see interleaving
-        for _ in 0..100_000 {
-            core::hint::spin_loop();
-        }
-    }
-    console::puts(b"[Task A] done.\n");
-}
-
-fn task_b() {
-    for i in 0..5u32 {
-        console::puts(b"[Task B] iteration ");
-        print_dec(i as usize);
-        console::puts(b"\n");
-        for _ in 0..100_000 {
-            core::hint::spin_loop();
-        }
-    }
-    console::puts(b"[Task B] done.\n");
-}
-
-fn task_c() {
-    for i in 0..5u32 {
-        console::puts(b"[Task C] iteration ");
-        print_dec(i as usize);
-        console::puts(b"\n");
-        for _ in 0..100_000 {
-            core::hint::spin_loop();
-        }
-    }
-    console::puts(b"[Task C] done.\n");
 }
 
 fn print_hex(val: usize) {
