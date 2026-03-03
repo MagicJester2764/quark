@@ -4,6 +4,7 @@
 mod console;
 #[allow(dead_code)]
 mod fat32;
+mod idt;
 #[allow(dead_code)]
 mod modules;
 mod multiboot2;
@@ -32,6 +33,7 @@ pub extern "C" fn kernel_main(multiboot_info: usize) -> ! {
     console::init(fb);
     console::clear();
     console::puts(b"Quark v0.1.0 - microkernel\n");
+    unsafe { idt::init() };
     console::puts(b"Booted successfully.\n");
 
     // Print boot modules

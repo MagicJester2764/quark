@@ -69,6 +69,17 @@ stack_bottom:
     .skip 65536         // 64 KiB kernel stack
 stack_top:
 
+.align 16
+ist1_stack_bottom:
+    .skip 16384         // 16 KiB double-fault stack
+.global ist1_stack_top
+ist1_stack_top:
+
+.align 16
+.global tss
+tss:
+    .skip 104           // x86-64 TSS, filled by Rust at runtime
+
 // ============================================================
 // 32-bit bootstrap (entered by multiboot2 bootloader)
 // ============================================================
@@ -143,7 +154,7 @@ _start:
     mov %eax, %cr0
 
     // Load 64-bit GDT
-    lgdt gdt64_ptr
+    lgdt gdt64_ptr32
 
     // Far jump to 64-bit code segment
     ljmp $0x08, $_start64
@@ -175,16 +186,24 @@ _start64:
     jmp 2b
 
 // ============================================================
-// GDT for 64-bit mode
+// GDT for 64-bit mode (writable for TSS descriptor patching)
 // ============================================================
-.section .rodata
+.section .data
 .align 16
+.global gdt64
 gdt64:
-    .quad 0x0000000000000000    // null descriptor
-    .quad 0x00AF9A000000FFFF    // code: 64-bit, present, ring 0, executable
-    .quad 0x00CF92000000FFFF    // data: present, ring 0, writable
+    .quad 0x0000000000000000    // [0x00] null
+    .quad 0x00AF9A000000FFFF    // [0x08] code64
+    .quad 0x00CF92000000FFFF    // [0x10] data64
+    .quad 0                     // [0x18] TSS low  (Rust fills)
+    .quad 0                     // [0x20] TSS high (Rust fills)
 gdt64_end:
 
-gdt64_ptr:
+gdt64_ptr32:                    // 32-bit boot lgdt (6 bytes: 2+4)
     .short gdt64_end - gdt64 - 1
     .long gdt64
+
+.global gdt64_ptr
+gdt64_ptr:                      // 64-bit lgdt from Rust (10 bytes: 2+8)
+    .short gdt64_end - gdt64 - 1
+    .quad gdt64
