@@ -5,8 +5,13 @@ use libquark::syscall;
 
 const PAGE_SIZE: usize = 4096;
 const BOOT_INFO_ADDR: usize = 0x80_4000_0000;
+const FILE_BUF_BASE: usize = 0x82_0000_0000;
+const ROOTFS_BASE: usize = 0x85_0000_0000;
 
-/// Boot info page layout — matches kernel's BootInfo struct.
+// ---------------------------------------------------------------------------
+// Boot info structures (matches kernel's BootInfo)
+// ---------------------------------------------------------------------------
+
 #[repr(C)]
 struct BootInfo {
     module_count: u64,
@@ -20,7 +25,10 @@ struct BootModuleDesc {
     name: [u8; 48],
 }
 
-/// ELF64 header (minimal fields we need).
+// ---------------------------------------------------------------------------
+// ELF64 structures
+// ---------------------------------------------------------------------------
+
 #[repr(C, packed)]
 struct Elf64Header {
     e_ident: [u8; 16],
@@ -51,97 +59,178 @@ struct Elf64Phdr {
 const PT_LOAD: u32 = 1;
 const ELF_MAGIC: [u8; 4] = [0x7F, b'E', b'L', b'F'];
 
-#[unsafe(no_mangle)]
-#[link_section = ".text.entry"]
-pub extern "C" fn _start() -> ! {
-    syscall::sys_write(b"[init] Starting init process.\n");
+// ---------------------------------------------------------------------------
+// Minimal FAT32 reader (read-only, root directory only)
+// ---------------------------------------------------------------------------
 
-    let info = unsafe { &*(BOOT_INFO_ADDR as *const BootInfo) };
-    let mod_count = info.module_count as usize;
+struct Bpb {
+    bytes_per_sector: u32,
+    sectors_per_cluster: u32,
+    reserved_sectors: u32,
+    num_fats: u32,
+    fat_size_32: u32,
+    root_cluster: u32,
+}
 
-    syscall::sys_write(b"[init] Boot modules: ");
-    print_dec(mod_count);
-    syscall::sys_write(b"\n");
-
-    // Pass 1: Spawn nameserver first so it gets a well-known TID (2)
-    for i in 0..mod_count {
-        let m = &info.modules[i];
-        let name = module_name(&m.name);
-        if starts_with(name, b"nameserver") {
-            try_spawn(m, name);
-            break;
-        }
-    }
-
-    // Pass 2: Spawn remaining modules (skip init and nameserver)
-    for i in 0..mod_count {
-        let m = &info.modules[i];
-        let name = module_name(&m.name);
-
-        if starts_with(name, b"init") || starts_with(name, b"nameserver") {
-            continue;
-        }
-
-        try_spawn(m, name);
-    }
-
-    syscall::sys_write(b"[init] All modules loaded. Entering idle loop.\n");
-
-    // Idle yield loop
-    loop {
-        syscall::sys_yield();
+fn parse_bpb(data: &[u8]) -> Bpb {
+    Bpb {
+        bytes_per_sector: read_u16(data, 11) as u32,
+        sectors_per_cluster: data[13] as u32,
+        reserved_sectors: read_u16(data, 14) as u32,
+        num_fats: data[16] as u32,
+        fat_size_32: read_u32(data, 36),
+        root_cluster: read_u32(data, 44),
     }
 }
 
-/// Check if a module is a valid ELF, spawn it, and grant capabilities as needed.
-fn try_spawn(m: &BootModuleDesc, name: &[u8]) {
-    let phys_start = m.phys_start as usize;
-    let mod_size = (m.phys_end - m.phys_start) as usize;
-    if mod_size < 4 {
-        return;
+fn read_u16(data: &[u8], off: usize) -> u16 {
+    u16::from_le_bytes([data[off], data[off + 1]])
+}
+
+fn read_u32(data: &[u8], off: usize) -> u32 {
+    u32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]])
+}
+
+fn fat_offset(bpb: &Bpb) -> usize {
+    (bpb.reserved_sectors * bpb.bytes_per_sector) as usize
+}
+
+fn data_region_offset(bpb: &Bpb) -> usize {
+    ((bpb.reserved_sectors + bpb.num_fats * bpb.fat_size_32) * bpb.bytes_per_sector) as usize
+}
+
+fn cluster_data_offset(bpb: &Bpb, cluster: u32) -> usize {
+    data_region_offset(bpb)
+        + ((cluster - 2) as usize)
+            * (bpb.sectors_per_cluster * bpb.bytes_per_sector) as usize
+}
+
+fn fat_next(rootfs: &[u8], bpb: &Bpb, cluster: u32) -> Option<u32> {
+    let off = fat_offset(bpb) + (cluster as usize) * 4;
+    let next = read_u32(rootfs, off) & 0x0FFF_FFFF;
+    if next >= 0x0FFF_FFF8 {
+        None
+    } else {
+        Some(next)
     }
-    // Quick ELF magic check via first 4 bytes mapped temporarily
-    let temp_check: usize = 0x81_0000_0000;
-    if syscall::sys_map_phys(phys_start, temp_check, 1).is_err() {
-        return;
-    }
-    let magic = unsafe { core::slice::from_raw_parts(temp_check as *const u8, 4) };
-    if magic != ELF_MAGIC {
-        return;
+}
+
+const MAX_DIR_ENTRIES: usize = 32;
+
+struct RootDirEntry {
+    name: [u8; 11],
+    first_cluster: u32,
+    file_size: u32,
+}
+
+fn scan_root_dir(rootfs: &[u8], bpb: &Bpb) -> ([RootDirEntry; MAX_DIR_ENTRIES], usize) {
+    let mut entries: [RootDirEntry; MAX_DIR_ENTRIES] = unsafe { core::mem::zeroed() };
+    let mut count = 0;
+    let cluster_bytes = (bpb.sectors_per_cluster * bpb.bytes_per_sector) as usize;
+    let mut cluster = bpb.root_cluster;
+
+    loop {
+        let base = cluster_data_offset(bpb, cluster);
+        let num_entries = cluster_bytes / 32;
+
+        for i in 0..num_entries {
+            if count >= MAX_DIR_ENTRIES {
+                return (entries, count);
+            }
+
+            let off = base + i * 32;
+            let first_byte = rootfs[off];
+
+            // End of directory
+            if first_byte == 0x00 {
+                return (entries, count);
+            }
+            // Deleted entry
+            if first_byte == 0xE5 {
+                continue;
+            }
+
+            let attr = rootfs[off + 11];
+            if attr & 0x0F == 0x0F { continue; } // LFN
+            if attr & 0x08 != 0 { continue; }     // volume label
+            if attr & 0x10 != 0 { continue; }     // subdirectory
+
+            let mut name = [0u8; 11];
+            name.copy_from_slice(&rootfs[off..off + 11]);
+
+            let cluster_hi = read_u16(rootfs, off + 20) as u32;
+            let cluster_lo = read_u16(rootfs, off + 26) as u32;
+
+            entries[count] = RootDirEntry {
+                name,
+                first_cluster: (cluster_hi << 16) | cluster_lo,
+                file_size: read_u32(rootfs, off + 28),
+            };
+            count += 1;
+        }
+
+        match fat_next(rootfs, bpb, cluster) {
+            Some(next) => cluster = next,
+            None => break,
+        }
     }
 
-    syscall::sys_write(b"[init] Loading module: ");
-    syscall::sys_write(name);
-    syscall::sys_write(b"\n");
+    (entries, count)
+}
 
-    match spawn_module(m) {
-        Ok(tid) => {
-            // Grant I/O port and IRQ capabilities to keyboard driver
-            if starts_with(name, b"keyboard") {
-                let _ = syscall::sys_grant_ioport(tid);
-                let _ = syscall::sys_grant_irq(tid, 1);
+// ---------------------------------------------------------------------------
+// File reading: assemble file data from cluster chain into contiguous buffer
+// ---------------------------------------------------------------------------
+
+fn read_file_to_buffer<'a>(
+    rootfs: &[u8],
+    bpb: &Bpb,
+    first_cluster: u32,
+    file_size: u32,
+) -> Result<&'a [u8], ()> {
+    let size = file_size as usize;
+    let pages_needed = (size + PAGE_SIZE - 1) / PAGE_SIZE;
+
+    // Allocate physical pages and map at FILE_BUF_BASE
+    for p in 0..pages_needed {
+        let frame = syscall::sys_phys_alloc(1)?;
+        syscall::sys_map_phys(frame, FILE_BUF_BASE + p * PAGE_SIZE, 1)?;
+    }
+
+    let cluster_bytes = (bpb.sectors_per_cluster * bpb.bytes_per_sector) as usize;
+    let mut cluster = first_cluster;
+    let mut copied = 0usize;
+
+    while copied < size {
+        let src_off = cluster_data_offset(bpb, cluster);
+        let chunk = cluster_bytes.min(size - copied);
+
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                rootfs.as_ptr().add(src_off),
+                (FILE_BUF_BASE + copied) as *mut u8,
+                chunk,
+            );
+        }
+
+        copied += chunk;
+
+        if copied < size {
+            match fat_next(rootfs, bpb, cluster) {
+                Some(next) => cluster = next,
+                None => break,
             }
         }
-        Err(()) => {
-            syscall::sys_write(b"[init]   FAILED to spawn module.\n");
-        }
     }
+
+    Ok(unsafe { core::slice::from_raw_parts(FILE_BUF_BASE as *const u8, size) })
 }
 
-/// Spawn a user-space task from an ELF boot module.
-fn spawn_module(m: &BootModuleDesc) -> Result<usize, ()> {
-    let phys_start = m.phys_start as usize;
-    let phys_end = m.phys_end as usize;
-    let mod_size = phys_end - phys_start;
-    let mod_pages = (mod_size + PAGE_SIZE - 1) / PAGE_SIZE;
+// ---------------------------------------------------------------------------
+// ELF spawning (takes pre-mapped byte slice)
+// ---------------------------------------------------------------------------
 
-    // Map the module's physical pages into init's address space temporarily
-    // Use an address above 4 GiB so it doesn't conflict with identity mapping
-    let temp_base: usize = 0x82_0000_0000;
-    syscall::sys_map_phys(phys_start, temp_base, mod_pages)?;
-
-    let elf_data = unsafe { core::slice::from_raw_parts(temp_base as *const u8, mod_size) };
-
+fn spawn_elf(elf_data: &[u8]) -> Result<usize, ()> {
     // Validate ELF magic
     if elf_data.len() < 64 || elf_data[0..4] != ELF_MAGIC {
         return Err(());
@@ -229,7 +318,6 @@ fn spawn_module(m: &BootModuleDesc) -> Result<usize, ()> {
     let stack_bottom = stack_top - stack_pages * PAGE_SIZE;
     for p in 0..stack_pages {
         let frame = syscall::sys_phys_alloc(1)?;
-        // Zero the stack frame
         let temp_page: usize = 0x84_0000_0000 + p * PAGE_SIZE;
         syscall::sys_map_phys(frame, temp_page, 1)?;
         unsafe {
@@ -241,12 +329,130 @@ fn spawn_module(m: &BootModuleDesc) -> Result<usize, ()> {
     // Start the task
     syscall::sys_task_start(tid, entry, stack_top as u64, cr3)?;
 
-    syscall::sys_write(b"[init]   Spawned TID ");
-    print_dec(tid);
-    syscall::sys_write(b"\n");
-
     Ok(tid)
 }
+
+// ---------------------------------------------------------------------------
+// Rootfs loading
+// ---------------------------------------------------------------------------
+
+fn load_from_rootfs(rootfs_phys: usize, rootfs_size: usize) {
+    syscall::sys_write(b"[init] Mounting FAT32 rootfs\n");
+
+    // Map the entire rootfs image
+    let rootfs_pages = (rootfs_size + PAGE_SIZE - 1) / PAGE_SIZE;
+    if syscall::sys_map_phys(rootfs_phys, ROOTFS_BASE, rootfs_pages).is_err() {
+        syscall::sys_write(b"[init] Failed to map rootfs\n");
+        return;
+    }
+
+    let rootfs = unsafe { core::slice::from_raw_parts(ROOTFS_BASE as *const u8, rootfs_size) };
+    let bpb = parse_bpb(rootfs);
+    let (entries, count) = scan_root_dir(rootfs, &bpb);
+
+    syscall::sys_write(b"[init] Files on rootfs: ");
+    print_dec(count);
+    syscall::sys_write(b"\n");
+
+    // Pass 1: find and spawn NAMESRVR.ELF first (guarantees TID 2)
+    for i in 0..count {
+        let e = &entries[i];
+        if &e.name[0..8] == b"NAMESRVR" && &e.name[8..11] == b"ELF" {
+            syscall::sys_write(b"[init] Loading NAMESRVR.ELF\n");
+            if let Ok(data) = read_file_to_buffer(rootfs, &bpb, e.first_cluster, e.file_size) {
+                match spawn_elf(data) {
+                    Ok(tid) => {
+                        syscall::sys_write(b"[init]   Spawned TID ");
+                        print_dec(tid);
+                        syscall::sys_write(b"\n");
+                    }
+                    Err(()) => {
+                        syscall::sys_write(b"[init]   FAILED to spawn\n");
+                    }
+                }
+            }
+            break;
+        }
+    }
+
+    // Pass 2: spawn remaining .ELF files
+    for i in 0..count {
+        let e = &entries[i];
+
+        // Skip nameserver (already spawned)
+        if &e.name[0..8] == b"NAMESRVR" {
+            continue;
+        }
+
+        // Only spawn .ELF files
+        if &e.name[8..11] != b"ELF" {
+            continue;
+        }
+
+        syscall::sys_write(b"[init] Loading ");
+        print_fat_name(&e.name);
+        syscall::sys_write(b"\n");
+
+        if let Ok(data) = read_file_to_buffer(rootfs, &bpb, e.first_cluster, e.file_size) {
+            match spawn_elf(data) {
+                Ok(tid) => {
+                    // Grant I/O port and IRQ capabilities to keyboard driver
+                    if &e.name[0..8] == b"KEYBOARD" {
+                        let _ = syscall::sys_grant_ioport(tid);
+                        let _ = syscall::sys_grant_irq(tid, 1);
+                    }
+                    syscall::sys_write(b"[init]   Spawned TID ");
+                    print_dec(tid);
+                    syscall::sys_write(b"\n");
+                }
+                Err(()) => {
+                    syscall::sys_write(b"[init]   FAILED to spawn\n");
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Entry point
+// ---------------------------------------------------------------------------
+
+#[unsafe(no_mangle)]
+#[link_section = ".text.entry"]
+pub extern "C" fn _start() -> ! {
+    syscall::sys_write(b"[init] Starting init process.\n");
+
+    let info = unsafe { &*(BOOT_INFO_ADDR as *const BootInfo) };
+    let mod_count = info.module_count as usize;
+
+    // Find rootfs module
+    let mut found = false;
+    for i in 0..mod_count {
+        let m = &info.modules[i];
+        let name = module_name(&m.name);
+        if starts_with(name, b"rootfs") {
+            let phys = m.phys_start as usize;
+            let size = (m.phys_end - m.phys_start) as usize;
+            load_from_rootfs(phys, size);
+            found = true;
+            break;
+        }
+    }
+
+    if !found {
+        syscall::sys_write(b"[init] ERROR: rootfs module not found!\n");
+    }
+
+    syscall::sys_write(b"[init] All programs loaded. Entering idle loop.\n");
+
+    loop {
+        syscall::sys_yield();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
 
 fn module_name(name: &[u8; 48]) -> &[u8] {
     let len = name.iter().position(|&b| b == 0).unwrap_or(48);
@@ -258,6 +464,23 @@ fn starts_with(haystack: &[u8], needle: &[u8]) -> bool {
         return false;
     }
     haystack[..needle.len()] == *needle
+}
+
+fn print_fat_name(name: &[u8; 11]) {
+    // Print base name (trim trailing spaces)
+    let base_len = name[0..8]
+        .iter()
+        .rposition(|&b| b != b' ')
+        .map_or(0, |p| p + 1);
+    syscall::sys_write(&name[..base_len]);
+    let ext_len = name[8..11]
+        .iter()
+        .rposition(|&b| b != b' ')
+        .map_or(0, |p| p + 1);
+    if ext_len > 0 {
+        syscall::sys_write(b".");
+        syscall::sys_write(&name[8..8 + ext_len]);
+    }
 }
 
 fn print_dec(val: usize) {
