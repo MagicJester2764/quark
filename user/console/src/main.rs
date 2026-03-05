@@ -3,7 +3,7 @@
 
 use font8x8::legacy::BASIC_LEGACY;
 use libquark::ipc::{Message, TID_ANY};
-use libquark::syscall;
+use libquark::{println, syscall};
 
 const NAMESERVER_TID: usize = 2;
 
@@ -39,17 +39,17 @@ static mut INITIALIZED: bool = false;
 #[unsafe(no_mangle)]
 #[link_section = ".text.entry"]
 pub extern "C" fn _start() -> ! {
-    syscall::sys_write(b"[console] Started, waiting for FB init.\n");
+    println!("[console] Started, waiting for FB init.");
 
     // Wait for framebuffer init message from init
     let mut msg = Message::empty();
     if syscall::sys_recv(TID_ANY, &mut msg).is_err() {
-        syscall::sys_write(b"[console] Failed to receive FB init.\n");
+        println!("[console] Failed to receive FB init.");
         syscall::sys_exit();
     }
 
     if msg.tag != TAG_FB_INIT {
-        syscall::sys_write(b"[console] Unexpected first message.\n");
+        println!("[console] Unexpected first message.");
         syscall::sys_exit();
     }
 
@@ -62,7 +62,7 @@ pub extern "C" fn _start() -> ! {
     // Register with nameserver
     register_with_nameserver();
 
-    syscall::sys_write(b"[console] Ready.\n");
+    println!("[console] Ready.");
 
     // Main loop: serve write requests
     loop {
@@ -107,7 +107,7 @@ fn init_framebuffer(msg: &Message) {
     let fb_vaddr: usize = 0x81_0000_0000;
 
     if syscall::sys_map_phys(phys_addr, fb_vaddr, pages).is_err() {
-        syscall::sys_write(b"[console] Failed to map framebuffer!\n");
+        println!("[console] Failed to map framebuffer!");
         return;
     }
 
@@ -251,13 +251,13 @@ fn register_with_nameserver() {
 
     let mut reply = Message::empty();
     if syscall::sys_call(NAMESERVER_TID, &msg, &mut reply).is_ok() {
-        syscall::sys_write(b"[console] Registered with nameserver.\n");
+        println!("[console] Registered with nameserver.");
     }
 }
 
 #[panic_handler]
-fn panic(_info: &core::panic::PanicInfo) -> ! {
-    syscall::sys_write(b"[console] PANIC!\n");
+fn panic(info: &core::panic::PanicInfo) -> ! {
+    println!("[console] PANIC: {}", info);
     loop {
         core::hint::spin_loop();
     }

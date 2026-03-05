@@ -2,7 +2,7 @@
 #![no_main]
 
 use libquark::ipc::{Message, TID_ANY};
-use libquark::syscall;
+use libquark::{println, syscall};
 
 const TAG_REGISTER: u64 = 1;
 const TAG_LOOKUP: u64 = 2;
@@ -21,7 +21,7 @@ struct ServiceEntry {
 #[unsafe(no_mangle)]
 #[link_section = ".text.entry"]
 pub extern "C" fn _start() -> ! {
-    syscall::sys_write(b"[nameserver] Started.\n");
+    println!("[nameserver] Started.");
 
     let mut services: [Option<ServiceEntry>; MAX_SERVICES] = {
         const NONE: Option<ServiceEntry> = None;
@@ -108,8 +108,8 @@ fn extract_name(msg: &Message) -> ([u8; NAME_LEN], usize) {
 }
 
 #[panic_handler]
-fn panic(_info: &core::panic::PanicInfo) -> ! {
-    syscall::sys_write(b"[nameserver] PANIC!\n");
+fn panic(info: &core::panic::PanicInfo) -> ! {
+    println!("[nameserver] PANIC: {}", info);
     loop {
         core::hint::spin_loop();
     }

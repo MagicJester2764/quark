@@ -2,7 +2,7 @@
 #![no_main]
 
 use libquark::ipc::{Message, TID_ANY};
-use libquark::syscall;
+use libquark::{println, syscall};
 
 // Nameserver well-known TID (init spawns nameserver first to guarantee this)
 const NAMESERVER_TID: usize = 2;
@@ -116,11 +116,11 @@ const SC_CAPSLOCK: u8 = 0x3A;
 #[unsafe(no_mangle)]
 #[link_section = ".text.entry"]
 pub extern "C" fn _start() -> ! {
-    syscall::sys_write(b"[keyboard] Started.\n");
+    println!("[keyboard] Started.");
 
     // Register for IRQ 1 (keyboard)
     if syscall::sys_irq_register(1).is_err() {
-        syscall::sys_write(b"[keyboard] Failed to register IRQ 1!\n");
+        println!("[keyboard] Failed to register IRQ 1!");
         syscall::sys_exit();
     }
 
@@ -270,15 +270,15 @@ fn register_with_nameserver() {
 
     let mut reply = Message::empty();
     if syscall::sys_call(NAMESERVER_TID, &msg, &mut reply).is_ok() {
-        syscall::sys_write(b"[keyboard] Registered with nameserver.\n");
+        println!("[keyboard] Registered with nameserver.");
     } else {
-        syscall::sys_write(b"[keyboard] Failed to register with nameserver.\n");
+        println!("[keyboard] Failed to register with nameserver.");
     }
 }
 
 #[panic_handler]
-fn panic(_info: &core::panic::PanicInfo) -> ! {
-    syscall::sys_write(b"[keyboard] PANIC!\n");
+fn panic(info: &core::panic::PanicInfo) -> ! {
+    println!("[keyboard] PANIC: {}", info);
     loop {
         core::hint::spin_loop();
     }

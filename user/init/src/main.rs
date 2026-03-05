@@ -2,7 +2,7 @@
 #![no_main]
 
 use libquark::ipc::Message;
-use libquark::syscall;
+use libquark::{print, println, syscall};
 
 const PAGE_SIZE: usize = 4096;
 const BOOT_INFO_ADDR: usize = 0x80_4000_0000;
@@ -348,12 +348,12 @@ fn spawn_elf(elf_data: &[u8]) -> Result<usize, ()> {
 // ---------------------------------------------------------------------------
 
 fn load_from_rootfs(rootfs_phys: usize, rootfs_size: usize) {
-    syscall::sys_write(b"[init] Mounting FAT32 rootfs\n");
+    println!("[init] Mounting FAT32 rootfs");
 
     // Map the entire rootfs image
     let rootfs_pages = (rootfs_size + PAGE_SIZE - 1) / PAGE_SIZE;
     if syscall::sys_map_phys(rootfs_phys, ROOTFS_BASE, rootfs_pages).is_err() {
-        syscall::sys_write(b"[init] Failed to map rootfs\n");
+        println!("[init] Failed to map rootfs");
         return;
     }
 
@@ -361,25 +361,17 @@ fn load_from_rootfs(rootfs_phys: usize, rootfs_size: usize) {
     let bpb = parse_bpb(rootfs);
     let (entries, count) = scan_root_dir(rootfs, &bpb);
 
-    syscall::sys_write(b"[init] Files on rootfs: ");
-    print_dec(count);
-    syscall::sys_write(b"\n");
+    println!("[init] Files on rootfs: {}", count);
 
     // Pass 1: find and spawn NAMESRVR.ELF first (guarantees TID 2)
     for i in 0..count {
         let e = &entries[i];
         if &e.name[0..8] == b"NAMESRVR" && &e.name[8..11] == b"ELF" {
-            syscall::sys_write(b"[init] Loading NAMESRVR.ELF\n");
+            println!("[init] Loading NAMESRVR.ELF");
             if let Ok(data) = read_file_to_buffer(rootfs, &bpb, e.first_cluster, e.file_size) {
                 match spawn_elf(data) {
-                    Ok(tid) => {
-                        syscall::sys_write(b"[init]   Spawned TID ");
-                        print_dec(tid);
-                        syscall::sys_write(b"\n");
-                    }
-                    Err(()) => {
-                        syscall::sys_write(b"[init]   FAILED to spawn\n");
-                    }
+                    Ok(tid) => println!("[init]   Spawned TID {}", tid),
+                    Err(()) => println!("[init]   FAILED to spawn"),
                 }
             }
             break;
@@ -391,22 +383,16 @@ fn load_from_rootfs(rootfs_phys: usize, rootfs_size: usize) {
     for i in 0..count {
         let e = &entries[i];
         if &e.name[0..7] == b"CONSOLE" && &e.name[8..11] == b"ELF" {
-            syscall::sys_write(b"[init] Loading CONSOLE.ELF\n");
+            println!("[init] Loading CONSOLE.ELF");
             if let Ok(data) = read_file_to_buffer(rootfs, &bpb, e.first_cluster, e.file_size) {
                 match spawn_elf(data) {
                     Ok(tid) => {
                         console_tid = tid;
-                        // Grant MAP_PHYS so console can map the framebuffer
                         let _ = syscall::sys_grant_cap(tid, syscall::CAP_MAP_PHYS);
-                        // Send framebuffer info via IPC
                         send_fb_info(tid);
-                        syscall::sys_write(b"[init]   Console spawned TID ");
-                        print_dec(tid);
-                        syscall::sys_write(b"\n");
+                        println!("[init]   Console spawned TID {}", tid);
                     }
-                    Err(()) => {
-                        syscall::sys_write(b"[init]   FAILED to spawn console\n");
-                    }
+                    Err(()) => println!("[init]   FAILED to spawn console"),
                 }
             }
             break;
@@ -430,14 +416,13 @@ fn load_from_rootfs(rootfs_phys: usize, rootfs_size: usize) {
             continue;
         }
 
-        syscall::sys_write(b"[init] Loading ");
+        print!("[init] Loading ");
         print_fat_name(&e.name);
-        syscall::sys_write(b"\n");
+        println!();
 
         if let Ok(data) = read_file_to_buffer(rootfs, &bpb, e.first_cluster, e.file_size) {
             match spawn_elf(data) {
                 Ok(tid) => {
-                    // Grant I/O port and IRQ capabilities to keyboard driver
                     if &e.name[0..8] == b"KEYBOARD" {
                         let _ = syscall::sys_grant_ioport(tid);
                         let _ = syscall::sys_grant_irq(tid, 1);
@@ -447,13 +432,9 @@ fn load_from_rootfs(rootfs_phys: usize, rootfs_size: usize) {
                         let _ = syscall::sys_fd_set(tid, 1, console_tid, 1); // TAG_WRITE=1
                         let _ = syscall::sys_fd_set(tid, 2, console_tid, 1);
                     }
-                    syscall::sys_write(b"[init]   Spawned TID ");
-                    print_dec(tid);
-                    syscall::sys_write(b"\n");
+                    println!("[init]   Spawned TID {}", tid);
                 }
-                Err(()) => {
-                    syscall::sys_write(b"[init]   FAILED to spawn\n");
-                }
+                Err(()) => println!("[init]   FAILED to spawn"),
             }
         }
     }
@@ -466,7 +447,7 @@ fn load_from_rootfs(rootfs_phys: usize, rootfs_size: usize) {
 #[unsafe(no_mangle)]
 #[link_section = ".text.entry"]
 pub extern "C" fn _start() -> ! {
-    syscall::sys_write(b"[init] Starting init process.\n");
+    println!("[init] Starting init process.");
 
     let info = unsafe { &*(BOOT_INFO_ADDR as *const BootInfo) };
     let mod_count = info.module_count as usize;
@@ -486,10 +467,10 @@ pub extern "C" fn _start() -> ! {
     }
 
     if !found {
-        syscall::sys_write(b"[init] ERROR: rootfs module not found!\n");
+        println!("[init] ERROR: rootfs module not found!");
     }
 
-    syscall::sys_write(b"[init] All programs loaded. Entering idle loop.\n");
+    println!("[init] All programs loaded. Entering idle loop.");
 
     loop {
         syscall::sys_yield();
@@ -523,7 +504,7 @@ fn send_fb_info(console_tid: usize) {
 
     let mut reply = Message::empty();
     if syscall::sys_call(console_tid, &msg, &mut reply).is_err() {
-        syscall::sys_write(b"[init] Failed to send FB info to console\n");
+        println!("[init] Failed to send FB info to console");
     }
 }
 
@@ -544,45 +525,27 @@ fn starts_with(haystack: &[u8], needle: &[u8]) -> bool {
 }
 
 fn print_fat_name(name: &[u8; 11]) {
-    // Print base name (trim trailing spaces)
     let base_len = name[0..8]
         .iter()
         .rposition(|&b| b != b' ')
         .map_or(0, |p| p + 1);
-    syscall::sys_write(&name[..base_len]);
+    if let Ok(base) = core::str::from_utf8(&name[..base_len]) {
+        print!("{}", base);
+    }
     let ext_len = name[8..11]
         .iter()
         .rposition(|&b| b != b' ')
         .map_or(0, |p| p + 1);
     if ext_len > 0 {
-        syscall::sys_write(b".");
-        syscall::sys_write(&name[8..8 + ext_len]);
+        if let Ok(ext) = core::str::from_utf8(&name[8..8 + ext_len]) {
+            print!(".{}", ext);
+        }
     }
-}
-
-fn print_dec(val: usize) {
-    if val == 0 {
-        syscall::sys_write(b"0");
-        return;
-    }
-    let mut buf = [0u8; 20];
-    let mut n = val;
-    let mut i = 0;
-    while n > 0 {
-        buf[i] = b'0' + (n % 10) as u8;
-        n /= 10;
-        i += 1;
-    }
-    let mut out = [0u8; 20];
-    for j in 0..i {
-        out[j] = buf[i - 1 - j];
-    }
-    syscall::sys_write(&out[..i]);
 }
 
 #[panic_handler]
-fn panic(_info: &core::panic::PanicInfo) -> ! {
-    syscall::sys_write(b"[init] PANIC!\n");
+fn panic(info: &core::panic::PanicInfo) -> ! {
+    println!("[init] PANIC: {}", info);
     loop {
         core::hint::spin_loop();
     }
