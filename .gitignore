@@ -4,3 +4,5 @@
 /isodir
 /drivers/*/target
 /drivers/*/*.drv
+/user/*/target
+/user/*/Cargo.lock
