@@ -8,6 +8,20 @@ use alloc::alloc::{alloc, dealloc, Layout};
 pub const MAX_TASKS: usize = 64;
 pub const KERNEL_STACK_SIZE: usize = 16384; // 16 KiB per task
 const STACK_ALIGN: usize = 16;
+pub const MAX_FDS: usize = 8;
+
+/// File descriptor entry — routes writes/reads to a service via IPC.
+#[derive(Debug, Clone, Copy)]
+pub struct FdEntry {
+    pub target_tid: usize,
+    pub tag: u64,
+}
+
+impl FdEntry {
+    pub const fn empty() -> Self {
+        FdEntry { target_tid: 0, tag: 0 }
+    }
+}
 
 // Capability bits
 pub const CAP_IOPORT: u32 = 1 << 0;
@@ -35,6 +49,9 @@ pub struct Task {
     pub priority: u8,
     pub cr3: usize,
     pub caps: u32,
+    /// File descriptor table. fd 0=stdin, 1=stdout, 2=stderr.
+    /// An entry with target_tid=0 means the fd is not connected.
+    pub fds: [FdEntry; MAX_FDS],
 }
 
 unsafe impl Send for Task {}
@@ -88,6 +105,7 @@ impl Task {
             priority: 0,
             cr3: crate::paging::read_cr3(),
             caps: 0,
+            fds: [FdEntry::empty(); MAX_FDS],
         }
     }
 

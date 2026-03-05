@@ -37,6 +37,7 @@ pub fn init() {
             priority: 255, // lowest priority
             cr3: crate::paging::read_cr3(),
             caps: crate::task::CAP_ALL,
+            fds: [crate::task::FdEntry::empty(); crate::task::MAX_FDS],
         });
     }
     CURRENT_TID.store(0, Ordering::SeqCst);
@@ -294,6 +295,7 @@ pub fn create_empty_task() -> Option<usize> {
             priority: 0,
             cr3: 0,
             caps: 0,
+            fds: [crate::task::FdEntry::empty(); crate::task::MAX_FDS],
         });
     }
 
@@ -347,6 +349,43 @@ pub fn grant_cap(tid: usize, cap: u32) -> Result<(), ()> {
                 Ok(())
             }
             None => Err(()),
+        }
+    }
+}
+
+/// Set a file descriptor entry on a task.
+pub fn set_fd(tid: usize, fd: usize, entry: crate::task::FdEntry) -> Result<(), ()> {
+    if fd >= crate::task::MAX_FDS {
+        return Err(());
+    }
+    unsafe {
+        match TASKS[tid].as_mut() {
+            Some(task) => {
+                task.fds[fd] = entry;
+                Ok(())
+            }
+            None => Err(()),
+        }
+    }
+}
+
+/// Get a file descriptor entry for the current task.
+pub fn current_fd(fd: usize) -> Option<crate::task::FdEntry> {
+    if fd >= crate::task::MAX_FDS {
+        return None;
+    }
+    unsafe {
+        let tid = CURRENT_TID.load(Ordering::SeqCst);
+        match TASKS[tid].as_ref() {
+            Some(task) => {
+                let entry = task.fds[fd];
+                if entry.target_tid == 0 {
+                    None
+                } else {
+                    Some(entry)
+                }
+            }
+            None => None,
         }
     }
 }

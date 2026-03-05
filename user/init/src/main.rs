@@ -387,6 +387,7 @@ fn load_from_rootfs(rootfs_phys: usize, rootfs_size: usize) {
     }
 
     // Pass 2: spawn CONSOLE.ELF (needs framebuffer info from boot info)
+    let mut console_tid: usize = 0;
     for i in 0..count {
         let e = &entries[i];
         if &e.name[0..7] == b"CONSOLE" && &e.name[8..11] == b"ELF" {
@@ -394,6 +395,7 @@ fn load_from_rootfs(rootfs_phys: usize, rootfs_size: usize) {
             if let Ok(data) = read_file_to_buffer(rootfs, &bpb, e.first_cluster, e.file_size) {
                 match spawn_elf(data) {
                     Ok(tid) => {
+                        console_tid = tid;
                         // Grant MAP_PHYS so console can map the framebuffer
                         let _ = syscall::sys_grant_cap(tid, syscall::CAP_MAP_PHYS);
                         // Send framebuffer info via IPC
@@ -439,6 +441,11 @@ fn load_from_rootfs(rootfs_phys: usize, rootfs_size: usize) {
                     if &e.name[0..8] == b"KEYBOARD" {
                         let _ = syscall::sys_grant_ioport(tid);
                         let _ = syscall::sys_grant_irq(tid, 1);
+                    }
+                    // Wire stdout/stderr to console server
+                    if console_tid != 0 {
+                        let _ = syscall::sys_fd_set(tid, 1, console_tid, 1); // TAG_WRITE=1
+                        let _ = syscall::sys_fd_set(tid, 2, console_tid, 1);
                     }
                     syscall::sys_write(b"[init]   Spawned TID ");
                     print_dec(tid);

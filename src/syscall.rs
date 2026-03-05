@@ -36,6 +36,9 @@ pub const SYS_GRANT_IOPORT: u64 = 46;
 pub const SYS_GRANT_IRQ: u64 = 47;
 pub const SYS_GRANT_CAP: u64 = 48;
 
+pub const SYS_FD_WRITE: u64 = 50;
+pub const SYS_FD_SET: u64 = 52;
+
 const SFMASK_VALUE: u64 = (1 << 9) | (1 << 10); // clear IF | DF
 
 fn read_msr(msr: u32) -> u64 {
@@ -97,6 +100,46 @@ const USER_ADDR_LIMIT: u64 = 0x0000_8000_0000_0000;
 /// Validate that a user pointer range is entirely in user space.
 fn validate_user_ptr(addr: u64, len: u64) -> bool {
     addr < USER_ADDR_LIMIT && len <= USER_ADDR_LIMIT && addr + len <= USER_ADDR_LIMIT
+}
+
+/// Maximum bytes per IPC write message (5 data words × 8 bytes).
+const FD_WRITE_MAX_CHUNK: usize = 40;
+
+/// Send a write via IPC to a service, chunking data into 40-byte messages.
+/// Returns bytes written.
+fn fd_write_ipc(target_tid: usize, tag: u64, ptr: *const u8, len: usize) -> u64 {
+    if len == 0 {
+        return 0;
+    }
+    let buf = unsafe { core::slice::from_raw_parts(ptr, len) };
+    let mut offset = 0usize;
+    while offset < len {
+        let chunk = (len - offset).min(FD_WRITE_MAX_CHUNK);
+        // Pack bytes into data[1..6]
+        let mut data = [0u64; 6];
+        data[0] = chunk as u64;
+        for i in 0..5 {
+            let base = i * 8;
+            let mut w = [0u8; 8];
+            for j in 0..8 {
+                if base + j < chunk {
+                    w[j] = buf[offset + base + j];
+                }
+            }
+            data[i + 1] = u64::from_le_bytes(w);
+        }
+        let msg = crate::ipc::Message {
+            sender: 0,
+            tag,
+            data,
+        };
+        match crate::ipc::sys_call(target_tid, &msg) {
+            Ok(_) => {}
+            Err(_) => return offset as u64,
+        }
+        offset += chunk;
+    }
+    len as u64
 }
 
 /// Called from assembly with 6 args mapped from user registers.
@@ -345,6 +388,50 @@ extern "C" fn syscall_dispatch(
             let tid = arg0 as usize;
             let caps = arg1 as u32;
             match scheduler::grant_cap(tid, caps) {
+                Ok(()) => 0,
+                Err(()) => u64::MAX,
+            }
+        }
+        SYS_FD_WRITE => {
+            // arg0 = fd, arg1 = buf ptr, arg2 = len
+            // Looks up fd -> (target_tid, tag), sends IPC write messages
+            let fd = arg0 as usize;
+            let ptr = arg1 as *const u8;
+            let len = arg2 as usize;
+            if len > 0 && !ptr.is_null() && !validate_user_ptr(arg1, arg2) {
+                return u64::MAX;
+            }
+            match scheduler::current_fd(fd) {
+                Some(entry) => {
+                    fd_write_ipc(entry.target_tid, entry.tag, ptr, len)
+                }
+                None => {
+                    // fd not connected — fall back to kernel console for fd 1/2
+                    if (fd == 1 || fd == 2) && len > 0 && !ptr.is_null() {
+                        let slice = unsafe { core::slice::from_raw_parts(ptr, len) };
+                        crate::console::puts(slice);
+                        len as u64
+                    } else {
+                        u64::MAX
+                    }
+                }
+            }
+        }
+        SYS_FD_SET => {
+            // arg0 = target task tid, arg1 = fd, arg2 = service tid, arg3 = tag
+            // Requires CAP_TASK_MGMT
+            if !scheduler::current_task_has_cap(crate::task::CAP_TASK_MGMT) {
+                return u64::MAX;
+            }
+            let tid = arg0 as usize;
+            let fd = arg1 as usize;
+            let service_tid = arg2 as usize;
+            let tag = arg3;
+            let entry = crate::task::FdEntry {
+                target_tid: service_tid,
+                tag,
+            };
+            match scheduler::set_fd(tid, fd, entry) {
                 Ok(()) => 0,
                 Err(()) => u64::MAX,
             }

@@ -28,6 +28,9 @@ pub const SYS_GRANT_IOPORT: u64 = 46;
 pub const SYS_GRANT_IRQ: u64 = 47;
 pub const SYS_GRANT_CAP: u64 = 48;
 
+pub const SYS_FD_WRITE: u64 = 50;
+pub const SYS_FD_SET: u64 = 52;
+
 #[inline(always)]
 pub unsafe fn syscall0(nr: u64) -> u64 {
     let ret: u64;
@@ -261,6 +264,15 @@ pub fn sys_grant_irq(tid: usize, irq: u8) -> Result<(), ()> {
 
 pub fn sys_grant_cap(tid: usize, caps: u32) -> Result<(), ()> {
     let ret = unsafe { syscall2(SYS_GRANT_CAP, tid as u64, caps as u64) };
+    if ret == u64::MAX { Err(()) } else { Ok(()) }
+}
+
+pub fn sys_fd_write(fd: usize, buf: &[u8]) -> u64 {
+    unsafe { syscall3(SYS_FD_WRITE, fd as u64, buf.as_ptr() as u64, buf.len() as u64) }
+}
+
+pub fn sys_fd_set(tid: usize, fd: usize, service_tid: usize, tag: u64) -> Result<(), ()> {
+    let ret = unsafe { syscall4(SYS_FD_SET, tid as u64, fd as u64, service_tid as u64, tag) };
     if ret == u64::MAX { Err(()) } else { Ok(()) }
 }
 
