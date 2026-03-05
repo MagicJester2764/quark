@@ -22,6 +22,50 @@ pub unsafe fn inb(port: u16) -> u8 {
     val
 }
 
+/// Write a 16-bit word to an I/O port.
+pub unsafe fn outw(port: u16, val: u16) {
+    core::arch::asm!(
+        "out %ax, %dx",
+        in("dx") port,
+        in("ax") val,
+        options(att_syntax, nostack, nomem)
+    );
+}
+
+/// Read a 16-bit word from an I/O port.
+pub unsafe fn inw(port: u16) -> u16 {
+    let val: u16;
+    core::arch::asm!(
+        "in %dx, %ax",
+        in("dx") port,
+        out("ax") val,
+        options(att_syntax, nostack, nomem)
+    );
+    val
+}
+
+/// Write a 32-bit dword to an I/O port.
+pub unsafe fn outl(port: u16, val: u32) {
+    core::arch::asm!(
+        "out %eax, %dx",
+        in("dx") port,
+        in("eax") val,
+        options(att_syntax, nostack, nomem)
+    );
+}
+
+/// Read a 32-bit dword from an I/O port.
+pub unsafe fn inl(port: u16) -> u32 {
+    let val: u32;
+    core::arch::asm!(
+        "in %dx, %eax",
+        in("dx") port,
+        out("eax") val,
+        options(att_syntax, nostack, nomem)
+    );
+    val
+}
+
 /// Small delay for PIC initialization timing (write to unused port 0x80).
 pub unsafe fn io_wait() {
     outb(0x80, 0);

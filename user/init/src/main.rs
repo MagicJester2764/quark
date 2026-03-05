@@ -451,6 +451,14 @@ fn load_from_boot_image(rootfs_phys: usize, rootfs_size: usize) {
                         let _ = syscall::sys_grant_ioport(tid);
                         let _ = syscall::sys_grant_irq(tid, 1);
                     }
+                    if &e.name[0..8] == b"DISK    " {
+                        let _ = syscall::sys_grant_ioport(tid);
+                        let _ = syscall::sys_grant_irq(tid, 14);
+                        let _ = syscall::sys_grant_cap(tid, syscall::CAP_MAP_PHYS);
+                    }
+                    if &e.name[0..8] == b"DISKTEST" {
+                        let _ = syscall::sys_grant_cap(tid, syscall::CAP_PHYS_ALLOC | syscall::CAP_MAP_PHYS);
+                    }
                     // Wire stdout/stderr to console server BEFORE starting
                     if console_tid != 0 {
                         let _ = syscall::sys_fd_set(tid, 1, console_tid, 1); // TAG_WRITE=1

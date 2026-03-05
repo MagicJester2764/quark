@@ -267,16 +267,19 @@ extern "C" fn syscall_dispatch(
             0
         }
         SYS_IOPORT => {
+            // arg0=port, arg1=op (0=read8,1=write8,2=read16,3=write16,4=read32,5=write32), arg2=value (for writes)
             if !scheduler::current_task_has_cap(crate::task::CAP_IOPORT) {
                 return u64::MAX;
             }
             let port = arg0 as u16;
-            let is_write = arg1;
-            if is_write != 0 {
-                unsafe { crate::io::outb(port, arg2 as u8) };
-                0
-            } else {
-                unsafe { crate::io::inb(port) as u64 }
+            match arg1 {
+                0 => unsafe { crate::io::inb(port) as u64 },
+                1 => { unsafe { crate::io::outb(port, arg2 as u8) }; 0 }
+                2 => unsafe { crate::io::inw(port) as u64 },
+                3 => { unsafe { crate::io::outw(port, arg2 as u16) }; 0 }
+                4 => unsafe { crate::io::inl(port) as u64 },
+                5 => { unsafe { crate::io::outl(port, arg2 as u32) }; 0 }
+                _ => u64::MAX,
             }
         }
         SYS_MAP_PHYS => {

@@ -22,7 +22,9 @@ User space provides:
 - **Console server** (`user/console`) — framebuffer text rendering via font8x8, serves write requests over IPC
 - **Keyboard driver** (`user/keyboard`) — PS/2 scancode translation, IRQ 1 handling
 - **Input server** (`user/input`) — line discipline (echo, backspace, newline) wrapping the keyboard driver
+- **Disk driver** (`user/disk`) — ATA PIO disk driver (IRQ 14, read-only), registers as "disk" with nameserver
 - **Hello** (`user/hello`) — test program that prints via `println!`
+- **Disktest** (`user/disktest`) — reads sector 0 from disk and prints hex dump
 
 ## How it works
 
@@ -35,7 +37,7 @@ User space provides:
 5. Init mounts the FAT32 boot image and spawns services in order:
    - Pass 1: Nameserver (guarantees TID 2)
    - Pass 2: Console server (granted `CAP_MAP_PHYS`, receives framebuffer info via IPC)
-   - Pass 3: Remaining programs (fds wired to console before starting)
+   - Pass 3: Remaining programs — disk driver (granted `CAP_IOPORT` + IRQ 14 + `CAP_MAP_PHYS`), disktest (granted `CAP_PHYS_ALLOC` + `CAP_MAP_PHYS`), others (fds wired to console before starting)
    - Pass 4: Input server (fds wired, then stdin wired retroactively to prior tasks)
 6. The kernel enters an idle HLT loop
 
@@ -91,6 +93,8 @@ user/
   console/            Framebuffer console server (font8x8)
   keyboard/           PS/2 keyboard driver (IRQ 1, scancode set 1)
   input/              Line-discipline input server
+  disk/               ATA PIO disk driver (primary master, LBA28)
+  disktest/           Disk test program (reads and dumps sector 0)
   hello/              Test program
 ```
 

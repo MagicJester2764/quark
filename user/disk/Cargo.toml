@@ -1,0 +1,13 @@
+[package]
+name = "disk"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+libquark = { path = "../libquark" }
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"

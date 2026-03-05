@@ -248,6 +248,22 @@ pub fn sys_ioport_write(port: u16, val: u8) {
     unsafe { syscall3(SYS_IOPORT, port as u64, 1, val as u64) };
 }
 
+pub fn sys_ioport_read16(port: u16) -> u16 {
+    unsafe { syscall3(SYS_IOPORT, port as u64, 2, 0) as u16 }
+}
+
+pub fn sys_ioport_write16(port: u16, val: u16) {
+    unsafe { syscall3(SYS_IOPORT, port as u64, 3, val as u64) };
+}
+
+pub fn sys_ioport_read32(port: u16) -> u32 {
+    unsafe { syscall3(SYS_IOPORT, port as u64, 4, 0) as u32 }
+}
+
+pub fn sys_ioport_write32(port: u16, val: u32) {
+    unsafe { syscall3(SYS_IOPORT, port as u64, 5, val as u64) };
+}
+
 pub fn sys_irq_register(irq: u8) -> Result<(), ()> {
     let ret = unsafe { syscall1(SYS_IRQ_REGISTER, irq as u64) };
     if ret == u64::MAX { Err(()) } else { Ok(()) }
