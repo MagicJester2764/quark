@@ -241,7 +241,22 @@ fn read_file_to_buffer<'a>(
 // ELF spawning (takes pre-mapped byte slice)
 // ---------------------------------------------------------------------------
 
-fn spawn_elf(elf_data: &[u8]) -> Result<usize, ()> {
+struct SpawnInfo {
+    tid: usize,
+    entry: u64,
+    stack_top: u64,
+    cr3: usize,
+}
+
+impl SpawnInfo {
+    fn start(&self) -> Result<(), ()> {
+        syscall::sys_task_start(self.tid, self.entry, self.stack_top, self.cr3)
+    }
+}
+
+/// Load an ELF into a new task but do NOT start it.
+/// Call info.start() after wiring fds / granting caps.
+fn load_elf(elf_data: &[u8]) -> Result<SpawnInfo, ()> {
     // Validate ELF magic
     if elf_data.len() < 64 || elf_data[0..4] != ELF_MAGIC {
         return Err(());
@@ -337,10 +352,7 @@ fn spawn_elf(elf_data: &[u8]) -> Result<usize, ()> {
         syscall::sys_addrspace_map(cr3, stack_bottom + p * PAGE_SIZE, frame, 1, 1)?;
     }
 
-    // Start the task
-    syscall::sys_task_start(tid, entry, stack_top as u64, cr3)?;
-
-    Ok(tid)
+    Ok(SpawnInfo { tid, entry, stack_top: stack_top as u64, cr3 })
 }
 
 // ---------------------------------------------------------------------------
@@ -369,8 +381,11 @@ fn load_from_rootfs(rootfs_phys: usize, rootfs_size: usize) {
         if &e.name[0..8] == b"NAMESRVR" && &e.name[8..11] == b"ELF" {
             println!("[init] Loading NAMESRVR.ELF");
             if let Ok(data) = read_file_to_buffer(rootfs, &bpb, e.first_cluster, e.file_size) {
-                match spawn_elf(data) {
-                    Ok(tid) => println!("[init]   Spawned TID {}", tid),
+                match load_elf(data) {
+                    Ok(info) => {
+                        let _ = info.start();
+                        println!("[init]   Spawned TID {}", info.tid);
+                    }
                     Err(()) => println!("[init]   FAILED to spawn"),
                 }
             }
@@ -385,12 +400,18 @@ fn load_from_rootfs(rootfs_phys: usize, rootfs_size: usize) {
         if &e.name[0..8] == b"CONSOLE " && &e.name[8..11] == b"ELF" {
             println!("[init] Loading CONSOLE.ELF");
             if let Ok(data) = read_file_to_buffer(rootfs, &bpb, e.first_cluster, e.file_size) {
-                match spawn_elf(data) {
-                    Ok(tid) => {
-                        console_tid = tid;
-                        let _ = syscall::sys_grant_cap(tid, syscall::CAP_MAP_PHYS);
-                        send_fb_info(tid);
-                        println!("[init]   Console spawned TID {}", tid);
+                match load_elf(data) {
+                    Ok(info) => {
+                        console_tid = info.tid;
+                        let _ = syscall::sys_grant_cap(info.tid, syscall::CAP_MAP_PHYS);
+                        let _ = info.start();
+                        send_fb_info(info.tid);
+                        // Wire init's own stdout/stderr to console server so all
+                        // subsequent prints go through the console (not kernel fallback)
+                        let my_tid = syscall::sys_getpid() as usize;
+                        let _ = syscall::sys_fd_set(my_tid, 1, info.tid, 1); // TAG_WRITE=1
+                        let _ = syscall::sys_fd_set(my_tid, 2, info.tid, 1);
+                        println!("[init]   Console spawned TID {}", info.tid);
                     }
                     Err(()) => println!("[init]   FAILED to spawn console"),
                 }
@@ -423,17 +444,19 @@ fn load_from_rootfs(rootfs_phys: usize, rootfs_size: usize) {
         println!();
 
         if let Ok(data) = read_file_to_buffer(rootfs, &bpb, e.first_cluster, e.file_size) {
-            match spawn_elf(data) {
-                Ok(tid) => {
+            match load_elf(data) {
+                Ok(info) => {
+                    let tid = info.tid;
                     if &e.name[0..8] == b"KEYBOARD" {
                         let _ = syscall::sys_grant_ioport(tid);
                         let _ = syscall::sys_grant_irq(tid, 1);
                     }
-                    // Wire stdout/stderr to console server
+                    // Wire stdout/stderr to console server BEFORE starting
                     if console_tid != 0 {
                         let _ = syscall::sys_fd_set(tid, 1, console_tid, 1); // TAG_WRITE=1
                         let _ = syscall::sys_fd_set(tid, 2, console_tid, 1);
                     }
+                    let _ = info.start();
                     if spawned_count < 32 {
                         spawned_tids[spawned_count] = tid;
                         spawned_count += 1;
@@ -452,15 +475,16 @@ fn load_from_rootfs(rootfs_phys: usize, rootfs_size: usize) {
         if &e.name[0..8] == b"INPUT   " && &e.name[8..11] == b"ELF" {
             println!("[init] Loading INPUT.ELF");
             if let Ok(data) = read_file_to_buffer(rootfs, &bpb, e.first_cluster, e.file_size) {
-                match spawn_elf(data) {
-                    Ok(tid) => {
-                        input_tid = tid;
-                        // Wire input server's stdout/stderr to console
+                match load_elf(data) {
+                    Ok(info) => {
+                        input_tid = info.tid;
+                        // Wire input server's stdout/stderr to console BEFORE starting
                         if console_tid != 0 {
-                            let _ = syscall::sys_fd_set(tid, 1, console_tid, 1);
-                            let _ = syscall::sys_fd_set(tid, 2, console_tid, 1);
+                            let _ = syscall::sys_fd_set(info.tid, 1, console_tid, 1);
+                            let _ = syscall::sys_fd_set(info.tid, 2, console_tid, 1);
                         }
-                        println!("[init]   Input spawned TID {}", tid);
+                        let _ = info.start();
+                        println!("[init]   Input spawned TID {}", info.tid);
                     }
                     Err(()) => println!("[init]   FAILED to spawn input"),
                 }
@@ -521,11 +545,16 @@ pub extern "C" fn _start() -> ! {
 fn send_fb_info(console_tid: usize) {
     let info = unsafe { &*(BOOT_INFO_ADDR as *const BootInfo) };
 
+    // Query the kernel console's current cursor position so the
+    // user-space console server can continue where the kernel left off.
+    let (row, col) = syscall::sys_console_pos();
+
     // Pack framebuffer info into one IPC message
     // data[0] = physical address
     // data[1] = (width << 32) | height
     // data[2] = (pitch << 32) | bpp
     // data[3] = (red_pos << 16) | (green_pos << 8) | blue_pos
+    // data[4] = (cursor_row << 32) | cursor_col
     let msg = Message {
         sender: 0,
         tag: 100, // TAG_FB_INIT
@@ -534,7 +563,7 @@ fn send_fb_info(console_tid: usize) {
             ((info.fb_width as u64) << 32) | (info.fb_height as u64),
             ((info.fb_pitch as u64) << 32) | (info.fb_bpp as u64),
             ((info.fb_red_pos as u64) << 16) | ((info.fb_green_pos as u64) << 8) | (info.fb_blue_pos as u64),
-            0,
+            ((row as u64) << 32) | (col as u64),
             0,
         ],
     };

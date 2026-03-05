@@ -16,6 +16,7 @@ const KERNEL_CS: u64 = 0x08;
 pub const SYS_EXIT: u64 = 0;
 pub const SYS_YIELD: u64 = 1;
 pub const SYS_WRITE: u64 = 2;
+pub const SYS_CONSOLE_POS: u64 = 3;
 pub const SYS_SEND: u64 = 10;
 pub const SYS_RECV: u64 = 11;
 pub const SYS_CALL: u64 = 12;
@@ -198,6 +199,10 @@ extern "C" fn syscall_dispatch(
                 return u64::MAX;
             }
             len as u64
+        }
+        SYS_CONSOLE_POS => {
+            let (row, col) = console::cursor_pos_and_disable();
+            ((row as u64) << 32) | (col as u64)
         }
         SYS_GETPID => scheduler::current_tid() as u64,
         SYS_SEND => {

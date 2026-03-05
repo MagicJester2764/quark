@@ -92,6 +92,7 @@ fn init_framebuffer(msg: &Message) {
     // data[1] = (width << 32) | height
     // data[2] = (pitch << 32) | bpp
     // data[3] = (red_pos << 16) | (green_pos << 8) | blue_pos
+    // data[4] = (cursor_row << 32) | cursor_col
     let phys_addr = msg.data[0] as usize;
     let w = (msg.data[1] >> 32) as usize;
     let h = (msg.data[1] & 0xFFFF_FFFF) as usize;
@@ -100,6 +101,8 @@ fn init_framebuffer(msg: &Message) {
     let rp = ((msg.data[3] >> 16) & 0xFF) as u8;
     let gp = ((msg.data[3] >> 8) & 0xFF) as u8;
     let bp = (msg.data[3] & 0xFF) as u8;
+    let cursor_row = (msg.data[4] >> 32) as usize;
+    let cursor_col = (msg.data[4] & 0xFFFF_FFFF) as usize;
 
     // Map the framebuffer into our address space
     let fb_size = pitch * h;
@@ -111,16 +114,20 @@ fn init_framebuffer(msg: &Message) {
         return;
     }
 
+    let rows = h / GLYPH_H;
+    let cols = w / GLYPH_W;
+
     unsafe {
         FB = fb_vaddr;
         PITCH = pitch;
         WIDTH = w;
         HEIGHT = h;
         BPP = bpp;
-        COLS = w / GLYPH_W;
-        ROWS = h / GLYPH_H;
-        COL = 0;
-        ROW = 0;
+        COLS = cols;
+        ROWS = rows;
+        // Continue where the kernel console left off
+        COL = cursor_col.min(cols.saturating_sub(1));
+        ROW = cursor_row.min(rows.saturating_sub(1));
         R_POS = rp;
         G_POS = gp;
         B_POS = bp;

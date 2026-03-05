@@ -54,6 +54,15 @@ pub fn clear() {
     }
 }
 
+pub fn cursor_pos_and_disable() -> (usize, usize) {
+    unsafe {
+        match MODE {
+            2 => framebuffer::cursor_pos_and_disable(),
+            _ => (0, 0),
+        }
+    }
+}
+
 pub fn puts(s: &[u8]) {
     unsafe {
         match MODE {

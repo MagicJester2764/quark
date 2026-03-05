@@ -9,6 +9,7 @@ use core::arch::asm;
 pub const SYS_EXIT: u64 = 0;
 pub const SYS_YIELD: u64 = 1;
 pub const SYS_WRITE: u64 = 2;
+pub const SYS_CONSOLE_POS: u64 = 3;
 pub const SYS_SEND: u64 = 10;
 pub const SYS_RECV: u64 = 11;
 pub const SYS_CALL: u64 = 12;
@@ -162,6 +163,14 @@ pub fn sys_yield() {
 
 pub fn sys_write(buf: &[u8]) -> u64 {
     unsafe { syscall2(SYS_WRITE, buf.as_ptr() as u64, buf.len() as u64) }
+}
+
+/// Returns (row, col) of the kernel console cursor.
+pub fn sys_console_pos() -> (usize, usize) {
+    let ret = unsafe { syscall0(SYS_CONSOLE_POS) };
+    let row = (ret >> 32) as usize;
+    let col = (ret & 0xFFFF_FFFF) as usize;
+    (row, col)
 }
 
 pub fn sys_getpid() -> u64 {

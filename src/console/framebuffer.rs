@@ -12,6 +12,7 @@ static mut COLS: usize = 0;   // text columns
 static mut ROWS: usize = 0;   // text rows
 static mut COL: usize = 0;
 static mut ROW: usize = 0;
+static mut DISABLED: bool = false;
 
 // RGB channel bit positions
 static mut R_POS: u8 = 16;
@@ -42,6 +43,17 @@ pub unsafe fn init(
     B_POS = blue_pos;
 }
 
+/// Returns the current cursor position and disables the kernel framebuffer
+/// console. After this call, all framebuffer output is handled by the
+/// user-space console server.
+pub fn cursor_pos_and_disable() -> (usize, usize) {
+    unsafe {
+        let pos = (ROW, COL);
+        DISABLED = true;
+        pos
+    }
+}
+
 pub fn clear() {
     unsafe {
         let buf = FB as *mut u8;
@@ -55,6 +67,11 @@ pub fn clear() {
 }
 
 pub fn puts(s: &[u8]) {
+    unsafe {
+        if DISABLED {
+            return;
+        }
+    }
     for &b in s {
         putc(b);
     }
