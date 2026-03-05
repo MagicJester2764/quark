@@ -7,7 +7,7 @@ use libquark::{print, println, syscall};
 const PAGE_SIZE: usize = 4096;
 const BOOT_INFO_ADDR: usize = 0x80_4000_0000;
 const FILE_BUF_BASE: usize = 0x82_0000_0000;
-const ROOTFS_BASE: usize = 0x85_0000_0000;
+const BOOT_IMG_BASE: usize = 0x85_0000_0000;
 
 // ---------------------------------------------------------------------------
 // Boot info structures (matches kernel's BootInfo)
@@ -359,17 +359,17 @@ fn load_elf(elf_data: &[u8]) -> Result<SpawnInfo, ()> {
 // Rootfs loading
 // ---------------------------------------------------------------------------
 
-fn load_from_rootfs(rootfs_phys: usize, rootfs_size: usize) {
-    println!("[init] Mounting FAT32 rootfs");
+fn load_from_boot_image(rootfs_phys: usize, rootfs_size: usize) {
+    println!("[init] Mounting boot image");
 
     // Map the entire rootfs image
     let rootfs_pages = (rootfs_size + PAGE_SIZE - 1) / PAGE_SIZE;
-    if syscall::sys_map_phys(rootfs_phys, ROOTFS_BASE, rootfs_pages).is_err() {
-        println!("[init] Failed to map rootfs");
+    if syscall::sys_map_phys(rootfs_phys, BOOT_IMG_BASE, rootfs_pages).is_err() {
+        println!("[init] Failed to map boot image");
         return;
     }
 
-    let rootfs = unsafe { core::slice::from_raw_parts(ROOTFS_BASE as *const u8, rootfs_size) };
+    let rootfs = unsafe { core::slice::from_raw_parts(BOOT_IMG_BASE as *const u8, rootfs_size) };
     let bpb = parse_bpb(rootfs);
     let (entries, count) = scan_root_dir(rootfs, &bpb);
 
@@ -513,22 +513,22 @@ pub extern "C" fn _start() -> ! {
     let info = unsafe { &*(BOOT_INFO_ADDR as *const BootInfo) };
     let mod_count = info.module_count as usize;
 
-    // Find rootfs module
+    // Find boot image module
     let mut found = false;
     for i in 0..mod_count {
         let m = &info.modules[i];
         let name = module_name(&m.name);
-        if starts_with(name, b"rootfs") {
+        if starts_with(name, b"boot") {
             let phys = m.phys_start as usize;
             let size = (m.phys_end - m.phys_start) as usize;
-            load_from_rootfs(phys, size);
+            load_from_boot_image(phys, size);
             found = true;
             break;
         }
     }
 
     if !found {
-        println!("[init] ERROR: rootfs module not found!");
+        println!("[init] ERROR: boot image module not found!");
     }
 
     println!("[init] All programs loaded. Entering idle loop.");

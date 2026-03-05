@@ -28,11 +28,11 @@ User space provides:
 
 ### Boot process
 
-1. **GRUB or Bang** loads `kernel.bin`, `init.elf`, and `rootfs.img` as Multiboot2 modules
+1. **GRUB or Bang** loads `kernel.bin`, `init.elf`, and `boot.img` as Multiboot2 modules
 2. The 32-bit entry point (`boot.s`) sets up identity-mapped page tables (4 GiB via 2 MiB huge pages), enables long mode, and jumps to 64-bit Rust code
 3. The kernel initializes the scheduler, IPC, IDT, PIT, syscalls, and physical memory manager
 4. `spawn_init()` creates the init task with framebuffer info in a boot info page
-5. Init mounts the FAT32 rootfs and spawns services in order:
+5. Init mounts the FAT32 boot image and spawns services in order:
    - Pass 1: Nameserver (guarantees TID 2)
    - Pass 2: Console server (granted `CAP_MAP_PHYS`, receives framebuffer info via IPC)
    - Pass 3: Remaining programs (fds wired to console before starting)
