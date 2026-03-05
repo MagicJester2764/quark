@@ -123,7 +123,7 @@ pub extern "C" fn kernel_main(multiboot_info: usize) -> ! {
         console::puts(b"Loading init from module: ");
         console::puts(modules::name_str(m));
         console::puts(b"\n");
-        match userspace::spawn_init(elf_data) {
+        match userspace::spawn_init(elf_data, fb) {
             Some(tid) => {
                 console::puts(b"Init spawned (TID ");
                 print_dec(tid);

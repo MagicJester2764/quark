@@ -26,6 +26,7 @@ pub const SYS_PHYS_ALLOC: u64 = 44;
 pub const SYS_PHYS_FREE: u64 = 45;
 pub const SYS_GRANT_IOPORT: u64 = 46;
 pub const SYS_GRANT_IRQ: u64 = 47;
+pub const SYS_GRANT_CAP: u64 = 48;
 
 #[inline(always)]
 pub unsafe fn syscall0(nr: u64) -> u64 {
@@ -257,3 +258,15 @@ pub fn sys_grant_irq(tid: usize, irq: u8) -> Result<(), ()> {
     let ret = unsafe { syscall2(SYS_GRANT_IRQ, tid as u64, irq as u64) };
     if ret == u64::MAX { Err(()) } else { Ok(()) }
 }
+
+pub fn sys_grant_cap(tid: usize, caps: u32) -> Result<(), ()> {
+    let ret = unsafe { syscall2(SYS_GRANT_CAP, tid as u64, caps as u64) };
+    if ret == u64::MAX { Err(()) } else { Ok(()) }
+}
+
+// Capability bit constants
+pub const CAP_IOPORT: u32 = 1 << 0;
+pub const CAP_MAP_PHYS: u32 = 1 << 1;
+pub const CAP_IRQ: u32 = 1 << 2;
+pub const CAP_TASK_MGMT: u32 = 1 << 3;
+pub const CAP_PHYS_ALLOC: u32 = 1 << 4;

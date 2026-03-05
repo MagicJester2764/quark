@@ -17,12 +17,12 @@ SECTIONS {
     }
 
     .data : ALIGN(4K) {
-        *(.data .data.*)
+        *(.data .data.* .ldata .ldata.*)
     }
 
     .bss : ALIGN(4K) {
         *(COMMON)
-        *(.bss .bss.*)
+        *(.bss .bss.* .lbss .lbss.*)
     }
 
     /DISCARD/ : {

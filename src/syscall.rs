@@ -34,6 +34,7 @@ pub const SYS_PHYS_ALLOC: u64 = 44;
 pub const SYS_PHYS_FREE: u64 = 45;
 pub const SYS_GRANT_IOPORT: u64 = 46;
 pub const SYS_GRANT_IRQ: u64 = 47;
+pub const SYS_GRANT_CAP: u64 = 48;
 
 const SFMASK_VALUE: u64 = (1 << 9) | (1 << 10); // clear IF | DF
 
@@ -332,6 +333,18 @@ extern "C" fn syscall_dispatch(
             }
             let tid = arg0 as usize;
             match scheduler::grant_cap(tid, crate::task::CAP_IRQ) {
+                Ok(()) => 0,
+                Err(()) => u64::MAX,
+            }
+        }
+        SYS_GRANT_CAP => {
+            // arg0 = tid, arg1 = capability bits to grant
+            if !scheduler::current_task_has_cap(crate::task::CAP_TASK_MGMT) {
+                return u64::MAX;
+            }
+            let tid = arg0 as usize;
+            let caps = arg1 as u32;
+            match scheduler::grant_cap(tid, caps) {
                 Ok(()) => 0,
                 Err(()) => u64::MAX,
             }

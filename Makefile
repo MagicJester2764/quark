@@ -24,6 +24,9 @@ NS_ELF := $(NS_DIR)/target/$(TARGET)/release/nameserver
 KBD_DIR := user/keyboard
 KBD_ELF := $(KBD_DIR)/target/$(TARGET)/release/keyboard
 
+CON_DIR := user/console
+CON_ELF := $(CON_DIR)/target/$(TARGET)/release/console
+
 .PHONY: all clean iso run run-uefi drivers user FORCE
 
 all: $(KERNEL) drivers user
@@ -42,7 +45,7 @@ $(FAT32_DRV_BIN): FORCE
 	cd $(FAT32_DRV_DIR) && cargo build --release
 	objcopy -O binary $(FAT32_DRV_ELF) $(FAT32_DRV_BIN)
 
-user: $(INIT_ELF) $(HELLO_ELF) $(NS_ELF) $(KBD_ELF)
+user: $(INIT_ELF) $(HELLO_ELF) $(NS_ELF) $(KBD_ELF) $(CON_ELF)
 
 $(INIT_ELF): FORCE
 	cd $(INIT_DIR) && cargo build --release
@@ -55,6 +58,9 @@ $(NS_ELF): FORCE
 
 $(KBD_ELF): FORCE
 	cd $(KBD_DIR) && cargo build --release
+
+$(CON_ELF): FORCE
+	cd $(CON_DIR) && cargo build --release
 
 iso: $(KERNEL)
 	@mkdir -p isodir/boot/grub
@@ -79,6 +85,7 @@ clean:
 	cd $(HELLO_DIR) && cargo clean
 	cd $(NS_DIR) && cargo clean
 	cd $(KBD_DIR) && cargo clean
+	cd $(CON_DIR) && cargo clean
 	rm -rf $(KERNEL) $(VGA_DRV_BIN) $(FAT32_DRV_BIN) quark.iso isodir
 
 FORCE:

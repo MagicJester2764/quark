@@ -196,11 +196,21 @@ fn enter_user_inner(entry: u64, stack: u64, pml4: u64) {
     }
 }
 
-/// Boot info page layout at 0x200000 in init's address space.
-/// Contains information about boot modules so init can load them.
+/// Boot info page layout at BOOT_INFO_ADDR in init's address space.
+/// Contains information about boot modules and framebuffer so init can load them.
 #[repr(C)]
 pub struct BootInfo {
     pub module_count: u64,
+    pub fb_addr: u64,
+    pub fb_pitch: u32,
+    pub fb_width: u32,
+    pub fb_height: u32,
+    pub fb_bpp: u8,
+    pub fb_type: u8,
+    pub fb_red_pos: u8,
+    pub fb_green_pos: u8,
+    pub fb_blue_pos: u8,
+    _pad: [u8; 3],
     pub modules: [BootModuleDesc; 32],
 }
 
@@ -218,8 +228,8 @@ pub const BOOT_INFO_ADDR: usize = 0x80_4000_0000;
 /// Spawn the init process from ELF data (bootstrap only).
 ///
 /// Loads the ELF, creates a task with CAP_ALL, and maps a boot info page
-/// at BOOT_INFO_ADDR containing module descriptors.
-pub fn spawn_init(elf_data: &[u8]) -> Option<usize> {
+/// at BOOT_INFO_ADDR containing module descriptors and framebuffer info.
+pub fn spawn_init(elf_data: &[u8], fb: Option<crate::multiboot2::FramebufferInfo>) -> Option<usize> {
     let (pml4, entry, stack_top) = elf::load_elf(elf_data).ok()?;
 
     // Spawn a kernel task that will transition to user mode
@@ -244,6 +254,18 @@ pub fn spawn_init(elf_data: &[u8]) -> Option<usize> {
     unsafe {
         let info = info_frame.address() as *mut BootInfo;
         core::ptr::write_bytes(info, 0, 1);
+
+        if let Some(ref fbi) = fb {
+            (*info).fb_addr = fbi.addr;
+            (*info).fb_pitch = fbi.pitch;
+            (*info).fb_width = fbi.width;
+            (*info).fb_height = fbi.height;
+            (*info).fb_bpp = fbi.bpp;
+            (*info).fb_type = fbi.fb_type;
+            (*info).fb_red_pos = fbi.red_pos;
+            (*info).fb_green_pos = fbi.green_pos;
+            (*info).fb_blue_pos = fbi.blue_pos;
+        }
 
         let mod_count = crate::modules::count();
         (*info).module_count = mod_count as u64;

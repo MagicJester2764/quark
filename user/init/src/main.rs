@@ -1,6 +1,7 @@
 #![no_std]
 #![no_main]
 
+use libquark::ipc::Message;
 use libquark::syscall;
 
 const PAGE_SIZE: usize = 4096;
@@ -15,6 +16,16 @@ const ROOTFS_BASE: usize = 0x85_0000_0000;
 #[repr(C)]
 struct BootInfo {
     module_count: u64,
+    fb_addr: u64,
+    fb_pitch: u32,
+    fb_width: u32,
+    fb_height: u32,
+    fb_bpp: u8,
+    fb_type: u8,
+    fb_red_pos: u8,
+    fb_green_pos: u8,
+    fb_blue_pos: u8,
+    _pad: [u8; 3],
     modules: [BootModuleDesc; 32],
 }
 
@@ -375,12 +386,40 @@ fn load_from_rootfs(rootfs_phys: usize, rootfs_size: usize) {
         }
     }
 
-    // Pass 2: spawn remaining .ELF files
+    // Pass 2: spawn CONSOLE.ELF (needs framebuffer info from boot info)
+    for i in 0..count {
+        let e = &entries[i];
+        if &e.name[0..7] == b"CONSOLE" && &e.name[8..11] == b"ELF" {
+            syscall::sys_write(b"[init] Loading CONSOLE.ELF\n");
+            if let Ok(data) = read_file_to_buffer(rootfs, &bpb, e.first_cluster, e.file_size) {
+                match spawn_elf(data) {
+                    Ok(tid) => {
+                        // Grant MAP_PHYS so console can map the framebuffer
+                        let _ = syscall::sys_grant_cap(tid, syscall::CAP_MAP_PHYS);
+                        // Send framebuffer info via IPC
+                        send_fb_info(tid);
+                        syscall::sys_write(b"[init]   Console spawned TID ");
+                        print_dec(tid);
+                        syscall::sys_write(b"\n");
+                    }
+                    Err(()) => {
+                        syscall::sys_write(b"[init]   FAILED to spawn console\n");
+                    }
+                }
+            }
+            break;
+        }
+    }
+
+    // Pass 3: spawn remaining .ELF files
     for i in 0..count {
         let e = &entries[i];
 
-        // Skip nameserver (already spawned)
+        // Skip nameserver and console (already spawned)
         if &e.name[0..8] == b"NAMESRVR" {
+            continue;
+        }
+        if &e.name[0..7] == b"CONSOLE" && &e.name[8..11] == b"ELF" {
             continue;
         }
 
@@ -447,6 +486,37 @@ pub extern "C" fn _start() -> ! {
 
     loop {
         syscall::sys_yield();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Framebuffer info handoff to console server
+// ---------------------------------------------------------------------------
+
+fn send_fb_info(console_tid: usize) {
+    let info = unsafe { &*(BOOT_INFO_ADDR as *const BootInfo) };
+
+    // Pack framebuffer info into one IPC message
+    // data[0] = physical address
+    // data[1] = (width << 32) | height
+    // data[2] = (pitch << 32) | bpp
+    // data[3] = (red_pos << 16) | (green_pos << 8) | blue_pos
+    let msg = Message {
+        sender: 0,
+        tag: 100, // TAG_FB_INIT
+        data: [
+            info.fb_addr,
+            ((info.fb_width as u64) << 32) | (info.fb_height as u64),
+            ((info.fb_pitch as u64) << 32) | (info.fb_bpp as u64),
+            ((info.fb_red_pos as u64) << 16) | ((info.fb_green_pos as u64) << 8) | (info.fb_blue_pos as u64),
+            0,
+            0,
+        ],
+    };
+
+    let mut reply = Message::empty();
+    if syscall::sys_call(console_tid, &msg, &mut reply).is_err() {
+        syscall::sys_write(b"[init] Failed to send FB info to console\n");
     }
 }
 
