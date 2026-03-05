@@ -399,15 +399,17 @@ fn load_from_rootfs(rootfs_phys: usize, rootfs_size: usize) {
         }
     }
 
-    // Pass 3: spawn remaining .ELF files
+    // Pass 3: spawn remaining .ELF files (except INPUT.ELF which needs keyboard first)
+    let mut spawned_tids = [0usize; 32];
+    let mut spawned_count = 0usize;
     for i in 0..count {
         let e = &entries[i];
 
-        // Skip nameserver and console (already spawned)
-        if &e.name[0..8] == b"NAMESRVR" {
+        // Skip already-spawned and input (deferred)
+        if &e.name[0..8] == b"NAMESRVR" || (&e.name[0..8] == b"CONSOLE " && &e.name[8..11] == b"ELF") {
             continue;
         }
-        if &e.name[0..8] == b"CONSOLE " && &e.name[8..11] == b"ELF" {
+        if &e.name[0..8] == b"INPUT   " && &e.name[8..11] == b"ELF" {
             continue;
         }
 
@@ -432,10 +434,45 @@ fn load_from_rootfs(rootfs_phys: usize, rootfs_size: usize) {
                         let _ = syscall::sys_fd_set(tid, 1, console_tid, 1); // TAG_WRITE=1
                         let _ = syscall::sys_fd_set(tid, 2, console_tid, 1);
                     }
+                    if spawned_count < 32 {
+                        spawned_tids[spawned_count] = tid;
+                        spawned_count += 1;
+                    }
                     println!("[init]   Spawned TID {}", tid);
                 }
                 Err(()) => println!("[init]   FAILED to spawn"),
             }
+        }
+    }
+
+    // Pass 4: spawn INPUT.ELF (needs keyboard to be running)
+    let mut input_tid: usize = 0;
+    for i in 0..count {
+        let e = &entries[i];
+        if &e.name[0..8] == b"INPUT   " && &e.name[8..11] == b"ELF" {
+            println!("[init] Loading INPUT.ELF");
+            if let Ok(data) = read_file_to_buffer(rootfs, &bpb, e.first_cluster, e.file_size) {
+                match spawn_elf(data) {
+                    Ok(tid) => {
+                        input_tid = tid;
+                        // Wire input server's stdout/stderr to console
+                        if console_tid != 0 {
+                            let _ = syscall::sys_fd_set(tid, 1, console_tid, 1);
+                            let _ = syscall::sys_fd_set(tid, 2, console_tid, 1);
+                        }
+                        println!("[init]   Input spawned TID {}", tid);
+                    }
+                    Err(()) => println!("[init]   FAILED to spawn input"),
+                }
+            }
+            break;
+        }
+    }
+
+    // Wire fd 0 (stdin) to input server for all previously spawned tasks
+    if input_tid != 0 {
+        for i in 0..spawned_count {
+            let _ = syscall::sys_fd_set(spawned_tids[i], 0, input_tid, 1); // TAG_READ=1
         }
     }
 }

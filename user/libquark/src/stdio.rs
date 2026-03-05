@@ -38,6 +38,13 @@ pub fn _eprint(args: fmt::Arguments) {
     Stderr.write_fmt(args).unwrap();
 }
 
+/// Read a line from stdin (fd 0) into `buf`. Returns the number of bytes read.
+/// Blocks until a line is available. Returns 0 if stdin is not connected.
+pub fn read_line(buf: &mut [u8]) -> usize {
+    let ret = syscall::sys_fd_read(0, buf);
+    if ret == u64::MAX { 0 } else { ret as usize }
+}
+
 #[macro_export]
 macro_rules! print {
     ($($arg:tt)*) => {

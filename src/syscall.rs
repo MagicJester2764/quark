@@ -37,6 +37,7 @@ pub const SYS_GRANT_IRQ: u64 = 47;
 pub const SYS_GRANT_CAP: u64 = 48;
 
 pub const SYS_FD_WRITE: u64 = 50;
+pub const SYS_FD_READ: u64 = 51;
 pub const SYS_FD_SET: u64 = 52;
 
 const SFMASK_VALUE: u64 = (1 << 9) | (1 << 10); // clear IF | DF
@@ -140,6 +141,35 @@ fn fd_write_ipc(target_tid: usize, tag: u64, ptr: *const u8, len: usize) -> u64 
         offset += chunk;
     }
     len as u64
+}
+
+/// Send a read request via IPC to a service, copy response into user buffer.
+/// Returns bytes read, or u64::MAX on error.
+fn fd_read_ipc(target_tid: usize, tag: u64, ptr: *mut u8, max_len: usize) -> u64 {
+    let request_len = max_len.min(FD_WRITE_MAX_CHUNK);
+    let msg = crate::ipc::Message {
+        sender: 0,
+        tag,
+        data: [request_len as u64, 0, 0, 0, 0, 0],
+    };
+    match crate::ipc::sys_call(target_tid, &msg) {
+        Ok(reply) => {
+            let actual = (reply.data[0] as usize).min(request_len);
+            // Unpack bytes from reply.data[1..6]
+            let buf = unsafe { core::slice::from_raw_parts_mut(ptr, actual) };
+            for i in 0..5 {
+                let base = i * 8;
+                let bytes = reply.data[i + 1].to_le_bytes();
+                for j in 0..8 {
+                    if base + j < actual {
+                        buf[base + j] = bytes[j];
+                    }
+                }
+            }
+            actual as u64
+        }
+        Err(_) => u64::MAX,
+    }
 }
 
 /// Called from assembly with 6 args mapped from user registers.
@@ -415,6 +445,21 @@ extern "C" fn syscall_dispatch(
                         u64::MAX
                     }
                 }
+            }
+        }
+        SYS_FD_READ => {
+            // arg0 = fd, arg1 = buf ptr, arg2 = max len
+            let fd = arg0 as usize;
+            let ptr = arg1 as *mut u8;
+            let max_len = arg2 as usize;
+            if max_len > 0 && !ptr.is_null() && !validate_user_ptr(arg1, arg2) {
+                return u64::MAX;
+            }
+            match scheduler::current_fd(fd) {
+                Some(entry) => {
+                    fd_read_ipc(entry.target_tid, entry.tag, ptr, max_len)
+                }
+                None => u64::MAX,
             }
         }
         SYS_FD_SET => {

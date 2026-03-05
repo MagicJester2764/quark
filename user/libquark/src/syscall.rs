@@ -29,6 +29,7 @@ pub const SYS_GRANT_IRQ: u64 = 47;
 pub const SYS_GRANT_CAP: u64 = 48;
 
 pub const SYS_FD_WRITE: u64 = 50;
+pub const SYS_FD_READ: u64 = 51;
 pub const SYS_FD_SET: u64 = 52;
 
 #[inline(always)]
@@ -269,6 +270,10 @@ pub fn sys_grant_cap(tid: usize, caps: u32) -> Result<(), ()> {
 
 pub fn sys_fd_write(fd: usize, buf: &[u8]) -> u64 {
     unsafe { syscall3(SYS_FD_WRITE, fd as u64, buf.as_ptr() as u64, buf.len() as u64) }
+}
+
+pub fn sys_fd_read(fd: usize, buf: &mut [u8]) -> u64 {
+    unsafe { syscall3(SYS_FD_READ, fd as u64, buf.as_mut_ptr() as u64, buf.len() as u64) }
 }
 
 pub fn sys_fd_set(tid: usize, fd: usize, service_tid: usize, tag: u64) -> Result<(), ()> {
