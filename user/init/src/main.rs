@@ -382,7 +382,7 @@ fn load_from_rootfs(rootfs_phys: usize, rootfs_size: usize) {
     let mut console_tid: usize = 0;
     for i in 0..count {
         let e = &entries[i];
-        if &e.name[0..7] == b"CONSOLE" && &e.name[8..11] == b"ELF" {
+        if &e.name[0..8] == b"CONSOLE " && &e.name[8..11] == b"ELF" {
             println!("[init] Loading CONSOLE.ELF");
             if let Ok(data) = read_file_to_buffer(rootfs, &bpb, e.first_cluster, e.file_size) {
                 match spawn_elf(data) {
@@ -407,7 +407,7 @@ fn load_from_rootfs(rootfs_phys: usize, rootfs_size: usize) {
         if &e.name[0..8] == b"NAMESRVR" {
             continue;
         }
-        if &e.name[0..7] == b"CONSOLE" && &e.name[8..11] == b"ELF" {
+        if &e.name[0..8] == b"CONSOLE " && &e.name[8..11] == b"ELF" {
             continue;
         }
 
