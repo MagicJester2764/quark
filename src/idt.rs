@@ -411,7 +411,13 @@ extern "C" fn irq_handler(frame: &InterruptFrame) {
                 return;
             }
         }
-        _ => {}
+        _ => {
+            // Try user-space dispatch for all other IRQs
+            if crate::irq_dispatch::dispatch_irq(irq) {
+                unsafe { pic::send_eoi(irq) };
+                return;
+            }
+        }
     }
 
     unsafe { pic::send_eoi(irq) };

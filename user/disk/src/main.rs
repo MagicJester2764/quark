@@ -150,12 +150,9 @@ fn ata_identify() -> bool {
 
     // Print drive info
     if let Ok(model_str) = core::str::from_utf8(&model[..model_len]) {
-        println!("[disk] ATA drive: {} ({} sectors, {} MiB)",
-            model_str, lba28_sectors, lba28_sectors / 2048);
-    } else {
-        println!("[disk] ATA drive: ({} sectors, {} MiB)",
-            lba28_sectors, lba28_sectors / 2048);
+        println!("[disk] ATA drive: {}", model_str);
     }
+    println!("[disk] {} sectors ({} MiB)", lba28_sectors, lba28_sectors / 2048);
 
     true
 }

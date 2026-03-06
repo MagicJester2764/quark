@@ -2,7 +2,7 @@
 #![no_main]
 
 use libquark::ipc::Message;
-use libquark::{print, println, syscall};
+use libquark::{println, syscall};
 
 const NAMESERVER_TID: usize = 2;
 
@@ -106,20 +106,36 @@ pub extern "C" fn _start() -> ! {
     let data = unsafe { core::slice::from_raw_parts(BUF_VADDR as *const u8, 64) };
     for row in 0..4 {
         let off = row * 16;
-        print!("{:04x}: ", off);
-        for i in 0..16 {
-            print!("{:02x} ", data[off + i]);
-        }
-        print!(" |");
+        // Build entire line in a buffer to print atomically
+        let mut line = [0u8; 80]; // "XXXX: XX XX ... XX  |................|\n"
+        let mut pos = 0;
+        // Offset
+        let hex_chars = b"0123456789abcdef";
+        line[pos] = hex_chars[((off >> 12) & 0xF) as usize]; pos += 1;
+        line[pos] = hex_chars[((off >> 8) & 0xF) as usize]; pos += 1;
+        line[pos] = hex_chars[((off >> 4) & 0xF) as usize]; pos += 1;
+        line[pos] = hex_chars[(off & 0xF) as usize]; pos += 1;
+        line[pos] = b':'; pos += 1;
+        line[pos] = b' '; pos += 1;
+        // Hex bytes
         for i in 0..16 {
             let b = data[off + i];
-            if b >= 0x20 && b < 0x7F {
-                print!("{}", b as char);
-            } else {
-                print!(".");
-            }
+            line[pos] = hex_chars[(b >> 4) as usize]; pos += 1;
+            line[pos] = hex_chars[(b & 0xF) as usize]; pos += 1;
+            line[pos] = b' '; pos += 1;
         }
-        println!("|");
+        // ASCII
+        line[pos] = b' '; pos += 1;
+        line[pos] = b'|'; pos += 1;
+        for i in 0..16 {
+            let b = data[off + i];
+            line[pos] = if b >= 0x20 && b < 0x7F { b } else { b'.' };
+            pos += 1;
+        }
+        line[pos] = b'|'; pos += 1;
+        if let Ok(s) = core::str::from_utf8(&line[..pos]) {
+            println!("{}", s);
+        }
     }
 
     println!("[disktest] Done.");

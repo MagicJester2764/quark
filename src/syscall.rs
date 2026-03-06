@@ -258,6 +258,7 @@ extern "C" fn syscall_dispatch(
             let irq = arg0 as u8;
             let tid = scheduler::current_tid();
             crate::irq_dispatch::register_irq_handler(irq, tid);
+            unsafe { crate::pic::enable_irq(irq) };
             0
         }
         SYS_IRQ_ACK => {

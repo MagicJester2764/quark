@@ -2,7 +2,7 @@
 #![no_main]
 
 use libquark::ipc::Message;
-use libquark::{print, println, syscall};
+use libquark::{println, syscall};
 
 const PAGE_SIZE: usize = 4096;
 const BOOT_INFO_ADDR: usize = 0x80_4000_0000;
@@ -439,9 +439,11 @@ fn load_from_boot_image(rootfs_phys: usize, rootfs_size: usize) {
             continue;
         }
 
-        print!("[init] Loading ");
-        print_fat_name(&e.name);
-        println!();
+        let mut namebuf = [0u8; 16];
+        let namelen = fat_name_to_buf(&e.name, &mut namebuf);
+        if let Ok(fname) = core::str::from_utf8(&namebuf[..namelen]) {
+            println!("[init] Loading {}", fname);
+        }
 
         if let Ok(data) = read_file_to_buffer(rootfs, &bpb, e.first_cluster, e.file_size) {
             match load_elf(data) {
@@ -598,23 +600,35 @@ fn starts_with(haystack: &[u8], needle: &[u8]) -> bool {
     haystack[..needle.len()] == *needle
 }
 
-fn print_fat_name(name: &[u8; 11]) {
+fn fat_name_to_buf(name: &[u8; 11], buf: &mut [u8; 16]) -> usize {
     let base_len = name[0..8]
         .iter()
         .rposition(|&b| b != b' ')
         .map_or(0, |p| p + 1);
-    if let Ok(base) = core::str::from_utf8(&name[..base_len]) {
-        print!("{}", base);
+    let mut pos = 0;
+    for i in 0..base_len {
+        if pos < buf.len() {
+            buf[pos] = name[i];
+            pos += 1;
+        }
     }
     let ext_len = name[8..11]
         .iter()
         .rposition(|&b| b != b' ')
         .map_or(0, |p| p + 1);
     if ext_len > 0 {
-        if let Ok(ext) = core::str::from_utf8(&name[8..8 + ext_len]) {
-            print!(".{}", ext);
+        if pos < buf.len() {
+            buf[pos] = b'.';
+            pos += 1;
+        }
+        for i in 0..ext_len {
+            if pos < buf.len() {
+                buf[pos] = name[8 + i];
+                pos += 1;
+            }
         }
     }
+    pos
 }
 
 #[panic_handler]
