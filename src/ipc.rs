@@ -119,7 +119,15 @@ pub fn sys_recv(from: usize) -> Result<Message, IpcError> {
             };
             if dest == receiver && (from == TID_ANY || from == tid) {
                 let was_call = matches!(TASK_IPC[tid].state, IpcState::CallSendBlocked(_));
-                let msg = TASK_IPC[tid].pending_msg.take().unwrap();
+                let msg = match TASK_IPC[tid].pending_msg.take() {
+                    Some(m) => m,
+                    None => {
+                        // Inconsistent state: reset sender and skip
+                        TASK_IPC[tid].state = IpcState::None;
+                        scheduler::unblock_task(tid);
+                        continue;
+                    }
+                };
                 if was_call {
                     // Transition to CallBlocked — keep blocked, waiting for reply
                     TASK_IPC[tid].state = IpcState::CallBlocked(receiver);
@@ -212,7 +220,13 @@ pub fn sys_call(dest: usize, msg: &Message) -> Result<Message, IpcError> {
         }
 
         // Reply arrived
-        let reply = TASK_IPC[caller].pending_msg.take().unwrap();
+        let reply = match TASK_IPC[caller].pending_msg.take() {
+            Some(m) => m,
+            None => {
+                TASK_IPC[caller].state = IpcState::None;
+                return Err(IpcError::DeadTask);
+            }
+        };
         TASK_IPC[caller].state = IpcState::None;
         Ok(reply)
     }
@@ -236,6 +250,55 @@ pub fn sys_reply(dest: usize, msg: &Message) -> Result<(), IpcError> {
                 Ok(())
             }
             _ => Err(IpcError::NotWaiting),
+        }
+    }
+}
+
+/// Clean up IPC state when a task dies.
+/// Unblocks any tasks that were blocked waiting on the dead task.
+pub fn cleanup_task_ipc(dead_tid: usize) {
+    if dead_tid >= MAX_TASKS {
+        return;
+    }
+
+    unsafe {
+        // Clear the dead task's own IPC state
+        TASK_IPC[dead_tid].state = IpcState::None;
+        TASK_IPC[dead_tid].pending_msg = None;
+
+        // Scan all tasks for those blocked on the dead task
+        let error_msg = Message {
+            sender: dead_tid,
+            tag: u64::MAX,
+            data: [0; 6],
+        };
+
+        for tid in 0..MAX_TASKS {
+            if tid == dead_tid {
+                continue;
+            }
+            match TASK_IPC[tid].state {
+                IpcState::SendBlocked(dest) if dest == dead_tid => {
+                    TASK_IPC[tid].state = IpcState::None;
+                    scheduler::unblock_task(tid);
+                }
+                IpcState::CallSendBlocked(dest) if dest == dead_tid => {
+                    TASK_IPC[tid].pending_msg = Some(error_msg);
+                    TASK_IPC[tid].state = IpcState::None;
+                    scheduler::unblock_task(tid);
+                }
+                IpcState::CallBlocked(dest) if dest == dead_tid => {
+                    TASK_IPC[tid].pending_msg = Some(error_msg);
+                    TASK_IPC[tid].state = IpcState::None;
+                    scheduler::unblock_task(tid);
+                }
+                IpcState::RecvBlocked(from) if from == dead_tid => {
+                    TASK_IPC[tid].pending_msg = Some(error_msg);
+                    TASK_IPC[tid].state = IpcState::None;
+                    scheduler::unblock_task(tid);
+                }
+                _ => {}
+            }
         }
     }
 }

@@ -26,6 +26,7 @@ pub const SYS_IRQ_REGISTER: u64 = 30;
 pub const SYS_IRQ_ACK: u64 = 31;
 pub const SYS_IOPORT: u64 = 32;
 pub const SYS_MAP_PHYS: u64 = 33;
+pub const SYS_IOPORT_REP: u64 = 34;
 
 pub const SYS_TASK_CREATE: u64 = 40;
 pub const SYS_ADDRSPACE_CREATE: u64 = 41;
@@ -101,7 +102,7 @@ const USER_ADDR_LIMIT: u64 = 0x0000_8000_0000_0000;
 
 /// Validate that a user pointer range is entirely in user space.
 fn validate_user_ptr(addr: u64, len: u64) -> bool {
-    addr < USER_ADDR_LIMIT && len <= USER_ADDR_LIMIT && addr + len <= USER_ADDR_LIMIT
+    addr.checked_add(len).map_or(false, |end| end <= USER_ADDR_LIMIT)
 }
 
 /// Maximum bytes per IPC write message (5 data words × 8 bytes).
@@ -283,6 +284,33 @@ extern "C" fn syscall_dispatch(
                 _ => u64::MAX,
             }
         }
+        SYS_IOPORT_REP => {
+            // arg0=port, arg1=user_buf_ptr, arg2=count (words), arg3=op (0=insw, 1=outsw)
+            if !scheduler::current_task_has_cap(crate::task::CAP_IOPORT) {
+                return u64::MAX;
+            }
+            let port = arg0 as u16;
+            let buf = arg1;
+            let count = arg2 as usize;
+            let op = arg3;
+            if count == 0 {
+                return 0;
+            }
+            if !validate_user_ptr(buf, (count as u64).saturating_mul(2)) {
+                return u64::MAX;
+            }
+            match op {
+                0 => {
+                    unsafe { crate::io::rep_insw(port, buf as *mut u16, count) };
+                    0
+                }
+                1 => {
+                    unsafe { crate::io::rep_outsw(port, buf as *const u16, count) };
+                    0
+                }
+                _ => u64::MAX,
+            }
+        }
         SYS_MAP_PHYS => {
             if !scheduler::current_task_has_cap(crate::task::CAP_MAP_PHYS) {
                 return u64::MAX;
@@ -402,6 +430,9 @@ extern "C" fn syscall_dispatch(
             if !scheduler::current_task_has_cap(crate::task::CAP_TASK_MGMT) {
                 return u64::MAX;
             }
+            if !scheduler::current_task_has_cap(crate::task::CAP_IOPORT) {
+                return u64::MAX;
+            }
             let tid = arg0 as usize;
             match scheduler::grant_cap(tid, crate::task::CAP_IOPORT) {
                 Ok(()) => 0,
@@ -411,6 +442,9 @@ extern "C" fn syscall_dispatch(
         SYS_GRANT_IRQ => {
             // arg0 = tid, arg1 = irq
             if !scheduler::current_task_has_cap(crate::task::CAP_TASK_MGMT) {
+                return u64::MAX;
+            }
+            if !scheduler::current_task_has_cap(crate::task::CAP_IRQ) {
                 return u64::MAX;
             }
             let tid = arg0 as usize;
@@ -426,6 +460,10 @@ extern "C" fn syscall_dispatch(
             }
             let tid = arg0 as usize;
             let caps = arg1 as u32;
+            let caller_caps = scheduler::current_task_caps();
+            if caps & !caller_caps != 0 {
+                return u64::MAX;
+            }
             match scheduler::grant_cap(tid, caps) {
                 Ok(()) => 0,
                 Err(()) => u64::MAX,

@@ -126,9 +126,7 @@ fn ata_identify() -> bool {
 
     // Read 256 words of identify data
     let mut identify = [0u16; 256];
-    for i in 0..256 {
-        identify[i] = syscall::sys_ioport_read16(ATA_DATA);
-    }
+    let _ = syscall::sys_ioport_rep_insw(ATA_DATA, &mut identify);
 
     // Extract model string (words 27-46, swapped byte pairs)
     let mut model = [0u8; 40];
@@ -188,9 +186,7 @@ fn ata_read_sector(lba: u32, buf: *mut u8) -> bool {
 
     // Read 256 words (512 bytes)
     let words = unsafe { core::slice::from_raw_parts_mut(buf as *mut u16, 256) };
-    for i in 0..256 {
-        words[i] = syscall::sys_ioport_read16(ATA_DATA);
-    }
+    let _ = syscall::sys_ioport_rep_insw(ATA_DATA, words);
 
     true
 }

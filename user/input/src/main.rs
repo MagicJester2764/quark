@@ -40,7 +40,6 @@ pub extern "C" fn _start() -> ! {
 
     let mut line_buf = [0u8; LINE_BUF_SIZE];
     let mut line_len: usize = 0;
-    let mut waiting_reader: Option<(usize, usize)> = None; // (tid, max_bytes)
 
     // Main loop: multiplex between keyboard events and reader requests.
     // We alternate between polling keyboard and checking for reader requests.

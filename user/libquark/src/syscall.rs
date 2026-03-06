@@ -19,6 +19,7 @@ pub const SYS_IRQ_REGISTER: u64 = 30;
 pub const SYS_IRQ_ACK: u64 = 31;
 pub const SYS_IOPORT: u64 = 32;
 pub const SYS_MAP_PHYS: u64 = 33;
+pub const SYS_IOPORT_REP: u64 = 34;
 pub const SYS_TASK_CREATE: u64 = 40;
 pub const SYS_ADDRSPACE_CREATE: u64 = 41;
 pub const SYS_ADDRSPACE_MAP: u64 = 42;
@@ -262,6 +263,20 @@ pub fn sys_ioport_read32(port: u16) -> u32 {
 
 pub fn sys_ioport_write32(port: u16, val: u32) {
     unsafe { syscall3(SYS_IOPORT, port as u64, 5, val as u64) };
+}
+
+pub fn sys_ioport_rep_insw(port: u16, buf: &mut [u16]) -> Result<(), ()> {
+    let ret = unsafe {
+        syscall4(SYS_IOPORT_REP, port as u64, buf.as_mut_ptr() as u64, buf.len() as u64, 0)
+    };
+    if ret == u64::MAX { Err(()) } else { Ok(()) }
+}
+
+pub fn sys_ioport_rep_outsw(port: u16, buf: &[u16]) -> Result<(), ()> {
+    let ret = unsafe {
+        syscall4(SYS_IOPORT_REP, port as u64, buf.as_ptr() as u64, buf.len() as u64, 1)
+    };
+    if ret == u64::MAX { Err(()) } else { Ok(()) }
 }
 
 pub fn sys_irq_register(irq: u8) -> Result<(), ()> {

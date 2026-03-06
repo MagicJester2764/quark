@@ -96,6 +96,20 @@ pub fn dispatch_irq(irq: u8) -> bool {
     }
 }
 
+/// Unregister all IRQ handlers for a dead task and drain its ring buffers.
+pub fn unregister_task_irqs(tid: usize) {
+    unsafe {
+        for irq in 0..MAX_IRQS {
+            if IRQ_HAS_HANDLER[irq] && IRQ_HANDLERS[irq] == tid {
+                IRQ_HAS_HANDLER[irq] = false;
+                IRQ_HANDLERS[irq] = 0;
+                // Drain the ring buffer
+                IRQ_RINGS[irq] = IrqRing::new();
+            }
+        }
+    }
+}
+
 /// Poll for a pending IRQ message destined for a given task.
 /// Checks all IRQ ring buffers registered to this TID.
 pub fn poll_irq_message(tid: usize) -> Option<Message> {

@@ -227,6 +227,80 @@ pub unsafe fn map_page(
     Ok(())
 }
 
+/// Destroy a user address space, freeing all user page tables and mapped frames.
+///
+/// - PML4[0]: Free the deep-copied PDPT frame only (PD children are kernel-shared).
+/// - PML4[1..255]: Recursively free entire subtree (user-only).
+/// - PML4[256..511]: Skip (kernel upper-half, shared).
+/// - Free the PML4 frame itself.
+///
+/// # Safety
+/// `pml4_phys` must be a valid user address space (not the kernel CR3).
+pub unsafe fn destroy_address_space(pml4_phys: usize) {
+    if pml4_phys == 0 || pml4_phys == kernel_cr3() {
+        return;
+    }
+
+    let pml4 = table_at(pml4_phys);
+
+    // PML4[0]: free only the deep-copied PDPT frame, not its children
+    if pml4.entries[0].is_present() {
+        let pdpt_phys = pml4.entries[0].frame_address();
+        pmm::free(pmm::PhysFrame::from_address(pdpt_phys));
+    }
+
+    // PML4[1..255]: user-space entries — free entire subtrees
+    for i in 1..256 {
+        if pml4.entries[i].is_present() {
+            let pdpt_phys = pml4.entries[i].frame_address();
+            free_pdpt_tree(pdpt_phys);
+        }
+    }
+
+    // PML4[256..511]: kernel upper-half — skip
+
+    // Free the PML4 frame itself
+    pmm::free(pmm::PhysFrame::from_address(pml4_phys));
+}
+
+unsafe fn free_pdpt_tree(pdpt_phys: usize) {
+    let pdpt = table_at(pdpt_phys);
+    for i in 0..512 {
+        if pdpt.entries[i].is_present() && !pdpt.entries[i].is_huge() {
+            let pd_phys = pdpt.entries[i].frame_address();
+            free_pd_tree(pd_phys);
+        }
+    }
+    pmm::free(pmm::PhysFrame::from_address(pdpt_phys));
+}
+
+unsafe fn free_pd_tree(pd_phys: usize) {
+    let pd = table_at(pd_phys);
+    for i in 0..512 {
+        if pd.entries[i].is_present() {
+            if pd.entries[i].is_huge() {
+                // 2M huge page leaf — nothing to recurse, but don't free
+                // (these shouldn't appear in user space normally)
+                continue;
+            }
+            let pt_phys = pd.entries[i].frame_address();
+            free_pt_leaves(pt_phys);
+        }
+    }
+    pmm::free(pmm::PhysFrame::from_address(pd_phys));
+}
+
+unsafe fn free_pt_leaves(pt_phys: usize) {
+    let pt = table_at(pt_phys);
+    for i in 0..512 {
+        if pt.entries[i].is_present() {
+            let frame_phys = pt.entries[i].frame_address();
+            pmm::free(pmm::PhysFrame::from_address(frame_phys));
+        }
+    }
+    pmm::free(pmm::PhysFrame::from_address(pt_phys));
+}
+
 /// Unmap a 4 KiB virtual page. Returns the physical frame address that was mapped.
 ///
 /// The caller is responsible for freeing the returned frame if desired.

@@ -194,7 +194,8 @@ unsafe fn dequeue_ready() -> Option<usize> {
 /// Add a task TID to the back of the ready queue.
 unsafe fn enqueue(tid: usize) {
     if READY_COUNT >= MAX_TASKS {
-        return; // queue full
+        crate::console::puts(b"scheduler: ready queue full, dropping task\n");
+        return;
     }
     READY_QUEUE[READY_TAIL] = tid;
     READY_TAIL = (READY_TAIL + 1) % MAX_TASKS;
@@ -246,16 +247,36 @@ pub unsafe fn get_task_mut(tid: usize) -> Option<&'static mut Task> {
     }
 }
 
-/// Reap dead tasks (free their stacks).
+/// Reap dead tasks (clean up IPC, IRQs, address space, and free stacks).
 pub fn reap_dead() {
     unsafe {
         for i in 1..MAX_TASKS {
             if let Some(ref mut task) = TASKS[i] {
                 if task.state == TaskState::Dead {
+                    // Clean up IPC state and unblock tasks waiting on this one
+                    crate::ipc::cleanup_task_ipc(i);
+                    // Unregister any IRQ handlers
+                    crate::irq_dispatch::unregister_task_irqs(i);
+                    // Destroy user address space
+                    let cr3 = task.cr3;
+                    if cr3 != 0 && cr3 != crate::paging::kernel_cr3() {
+                        crate::paging::destroy_address_space(cr3);
+                    }
                     task.free_stack();
                     TASKS[i] = None;
                 }
             }
+        }
+    }
+}
+
+/// Get the current task's capability bits.
+pub fn current_task_caps() -> u32 {
+    let tid = current_tid();
+    unsafe {
+        match TASKS[tid].as_ref() {
+            Some(task) => task.caps,
+            None => 0,
         }
     }
 }

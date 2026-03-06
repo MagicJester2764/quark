@@ -66,6 +66,34 @@ pub unsafe fn inl(port: u16) -> u32 {
     val
 }
 
+/// Read `count` 16-bit words from an I/O port into a buffer using `rep insw`.
+///
+/// # Safety
+/// `buf` must point to at least `count * 2` writable bytes.
+pub unsafe fn rep_insw(port: u16, buf: *mut u16, count: usize) {
+    core::arch::asm!(
+        "rep insw",
+        in("dx") port,
+        inout("rdi") buf => _,
+        inout("rcx") count => _,
+        options(att_syntax, nostack)
+    );
+}
+
+/// Write `count` 16-bit words from a buffer to an I/O port using `rep outsw`.
+///
+/// # Safety
+/// `buf` must point to at least `count * 2` readable bytes.
+pub unsafe fn rep_outsw(port: u16, buf: *const u16, count: usize) {
+    core::arch::asm!(
+        "rep outsw",
+        in("dx") port,
+        inout("rsi") buf => _,
+        inout("rcx") count => _,
+        options(att_syntax, nostack)
+    );
+}
+
 /// Small delay for PIC initialization timing (write to unused port 0x80).
 pub unsafe fn io_wait() {
     outb(0x80, 0);
