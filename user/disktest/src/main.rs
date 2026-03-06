@@ -31,8 +31,8 @@ fn lookup_service(name: &[u8]) -> Option<usize> {
     };
 
     let mut reply = Message::empty();
-    if syscall::sys_call(NAMESERVER_TID, &msg, &mut reply).is_ok() && reply.data[0] != 0 {
-        Some(reply.data[0] as usize)
+    if syscall::sys_call(NAMESERVER_TID, &msg, &mut reply).is_ok() && reply.tag != u64::MAX {
+        Some(reply.tag as usize)
     } else {
         None
     }
@@ -49,12 +49,17 @@ pub extern "C" fn _start() -> ! {
     }
 
     // Look up disk service
+    let mut attempts = 0;
     let disk_tid = loop {
         if let Some(tid) = lookup_service(b"disk") {
-            println!("[disktest] Found disk server at TID {}.", tid);
+            println!("[disktest] Found disk at TID {}.", tid);
             break tid;
         }
-        println!("[disktest] Waiting for disk server...");
+        attempts += 1;
+        if attempts >= 20 {
+            println!("[disktest] Disk server not found.");
+            syscall::sys_exit();
+        }
         for _ in 0..100 {
             syscall::sys_yield();
         }

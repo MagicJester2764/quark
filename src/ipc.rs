@@ -145,7 +145,16 @@ pub fn sys_recv(from: usize) -> Result<Message, IpcError> {
         scheduler::block_task(receiver);
         scheduler::yield_now();
 
-        // When we wake up, check IRQ messages first (may have been unblocked by IRQ)
+        // When we wake up, check if an IPC message was delivered first.
+        // This must come before IRQ polling — otherwise an IRQ arriving
+        // between the IPC delivery and our resume would cause us to
+        // return the IRQ message and orphan the IPC message.
+        if let Some(msg) = TASK_IPC[receiver].pending_msg.take() {
+            TASK_IPC[receiver].state = IpcState::None;
+            return Ok(msg);
+        }
+
+        // No IPC message — we were woken by an IRQ dispatch
         if from == 0 || from == TID_ANY {
             if let Some(msg) = crate::irq_dispatch::poll_irq_message(receiver) {
                 TASK_IPC[receiver].state = IpcState::None;
@@ -153,10 +162,9 @@ pub fn sys_recv(from: usize) -> Result<Message, IpcError> {
             }
         }
 
-        // When we wake up, message was delivered to our pending slot
-        let msg = TASK_IPC[receiver].pending_msg.take().unwrap();
+        // Should not reach here — either IPC or IRQ should have woken us
         TASK_IPC[receiver].state = IpcState::None;
-        Ok(msg)
+        Err(IpcError::WouldBlock)
     }
 }
 
