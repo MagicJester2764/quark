@@ -631,11 +631,12 @@ impl DiskReader {
     }
 }
 
-fn disk_scan_root_dir(disk: &DiskReader) -> ([RootDirEntry; MAX_DIR_ENTRIES], usize) {
+/// Scan a directory at the given starting cluster for file entries.
+fn disk_scan_dir(disk: &DiskReader, dir_cluster: u32) -> ([RootDirEntry; MAX_DIR_ENTRIES], usize) {
     let mut entries: [RootDirEntry; MAX_DIR_ENTRIES] = unsafe { core::mem::zeroed() };
     let mut count = 0;
     let spc = disk.bpb.sectors_per_cluster;
-    let mut cluster = disk.bpb.root_cluster;
+    let mut cluster = dir_cluster;
 
     'outer: loop {
         let start_lba = disk.cluster_start_lba(cluster);
@@ -677,6 +678,43 @@ fn disk_scan_root_dir(disk: &DiskReader) -> ([RootDirEntry; MAX_DIR_ENTRIES], us
     }
 
     (entries, count)
+}
+
+/// Find a subdirectory by its FAT 8.3 name within a directory cluster.
+/// Returns the subdirectory's starting cluster, or None if not found.
+fn disk_find_subdir(disk: &DiskReader, dir_cluster: u32, target: &[u8; 11]) -> Option<u32> {
+    let spc = disk.bpb.sectors_per_cluster;
+    let mut cluster = dir_cluster;
+
+    loop {
+        let start_lba = disk.cluster_start_lba(cluster);
+        for s in 0..spc {
+            if disk.read_sector(start_lba + s).is_err() { return None; }
+            let mut sec_buf = [0u8; 512];
+            sec_buf.copy_from_slice(disk.sector_data());
+
+            for e in 0..16 {
+                let off = e * 32;
+                let first_byte = sec_buf[off];
+                if first_byte == 0x00 { return None; }
+                if first_byte == 0xE5 { continue; }
+                let attr = sec_buf[off + 11];
+                if attr & 0x0F == 0x0F { continue; }
+                if attr & 0x10 == 0 { continue; } // skip non-directories
+
+                if &sec_buf[off..off + 11] == target {
+                    let hi = read_u16(&sec_buf, off + 20) as u32;
+                    let lo = read_u16(&sec_buf, off + 26) as u32;
+                    return Some((hi << 16) | lo);
+                }
+            }
+        }
+        match disk.fat_next(cluster) {
+            Some(next) => cluster = next,
+            None => break,
+        }
+    }
+    None
 }
 
 fn read_file_from_disk(
@@ -935,9 +973,25 @@ fn load_from_disk(console_tid: usize, input_tid: usize) {
         }
     };
 
-    // Scan root directory
-    let (entries, count) = disk_scan_root_dir(&disk);
-    println!("[init] Files on disk: {}", count);
+    // Navigate to /usr/bin/
+    //   FAT 8.3: "USR     " (dir), "BIN     " (dir)
+    let usr_cluster = match disk_find_subdir(&disk, disk.bpb.root_cluster, b"USR        ") {
+        Some(c) => c,
+        None => {
+            println!("[init] /usr not found on disk.");
+            return;
+        }
+    };
+    let bin_cluster = match disk_find_subdir(&disk, usr_cluster, b"BIN        ") {
+        Some(c) => c,
+        None => {
+            println!("[init] /usr/bin not found on disk.");
+            return;
+        }
+    };
+
+    let (entries, count) = disk_scan_dir(&disk, bin_cluster);
+    println!("[init] Files in /usr/bin: {}", count);
 
     // Load non-essential ELFs from disk
     for i in 0..count {
