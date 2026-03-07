@@ -413,7 +413,7 @@ fn is_essential_elf(name: &[u8; 11]) -> bool {
     if &name[8..11] != b"ELF" { return false; }
     let base = &name[0..8];
     base == b"NAMESRVR" || base == b"CONSOLE " || base == b"KEYBOARD"
-        || base == b"DISK    " || base == b"INPUT   "
+        || base == b"DISK    " || base == b"INPUT   " || base == b"VFS     "
 }
 
 /// Grant capabilities based on FAT 8.3 name.
@@ -427,6 +427,8 @@ fn grant_caps_by_name(name: &[u8; 11], tid: usize) {
         let _ = syscall::sys_grant_irq(tid, 14);
         let _ = syscall::sys_grant_cap(tid, syscall::CAP_MAP_PHYS);
     } else if base == b"DISKTEST" {
+        let _ = syscall::sys_grant_cap(tid, syscall::CAP_PHYS_ALLOC | syscall::CAP_MAP_PHYS);
+    } else if base == b"VFS     " {
         let _ = syscall::sys_grant_cap(tid, syscall::CAP_PHYS_ALLOC | syscall::CAP_MAP_PHYS);
     }
 }
@@ -803,6 +805,7 @@ fn send_fb_info(console_tid: usize) {
 struct BootContext {
     console_tid: usize,
     input_tid: usize,
+    vfs_spawn: Option<SpawnInfo>,
 }
 
 fn load_essentials_from_boot_image(rootfs_phys: usize, rootfs_size: usize) -> BootContext {
@@ -812,7 +815,7 @@ fn load_essentials_from_boot_image(rootfs_phys: usize, rootfs_size: usize) -> Bo
     let rootfs_pages = (rootfs_size + PAGE_SIZE - 1) / PAGE_SIZE;
     if syscall::sys_map_phys(rootfs_phys, BOOT_IMG_BASE, rootfs_pages).is_err() {
         println!("[init] Failed to map boot image");
-        return BootContext { console_tid: 0, input_tid: 0 };
+        return BootContext { console_tid: 0, input_tid: 0, vfs_spawn: None };
     }
 
     let rootfs = unsafe { core::slice::from_raw_parts(BOOT_IMG_BASE as *const u8, rootfs_size) };
@@ -875,8 +878,8 @@ fn load_essentials_from_boot_image(rootfs_phys: usize, rootfs_size: usize) -> Bo
         if &e.name[0..8] == b"NAMESRVR" || (&e.name[0..8] == b"CONSOLE " && &e.name[8..11] == b"ELF") {
             continue;
         }
-        // Skip INPUT (deferred to after keyboard)
-        if &e.name[0..8] == b"INPUT   " && &e.name[8..11] == b"ELF" {
+        // Skip INPUT (deferred to after keyboard) and VFS (deferred to after phase 2)
+        if (&e.name[0..8] == b"INPUT   " || &e.name[0..8] == b"VFS     ") && &e.name[8..11] == b"ELF" {
             continue;
         }
         // Only spawn .ELF files
@@ -946,20 +949,71 @@ fn load_essentials_from_boot_image(rootfs_phys: usize, rootfs_size: usize) -> Bo
         }
     }
 
-    BootContext { console_tid, input_tid }
+    // Pass 5: load VFS.ELF but do NOT start it yet (deferred to after phase 2)
+    let mut vfs_spawn: Option<SpawnInfo> = None;
+    for i in 0..count {
+        let e = &entries[i];
+        if &e.name[0..8] == b"VFS     " && &e.name[8..11] == b"ELF" {
+            println!("[init] Loading VFS.ELF (deferred start)");
+            if let Ok(data) = read_file_to_buffer(rootfs, &bpb, e.first_cluster, e.file_size) {
+                match load_elf(data) {
+                    Ok(info) => {
+                        grant_caps_by_name(&e.name, info.tid);
+                        if console_tid != 0 {
+                            let _ = syscall::sys_fd_set(info.tid, 1, console_tid, 1);
+                            let _ = syscall::sys_fd_set(info.tid, 2, console_tid, 1);
+                        }
+                        if input_tid != 0 {
+                            let _ = syscall::sys_fd_set(info.tid, 0, input_tid, 1);
+                        }
+                        println!("[init]   VFS loaded as TID {}", info.tid);
+                        vfs_spawn = Some(info);
+                    }
+                    Err(()) => println!("[init]   FAILED to load VFS"),
+                }
+            }
+            break;
+        }
+    }
+
+    BootContext { console_tid, input_tid, vfs_spawn }
 }
 
 // ---------------------------------------------------------------------------
 // Phase 2: Load remaining programs from disk
 // ---------------------------------------------------------------------------
 
-fn load_from_disk(console_tid: usize, input_tid: usize) {
+const MAX_DEFERRED: usize = 16;
+
+struct DeferredTasks {
+    spawns: [Option<SpawnInfo>; MAX_DEFERRED],
+    count: usize,
+}
+
+impl DeferredTasks {
+    fn new() -> Self {
+        const NONE: Option<SpawnInfo> = None;
+        DeferredTasks { spawns: [NONE; MAX_DEFERRED], count: 0 }
+    }
+
+    fn start_all(&mut self) {
+        for i in 0..self.count {
+            if let Some(info) = self.spawns[i].take() {
+                let _ = info.start();
+            }
+        }
+    }
+}
+
+fn load_from_disk(console_tid: usize, input_tid: usize) -> DeferredTasks {
+    let mut deferred = DeferredTasks::new();
+
     // Discover disk service via nameserver
     let disk_tid = match lookup_service_with_retry(b"disk", 20) {
         Some(tid) => tid,
         None => {
             println!("[init] Disk service not found, skipping disk loading.");
-            return;
+            return deferred;
         }
     };
     println!("[init] Found disk at TID {}", disk_tid);
@@ -969,7 +1023,7 @@ fn load_from_disk(console_tid: usize, input_tid: usize) {
         Ok(d) => d,
         Err(()) => {
             println!("[init] Failed to read disk filesystem.");
-            return;
+            return deferred;
         }
     };
 
@@ -979,21 +1033,21 @@ fn load_from_disk(console_tid: usize, input_tid: usize) {
         Some(c) => c,
         None => {
             println!("[init] /usr not found on disk.");
-            return;
+            return deferred;
         }
     };
     let bin_cluster = match disk_find_subdir(&disk, usr_cluster, b"BIN        ") {
         Some(c) => c,
         None => {
             println!("[init] /usr/bin not found on disk.");
-            return;
+            return deferred;
         }
     };
 
     let (entries, count) = disk_scan_dir(&disk, bin_cluster);
     println!("[init] Files in /usr/bin: {}", count);
 
-    // Load non-essential ELFs from disk
+    // Load non-essential ELFs from disk (but don't start them yet)
     for i in 0..count {
         let e = &entries[i];
         if &e.name[8..11] != b"ELF" { continue; }
@@ -1014,17 +1068,22 @@ fn load_from_disk(console_tid: usize, input_tid: usize) {
                         let _ = syscall::sys_fd_set(tid, 1, console_tid, 1);
                         let _ = syscall::sys_fd_set(tid, 2, console_tid, 1);
                     }
-                    let _ = info.start();
                     if input_tid != 0 {
                         let _ = syscall::sys_fd_set(tid, 0, input_tid, 1);
                     }
-                    println!("[init]   Spawned TID {}", tid);
+                    println!("[init]   Loaded TID {} (deferred start)", tid);
+                    if deferred.count < MAX_DEFERRED {
+                        deferred.spawns[deferred.count] = Some(info);
+                        deferred.count += 1;
+                    }
                 }
                 Err(()) => println!("[init]   FAILED to spawn"),
             },
             Err(()) => println!("[init]   FAILED to read from disk"),
         }
     }
+
+    deferred
 }
 
 // ---------------------------------------------------------------------------
@@ -1056,8 +1115,22 @@ pub extern "C" fn _start() -> ! {
             let _ = syscall::sys_phys_free(phys, pages);
             println!("[init] Boot image freed ({} pages).", pages);
 
-            // Phase 2: Load remaining programs from disk
-            load_from_disk(ctx.console_tid, ctx.input_tid);
+            // Phase 2: Load remaining programs from disk (loaded but not started)
+            let mut deferred = load_from_disk(ctx.console_tid, ctx.input_tid);
+
+            // Phase 3: Start VFS, wait for it to finish its disk I/O,
+            // then start remaining programs so they don't compete
+            if let Some(vfs) = ctx.vfs_spawn {
+                println!("[init] Starting VFS (TID {})", vfs.tid);
+                let _ = vfs.start();
+                if lookup_service_with_retry(b"vfs", 50).is_some() {
+                    println!("[init] VFS ready.");
+                }
+            }
+
+            // Phase 4: Start non-essential programs
+            println!("[init] All programs loaded. Starting deferred tasks.");
+            deferred.start_all();
 
             found = true;
             break;
@@ -1067,8 +1140,6 @@ pub extern "C" fn _start() -> ! {
     if !found {
         println!("[init] ERROR: boot image module not found!");
     }
-
-    println!("[init] All programs loaded. Entering idle loop.");
 
     loop {
         syscall::sys_yield();
