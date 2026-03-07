@@ -17,7 +17,7 @@ The kernel provides:
 
 User space provides:
 
-- **Init** (`user/init`) — ELF loader, reads FAT32 rootfs, spawns and wires all services
+- **Init** (`user/init`) — Two-phase ELF loader: essential services from boot image, remaining programs from disk via GPT/FAT32
 - **Nameserver** (`user/nameserver`) — service discovery via name registration/lookup
 - **Console server** (`user/console`) — framebuffer text rendering via font8x8, serves write requests over IPC
 - **Keyboard driver** (`user/keyboard`) — PS/2 scancode translation, IRQ 1 handling
@@ -34,12 +34,18 @@ User space provides:
 2. The 32-bit entry point (`boot.s`) sets up identity-mapped page tables (4 GiB via 2 MiB huge pages), enables long mode, and jumps to 64-bit Rust code
 3. The kernel initializes the scheduler, IPC, IDT, PIT, syscalls, and physical memory manager
 4. `spawn_init()` creates the init task with framebuffer info in a boot info page
-5. Init mounts the FAT32 boot image and spawns services in order:
+5. **Phase 1** — Init mounts the FAT32 boot image and spawns essential services:
    - Pass 1: Nameserver (guarantees TID 2)
    - Pass 2: Console server (granted `CAP_MAP_PHYS`, receives framebuffer info via IPC)
-   - Pass 3: Remaining programs — disk driver (granted `CAP_IOPORT` + IRQ 14 + `CAP_MAP_PHYS`), disktest (granted `CAP_PHYS_ALLOC` + `CAP_MAP_PHYS`), others (fds wired to console before starting)
+   - Pass 3: Keyboard driver, disk driver (granted caps, fds wired to console)
    - Pass 4: Input server (fds wired, then stdin wired retroactively to prior tasks)
-6. The kernel enters an idle HLT loop
+   - Boot image pages freed via `sys_phys_free`
+6. **Phase 2** — Init loads remaining programs from disk:
+   - Discovers the disk service via nameserver (with retry)
+   - Parses GPT partition table to find the rootfs partition (falls back to MBR/raw FAT)
+   - Navigates FAT32 directory tree to `/usr/bin/`
+   - Spawns non-essential ELFs (hello, disktest, etc.) with caps and fd wiring
+7. The kernel enters an idle HLT loop
 
 ### IPC
 
@@ -88,7 +94,7 @@ drivers/
 
 user/
   libquark/           User-space library (syscalls, IPC, stdio macros)
-  init/               Init process (ELF loader, FAT32 reader, service wiring)
+  init/               Init process (two-phase boot, GPT/FAT32 disk reader, service wiring)
   nameserver/         Service name registry
   console/            Framebuffer console server (font8x8)
   keyboard/           PS/2 keyboard driver (IRQ 1, scancode set 1)
@@ -131,8 +137,8 @@ make run
 
 ```bash
 cd ../bang
-make sync-quark   # Builds quark and copies kernel + drivers + user programs
-make run          # Boots via UEFI
+make sync-quark   # Builds quark; copies essential ELFs to boot.img, others to rootfs/usr/bin/
+make run          # Creates GPT disk image and boots via UEFI
 ```
 
 ## Disclaimer
