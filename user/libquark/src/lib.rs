@@ -4,3 +4,4 @@ pub mod console;
 pub mod ipc;
 pub mod stdio;
 pub mod syscall;
+pub mod vfs;

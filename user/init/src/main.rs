@@ -2,18 +2,14 @@
 #![no_main]
 
 use libquark::ipc::Message;
-use libquark::{println, syscall};
+use libquark::{println, syscall, vfs};
 
 const PAGE_SIZE: usize = 4096;
 const BOOT_INFO_ADDR: usize = 0x80_4000_0000;
 const FILE_BUF_BASE: usize = 0x82_0000_0000;
 const BOOT_IMG_BASE: usize = 0x85_0000_0000;
-const DISK_IO_BUF: usize = 0x86_0000_0000;
-
 const NAMESERVER_TID: usize = 2;
 const TAG_NS_LOOKUP: u64 = 2;
-const TAG_READ_SECTOR: u64 = 1;
-const TAG_DISK_OK: u64 = 0;
 
 // ---------------------------------------------------------------------------
 // Boot info structures (matches kernel's BootInfo)
@@ -469,298 +465,7 @@ fn lookup_service_with_retry(name: &[u8], max_attempts: usize) -> Option<usize> 
     None
 }
 
-// ---------------------------------------------------------------------------
-// Disk-based FAT32 reader
-// ---------------------------------------------------------------------------
-
-struct DiskReader {
-    disk_tid: usize,
-    buf_phys: usize,
-    part_lba: u32, // starting LBA of the FAT32 partition
-    bpb: Bpb,
-}
-
-impl DiskReader {
-    fn new(disk_tid: usize) -> Result<Self, ()> {
-        let buf_phys = syscall::sys_phys_alloc(1).map_err(|_| {
-            println!("[init] Failed to alloc phys page for disk I/O");
-        })?;
-        syscall::sys_map_phys(buf_phys, DISK_IO_BUF, 1).map_err(|_| {
-            println!("[init] Failed to map disk I/O buffer");
-        })?;
-
-        // Find the rootfs partition by reading GPT
-        let part_lba = Self::find_rootfs_partition(disk_tid, buf_phys)?;
-        println!("[init] Rootfs partition at LBA {}", part_lba);
-
-        // Read BPB from partition start
-        if part_lba > 0 {
-            Self::raw_read_sector(disk_tid, buf_phys, part_lba).map_err(|_| {
-                println!("[init] Failed to read BPB at LBA {}", part_lba);
-            })?;
-        }
-        let data = unsafe { core::slice::from_raw_parts(DISK_IO_BUF as *const u8, 512) };
-        let bpb = parse_bpb(data);
-        println!("[init] BPB: bps={} spc={} reserved={} root_cluster={}",
-            bpb.bytes_per_sector, bpb.sectors_per_cluster,
-            bpb.reserved_sectors, bpb.root_cluster);
-
-        Ok(DiskReader { disk_tid, buf_phys, part_lba, bpb })
-    }
-
-    /// Parse GPT to find the second partition (rootfs).
-    fn find_rootfs_partition(disk_tid: usize, buf_phys: usize) -> Result<u32, ()> {
-        // Read LBA 0 to check for protective MBR vs raw FAT
-        Self::raw_read_sector(disk_tid, buf_phys, 0)?;
-        let sec0 = unsafe { core::slice::from_raw_parts(DISK_IO_BUF as *const u8, 512) };
-
-        // Check MBR signature (0x55AA at offset 510)
-        let has_mbr = sec0[510] == 0x55 && sec0[511] == 0xAA;
-        // Check if sector 0 looks like a FAT BPB (bytes_per_sector at offset 11)
-        let bps = read_u16(sec0, 11);
-        let is_fat = bps == 512 || bps == 1024 || bps == 2048 || bps == 4096;
-
-        if !has_mbr || is_fat {
-            // No partition table, or this is a raw FAT filesystem
-            println!("[init] No partition table, using LBA 0 as filesystem start");
-            return Ok(0);
-        }
-
-        // Read GPT header (LBA 1)
-        Self::raw_read_sector(disk_tid, buf_phys, 1)?;
-        let hdr = unsafe { core::slice::from_raw_parts(DISK_IO_BUF as *const u8, 512) };
-
-        // Verify GPT signature "EFI PART"
-        if &hdr[0..8] != b"EFI PART" {
-            // Try MBR partition table instead
-            println!("[init] No GPT, checking MBR partitions");
-            Self::raw_read_sector(disk_tid, buf_phys, 0)?;
-            let mbr = unsafe { core::slice::from_raw_parts(DISK_IO_BUF as *const u8, 512) };
-            // MBR partition entry 1 at offset 446, start LBA at offset 8
-            let p1_lba = read_u32(mbr, 446 + 8);
-            if p1_lba != 0 {
-                return Ok(p1_lba);
-            }
-            println!("[init] No usable partition found");
-            return Err(());
-        }
-
-        let entry_start_lba = read_u32(hdr, 72); // partition entry start LBA (usually 2)
-        let entry_size = read_u32(hdr, 84);       // size of each entry (usually 128)
-        let num_entries = read_u32(hdr, 80);
-
-        println!("[init] GPT: {} entries at LBA {}, size {}", num_entries, entry_start_lba, entry_size);
-
-        if entry_size == 0 {
-            return Err(());
-        }
-
-        // Read the sector containing partition entries
-        Self::raw_read_sector(disk_tid, buf_phys, entry_start_lba)?;
-        let entries = unsafe { core::slice::from_raw_parts(DISK_IO_BUF as *const u8, 512) };
-
-        // We want the second partition (index 1) — the rootfs
-        let entries_per_sector = 512 / entry_size as usize;
-        let part_idx = 1; // second partition
-        let sector_of_entry = part_idx / entries_per_sector;
-        let offset_in_sector = (part_idx % entries_per_sector) * entry_size as usize;
-
-        if sector_of_entry > 0 {
-            Self::raw_read_sector(disk_tid, buf_phys, entry_start_lba + sector_of_entry as u32)?;
-        }
-
-        let data = if sector_of_entry > 0 {
-            unsafe { core::slice::from_raw_parts(DISK_IO_BUF as *const u8, 512) }
-        } else {
-            entries
-        };
-
-        // GPT entry: bytes 32-39 = starting LBA (u64 LE)
-        let start_lba_off = offset_in_sector + 32;
-        let start_lba = read_u32(data, start_lba_off); // lower 32 bits suffice
-
-        println!("[init] GPT partition 2 starts at LBA {}", start_lba);
-
-        if start_lba == 0 {
-            println!("[init] Rootfs partition not found in GPT");
-            return Err(());
-        }
-
-        Ok(start_lba)
-    }
-
-    fn raw_read_sector(disk_tid: usize, buf_phys: usize, lba: u32) -> Result<(), ()> {
-        let msg = Message {
-            sender: 0,
-            tag: TAG_READ_SECTOR,
-            data: [lba as u64, buf_phys as u64, 0, 0, 0, 0],
-        };
-        let mut reply = Message::empty();
-        if syscall::sys_call(disk_tid, &msg, &mut reply).is_err() {
-            println!("[init] disk read IPC failed for LBA {}", lba);
-            return Err(());
-        }
-        if reply.tag != TAG_DISK_OK {
-            println!("[init] disk read LBA {} failed: tag={}", lba, reply.tag);
-            return Err(());
-        }
-        Ok(())
-    }
-
-    /// Read a sector relative to the partition start.
-    fn read_sector(&self, lba: u32) -> Result<(), ()> {
-        Self::raw_read_sector(self.disk_tid, self.buf_phys, self.part_lba + lba)
-    }
-
-    fn sector_data(&self) -> &[u8] {
-        unsafe { core::slice::from_raw_parts(DISK_IO_BUF as *const u8, 512) }
-    }
-
-    fn fat_next(&self, cluster: u32) -> Option<u32> {
-        let fat_byte_off = (cluster as usize) * 4;
-        let sector_in_fat = fat_byte_off / 512;
-        let offset_in_sector = fat_byte_off % 512;
-        let lba = self.bpb.reserved_sectors + sector_in_fat as u32;
-        if self.read_sector(lba).is_err() { return None; }
-        let data = self.sector_data();
-        let next = read_u32(data, offset_in_sector) & 0x0FFF_FFFF;
-        if next >= 0x0FFF_FFF8 { None } else { Some(next) }
-    }
-
-    fn cluster_start_lba(&self, cluster: u32) -> u32 {
-        let data_start = self.bpb.reserved_sectors + self.bpb.num_fats * self.bpb.fat_size_32;
-        data_start + (cluster - 2) * self.bpb.sectors_per_cluster
-    }
-}
-
-/// Scan a directory at the given starting cluster for file entries.
-fn disk_scan_dir(disk: &DiskReader, dir_cluster: u32) -> ([RootDirEntry; MAX_DIR_ENTRIES], usize) {
-    let mut entries: [RootDirEntry; MAX_DIR_ENTRIES] = unsafe { core::mem::zeroed() };
-    let mut count = 0;
-    let spc = disk.bpb.sectors_per_cluster;
-    let mut cluster = dir_cluster;
-
-    'outer: loop {
-        let start_lba = disk.cluster_start_lba(cluster);
-        for s in 0..spc {
-            if disk.read_sector(start_lba + s).is_err() {
-                break 'outer;
-            }
-            // Copy sector data out before it's overwritten by fat_next
-            let mut sec_buf = [0u8; 512];
-            sec_buf.copy_from_slice(disk.sector_data());
-
-            for e in 0..16 {
-                if count >= MAX_DIR_ENTRIES { break 'outer; }
-                let off = e * 32;
-                let first_byte = sec_buf[off];
-                if first_byte == 0x00 { break 'outer; }
-                if first_byte == 0xE5 { continue; }
-                let attr = sec_buf[off + 11];
-                if attr & 0x0F == 0x0F { continue; }
-                if attr & 0x08 != 0 { continue; }
-                if attr & 0x10 != 0 { continue; }
-
-                let mut name = [0u8; 11];
-                name.copy_from_slice(&sec_buf[off..off + 11]);
-                let cluster_hi = read_u16(&sec_buf, off + 20) as u32;
-                let cluster_lo = read_u16(&sec_buf, off + 26) as u32;
-                entries[count] = RootDirEntry {
-                    name,
-                    first_cluster: (cluster_hi << 16) | cluster_lo,
-                    file_size: read_u32(&sec_buf, off + 28),
-                };
-                count += 1;
-            }
-        }
-        match disk.fat_next(cluster) {
-            Some(next) => cluster = next,
-            None => break,
-        }
-    }
-
-    (entries, count)
-}
-
-/// Find a subdirectory by its FAT 8.3 name within a directory cluster.
-/// Returns the subdirectory's starting cluster, or None if not found.
-fn disk_find_subdir(disk: &DiskReader, dir_cluster: u32, target: &[u8; 11]) -> Option<u32> {
-    let spc = disk.bpb.sectors_per_cluster;
-    let mut cluster = dir_cluster;
-
-    loop {
-        let start_lba = disk.cluster_start_lba(cluster);
-        for s in 0..spc {
-            if disk.read_sector(start_lba + s).is_err() { return None; }
-            let mut sec_buf = [0u8; 512];
-            sec_buf.copy_from_slice(disk.sector_data());
-
-            for e in 0..16 {
-                let off = e * 32;
-                let first_byte = sec_buf[off];
-                if first_byte == 0x00 { return None; }
-                if first_byte == 0xE5 { continue; }
-                let attr = sec_buf[off + 11];
-                if attr & 0x0F == 0x0F { continue; }
-                if attr & 0x10 == 0 { continue; } // skip non-directories
-
-                if &sec_buf[off..off + 11] == target {
-                    let hi = read_u16(&sec_buf, off + 20) as u32;
-                    let lo = read_u16(&sec_buf, off + 26) as u32;
-                    return Some((hi << 16) | lo);
-                }
-            }
-        }
-        match disk.fat_next(cluster) {
-            Some(next) => cluster = next,
-            None => break,
-        }
-    }
-    None
-}
-
-fn read_file_from_disk(
-    disk: &DiskReader,
-    first_cluster: u32,
-    file_size: u32,
-) -> Result<&'static [u8], ()> {
-    let size = file_size as usize;
-    let pages_needed = (size + PAGE_SIZE - 1) / PAGE_SIZE;
-
-    for p in 0..pages_needed {
-        let frame = syscall::sys_phys_alloc(1)?;
-        syscall::sys_map_phys(frame, FILE_BUF_BASE + p * PAGE_SIZE, 1)?;
-    }
-
-    let spc = disk.bpb.sectors_per_cluster;
-    let mut cluster = first_cluster;
-    let mut copied = 0usize;
-
-    while copied < size {
-        let start_lba = disk.cluster_start_lba(cluster);
-        for s in 0..spc {
-            if copied >= size { break; }
-            disk.read_sector(start_lba + s)?;
-            let chunk = 512.min(size - copied);
-            unsafe {
-                core::ptr::copy_nonoverlapping(
-                    DISK_IO_BUF as *const u8,
-                    (FILE_BUF_BASE + copied) as *mut u8,
-                    chunk,
-                );
-            }
-            copied += chunk;
-        }
-        if copied < size {
-            match disk.fat_next(cluster) {
-                Some(next) => cluster = next,
-                None => break,
-            }
-        }
-    }
-
-    Ok(unsafe { core::slice::from_raw_parts(FILE_BUF_BASE as *const u8, size) })
-}
+// (Disk-based FAT32 reader removed — init now uses VFS for disk files)
 
 // ---------------------------------------------------------------------------
 // Framebuffer info handoff to console server
@@ -1005,81 +710,114 @@ impl DeferredTasks {
     }
 }
 
-fn load_from_disk(console_tid: usize, input_tid: usize) -> DeferredTasks {
+fn load_from_vfs(vfs_tid: usize, console_tid: usize, input_tid: usize) -> DeferredTasks {
     let mut deferred = DeferredTasks::new();
 
-    // Discover disk service via nameserver
-    let disk_tid = match lookup_service_with_retry(b"disk", 20) {
-        Some(tid) => tid,
-        None => {
-            println!("[init] Disk service not found, skipping disk loading.");
-            return deferred;
-        }
-    };
-    println!("[init] Found disk at TID {}", disk_tid);
-
-    // Initialize disk reader (reads BPB from sector 0)
-    let disk = match DiskReader::new(disk_tid) {
-        Ok(d) => d,
-        Err(()) => {
-            println!("[init] Failed to read disk filesystem.");
+    // Open /usr/bin directory via VFS
+    let (dir_handle, _, _) = match vfs::open(vfs_tid, b"/usr/bin") {
+        Ok(h) => h,
+        Err(_) => {
+            println!("[init] /usr/bin not found on VFS.");
             return deferred;
         }
     };
 
-    // Navigate to /usr/bin/
-    //   FAT 8.3: "USR     " (dir), "BIN     " (dir)
-    let usr_cluster = match disk_find_subdir(&disk, disk.bpb.root_cluster, b"USR        ") {
-        Some(c) => c,
-        None => {
-            println!("[init] /usr not found on disk.");
-            return deferred;
-        }
-    };
-    let bin_cluster = match disk_find_subdir(&disk, usr_cluster, b"BIN        ") {
-        Some(c) => c,
-        None => {
-            println!("[init] /usr/bin not found on disk.");
-            return deferred;
-        }
-    };
+    // Enumerate directory entries, collecting non-essential ELF names+sizes
+    let mut file_entries: [(u32, [u8; 11]); MAX_DIR_ENTRIES] = [(0, [0; 11]); MAX_DIR_ENTRIES];
+    let mut file_count = 0;
+    let mut index = 0u32;
 
-    let (entries, count) = disk_scan_dir(&disk, bin_cluster);
-    println!("[init] Files in /usr/bin: {}", count);
-
-    // Load non-essential ELFs from disk (but don't start them yet)
-    for i in 0..count {
-        let e = &entries[i];
-        if &e.name[8..11] != b"ELF" { continue; }
-        if is_essential_elf(&e.name) { continue; }
-
-        let mut namebuf = [0u8; 16];
-        let namelen = fat_name_to_buf(&e.name, &mut namebuf);
-        if let Ok(fname) = core::str::from_utf8(&namebuf[..namelen]) {
-            println!("[init] Loading {} from disk", fname);
-        }
-
-        match read_file_from_disk(&disk, e.first_cluster, e.file_size) {
-            Ok(data) => match load_elf(data) {
-                Ok(info) => {
-                    let tid = info.tid;
-                    grant_caps_by_name(&e.name, tid);
-                    if console_tid != 0 {
-                        let _ = syscall::sys_fd_set(tid, 1, console_tid, 1);
-                        let _ = syscall::sys_fd_set(tid, 2, console_tid, 1);
-                    }
-                    if input_tid != 0 {
-                        let _ = syscall::sys_fd_set(tid, 0, input_tid, 1);
-                    }
-                    println!("[init]   Loaded TID {} (deferred start)", tid);
-                    if deferred.count < MAX_DEFERRED {
-                        deferred.spawns[deferred.count] = Some(info);
-                        deferred.count += 1;
+    loop {
+        match vfs::readdir(vfs_tid, dir_handle, index) {
+            Ok(Some(entry)) => {
+                if &entry.name[8..11] == b"ELF" && !is_essential_elf(&entry.name) && !entry.is_dir {
+                    if file_count < MAX_DIR_ENTRIES {
+                        file_entries[file_count] = (entry.size, entry.name);
+                        file_count += 1;
                     }
                 }
-                Err(()) => println!("[init]   FAILED to spawn"),
-            },
-            Err(()) => println!("[init]   FAILED to read from disk"),
+                index += 1;
+            }
+            Ok(None) => break,
+            Err(_) => break,
+        }
+    }
+    let _ = vfs::close(vfs_tid, dir_handle);
+
+    println!("[init] Files in /usr/bin: {}", file_count);
+
+    // Load each non-essential ELF via VFS (but don't start them yet)
+    for i in 0..file_count {
+        let (_, ref name) = file_entries[i];
+
+        let mut namebuf = [0u8; 16];
+        let namelen = fat_name_to_buf(name, &mut namebuf);
+        if let Ok(fname) = core::str::from_utf8(&namebuf[..namelen]) {
+            println!("[init] Loading {} from VFS", fname);
+        }
+
+        // Build path: "/usr/bin/<name>"
+        let mut path = [0u8; 48];
+        let prefix = b"/usr/bin/";
+        path[..prefix.len()].copy_from_slice(prefix);
+        path[prefix.len()..prefix.len() + namelen].copy_from_slice(&namebuf[..namelen]);
+        let path_len = prefix.len() + namelen;
+
+        // Open file via VFS
+        let (file_handle, file_size, _) = match vfs::open(vfs_tid, &path[..path_len]) {
+            Ok(h) => h,
+            Err(_) => {
+                println!("[init]   FAILED to open via VFS");
+                continue;
+            }
+        };
+
+        let size = file_size as usize;
+        let pages_needed = (size + PAGE_SIZE - 1) / PAGE_SIZE;
+
+        // Allocate pages and read file content via VFS directly into them
+        let mut success = true;
+        for p in 0..pages_needed {
+            let frame = match syscall::sys_phys_alloc(1) {
+                Ok(f) => f,
+                Err(()) => { success = false; break; }
+            };
+            if syscall::sys_map_phys(frame, FILE_BUF_BASE + p * PAGE_SIZE, 1).is_err() {
+                success = false; break;
+            }
+            let offset = (p * PAGE_SIZE) as u32;
+            let to_read = PAGE_SIZE.min(size - p * PAGE_SIZE) as u32;
+            if vfs::read(vfs_tid, file_handle, frame, offset, to_read).is_err() {
+                success = false; break;
+            }
+        }
+
+        let _ = vfs::close(vfs_tid, file_handle);
+
+        if !success {
+            println!("[init]   FAILED to read from VFS");
+            continue;
+        }
+
+        let data = unsafe { core::slice::from_raw_parts(FILE_BUF_BASE as *const u8, size) };
+        match load_elf(data) {
+            Ok(info) => {
+                let tid = info.tid;
+                grant_caps_by_name(name, tid);
+                if console_tid != 0 {
+                    let _ = syscall::sys_fd_set(tid, 1, console_tid, 1);
+                    let _ = syscall::sys_fd_set(tid, 2, console_tid, 1);
+                }
+                if input_tid != 0 {
+                    let _ = syscall::sys_fd_set(tid, 0, input_tid, 1);
+                }
+                println!("[init]   Loaded TID {} (deferred start)", tid);
+                if deferred.count < MAX_DEFERRED {
+                    deferred.spawns[deferred.count] = Some(info);
+                    deferred.count += 1;
+                }
+            }
+            Err(()) => println!("[init]   FAILED to spawn"),
         }
     }
 
@@ -1115,18 +853,31 @@ pub extern "C" fn _start() -> ! {
             let _ = syscall::sys_phys_free(phys, pages);
             println!("[init] Boot image freed ({} pages).", pages);
 
-            // Phase 2: Load remaining programs from disk (loaded but not started)
-            let mut deferred = load_from_disk(ctx.console_tid, ctx.input_tid);
-
-            // Phase 3: Start VFS, wait for it to finish its disk I/O,
-            // then start remaining programs so they don't compete
-            if let Some(vfs) = ctx.vfs_spawn {
+            // Phase 2: Start VFS, wait for it to register
+            let vfs_tid = if let Some(vfs) = ctx.vfs_spawn {
                 println!("[init] Starting VFS (TID {})", vfs.tid);
                 let _ = vfs.start();
-                if lookup_service_with_retry(b"vfs", 50).is_some() {
-                    println!("[init] VFS ready.");
+                match lookup_service_with_retry(b"vfs", 50) {
+                    Some(tid) => {
+                        println!("[init] VFS ready.");
+                        Some(tid)
+                    }
+                    None => {
+                        println!("[init] VFS failed to register.");
+                        None
+                    }
                 }
-            }
+            } else {
+                None
+            };
+
+            // Phase 3: Load remaining programs from VFS (loaded but not started)
+            let mut deferred = if let Some(vfs) = vfs_tid {
+                load_from_vfs(vfs, ctx.console_tid, ctx.input_tid)
+            } else {
+                println!("[init] No VFS, skipping disk program loading.");
+                DeferredTasks::new()
+            };
 
             // Phase 4: Start non-essential programs
             println!("[init] All programs loaded. Starting deferred tasks.");

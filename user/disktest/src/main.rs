@@ -2,16 +2,11 @@
 #![no_main]
 
 use libquark::ipc::Message;
-use libquark::{println, syscall};
+use libquark::{println, syscall, vfs};
 
+const PAGE_SIZE: usize = 4096;
 const NAMESERVER_TID: usize = 2;
-
-// Nameserver protocol
 const TAG_NS_LOOKUP: u64 = 2;
-
-// Disk IPC tags
-const TAG_READ_SECTOR: u64 = 1;
-const TAG_OK: u64 = 0;
 
 // Address where we map our shared buffer page
 const BUF_VADDR: usize = 0x87_0000_0000;
@@ -38,26 +33,46 @@ fn lookup_service(name: &[u8]) -> Option<usize> {
     }
 }
 
+fn fat_name_to_str<'a>(name: &[u8; 11], buf: &'a mut [u8; 16]) -> &'a [u8] {
+    let base_len = name[0..8]
+        .iter()
+        .rposition(|&b| b != b' ')
+        .map_or(0, |p| p + 1);
+    let mut pos = 0;
+    for i in 0..base_len {
+        buf[pos] = name[i];
+        pos += 1;
+    }
+    let ext_len = name[8..11]
+        .iter()
+        .rposition(|&b| b != b' ')
+        .map_or(0, |p| p + 1);
+    if ext_len > 0 {
+        buf[pos] = b'.';
+        pos += 1;
+        for i in 0..ext_len {
+            buf[pos] = name[8 + i];
+            pos += 1;
+        }
+    }
+    &buf[..pos]
+}
+
 #[unsafe(no_mangle)]
 #[link_section = ".text.entry"]
 pub extern "C" fn _start() -> ! {
     println!("[disktest] Started.");
 
-    // Wait a bit for disk driver to register
-    for _ in 0..10 {
-        syscall::sys_yield();
-    }
-
-    // Look up disk service
+    // Look up VFS service
     let mut attempts = 0;
-    let disk_tid = loop {
-        if let Some(tid) = lookup_service(b"disk") {
-            println!("[disktest] Found disk at TID {}.", tid);
+    let vfs_tid = loop {
+        if let Some(tid) = lookup_service(b"vfs") {
+            println!("[disktest] Found VFS at TID {}.", tid);
             break tid;
         }
         attempts += 1;
         if attempts >= 20 {
-            println!("[disktest] Disk server not found.");
+            println!("[disktest] VFS not found.");
             syscall::sys_exit();
         }
         for _ in 0..100 {
@@ -65,7 +80,7 @@ pub extern "C" fn _start() -> ! {
         }
     };
 
-    // Allocate a physical page for the shared buffer
+    // Allocate a physical page for VFS reads
     let phys = match syscall::sys_phys_alloc(1) {
         Ok(addr) => addr,
         Err(()) => {
@@ -73,74 +88,89 @@ pub extern "C" fn _start() -> ! {
             syscall::sys_exit();
         }
     };
-
-    // Map it into our address space
     if syscall::sys_map_phys(phys, BUF_VADDR, 1).is_err() {
         println!("[disktest] Failed to map buffer page!");
         syscall::sys_exit();
     }
 
-    // Zero the buffer
-    unsafe {
-        core::ptr::write_bytes(BUF_VADDR as *mut u8, 0, 4096);
+    // List root directory
+    println!("[disktest] Listing /:");
+    match vfs::open(vfs_tid, b"/") {
+        Ok((handle, _, _)) => {
+            let mut idx = 0u32;
+            loop {
+                match vfs::readdir(vfs_tid, handle, idx) {
+                    Ok(Some(entry)) => {
+                        let mut nbuf = [0u8; 16];
+                        let name = fat_name_to_str(&entry.name, &mut nbuf);
+                        let kind = if entry.is_dir { "DIR " } else { "FILE" };
+                        if let Ok(s) = core::str::from_utf8(name) {
+                            println!("  {} {} ({} bytes)", kind, s, entry.size);
+                        }
+                        idx += 1;
+                    }
+                    Ok(None) => break,
+                    Err(e) => {
+                        println!("[disktest] readdir error: {}", e);
+                        break;
+                    }
+                }
+            }
+            let _ = vfs::close(vfs_tid, handle);
+        }
+        Err(e) => println!("[disktest] Failed to open /: {}", e),
     }
 
-    // Read sector 0
-    println!("[disktest] Reading sector 0...");
-    let msg = Message {
-        sender: 0,
-        tag: TAG_READ_SECTOR,
-        data: [0, phys as u64, 0, 0, 0, 0], // LBA=0, phys_addr
-    };
+    // Read first 64 bytes of /usr/bin/HELLO.ELF via VFS
+    println!("[disktest] Reading /usr/bin/HELLO.ELF...");
+    match vfs::open(vfs_tid, b"/usr/bin/HELLO.ELF") {
+        Ok((handle, size, _)) => {
+            println!("[disktest] Opened (size={}).", size);
 
-    let mut reply = Message::empty();
-    if syscall::sys_call(disk_tid, &msg, &mut reply).is_err() {
-        println!("[disktest] IPC call to disk server failed!");
-        syscall::sys_exit();
-    }
+            // Read first page
+            match vfs::read(vfs_tid, handle, phys, 0, PAGE_SIZE as u32) {
+                Ok(bytes_read) => {
+                    println!("[disktest] Read {} bytes.", bytes_read);
+                    let dump_len = 64.min(bytes_read as usize);
+                    let data = unsafe {
+                        core::slice::from_raw_parts(BUF_VADDR as *const u8, dump_len)
+                    };
+                    for row in 0..(dump_len / 16) {
+                        let off = row * 16;
+                        let mut line = [0u8; 80];
+                        let mut pos = 0;
+                        let hex_chars = b"0123456789abcdef";
+                        line[pos] = hex_chars[(off >> 12) & 0xF]; pos += 1;
+                        line[pos] = hex_chars[(off >> 8) & 0xF]; pos += 1;
+                        line[pos] = hex_chars[(off >> 4) & 0xF]; pos += 1;
+                        line[pos] = hex_chars[off & 0xF]; pos += 1;
+                        line[pos] = b':'; pos += 1;
+                        line[pos] = b' '; pos += 1;
+                        for i in 0..16 {
+                            let b = data[off + i];
+                            line[pos] = hex_chars[(b >> 4) as usize]; pos += 1;
+                            line[pos] = hex_chars[(b & 0xF) as usize]; pos += 1;
+                            line[pos] = b' '; pos += 1;
+                        }
+                        line[pos] = b' '; pos += 1;
+                        line[pos] = b'|'; pos += 1;
+                        for i in 0..16 {
+                            let b = data[off + i];
+                            line[pos] = if b >= 0x20 && b < 0x7F { b } else { b'.' };
+                            pos += 1;
+                        }
+                        line[pos] = b'|'; pos += 1;
+                        if let Ok(s) = core::str::from_utf8(&line[..pos]) {
+                            println!("{}", s);
+                        }
+                    }
+                }
+                Err(e) => println!("[disktest] Read error: {}", e),
+            }
 
-    if reply.tag != TAG_OK {
-        println!("[disktest] Disk read failed (tag={}).", reply.tag);
-        syscall::sys_exit();
-    }
-
-    let bytes_read = reply.data[0];
-    println!("[disktest] Read {} bytes from sector 0.", bytes_read);
-
-    // Print first 64 bytes as hex + ASCII
-    let data = unsafe { core::slice::from_raw_parts(BUF_VADDR as *const u8, 64) };
-    for row in 0..4 {
-        let off = row * 16;
-        // Build entire line in a buffer to print atomically
-        let mut line = [0u8; 80]; // "XXXX: XX XX ... XX  |................|\n"
-        let mut pos = 0;
-        // Offset
-        let hex_chars = b"0123456789abcdef";
-        line[pos] = hex_chars[((off >> 12) & 0xF) as usize]; pos += 1;
-        line[pos] = hex_chars[((off >> 8) & 0xF) as usize]; pos += 1;
-        line[pos] = hex_chars[((off >> 4) & 0xF) as usize]; pos += 1;
-        line[pos] = hex_chars[(off & 0xF) as usize]; pos += 1;
-        line[pos] = b':'; pos += 1;
-        line[pos] = b' '; pos += 1;
-        // Hex bytes
-        for i in 0..16 {
-            let b = data[off + i];
-            line[pos] = hex_chars[(b >> 4) as usize]; pos += 1;
-            line[pos] = hex_chars[(b & 0xF) as usize]; pos += 1;
-            line[pos] = b' '; pos += 1;
+            let _ = vfs::close(vfs_tid, handle);
         }
-        // ASCII
-        line[pos] = b' '; pos += 1;
-        line[pos] = b'|'; pos += 1;
-        for i in 0..16 {
-            let b = data[off + i];
-            line[pos] = if b >= 0x20 && b < 0x7F { b } else { b'.' };
-            pos += 1;
-        }
-        line[pos] = b'|'; pos += 1;
-        if let Ok(s) = core::str::from_utf8(&line[..pos]) {
-            println!("{}", s);
-        }
+        Err(e) => println!("[disktest] Failed to open file: {}", e),
     }
 
     println!("[disktest] Done.");
