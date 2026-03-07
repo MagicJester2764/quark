@@ -5,16 +5,12 @@
 /// Covers up to 4 GiB of physical memory (131072 bytes = 1048576 bits = 1048576 frames).
 
 use crate::multiboot2::{MemoryRegion, MMAP_TYPE_AVAILABLE, MAX_MEMORY_REGIONS};
+use crate::sync::IrqSpinLock;
 
 const PAGE_SIZE: usize = 4096;
 
 /// 4 GiB / 4 KiB = 1048576 frames, 1048576 / 8 = 131072 bytes.
 const BITMAP_SIZE: usize = 131072;
-
-/// All frames start as used (0xFF). Init clears available regions.
-static mut BITMAP: [u8; BITMAP_SIZE] = [0xFF; BITMAP_SIZE];
-static mut TOTAL_FRAMES: usize = 0;
-static mut FREE_FRAMES: usize = 0;
 
 extern "C" {
     static __bss_end: u8;
@@ -34,35 +30,46 @@ impl PhysFrame {
     }
 }
 
-fn frame_index(addr: usize) -> usize {
-    addr / PAGE_SIZE
+struct PmmInner {
+    bitmap: [u8; BITMAP_SIZE],
+    total_frames: usize,
+    free_frames: usize,
 }
 
-unsafe fn set_used(frame_idx: usize) {
-    BITMAP[frame_idx / 8] |= 1 << (frame_idx % 8);
-}
+impl PmmInner {
+    fn frame_index(addr: usize) -> usize {
+        addr / PAGE_SIZE
+    }
 
-unsafe fn set_free(frame_idx: usize) {
-    BITMAP[frame_idx / 8] &= !(1 << (frame_idx % 8));
-}
+    fn set_used(&mut self, frame_idx: usize) {
+        self.bitmap[frame_idx / 8] |= 1 << (frame_idx % 8);
+    }
 
-fn is_used(frame_idx: usize) -> bool {
-    unsafe { BITMAP[frame_idx / 8] & (1 << (frame_idx % 8)) != 0 }
-}
+    fn set_free(&mut self, frame_idx: usize) {
+        self.bitmap[frame_idx / 8] &= !(1 << (frame_idx % 8));
+    }
 
-/// Mark a range of physical addresses as used in the bitmap.
-unsafe fn mark_range_used(start: usize, end: usize) {
-    let first = frame_index(start);
-    let last = frame_index(end.saturating_sub(1));
-    for i in first..=last {
-        if i < BITMAP_SIZE * 8 {
-            if !is_used(i) {
-                set_used(i);
-                FREE_FRAMES -= 1;
+    fn is_used(&self, frame_idx: usize) -> bool {
+        self.bitmap[frame_idx / 8] & (1 << (frame_idx % 8)) != 0
+    }
+
+    fn mark_range_used(&mut self, start: usize, end: usize) {
+        let first = Self::frame_index(start);
+        let last = Self::frame_index(end.saturating_sub(1));
+        for i in first..=last {
+            if i < BITMAP_SIZE * 8 && !self.is_used(i) {
+                self.set_used(i);
+                self.free_frames -= 1;
             }
         }
     }
 }
+
+static PMM: IrqSpinLock<PmmInner> = IrqSpinLock::new(PmmInner {
+    bitmap: [0xFF; BITMAP_SIZE],
+    total_frames: 0,
+    free_frames: 0,
+});
 
 /// Initialize the physical memory manager.
 ///
@@ -75,6 +82,8 @@ pub unsafe fn init(
     mb_info_addr: usize,
     mb_info_size: usize,
 ) {
+    let mut pmm = PMM.lock();
+
     // Step 1: For each available region, clear bits (mark free).
     for i in 0..count {
         let r = &regions[i];
@@ -86,8 +95,8 @@ pub unsafe fn init(
         let length = r.length as usize;
         let end = base + length;
 
-        let first = frame_index((base + PAGE_SIZE - 1) & !(PAGE_SIZE - 1)); // round up
-        let last = frame_index(end.saturating_sub(1)); // round down to last full frame
+        let first = PmmInner::frame_index((base + PAGE_SIZE - 1) & !(PAGE_SIZE - 1));
+        let last = PmmInner::frame_index(end.saturating_sub(1));
 
         if first > last {
             continue;
@@ -95,9 +104,9 @@ pub unsafe fn init(
 
         for f in first..=last {
             if f < BITMAP_SIZE * 8 {
-                set_free(f);
-                FREE_FRAMES += 1;
-                TOTAL_FRAMES += 1;
+                pmm.set_free(f);
+                pmm.free_frames += 1;
+                pmm.total_frames += 1;
             }
         }
     }
@@ -105,37 +114,35 @@ pub unsafe fn init(
     // Step 2: Re-mark reserved regions as used.
 
     // First 1 MiB (BIOS, video memory, etc.)
-    mark_range_used(0, 0x100000);
+    pmm.mark_range_used(0, 0x100000);
 
     // Kernel: 0x100000 (1 MiB load address) through __bss_end
     let kernel_end = &__bss_end as *const u8 as usize;
-    mark_range_used(0x100000, kernel_end);
+    pmm.mark_range_used(0x100000, kernel_end);
 
     // Multiboot2 info structure
-    mark_range_used(mb_info_addr, mb_info_addr + mb_info_size);
+    pmm.mark_range_used(mb_info_addr, mb_info_addr + mb_info_size);
 
     // Boot modules (already tracked by modules registry)
     let mod_count = crate::modules::count();
     for i in 0..mod_count {
         if let Some(m) = crate::modules::get(i) {
-            mark_range_used(m.start, m.end);
+            pmm.mark_range_used(m.start, m.end);
         }
     }
 }
 
 /// Allocate a single 4 KiB physical frame.
 pub fn alloc() -> Option<PhysFrame> {
-    unsafe {
-        for byte_idx in 0..BITMAP_SIZE {
-            if BITMAP[byte_idx] != 0xFF {
-                // At least one free bit in this byte
-                for bit in 0..8u8 {
-                    if BITMAP[byte_idx] & (1 << bit) == 0 {
-                        let frame_idx = byte_idx * 8 + bit as usize;
-                        set_used(frame_idx);
-                        FREE_FRAMES -= 1;
-                        return Some(PhysFrame(frame_idx * PAGE_SIZE));
-                    }
+    let mut pmm = PMM.lock();
+    for byte_idx in 0..BITMAP_SIZE {
+        if pmm.bitmap[byte_idx] != 0xFF {
+            for bit in 0..8u8 {
+                if pmm.bitmap[byte_idx] & (1 << bit) == 0 {
+                    let frame_idx = byte_idx * 8 + bit as usize;
+                    pmm.set_used(frame_idx);
+                    pmm.free_frames -= 1;
+                    return Some(PhysFrame(frame_idx * PAGE_SIZE));
                 }
             }
         }
@@ -145,21 +152,20 @@ pub fn alloc() -> Option<PhysFrame> {
 
 /// Free a previously allocated physical frame.
 pub fn free(frame: PhysFrame) {
-    let idx = frame_index(frame.address());
-    if idx < BITMAP_SIZE * 8 && is_used(idx) {
-        unsafe {
-            set_free(idx);
-            FREE_FRAMES += 1;
-        }
+    let mut pmm = PMM.lock();
+    let idx = PmmInner::frame_index(frame.address());
+    if idx < BITMAP_SIZE * 8 && pmm.is_used(idx) {
+        pmm.set_free(idx);
+        pmm.free_frames += 1;
     }
 }
 
 /// Number of free 4 KiB frames.
 pub fn free_count() -> usize {
-    unsafe { FREE_FRAMES }
+    PMM.lock().free_frames
 }
 
 /// Total number of frames that were initially available.
 pub fn total_count() -> usize {
-    unsafe { TOTAL_FRAMES }
+    PMM.lock().total_frames
 }

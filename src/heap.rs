@@ -8,12 +8,11 @@
 /// prevent deadlock if an IRQ handler ever triggers allocation.
 
 use core::alloc::{GlobalAlloc, Layout};
-use core::cell::UnsafeCell;
 use core::ptr;
-use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::paging;
 use crate::pmm;
+use crate::sync::IrqSpinLock;
 
 const PAGE_SIZE: usize = 4096;
 const HEAP_START: usize = 0x1_0000_0000;
@@ -42,48 +41,6 @@ struct AllocHeader {
 }
 
 // ---------------------------------------------------------------------------
-// Interrupt-safe spin lock
-// ---------------------------------------------------------------------------
-
-struct SpinLock {
-    locked: AtomicBool,
-}
-
-impl SpinLock {
-    const fn new() -> Self {
-        SpinLock {
-            locked: AtomicBool::new(false),
-        }
-    }
-
-    /// Acquire the lock. Saves RFLAGS and disables interrupts before spinning.
-    /// Returns the saved RFLAGS value (caller must pass it to `unlock`).
-    fn lock(&self) -> u64 {
-        let saved: u64;
-        unsafe {
-            core::arch::asm!("pushfq; pop {}; cli", out(reg) saved, options(nostack));
-        }
-        while self
-            .locked
-            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
-        {
-            core::hint::spin_loop();
-        }
-        saved
-    }
-
-    /// Release the lock and restore the interrupt flag from saved RFLAGS.
-    unsafe fn unlock(&self, saved: u64) {
-        self.locked.store(false, Ordering::Release);
-        // Restore IF (bit 9) only — push saved flags then popf.
-        if saved & (1 << 9) != 0 {
-            core::arch::asm!("sti", options(nostack, nomem));
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Heap inner state
 // ---------------------------------------------------------------------------
 
@@ -94,23 +51,20 @@ struct HeapInner {
     initialized: bool,
 }
 
+unsafe impl Send for HeapInner {}
+
 // ---------------------------------------------------------------------------
 // LockedHeap — the #[global_allocator]
 // ---------------------------------------------------------------------------
 
 pub struct LockedHeap {
-    lock: SpinLock,
-    inner: UnsafeCell<HeapInner>,
+    inner: IrqSpinLock<HeapInner>,
 }
-
-unsafe impl Send for LockedHeap {}
-unsafe impl Sync for LockedHeap {}
 
 impl LockedHeap {
     const fn new() -> Self {
         LockedHeap {
-            lock: SpinLock::new(),
-            inner: UnsafeCell::new(HeapInner {
+            inner: IrqSpinLock::new(HeapInner {
                 free_list_head: ptr::null_mut(),
                 heap_end: 0,
                 total_size: 0,
@@ -125,18 +79,13 @@ static ALLOCATOR: LockedHeap = LockedHeap::new();
 
 unsafe impl GlobalAlloc for LockedHeap {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let saved = self.lock.lock();
-        let inner = &mut *self.inner.get();
-        let result = alloc_inner(inner, layout);
-        self.lock.unlock(saved);
-        result
+        let mut inner = self.inner.lock();
+        alloc_inner(&mut inner, layout)
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, _layout: Layout) {
-        let saved = self.lock.lock();
-        let inner = &mut *self.inner.get();
-        dealloc_inner(inner, ptr);
-        self.lock.unlock(saved);
+        let mut inner = self.inner.lock();
+        dealloc_inner(&mut inner, ptr);
     }
 }
 
@@ -341,7 +290,7 @@ unsafe fn grow(heap: &mut HeapInner, min_bytes: usize) {
 /// # Safety
 /// Must be called exactly once, after PMM and paging are available.
 pub unsafe fn init() {
-    let inner = &mut *ALLOCATOR.inner.get();
+    let mut inner = ALLOCATOR.inner.lock();
     if inner.initialized {
         return;
     }

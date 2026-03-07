@@ -42,6 +42,9 @@ pub const SYS_FD_WRITE: u64 = 50;
 pub const SYS_FD_READ: u64 = 51;
 pub const SYS_FD_SET: u64 = 52;
 
+pub const SYS_FUTEX_WAIT: u64 = 60;
+pub const SYS_FUTEX_WAKE: u64 = 61;
+
 const SFMASK_VALUE: u64 = (1 << 9) | (1 << 10); // clear IF | DF
 
 fn read_msr(msr: u32) -> u64 {
@@ -527,6 +530,14 @@ extern "C" fn syscall_dispatch(
                 Ok(()) => 0,
                 Err(()) => u64::MAX,
             }
+        }
+        SYS_FUTEX_WAIT => {
+            // arg0 = addr, arg1 = expected value
+            crate::futex::futex_wait(arg0, arg1 as u32)
+        }
+        SYS_FUTEX_WAKE => {
+            // arg0 = addr, arg1 = max_wake
+            crate::futex::futex_wake(arg0, arg1)
         }
         _ => u64::MAX,
     }

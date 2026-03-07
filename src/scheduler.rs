@@ -257,6 +257,8 @@ pub fn reap_dead() {
                     crate::ipc::cleanup_task_ipc(i);
                     // Unregister any IRQ handlers
                     crate::irq_dispatch::unregister_task_irqs(i);
+                    // Clean up futex waiters
+                    crate::futex::cleanup_task(i);
                     // Destroy user address space
                     let cr3 = task.cr3;
                     if cr3 != 0 && cr3 != crate::paging::kernel_cr3() {
@@ -266,6 +268,17 @@ pub fn reap_dead() {
                     TASKS[i] = None;
                 }
             }
+        }
+    }
+}
+
+/// Get the current task's CR3 (address space).
+pub fn current_task_cr3() -> usize {
+    let tid = current_tid();
+    unsafe {
+        match TASKS[tid].as_ref() {
+            Some(task) => task.cr3,
+            None => 0,
         }
     }
 }

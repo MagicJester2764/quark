@@ -5,6 +5,7 @@
 
 use crate::ipc::Message;
 use crate::scheduler;
+use crate::sync::IrqSpinLock;
 
 const MAX_IRQS: usize = 16;
 const IRQ_RING_SIZE: usize = 8;
@@ -48,23 +49,27 @@ impl IrqRing {
     }
 }
 
-/// Registered handler TID for each IRQ (0 = no handler).
-static mut IRQ_HANDLERS: [usize; MAX_IRQS] = [0; MAX_IRQS];
-/// Whether each IRQ has a registered user-space handler.
-static mut IRQ_HAS_HANDLER: [bool; MAX_IRQS] = [false; MAX_IRQS];
-/// Per-IRQ pending message ring buffers.
-static mut IRQ_RINGS: [IrqRing; MAX_IRQS] = {
-    const INIT: IrqRing = IrqRing::new();
-    [INIT; MAX_IRQS]
-};
+struct IrqDispatchState {
+    handlers: [usize; MAX_IRQS],
+    has_handler: [bool; MAX_IRQS],
+    rings: [IrqRing; MAX_IRQS],
+}
+
+static IRQ_STATE: IrqSpinLock<IrqDispatchState> = IrqSpinLock::new(IrqDispatchState {
+    handlers: [0; MAX_IRQS],
+    has_handler: [false; MAX_IRQS],
+    rings: {
+        const INIT: IrqRing = IrqRing::new();
+        [INIT; MAX_IRQS]
+    },
+});
 
 /// Register a user-space task to handle an IRQ.
 pub fn register_irq_handler(irq: u8, tid: usize) {
     if (irq as usize) < MAX_IRQS {
-        unsafe {
-            IRQ_HANDLERS[irq as usize] = tid;
-            IRQ_HAS_HANDLER[irq as usize] = true;
-        }
+        let mut state = IRQ_STATE.lock();
+        state.handlers[irq as usize] = tid;
+        state.has_handler[irq as usize] = true;
     }
 }
 
@@ -77,35 +82,34 @@ pub fn dispatch_irq(irq: u8) -> bool {
         return false;
     }
 
-    unsafe {
-        if !IRQ_HAS_HANDLER[idx] {
-            return false;
-        }
-
-        let tid = IRQ_HANDLERS[idx];
-        let msg = Message {
-            sender: 0, // kernel TID
-            tag: irq as u64,
-            data: [0; 6],
-        };
-
-        IRQ_RINGS[idx].push(msg);
-        scheduler::unblock_task(tid);
-
-        true
+    let mut state = IRQ_STATE.lock();
+    if !state.has_handler[idx] {
+        return false;
     }
+
+    let tid = state.handlers[idx];
+    let msg = Message {
+        sender: 0, // kernel TID
+        tag: irq as u64,
+        data: [0; 6],
+    };
+
+    state.rings[idx].push(msg);
+    // Drop lock before calling scheduler (avoids potential ordering issues)
+    drop(state);
+    scheduler::unblock_task(tid);
+
+    true
 }
 
 /// Unregister all IRQ handlers for a dead task and drain its ring buffers.
 pub fn unregister_task_irqs(tid: usize) {
-    unsafe {
-        for irq in 0..MAX_IRQS {
-            if IRQ_HAS_HANDLER[irq] && IRQ_HANDLERS[irq] == tid {
-                IRQ_HAS_HANDLER[irq] = false;
-                IRQ_HANDLERS[irq] = 0;
-                // Drain the ring buffer
-                IRQ_RINGS[irq] = IrqRing::new();
-            }
+    let mut state = IRQ_STATE.lock();
+    for irq in 0..MAX_IRQS {
+        if state.has_handler[irq] && state.handlers[irq] == tid {
+            state.has_handler[irq] = false;
+            state.handlers[irq] = 0;
+            state.rings[irq] = IrqRing::new();
         }
     }
 }
@@ -113,12 +117,11 @@ pub fn unregister_task_irqs(tid: usize) {
 /// Poll for a pending IRQ message destined for a given task.
 /// Checks all IRQ ring buffers registered to this TID.
 pub fn poll_irq_message(tid: usize) -> Option<Message> {
-    unsafe {
-        for irq in 0..MAX_IRQS {
-            if IRQ_HAS_HANDLER[irq] && IRQ_HANDLERS[irq] == tid {
-                if let Some(msg) = IRQ_RINGS[irq].pop() {
-                    return Some(msg);
-                }
+    let mut state = IRQ_STATE.lock();
+    for irq in 0..MAX_IRQS {
+        if state.has_handler[irq] && state.handlers[irq] == tid {
+            if let Some(msg) = state.rings[irq].pop() {
+                return Some(msg);
             }
         }
     }
