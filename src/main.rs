@@ -87,21 +87,6 @@ pub extern "C" fn kernel_main(multiboot_info: usize) -> ! {
         console::puts(b"FAT32 driver loaded.\n");
     }
 
-    // Print memory map
-    console::puts(b"Memory map:\n");
-    for i in 0..mmap_count {
-        let r = &mmap_regions[i];
-        console::puts(b"  ");
-        print_hex(r.base as usize);
-        console::puts(b" - ");
-        print_hex((r.base + r.length) as usize);
-        console::puts(b" (");
-        print_dec(r.length as usize / 1024);
-        console::puts(b" KiB) type=");
-        print_dec(r.region_type as usize);
-        console::puts(b"\n");
-    }
-
     // Print PMM stats
     console::puts(b"PMM initialized: ");
     print_dec(pmm::free_count());
