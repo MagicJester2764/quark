@@ -37,6 +37,8 @@ pub const SYS_FD_SET: u64 = 52;
 pub const SYS_FUTEX_WAIT: u64 = 60;
 pub const SYS_FUTEX_WAKE: u64 = 61;
 
+pub const SYS_MMAP: u64 = 70;
+
 #[inline(always)]
 pub unsafe fn syscall0(nr: u64) -> u64 {
     let ret: u64;
@@ -331,6 +333,14 @@ pub fn sys_futex_wait(addr: *const u32, expected: u32) -> u64 {
 
 pub fn sys_futex_wake(addr: *const u32, max_wake: usize) -> u64 {
     unsafe { syscall2(SYS_FUTEX_WAKE, addr as u64, max_wake as u64) }
+}
+
+/// Map anonymous memory into the caller's address space.
+/// `vaddr` must be page-aligned and in user space (>= 0x80_0000_0000).
+/// Returns 0 on success, u64::MAX on failure.
+pub fn sys_mmap(vaddr: usize, pages: usize) -> Result<(), ()> {
+    let ret = unsafe { syscall2(SYS_MMAP, vaddr as u64, pages as u64) };
+    if ret == u64::MAX { Err(()) } else { Ok(()) }
 }
 
 // Capability bit constants

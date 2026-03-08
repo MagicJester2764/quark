@@ -45,6 +45,8 @@ pub const SYS_FD_SET: u64 = 52;
 pub const SYS_FUTEX_WAIT: u64 = 60;
 pub const SYS_FUTEX_WAKE: u64 = 61;
 
+pub const SYS_MMAP: u64 = 70;
+
 const SFMASK_VALUE: u64 = (1 << 9) | (1 << 10); // clear IF | DF
 
 fn read_msr(msr: u32) -> u64 {
@@ -538,6 +540,47 @@ extern "C" fn syscall_dispatch(
         SYS_FUTEX_WAKE => {
             // arg0 = addr, arg1 = max_wake
             crate::futex::futex_wake(arg0, arg1)
+        }
+        SYS_MMAP => {
+            // arg0 = vaddr, arg1 = pages
+            // Allocates physical frames and maps them into the caller's address space.
+            // No capability required — every task can grow its own heap.
+            let vaddr = arg0 as usize;
+            let pages = arg1 as usize;
+            if pages == 0 || pages > 256 {
+                return u64::MAX;
+            }
+            // Must be page-aligned
+            if vaddr & 0xFFF != 0 {
+                return u64::MAX;
+            }
+            // Must be in user space and NOT in PML4[0] (kernel identity map / heap)
+            let end = match (vaddr as u64).checked_add((pages as u64) * 4096) {
+                Some(e) => e,
+                None => return u64::MAX,
+            };
+            if end > USER_ADDR_LIMIT {
+                return u64::MAX;
+            }
+            // Reject PML4[0] range (0 .. 0x80_0000_0000) — collides with kernel heap
+            if vaddr < 0x80_0000_0000 {
+                return u64::MAX;
+            }
+            let cr3 = paging::read_cr3();
+            let flags = paging::PRESENT | paging::WRITABLE | paging::USER;
+            for i in 0..pages {
+                let phys = match crate::pmm::alloc() {
+                    Some(frame) => frame.address(),
+                    None => return u64::MAX, // TODO: unmap already-mapped pages on failure
+                };
+                // Zero the frame (identity-mapped)
+                unsafe { core::ptr::write_bytes(phys as *mut u8, 0, 4096) };
+                let v = vaddr + i * 4096;
+                if unsafe { paging::map_page(cr3, v, phys, flags) }.is_err() {
+                    return u64::MAX;
+                }
+            }
+            0
         }
         _ => u64::MAX,
     }
