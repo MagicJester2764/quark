@@ -54,6 +54,8 @@ pub struct Task {
     pub fds: [FdEntry; MAX_FDS],
     /// Pager task TID for exception forwarding. 0 = no pager (kill on fault).
     pub pager_tid: usize,
+    /// Parent task TID. 0 = no parent (init/kernel tasks).
+    pub parent_tid: usize,
 }
 
 unsafe impl Send for Task {}
@@ -109,6 +111,7 @@ impl Task {
             caps: 0,
             fds: [FdEntry::empty(); MAX_FDS],
             pager_tid: 0,
+            parent_tid: 0,
         }
     }
 

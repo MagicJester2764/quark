@@ -50,6 +50,7 @@ pub const SYS_MMAP: u64 = 70;
 pub const SYS_RECV_TIMEOUT: u64 = 80;
 pub const SYS_TICKS: u64 = 81;
 pub const SYS_SET_PAGER: u64 = 82;
+pub const SYS_WAIT: u64 = 83;
 
 const SFMASK_VALUE: u64 = (1 << 9) | (1 << 10); // clear IF | DF
 
@@ -601,6 +602,10 @@ extern "C" fn syscall_dispatch(
         }
         SYS_TICKS => {
             crate::pit::ticks()
+        }
+        SYS_WAIT => {
+            // Block until a child task exits. Returns child TID or u64::MAX.
+            scheduler::sys_wait()
         }
         SYS_SET_PAGER => {
             // arg0 = tid, arg1 = pager_tid

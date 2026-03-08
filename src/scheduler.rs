@@ -23,6 +23,13 @@ static CURRENT_TID: AtomicUsize = AtomicUsize::new(0);
 static NEXT_TID: AtomicUsize = AtomicUsize::new(1); // TID 0 is idle
 static INITIALIZED: AtomicBool = AtomicBool::new(false);
 
+/// Per-task wait state. If true, the task is blocked in sys_wait.
+static mut WAIT_BLOCKED: [bool; MAX_TASKS] = [false; MAX_TASKS];
+/// TID of the dead child collected for a waiting parent. 0 = none yet.
+static mut WAIT_RESULT: [usize; MAX_TASKS] = [0; MAX_TASKS];
+/// Per-task "reaped" flag. If true, parent has collected the exit via sys_wait (or has no parent).
+static mut REAPED: [bool; MAX_TASKS] = [false; MAX_TASKS];
+
 /// Initialize the scheduler. Creates the idle task (TID 0) which represents
 /// the current execution context (kernel_main's continuation).
 pub fn init() {
@@ -39,6 +46,7 @@ pub fn init() {
             caps: crate::task::CAP_ALL,
             fds: [crate::task::FdEntry::empty(); crate::task::MAX_FDS],
             pager_tid: 0,
+            parent_tid: 0,
         });
     }
     CURRENT_TID.store(0, Ordering::SeqCst);
@@ -77,6 +85,14 @@ pub fn exit() -> ! {
         let current = CURRENT_TID.load(Ordering::SeqCst);
         if let Some(ref mut task) = TASKS[current] {
             task.state = TaskState::Dead;
+            let parent = task.parent_tid;
+            // If parent is blocked in sys_wait, wake it with our TID
+            if parent != 0 && WAIT_BLOCKED[parent] {
+                WAIT_BLOCKED[parent] = false;
+                WAIT_RESULT[parent] = current;
+                REAPED[current] = true;
+                unblock_task(parent);
+            }
         }
         schedule_inner(false);
     }
@@ -236,6 +252,47 @@ pub fn unblock_task(tid: usize) {
     }
 }
 
+/// Block the current task until a child exits. Returns the dead child's TID.
+/// Returns u64::MAX if the caller has no children.
+pub fn sys_wait() -> u64 {
+    let parent = current_tid();
+
+    unsafe {
+        // Check if any child is already dead (zombie) and not yet reaped
+        for i in 1..MAX_TASKS {
+            if let Some(ref task) = TASKS[i] {
+                if task.parent_tid == parent && task.state == TaskState::Dead && !REAPED[i] {
+                    REAPED[i] = true;
+                    return i as u64;
+                }
+            }
+        }
+
+        // Check if we have any living children at all
+        let has_children = (1..MAX_TASKS).any(|i| {
+            TASKS[i].as_ref().is_some_and(|t| t.parent_tid == parent)
+        });
+        if !has_children {
+            return u64::MAX;
+        }
+
+        // Block until a child exits
+        WAIT_BLOCKED[parent] = true;
+        WAIT_RESULT[parent] = 0;
+        block_task(parent);
+        yield_now();
+
+        // Woken up — WAIT_RESULT has the dead child's TID
+        let child_tid = WAIT_RESULT[parent];
+        WAIT_RESULT[parent] = 0;
+        if child_tid != 0 {
+            child_tid as u64
+        } else {
+            u64::MAX
+        }
+    }
+}
+
 /// Get a mutable reference to a task by TID.
 ///
 /// # Safety
@@ -249,11 +306,21 @@ pub unsafe fn get_task_mut(tid: usize) -> Option<&'static mut Task> {
 }
 
 /// Reap dead tasks (clean up IPC, IRQs, address space, and free stacks).
+/// Only reaps tasks that have been collected by sys_wait, have no parent,
+/// or whose parent is already gone.
 pub fn reap_dead() {
     unsafe {
         for i in 1..MAX_TASKS {
             if let Some(ref mut task) = TASKS[i] {
                 if task.state == TaskState::Dead {
+                    let parent = task.parent_tid;
+                    // Only reap if: already collected, no parent, or parent is gone
+                    let can_reap = REAPED[i]
+                        || parent == 0
+                        || TASKS[parent].is_none();
+                    if !can_reap {
+                        continue;
+                    }
                     // Clean up IPC state and unblock tasks waiting on this one
                     crate::ipc::cleanup_task_ipc(i);
                     // Unregister any IRQ handlers
@@ -266,6 +333,10 @@ pub fn reap_dead() {
                         crate::paging::destroy_address_space(cr3);
                     }
                     task.free_stack();
+                    REAPED[i] = false;
+                    // Clean up wait state if this task was a parent
+                    WAIT_BLOCKED[i] = false;
+                    WAIT_RESULT[i] = 0;
                     TASKS[i] = None;
                 }
             }
@@ -320,6 +391,7 @@ pub fn create_empty_task() -> Option<usize> {
         return None;
     }
 
+    let parent = current_tid();
     unsafe {
         TASKS[tid] = Some(Task {
             tid,
@@ -332,6 +404,7 @@ pub fn create_empty_task() -> Option<usize> {
             caps: 0,
             fds: [crate::task::FdEntry::empty(); crate::task::MAX_FDS],
             pager_tid: 0,
+            parent_tid: parent,
         });
     }
 

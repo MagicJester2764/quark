@@ -17,7 +17,7 @@ Scheduler, synchronous IPC, address spaces, capabilities, fd table, IRQ delegati
 
 5. **Write support in VFS/disk** — Disk driver is read-only. No file creation or modification.
 
-6. **Process groups / wait** — No `sys_wait()` for parent to wait on child exit. Init can't know when a spawned task finishes. Reaping is fire-and-forget.
+6. ~~**Process groups / wait**~~ — **Done.** `sys_wait()` (syscall 83) blocks parent until a child exits, returns child TID. Tasks track `parent_tid`; dead tasks become zombies until collected. `reap_dead()` respects parent/child relationships.
 
 7. **Per-task memory limits / quotas** — Any task with `CAP_PHYS_ALLOC` can exhaust all RAM. No resource accounting.
 

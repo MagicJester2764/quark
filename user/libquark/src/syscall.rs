@@ -42,6 +42,7 @@ pub const SYS_MMAP: u64 = 70;
 pub const SYS_RECV_TIMEOUT: u64 = 80;
 pub const SYS_TICKS: u64 = 81;
 pub const SYS_SET_PAGER: u64 = 82;
+pub const SYS_WAIT: u64 = 83;
 
 #[inline(always)]
 pub unsafe fn syscall0(nr: u64) -> u64 {
@@ -374,6 +375,13 @@ pub fn sleep_ms(ms: u64) {
     // PIT runs at 100 Hz → 1 tick = 10 ms. Round up.
     let ticks = (ms + 9) / 10;
     sleep_ticks(ticks);
+}
+
+/// Wait for a child task to exit. Returns the dead child's TID.
+/// Returns Err(()) if the caller has no children.
+pub fn sys_wait() -> Result<usize, ()> {
+    let ret = unsafe { syscall0(SYS_WAIT) };
+    if ret == u64::MAX { Err(()) } else { Ok(ret as usize) }
 }
 
 /// Set the pager task for exception forwarding (requires CAP_TASK_MGMT).
