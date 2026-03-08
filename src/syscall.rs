@@ -51,6 +51,7 @@ pub const SYS_RECV_TIMEOUT: u64 = 80;
 pub const SYS_TICKS: u64 = 81;
 pub const SYS_SET_PAGER: u64 = 82;
 pub const SYS_WAIT: u64 = 83;
+pub const SYS_SET_MEM_LIMIT: u64 = 84;
 
 const SFMASK_VALUE: u64 = (1 << 9) | (1 << 10); // clear IF | DF
 
@@ -401,11 +402,18 @@ extern "C" fn syscall_dispatch(
             if count == 0 {
                 return u64::MAX;
             }
+            // Check memory quota
+            if !scheduler::current_task_check_mem(count) {
+                return u64::MAX;
+            }
             // For simplicity, allocate pages one at a time and return the first
             // (Only single-page alloc is reliable with bitmap allocator)
             if count == 1 {
                 match crate::pmm::alloc() {
-                    Some(frame) => frame.address() as u64,
+                    Some(frame) => {
+                        scheduler::current_task_charge_mem(1);
+                        frame.address() as u64
+                    }
                     None => u64::MAX,
                 }
             } else {
@@ -420,6 +428,7 @@ extern "C" fn syscall_dispatch(
                         return u64::MAX;
                     }
                 }
+                scheduler::current_task_charge_mem(count);
                 first as u64
             }
         }
@@ -571,6 +580,10 @@ extern "C" fn syscall_dispatch(
             if vaddr < 0x80_0000_0000 {
                 return u64::MAX;
             }
+            // Check memory quota
+            if !scheduler::current_task_check_mem(pages) {
+                return u64::MAX;
+            }
             let cr3 = paging::read_cr3();
             let flags = paging::PRESENT | paging::WRITABLE | paging::USER;
             for i in 0..pages {
@@ -585,6 +598,7 @@ extern "C" fn syscall_dispatch(
                     return u64::MAX;
                 }
             }
+            scheduler::current_task_charge_mem(pages);
             0
         }
         SYS_RECV_TIMEOUT => {
@@ -606,6 +620,18 @@ extern "C" fn syscall_dispatch(
         SYS_WAIT => {
             // Block until a child task exits. Returns child TID or u64::MAX.
             scheduler::sys_wait()
+        }
+        SYS_SET_MEM_LIMIT => {
+            // arg0 = tid, arg1 = limit in pages (0 = unlimited)
+            if !scheduler::current_task_has_cap(crate::task::CAP_TASK_MGMT) {
+                return u64::MAX;
+            }
+            let tid = arg0 as usize;
+            let limit = arg1 as usize;
+            match scheduler::set_mem_limit(tid, limit) {
+                Ok(()) => 0,
+                Err(()) => u64::MAX,
+            }
         }
         SYS_SET_PAGER => {
             // arg0 = tid, arg1 = pager_tid

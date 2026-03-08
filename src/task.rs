@@ -56,6 +56,10 @@ pub struct Task {
     pub pager_tid: usize,
     /// Parent task TID. 0 = no parent (init/kernel tasks).
     pub parent_tid: usize,
+    /// Number of physical pages allocated by this task (via sys_mmap / sys_phys_alloc).
+    pub mem_pages: usize,
+    /// Maximum pages this task may allocate. 0 = unlimited.
+    pub mem_limit: usize,
 }
 
 unsafe impl Send for Task {}
@@ -112,6 +116,8 @@ impl Task {
             fds: [FdEntry::empty(); MAX_FDS],
             pager_tid: 0,
             parent_tid: 0,
+            mem_pages: 0,
+            mem_limit: 0,
         }
     }
 

@@ -47,6 +47,8 @@ pub fn init() {
             fds: [crate::task::FdEntry::empty(); crate::task::MAX_FDS],
             pager_tid: 0,
             parent_tid: 0,
+            mem_pages: 0,
+            mem_limit: 0,
         });
     }
     CURRENT_TID.store(0, Ordering::SeqCst);
@@ -405,6 +407,8 @@ pub fn create_empty_task() -> Option<usize> {
             fds: [crate::task::FdEntry::empty(); crate::task::MAX_FDS],
             pager_tid: 0,
             parent_tid: parent,
+            mem_pages: 0,
+            mem_limit: 0,
         });
     }
 
@@ -498,6 +502,47 @@ pub fn current_task_pager() -> usize {
         match TASKS[tid].as_ref() {
             Some(task) => task.pager_tid,
             None => 0,
+        }
+    }
+}
+
+/// Check if the current task can allocate `pages` more pages.
+/// Returns false if the allocation would exceed the task's memory limit.
+pub fn current_task_check_mem(pages: usize) -> bool {
+    let tid = current_tid();
+    unsafe {
+        match TASKS[tid].as_ref() {
+            Some(task) => {
+                if task.mem_limit == 0 {
+                    true // unlimited
+                } else {
+                    task.mem_pages + pages <= task.mem_limit
+                }
+            }
+            None => false,
+        }
+    }
+}
+
+/// Add `pages` to the current task's memory usage counter.
+pub fn current_task_charge_mem(pages: usize) {
+    let tid = current_tid();
+    unsafe {
+        if let Some(ref mut task) = TASKS[tid] {
+            task.mem_pages += pages;
+        }
+    }
+}
+
+/// Set the memory limit (in pages) for a task. 0 = unlimited.
+pub fn set_mem_limit(tid: usize, limit: usize) -> Result<(), ()> {
+    unsafe {
+        match TASKS[tid].as_mut() {
+            Some(task) => {
+                task.mem_limit = limit;
+                Ok(())
+            }
+            None => Err(()),
         }
     }
 }

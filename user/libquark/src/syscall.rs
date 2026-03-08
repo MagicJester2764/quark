@@ -43,6 +43,7 @@ pub const SYS_RECV_TIMEOUT: u64 = 80;
 pub const SYS_TICKS: u64 = 81;
 pub const SYS_SET_PAGER: u64 = 82;
 pub const SYS_WAIT: u64 = 83;
+pub const SYS_SET_MEM_LIMIT: u64 = 84;
 
 #[inline(always)]
 pub unsafe fn syscall0(nr: u64) -> u64 {
@@ -375,6 +376,13 @@ pub fn sleep_ms(ms: u64) {
     // PIT runs at 100 Hz → 1 tick = 10 ms. Round up.
     let ticks = (ms + 9) / 10;
     sleep_ticks(ticks);
+}
+
+/// Set the memory limit (in pages) for a task. 0 = unlimited.
+/// Requires CAP_TASK_MGMT.
+pub fn sys_set_mem_limit(tid: usize, limit_pages: usize) -> Result<(), ()> {
+    let ret = unsafe { syscall2(SYS_SET_MEM_LIMIT, tid as u64, limit_pages as u64) };
+    if ret == u64::MAX { Err(()) } else { Ok(()) }
 }
 
 /// Wait for a child task to exit. Returns the dead child's TID.
