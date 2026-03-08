@@ -3,7 +3,7 @@
 //! Sets up handlers for all 32 CPU exceptions, a TSS for double-fault
 //! recovery, and the GDT changes to support the TSS.
 
-use crate::{console, io, pic, pit};
+use crate::{console, io, ipc, pic, pit, scheduler};
 
 // ---------------------------------------------------------------------------
 // Structures
@@ -315,10 +315,67 @@ core::arch::global_asm!(
 // Rust exception handler
 // ---------------------------------------------------------------------------
 
+/// Page fault error code bits.
+const PF_PRESENT: u64 = 1 << 0;
+const PF_WRITE: u64 = 1 << 1;
+const PF_USER: u64 = 1 << 2;
+const PF_INSN_FETCH: u64 = 1 << 4;
+
+/// IPC tag for page fault messages sent to pager tasks.
+pub const TAG_PAGE_FAULT: u64 = 0xFFFF_0001;
+
 #[no_mangle]
 extern "C" fn exception_handler(frame: &InterruptFrame) {
     let vec = frame.vector as usize;
+    let from_user = frame.cs & 3 != 0;
 
+    // Handle user-mode page faults: forward to pager or kill task
+    if vec == 14 && from_user {
+        let cr2: u64;
+        unsafe { core::arch::asm!("mov {}, cr2", out(reg) cr2, options(nostack, nomem)) };
+
+        let tid = scheduler::current_tid();
+        let pager = scheduler::current_task_pager();
+
+        if pager != 0 {
+            // Forward fault to pager via IPC call.
+            // data: [fault_addr, error_code, rip, rsp, access_flags, 0]
+            // access_flags: bit 0=present, bit 1=write, bit 2=user, bit 4=insn_fetch
+            let fault_msg = ipc::Message {
+                sender: tid,
+                tag: TAG_PAGE_FAULT,
+                data: [
+                    cr2,
+                    frame.error_code,
+                    frame.rip,
+                    frame.rsp,
+                    frame.error_code & (PF_PRESENT | PF_WRITE | PF_USER | PF_INSN_FETCH),
+                    0,
+                ],
+            };
+            // Enable interrupts so the pager can run (we're in an exception handler
+            // with IF cleared). fault_call will block us and yield.
+            unsafe { core::arch::asm!("sti", options(nostack, nomem)) };
+            ipc::fault_call(tid, pager, fault_msg);
+            // Pager replied — page should be mapped. Return to retry instruction.
+            return;
+        }
+
+        // No pager — kill the faulting task
+        console::puts(b"\n[kernel] Page fault in task ");
+        print_dec(tid);
+        console::puts(b" at ");
+        print_hex(cr2);
+        console::puts(b" (RIP=");
+        print_hex(frame.rip);
+        console::puts(b") - no pager, killing task.\n");
+
+        unsafe { core::arch::asm!("sti", options(nostack, nomem)) };
+        scheduler::exit();
+        // exit() never returns
+    }
+
+    // All other exceptions (or kernel page faults): fatal
     console::puts(b"\n!!! EXCEPTION: ");
     if vec < 32 {
         console::puts(EXCEPTION_NAMES[vec]);

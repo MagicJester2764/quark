@@ -11,7 +11,7 @@ Scheduler, synchronous IPC, address spaces, capabilities, fd table, IRQ delegati
 
 3. ~~**Timers for userspace**~~ — **Done.** `sys_ticks()` (syscall 81) reads PIT counter. `libquark::syscall::sleep_ms(ms)` and `sleep_ticks(ticks)` provide blocking sleep via recv_timeout.
 
-4. **Page fault / exception forwarding** — A page fault in userspace triple-faults. Forwarding exceptions to a designated pager task is a classic microkernel pattern and enables demand paging, copy-on-write, and stack growth.
+4. ~~**Page fault / exception forwarding**~~ — **Done.** User page faults are forwarded to a pager task via IPC (`TAG_PAGE_FAULT`, `sys_set_pager` syscall 82). If no pager, the faulting task is killed cleanly instead of triple-faulting. Enables demand paging, COW, and stack growth.
 
 ## Medium impact (needed for real workloads)
 

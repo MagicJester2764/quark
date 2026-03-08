@@ -38,6 +38,7 @@ pub fn init() {
             cr3: crate::paging::read_cr3(),
             caps: crate::task::CAP_ALL,
             fds: [crate::task::FdEntry::empty(); crate::task::MAX_FDS],
+            pager_tid: 0,
         });
     }
     CURRENT_TID.store(0, Ordering::SeqCst);
@@ -330,6 +331,7 @@ pub fn create_empty_task() -> Option<usize> {
             cr3: 0,
             caps: 0,
             fds: [crate::task::FdEntry::empty(); crate::task::MAX_FDS],
+            pager_tid: 0,
         });
     }
 
@@ -399,6 +401,30 @@ pub fn set_fd(tid: usize, fd: usize, entry: crate::task::FdEntry) -> Result<(), 
                 Ok(())
             }
             None => Err(()),
+        }
+    }
+}
+
+/// Set the pager task for a given task.
+pub fn set_pager(tid: usize, pager_tid: usize) -> Result<(), ()> {
+    unsafe {
+        match TASKS[tid].as_mut() {
+            Some(task) => {
+                task.pager_tid = pager_tid;
+                Ok(())
+            }
+            None => Err(()),
+        }
+    }
+}
+
+/// Get the pager TID for the current task. Returns 0 if no pager.
+pub fn current_task_pager() -> usize {
+    let tid = current_tid();
+    unsafe {
+        match TASKS[tid].as_ref() {
+            Some(task) => task.pager_tid,
+            None => 0,
         }
     }
 }

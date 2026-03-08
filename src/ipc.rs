@@ -336,6 +336,42 @@ pub fn sys_recv_timeout(from: usize, timeout_ticks: u64) -> Result<Message, IpcE
     }
 }
 
+/// Kernel-initiated IPC call on behalf of a faulting task.
+/// Used by the exception handler to forward page faults to a pager task.
+/// The faulting task is blocked until the pager replies via sys_reply.
+///
+/// Must be called with the faulting task as the current task.
+/// After this returns, the pager has replied and the faulting task can resume.
+pub fn fault_call(faulting_tid: usize, pager_tid: usize, msg: Message) {
+    unsafe {
+        // Check if pager is recv-blocked waiting for us (or TID_ANY)
+        let pager_state = TASK_IPC[pager_tid].state;
+        match pager_state {
+            IpcState::RecvBlocked(from) if from == faulting_tid || from == TID_ANY => {
+                // Fast path: deliver directly to pager
+                TASK_IPC[pager_tid].pending_msg = Some(msg);
+                TASK_IPC[pager_tid].state = IpcState::None;
+                scheduler::unblock_task(pager_tid);
+                // Faulting task waits for reply
+                TASK_IPC[faulting_tid].state = IpcState::CallBlocked(pager_tid);
+                TASK_IPC[faulting_tid].pending_msg = None;
+            }
+            _ => {
+                // Slow path: pager not waiting — queue as CallSendBlocked.
+                // When pager calls sys_recv, it picks this up.
+                TASK_IPC[faulting_tid].pending_msg = Some(msg);
+                TASK_IPC[faulting_tid].state = IpcState::CallSendBlocked(pager_tid);
+            }
+        }
+        scheduler::block_task(faulting_tid);
+        scheduler::yield_now();
+
+        // Resumed — pager replied. Clean up.
+        TASK_IPC[faulting_tid].pending_msg = None;
+        TASK_IPC[faulting_tid].state = IpcState::None;
+    }
+}
+
 /// Check all task timeouts and unblock expired ones.
 /// Called from `pit::tick()` on every timer interrupt.
 pub fn check_timeouts() {

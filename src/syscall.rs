@@ -49,6 +49,7 @@ pub const SYS_MMAP: u64 = 70;
 
 pub const SYS_RECV_TIMEOUT: u64 = 80;
 pub const SYS_TICKS: u64 = 81;
+pub const SYS_SET_PAGER: u64 = 82;
 
 const SFMASK_VALUE: u64 = (1 << 9) | (1 << 10); // clear IF | DF
 
@@ -600,6 +601,18 @@ extern "C" fn syscall_dispatch(
         }
         SYS_TICKS => {
             crate::pit::ticks()
+        }
+        SYS_SET_PAGER => {
+            // arg0 = tid, arg1 = pager_tid
+            if !scheduler::current_task_has_cap(crate::task::CAP_TASK_MGMT) {
+                return u64::MAX;
+            }
+            let tid = arg0 as usize;
+            let pager_tid = arg1 as usize;
+            match scheduler::set_pager(tid, pager_tid) {
+                Ok(()) => 0,
+                Err(()) => u64::MAX,
+            }
         }
         _ => u64::MAX,
     }

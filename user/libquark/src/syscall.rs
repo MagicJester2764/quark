@@ -41,6 +41,7 @@ pub const SYS_MMAP: u64 = 70;
 
 pub const SYS_RECV_TIMEOUT: u64 = 80;
 pub const SYS_TICKS: u64 = 81;
+pub const SYS_SET_PAGER: u64 = 82;
 
 #[inline(always)]
 pub unsafe fn syscall0(nr: u64) -> u64 {
@@ -374,6 +375,17 @@ pub fn sleep_ms(ms: u64) {
     let ticks = (ms + 9) / 10;
     sleep_ticks(ticks);
 }
+
+/// Set the pager task for exception forwarding (requires CAP_TASK_MGMT).
+/// Page faults in the target task will be forwarded to pager_tid via IPC.
+pub fn sys_set_pager(tid: usize, pager_tid: usize) -> Result<(), ()> {
+    let ret = unsafe { syscall2(SYS_SET_PAGER, tid as u64, pager_tid as u64) };
+    if ret == u64::MAX { Err(()) } else { Ok(()) }
+}
+
+/// IPC tag for page fault messages from the kernel.
+/// data: [fault_addr, error_code, rip, rsp, access_flags, 0]
+pub const TAG_PAGE_FAULT: u64 = 0xFFFF_0001;
 
 /// Map anonymous memory into the caller's address space.
 /// `vaddr` must be page-aligned and in user space (>= 0x80_0000_0000).

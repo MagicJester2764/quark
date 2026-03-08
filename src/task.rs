@@ -52,6 +52,8 @@ pub struct Task {
     /// File descriptor table. fd 0=stdin, 1=stdout, 2=stderr.
     /// An entry with target_tid=0 means the fd is not connected.
     pub fds: [FdEntry; MAX_FDS],
+    /// Pager task TID for exception forwarding. 0 = no pager (kill on fault).
+    pub pager_tid: usize,
 }
 
 unsafe impl Send for Task {}
@@ -106,6 +108,7 @@ impl Task {
             cr3: crate::paging::read_cr3(),
             caps: 0,
             fds: [FdEntry::empty(); MAX_FDS],
+            pager_tid: 0,
         }
     }
 
