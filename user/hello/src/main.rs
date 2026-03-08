@@ -37,6 +37,14 @@ pub extern "C" fn _start() -> ! {
     println!("Reuse vec len: {}", reuse.len());
 
     println!("Heap test passed!");
+
+    // Test sleep
+    let t0 = syscall::sys_ticks();
+    println!("Sleeping 500ms (tick {})...", t0);
+    syscall::sleep_ms(500);
+    let t1 = syscall::sys_ticks();
+    println!("Woke up at tick {} ({}ms elapsed)", t1, (t1 - t0) * 10);
+
     syscall::sys_exit();
 }
 

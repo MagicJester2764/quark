@@ -39,6 +39,9 @@ pub const SYS_FUTEX_WAKE: u64 = 61;
 
 pub const SYS_MMAP: u64 = 70;
 
+pub const SYS_RECV_TIMEOUT: u64 = 80;
+pub const SYS_TICKS: u64 = 81;
+
 #[inline(always)]
 pub unsafe fn syscall0(nr: u64) -> u64 {
     let ret: u64;
@@ -333,6 +336,43 @@ pub fn sys_futex_wait(addr: *const u32, expected: u32) -> u64 {
 
 pub fn sys_futex_wake(addr: *const u32, max_wake: usize) -> u64 {
     unsafe { syscall2(SYS_FUTEX_WAKE, addr as u64, max_wake as u64) }
+}
+
+/// Receive with timeout.
+/// Returns Ok(()) if a message was received (written to `msg`),
+/// Err(1) on timeout, Err(u64::MAX) on error.
+pub fn sys_recv_timeout(from: usize, msg: &mut crate::ipc::Message, timeout_ticks: u64) -> Result<(), u64> {
+    let ret = unsafe {
+        syscall3(SYS_RECV_TIMEOUT, from as u64, msg as *mut _ as u64, timeout_ticks)
+    };
+    match ret {
+        0 => Ok(()),
+        other => Err(other),
+    }
+}
+
+/// Read the kernel PIT tick counter (100 Hz, 10 ms per tick).
+pub fn sys_ticks() -> u64 {
+    unsafe { syscall0(SYS_TICKS) }
+}
+
+/// Sleep for `ticks` PIT ticks (each tick = 10 ms at 100 Hz).
+pub fn sleep_ticks(ticks: u64) {
+    if ticks == 0 {
+        return;
+    }
+    // Block by doing a recv_timeout from our own TID — nobody will send to us specifically,
+    // so it always times out after the deadline.
+    let from = sys_getpid() as usize;
+    let mut msg = crate::ipc::Message::empty();
+    let _ = sys_recv_timeout(from, &mut msg, ticks);
+}
+
+/// Sleep for approximately `ms` milliseconds.
+pub fn sleep_ms(ms: u64) {
+    // PIT runs at 100 Hz → 1 tick = 10 ms. Round up.
+    let ticks = (ms + 9) / 10;
+    sleep_ticks(ticks);
 }
 
 /// Map anonymous memory into the caller's address space.

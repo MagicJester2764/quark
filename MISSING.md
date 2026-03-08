@@ -7,9 +7,9 @@ Scheduler, synchronous IPC, address spaces, capabilities, fd table, IRQ delegati
 
 1. ~~**User-space memory allocation**~~ — **Done.** `sys_mmap(vaddr, pages)` (syscall 70) allocates+maps frames. `libquark::allocator` provides `#[global_allocator]` backed by sys_mmap, enabling `Vec`, `String`, etc.
 
-2. **Async notifications / non-blocking IPC** — Everything is synchronous send/recv. A task can't wait on IPC *and* a timer *and* an IRQ simultaneously. A lightweight notification/signal word (like seL4's) or `sys_recv_timeout` would fix this.
+2. ~~**Async notifications / non-blocking IPC**~~ — **Partially done.** `sys_recv_timeout(from, msg, ticks)` (syscall 80) adds non-blocking poll (ticks=0) and timed receive. Full notification word (seL4-style) still missing for true multiplexed wait.
 
-3. **Timers for userspace** — No `sleep()`, no timeouts, no wall clock. Tasks that need delays (retries, animations, polling intervals) have no option but busy-wait or yield loops.
+3. ~~**Timers for userspace**~~ — **Done.** `sys_ticks()` (syscall 81) reads PIT counter. `libquark::syscall::sleep_ms(ms)` and `sleep_ticks(ticks)` provide blocking sleep via recv_timeout.
 
 4. **Page fault / exception forwarding** — A page fault in userspace triple-faults. Forwarding exceptions to a designated pager task is a classic microkernel pattern and enables demand paging, copy-on-write, and stack growth.
 

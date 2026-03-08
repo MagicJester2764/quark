@@ -21,6 +21,7 @@ pub unsafe fn init(hz: u32) {
 /// Called from the IRQ 0 handler to bump the tick counter and trigger scheduling.
 pub fn tick() {
     TICKS.fetch_add(1, Ordering::Relaxed);
+    crate::ipc::check_timeouts();
     crate::scheduler::timer_tick();
 }
 

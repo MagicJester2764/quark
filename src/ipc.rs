@@ -13,6 +13,7 @@ pub enum IpcError {
     DeadTask,
     WouldBlock,
     NotWaiting,
+    Timeout,
 }
 
 /// Fixed-size IPC message: sender TID, tag, and 6 payload words.
@@ -63,6 +64,9 @@ static mut TASK_IPC: [TaskIpc; MAX_TASKS] = {
     };
     [INIT; MAX_TASKS]
 };
+
+/// Per-task timeout deadline (PIT tick count). 0 = no timeout.
+static mut TASK_TIMEOUT: [u64; MAX_TASKS] = [0; MAX_TASKS];
 
 /// Synchronous send: blocks until receiver calls recv.
 pub fn sys_send(dest: usize, msg: &Message) -> Result<(), IpcError> {
@@ -254,6 +258,103 @@ pub fn sys_reply(dest: usize, msg: &Message) -> Result<(), IpcError> {
     }
 }
 
+/// Synchronous receive with timeout: blocks until a message arrives or deadline expires.
+/// `from` is the expected sender TID, or TID_ANY for any sender.
+/// `timeout_ticks` is the number of PIT ticks to wait (0 = non-blocking poll).
+pub fn sys_recv_timeout(from: usize, timeout_ticks: u64) -> Result<Message, IpcError> {
+    let receiver = scheduler::current_tid();
+
+    unsafe {
+        // Check if any sender is blocked waiting to send to us (same as sys_recv)
+        for tid in 0..MAX_TASKS {
+            if tid == receiver {
+                continue;
+            }
+            let dest = match TASK_IPC[tid].state {
+                IpcState::SendBlocked(d) => d,
+                IpcState::CallSendBlocked(d) => d,
+                _ => continue,
+            };
+            if dest == receiver && (from == TID_ANY || from == tid) {
+                let was_call = matches!(TASK_IPC[tid].state, IpcState::CallSendBlocked(_));
+                let msg = match TASK_IPC[tid].pending_msg.take() {
+                    Some(m) => m,
+                    None => {
+                        TASK_IPC[tid].state = IpcState::None;
+                        scheduler::unblock_task(tid);
+                        continue;
+                    }
+                };
+                if was_call {
+                    TASK_IPC[tid].state = IpcState::CallBlocked(receiver);
+                } else {
+                    TASK_IPC[tid].state = IpcState::None;
+                    scheduler::unblock_task(tid);
+                }
+                return Ok(msg);
+            }
+        }
+
+        // Check for pending IRQ messages
+        if from == 0 || from == TID_ANY {
+            if let Some(msg) = crate::irq_dispatch::poll_irq_message(receiver) {
+                return Ok(msg);
+            }
+        }
+
+        // Non-blocking poll: return immediately if timeout is 0
+        if timeout_ticks == 0 {
+            return Err(IpcError::Timeout);
+        }
+
+        // Set deadline and block
+        TASK_TIMEOUT[receiver] = crate::pit::ticks() + timeout_ticks;
+        TASK_IPC[receiver].state = IpcState::RecvBlocked(from);
+        scheduler::block_task(receiver);
+        scheduler::yield_now();
+
+        // Clear timeout (may already be 0 if expired)
+        TASK_TIMEOUT[receiver] = 0;
+
+        // Check if an IPC message was delivered
+        if let Some(msg) = TASK_IPC[receiver].pending_msg.take() {
+            TASK_IPC[receiver].state = IpcState::None;
+            return Ok(msg);
+        }
+
+        // Check IRQ messages
+        if from == 0 || from == TID_ANY {
+            if let Some(msg) = crate::irq_dispatch::poll_irq_message(receiver) {
+                TASK_IPC[receiver].state = IpcState::None;
+                return Ok(msg);
+            }
+        }
+
+        // No message — must have been a timeout
+        TASK_IPC[receiver].state = IpcState::None;
+        Err(IpcError::Timeout)
+    }
+}
+
+/// Check all task timeouts and unblock expired ones.
+/// Called from `pit::tick()` on every timer interrupt.
+pub fn check_timeouts() {
+    let now = crate::pit::ticks();
+    unsafe {
+        for tid in 0..MAX_TASKS {
+            let deadline = TASK_TIMEOUT[tid];
+            if deadline != 0 && now >= deadline {
+                TASK_TIMEOUT[tid] = 0;
+                // Only unblock if still RecvBlocked (could have been woken by IPC already)
+                if matches!(TASK_IPC[tid].state, IpcState::RecvBlocked(_)) {
+                    TASK_IPC[tid].state = IpcState::None;
+                    scheduler::unblock_task(tid);
+                }
+            }
+        }
+    }
+}
+
 /// Clean up IPC state when a task dies.
 /// Unblocks any tasks that were blocked waiting on the dead task.
 pub fn cleanup_task_ipc(dead_tid: usize) {
@@ -262,9 +363,10 @@ pub fn cleanup_task_ipc(dead_tid: usize) {
     }
 
     unsafe {
-        // Clear the dead task's own IPC state
+        // Clear the dead task's own IPC state and timeout
         TASK_IPC[dead_tid].state = IpcState::None;
         TASK_IPC[dead_tid].pending_msg = None;
+        TASK_TIMEOUT[dead_tid] = 0;
 
         // Scan all tasks for those blocked on the dead task
         let error_msg = Message {

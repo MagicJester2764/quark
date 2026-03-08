@@ -47,6 +47,9 @@ pub const SYS_FUTEX_WAKE: u64 = 61;
 
 pub const SYS_MMAP: u64 = 70;
 
+pub const SYS_RECV_TIMEOUT: u64 = 80;
+pub const SYS_TICKS: u64 = 81;
+
 const SFMASK_VALUE: u64 = (1 << 9) | (1 << 10); // clear IF | DF
 
 fn read_msr(msr: u32) -> u64 {
@@ -581,6 +584,22 @@ extern "C" fn syscall_dispatch(
                 }
             }
             0
+        }
+        SYS_RECV_TIMEOUT => {
+            // arg0 = from, arg1 = msg_ptr, arg2 = timeout_ticks
+            let from = arg0 as usize;
+            let msg_ptr = arg1 as *mut crate::ipc::Message;
+            let timeout = arg2;
+            let msg_size = core::mem::size_of::<crate::ipc::Message>() as u64;
+            if msg_ptr.is_null() || !validate_user_ptr(arg1, msg_size) { return u64::MAX; }
+            match crate::ipc::sys_recv_timeout(from, timeout) {
+                Ok(msg) => { unsafe { *msg_ptr = msg }; 0 }
+                Err(crate::ipc::IpcError::Timeout) => 1,
+                Err(_) => u64::MAX,
+            }
+        }
+        SYS_TICKS => {
+            crate::pit::ticks()
         }
         _ => u64::MAX,
     }
