@@ -5,11 +5,22 @@ extern crate alloc;
 
 use alloc::string::String;
 use alloc::vec::Vec;
-use libquark::{println, syscall};
+use libquark::{args, println, syscall};
 
 #[unsafe(no_mangle)]
 #[link_section = ".text.entry"]
 pub extern "C" fn _start() -> ! {
+    // Print program arguments
+    let argc = args::argc();
+    println!("argc={}", argc);
+    for i in 0..argc {
+        if let Some(arg) = args::argv(i) {
+            if let Ok(s) = core::str::from_utf8(arg) {
+                println!("  argv[{}] = \"{}\"", i, s);
+            }
+        }
+    }
+
     println!("Hello from user space!");
 
     // Test Vec

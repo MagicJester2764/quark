@@ -21,7 +21,7 @@ Scheduler, synchronous IPC, address spaces, capabilities, fd table, IRQ delegati
 
 7. **Per-task memory limits / quotas** — Any task with `CAP_PHYS_ALLOC` can exhaust all RAM. No resource accounting.
 
-8. **Proper `exec` / program arguments** — No way to pass argv/argc/environment to a spawned program. Init hardcodes everything.
+8. ~~**Proper `exec` / program arguments**~~ — **Done.** Init maps an argument page at `0x80_8000_0000` in child address spaces. `libquark::args::argc()` / `argv(n)` read from it. Init passes program name as argv[0] for all spawned tasks.
 
 ## Lower priority (completeness)
 

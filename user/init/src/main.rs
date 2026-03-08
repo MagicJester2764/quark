@@ -358,6 +358,47 @@ fn load_elf(elf_data: &[u8]) -> Result<SpawnInfo, ()> {
 }
 
 // ---------------------------------------------------------------------------
+// Program arguments
+// ---------------------------------------------------------------------------
+
+const ARGS_PAGE_ADDR: usize = 0x80_8000_0000;
+const ARGS_TEMP_PAGE: usize = 0x88_0000_0000;
+
+/// Write program arguments into the child task's address space.
+/// `args` is a list of byte slices (argv[0], argv[1], ...).
+/// Allocates one physical page, writes the args layout, maps into child's CR3.
+fn set_args(info: &SpawnInfo, args: &[&[u8]]) -> Result<(), ()> {
+    let frame = syscall::sys_phys_alloc(1)?;
+    syscall::sys_map_phys(frame, ARGS_TEMP_PAGE, 1)?;
+
+    let base = ARGS_TEMP_PAGE as *mut u8;
+    unsafe {
+        // Zero the page
+        core::ptr::write_bytes(base, 0, PAGE_SIZE);
+
+        // Write argc
+        *(base as *mut u64) = args.len() as u64;
+
+        let mut offset = 8usize;
+        for arg in args {
+            // Write arg length
+            if offset + 8 + arg.len() > PAGE_SIZE {
+                break; // Out of space
+            }
+            *(base.add(offset) as *mut u64) = arg.len() as u64;
+            offset += 8;
+            // Write arg bytes
+            core::ptr::copy_nonoverlapping(arg.as_ptr(), base.add(offset), arg.len());
+            offset += arg.len();
+        }
+    }
+
+    // Map into child's address space
+    syscall::sys_addrspace_map(info.cr3, ARGS_PAGE_ADDR, frame, 1, 0)?; // read-only
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
@@ -537,6 +578,7 @@ fn load_essentials_from_boot_image(rootfs_phys: usize, rootfs_size: usize) -> Bo
             if let Ok(data) = read_file_to_buffer(rootfs, &bpb, e.first_cluster, e.file_size) {
                 match load_elf(data) {
                     Ok(info) => {
+                        let _ = set_args(&info, &[b"nameserver"]);
                         let _ = info.start();
                         println!("[init]   Spawned TID {}", info.tid);
                     }
@@ -558,6 +600,7 @@ fn load_essentials_from_boot_image(rootfs_phys: usize, rootfs_size: usize) -> Bo
                     Ok(info) => {
                         console_tid = info.tid;
                         let _ = syscall::sys_grant_cap(info.tid, syscall::CAP_MAP_PHYS);
+                        let _ = set_args(&info, &[b"console"]);
                         let _ = info.start();
                         send_fb_info(info.tid);
                         // Wire init's own stdout/stderr to console server
@@ -611,6 +654,7 @@ fn load_essentials_from_boot_image(rootfs_phys: usize, rootfs_size: usize) -> Bo
                         let _ = syscall::sys_fd_set(tid, 1, console_tid, 1);
                         let _ = syscall::sys_fd_set(tid, 2, console_tid, 1);
                     }
+                    let _ = set_args(&info, &[&namebuf[..namelen]]);
                     let _ = info.start();
                     if spawned_count < 32 {
                         spawned_tids[spawned_count] = tid;
@@ -637,6 +681,7 @@ fn load_essentials_from_boot_image(rootfs_phys: usize, rootfs_size: usize) -> Bo
                             let _ = syscall::sys_fd_set(info.tid, 1, console_tid, 1);
                             let _ = syscall::sys_fd_set(info.tid, 2, console_tid, 1);
                         }
+                        let _ = set_args(&info, &[b"input"]);
                         let _ = info.start();
                         println!("[init]   Input spawned TID {}", info.tid);
                     }
@@ -671,6 +716,7 @@ fn load_essentials_from_boot_image(rootfs_phys: usize, rootfs_size: usize) -> Bo
                         if input_tid != 0 {
                             let _ = syscall::sys_fd_set(info.tid, 0, input_tid, 1);
                         }
+                        let _ = set_args(&info, &[b"vfs"]);
                         println!("[init]   VFS loaded as TID {}", info.tid);
                         vfs_spawn = Some(info);
                     }
@@ -701,10 +747,13 @@ impl DeferredTasks {
         DeferredTasks { spawns: [NONE; MAX_DEFERRED], count: 0 }
     }
 
-    fn start_all(&mut self) {
+    /// Start each deferred task one at a time, waiting for each to exit
+    /// before starting the next (prevents interleaved output).
+    fn start_sequentially(&mut self) {
         for i in 0..self.count {
             if let Some(info) = self.spawns[i].take() {
                 let _ = info.start();
+                let _ = syscall::sys_wait();
             }
         }
     }
@@ -811,6 +860,7 @@ fn load_from_vfs(vfs_tid: usize, console_tid: usize, input_tid: usize) -> Deferr
                 if input_tid != 0 {
                     let _ = syscall::sys_fd_set(tid, 0, input_tid, 1);
                 }
+                let _ = set_args(&info, &[&namebuf[..namelen]]);
                 println!("[init]   Loaded TID {} (deferred start)", tid);
                 if deferred.count < MAX_DEFERRED {
                     deferred.spawns[deferred.count] = Some(info);
@@ -881,7 +931,7 @@ pub extern "C" fn _start() -> ! {
 
             // Phase 4: Start non-essential programs
             println!("[init] All programs loaded. Starting deferred tasks.");
-            deferred.start_all();
+            deferred.start_sequentially();
 
             found = true;
             break;

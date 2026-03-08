@@ -2,6 +2,7 @@
 
 extern crate alloc;
 
+pub mod args;
 pub mod console;
 pub mod ipc;
 pub mod stdio;
