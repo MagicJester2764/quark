@@ -464,8 +464,6 @@ fn grant_caps_by_name(name: &[u8; 11], tid: usize) {
         let _ = syscall::sys_grant_ioport(tid);
         let _ = syscall::sys_grant_irq(tid, 14);
         let _ = syscall::sys_grant_cap(tid, syscall::CAP_MAP_PHYS);
-    } else if base == b"DISKTEST" {
-        let _ = syscall::sys_grant_cap(tid, syscall::CAP_PHYS_ALLOC | syscall::CAP_MAP_PHYS);
     } else if base == b"VFS     " {
         let _ = syscall::sys_grant_cap(tid, syscall::CAP_PHYS_ALLOC | syscall::CAP_MAP_PHYS);
     } else if base == b"NET     " {
@@ -474,8 +472,6 @@ fn grant_caps_by_name(name: &[u8; 11], tid: usize) {
     } else if base == b"SHELL   " {
         let _ = syscall::sys_grant_cap(tid,
             syscall::CAP_TASK_MGMT | syscall::CAP_PHYS_ALLOC | syscall::CAP_MAP_PHYS);
-    } else if base == b"CAT     " {
-        let _ = syscall::sys_grant_cap(tid, syscall::CAP_PHYS_ALLOC | syscall::CAP_MAP_PHYS);
     }
 }
 
@@ -784,19 +780,16 @@ fn load_from_vfs(vfs_tid: usize, console_pipe: usize, input_tid: usize) -> Defer
         }
     };
 
-    // Enumerate directory entries, collecting non-essential ELF names+sizes
-    let mut file_entries: [(u32, [u8; 11]); MAX_DIR_ENTRIES] = [(0, [0; 11]); MAX_DIR_ENTRIES];
-    let mut file_count = 0;
+    // Find SHELL.ELF in /usr/bin
+    let mut shell_name: Option<[u8; 11]> = None;
     let mut index = 0u32;
 
     loop {
         match vfs::readdir(vfs_tid, dir_handle, index) {
             Ok(Some(entry)) => {
-                if &entry.name[8..11] == b"ELF" && !is_essential_elf(&entry.name) && !entry.is_dir {
-                    if file_count < MAX_DIR_ENTRIES {
-                        file_entries[file_count] = (entry.size, entry.name);
-                        file_count += 1;
-                    }
+                if &entry.name[0..8] == b"SHELL   " && &entry.name[8..11] == b"ELF" && !entry.is_dir {
+                    shell_name = Some(entry.name);
+                    break;
                 }
                 index += 1;
             }
@@ -806,99 +799,81 @@ fn load_from_vfs(vfs_tid: usize, console_pipe: usize, input_tid: usize) -> Defer
     }
     let _ = vfs::close(vfs_tid, dir_handle);
 
-    // Reorder so SHELL is last (it blocks forever reading input)
-    let mut shell_idx: Option<usize> = None;
-    for i in 0..file_count {
-        if &file_entries[i].1[0..8] == b"SHELL   " {
-            shell_idx = Some(i);
-            break;
+    let name = match shell_name {
+        Some(n) => n,
+        None => {
+            println!("[init] SHELL.ELF not found in /usr/bin");
+            return deferred;
         }
-    }
-    if let Some(si) = shell_idx {
-        // Move shell entry to the end by rotating
-        let saved = file_entries[si];
-        for j in si..file_count - 1 {
-            file_entries[j] = file_entries[j + 1];
+    };
+
+    let mut namebuf = [0u8; 16];
+    let namelen = fat_name_to_buf(&name, &mut namebuf);
+    println!("[init] Loading SHELL.ELF from VFS");
+
+    // Build path: "/usr/bin/SHELL.ELF"
+    let mut path = [0u8; 48];
+    let prefix = b"/usr/bin/";
+    path[..prefix.len()].copy_from_slice(prefix);
+    path[prefix.len()..prefix.len() + namelen].copy_from_slice(&namebuf[..namelen]);
+    let path_len = prefix.len() + namelen;
+
+    // Open file via VFS
+    let (file_handle, file_size, _) = match vfs::open(vfs_tid, &path[..path_len]) {
+        Ok(h) => h,
+        Err(_) => {
+            println!("[init]   FAILED to open via VFS");
+            return deferred;
         }
-        file_entries[file_count - 1] = saved;
-    }
+    };
 
-    println!("[init] Files in /usr/bin: {}", file_count);
+    let size = file_size as usize;
+    let pages_needed = (size + PAGE_SIZE - 1) / PAGE_SIZE;
 
-    // Load each non-essential ELF via VFS (but don't start them yet)
-    for i in 0..file_count {
-        let (_, ref name) = file_entries[i];
-
-        let mut namebuf = [0u8; 16];
-        let namelen = fat_name_to_buf(name, &mut namebuf);
-        if let Ok(fname) = core::str::from_utf8(&namebuf[..namelen]) {
-            println!("[init] Loading {} from VFS", fname);
-        }
-
-        // Build path: "/usr/bin/<name>"
-        let mut path = [0u8; 48];
-        let prefix = b"/usr/bin/";
-        path[..prefix.len()].copy_from_slice(prefix);
-        path[prefix.len()..prefix.len() + namelen].copy_from_slice(&namebuf[..namelen]);
-        let path_len = prefix.len() + namelen;
-
-        // Open file via VFS
-        let (file_handle, file_size, _) = match vfs::open(vfs_tid, &path[..path_len]) {
-            Ok(h) => h,
-            Err(_) => {
-                println!("[init]   FAILED to open via VFS");
-                continue;
-            }
+    // Allocate pages and read file content via VFS directly into them
+    let mut success = true;
+    for p in 0..pages_needed {
+        let frame = match syscall::sys_phys_alloc(1) {
+            Ok(f) => f,
+            Err(()) => { success = false; break; }
         };
+        if syscall::sys_map_phys(frame, FILE_BUF_BASE + p * PAGE_SIZE, 1).is_err() {
+            success = false; break;
+        }
+        let offset = (p * PAGE_SIZE) as u32;
+        let to_read = PAGE_SIZE.min(size - p * PAGE_SIZE) as u32;
+        if vfs::read(vfs_tid, file_handle, frame, offset, to_read).is_err() {
+            success = false; break;
+        }
+    }
 
-        let size = file_size as usize;
-        let pages_needed = (size + PAGE_SIZE - 1) / PAGE_SIZE;
+    let _ = vfs::close(vfs_tid, file_handle);
 
-        // Allocate pages and read file content via VFS directly into them
-        let mut success = true;
-        for p in 0..pages_needed {
-            let frame = match syscall::sys_phys_alloc(1) {
-                Ok(f) => f,
-                Err(()) => { success = false; break; }
-            };
-            if syscall::sys_map_phys(frame, FILE_BUF_BASE + p * PAGE_SIZE, 1).is_err() {
-                success = false; break;
+    if !success {
+        println!("[init]   FAILED to read from VFS");
+        return deferred;
+    }
+
+    let data = unsafe { core::slice::from_raw_parts(FILE_BUF_BASE as *const u8, size) };
+    match load_elf(data) {
+        Ok(info) => {
+            let tid = info.tid;
+            grant_caps_by_name(&name, tid);
+            if console_pipe != 0 {
+                let _ = syscall::sys_pipe_fd_set(tid, 1, console_pipe, true);
+                let _ = syscall::sys_pipe_fd_set(tid, 2, console_pipe, true);
             }
-            let offset = (p * PAGE_SIZE) as u32;
-            let to_read = PAGE_SIZE.min(size - p * PAGE_SIZE) as u32;
-            if vfs::read(vfs_tid, file_handle, frame, offset, to_read).is_err() {
-                success = false; break;
+            if input_tid != 0 {
+                let _ = syscall::sys_fd_set(tid, 0, input_tid, 1);
+            }
+            let _ = set_args(&info, &[&namebuf[..namelen]]);
+            println!("[init]   Loaded TID {} (deferred start)", tid);
+            if deferred.count < MAX_DEFERRED {
+                deferred.spawns[deferred.count] = Some(info);
+                deferred.count += 1;
             }
         }
-
-        let _ = vfs::close(vfs_tid, file_handle);
-
-        if !success {
-            println!("[init]   FAILED to read from VFS");
-            continue;
-        }
-
-        let data = unsafe { core::slice::from_raw_parts(FILE_BUF_BASE as *const u8, size) };
-        match load_elf(data) {
-            Ok(info) => {
-                let tid = info.tid;
-                grant_caps_by_name(name, tid);
-                if console_pipe != 0 {
-                    let _ = syscall::sys_pipe_fd_set(tid, 1, console_pipe, true);
-                    let _ = syscall::sys_pipe_fd_set(tid, 2, console_pipe, true);
-                }
-                if input_tid != 0 {
-                    let _ = syscall::sys_fd_set(tid, 0, input_tid, 1);
-                }
-                let _ = set_args(&info, &[&namebuf[..namelen]]);
-                println!("[init]   Loaded TID {} (deferred start)", tid);
-                if deferred.count < MAX_DEFERRED {
-                    deferred.spawns[deferred.count] = Some(info);
-                    deferred.count += 1;
-                }
-            }
-            Err(()) => println!("[init]   FAILED to spawn"),
-        }
+        Err(()) => println!("[init]   FAILED to spawn"),
     }
 
     deferred

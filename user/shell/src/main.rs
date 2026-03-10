@@ -244,7 +244,7 @@ fn eq_ignore_case(a: &[u8], b: &[u8]) -> bool {
 }
 
 fn grant_caps_by_name(name: &[u8], tid: usize) {
-    if eq_ignore_case(name, b"cat") {
+    if eq_ignore_case(name, b"cat") || eq_ignore_case(name, b"disktest") {
         let _ = syscall::sys_grant_cap(tid, syscall::CAP_PHYS_ALLOC | syscall::CAP_MAP_PHYS);
     }
 }
