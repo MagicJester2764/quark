@@ -29,12 +29,16 @@ User space provides:
 
 - **Init** (`user/init`) — Two-phase ELF loader: essential services from boot image, remaining programs from disk via GPT/FAT32. Passes program arguments, wires fds, grants capabilities, enforces sequential startup.
 - **Nameserver** (`user/nameserver`) — service discovery via name registration/lookup
-- **Console server** (`user/console`) — framebuffer text rendering via font8x8, serves write requests over IPC
+- **Console server** (`user/console`) — framebuffer text rendering via font8x8 with ANSI escape sequence support (cursor movement, colors, clear screen), serves write requests over IPC
 - **Keyboard driver** (`user/keyboard`) — PS/2 scancode translation, IRQ 1 handling
 - **Input server** (`user/input`) — line discipline (echo, backspace, newline) wrapping the keyboard driver
 - **Disk driver** (`user/disk`) — ATA PIO disk driver (IRQ 14, read + write), registers as "disk" with nameserver
 - **VFS** (`user/vfs`) — FAT32 filesystem service: read, write, create files/directories over IPC. Registers as "vfs" with nameserver.
 - **Net** (`user/net`) — RTL8139 NIC driver with PCI enumeration, DMA ring buffers, Ethernet/ARP/IPv4/ICMP/UDP. Registers as "net" with nameserver. Client API in `libquark::net`.
+- **Shell** (`user/shell`) — interactive command interpreter: reads input, parses commands, loads ELFs from `/usr/bin/` via VFS, spawns tasks with fd wiring, waits for exit
+- **Echo** (`user/echo`) — prints arguments to stdout
+- **Ls** (`user/ls`) — lists directory contents via VFS (default `/usr/bin`)
+- **Cat** (`user/cat`) — reads and prints files via VFS
 - **Hello** (`user/hello`) — test program that prints via `println!`
 - **Disktest** (`user/disktest`) — reads sector 0 from disk and prints hex dump
 
@@ -118,6 +122,10 @@ user/
   disk/               ATA PIO disk driver (primary master, LBA28, read + write)
   vfs/                FAT32 filesystem service (read, write, create)
   net/                RTL8139 NIC driver (Ethernet, ARP, IPv4, ICMP, UDP)
+  shell/              Interactive command interpreter
+  echo/               Echo arguments to stdout
+  ls/                 Directory listing via VFS
+  cat/                File reader via VFS
   disktest/           Disk test program (reads and dumps sector 0)
   hello/              Test program
 ```
