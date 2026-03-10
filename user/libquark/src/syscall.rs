@@ -44,6 +44,7 @@ pub const SYS_TICKS: u64 = 81;
 pub const SYS_SET_PAGER: u64 = 82;
 pub const SYS_WAIT: u64 = 83;
 pub const SYS_SET_MEM_LIMIT: u64 = 84;
+pub const SYS_NOTIFY: u64 = 85;
 
 pub const SYS_SHMEM_CREATE: u64 = 90;
 pub const SYS_SHMEM_MAP: u64 = 91;
@@ -423,6 +424,18 @@ pub fn sys_set_pager(tid: usize, pager_tid: usize) -> Result<(), ()> {
     let ret = unsafe { syscall2(SYS_SET_PAGER, tid as u64, pager_tid as u64) };
     if ret == u64::MAX { Err(()) } else { Ok(()) }
 }
+
+/// Send an asynchronous notification to a task.
+/// `badge` bits are OR'd into the target's notification word (non-blocking).
+/// The target receives a message with tag=TAG_NOTIFICATION and data[0]=accumulated word.
+pub fn sys_notify(dest: usize, badge: u64) -> Result<(), ()> {
+    let ret = unsafe { syscall2(SYS_NOTIFY, dest as u64, badge) };
+    if ret == u64::MAX { Err(()) } else { Ok(()) }
+}
+
+/// IPC tag for notification messages from the kernel.
+/// data[0] = notification word (accumulated OR of all badges since last consume).
+pub const TAG_NOTIFICATION: u64 = 0xFFFF_0002;
 
 /// IPC tag for page fault messages from the kernel.
 /// data: [fault_addr, error_code, rip, rsp, access_flags, 0]

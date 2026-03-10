@@ -68,6 +68,36 @@ static mut TASK_IPC: [TaskIpc; MAX_TASKS] = {
 /// Per-task timeout deadline (PIT tick count). 0 = no timeout.
 static mut TASK_TIMEOUT: [u64; MAX_TASKS] = [0; MAX_TASKS];
 
+/// Per-task notification word (seL4-style). Bits are OR'd in by sys_notify().
+/// Atomically read-and-cleared when consumed by sys_recv/sys_recv_timeout.
+static mut TASK_NOTIFY: [u64; MAX_TASKS] = [0; MAX_TASKS];
+
+/// Tag for notification messages delivered to user space.
+pub const TAG_NOTIFICATION: u64 = 0xFFFF_0002;
+
+/// Asynchronous notification: OR `badge` into dest's notification word.
+/// Non-blocking. Wakes the dest task if it is RecvBlocked(0) or RecvBlocked(TID_ANY).
+pub fn sys_notify(dest: usize, badge: u64) -> Result<(), IpcError> {
+    if dest >= MAX_TASKS || badge == 0 {
+        return Err(IpcError::InvalidTid);
+    }
+
+    unsafe {
+        TASK_NOTIFY[dest] |= badge;
+
+        // Wake the task if it's recv-blocked and would accept a notification
+        match TASK_IPC[dest].state {
+            IpcState::RecvBlocked(from) if from == 0 || from == TID_ANY => {
+                TASK_IPC[dest].state = IpcState::None;
+                scheduler::unblock_task(dest);
+            }
+            _ => {}
+        }
+    }
+
+    Ok(())
+}
+
 /// Synchronous send: blocks until receiver calls recv.
 pub fn sys_send(dest: usize, msg: &Message) -> Result<(), IpcError> {
     if dest >= MAX_TASKS {
@@ -152,6 +182,19 @@ pub fn sys_recv(from: usize) -> Result<Message, IpcError> {
             }
         }
 
+        // Check for pending notifications (from=0 or TID_ANY)
+        if from == 0 || from == TID_ANY {
+            let word = TASK_NOTIFY[receiver];
+            if word != 0 {
+                TASK_NOTIFY[receiver] = 0;
+                return Ok(Message {
+                    sender: 0,
+                    tag: TAG_NOTIFICATION,
+                    data: [word, 0, 0, 0, 0, 0],
+                });
+            }
+        }
+
         // No sender ready — block receiver
         TASK_IPC[receiver].state = IpcState::RecvBlocked(from);
         scheduler::block_task(receiver);
@@ -166,7 +209,7 @@ pub fn sys_recv(from: usize) -> Result<Message, IpcError> {
             return Ok(msg);
         }
 
-        // No IPC message — we were woken by an IRQ dispatch
+        // No IPC message — check IRQ
         if from == 0 || from == TID_ANY {
             if let Some(msg) = crate::irq_dispatch::poll_irq_message(receiver) {
                 TASK_IPC[receiver].state = IpcState::None;
@@ -174,7 +217,21 @@ pub fn sys_recv(from: usize) -> Result<Message, IpcError> {
             }
         }
 
-        // Should not reach here — either IPC or IRQ should have woken us
+        // Check notification word
+        if from == 0 || from == TID_ANY {
+            let word = TASK_NOTIFY[receiver];
+            if word != 0 {
+                TASK_NOTIFY[receiver] = 0;
+                TASK_IPC[receiver].state = IpcState::None;
+                return Ok(Message {
+                    sender: 0,
+                    tag: TAG_NOTIFICATION,
+                    data: [word, 0, 0, 0, 0, 0],
+                });
+            }
+        }
+
+        // Should not reach here — either IPC, IRQ, or notification should have woken us
         TASK_IPC[receiver].state = IpcState::None;
         Err(IpcError::WouldBlock)
     }
@@ -302,6 +359,19 @@ pub fn sys_recv_timeout(from: usize, timeout_ticks: u64) -> Result<Message, IpcE
             }
         }
 
+        // Check for pending notifications
+        if from == 0 || from == TID_ANY {
+            let word = TASK_NOTIFY[receiver];
+            if word != 0 {
+                TASK_NOTIFY[receiver] = 0;
+                return Ok(Message {
+                    sender: 0,
+                    tag: TAG_NOTIFICATION,
+                    data: [word, 0, 0, 0, 0, 0],
+                });
+            }
+        }
+
         // Non-blocking poll: return immediately if timeout is 0
         if timeout_ticks == 0 {
             return Err(IpcError::Timeout);
@@ -327,6 +397,20 @@ pub fn sys_recv_timeout(from: usize, timeout_ticks: u64) -> Result<Message, IpcE
             if let Some(msg) = crate::irq_dispatch::poll_irq_message(receiver) {
                 TASK_IPC[receiver].state = IpcState::None;
                 return Ok(msg);
+            }
+        }
+
+        // Check notification word
+        if from == 0 || from == TID_ANY {
+            let word = TASK_NOTIFY[receiver];
+            if word != 0 {
+                TASK_NOTIFY[receiver] = 0;
+                TASK_IPC[receiver].state = IpcState::None;
+                return Ok(Message {
+                    sender: 0,
+                    tag: TAG_NOTIFICATION,
+                    data: [word, 0, 0, 0, 0, 0],
+                });
             }
         }
 
@@ -399,10 +483,11 @@ pub fn cleanup_task_ipc(dead_tid: usize) {
     }
 
     unsafe {
-        // Clear the dead task's own IPC state and timeout
+        // Clear the dead task's own IPC state, timeout, and notifications
         TASK_IPC[dead_tid].state = IpcState::None;
         TASK_IPC[dead_tid].pending_msg = None;
         TASK_TIMEOUT[dead_tid] = 0;
+        TASK_NOTIFY[dead_tid] = 0;
 
         // Scan all tasks for those blocked on the dead task
         let error_msg = Message {

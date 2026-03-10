@@ -52,6 +52,7 @@ pub const SYS_TICKS: u64 = 81;
 pub const SYS_SET_PAGER: u64 = 82;
 pub const SYS_WAIT: u64 = 83;
 pub const SYS_SET_MEM_LIMIT: u64 = 84;
+pub const SYS_NOTIFY: u64 = 85;
 
 pub const SYS_SHMEM_CREATE: u64 = 90;
 pub const SYS_SHMEM_MAP: u64 = 91;
@@ -663,6 +664,15 @@ extern "C" fn syscall_dispatch(
             match scheduler::grant_cap(dest, caps) {
                 Ok(()) => 0,
                 Err(()) => u64::MAX,
+            }
+        }
+        SYS_NOTIFY => {
+            // arg0 = dest tid, arg1 = badge (bits to OR into notification word)
+            let dest = arg0 as usize;
+            let badge = arg1;
+            match crate::ipc::sys_notify(dest, badge) {
+                Ok(()) => 0,
+                Err(_) => u64::MAX,
             }
         }
         SYS_SET_PAGER => {

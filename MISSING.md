@@ -7,7 +7,7 @@ Scheduler, synchronous IPC, address spaces, capabilities, fd table, IRQ delegati
 
 1. ~~**User-space memory allocation**~~ — **Done.** `sys_mmap(vaddr, pages)` (syscall 70) allocates+maps frames. `libquark::allocator` provides `#[global_allocator]` backed by sys_mmap, enabling `Vec`, `String`, etc.
 
-2. ~~**Async notifications / non-blocking IPC**~~ — **Partially done.** `sys_recv_timeout(from, msg, ticks)` (syscall 80) adds non-blocking poll (ticks=0) and timed receive. Full notification word (seL4-style) still missing for true multiplexed wait.
+2. ~~**Async notifications / non-blocking IPC**~~ — **Done.** `sys_recv_timeout(from, msg, ticks)` (syscall 80) adds non-blocking poll and timed receive. `sys_notify(dest, badge)` (syscall 85) provides seL4-style async notifications: badge bits are OR'd into a per-task notification word, delivered as `TAG_NOTIFICATION` messages via `sys_recv`. Enables true multiplexed wait over IPC + IRQs + notifications.
 
 3. ~~**Timers for userspace**~~ — **Done.** `sys_ticks()` (syscall 81) reads PIT counter. `libquark::syscall::sleep_ms(ms)` and `sleep_ticks(ticks)` provide blocking sleep via recv_timeout.
 
