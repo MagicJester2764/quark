@@ -36,6 +36,14 @@ static mut G_POS: u8 = 8;
 static mut B_POS: u8 = 0;
 static mut INITIALIZED: bool = false;
 
+// ANSI escape sequence state machine
+static mut ESC_STATE: u8 = 0;       // 0=normal, 1=got ESC, 2=got CSI
+static mut ESC_PARAMS: [u16; 4] = [0; 4];
+static mut ESC_PARAM_COUNT: usize = 0;
+
+// Foreground color (set via SGR escape codes)
+static mut FG_COLOR: u32 = 0;
+
 #[unsafe(no_mangle)]
 #[link_section = ".text.entry"]
 pub extern "C" fn _start() -> ! {
@@ -132,6 +140,7 @@ fn init_framebuffer(msg: &Message) {
         G_POS = gp;
         B_POS = bp;
         INITIALIZED = true;
+        FG_COLOR = encode_color(0xCC, 0xCC, 0xCC);
     }
 }
 
@@ -162,23 +171,50 @@ fn write_bytes(s: &[u8]) {
 
 fn putc(c: u8) {
     unsafe {
-        match c {
-            b'\n' => {
-                COL = 0;
-                ROW += 1;
-            }
-            byte => {
-                draw_glyph(COL, ROW, byte);
-                COL += 1;
-                if COL >= COLS {
-                    COL = 0;
-                    ROW += 1;
+        match ESC_STATE {
+            0 => match c {
+                0x1b => { ESC_STATE = 1; }
+                b'\n' => { COL = 0; ROW += 1; }
+                b'\r' => { COL = 0; }
+                b'\t' => {
+                    let next = (COL + 8) & !7;
+                    COL = if next < COLS { next } else { COLS - 1 };
                 }
-            }
+                0x08 => {
+                    if COL > 0 { COL -= 1; }
+                }
+                byte => {
+                    draw_glyph(COL, ROW, byte);
+                    COL += 1;
+                    if COL >= COLS { COL = 0; ROW += 1; }
+                }
+            },
+            1 => {
+                if c == b'[' {
+                    ESC_STATE = 2;
+                    ESC_PARAMS = [0; 4];
+                    ESC_PARAM_COUNT = 0;
+                } else {
+                    ESC_STATE = 0;
+                }
+            },
+            2 => {
+                if c >= b'0' && c <= b'9' {
+                    let idx = ESC_PARAM_COUNT;
+                    if idx < 4 {
+                        ESC_PARAMS[idx] = ESC_PARAMS[idx] * 10 + (c - b'0') as u16;
+                    }
+                } else if c == b';' {
+                    if ESC_PARAM_COUNT < 3 { ESC_PARAM_COUNT += 1; }
+                } else {
+                    if ESC_PARAM_COUNT < 4 { ESC_PARAM_COUNT += 1; }
+                    dispatch_csi(c);
+                    ESC_STATE = 0;
+                }
+            },
+            _ => { ESC_STATE = 0; }
         }
-        if ROW >= ROWS {
-            scroll();
-        }
+        if ROW >= ROWS { scroll(); }
     }
 }
 
@@ -194,7 +230,7 @@ fn draw_glyph(col: usize, row: usize, ch: u8) {
 
     unsafe {
         let bytes_per_pixel = BPP / 8;
-        let fg = encode_color(0xCC, 0xCC, 0xCC);
+        let fg = FG_COLOR;
 
         for (gy, &glyph_row) in glyph.iter().enumerate() {
             let y = pixel_y + gy;
@@ -220,6 +256,63 @@ fn draw_glyph(col: usize, row: usize, ch: u8) {
 
 unsafe fn encode_color(r: u8, g: u8, b: u8) -> u32 {
     (r as u32) << R_POS | (g as u32) << G_POS | (b as u32) << B_POS
+}
+
+fn dispatch_csi(cmd: u8) {
+    unsafe {
+        let p0 = ESC_PARAMS[0] as usize;
+        let p1 = ESC_PARAMS[1] as usize;
+        match cmd {
+            b'A' => { ROW = ROW.saturating_sub(p0.max(1)); }
+            b'B' => { ROW = (ROW + p0.max(1)).min(ROWS - 1); }
+            b'C' => { COL = (COL + p0.max(1)).min(COLS - 1); }
+            b'D' => { COL = COL.saturating_sub(p0.max(1)); }
+            b'H' => {
+                ROW = if p0 > 0 { (p0 - 1).min(ROWS - 1) } else { 0 };
+                COL = if p1 > 0 { (p1 - 1).min(COLS - 1) } else { 0 };
+            }
+            b'J' => {
+                if p0 == 2 {
+                    let buf = FB as *mut u8;
+                    let total = HEIGHT * PITCH;
+                    for i in 0..total { buf.add(i).write_volatile(0); }
+                    ROW = 0; COL = 0;
+                }
+            }
+            b'K' => {
+                if p0 == 0 {
+                    for c in COL..COLS { draw_glyph(c, ROW, b' '); }
+                }
+            }
+            b'm' => {
+                for i in 0..ESC_PARAM_COUNT {
+                    apply_sgr(ESC_PARAMS[i]);
+                }
+                if ESC_PARAM_COUNT == 0 {
+                    apply_sgr(0);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn apply_sgr(code: u16) {
+    unsafe {
+        match code {
+            0  => { FG_COLOR = encode_color(0xCC, 0xCC, 0xCC); }
+            1  => { FG_COLOR = encode_color(0xFF, 0xFF, 0xFF); }
+            30 => { FG_COLOR = encode_color(0x00, 0x00, 0x00); }
+            31 => { FG_COLOR = encode_color(0xCC, 0x00, 0x00); }
+            32 => { FG_COLOR = encode_color(0x00, 0xCC, 0x00); }
+            33 => { FG_COLOR = encode_color(0xCC, 0xCC, 0x00); }
+            34 => { FG_COLOR = encode_color(0x00, 0x00, 0xCC); }
+            35 => { FG_COLOR = encode_color(0xCC, 0x00, 0xCC); }
+            36 => { FG_COLOR = encode_color(0x00, 0xCC, 0xCC); }
+            37 => { FG_COLOR = encode_color(0xCC, 0xCC, 0xCC); }
+            _  => {}
+        }
+    }
 }
 
 fn scroll() {
