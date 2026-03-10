@@ -1,6 +1,6 @@
 # Quark
 
-A minimal x86-64 microkernel with user-space servers and IPC-backed stdio.
+A minimal x86-64 microkernel with user-space servers, IPC-backed stdio, and a growing set of OS primitives (virtual memory, futex/mutex, shared memory, networking).
 
 ## What it does
 
@@ -10,19 +10,31 @@ The kernel provides:
 
 - Preemptive round-robin scheduling (100 Hz PIT timer)
 - Synchronous IPC (send/recv/call/reply with fixed-size messages)
+- Async notifications (seL4-style badge OR with multiplexed wait)
 - Virtual address space creation and page mapping
+- `sys_mmap` for user-space memory allocation (backs `Vec`, `String`, etc.)
 - Per-task file descriptor table with IPC-backed read/write
 - Capability-based access control (I/O ports, IRQs, physical memory mapping)
+- Capability transfer over IPC (tasks can delegate caps without `CAP_TASK_MGMT`)
 - IRQ delivery to user-space drivers
+- Page fault forwarding to pager tasks (enables demand paging, COW, stack growth)
+- Futex wait/wake for user-space synchronization
+- Shared memory regions (create, grant, map across tasks)
+- Per-task memory quotas
+- Process wait (`sys_wait` for parent to collect child exit status)
+- Program arguments (`argc`/`argv` via mapped argument page)
+- Timed receive and tick counter for user-space timers/sleep
 
 User space provides:
 
-- **Init** (`user/init`) — Two-phase ELF loader: essential services from boot image, remaining programs from disk via GPT/FAT32
+- **Init** (`user/init`) — Two-phase ELF loader: essential services from boot image, remaining programs from disk via GPT/FAT32. Passes program arguments, wires fds, grants capabilities, enforces sequential startup.
 - **Nameserver** (`user/nameserver`) — service discovery via name registration/lookup
 - **Console server** (`user/console`) — framebuffer text rendering via font8x8, serves write requests over IPC
 - **Keyboard driver** (`user/keyboard`) — PS/2 scancode translation, IRQ 1 handling
 - **Input server** (`user/input`) — line discipline (echo, backspace, newline) wrapping the keyboard driver
-- **Disk driver** (`user/disk`) — ATA PIO disk driver (IRQ 14, read-only), registers as "disk" with nameserver
+- **Disk driver** (`user/disk`) — ATA PIO disk driver (IRQ 14, read + write), registers as "disk" with nameserver
+- **VFS** (`user/vfs`) — FAT32 filesystem service: read, write, create files/directories over IPC. Registers as "vfs" with nameserver.
+- **Net** (`user/net`) — RTL8139 NIC driver with PCI enumeration, DMA ring buffers, Ethernet/ARP/IPv4/ICMP/UDP. Registers as "net" with nameserver. Client API in `libquark::net`.
 - **Hello** (`user/hello`) — test program that prints via `println!`
 - **Disktest** (`user/disktest`) — reads sector 0 from disk and prints hex dump
 
@@ -49,7 +61,7 @@ User space provides:
 
 ### IPC
 
-Fixed-size synchronous messages: sender TID, tag (u64), and 6 data words (48 bytes payload). `sys_call` combines send + receive-reply atomically using a `CallSendBlocked` state to prevent races between message pickup and reply delivery.
+Fixed-size synchronous messages: sender TID, tag (u64), and 6 data words (48 bytes payload). `sys_call` combines send + receive-reply atomically using a `CallSendBlocked` state to prevent races between message pickup and reply delivery. `sys_recv_timeout` adds non-blocking poll and timed receive. `sys_notify` provides seL4-style async notifications: badge bits are OR'd into a per-task notification word and delivered as `TAG_NOTIFICATION` messages via `sys_recv`, enabling multiplexed wait over IPC + IRQs + notifications.
 
 ### File descriptors
 
@@ -66,12 +78,16 @@ src/
   main.rs             Kernel entry, boot flow
   boot.s              32-to-64-bit bootstrap assembly
   scheduler.rs        Round-robin preemptive scheduler
-  ipc.rs              Synchronous IPC (send/recv/call/reply)
+  ipc.rs              Synchronous IPC (send/recv/call/reply + async notifications)
   syscall.rs          Syscall dispatch (syscall/sysret via STAR/LSTAR)
   task.rs             Task struct, fd table, capabilities
   paging.rs           Page table management, huge page splitting
   pmm.rs              Physical memory manager (bitmap allocator)
   heap.rs             Kernel heap allocator
+  sync.rs             IrqSpinLock<T> (interrupt-safe RAII spinlock)
+  futex.rs            Futex wait/wake for user-space synchronization
+  shmem.rs            Shared memory regions (create, grant, map)
+  elf.rs              ELF binary parser
   idt.rs              Interrupt descriptor table
   pit.rs              PIT timer (100 Hz)
   pic.rs              8259 PIC driver
@@ -93,13 +109,15 @@ drivers/
   fat32/              FAT32 filesystem driver (flat binary)
 
 user/
-  libquark/           User-space library (syscalls, IPC, stdio macros)
+  libquark/           User-space library (syscalls, IPC, stdio, allocator, sync, vfs, net, args)
   init/               Init process (two-phase boot, GPT/FAT32 disk reader, service wiring)
   nameserver/         Service name registry
   console/            Framebuffer console server (font8x8)
   keyboard/           PS/2 keyboard driver (IRQ 1, scancode set 1)
   input/              Line-discipline input server
-  disk/               ATA PIO disk driver (primary master, LBA28)
+  disk/               ATA PIO disk driver (primary master, LBA28, read + write)
+  vfs/                FAT32 filesystem service (read, write, create)
+  net/                RTL8139 NIC driver (Ethernet, ARP, IPv4, ICMP, UDP)
   disktest/           Disk test program (reads and dumps sector 0)
   hello/              Test program
 ```
@@ -131,6 +149,12 @@ make clean       # Remove all build artifacts
 
 ```bash
 make run
+```
+
+To enable networking (RTL8139), add QEMU flags:
+
+```bash
+qemu-system-x86_64 -cdrom quark.iso -device rtl8139,netdev=n -netdev user,id=n
 ```
 
 ### With Bang bootloader (UEFI)
