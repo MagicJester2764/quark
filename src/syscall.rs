@@ -43,6 +43,7 @@ pub const SYS_FD_READ: u64 = 51;
 pub const SYS_FD_SET: u64 = 52;
 pub const SYS_PIPE_CREATE: u64 = 53;
 pub const SYS_PIPE_FD_SET: u64 = 54;
+pub const SYS_FD_DUP: u64 = 55;
 
 pub const SYS_FUTEX_WAIT: u64 = 60;
 pub const SYS_FUTEX_WAKE: u64 = 61;
@@ -588,6 +589,40 @@ extern "C" fn syscall_dispatch(
                 crate::task::FdKind::PipeRead(handle)
             };
             match scheduler::set_fd(tid, fd, kind) {
+                Ok(()) => 0,
+                Err(()) => u64::MAX,
+            }
+        }
+        SYS_FD_DUP => {
+            // arg0 = target tid, arg1 = target fd, arg2 = source fd (from current task)
+            // Copies the caller's source fd to the target task's target fd.
+            // Increments pipe refcount if the fd is a pipe endpoint.
+            // Requires CAP_TASK_MGMT.
+            if !scheduler::current_task_has_cap(crate::task::CAP_TASK_MGMT) {
+                return u64::MAX;
+            }
+            let target_tid = arg0 as usize;
+            let target_fd = arg1 as usize;
+            let source_fd = arg2 as usize;
+            let kind = scheduler::current_fd(source_fd);
+            if kind.is_empty() {
+                return u64::MAX;
+            }
+            // If it's a pipe, bump the refcount
+            match kind {
+                crate::task::FdKind::PipeRead(handle) => {
+                    if crate::pipe::add_ref(handle, false).is_err() {
+                        return u64::MAX;
+                    }
+                }
+                crate::task::FdKind::PipeWrite(handle) => {
+                    if crate::pipe::add_ref(handle, true).is_err() {
+                        return u64::MAX;
+                    }
+                }
+                _ => {}
+            }
+            match scheduler::set_fd(target_tid, target_fd, kind) {
                 Ok(()) => 0,
                 Err(()) => u64::MAX,
             }

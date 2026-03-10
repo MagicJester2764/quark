@@ -253,8 +253,6 @@ fn cmd_exec(
     cmd: &[u8],
     args_str: &[u8],
     vfs_tid: usize,
-    console_tid: usize,
-    input_tid: usize,
 ) {
     // Build uppercase FAT filename
     let cmd_len = cmd.len().min(8);
@@ -333,14 +331,10 @@ fn cmd_exec(
     // Grant capabilities based on command name
     grant_caps_by_name(cmd, tid);
 
-    // Wire file descriptors
-    if console_tid != 0 {
-        let _ = syscall::sys_fd_set(tid, 1, console_tid, 1);
-        let _ = syscall::sys_fd_set(tid, 2, console_tid, 1);
-    }
-    if input_tid != 0 {
-        let _ = syscall::sys_fd_set(tid, 0, input_tid, 1);
-    }
+    // Wire file descriptors — duplicate shell's own fds to child
+    let _ = syscall::sys_fd_dup(tid, 0, 0); // stdin
+    let _ = syscall::sys_fd_dup(tid, 1, 1); // stdout
+    let _ = syscall::sys_fd_dup(tid, 2, 2); // stderr
 
     // Build argv: [command_name, ...split args]
     let mut argv_bufs: [&[u8]; 16] = [b""; 16];
@@ -395,9 +389,6 @@ pub extern "C" fn _start() -> ! {
         }
     };
 
-    let console_tid = lookup_service(b"console").unwrap_or(0);
-    let input_tid = lookup_service(b"input").unwrap_or(0);
-
     // Main loop
     let mut line_buf = [0u8; 256];
     loop {
@@ -451,7 +442,7 @@ pub extern "C" fn _start() -> ! {
         }
 
         // External command
-        cmd_exec(cmd, args_str, vfs_tid, console_tid, input_tid);
+        cmd_exec(cmd, args_str, vfs_tid);
     }
 }
 

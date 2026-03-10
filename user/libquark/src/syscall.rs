@@ -35,6 +35,7 @@ pub const SYS_FD_READ: u64 = 51;
 pub const SYS_FD_SET: u64 = 52;
 pub const SYS_PIPE_CREATE: u64 = 53;
 pub const SYS_PIPE_FD_SET: u64 = 54;
+pub const SYS_FD_DUP: u64 = 55;
 
 pub const SYS_FUTEX_WAIT: u64 = 60;
 pub const SYS_FUTEX_WAKE: u64 = 61;
@@ -470,6 +471,15 @@ pub fn sys_pipe_create() -> Result<usize, ()> {
 pub fn sys_pipe_fd_set(tid: usize, fd: usize, pipe_handle: usize, is_write: bool) -> Result<(), ()> {
     let ret = unsafe {
         syscall4(SYS_PIPE_FD_SET, tid as u64, fd as u64, pipe_handle as u64, is_write as u64)
+    };
+    if ret == u64::MAX { Err(()) } else { Ok(()) }
+}
+
+/// Duplicate the caller's source fd onto a target task's target fd.
+/// Handles pipe refcounting automatically. Requires CAP_TASK_MGMT.
+pub fn sys_fd_dup(target_tid: usize, target_fd: usize, source_fd: usize) -> Result<(), ()> {
+    let ret = unsafe {
+        syscall3(SYS_FD_DUP, target_tid as u64, target_fd as u64, source_fd as u64)
     };
     if ret == u64::MAX { Err(()) } else { Ok(()) }
 }
