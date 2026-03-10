@@ -229,20 +229,51 @@ fn set_args(info: &SpawnInfo, args: &[&[u8]]) -> Result<(), ()> {
 // Capability granting for child tasks
 // ---------------------------------------------------------------------------
 
-fn grant_caps_by_name(name: &[u8], tid: usize) {
-    // Uppercase name for matching
-    let mut upper = [b' '; 8];
-    for i in 0..name.len().min(8) {
-        upper[i] = if name[i] >= b'a' && name[i] <= b'z' {
-            name[i] - 32
-        } else {
-            name[i]
-        };
+fn eq_ignore_case(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
     }
+    for i in 0..a.len() {
+        let ca = if a[i] >= b'a' && a[i] <= b'z' { a[i] - 32 } else { a[i] };
+        let cb = if b[i] >= b'a' && b[i] <= b'z' { b[i] - 32 } else { b[i] };
+        if ca != cb {
+            return false;
+        }
+    }
+    true
+}
 
-    if &upper == b"CAT     " {
+fn grant_caps_by_name(name: &[u8], tid: usize) {
+    if eq_ignore_case(name, b"cat") {
         let _ = syscall::sys_grant_cap(tid, syscall::CAP_PHYS_ALLOC | syscall::CAP_MAP_PHYS);
     }
+}
+
+fn build_path(cmd: &[u8], path_buf: &mut [u8; 64]) -> usize {
+    let has_slash = cmd.iter().any(|&b| b == b'/');
+
+    if has_slash {
+        // Absolute/relative path — copy directly
+        let len = cmd.len().min(64);
+        path_buf[..len].copy_from_slice(&cmd[..len]);
+        len
+    } else {
+        // Bare command — prepend /usr/bin/, append .ELF
+        let prefix = b"/usr/bin/";
+        let suffix = b".ELF";
+        let cmd_len = cmd.len().min(64 - prefix.len() - suffix.len());
+        path_buf[..prefix.len()].copy_from_slice(prefix);
+        let mut pos = prefix.len();
+        path_buf[pos..pos + cmd_len].copy_from_slice(&cmd[..cmd_len]);
+        pos += cmd_len;
+        path_buf[pos..pos + suffix.len()].copy_from_slice(suffix);
+        pos += suffix.len();
+        pos
+    }
+}
+
+fn ends_with_elf(path: &[u8]) -> bool {
+    path.len() >= 4 && eq_ignore_case(&path[path.len() - 4..], b".elf")
 }
 
 // ---------------------------------------------------------------------------
@@ -254,38 +285,33 @@ fn cmd_exec(
     args_str: &[u8],
     vfs_tid: usize,
 ) {
-    // Build uppercase FAT filename
-    let cmd_len = cmd.len().min(8);
-    let mut upper_cmd = [0u8; 8];
-    for i in 0..cmd_len {
-        upper_cmd[i] = if cmd[i] >= b'a' && cmd[i] <= b'z' {
-            cmd[i] - 32
-        } else {
-            cmd[i]
-        };
-    }
+    let mut path = [0u8; 64];
+    let pos = build_path(cmd, &mut path);
+    let has_slash = cmd.iter().any(|&b| b == b'/');
 
-    // Build VFS path: /usr/bin/<CMD>.ELF
-    let mut path = [0u8; 32];
-    let prefix = b"/usr/bin/";
-    path[..prefix.len()].copy_from_slice(prefix);
-    let mut pos = prefix.len();
-    for i in 0..cmd_len {
-        path[pos] = upper_cmd[i];
-        pos += 1;
-    }
-    let suffix = b".ELF";
-    path[pos..pos + suffix.len()].copy_from_slice(suffix);
-    pos += suffix.len();
-
-    // Open ELF file via VFS
+    // Open ELF file via VFS — try exact path first, then with .ELF appended
     let (file_handle, file_size, _) = match vfs::open(vfs_tid, &path[..pos]) {
         Ok(h) => h,
         Err(_) => {
-            if let Ok(s) = core::str::from_utf8(cmd) {
-                println!("{}: not found", s);
+            // If path had a slash and doesn't end in .ELF, retry with .ELF appended
+            if has_slash && !ends_with_elf(&path[..pos]) && pos + 4 <= 64 {
+                let suffix = b".ELF";
+                path[pos..pos + 4].copy_from_slice(suffix);
+                match vfs::open(vfs_tid, &path[..pos + 4]) {
+                    Ok(h) => h,
+                    Err(_) => {
+                        if let Ok(s) = core::str::from_utf8(cmd) {
+                            println!("{}: not found", s);
+                        }
+                        return;
+                    }
+                }
+            } else {
+                if let Ok(s) = core::str::from_utf8(cmd) {
+                    println!("{}: not found", s);
+                }
+                return;
             }
-            return;
         }
     };
 
@@ -328,8 +354,18 @@ fn cmd_exec(
 
     let tid = info.tid;
 
-    // Grant capabilities based on command name
-    grant_caps_by_name(cmd, tid);
+    // Grant capabilities based on command basename (strip path and .ELF extension)
+    let basename = if let Some(slash_pos) = cmd.iter().rposition(|&b| b == b'/') {
+        &cmd[slash_pos + 1..]
+    } else {
+        cmd
+    };
+    let name = if ends_with_elf(basename) {
+        &basename[..basename.len() - 4]
+    } else {
+        basename
+    };
+    grant_caps_by_name(name, tid);
 
     // Wire file descriptors — duplicate shell's own fds to child
     let _ = syscall::sys_fd_dup(tid, 0, 0); // stdin
