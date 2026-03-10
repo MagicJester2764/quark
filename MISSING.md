@@ -29,6 +29,6 @@ Scheduler, synchronous IPC, address spaces, capabilities, fd table, IRQ delegati
 
 10. **Network stack** — Typically a userspace service in a microkernel.
 
-11. **Shared memory** — No way for two tasks to map the same physical pages. Needed for zero-copy IPC, mmap'd files, etc.
+11. ~~**Shared memory**~~ — **Done.** `sys_shmem_create(pages)` (syscall 90) allocates a shared region, `sys_shmem_grant(handle, tid)` (92) grants access, `sys_shmem_map(handle, vaddr)` (91) maps into caller's space. Up to 32 regions, 16 pages each. Access tracked via per-region bitmask.
 
 12. **Capability transfer over IPC** — Can't pass capabilities through messages. Init must pre-grant everything.

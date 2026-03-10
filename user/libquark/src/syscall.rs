@@ -45,6 +45,10 @@ pub const SYS_SET_PAGER: u64 = 82;
 pub const SYS_WAIT: u64 = 83;
 pub const SYS_SET_MEM_LIMIT: u64 = 84;
 
+pub const SYS_SHMEM_CREATE: u64 = 90;
+pub const SYS_SHMEM_MAP: u64 = 91;
+pub const SYS_SHMEM_GRANT: u64 = 92;
+
 #[inline(always)]
 pub unsafe fn syscall0(nr: u64) -> u64 {
     let ret: u64;
@@ -382,6 +386,26 @@ pub fn sleep_ms(ms: u64) {
 /// Requires CAP_TASK_MGMT.
 pub fn sys_set_mem_limit(tid: usize, limit_pages: usize) -> Result<(), ()> {
     let ret = unsafe { syscall2(SYS_SET_MEM_LIMIT, tid as u64, limit_pages as u64) };
+    if ret == u64::MAX { Err(()) } else { Ok(()) }
+}
+
+/// Create a shared memory region. Returns a handle on success.
+pub fn sys_shmem_create(pages: usize) -> Result<usize, ()> {
+    let ret = unsafe { syscall1(SYS_SHMEM_CREATE, pages as u64) };
+    if ret == u64::MAX { Err(()) } else { Ok(ret as usize) }
+}
+
+/// Map a shared memory region into the caller's address space.
+/// vaddr must be page-aligned and in user space (>= 0x80_0000_0000).
+pub fn sys_shmem_map(handle: usize, vaddr: usize) -> Result<(), ()> {
+    let ret = unsafe { syscall2(SYS_SHMEM_MAP, handle as u64, vaddr as u64) };
+    if ret == u64::MAX { Err(()) } else { Ok(()) }
+}
+
+/// Grant another task access to a shared memory region.
+/// Must be the region's creator or have CAP_TASK_MGMT.
+pub fn sys_shmem_grant(handle: usize, target_tid: usize) -> Result<(), ()> {
+    let ret = unsafe { syscall2(SYS_SHMEM_GRANT, handle as u64, target_tid as u64) };
     if ret == u64::MAX { Err(()) } else { Ok(()) }
 }
 

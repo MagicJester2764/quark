@@ -53,6 +53,10 @@ pub const SYS_SET_PAGER: u64 = 82;
 pub const SYS_WAIT: u64 = 83;
 pub const SYS_SET_MEM_LIMIT: u64 = 84;
 
+pub const SYS_SHMEM_CREATE: u64 = 90;
+pub const SYS_SHMEM_MAP: u64 = 91;
+pub const SYS_SHMEM_GRANT: u64 = 92;
+
 const SFMASK_VALUE: u64 = (1 << 9) | (1 << 10); // clear IF | DF
 
 fn read_msr(msr: u32) -> u64 {
@@ -632,6 +636,18 @@ extern "C" fn syscall_dispatch(
                 Ok(()) => 0,
                 Err(()) => u64::MAX,
             }
+        }
+        SYS_SHMEM_CREATE => {
+            // arg0 = pages
+            crate::shmem::create(arg0 as usize)
+        }
+        SYS_SHMEM_MAP => {
+            // arg0 = handle, arg1 = vaddr
+            crate::shmem::map(arg0 as usize, arg1 as usize)
+        }
+        SYS_SHMEM_GRANT => {
+            // arg0 = handle, arg1 = target tid
+            crate::shmem::grant(arg0 as usize, arg1 as usize)
         }
         SYS_SET_PAGER => {
             // arg0 = tid, arg1 = pager_tid

@@ -24,6 +24,7 @@ pub mod syscall;
 mod elf;
 mod futex;
 mod services;
+mod shmem;
 pub mod task;
 mod userspace;
 
