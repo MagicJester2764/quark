@@ -9,6 +9,8 @@ const TAG_READ: u64 = 2;
 const TAG_CLOSE: u64 = 3;
 const TAG_READDIR: u64 = 4;
 const TAG_STAT: u64 = 5;
+const TAG_WRITE: u64 = 6;
+const TAG_CREATE: u64 = 7;
 const TAG_ERROR: u64 = u64::MAX;
 
 // Error codes (match VFS server)
@@ -122,6 +124,52 @@ pub fn readdir(vfs_tid: usize, handle: usize, index: u32) -> Result<Option<DirEn
     let attr = reply.data[4] as u8;
 
     Ok(Some(DirEntry { name, size, is_dir, cluster, attr }))
+}
+
+/// Write data from a client-owned physical page into a file.
+/// `phys_addr` must be a physical address the VFS can map.
+/// Returns bytes actually written.
+pub fn write(
+    vfs_tid: usize,
+    handle: usize,
+    phys_addr: usize,
+    offset: u32,
+    len: u32,
+) -> Result<u32, u64> {
+    let msg = Message {
+        sender: 0,
+        tag: TAG_WRITE,
+        data: [handle as u64, phys_addr as u64, offset as u64, len as u64, 0, 0],
+    };
+    let mut reply = Message::empty();
+    if syscall::sys_call(vfs_tid, &msg, &mut reply).is_err() {
+        return Err(ERR_IO);
+    }
+    if reply.tag == TAG_ERROR {
+        return Err(reply.data[0]);
+    }
+    Ok(reply.data[0] as u32)
+}
+
+/// Create a new file or directory.
+/// Returns (handle, size=0, is_dir).
+/// If `is_dir` is true, creates a directory; otherwise creates a file.
+pub fn create(vfs_tid: usize, path: &[u8], is_dir: bool) -> Result<(usize, u32, bool), u64> {
+    let mut data = [0u64; 6];
+    let bytes = unsafe { core::slice::from_raw_parts_mut(data.as_mut_ptr() as *mut u8, 48) };
+    let len = path.len().min(40); // leave room for flags in data[5]
+    bytes[..len].copy_from_slice(&path[..len]);
+    data[5] = if is_dir { 1 } else { 0 };
+
+    let msg = Message { sender: 0, tag: TAG_CREATE, data };
+    let mut reply = Message::empty();
+    if syscall::sys_call(vfs_tid, &msg, &mut reply).is_err() {
+        return Err(ERR_IO);
+    }
+    if reply.tag == TAG_ERROR {
+        return Err(reply.data[0]);
+    }
+    Ok((reply.data[0] as usize, reply.data[1] as u32, reply.data[2] != 0))
 }
 
 /// Get file/directory info for an open handle.

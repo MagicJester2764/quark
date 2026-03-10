@@ -14,6 +14,7 @@ const TAG_NS_LOOKUP: u64 = 2;
 
 // Disk driver protocol
 const TAG_READ_SECTOR: u64 = 1;
+const TAG_WRITE_SECTOR: u64 = 2;
 const TAG_DISK_OK: u64 = 0;
 
 // VFS IPC tags
@@ -22,6 +23,8 @@ const TAG_READ: u64 = 2;
 const TAG_CLOSE: u64 = 3;
 const TAG_READDIR: u64 = 4;
 const TAG_STAT: u64 = 5;
+const TAG_WRITE: u64 = 6;
+const TAG_CREATE: u64 = 7;
 const TAG_OK: u64 = 0;
 const TAG_ERROR: u64 = u64::MAX;
 
@@ -124,6 +127,104 @@ impl DiskState {
         data_start + (cluster - 2) * self.bpb.sectors_per_cluster
     }
 
+    fn write_sector(&self, lba: u32) -> Result<(), ()> {
+        let msg = Message {
+            sender: 0,
+            tag: TAG_WRITE_SECTOR,
+            data: [
+                (self.part_lba + lba) as u64,
+                self.buf_phys as u64,
+                0, 0, 0, 0,
+            ],
+        };
+        let mut reply = Message::empty();
+        if syscall::sys_call(self.disk_tid, &msg, &mut reply).is_err() {
+            return Err(());
+        }
+        if reply.tag != TAG_DISK_OK {
+            return Err(());
+        }
+        Ok(())
+    }
+
+    fn sector_data_mut(&self) -> &mut [u8] {
+        unsafe { core::slice::from_raw_parts_mut(DISK_IO_BUF as *mut u8, 512) }
+    }
+
+    /// Write a FAT entry: set fat[cluster] = value.
+    fn fat_set(&self, cluster: u32, value: u32) -> Result<(), ()> {
+        let fat_byte_off = (cluster as usize) * 4;
+        let sector_in_fat = fat_byte_off / 512;
+        let offset_in_sector = fat_byte_off % 512;
+        let lba = self.bpb.reserved_sectors + sector_in_fat as u32;
+
+        // Read the FAT sector
+        self.read_sector(lba).map_err(|_| ())?;
+
+        // Modify the entry (preserve top 4 bits)
+        let data = self.sector_data_mut();
+        let old = read_u32(data, offset_in_sector);
+        let new_val = (old & 0xF000_0000) | (value & 0x0FFF_FFFF);
+        let bytes = new_val.to_le_bytes();
+        data[offset_in_sector..offset_in_sector + 4].copy_from_slice(&bytes);
+
+        // Write back
+        self.write_sector(lba).map_err(|_| ())?;
+
+        // Update second FAT copy if present (buffer still has modified sector)
+        if self.bpb.num_fats > 1 {
+            let lba2 = lba + self.bpb.fat_size_32;
+            self.write_sector(lba2).map_err(|_| ())?;
+        }
+
+        Ok(())
+    }
+
+    /// Allocate a free cluster. Marks it as EOF in the FAT.
+    fn fat_alloc(&self) -> Result<u32, ()> {
+        let total_data_clusters =
+            (self.bpb.fat_size_32 * 512 / 4) as u32;
+        // Scan FAT for a free entry (value == 0)
+        for cluster in 2..total_data_clusters {
+            let fat_byte_off = (cluster as usize) * 4;
+            let sector_in_fat = fat_byte_off / 512;
+            let offset_in_sector = fat_byte_off % 512;
+            let lba = self.bpb.reserved_sectors + sector_in_fat as u32;
+
+            if self.read_sector(lba).is_err() {
+                continue;
+            }
+            let data = self.sector_data();
+            let val = read_u32(data, offset_in_sector) & 0x0FFF_FFFF;
+            if val == 0 {
+                // Mark as EOF
+                self.fat_set(cluster, 0x0FFF_FFFF)?;
+                return Ok(cluster);
+            }
+        }
+        Err(()) // disk full
+    }
+
+    /// Extend a cluster chain by allocating a new cluster and linking it.
+    fn fat_extend(&self, last_cluster: u32) -> Result<u32, ()> {
+        let new_cluster = self.fat_alloc()?;
+        self.fat_set(last_cluster, new_cluster)?;
+        Ok(new_cluster)
+    }
+
+    /// Zero out a cluster's data sectors.
+    fn zero_cluster(&self, cluster: u32) -> Result<(), ()> {
+        let start_lba = self.cluster_start_lba(cluster);
+        let data = self.sector_data_mut();
+        for i in 0..512 {
+            data[i] = 0;
+        }
+        for s in 0..self.bpb.sectors_per_cluster {
+            self.write_sector(start_lba + s).map_err(|_| ())?;
+        }
+        Ok(())
+    }
+
     fn find_rootfs_partition(disk_tid: usize, buf_phys: usize) -> Result<u32, ()> {
         Self::raw_read_sector(disk_tid, buf_phys, 0)?;
         let sec0 = unsafe { core::slice::from_raw_parts(DISK_IO_BUF as *const u8, 512) };
@@ -201,6 +302,9 @@ struct OpenFile {
     // Cache current cluster position to avoid re-traversing chain
     cur_cluster: u32,
     cur_cluster_offset: u32, // byte offset corresponding to cur_cluster start
+    // Parent directory cluster and 8.3 name for updating dir entry on write
+    dir_cluster: u32,
+    fat_name: [u8; 11],
 }
 
 static mut FILE_TABLE: [OpenFile; MAX_OPEN_FILES] = {
@@ -213,11 +317,20 @@ static mut FILE_TABLE: [OpenFile; MAX_OPEN_FILES] = {
         read_offset: 0,
         cur_cluster: 0,
         cur_cluster_offset: 0,
+        dir_cluster: 0,
+        fat_name: [0; 11],
     };
     [EMPTY; MAX_OPEN_FILES]
 };
 
-fn alloc_handle(tid: usize, cluster: u32, size: u32, is_dir: bool) -> Option<usize> {
+fn alloc_handle(
+    tid: usize,
+    cluster: u32,
+    size: u32,
+    is_dir: bool,
+    dir_cluster: u32,
+    fat_name: &[u8; 11],
+) -> Option<usize> {
     unsafe {
         for i in 0..MAX_OPEN_FILES {
             if !FILE_TABLE[i].in_use {
@@ -230,6 +343,8 @@ fn alloc_handle(tid: usize, cluster: u32, size: u32, is_dir: bool) -> Option<usi
                     read_offset: 0,
                     cur_cluster: cluster,
                     cur_cluster_offset: 0,
+                    dir_cluster,
+                    fat_name: *fat_name,
                 };
                 return Some(i);
             }
@@ -298,12 +413,12 @@ fn to_fat83(component: &[u8], out: &mut [u8; 11]) {
     }
 }
 
-/// Resolve a path like "/USR/BIN/HELLO.ELF" to (cluster, size, is_dir).
+/// Resolve a path like "/USR/BIN/HELLO.ELF" to (cluster, size, is_dir, parent_cluster, fat_name).
 /// Paths use "/" separators. Leading "/" is optional.
 fn resolve_path(
     disk: &DiskState,
     path: &[u8],
-) -> Result<(u32, u32, bool), u64> {
+) -> Result<(u32, u32, bool, u32, [u8; 11]), u64> {
     let path = if !path.is_empty() && path[0] == b'/' {
         &path[1..]
     } else {
@@ -312,7 +427,8 @@ fn resolve_path(
 
     if path.is_empty() {
         // Root directory
-        return Ok((disk.bpb.root_cluster, 0, true));
+        let root_name = [b' '; 11];
+        return Ok((disk.bpb.root_cluster, 0, true, 0, root_name));
     }
 
     let mut current_cluster = disk.bpb.root_cluster;
@@ -329,7 +445,8 @@ fn resolve_path(
         if component.is_empty() {
             remaining = rest;
             if remaining.is_empty() {
-                return Ok((current_cluster, 0, true));
+                let root_name = [b' '; 11];
+                return Ok((current_cluster, 0, true, 0, root_name));
             }
             continue;
         }
@@ -343,7 +460,7 @@ fn resolve_path(
         match find_entry(disk, current_cluster, &target)? {
             Some((cluster, size, is_dir)) => {
                 if is_last {
-                    return Ok((cluster, size, is_dir));
+                    return Ok((cluster, size, is_dir, current_cluster, target));
                 }
                 // Intermediate component must be a directory
                 if !is_dir {
@@ -585,6 +702,279 @@ fn read_dir_entry(
 }
 
 // ---------------------------------------------------------------------------
+// Create a new directory entry
+// ---------------------------------------------------------------------------
+
+/// Create a new file entry in a directory. Returns the first cluster of the new file.
+fn create_dir_entry(
+    disk: &DiskState,
+    dir_cluster: u32,
+    name: &[u8; 11],
+    is_dir: bool,
+) -> Result<u32, u64> {
+    // Check if name already exists
+    if let Ok(Some(_)) = find_entry(disk, dir_cluster, name) {
+        return Err(ERR_INVALID_PATH); // already exists
+    }
+
+    // Allocate a cluster for the new file/dir
+    let new_cluster = disk.fat_alloc().map_err(|_| ERR_IO)?;
+
+    // Zero the new cluster
+    disk.zero_cluster(new_cluster).map_err(|_| ERR_IO)?;
+
+    // If creating a directory, write "." and ".." entries
+    if is_dir {
+        let start_lba = disk.cluster_start_lba(new_cluster);
+        if disk.read_sector(start_lba).is_err() {
+            return Err(ERR_IO);
+        }
+        let sec = disk.sector_data_mut();
+
+        // "." entry — points to self
+        sec[0..11].copy_from_slice(b".          ");
+        sec[11] = 0x10; // directory attribute
+        let cl_hi = ((new_cluster >> 16) & 0xFFFF) as u16;
+        let cl_lo = (new_cluster & 0xFFFF) as u16;
+        sec[20..22].copy_from_slice(&cl_hi.to_le_bytes());
+        sec[26..28].copy_from_slice(&cl_lo.to_le_bytes());
+
+        // ".." entry — points to parent
+        sec[32..43].copy_from_slice(b"..         ");
+        sec[43] = 0x10;
+        let parent_cl = if dir_cluster == disk.bpb.root_cluster { 0 } else { dir_cluster };
+        let p_hi = ((parent_cl >> 16) & 0xFFFF) as u16;
+        let p_lo = (parent_cl & 0xFFFF) as u16;
+        sec[52..54].copy_from_slice(&p_hi.to_le_bytes());
+        sec[58..60].copy_from_slice(&p_lo.to_le_bytes());
+
+        disk.write_sector(start_lba).map_err(|_| ERR_IO)?;
+    }
+
+    // Find a free slot in the parent directory
+    let spc = disk.bpb.sectors_per_cluster;
+    let mut cluster = dir_cluster;
+
+    loop {
+        let start_lba = disk.cluster_start_lba(cluster);
+        for s in 0..spc {
+            if disk.read_sector(start_lba + s).is_err() {
+                return Err(ERR_IO);
+            }
+            let mut sec_buf = [0u8; 512];
+            sec_buf.copy_from_slice(disk.sector_data());
+
+            for e in 0..16 {
+                let off = e * 32;
+                let first_byte = sec_buf[off];
+                // Free slot: 0x00 (end of dir) or 0xE5 (deleted)
+                if first_byte == 0x00 || first_byte == 0xE5 {
+                    // Write the new entry
+                    sec_buf[off..off + 11].copy_from_slice(name);
+                    sec_buf[off + 11] = if is_dir { 0x10 } else { 0x20 }; // dir or archive
+                    // Zero out remaining fields (timestamps etc.)
+                    for i in 12..32 {
+                        if i != 11 {
+                            sec_buf[off + i] = 0;
+                        }
+                    }
+                    // Set first cluster
+                    let cl_hi = ((new_cluster >> 16) & 0xFFFF) as u16;
+                    let cl_lo = (new_cluster & 0xFFFF) as u16;
+                    sec_buf[off + 20..off + 22].copy_from_slice(&cl_hi.to_le_bytes());
+                    sec_buf[off + 26..off + 28].copy_from_slice(&cl_lo.to_le_bytes());
+                    // Size = 0 initially
+                    sec_buf[off + 28..off + 32].copy_from_slice(&0u32.to_le_bytes());
+
+                    // If this was end-of-dir (0x00), mark next slot as end if room
+                    if first_byte == 0x00 && e + 1 < 16 {
+                        sec_buf[(e + 1) * 32] = 0x00;
+                    }
+
+                    // Write sector back
+                    let data = disk.sector_data_mut();
+                    data.copy_from_slice(&sec_buf);
+                    disk.write_sector(start_lba + s).map_err(|_| ERR_IO)?;
+
+                    return Ok(new_cluster);
+                }
+            }
+        }
+        // Extend the directory with a new cluster
+        match disk.fat_next(cluster) {
+            Some(next) => cluster = next,
+            None => {
+                let new_dir_cluster = disk.fat_extend(cluster).map_err(|_| ERR_IO)?;
+                disk.zero_cluster(new_dir_cluster).map_err(|_| ERR_IO)?;
+                cluster = new_dir_cluster;
+                // Loop again — the zeroed cluster will have 0x00 entries
+            }
+        }
+    }
+}
+
+/// Update the file size in its directory entry.
+fn update_dir_entry_size(
+    disk: &DiskState,
+    dir_cluster: u32,
+    name: &[u8; 11],
+    new_size: u32,
+) -> Result<(), u64> {
+    let spc = disk.bpb.sectors_per_cluster;
+    let mut cluster = dir_cluster;
+
+    loop {
+        let start_lba = disk.cluster_start_lba(cluster);
+        for s in 0..spc {
+            if disk.read_sector(start_lba + s).is_err() {
+                return Err(ERR_IO);
+            }
+            let mut sec_buf = [0u8; 512];
+            sec_buf.copy_from_slice(disk.sector_data());
+
+            for e in 0..16 {
+                let off = e * 32;
+                let first_byte = sec_buf[off];
+                if first_byte == 0x00 {
+                    return Err(ERR_NOT_FOUND);
+                }
+                if first_byte == 0xE5 {
+                    continue;
+                }
+                let attr = sec_buf[off + 11];
+                if attr & 0x0F == 0x0F || attr & 0x08 != 0 {
+                    continue;
+                }
+                if &sec_buf[off..off + 11] == name {
+                    sec_buf[off + 28..off + 32].copy_from_slice(&new_size.to_le_bytes());
+                    let data = disk.sector_data_mut();
+                    data.copy_from_slice(&sec_buf);
+                    disk.write_sector(start_lba + s).map_err(|_| ERR_IO)?;
+                    return Ok(());
+                }
+            }
+        }
+        match disk.fat_next(cluster) {
+            Some(next) => cluster = next,
+            None => break,
+        }
+    }
+    Err(ERR_NOT_FOUND)
+}
+
+// ---------------------------------------------------------------------------
+// Write file data from client's physical page
+// ---------------------------------------------------------------------------
+
+/// Write up to `len` bytes to a file at `offset` from the client's physical page.
+/// Returns bytes actually written.
+fn write_file_data(
+    disk: &DiskState,
+    file: &mut OpenFile,
+    client_phys: usize,
+    offset: u32,
+    len: u32,
+) -> Result<u32, u64> {
+    if file.is_dir {
+        return Err(ERR_IS_DIR);
+    }
+
+    let to_write = len.min(PAGE_SIZE as u32);
+    if to_write == 0 {
+        return Ok(0);
+    }
+
+    // Map client's physical page
+    if syscall::sys_map_phys(client_phys, CLIENT_BUF, 1).is_err() {
+        return Err(ERR_IO);
+    }
+
+    let cluster_bytes = disk.bpb.sectors_per_cluster * disk.bpb.bytes_per_sector;
+
+    // Navigate to the cluster containing `offset`, allocating as needed
+    let mut cluster = file.first_cluster;
+    let mut byte_pos: u32 = 0;
+
+    // Skip clusters until we reach the one containing `offset`
+    while byte_pos + cluster_bytes <= offset {
+        match disk.fat_next(cluster) {
+            Some(next) => {
+                cluster = next;
+                byte_pos += cluster_bytes;
+            }
+            None => {
+                // Need to allocate more clusters to reach the offset
+                let new = disk.fat_extend(cluster).map_err(|_| ERR_IO)?;
+                disk.zero_cluster(new).map_err(|_| ERR_IO)?;
+                cluster = new;
+                byte_pos += cluster_bytes;
+            }
+        }
+    }
+
+    let mut written = 0u32;
+
+    while written < to_write {
+        let offset_in_cluster = (offset + written) - byte_pos;
+        let sector_in_cluster = offset_in_cluster / disk.bpb.bytes_per_sector;
+        let offset_in_sector = offset_in_cluster % disk.bpb.bytes_per_sector;
+
+        let lba = disk.cluster_start_lba(cluster) + sector_in_cluster;
+
+        // Read existing sector data (for partial-sector writes)
+        if disk.read_sector(lba).is_err() {
+            return Err(ERR_IO);
+        }
+
+        let copy_start = offset_in_sector as usize;
+        let copy_len = (512 - copy_start).min((to_write - written) as usize);
+
+        // Copy from client buffer into disk I/O buffer
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                (CLIENT_BUF + written as usize) as *const u8,
+                (DISK_IO_BUF + copy_start) as *mut u8,
+                copy_len,
+            );
+        }
+
+        // Write sector back to disk
+        disk.write_sector(lba).map_err(|_| ERR_IO)?;
+
+        written += copy_len as u32;
+
+        // Check if we need to move to next cluster
+        let new_offset_in_cluster = offset_in_cluster + copy_len as u32;
+        if new_offset_in_cluster >= cluster_bytes && written < to_write {
+            match disk.fat_next(cluster) {
+                Some(next) => {
+                    cluster = next;
+                    byte_pos += cluster_bytes;
+                }
+                None => {
+                    let new = disk.fat_extend(cluster).map_err(|_| ERR_IO)?;
+                    disk.zero_cluster(new).map_err(|_| ERR_IO)?;
+                    cluster = new;
+                    byte_pos += cluster_bytes;
+                }
+            }
+        }
+    }
+
+    // Update cached position
+    file.cur_cluster = cluster;
+    file.cur_cluster_offset = byte_pos;
+
+    // Update file size if we wrote past the end
+    let new_end = offset + written;
+    if new_end > file.file_size {
+        file.file_size = new_end;
+    }
+
+    Ok(written)
+}
+
+// ---------------------------------------------------------------------------
 // IPC helpers
 // ---------------------------------------------------------------------------
 
@@ -744,6 +1134,8 @@ pub extern "C" fn _start() -> ! {
             TAG_CLOSE => handle_close(sender, &msg),
             TAG_READDIR => handle_readdir(&disk, sender, &msg),
             TAG_STAT => handle_stat(sender, &msg),
+            TAG_WRITE => handle_write(&disk, sender, &msg),
+            TAG_CREATE => handle_create(&disk, sender, &msg),
             _ => error_reply(sender, 0xFF),
         }
     }
@@ -763,8 +1155,8 @@ fn handle_open(disk: &DiskState, sender: usize, msg: &Message) {
     }
 
     match resolve_path(disk, path) {
-        Ok((cluster, size, is_dir)) => {
-            match alloc_handle(sender, cluster, size, is_dir) {
+        Ok((cluster, size, is_dir, dir_cluster, fat_name)) => {
+            match alloc_handle(sender, cluster, size, is_dir, dir_cluster, &fat_name) {
                 Some(handle) => {
                     let reply = Message {
                         sender: 0,
@@ -889,6 +1281,108 @@ fn handle_stat(sender: usize, msg: &Message) {
             let _ = syscall::sys_reply(sender, &reply);
         }
         None => error_reply(sender, ERR_INVALID_HANDLE),
+    }
+}
+
+/// TAG_WRITE: data[0]=handle, data[1]=phys_addr, data[2]=offset, data[3]=len
+/// Reply: tag=TAG_OK, data[0]=bytes_written  OR  tag=TAG_ERROR, data[0]=error_code
+fn handle_write(disk: &DiskState, sender: usize, msg: &Message) {
+    let handle = msg.data[0] as usize;
+    let phys_addr = msg.data[1] as usize;
+    let offset = msg.data[2] as u32;
+    let len = msg.data[3] as u32;
+
+    match get_handle(handle, sender) {
+        Some(file) => {
+            let dir_cluster = file.dir_cluster;
+            let fat_name = file.fat_name;
+            match write_file_data(disk, file, phys_addr, offset, len) {
+                Ok(bytes_written) => {
+                    // Update directory entry with new size
+                    let new_size = file.file_size;
+                    let _ = update_dir_entry_size(disk, dir_cluster, &fat_name, new_size);
+                    let reply = Message {
+                        sender: 0,
+                        tag: TAG_OK,
+                        data: [bytes_written as u64, 0, 0, 0, 0, 0],
+                    };
+                    let _ = syscall::sys_reply(sender, &reply);
+                }
+                Err(code) => error_reply(sender, code),
+            }
+        }
+        None => error_reply(sender, ERR_INVALID_HANDLE),
+    }
+}
+
+/// TAG_CREATE: data[0..6] = path (up to 48 bytes, null-terminated)
+///   Last component is the new file/dir name. Intermediate dirs must exist.
+///   If data[5] bit 0 is set, create a directory.
+/// Reply: tag=TAG_OK, data[0]=handle, data[1]=0 (size)  OR  tag=TAG_ERROR
+fn handle_create(disk: &DiskState, sender: usize, msg: &Message) {
+    // data[5] is used for flags — extract before treating data as path
+    let flags = msg.data[5];
+    let is_dir = flags & 1 != 0;
+
+    let path = extract_path(&msg.data);
+    if path.is_empty() {
+        error_reply(sender, ERR_INVALID_PATH);
+        return;
+    }
+
+    // Split path into parent + final component
+    let path_trimmed = if !path.is_empty() && path[0] == b'/' {
+        &path[1..]
+    } else {
+        path
+    };
+
+    // Find last '/'
+    let (parent_path, file_name) = match path_trimmed.iter().rposition(|&b| b == b'/') {
+        Some(pos) => (&path[..pos + 1], &path_trimmed[pos + 1..]),
+        None => (b"/" as &[u8], path_trimmed),
+    };
+
+    if file_name.is_empty() {
+        error_reply(sender, ERR_INVALID_PATH);
+        return;
+    }
+
+    // Resolve parent directory
+    let parent_cluster = match resolve_path(disk, parent_path) {
+        Ok((cluster, _, is_parent_dir, _, _)) => {
+            if !is_parent_dir {
+                error_reply(sender, ERR_NOT_DIR);
+                return;
+            }
+            cluster
+        }
+        Err(code) => {
+            error_reply(sender, code);
+            return;
+        }
+    };
+
+    // Convert filename to FAT 8.3
+    let mut fat_name = [0u8; 11];
+    to_fat83(file_name, &mut fat_name);
+
+    // Create the directory entry
+    match create_dir_entry(disk, parent_cluster, &fat_name, is_dir) {
+        Ok(new_cluster) => {
+            match alloc_handle(sender, new_cluster, 0, is_dir, parent_cluster, &fat_name) {
+                Some(handle) => {
+                    let reply = Message {
+                        sender: 0,
+                        tag: TAG_OK,
+                        data: [handle as u64, 0, is_dir as u64, 0, 0, 0],
+                    };
+                    let _ = syscall::sys_reply(sender, &reply);
+                }
+                None => error_reply(sender, ERR_TOO_MANY_OPEN),
+            }
+        }
+        Err(code) => error_reply(sender, code),
     }
 }
 

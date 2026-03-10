@@ -12,6 +12,7 @@ const TAG_NS_REGISTER: u64 = 1;
 
 // Disk IPC tags
 const TAG_READ_SECTOR: u64 = 1;
+const TAG_WRITE_SECTOR: u64 = 2;
 const TAG_DISK_INFO: u64 = 3;
 const TAG_OK: u64 = 0;
 const TAG_ERROR: u64 = u64::MAX;
@@ -37,6 +38,7 @@ const ATA_SR_ERR: u8 = 0x01;
 // ATA commands
 const ATA_CMD_IDENTIFY: u8 = 0xEC;
 const ATA_CMD_READ_PIO: u8 = 0x20;
+const ATA_CMD_WRITE_PIO: u8 = 0x30;
 
 // Temp vaddr for mapping client pages
 const TEMP_MAP_ADDR: usize = 0x86_0000_0000;
@@ -191,6 +193,51 @@ fn ata_read_sector(lba: u32, buf: *mut u8) -> bool {
     true
 }
 
+fn ata_write_sector(lba: u32, buf: *const u8) -> bool {
+    let max_sectors = unsafe { DRIVE.lba28_sectors };
+    if lba >= max_sectors {
+        return false;
+    }
+
+    ata_wait_not_busy();
+
+    // Select drive 0, LBA mode, top 4 bits of LBA
+    syscall::sys_ioport_write(ATA_DRIVE_HEAD, 0xE0 | ((lba >> 24) & 0x0F) as u8);
+    ata_400ns_delay();
+
+    // Set sector count = 1
+    syscall::sys_ioport_write(ATA_SECTOR_COUNT, 1);
+
+    // Set LBA
+    syscall::sys_ioport_write(ATA_LBA_LO, lba as u8);
+    syscall::sys_ioport_write(ATA_LBA_MID, (lba >> 8) as u8);
+    syscall::sys_ioport_write(ATA_LBA_HI, (lba >> 16) as u8);
+
+    // Send WRITE SECTORS command
+    syscall::sys_ioport_write(ATA_COMMAND, ATA_CMD_WRITE_PIO);
+    ata_400ns_delay();
+
+    // Wait for DRQ (device ready to accept data)
+    if !ata_wait_drq() {
+        return false;
+    }
+
+    // Write 256 words (512 bytes)
+    let words = unsafe { core::slice::from_raw_parts(buf as *const u16, 256) };
+    let _ = syscall::sys_ioport_rep_outsw(ATA_DATA, words);
+
+    // Flush cache — wait for BSY to clear after write
+    ata_wait_not_busy();
+
+    // Check for errors
+    let status = ata_read_status();
+    if status & ATA_SR_ERR != 0 {
+        return false;
+    }
+
+    true
+}
+
 fn register_with_nameserver() {
     let name = b"disk";
     let mut buf = [0u8; 24];
@@ -275,6 +322,38 @@ pub extern "C" fn _start() -> ! {
                         sender: 0,
                         tag: TAG_ERROR,
                         data: [2, 0, 0, 0, 0, 0], // read error
+                    }
+                };
+                let _ = syscall::sys_reply(msg.sender, &reply);
+            }
+            TAG_WRITE_SECTOR => {
+                let lba = msg.data[0] as u32;
+                let phys_addr = msg.data[1] as usize;
+
+                // Map the client's physical page at our temp address
+                if syscall::sys_map_phys(phys_addr, TEMP_MAP_ADDR, 1).is_err() {
+                    let reply = Message {
+                        sender: 0,
+                        tag: TAG_ERROR,
+                        data: [1, 0, 0, 0, 0, 0],
+                    };
+                    let _ = syscall::sys_reply(msg.sender, &reply);
+                    continue;
+                }
+
+                let success = ata_write_sector(lba, TEMP_MAP_ADDR as *const u8);
+
+                let reply = if success {
+                    Message {
+                        sender: 0,
+                        tag: TAG_OK,
+                        data: [512, 0, 0, 0, 0, 0],
+                    }
+                } else {
+                    Message {
+                        sender: 0,
+                        tag: TAG_ERROR,
+                        data: [3, 0, 0, 0, 0, 0], // write error
                     }
                 };
                 let _ = syscall::sys_reply(msg.sender, &reply);

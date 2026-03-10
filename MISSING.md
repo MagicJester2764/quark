@@ -15,7 +15,7 @@ Scheduler, synchronous IPC, address spaces, capabilities, fd table, IRQ delegati
 
 ## Medium impact (needed for real workloads)
 
-5. **Write support in VFS/disk** — Disk driver is read-only. No file creation or modification.
+5. ~~**Write support in VFS/disk**~~ — **Done.** Disk driver supports `TAG_WRITE_SECTOR` (ATA PIO write). VFS supports `TAG_WRITE` (write file data with auto-extend) and `TAG_CREATE` (create files/directories with FAT32 8.3 entries). `libquark::vfs::write()` and `create()` provide the client API.
 
 6. ~~**Process groups / wait**~~ — **Done.** `sys_wait()` (syscall 83) blocks parent until a child exits, returns child TID. Tasks track `parent_tid`; dead tasks become zombies until collected. `reap_dead()` respects parent/child relationships.
 
