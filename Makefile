@@ -39,6 +39,9 @@ DISKTEST_ELF := $(DISKTEST_DIR)/target/$(TARGET)/release/disktest
 VFS_DIR := user/vfs
 VFS_ELF := $(VFS_DIR)/target/$(TARGET)/release/vfs
 
+NET_DIR := user/net
+NET_ELF := $(NET_DIR)/target/$(TARGET)/release/net
+
 .PHONY: all clean iso run run-uefi drivers user FORCE
 
 all: $(KERNEL) drivers user
@@ -57,7 +60,7 @@ $(FAT32_DRV_BIN): FORCE
 	cd $(FAT32_DRV_DIR) && cargo build --release
 	objcopy -O binary $(FAT32_DRV_ELF) $(FAT32_DRV_BIN)
 
-user: $(INIT_ELF) $(HELLO_ELF) $(NS_ELF) $(KBD_ELF) $(CON_ELF) $(INP_ELF) $(DISK_ELF) $(DISKTEST_ELF) $(VFS_ELF)
+user: $(INIT_ELF) $(HELLO_ELF) $(NS_ELF) $(KBD_ELF) $(CON_ELF) $(INP_ELF) $(DISK_ELF) $(DISKTEST_ELF) $(VFS_ELF) $(NET_ELF)
 
 $(INIT_ELF): FORCE
 	cd $(INIT_DIR) && cargo build --release
@@ -85,6 +88,9 @@ $(DISKTEST_ELF): FORCE
 
 $(VFS_ELF): FORCE
 	cd $(VFS_DIR) && cargo build --release
+
+$(NET_ELF): FORCE
+	cd $(NET_DIR) && cargo build --release
 
 iso: $(KERNEL)
 	@mkdir -p isodir/boot/grub
@@ -114,6 +120,7 @@ clean:
 	cd $(DISK_DIR) && cargo clean
 	cd $(DISKTEST_DIR) && cargo clean
 	cd $(VFS_DIR) && cargo clean
+	cd $(NET_DIR) && cargo clean
 	rm -rf $(KERNEL) $(VGA_DRV_BIN) $(FAT32_DRV_BIN) quark.iso isodir
 
 FORCE:

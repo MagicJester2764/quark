@@ -451,6 +451,7 @@ fn is_essential_elf(name: &[u8; 11]) -> bool {
     let base = &name[0..8];
     base == b"NAMESRVR" || base == b"CONSOLE " || base == b"KEYBOARD"
         || base == b"DISK    " || base == b"INPUT   " || base == b"VFS     "
+        || base == b"NET     "
 }
 
 /// Grant capabilities based on FAT 8.3 name.
@@ -467,6 +468,9 @@ fn grant_caps_by_name(name: &[u8; 11], tid: usize) {
         let _ = syscall::sys_grant_cap(tid, syscall::CAP_PHYS_ALLOC | syscall::CAP_MAP_PHYS);
     } else if base == b"VFS     " {
         let _ = syscall::sys_grant_cap(tid, syscall::CAP_PHYS_ALLOC | syscall::CAP_MAP_PHYS);
+    } else if base == b"NET     " {
+        let _ = syscall::sys_grant_cap(tid,
+            syscall::CAP_IOPORT | syscall::CAP_IRQ | syscall::CAP_PHYS_ALLOC | syscall::CAP_MAP_PHYS);
     }
 }
 

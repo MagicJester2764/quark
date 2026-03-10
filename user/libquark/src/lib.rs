@@ -8,6 +8,7 @@ pub mod ipc;
 pub mod stdio;
 pub mod sync;
 pub mod syscall;
+pub mod net;
 pub mod vfs;
 
 pub mod allocator;

@@ -1,0 +1,92 @@
+/// Network client helpers — wraps net service IPC protocol for user-space callers.
+
+use crate::ipc::Message;
+use crate::syscall;
+
+const TAG_UDP_SEND: u64 = 1;
+const TAG_UDP_RECV: u64 = 2;
+const TAG_NET_CONFIG: u64 = 3;
+const TAG_NET_INFO: u64 = 4;
+const TAG_ERROR: u64 = u64::MAX;
+
+/// Send a UDP datagram. `phys_addr` must point to a page with the payload.
+/// `dst_ip` is packed big-endian (e.g., 10.0.2.2 = 0x0A000202).
+pub fn udp_send(
+    net_tid: usize,
+    phys_addr: usize,
+    len: usize,
+    dst_ip: u32,
+    dst_port: u16,
+    src_port: u16,
+) -> Result<(), u64> {
+    let msg = Message {
+        sender: 0,
+        tag: TAG_UDP_SEND,
+        data: [
+            phys_addr as u64,
+            len as u64,
+            dst_ip as u64,
+            ((dst_port as u64) << 16) | (src_port as u64),
+            0, 0,
+        ],
+    };
+    let mut reply = Message::empty();
+    if syscall::sys_call(net_tid, &msg, &mut reply).is_err() {
+        return Err(1);
+    }
+    if reply.tag == TAG_ERROR { Err(reply.data[0]) } else { Ok(()) }
+}
+
+/// Receive a UDP datagram. Blocks until data arrives on `listen_port` (0 = any).
+/// `phys_addr` must point to a page for the received payload.
+/// Returns (bytes_read, src_ip, src_port, dst_port).
+pub fn udp_recv(
+    net_tid: usize,
+    phys_addr: usize,
+    max_len: usize,
+    listen_port: u16,
+) -> Result<(usize, u32, u16, u16), u64> {
+    let msg = Message {
+        sender: 0,
+        tag: TAG_UDP_RECV,
+        data: [phys_addr as u64, max_len as u64, listen_port as u64, 0, 0, 0],
+    };
+    let mut reply = Message::empty();
+    if syscall::sys_call(net_tid, &msg, &mut reply).is_err() {
+        return Err(1);
+    }
+    if reply.tag == TAG_ERROR {
+        return Err(reply.data[0]);
+    }
+    let bytes = reply.data[0] as usize;
+    let src_ip = reply.data[1] as u32;
+    let ports = reply.data[2];
+    let src_port = (ports >> 16) as u16;
+    let dst_port = (ports & 0xFFFF) as u16;
+    Ok((bytes, src_ip, src_port, dst_port))
+}
+
+/// Get network info. Returns (mac_packed_le, ip_packed_be).
+pub fn info(net_tid: usize) -> Result<(u64, u32), u64> {
+    let msg = Message { sender: 0, tag: TAG_NET_INFO, data: [0; 6] };
+    let mut reply = Message::empty();
+    if syscall::sys_call(net_tid, &msg, &mut reply).is_err() {
+        return Err(1);
+    }
+    if reply.tag == TAG_ERROR { return Err(reply.data[0]); }
+    Ok((reply.data[0], reply.data[1] as u32))
+}
+
+/// Configure IP address, netmask, and gateway (all packed big-endian u32).
+pub fn configure(net_tid: usize, ip: u32, netmask: u32, gateway: u32) -> Result<(), u64> {
+    let msg = Message {
+        sender: 0,
+        tag: TAG_NET_CONFIG,
+        data: [ip as u64, netmask as u64, gateway as u64, 0, 0, 0],
+    };
+    let mut reply = Message::empty();
+    if syscall::sys_call(net_tid, &msg, &mut reply).is_err() {
+        return Err(1);
+    }
+    if reply.tag == TAG_ERROR { Err(reply.data[0]) } else { Ok(()) }
+}

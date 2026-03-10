@@ -1,7 +1,7 @@
 # Missing Features
 
 ## What Quark has
-Scheduler, synchronous IPC, address spaces, capabilities, fd table, IRQ delegation, PMM, heap, futex/mutex, ELF loading, nameserver, console, keyboard, input, disk, VFS
+Scheduler, synchronous IPC, address spaces, capabilities, fd table, IRQ delegation, PMM, heap, futex/mutex, ELF loading, nameserver, console, keyboard, input, disk, VFS, network
 
 ## High impact (blocking real programs)
 
@@ -27,7 +27,7 @@ Scheduler, synchronous IPC, address spaces, capabilities, fd table, IRQ delegati
 
 9. **SMP support** — Single-core only. Would need per-CPU scheduler state, IPI for cross-core scheduling, lock-aware context switch.
 
-10. **Network stack** — Typically a userspace service in a microkernel.
+10. ~~**Network stack**~~ — **Done.** RTL8139 NIC driver as userspace service (`user/net`). PCI enumeration, DMA ring buffers, Ethernet framing, ARP (request/reply/cache), IPv4, ICMP echo reply (ping), UDP send/receive via IPC. `libquark::net` provides client API (`udp_send`, `udp_recv`, `configure`, `info`). Registers as "net" with nameserver. QEMU: add `-device rtl8139,netdev=n -netdev user,id=n`.
 
 11. ~~**Shared memory**~~ — **Done.** `sys_shmem_create(pages)` (syscall 90) allocates a shared region, `sys_shmem_grant(handle, tid)` (92) grants access, `sys_shmem_map(handle, vaddr)` (91) maps into caller's space. Up to 32 regions, 16 pages each. Access tracked via per-region bitmask.
 
