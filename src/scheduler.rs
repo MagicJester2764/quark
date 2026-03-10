@@ -44,7 +44,7 @@ pub fn init() {
             priority: 255, // lowest priority
             cr3: crate::paging::read_cr3(),
             caps: crate::task::CAP_ALL,
-            fds: [crate::task::FdEntry::empty(); crate::task::MAX_FDS],
+            fds: [crate::task::FdKind::empty(); crate::task::MAX_FDS],
             pager_tid: 0,
             parent_tid: 0,
             mem_pages: 0,
@@ -323,6 +323,8 @@ pub fn reap_dead() {
                     if !can_reap {
                         continue;
                     }
+                    // Clean up pipe refcounts and wake blocked tasks
+                    crate::pipe::cleanup_task_fds(&task.fds);
                     // Clean up IPC state and unblock tasks waiting on this one
                     crate::ipc::cleanup_task_ipc(i);
                     // Unregister any IRQ handlers
@@ -404,7 +406,7 @@ pub fn create_empty_task() -> Option<usize> {
             priority: 0,
             cr3: 0,
             caps: 0,
-            fds: [crate::task::FdEntry::empty(); crate::task::MAX_FDS],
+            fds: [crate::task::FdKind::empty(); crate::task::MAX_FDS],
             pager_tid: 0,
             parent_tid: parent,
             mem_pages: 0,
@@ -467,7 +469,7 @@ pub fn grant_cap(tid: usize, cap: u32) -> Result<(), ()> {
 }
 
 /// Set a file descriptor entry on a task.
-pub fn set_fd(tid: usize, fd: usize, entry: crate::task::FdEntry) -> Result<(), ()> {
+pub fn set_fd(tid: usize, fd: usize, entry: crate::task::FdKind) -> Result<(), ()> {
     if fd >= crate::task::MAX_FDS {
         return Err(());
     }
@@ -548,22 +550,15 @@ pub fn set_mem_limit(tid: usize, limit: usize) -> Result<(), ()> {
 }
 
 /// Get a file descriptor entry for the current task.
-pub fn current_fd(fd: usize) -> Option<crate::task::FdEntry> {
+pub fn current_fd(fd: usize) -> crate::task::FdKind {
     if fd >= crate::task::MAX_FDS {
-        return None;
+        return crate::task::FdKind::Empty;
     }
     unsafe {
         let tid = CURRENT_TID.load(Ordering::SeqCst);
         match TASKS[tid].as_ref() {
-            Some(task) => {
-                let entry = task.fds[fd];
-                if entry.target_tid == 0 {
-                    None
-                } else {
-                    Some(entry)
-                }
-            }
-            None => None,
+            Some(task) => task.fds[fd],
+            None => crate::task::FdKind::Empty,
         }
     }
 }

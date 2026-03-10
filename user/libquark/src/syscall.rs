@@ -33,6 +33,8 @@ pub const SYS_GRANT_CAP: u64 = 48;
 pub const SYS_FD_WRITE: u64 = 50;
 pub const SYS_FD_READ: u64 = 51;
 pub const SYS_FD_SET: u64 = 52;
+pub const SYS_PIPE_CREATE: u64 = 53;
+pub const SYS_PIPE_FD_SET: u64 = 54;
 
 pub const SYS_FUTEX_WAIT: u64 = 60;
 pub const SYS_FUTEX_WAKE: u64 = 61;
@@ -453,6 +455,22 @@ pub fn sys_mmap(vaddr: usize, pages: usize) -> Result<(), ()> {
 /// Unlike sys_grant_cap, this does NOT require CAP_TASK_MGMT.
 pub fn sys_cap_transfer(dest: usize, caps: u32) -> Result<(), ()> {
     let ret = unsafe { syscall2(SYS_CAP_TRANSFER, dest as u64, caps as u64) };
+    if ret == u64::MAX { Err(()) } else { Ok(()) }
+}
+
+/// Create a kernel pipe. Returns the pipe handle on success.
+pub fn sys_pipe_create() -> Result<usize, ()> {
+    let ret = unsafe { syscall0(SYS_PIPE_CREATE) };
+    if ret == u64::MAX { Err(()) } else { Ok(ret as usize) }
+}
+
+/// Install a pipe endpoint as a file descriptor on a task.
+/// is_write: false = read end, true = write end.
+/// Requires CAP_TASK_MGMT.
+pub fn sys_pipe_fd_set(tid: usize, fd: usize, pipe_handle: usize, is_write: bool) -> Result<(), ()> {
+    let ret = unsafe {
+        syscall4(SYS_PIPE_FD_SET, tid as u64, fd as u64, pipe_handle as u64, is_write as u64)
+    };
     if ret == u64::MAX { Err(()) } else { Ok(()) }
 }
 

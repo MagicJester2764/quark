@@ -41,6 +41,8 @@ pub const SYS_GRANT_CAP: u64 = 48;
 pub const SYS_FD_WRITE: u64 = 50;
 pub const SYS_FD_READ: u64 = 51;
 pub const SYS_FD_SET: u64 = 52;
+pub const SYS_PIPE_CREATE: u64 = 53;
+pub const SYS_PIPE_FD_SET: u64 = 54;
 
 pub const SYS_FUTEX_WAIT: u64 = 60;
 pub const SYS_FUTEX_WAKE: u64 = 61;
@@ -496,7 +498,6 @@ extern "C" fn syscall_dispatch(
         }
         SYS_FD_WRITE => {
             // arg0 = fd, arg1 = buf ptr, arg2 = len
-            // Looks up fd -> (target_tid, tag), sends IPC write messages
             let fd = arg0 as usize;
             let ptr = arg1 as *const u8;
             let len = arg2 as usize;
@@ -504,10 +505,14 @@ extern "C" fn syscall_dispatch(
                 return u64::MAX;
             }
             match scheduler::current_fd(fd) {
-                Some(entry) => {
-                    fd_write_ipc(entry.target_tid, entry.tag, ptr, len)
+                crate::task::FdKind::Ipc { target_tid, tag } => {
+                    fd_write_ipc(target_tid, tag, ptr, len)
                 }
-                None => {
+                crate::task::FdKind::PipeWrite(handle) => {
+                    crate::pipe::write(handle, ptr, len)
+                }
+                crate::task::FdKind::PipeRead(_) => u64::MAX,
+                crate::task::FdKind::Empty => {
                     // fd not connected — fall back to kernel console for fd 1/2
                     if (fd == 1 || fd == 2) && len > 0 && !ptr.is_null() {
                         let slice = unsafe { core::slice::from_raw_parts(ptr, len) };
@@ -528,10 +533,14 @@ extern "C" fn syscall_dispatch(
                 return u64::MAX;
             }
             match scheduler::current_fd(fd) {
-                Some(entry) => {
-                    fd_read_ipc(entry.target_tid, entry.tag, ptr, max_len)
+                crate::task::FdKind::Ipc { target_tid, tag } => {
+                    fd_read_ipc(target_tid, tag, ptr, max_len)
                 }
-                None => u64::MAX,
+                crate::task::FdKind::PipeRead(handle) => {
+                    crate::pipe::read(handle, ptr, max_len)
+                }
+                crate::task::FdKind::PipeWrite(_) => u64::MAX,
+                crate::task::FdKind::Empty => u64::MAX,
             }
         }
         SYS_FD_SET => {
@@ -544,11 +553,41 @@ extern "C" fn syscall_dispatch(
             let fd = arg1 as usize;
             let service_tid = arg2 as usize;
             let tag = arg3;
-            let entry = crate::task::FdEntry {
+            let entry = crate::task::FdKind::Ipc {
                 target_tid: service_tid,
                 tag,
             };
             match scheduler::set_fd(tid, fd, entry) {
+                Ok(()) => 0,
+                Err(()) => u64::MAX,
+            }
+        }
+        SYS_PIPE_CREATE => {
+            // Create a kernel pipe, returns handle index
+            match crate::pipe::create() {
+                Some(handle) => handle as u64,
+                None => u64::MAX,
+            }
+        }
+        SYS_PIPE_FD_SET => {
+            // arg0 = target tid, arg1 = fd index, arg2 = pipe handle, arg3 = is_write (0=read, 1=write)
+            // Requires CAP_TASK_MGMT
+            if !scheduler::current_task_has_cap(crate::task::CAP_TASK_MGMT) {
+                return u64::MAX;
+            }
+            let tid = arg0 as usize;
+            let fd = arg1 as usize;
+            let handle = arg2 as usize;
+            let is_write = arg3 != 0;
+            if crate::pipe::add_ref(handle, is_write).is_err() {
+                return u64::MAX;
+            }
+            let kind = if is_write {
+                crate::task::FdKind::PipeWrite(handle)
+            } else {
+                crate::task::FdKind::PipeRead(handle)
+            };
+            match scheduler::set_fd(tid, fd, kind) {
                 Ok(()) => 0,
                 Err(()) => u64::MAX,
             }

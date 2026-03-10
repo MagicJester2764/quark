@@ -558,7 +558,7 @@ fn send_fb_info(console_tid: usize) {
 // ---------------------------------------------------------------------------
 
 struct BootContext {
-    console_tid: usize,
+    console_pipe: usize, // pipe handle for stdout/stderr
     input_tid: usize,
     vfs_spawn: Option<SpawnInfo>,
 }
@@ -570,7 +570,7 @@ fn load_essentials_from_boot_image(rootfs_phys: usize, rootfs_size: usize) -> Bo
     let rootfs_pages = (rootfs_size + PAGE_SIZE - 1) / PAGE_SIZE;
     if syscall::sys_map_phys(rootfs_phys, BOOT_IMG_BASE, rootfs_pages).is_err() {
         println!("[init] Failed to map boot image");
-        return BootContext { console_tid: 0, input_tid: 0, vfs_spawn: None };
+        return BootContext { console_pipe: 0, input_tid: 0, vfs_spawn: None };
     }
 
     let rootfs = unsafe { core::slice::from_raw_parts(BOOT_IMG_BASE as *const u8, rootfs_size) };
@@ -599,7 +599,7 @@ fn load_essentials_from_boot_image(rootfs_phys: usize, rootfs_size: usize) -> Bo
     }
 
     // Pass 2: spawn CONSOLE.ELF (needs framebuffer info from boot info)
-    let mut console_tid: usize = 0;
+    let mut console_pipe: usize = 0;
     for i in 0..count {
         let e = &entries[i];
         if &e.name[0..8] == b"CONSOLE " && &e.name[8..11] == b"ELF" {
@@ -607,15 +607,19 @@ fn load_essentials_from_boot_image(rootfs_phys: usize, rootfs_size: usize) -> Bo
             if let Ok(data) = read_file_to_buffer(rootfs, &bpb, e.first_cluster, e.file_size) {
                 match load_elf(data) {
                     Ok(info) => {
-                        console_tid = info.tid;
                         let _ = syscall::sys_grant_cap(info.tid, syscall::CAP_MAP_PHYS);
                         let _ = set_args(&info, &[b"console"]);
+                        // Create console pipe and set fds BEFORE starting console
+                        // to avoid race where console reaches main loop before fd 0 is set
+                        if let Ok(pipe) = syscall::sys_pipe_create() {
+                            console_pipe = pipe;
+                            let _ = syscall::sys_pipe_fd_set(info.tid, 0, pipe, false);
+                            let my_tid = syscall::sys_getpid() as usize;
+                            let _ = syscall::sys_pipe_fd_set(my_tid, 1, pipe, true);
+                            let _ = syscall::sys_pipe_fd_set(my_tid, 2, pipe, true);
+                        }
                         let _ = info.start();
                         send_fb_info(info.tid);
-                        // Wire init's own stdout/stderr to console server
-                        let my_tid = syscall::sys_getpid() as usize;
-                        let _ = syscall::sys_fd_set(my_tid, 1, info.tid, 1); // TAG_WRITE=1
-                        let _ = syscall::sys_fd_set(my_tid, 2, info.tid, 1);
                         println!("[init]   Console spawned TID {}", info.tid);
                     }
                     Err(()) => println!("[init]   FAILED to spawn console"),
@@ -659,9 +663,9 @@ fn load_essentials_from_boot_image(rootfs_phys: usize, rootfs_size: usize) -> Bo
                 Ok(info) => {
                     let tid = info.tid;
                     grant_caps_by_name(&e.name, tid);
-                    if console_tid != 0 {
-                        let _ = syscall::sys_fd_set(tid, 1, console_tid, 1);
-                        let _ = syscall::sys_fd_set(tid, 2, console_tid, 1);
+                    if console_pipe != 0 {
+                        let _ = syscall::sys_pipe_fd_set(tid, 1, console_pipe, true);
+                        let _ = syscall::sys_pipe_fd_set(tid, 2, console_pipe, true);
                     }
                     let _ = set_args(&info, &[&namebuf[..namelen]]);
                     let _ = info.start();
@@ -686,9 +690,9 @@ fn load_essentials_from_boot_image(rootfs_phys: usize, rootfs_size: usize) -> Bo
                 match load_elf(data) {
                     Ok(info) => {
                         input_tid = info.tid;
-                        if console_tid != 0 {
-                            let _ = syscall::sys_fd_set(info.tid, 1, console_tid, 1);
-                            let _ = syscall::sys_fd_set(info.tid, 2, console_tid, 1);
+                        if console_pipe != 0 {
+                            let _ = syscall::sys_pipe_fd_set(info.tid, 1, console_pipe, true);
+                            let _ = syscall::sys_pipe_fd_set(info.tid, 2, console_pipe, true);
                         }
                         let _ = set_args(&info, &[b"input"]);
                         let _ = info.start();
@@ -718,9 +722,9 @@ fn load_essentials_from_boot_image(rootfs_phys: usize, rootfs_size: usize) -> Bo
                 match load_elf(data) {
                     Ok(info) => {
                         grant_caps_by_name(&e.name, info.tid);
-                        if console_tid != 0 {
-                            let _ = syscall::sys_fd_set(info.tid, 1, console_tid, 1);
-                            let _ = syscall::sys_fd_set(info.tid, 2, console_tid, 1);
+                        if console_pipe != 0 {
+                            let _ = syscall::sys_pipe_fd_set(info.tid, 1, console_pipe, true);
+                            let _ = syscall::sys_pipe_fd_set(info.tid, 2, console_pipe, true);
                         }
                         if input_tid != 0 {
                             let _ = syscall::sys_fd_set(info.tid, 0, input_tid, 1);
@@ -736,7 +740,7 @@ fn load_essentials_from_boot_image(rootfs_phys: usize, rootfs_size: usize) -> Bo
         }
     }
 
-    BootContext { console_tid, input_tid, vfs_spawn }
+    BootContext { console_pipe, input_tid, vfs_spawn }
 }
 
 // ---------------------------------------------------------------------------
@@ -768,7 +772,7 @@ impl DeferredTasks {
     }
 }
 
-fn load_from_vfs(vfs_tid: usize, console_tid: usize, input_tid: usize) -> DeferredTasks {
+fn load_from_vfs(vfs_tid: usize, console_pipe: usize, input_tid: usize) -> DeferredTasks {
     let mut deferred = DeferredTasks::new();
 
     // Open /usr/bin directory via VFS
@@ -879,9 +883,9 @@ fn load_from_vfs(vfs_tid: usize, console_tid: usize, input_tid: usize) -> Deferr
             Ok(info) => {
                 let tid = info.tid;
                 grant_caps_by_name(name, tid);
-                if console_tid != 0 {
-                    let _ = syscall::sys_fd_set(tid, 1, console_tid, 1);
-                    let _ = syscall::sys_fd_set(tid, 2, console_tid, 1);
+                if console_pipe != 0 {
+                    let _ = syscall::sys_pipe_fd_set(tid, 1, console_pipe, true);
+                    let _ = syscall::sys_pipe_fd_set(tid, 2, console_pipe, true);
                 }
                 if input_tid != 0 {
                     let _ = syscall::sys_fd_set(tid, 0, input_tid, 1);
@@ -949,7 +953,7 @@ pub extern "C" fn _start() -> ! {
 
             // Phase 3: Load remaining programs from VFS (loaded but not started)
             let mut deferred = if let Some(vfs) = vfs_tid {
-                load_from_vfs(vfs, ctx.console_tid, ctx.input_tid)
+                load_from_vfs(vfs, ctx.console_pipe, ctx.input_tid)
             } else {
                 println!("[init] No VFS, skipping disk program loading.");
                 DeferredTasks::new()

@@ -10,17 +10,11 @@ const NAMESERVER_TID: usize = 2;
 // Nameserver protocol
 const TAG_NS_REGISTER: u64 = 1;
 
-// Console protocol
-const TAG_WRITE: u64 = 1;
-
 // Init -> console: framebuffer initialization
 const TAG_FB_INIT: u64 = 100;
 
 const GLYPH_W: usize = 8;
 const GLYPH_H: usize = 8;
-
-// Max payload bytes per IPC message (5 data words × 8 bytes)
-const MAX_WRITE_BYTES: usize = 40;
 
 static mut FB: usize = 0;
 static mut PITCH: usize = 0;
@@ -72,27 +66,17 @@ pub extern "C" fn _start() -> ! {
 
     println!("[console] Ready.");
 
-    // Main loop: serve write requests
+    // Main loop: read from pipe (fd 0) and render
     loop {
-        let mut msg = Message::empty();
-        if syscall::sys_recv(TID_ANY, &mut msg).is_err() {
-            continue;
+        let mut buf = [0u8; 256];
+        let n = syscall::sys_fd_read(0, &mut buf);
+        if n == 0 || n == u64::MAX {
+            break; // EOF or error
         }
-
-        match msg.tag {
-            TAG_WRITE => {
-                let len = (msg.data[0] as usize).min(MAX_WRITE_BYTES);
-                let bytes = data_to_bytes(&msg.data[1..6], len);
-                write_bytes(&bytes[..len]);
-                let reply = Message { sender: 0, tag: TAG_WRITE, data: [len as u64, 0, 0, 0, 0, 0] };
-                let _ = syscall::sys_reply(msg.sender, &reply);
-            }
-            _ => {
-                let reply = Message { sender: 0, tag: u64::MAX, data: [0; 6] };
-                let _ = syscall::sys_reply(msg.sender, &reply);
-            }
-        }
+        write_bytes(&buf[..n as usize]);
     }
+
+    syscall::sys_exit();
 }
 
 fn init_framebuffer(msg: &Message) {
@@ -142,20 +126,6 @@ fn init_framebuffer(msg: &Message) {
         INITIALIZED = true;
         FG_COLOR = encode_color(0xCC, 0xCC, 0xCC);
     }
-}
-
-fn data_to_bytes(words: &[u64], len: usize) -> [u8; MAX_WRITE_BYTES] {
-    let mut buf = [0u8; MAX_WRITE_BYTES];
-    for (i, &w) in words.iter().enumerate() {
-        let base = i * 8;
-        let bytes = w.to_le_bytes();
-        for j in 0..8 {
-            if base + j < len {
-                buf[base + j] = bytes[j];
-            }
-        }
-    }
-    buf
 }
 
 fn write_bytes(s: &[u8]) {

@@ -25,6 +25,7 @@ mod elf;
 mod futex;
 mod services;
 mod shmem;
+pub mod pipe;
 pub mod task;
 mod userspace;
 

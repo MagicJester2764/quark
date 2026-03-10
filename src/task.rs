@@ -10,16 +10,22 @@ pub const KERNEL_STACK_SIZE: usize = 16384; // 16 KiB per task
 const STACK_ALIGN: usize = 16;
 pub const MAX_FDS: usize = 8;
 
-/// File descriptor entry — routes writes/reads to a service via IPC.
+/// File descriptor kind — routes I/O to either an IPC service or a kernel pipe.
 #[derive(Debug, Clone, Copy)]
-pub struct FdEntry {
-    pub target_tid: usize,
-    pub tag: u64,
+pub enum FdKind {
+    Empty,
+    Ipc { target_tid: usize, tag: u64 },
+    PipeRead(usize),   // pipe handle index
+    PipeWrite(usize),  // pipe handle index
 }
 
-impl FdEntry {
+impl FdKind {
     pub const fn empty() -> Self {
-        FdEntry { target_tid: 0, tag: 0 }
+        FdKind::Empty
+    }
+
+    pub fn is_empty(&self) -> bool {
+        matches!(self, FdKind::Empty)
     }
 }
 
@@ -50,8 +56,7 @@ pub struct Task {
     pub cr3: usize,
     pub caps: u32,
     /// File descriptor table. fd 0=stdin, 1=stdout, 2=stderr.
-    /// An entry with target_tid=0 means the fd is not connected.
-    pub fds: [FdEntry; MAX_FDS],
+    pub fds: [FdKind; MAX_FDS],
     /// Pager task TID for exception forwarding. 0 = no pager (kill on fault).
     pub pager_tid: usize,
     /// Parent task TID. 0 = no parent (init/kernel tasks).
@@ -113,7 +118,7 @@ impl Task {
             priority: 0,
             cr3: crate::paging::read_cr3(),
             caps: 0,
-            fds: [FdEntry::empty(); MAX_FDS],
+            fds: [FdKind::empty(); MAX_FDS],
             pager_tid: 0,
             parent_tid: 0,
             mem_pages: 0,
