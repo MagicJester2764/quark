@@ -56,6 +56,7 @@ pub const SYS_SET_MEM_LIMIT: u64 = 84;
 pub const SYS_SHMEM_CREATE: u64 = 90;
 pub const SYS_SHMEM_MAP: u64 = 91;
 pub const SYS_SHMEM_GRANT: u64 = 92;
+pub const SYS_CAP_TRANSFER: u64 = 93;
 
 const SFMASK_VALUE: u64 = (1 << 9) | (1 << 10); // clear IF | DF
 
@@ -648,6 +649,21 @@ extern "C" fn syscall_dispatch(
         SYS_SHMEM_GRANT => {
             // arg0 = handle, arg1 = target tid
             crate::shmem::grant(arg0 as usize, arg1 as usize)
+        }
+        SYS_CAP_TRANSFER => {
+            // arg0 = dest tid, arg1 = capability bits to transfer
+            // Any task can transfer caps it holds — no CAP_TASK_MGMT required.
+            let dest = arg0 as usize;
+            let caps = arg1 as u32;
+            let caller_caps = scheduler::current_task_caps();
+            // Sender must hold all bits being transferred
+            if caps & !caller_caps != 0 {
+                return u64::MAX;
+            }
+            match scheduler::grant_cap(dest, caps) {
+                Ok(()) => 0,
+                Err(()) => u64::MAX,
+            }
         }
         SYS_SET_PAGER => {
             // arg0 = tid, arg1 = pager_tid

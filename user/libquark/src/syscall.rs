@@ -48,6 +48,7 @@ pub const SYS_SET_MEM_LIMIT: u64 = 84;
 pub const SYS_SHMEM_CREATE: u64 = 90;
 pub const SYS_SHMEM_MAP: u64 = 91;
 pub const SYS_SHMEM_GRANT: u64 = 92;
+pub const SYS_CAP_TRANSFER: u64 = 93;
 
 #[inline(always)]
 pub unsafe fn syscall0(nr: u64) -> u64 {
@@ -432,6 +433,13 @@ pub const TAG_PAGE_FAULT: u64 = 0xFFFF_0001;
 /// Returns 0 on success, u64::MAX on failure.
 pub fn sys_mmap(vaddr: usize, pages: usize) -> Result<(), ()> {
     let ret = unsafe { syscall2(SYS_MMAP, vaddr as u64, pages as u64) };
+    if ret == u64::MAX { Err(()) } else { Ok(()) }
+}
+
+/// Transfer capabilities to another task. The caller must hold all bits in `caps`.
+/// Unlike sys_grant_cap, this does NOT require CAP_TASK_MGMT.
+pub fn sys_cap_transfer(dest: usize, caps: u32) -> Result<(), ()> {
+    let ret = unsafe { syscall2(SYS_CAP_TRANSFER, dest as u64, caps as u64) };
     if ret == u64::MAX { Err(()) } else { Ok(()) }
 }
 
