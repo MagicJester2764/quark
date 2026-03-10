@@ -32,3 +32,21 @@ Scheduler, synchronous IPC, address spaces, capabilities, fd table, IRQ delegati
 11. ~~**Shared memory**~~ — **Done.** `sys_shmem_create(pages)` (syscall 90) allocates a shared region, `sys_shmem_grant(handle, tid)` (92) grants access, `sys_shmem_map(handle, vaddr)` (91) maps into caller's space. Up to 32 regions, 16 pages each. Access tracked via per-region bitmask.
 
 12. ~~**Capability transfer over IPC**~~ — **Done.** `sys_cap_transfer(dest, caps)` (syscall 93) lets any task transfer capabilities it holds to another task, without requiring CAP_TASK_MGMT. Services can now delegate their own capabilities to clients dynamically.
+
+## Next features
+
+13. ~~**Shell**~~ — **Done.** Interactive command interpreter (`user/shell`). Reads input, parses commands, loads ELFs from `/usr/bin/` via VFS, spawns tasks with fd wiring, waits for exit. Only builtin: `exit`. Loaded last by init so auto-run programs finish first.
+
+14. **`sys_kill` / signals** — Terminate tasks from userspace. Clean teardown (free pages, unblock IPC partners, notify parent via `sys_wait`).
+
+15. **Pipes** — Anonymous IPC channels (`sys_pipe` returns read/write fds). Enables `cmd1 | cmd2` in the shell.
+
+16. ~~**Userspace utilities (`ls`, `cat`, `echo`)**~~ — **Done.** `echo` prints arguments; `ls` lists directories via VFS (default `/usr/bin`); `cat` reads and prints files via VFS with phys page buffer. All loadable from shell.
+
+17. **TCP** — Extend the net driver with TCP (3-way handshake, sliding window, retransmit). Enables HTTP, telnet, etc.
+
+18. **DHCP client** — Auto-configure IP/netmask/gateway via DHCP instead of hardcoded 10.0.2.15.
+
+19. **DNS resolver** — Name resolution so network programs can use hostnames.
+
+20. **Task listing (`ps`)** — Syscall to enumerate running tasks + userspace `ps` command.

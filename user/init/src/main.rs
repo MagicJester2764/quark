@@ -471,6 +471,11 @@ fn grant_caps_by_name(name: &[u8; 11], tid: usize) {
     } else if base == b"NET     " {
         let _ = syscall::sys_grant_cap(tid,
             syscall::CAP_IOPORT | syscall::CAP_IRQ | syscall::CAP_PHYS_ALLOC | syscall::CAP_MAP_PHYS);
+    } else if base == b"SHELL   " {
+        let _ = syscall::sys_grant_cap(tid,
+            syscall::CAP_TASK_MGMT | syscall::CAP_PHYS_ALLOC | syscall::CAP_MAP_PHYS);
+    } else if base == b"CAT     " {
+        let _ = syscall::sys_grant_cap(tid, syscall::CAP_PHYS_ALLOC | syscall::CAP_MAP_PHYS);
     }
 }
 
@@ -796,6 +801,23 @@ fn load_from_vfs(vfs_tid: usize, console_tid: usize, input_tid: usize) -> Deferr
         }
     }
     let _ = vfs::close(vfs_tid, dir_handle);
+
+    // Reorder so SHELL is last (it blocks forever reading input)
+    let mut shell_idx: Option<usize> = None;
+    for i in 0..file_count {
+        if &file_entries[i].1[0..8] == b"SHELL   " {
+            shell_idx = Some(i);
+            break;
+        }
+    }
+    if let Some(si) = shell_idx {
+        // Move shell entry to the end by rotating
+        let saved = file_entries[si];
+        for j in si..file_count - 1 {
+            file_entries[j] = file_entries[j + 1];
+        }
+        file_entries[file_count - 1] = saved;
+    }
 
     println!("[init] Files in /usr/bin: {}", file_count);
 

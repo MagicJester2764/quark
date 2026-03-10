@@ -42,6 +42,18 @@ VFS_ELF := $(VFS_DIR)/target/$(TARGET)/release/vfs
 NET_DIR := user/net
 NET_ELF := $(NET_DIR)/target/$(TARGET)/release/net
 
+SHELL_DIR := user/shell
+SHELL_ELF := $(SHELL_DIR)/target/$(TARGET)/release/shell
+
+ECHO_DIR := user/echo
+ECHO_ELF := $(ECHO_DIR)/target/$(TARGET)/release/echo
+
+LS_DIR := user/ls
+LS_ELF := $(LS_DIR)/target/$(TARGET)/release/ls
+
+CAT_DIR := user/cat
+CAT_ELF := $(CAT_DIR)/target/$(TARGET)/release/cat
+
 .PHONY: all clean iso run run-uefi drivers user FORCE
 
 all: $(KERNEL) drivers user
@@ -60,7 +72,7 @@ $(FAT32_DRV_BIN): FORCE
 	cd $(FAT32_DRV_DIR) && cargo build --release
 	objcopy -O binary $(FAT32_DRV_ELF) $(FAT32_DRV_BIN)
 
-user: $(INIT_ELF) $(HELLO_ELF) $(NS_ELF) $(KBD_ELF) $(CON_ELF) $(INP_ELF) $(DISK_ELF) $(DISKTEST_ELF) $(VFS_ELF) $(NET_ELF)
+user: $(INIT_ELF) $(HELLO_ELF) $(NS_ELF) $(KBD_ELF) $(CON_ELF) $(INP_ELF) $(DISK_ELF) $(DISKTEST_ELF) $(VFS_ELF) $(NET_ELF) $(SHELL_ELF) $(ECHO_ELF) $(LS_ELF) $(CAT_ELF)
 
 $(INIT_ELF): FORCE
 	cd $(INIT_DIR) && cargo build --release
@@ -92,6 +104,18 @@ $(VFS_ELF): FORCE
 $(NET_ELF): FORCE
 	cd $(NET_DIR) && cargo build --release
 
+$(SHELL_ELF): FORCE
+	cd $(SHELL_DIR) && cargo build --release
+
+$(ECHO_ELF): FORCE
+	cd $(ECHO_DIR) && cargo build --release
+
+$(LS_ELF): FORCE
+	cd $(LS_DIR) && cargo build --release
+
+$(CAT_ELF): FORCE
+	cd $(CAT_DIR) && cargo build --release
+
 iso: $(KERNEL)
 	@mkdir -p isodir/boot/grub
 	@cp $(KERNEL) isodir/boot/kernel.bin
@@ -121,6 +145,10 @@ clean:
 	cd $(DISKTEST_DIR) && cargo clean
 	cd $(VFS_DIR) && cargo clean
 	cd $(NET_DIR) && cargo clean
+	cd $(SHELL_DIR) && cargo clean
+	cd $(ECHO_DIR) && cargo clean
+	cd $(LS_DIR) && cargo clean
+	cd $(CAT_DIR) && cargo clean
 	rm -rf $(KERNEL) $(VGA_DRV_BIN) $(FAT32_DRV_BIN) quark.iso isodir
 
 FORCE:
