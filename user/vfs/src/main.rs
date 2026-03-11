@@ -1,6 +1,7 @@
 #![no_std]
 #![no_main]
 #![allow(dead_code)]
+#![allow(static_mut_refs)]
 
 use libquark::ipc::{Message, TID_ANY};
 use libquark::{println, syscall};
@@ -40,6 +41,92 @@ const ERR_IS_DIR: u64 = 7;
 // Virtual addresses for temp mappings
 const DISK_IO_BUF: usize = 0x86_0000_0000;
 const CLIENT_BUF: usize = 0x87_0000_0000;
+const CACHE_BUF_BASE: usize = 0x8A_0000_0000;
+
+// ---------------------------------------------------------------------------
+// Sector cache
+// ---------------------------------------------------------------------------
+
+const CACHE_ENTRIES: usize = 16;
+
+struct CacheEntry {
+    valid: bool,
+    used: bool,
+    lba: u32,
+}
+
+struct SectorCache {
+    entries: [CacheEntry; CACHE_ENTRIES],
+    clock_hand: usize,
+}
+
+impl SectorCache {
+    const fn new() -> Self {
+        const EMPTY: CacheEntry = CacheEntry { valid: false, used: false, lba: 0 };
+        SectorCache {
+            entries: [EMPTY; CACHE_ENTRIES],
+            clock_hand: 0,
+        }
+    }
+
+    /// Look up a sector in the cache. Returns the slot index if found.
+    fn lookup(&mut self, lba: u32) -> Option<usize> {
+        for i in 0..CACHE_ENTRIES {
+            if self.entries[i].valid && self.entries[i].lba == lba {
+                self.entries[i].used = true;
+                return Some(i);
+            }
+        }
+        None
+    }
+
+    /// Find a victim slot using clock eviction and insert a new sector.
+    /// The caller must have already read the sector into DISK_IO_BUF.
+    /// Returns the slot index.
+    fn insert(&mut self, lba: u32) -> usize {
+        // First check for an invalid (empty) slot
+        for i in 0..CACHE_ENTRIES {
+            if !self.entries[i].valid {
+                self.fill_slot(i, lba);
+                return i;
+            }
+        }
+        // Clock eviction
+        loop {
+            let i = self.clock_hand;
+            self.clock_hand = (self.clock_hand + 1) % CACHE_ENTRIES;
+            if self.entries[i].used {
+                self.entries[i].used = false;
+            } else {
+                self.fill_slot(i, lba);
+                return i;
+            }
+        }
+    }
+
+    fn fill_slot(&mut self, idx: usize, lba: u32) {
+        // Copy from DISK_IO_BUF into cache slot
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                DISK_IO_BUF as *const u8,
+                (CACHE_BUF_BASE + idx * 512) as *mut u8,
+                512,
+            );
+        }
+        self.entries[idx] = CacheEntry { valid: true, used: true, lba };
+    }
+
+    /// Invalidate any cached copy of a given LBA.
+    fn invalidate(&mut self, lba: u32) {
+        for i in 0..CACHE_ENTRIES {
+            if self.entries[i].valid && self.entries[i].lba == lba {
+                self.entries[i].valid = false;
+            }
+        }
+    }
+}
+
+static mut SECTOR_CACHE: SectorCache = SectorCache::new();
 
 // ---------------------------------------------------------------------------
 // FAT32 structures
@@ -105,6 +192,20 @@ impl DiskState {
         Self::raw_read_sector(self.disk_tid, self.buf_phys, self.part_lba + lba)
     }
 
+    /// Read a sector through the cache. Returns a slice to cached data.
+    fn cached_read_sector(&self, lba: u32) -> Result<&[u8], ()> {
+        let abs_lba = self.part_lba + lba;
+        let cache = unsafe { &mut SECTOR_CACHE };
+        let idx = if let Some(i) = cache.lookup(abs_lba) {
+            i
+        } else {
+            // Cache miss — read from disk into DISK_IO_BUF, then insert into cache
+            Self::raw_read_sector(self.disk_tid, self.buf_phys, abs_lba)?;
+            cache.insert(abs_lba)
+        };
+        Ok(unsafe { core::slice::from_raw_parts((CACHE_BUF_BASE + idx * 512) as *const u8, 512) })
+    }
+
     fn sector_data(&self) -> &[u8] {
         unsafe { core::slice::from_raw_parts(DISK_IO_BUF as *const u8, 512) }
     }
@@ -114,10 +215,7 @@ impl DiskState {
         let sector_in_fat = fat_byte_off / 512;
         let offset_in_sector = fat_byte_off % 512;
         let lba = self.bpb.reserved_sectors + sector_in_fat as u32;
-        if self.read_sector(lba).is_err() {
-            return None;
-        }
-        let data = self.sector_data();
+        let data = self.cached_read_sector(lba).ok()?;
         let next = read_u32(data, offset_in_sector) & 0x0FFF_FFFF;
         if next >= 0x0FFF_FFF8 { None } else { Some(next) }
     }
@@ -170,11 +268,13 @@ impl DiskState {
 
         // Write back
         self.write_sector(lba).map_err(|_| ())?;
+        unsafe { SECTOR_CACHE.invalidate(self.part_lba + lba); }
 
         // Update second FAT copy if present (buffer still has modified sector)
         if self.bpb.num_fats > 1 {
             let lba2 = lba + self.bpb.fat_size_32;
             self.write_sector(lba2).map_err(|_| ())?;
+            unsafe { SECTOR_CACHE.invalidate(self.part_lba + lba2); }
         }
 
         Ok(())
@@ -191,10 +291,10 @@ impl DiskState {
             let offset_in_sector = fat_byte_off % 512;
             let lba = self.bpb.reserved_sectors + sector_in_fat as u32;
 
-            if self.read_sector(lba).is_err() {
-                continue;
-            }
-            let data = self.sector_data();
+            let data = match self.cached_read_sector(lba) {
+                Ok(d) => d,
+                Err(()) => continue,
+            };
             let val = read_u32(data, offset_in_sector) & 0x0FFF_FFFF;
             if val == 0 {
                 // Mark as EOF
@@ -221,6 +321,7 @@ impl DiskState {
         }
         for s in 0..self.bpb.sectors_per_cluster {
             self.write_sector(start_lba + s).map_err(|_| ())?;
+            unsafe { SECTOR_CACHE.invalidate(self.part_lba + start_lba + s); }
         }
         Ok(())
     }
@@ -487,11 +588,9 @@ fn find_entry(
     loop {
         let start_lba = disk.cluster_start_lba(cluster);
         for s in 0..spc {
-            if disk.read_sector(start_lba + s).is_err() {
-                return Err(ERR_IO);
-            }
+            let sec_data = disk.cached_read_sector(start_lba + s).map_err(|_| ERR_IO)?;
             let mut sec_buf = [0u8; 512];
-            sec_buf.copy_from_slice(disk.sector_data());
+            sec_buf.copy_from_slice(sec_data);
 
             for e in 0..16 {
                 let off = e * 32;
@@ -597,16 +696,14 @@ fn read_file_data(
         let offset_in_sector = offset_in_cluster % disk.bpb.bytes_per_sector;
 
         let lba = disk.cluster_start_lba(cluster) + sector_in_cluster;
-        if disk.read_sector(lba).is_err() {
-            return Err(ERR_IO);
-        }
+        let sec_data = disk.cached_read_sector(lba).map_err(|_| ERR_IO)?;
 
         let copy_start = offset_in_sector as usize;
         let copy_len = (512 - copy_start).min((to_read - written) as usize);
 
         unsafe {
             core::ptr::copy_nonoverlapping(
-                (DISK_IO_BUF + copy_start) as *const u8,
+                sec_data.as_ptr().add(copy_start),
                 (CLIENT_BUF + written as usize) as *mut u8,
                 copy_len,
             );
@@ -657,11 +754,9 @@ fn read_dir_entry(
     loop {
         let start_lba = disk.cluster_start_lba(cluster);
         for s in 0..spc {
-            if disk.read_sector(start_lba + s).is_err() {
-                return Err(ERR_IO);
-            }
+            let sec_data = disk.cached_read_sector(start_lba + s).map_err(|_| ERR_IO)?;
             let mut sec_buf = [0u8; 512];
-            sec_buf.copy_from_slice(disk.sector_data());
+            sec_buf.copy_from_slice(sec_data);
 
             for e in 0..16 {
                 let off = e * 32;
@@ -749,6 +844,7 @@ fn create_dir_entry(
         sec[58..60].copy_from_slice(&p_lo.to_le_bytes());
 
         disk.write_sector(start_lba).map_err(|_| ERR_IO)?;
+        unsafe { SECTOR_CACHE.invalidate(disk.part_lba + start_lba); }
     }
 
     // Find a free slot in the parent directory
@@ -758,11 +854,9 @@ fn create_dir_entry(
     loop {
         let start_lba = disk.cluster_start_lba(cluster);
         for s in 0..spc {
-            if disk.read_sector(start_lba + s).is_err() {
-                return Err(ERR_IO);
-            }
+            let sec_data = disk.cached_read_sector(start_lba + s).map_err(|_| ERR_IO)?;
             let mut sec_buf = [0u8; 512];
-            sec_buf.copy_from_slice(disk.sector_data());
+            sec_buf.copy_from_slice(sec_data);
 
             for e in 0..16 {
                 let off = e * 32;
@@ -795,6 +889,7 @@ fn create_dir_entry(
                     let data = disk.sector_data_mut();
                     data.copy_from_slice(&sec_buf);
                     disk.write_sector(start_lba + s).map_err(|_| ERR_IO)?;
+                    unsafe { SECTOR_CACHE.invalidate(disk.part_lba + start_lba + s); }
 
                     return Ok(new_cluster);
                 }
@@ -826,11 +921,9 @@ fn update_dir_entry_size(
     loop {
         let start_lba = disk.cluster_start_lba(cluster);
         for s in 0..spc {
-            if disk.read_sector(start_lba + s).is_err() {
-                return Err(ERR_IO);
-            }
+            let sec_data = disk.cached_read_sector(start_lba + s).map_err(|_| ERR_IO)?;
             let mut sec_buf = [0u8; 512];
-            sec_buf.copy_from_slice(disk.sector_data());
+            sec_buf.copy_from_slice(sec_data);
 
             for e in 0..16 {
                 let off = e * 32;
@@ -850,6 +943,7 @@ fn update_dir_entry_size(
                     let data = disk.sector_data_mut();
                     data.copy_from_slice(&sec_buf);
                     disk.write_sector(start_lba + s).map_err(|_| ERR_IO)?;
+                    unsafe { SECTOR_CACHE.invalidate(disk.part_lba + start_lba + s); }
                     return Ok(());
                 }
             }
@@ -940,6 +1034,7 @@ fn write_file_data(
 
         // Write sector back to disk
         disk.write_sector(lba).map_err(|_| ERR_IO)?;
+        unsafe { SECTOR_CACHE.invalidate(disk.part_lba + lba); }
 
         written += copy_len as u32;
 
@@ -1081,6 +1176,19 @@ pub extern "C" fn _start() -> ! {
     };
     if syscall::sys_map_phys(buf_phys, DISK_IO_BUF, 1).is_err() {
         println!("[vfs] Failed to map I/O buffer.");
+        syscall::sys_exit();
+    }
+
+    // Allocate sector cache buffer (2 pages = 8 KiB for 16 x 512-byte entries)
+    let cache_phys = match syscall::sys_phys_alloc(2) {
+        Ok(p) => p,
+        Err(()) => {
+            println!("[vfs] Failed to alloc cache pages.");
+            syscall::sys_exit();
+        }
+    };
+    if syscall::sys_map_phys(cache_phys, CACHE_BUF_BASE, 2).is_err() {
+        println!("[vfs] Failed to map cache buffer.");
         syscall::sys_exit();
     }
 
