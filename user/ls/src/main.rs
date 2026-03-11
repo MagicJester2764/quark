@@ -81,7 +81,7 @@ pub extern "C" fn _start() -> ! {
     };
 
     // Open directory
-    let (handle, _, is_dir) = match vfs::open(vfs_tid, path) {
+    let (handle, file_size, is_dir) = match vfs::open(vfs_tid, path) {
         Ok(h) => h,
         Err(e) => {
             if let Ok(s) = core::str::from_utf8(path) {
@@ -92,8 +92,14 @@ pub extern "C" fn _start() -> ! {
     };
 
     if !is_dir {
-        if let Ok(s) = core::str::from_utf8(path) {
-            println!("ls: '{}' is not a directory", s);
+        // Print file info like a single directory entry
+        let name = if let Some(pos) = path.iter().rposition(|&b| b == b'/') {
+            &path[pos + 1..]
+        } else {
+            path
+        };
+        if let Ok(s) = core::str::from_utf8(name) {
+            println!("{}  {}", s, file_size);
         }
         let _ = vfs::close(vfs_tid, handle);
         syscall::sys_exit();
