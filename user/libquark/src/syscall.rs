@@ -42,6 +42,11 @@ pub const SYS_FUTEX_WAKE: u64 = 61;
 
 pub const SYS_MMAP: u64 = 70;
 
+pub const SYS_GET_UID: u64 = 100;
+pub const SYS_SET_UID: u64 = 101;
+pub const SYS_SET_GID: u64 = 102;
+pub const SYS_GET_TUID: u64 = 103;
+
 pub const SYS_RECV_TIMEOUT: u64 = 80;
 pub const SYS_TICKS: u64 = 81;
 pub const SYS_SET_PAGER: u64 = 82;
@@ -197,6 +202,31 @@ pub fn sys_console_pos() -> (usize, usize) {
 
 pub fn sys_getpid() -> u64 {
     unsafe { syscall0(SYS_GETPID) }
+}
+
+pub fn sys_get_uid() -> (u32, u32) {
+    let ret = unsafe { syscall0(SYS_GET_UID) };
+    let uid = (ret >> 32) as u32;
+    let gid = (ret & 0xFFFF_FFFF) as u32;
+    (uid, gid)
+}
+
+pub fn sys_set_uid(tid: usize, uid: u32) -> Result<(), ()> {
+    let ret = unsafe { syscall2(SYS_SET_UID, tid as u64, uid as u64) };
+    if ret == 0 { Ok(()) } else { Err(()) }
+}
+
+pub fn sys_set_gid(tid: usize, gid: u32) -> Result<(), ()> {
+    let ret = unsafe { syscall2(SYS_SET_GID, tid as u64, gid as u64) };
+    if ret == 0 { Ok(()) } else { Err(()) }
+}
+
+pub fn sys_get_tuid(tid: usize) -> Result<(u32, u32), ()> {
+    let ret = unsafe { syscall1(SYS_GET_TUID, tid as u64) };
+    if ret == u64::MAX { return Err(()); }
+    let uid = (ret >> 32) as u32;
+    let gid = (ret & 0xFFFF_FFFF) as u32;
+    Ok((uid, gid))
 }
 
 pub fn sys_send(dest: usize, msg: &crate::ipc::Message) -> Result<(), ()> {
@@ -490,3 +520,4 @@ pub const CAP_MAP_PHYS: u32 = 1 << 1;
 pub const CAP_IRQ: u32 = 1 << 2;
 pub const CAP_TASK_MGMT: u32 = 1 << 3;
 pub const CAP_PHYS_ALLOC: u32 = 1 << 4;
+pub const CAP_SET_UID: u32 = 1 << 5;

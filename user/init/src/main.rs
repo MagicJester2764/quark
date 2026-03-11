@@ -472,6 +472,9 @@ fn grant_caps_by_name(name: &[u8; 11], tid: usize) {
     } else if base == b"SHELL   " {
         let _ = syscall::sys_grant_cap(tid,
             syscall::CAP_TASK_MGMT | syscall::CAP_PHYS_ALLOC | syscall::CAP_MAP_PHYS);
+    } else if base == b"LOGIN   " {
+        let _ = syscall::sys_grant_cap(tid,
+            syscall::CAP_TASK_MGMT | syscall::CAP_PHYS_ALLOC | syscall::CAP_MAP_PHYS | syscall::CAP_SET_UID);
     }
 }
 
@@ -780,16 +783,20 @@ fn load_from_vfs(vfs_tid: usize, console_pipe: usize, input_tid: usize) -> Defer
         }
     };
 
-    // Find SHELL.ELF in /usr/bin
+    // Find LOGIN.ELF (or SHELL.ELF as fallback) in /usr/bin
+    let mut login_name: Option<[u8; 11]> = None;
     let mut shell_name: Option<[u8; 11]> = None;
     let mut index = 0u32;
 
     loop {
         match vfs::readdir(vfs_tid, dir_handle, index) {
             Ok(Some(entry)) => {
+                if &entry.name[0..8] == b"LOGIN   " && &entry.name[8..11] == b"ELF" && !entry.is_dir {
+                    login_name = Some(entry.name);
+                    break;
+                }
                 if &entry.name[0..8] == b"SHELL   " && &entry.name[8..11] == b"ELF" && !entry.is_dir {
                     shell_name = Some(entry.name);
-                    break;
                 }
                 index += 1;
             }
@@ -799,17 +806,21 @@ fn load_from_vfs(vfs_tid: usize, console_pipe: usize, input_tid: usize) -> Defer
     }
     let _ = vfs::close(vfs_tid, dir_handle);
 
-    let name = match shell_name {
+    let name = match login_name.or(shell_name) {
         Some(n) => n,
         None => {
-            println!("[init] SHELL.ELF not found in /usr/bin");
+            println!("[init] LOGIN.ELF/SHELL.ELF not found in /usr/bin");
             return deferred;
         }
     };
 
     let mut namebuf = [0u8; 16];
     let namelen = fat_name_to_buf(&name, &mut namebuf);
-    println!("[init] Loading SHELL.ELF from VFS");
+    if login_name.is_some() {
+        println!("[init] Loading LOGIN.ELF from VFS");
+    } else {
+        println!("[init] Loading SHELL.ELF from VFS (login not found)");
+    }
 
     // Build path: "/usr/bin/SHELL.ELF"
     let mut path = [0u8; 48];

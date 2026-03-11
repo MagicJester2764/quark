@@ -48,6 +48,11 @@ pub const SYS_FD_DUP: u64 = 55;
 pub const SYS_FUTEX_WAIT: u64 = 60;
 pub const SYS_FUTEX_WAKE: u64 = 61;
 
+pub const SYS_GET_UID: u64 = 100;
+pub const SYS_SET_UID: u64 = 101;
+pub const SYS_SET_GID: u64 = 102;
+pub const SYS_GET_TUID: u64 = 103;
+
 pub const SYS_MMAP: u64 = 70;
 
 pub const SYS_RECV_TIMEOUT: u64 = 80;
@@ -758,6 +763,40 @@ extern "C" fn syscall_dispatch(
             let pager_tid = arg1 as usize;
             match scheduler::set_pager(tid, pager_tid) {
                 Ok(()) => 0,
+                Err(()) => u64::MAX,
+            }
+        }
+        SYS_GET_UID => {
+            let uid = scheduler::current_task_uid();
+            let gid = scheduler::current_task_gid();
+            ((uid as u64) << 32) | (gid as u64)
+        }
+        SYS_SET_UID => {
+            if !scheduler::current_task_has_cap(crate::task::CAP_SET_UID) {
+                return u64::MAX;
+            }
+            let tid = arg0 as usize;
+            let uid = arg1 as u32;
+            match scheduler::set_task_uid(tid, uid) {
+                Ok(()) => 0,
+                Err(()) => u64::MAX,
+            }
+        }
+        SYS_SET_GID => {
+            if !scheduler::current_task_has_cap(crate::task::CAP_SET_UID) {
+                return u64::MAX;
+            }
+            let tid = arg0 as usize;
+            let gid = arg1 as u32;
+            match scheduler::set_task_gid(tid, gid) {
+                Ok(()) => 0,
+                Err(()) => u64::MAX,
+            }
+        }
+        SYS_GET_TUID => {
+            let tid = arg0 as usize;
+            match scheduler::task_uid_gid(tid) {
+                Ok((uid, gid)) => ((uid as u64) << 32) | (gid as u64),
                 Err(()) => u64::MAX,
             }
         }

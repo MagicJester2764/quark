@@ -49,6 +49,8 @@ pub fn init() {
             parent_tid: 0,
             mem_pages: 0,
             mem_limit: 0,
+            uid: 0,
+            gid: 0,
         });
     }
     CURRENT_TID.store(0, Ordering::SeqCst);
@@ -381,6 +383,61 @@ pub fn current_task_has_cap(cap: u32) -> bool {
     }
 }
 
+/// Get the current task's UID.
+pub fn current_task_uid() -> u32 {
+    let tid = current_tid();
+    unsafe {
+        match TASKS[tid].as_ref() {
+            Some(task) => task.uid,
+            None => 0,
+        }
+    }
+}
+
+/// Get the current task's GID.
+pub fn current_task_gid() -> u32 {
+    let tid = current_tid();
+    unsafe {
+        match TASKS[tid].as_ref() {
+            Some(task) => task.gid,
+            None => 0,
+        }
+    }
+}
+
+/// Get a task's UID and GID by TID.
+pub fn task_uid_gid(tid: usize) -> Result<(u32, u32), ()> {
+    if tid >= MAX_TASKS { return Err(()); }
+    unsafe {
+        match TASKS[tid].as_ref() {
+            Some(task) => Ok((task.uid, task.gid)),
+            None => Err(()),
+        }
+    }
+}
+
+/// Set a task's UID.
+pub fn set_task_uid(tid: usize, uid: u32) -> Result<(), ()> {
+    if tid >= MAX_TASKS { return Err(()); }
+    unsafe {
+        match TASKS[tid].as_mut() {
+            Some(task) => { task.uid = uid; Ok(()) }
+            None => Err(()),
+        }
+    }
+}
+
+/// Set a task's GID.
+pub fn set_task_gid(tid: usize, gid: u32) -> Result<(), ()> {
+    if tid >= MAX_TASKS { return Err(()); }
+    unsafe {
+        match TASKS[tid].as_mut() {
+            Some(task) => { task.gid = gid; Ok(()) }
+            None => Err(()),
+        }
+    }
+}
+
 /// Create an empty task slot (Blocked, cr3=0, caps=0). Returns TID.
 pub fn create_empty_task() -> Option<usize> {
     let tid = NEXT_TID.fetch_add(1, Ordering::SeqCst);
@@ -396,6 +453,12 @@ pub fn create_empty_task() -> Option<usize> {
     }
 
     let parent = current_tid();
+    let (parent_uid, parent_gid) = unsafe {
+        match TASKS[parent].as_ref() {
+            Some(t) => (t.uid, t.gid),
+            None => (0, 0),
+        }
+    };
     unsafe {
         TASKS[tid] = Some(Task {
             tid,
@@ -411,6 +474,8 @@ pub fn create_empty_task() -> Option<usize> {
             parent_tid: parent,
             mem_pages: 0,
             mem_limit: 0,
+            uid: parent_uid,
+            gid: parent_gid,
         });
     }
 

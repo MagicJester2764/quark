@@ -2,7 +2,7 @@
 #![no_main]
 
 use libquark::ipc::Message;
-use libquark::{print, println, syscall, vfs};
+use libquark::{args, print, println, syscall, vfs};
 use libquark::stdio::read_line;
 
 const PAGE_SIZE: usize = 4096;
@@ -415,13 +415,27 @@ fn cmd_exec(
 
 static mut CWD: [u8; 64] = [0; 64];
 static mut CWD_LEN: usize = 0;
+static mut HOME: [u8; 64] = [0; 64];
+static mut HOME_LEN: usize = 0;
 
 fn cwd_init() {
+    // argv[1] = home directory (set by login), fallback to /home/root
+    let home = if let Some(h) = args::argv(1) {
+        if !h.is_empty() && h[0] == b'/' { h } else { b"/home/root" as &[u8] }
+    } else {
+        b"/home/root" as &[u8]
+    };
     unsafe {
-        let home = b"/home/root";
-        CWD[..home.len()].copy_from_slice(home);
-        CWD_LEN = home.len();
+        let len = home.len().min(64);
+        HOME[..len].copy_from_slice(&home[..len]);
+        HOME_LEN = len;
+        CWD[..len].copy_from_slice(&home[..len]);
+        CWD_LEN = len;
     }
+}
+
+fn home_get() -> &'static [u8] {
+    unsafe { &HOME[..HOME_LEN] }
 }
 
 fn cwd_get() -> &'static [u8] {
@@ -505,8 +519,7 @@ fn resolve_components(components: &[u8], out: &mut [u8; 128], start: usize) -> u
 fn cmd_cd(args_str: &[u8], vfs_tid: usize) {
     let arg = args_str.trim_ascii();
     if arg.is_empty() {
-        // cd with no args goes to /
-        cwd_set(b"/");
+        cwd_set(home_get());
         return;
     }
 

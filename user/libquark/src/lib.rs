@@ -9,6 +9,7 @@ pub mod stdio;
 pub mod sync;
 pub mod syscall;
 pub mod net;
+pub mod passwd;
 pub mod vfs;
 
 pub mod allocator;

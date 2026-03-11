@@ -35,7 +35,8 @@ pub const CAP_MAP_PHYS: u32 = 1 << 1;
 pub const CAP_IRQ: u32 = 1 << 2;
 pub const CAP_TASK_MGMT: u32 = 1 << 3;
 pub const CAP_PHYS_ALLOC: u32 = 1 << 4;
-pub const CAP_ALL: u32 = CAP_IOPORT | CAP_MAP_PHYS | CAP_IRQ | CAP_TASK_MGMT | CAP_PHYS_ALLOC;
+pub const CAP_SET_UID: u32 = 1 << 5;
+pub const CAP_ALL: u32 = CAP_IOPORT | CAP_MAP_PHYS | CAP_IRQ | CAP_TASK_MGMT | CAP_PHYS_ALLOC | CAP_SET_UID;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TaskState {
@@ -65,6 +66,10 @@ pub struct Task {
     pub mem_pages: usize,
     /// Maximum pages this task may allocate. 0 = unlimited.
     pub mem_limit: usize,
+    /// User ID. 0 = root.
+    pub uid: u32,
+    /// Group ID. 0 = root.
+    pub gid: u32,
 }
 
 unsafe impl Send for Task {}
@@ -123,6 +128,8 @@ impl Task {
             parent_tid: 0,
             mem_pages: 0,
             mem_limit: 0,
+            uid: 0,
+            gid: 0,
         }
     }
 
