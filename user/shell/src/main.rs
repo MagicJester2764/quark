@@ -418,8 +418,9 @@ static mut CWD_LEN: usize = 0;
 
 fn cwd_init() {
     unsafe {
-        CWD[0] = b'/';
-        CWD_LEN = 1;
+        let home = b"/home/root";
+        CWD[..home.len()].copy_from_slice(home);
+        CWD_LEN = home.len();
     }
 }
 
