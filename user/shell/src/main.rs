@@ -720,8 +720,12 @@ fn resolve_args<'a>(cmd: &[u8], args_str: &[u8], buf: &'a mut [u8; 256]) -> &'a 
         }
         let token = &bytes[tok_start..i];
 
-        // Resolve relative paths (anything not starting with / or -)
-        if !token.is_empty() && token[0] != b'/' && token[0] != b'-' {
+        // Resolve tokens that look like paths or are bare names for file commands
+        let is_file_cmd = eq_ignore_case(cmd, b"cat") || eq_ignore_case(cmd, b"ls");
+        let looks_like_path = !token.is_empty() && token[0] != b'-'
+            && (token[0] == b'.' || token.iter().any(|&b| b == b'/')
+                || is_file_cmd);
+        if looks_like_path {
             let mut resolved = [0u8; 128];
             let len = resolve_path(token, &mut resolved);
             let copy_len = len.min(256 - out_pos);
