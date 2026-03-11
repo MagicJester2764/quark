@@ -44,6 +44,7 @@ pub const SYS_FD_SET: u64 = 52;
 pub const SYS_PIPE_CREATE: u64 = 53;
 pub const SYS_PIPE_FD_SET: u64 = 54;
 pub const SYS_FD_DUP: u64 = 55;
+pub const SYS_FD_READ_NB: u64 = 56;
 
 pub const SYS_FUTEX_WAIT: u64 = 60;
 pub const SYS_FUTEX_WAKE: u64 = 61;
@@ -549,6 +550,21 @@ extern "C" fn syscall_dispatch(
                 }
                 crate::task::FdKind::PipeWrite(_) => u64::MAX,
                 crate::task::FdKind::Empty => u64::MAX,
+            }
+        }
+        SYS_FD_READ_NB => {
+            // Non-blocking fd read. Only supports pipe fds.
+            let fd = arg0 as usize;
+            let ptr = arg1 as *mut u8;
+            let max_len = arg2 as usize;
+            if max_len > 0 && !ptr.is_null() && !validate_user_ptr(arg1, arg2) {
+                return u64::MAX;
+            }
+            match scheduler::current_fd(fd) {
+                crate::task::FdKind::PipeRead(handle) => {
+                    crate::pipe::read_nonblock(handle, ptr, max_len)
+                }
+                _ => u64::MAX,
             }
         }
         SYS_FD_SET => {

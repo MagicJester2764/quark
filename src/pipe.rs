@@ -128,6 +128,47 @@ pub fn read(handle: usize, buf: *mut u8, max_len: usize) -> u64 {
     }
 }
 
+/// Non-blocking pipe read. Returns bytes read, 0 if empty (with writers), u64::MAX on error.
+/// Returns 0 with a special marker: if no writers remain, returns 0 (EOF).
+/// To distinguish empty-with-writers from EOF, we use a convention:
+/// 0 = EOF (no writers), 0xFFFF_FFFE = would block (empty but writers exist).
+pub fn read_nonblock(handle: usize, buf: *mut u8, max_len: usize) -> u64 {
+    unsafe {
+        if handle >= MAX_PIPES || !PIPES[handle].in_use {
+            return u64::MAX;
+        }
+
+        let pipe = &mut PIPES[handle];
+
+        if pipe.len > 0 {
+            let to_copy = pipe.len.min(max_len);
+            for i in 0..to_copy {
+                let pos = (pipe.read_pos + i) % PIPE_BUF_SIZE;
+                buf.add(i).write(pipe.buf[pos]);
+            }
+            pipe.read_pos = (pipe.read_pos + to_copy) % PIPE_BUF_SIZE;
+            pipe.len -= to_copy;
+
+            if pipe.write_waiter_count > 0 {
+                let tid = pipe.write_waiters[0];
+                pipe.write_waiter_count -= 1;
+                for j in 0..pipe.write_waiter_count {
+                    pipe.write_waiters[j] = pipe.write_waiters[j + 1];
+                }
+                scheduler::unblock_task(tid);
+            }
+
+            return to_copy as u64;
+        }
+
+        if pipe.writers == 0 {
+            return 0; // EOF
+        }
+
+        0xFFFF_FFFE // would block
+    }
+}
+
 /// Write to a pipe. Blocks if full and readers exist. Returns bytes written.
 pub fn write(handle: usize, buf: *const u8, len: usize) -> u64 {
     unsafe {

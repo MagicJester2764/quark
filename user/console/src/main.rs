@@ -39,6 +39,11 @@ static mut ESC_PARAM_COUNT: usize = 0;
 // Foreground color (set via SGR escape codes)
 static mut FG_COLOR: u32 = 0;
 
+// Cursor blink state
+static mut CURSOR_VISIBLE: bool = true;
+static mut CURSOR_LAST_TOGGLE: u64 = 0;
+const CURSOR_BLINK_TICKS: u64 = 50; // 500ms at 100 Hz
+
 // Text cell buffer — avoids expensive framebuffer reads during scroll
 const MAX_CELL_COLS: usize = 320;
 const MAX_CELL_ROWS: usize = 200;
@@ -85,14 +90,35 @@ pub extern "C" fn _start() -> ! {
 
     println!("[console] Ready.");
 
-    // Main loop: read from pipe (fd 0) and render
+    unsafe { CURSOR_LAST_TOGGLE = syscall::sys_ticks(); }
+
+    // Main loop: non-blocking read from pipe, blink cursor on idle
     loop {
         let mut buf = [0u8; 256];
-        let n = syscall::sys_fd_read(0, &mut buf);
-        if n == 0 || n == u64::MAX {
-            break; // EOF or error
+        let n = syscall::sys_fd_read_nb(0, &mut buf);
+        if n == 0 {
+            break; // EOF
+        } else if n == syscall::WOULD_BLOCK || n == u64::MAX {
+            // No data — check cursor blink
+            let now = syscall::sys_ticks();
+            unsafe {
+                if now.wrapping_sub(CURSOR_LAST_TOGGLE) >= CURSOR_BLINK_TICKS {
+                    CURSOR_VISIBLE = !CURSOR_VISIBLE;
+                    CURSOR_LAST_TOGGLE = now;
+                    draw_cursor();
+                }
+            }
+            syscall::sys_yield();
+        } else {
+            // Got data — hide cursor, write, show cursor
+            unsafe { hide_cursor(); }
+            write_bytes(&buf[..n as usize]);
+            unsafe {
+                CURSOR_VISIBLE = true;
+                CURSOR_LAST_TOGGLE = syscall::sys_ticks();
+                draw_cursor();
+            }
         }
-        write_bytes(&buf[..n as usize]);
     }
 
     syscall::sys_exit();
@@ -366,6 +392,52 @@ fn flush_dirty() {
         }
         DIRTY_MIN = usize::MAX;
         DIRTY_MAX = 0;
+    }
+}
+
+/// Draw cursor block at current position.
+unsafe fn draw_cursor() {
+    if !INITIALIZED { return; }
+    if CURSOR_VISIBLE {
+        // Draw a solid block at (COL, ROW) using FG_COLOR
+        draw_cursor_block(FG_COLOR);
+    } else {
+        // Restore the cell content at cursor position
+        hide_cursor();
+    }
+}
+
+/// Erase cursor by redrawing the cell content at cursor position.
+unsafe fn hide_cursor() {
+    if !INITIALIZED { return; }
+    if COL < COLS && ROW < ROWS {
+        let idx = cell_idx(COL, ROW);
+        draw_glyph(COL, ROW, CELL_CH[idx], CELL_FG[idx]);
+    }
+}
+
+/// Draw a solid underline cursor (bottom 2 rows of the glyph cell).
+unsafe fn draw_cursor_block(color: u32) {
+    if COL >= COLS || ROW >= ROWS { return; }
+    let pixel_x = COL * GLYPH_W;
+    let pixel_y = ROW * GLYPH_H;
+    let bytes_per_pixel = BPP / 8;
+
+    // Draw bottom 2 pixel rows as a solid underline
+    for gy in (GLYPH_H - 2)..GLYPH_H {
+        let y = pixel_y + gy;
+        let row_base = FB + y * PITCH + pixel_x * bytes_per_pixel;
+        for gx in 0..GLYPH_W {
+            let px = row_base + gx * bytes_per_pixel;
+            if bytes_per_pixel == 4 {
+                (px as *mut u32).write_volatile(color);
+            } else if bytes_per_pixel == 3 {
+                let ptr = px as *mut u8;
+                ptr.write_volatile(color as u8);
+                ptr.add(1).write_volatile((color >> 8) as u8);
+                ptr.add(2).write_volatile((color >> 16) as u8);
+            }
+        }
     }
 }
 

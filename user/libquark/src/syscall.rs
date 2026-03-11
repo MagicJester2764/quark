@@ -36,6 +36,7 @@ pub const SYS_FD_SET: u64 = 52;
 pub const SYS_PIPE_CREATE: u64 = 53;
 pub const SYS_PIPE_FD_SET: u64 = 54;
 pub const SYS_FD_DUP: u64 = 55;
+pub const SYS_FD_READ_NB: u64 = 56;
 
 pub const SYS_FUTEX_WAIT: u64 = 60;
 pub const SYS_FUTEX_WAKE: u64 = 61;
@@ -384,6 +385,14 @@ pub fn sys_fd_write(fd: usize, buf: &[u8]) -> u64 {
 pub fn sys_fd_read(fd: usize, buf: &mut [u8]) -> u64 {
     unsafe { syscall3(SYS_FD_READ, fd as u64, buf.as_mut_ptr() as u64, buf.len() as u64) }
 }
+
+/// Non-blocking read from a pipe fd.
+/// Returns bytes read, 0 for EOF, 0xFFFF_FFFE if would block, u64::MAX on error.
+pub fn sys_fd_read_nb(fd: usize, buf: &mut [u8]) -> u64 {
+    unsafe { syscall3(SYS_FD_READ_NB, fd as u64, buf.as_mut_ptr() as u64, buf.len() as u64) }
+}
+
+pub const WOULD_BLOCK: u64 = 0xFFFF_FFFE;
 
 pub fn sys_fd_set(tid: usize, fd: usize, service_tid: usize, tag: u64) -> Result<(), ()> {
     let ret = unsafe { syscall4(SYS_FD_SET, tid as u64, fd as u64, service_tid as u64, tag) };
