@@ -453,7 +453,8 @@ fn cwd_set(path: &[u8]) {
 /// Resolve a path relative to cwd. Handles `.`, `..`, absolute paths.
 /// Returns the resolved path length written into `out`.
 fn resolve_path(arg: &[u8], out: &mut [u8; 128]) -> usize {
-    if arg.first() == Some(&b'/') {
+    let trailing_slash = arg.len() > 1 && arg[arg.len() - 1] == b'/';
+    let mut pos = if arg.first() == Some(&b'/') {
         // Absolute path — start fresh
         out[0] = b'/';
         resolve_components(&arg[1..], out, 1)
@@ -461,14 +462,20 @@ fn resolve_path(arg: &[u8], out: &mut [u8; 128]) -> usize {
         // Relative path — start from cwd
         let cwd = cwd_get();
         out[..cwd.len()].copy_from_slice(cwd);
-        let mut pos = cwd.len();
+        let mut p = cwd.len();
         // Ensure trailing slash for joining
-        if pos > 0 && out[pos - 1] != b'/' && pos < 128 {
-            out[pos] = b'/';
-            pos += 1;
+        if p > 0 && out[p - 1] != b'/' && p < 128 {
+            out[p] = b'/';
+            p += 1;
         }
-        resolve_components(arg, out, pos)
+        resolve_components(arg, out, p)
+    };
+    // Preserve trailing slash from original arg
+    if trailing_slash && pos > 1 && pos < 128 && out[pos - 1] != b'/' {
+        out[pos] = b'/';
+        pos += 1;
     }
+    pos
 }
 
 fn resolve_components(components: &[u8], out: &mut [u8; 128], start: usize) -> usize {

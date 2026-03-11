@@ -1324,8 +1324,15 @@ fn handle_open(disk: &DiskState, sender: usize, msg: &Message) {
         return;
     }
 
+    // Trailing slash means the caller expects a directory
+    let trailing_slash = path.len() > 1 && path[path.len() - 1] == b'/';
+
     match resolve_path(disk, path) {
         Ok((cluster, size, is_dir, dir_cluster, fat_name)) => {
+            if trailing_slash && !is_dir {
+                error_reply(sender, ERR_NOT_DIR);
+                return;
+            }
             match alloc_handle(sender, cluster, size, is_dir, dir_cluster, &fat_name) {
                 Some(handle) => {
                     let reply = Message {
