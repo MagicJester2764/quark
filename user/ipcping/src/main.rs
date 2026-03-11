@@ -111,7 +111,7 @@ pub extern "C" fn _start() -> ! {
     let service_name = if let Some(arg) = args::argv(1) {
         arg
     } else {
-        b"nameserver" as &[u8]
+        b"vfs" as &[u8]
     };
 
     let count = if let Some(arg) = args::argv(2) {
