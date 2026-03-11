@@ -17,6 +17,7 @@ const TAG_NS_LOOKUP: u64 = 2;
 const TAG_READ_SECTOR: u64 = 1;
 const TAG_WRITE_SECTOR: u64 = 2;
 const TAG_DISK_OK: u64 = 0;
+const TAG_READ_SECTORS: u64 = 4;
 
 // VFS IPC tags
 const TAG_OPEN: u64 = 1;
@@ -81,13 +82,13 @@ impl SectorCache {
     }
 
     /// Find a victim slot using clock eviction and insert a new sector.
-    /// The caller must have already read the sector into DISK_IO_BUF.
+    /// `src` is the memory address containing the 512-byte sector data.
     /// Returns the slot index.
-    fn insert(&mut self, lba: u32) -> usize {
+    fn insert(&mut self, lba: u32, src: usize) -> usize {
         // First check for an invalid (empty) slot
         for i in 0..CACHE_ENTRIES {
             if !self.entries[i].valid {
-                self.fill_slot(i, lba);
+                self.fill_slot(i, lba, src);
                 return i;
             }
         }
@@ -98,17 +99,17 @@ impl SectorCache {
             if self.entries[i].used {
                 self.entries[i].used = false;
             } else {
-                self.fill_slot(i, lba);
+                self.fill_slot(i, lba, src);
                 return i;
             }
         }
     }
 
-    fn fill_slot(&mut self, idx: usize, lba: u32) {
-        // Copy from DISK_IO_BUF into cache slot
+    fn fill_slot(&mut self, idx: usize, lba: u32, src: usize) {
+        // Copy from source address into cache slot
         unsafe {
             core::ptr::copy_nonoverlapping(
-                DISK_IO_BUF as *const u8,
+                src as *const u8,
                 (CACHE_BUF_BASE + idx * 512) as *mut u8,
                 512,
             );
@@ -201,9 +202,59 @@ impl DiskState {
         } else {
             // Cache miss — read from disk into DISK_IO_BUF, then insert into cache
             Self::raw_read_sector(self.disk_tid, self.buf_phys, abs_lba)?;
-            cache.insert(abs_lba)
+            cache.insert(abs_lba, DISK_IO_BUF)
         };
         Ok(unsafe { core::slice::from_raw_parts((CACHE_BUF_BASE + idx * 512) as *const u8, 512) })
+    }
+
+    /// Read multiple consecutive sectors into DISK_IO_BUF (up to 8, fitting one 4K page).
+    fn raw_read_sectors(disk_tid: usize, buf_phys: usize, start_lba: u32, count: u32) -> Result<(), ()> {
+        let msg = Message {
+            sender: 0,
+            tag: TAG_READ_SECTORS,
+            data: [start_lba as u64, buf_phys as u64, count as u64, 0, 0, 0],
+        };
+        let mut reply = Message::empty();
+        if syscall::sys_call(disk_tid, &msg, &mut reply).is_err() {
+            return Err(());
+        }
+        if reply.tag != TAG_DISK_OK {
+            return Err(());
+        }
+        Ok(())
+    }
+
+    /// Prefetch consecutive sectors into the cache using a single multi-sector IPC call.
+    fn prefetch_sectors(&self, start_lba: u32, count: u32) {
+        let count = count.min(8) as usize;
+        let cache = unsafe { &mut SECTOR_CACHE };
+
+        // Check how many sectors are already cached
+        let mut all_cached = true;
+        for i in 0..count {
+            let abs_lba = self.part_lba + start_lba + i as u32;
+            if cache.lookup(abs_lba).is_none() {
+                all_cached = false;
+                break;
+            }
+        }
+        if all_cached {
+            return;
+        }
+
+        // Read all sectors in one IPC call
+        let abs_start = self.part_lba + start_lba;
+        if Self::raw_read_sectors(self.disk_tid, self.buf_phys, abs_start, count as u32).is_err() {
+            return;
+        }
+
+        // Insert each sector into the cache
+        for i in 0..count {
+            let abs_lba = abs_start + i as u32;
+            if cache.lookup(abs_lba).is_none() {
+                cache.insert(abs_lba, DISK_IO_BUF + i * 512);
+            }
+        }
     }
 
     fn sector_data(&self) -> &[u8] {
@@ -587,6 +638,7 @@ fn find_entry(
 
     loop {
         let start_lba = disk.cluster_start_lba(cluster);
+        disk.prefetch_sectors(start_lba, spc);
         for s in 0..spc {
             let sec_data = disk.cached_read_sector(start_lba + s).map_err(|_| ERR_IO)?;
             let mut sec_buf = [0u8; 512];
@@ -688,6 +740,10 @@ fn read_file_data(
     file.cur_cluster = cluster;
     file.cur_cluster_offset = byte_pos;
 
+    // Prefetch all sectors in the current cluster
+    let cluster_lba = disk.cluster_start_lba(cluster);
+    disk.prefetch_sectors(cluster_lba, disk.bpb.sectors_per_cluster);
+
     let mut written = 0u32;
 
     while written < to_read {
@@ -720,6 +776,9 @@ fn read_file_data(
                     byte_pos += cluster_bytes;
                     file.cur_cluster = cluster;
                     file.cur_cluster_offset = byte_pos;
+                    // Prefetch next cluster's sectors
+                    let next_lba = disk.cluster_start_lba(cluster);
+                    disk.prefetch_sectors(next_lba, disk.bpb.sectors_per_cluster);
                 }
                 None => break,
             }
@@ -753,6 +812,7 @@ fn read_dir_entry(
 
     loop {
         let start_lba = disk.cluster_start_lba(cluster);
+        disk.prefetch_sectors(start_lba, spc);
         for s in 0..spc {
             let sec_data = disk.cached_read_sector(start_lba + s).map_err(|_| ERR_IO)?;
             let mut sec_buf = [0u8; 512];
@@ -853,6 +913,7 @@ fn create_dir_entry(
 
     loop {
         let start_lba = disk.cluster_start_lba(cluster);
+        disk.prefetch_sectors(start_lba, spc);
         for s in 0..spc {
             let sec_data = disk.cached_read_sector(start_lba + s).map_err(|_| ERR_IO)?;
             let mut sec_buf = [0u8; 512];
@@ -920,6 +981,7 @@ fn update_dir_entry_size(
 
     loop {
         let start_lba = disk.cluster_start_lba(cluster);
+        disk.prefetch_sectors(start_lba, spc);
         for s in 0..spc {
             let sec_data = disk.cached_read_sector(start_lba + s).map_err(|_| ERR_IO)?;
             let mut sec_buf = [0u8; 512];

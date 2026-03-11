@@ -14,6 +14,7 @@ const TAG_NS_REGISTER: u64 = 1;
 const TAG_READ_SECTOR: u64 = 1;
 const TAG_WRITE_SECTOR: u64 = 2;
 const TAG_DISK_INFO: u64 = 3;
+const TAG_READ_SECTORS: u64 = 4;
 const TAG_OK: u64 = 0;
 const TAG_ERROR: u64 = u64::MAX;
 
@@ -193,6 +194,37 @@ fn ata_read_sector(lba: u32, buf: *mut u8) -> bool {
     true
 }
 
+fn ata_read_sectors(lba: u32, count: u32, buf: *mut u8) -> bool {
+    let max_sectors = unsafe { DRIVE.lba28_sectors };
+    if lba + count > max_sectors || count == 0 || count > 8 {
+        return false;
+    }
+
+    ata_wait_not_busy();
+
+    syscall::sys_ioport_write(ATA_DRIVE_HEAD, 0xE0 | ((lba >> 24) & 0x0F) as u8);
+    ata_400ns_delay();
+
+    syscall::sys_ioport_write(ATA_SECTOR_COUNT, count as u8);
+    syscall::sys_ioport_write(ATA_LBA_LO, lba as u8);
+    syscall::sys_ioport_write(ATA_LBA_MID, (lba >> 8) as u8);
+    syscall::sys_ioport_write(ATA_LBA_HI, (lba >> 16) as u8);
+
+    syscall::sys_ioport_write(ATA_COMMAND, ATA_CMD_READ_PIO);
+    ata_400ns_delay();
+
+    for i in 0..count {
+        if !ata_wait_drq() {
+            return false;
+        }
+        let offset = (i as usize) * 512;
+        let words = unsafe { core::slice::from_raw_parts_mut(buf.add(offset) as *mut u16, 256) };
+        let _ = syscall::sys_ioport_rep_insw(ATA_DATA, words);
+    }
+
+    true
+}
+
 fn ata_write_sector(lba: u32, buf: *const u8) -> bool {
     let max_sectors = unsafe { DRIVE.lba28_sectors };
     if lba >= max_sectors {
@@ -354,6 +386,38 @@ pub extern "C" fn _start() -> ! {
                         sender: 0,
                         tag: TAG_ERROR,
                         data: [3, 0, 0, 0, 0, 0], // write error
+                    }
+                };
+                let _ = syscall::sys_reply(msg.sender, &reply);
+            }
+            TAG_READ_SECTORS => {
+                let lba = msg.data[0] as u32;
+                let phys_addr = msg.data[1] as usize;
+                let count = (msg.data[2] as u32).min(8).max(1);
+
+                if syscall::sys_map_phys(phys_addr, TEMP_MAP_ADDR, 1).is_err() {
+                    let reply = Message {
+                        sender: 0,
+                        tag: TAG_ERROR,
+                        data: [1, 0, 0, 0, 0, 0],
+                    };
+                    let _ = syscall::sys_reply(msg.sender, &reply);
+                    continue;
+                }
+
+                let success = ata_read_sectors(lba, count, TEMP_MAP_ADDR as *mut u8);
+
+                let reply = if success {
+                    Message {
+                        sender: 0,
+                        tag: TAG_OK,
+                        data: [(count * 512) as u64, 0, 0, 0, 0, 0],
+                    }
+                } else {
+                    Message {
+                        sender: 0,
+                        tag: TAG_ERROR,
+                        data: [2, 0, 0, 0, 0, 0],
                     }
                 };
                 let _ = syscall::sys_reply(msg.sender, &reply);
