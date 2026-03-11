@@ -1,5 +1,6 @@
 #![no_std]
 #![no_main]
+#![allow(static_mut_refs)]
 
 use font8x8::legacy::BASIC_LEGACY;
 use libquark::ipc::{Message, TID_ANY};
@@ -37,6 +38,24 @@ static mut ESC_PARAM_COUNT: usize = 0;
 
 // Foreground color (set via SGR escape codes)
 static mut FG_COLOR: u32 = 0;
+
+// Text cell buffer — avoids expensive framebuffer reads during scroll
+const MAX_CELL_COLS: usize = 320;
+const MAX_CELL_ROWS: usize = 200;
+
+static mut CELL_CH: [u8; MAX_CELL_COLS * MAX_CELL_ROWS] = [0; MAX_CELL_COLS * MAX_CELL_ROWS];
+static mut CELL_FG: [u32; MAX_CELL_COLS * MAX_CELL_ROWS] = [0; MAX_CELL_COLS * MAX_CELL_ROWS];
+static mut DIRTY_MIN: usize = usize::MAX;
+static mut DIRTY_MAX: usize = 0;
+
+fn cell_idx(col: usize, row: usize) -> usize {
+    row * MAX_CELL_COLS + col
+}
+
+unsafe fn mark_dirty(row: usize) {
+    if row < DIRTY_MIN { DIRTY_MIN = row; }
+    if row > DIRTY_MAX { DIRTY_MAX = row; }
+}
 
 #[unsafe(no_mangle)]
 #[link_section = ".text.entry"]
@@ -137,6 +156,7 @@ fn write_bytes(s: &[u8]) {
     for &b in s {
         putc(b);
     }
+    flush_dirty();
 }
 
 fn putc(c: u8) {
@@ -154,7 +174,10 @@ fn putc(c: u8) {
                     if COL > 0 { COL -= 1; }
                 }
                 byte => {
-                    draw_glyph(COL, ROW, byte);
+                    let idx = cell_idx(COL, ROW);
+                    CELL_CH[idx] = byte;
+                    CELL_FG[idx] = FG_COLOR;
+                    mark_dirty(ROW);
                     COL += 1;
                     if COL >= COLS { COL = 0; ROW += 1; }
                 }
@@ -188,7 +211,7 @@ fn putc(c: u8) {
     }
 }
 
-fn draw_glyph(col: usize, row: usize, ch: u8) {
+fn draw_glyph(col: usize, row: usize, ch: u8, fg: u32) {
     let glyph = if (ch as usize) < BASIC_LEGACY.len() {
         BASIC_LEGACY[ch as usize]
     } else {
@@ -200,7 +223,6 @@ fn draw_glyph(col: usize, row: usize, ch: u8) {
 
     unsafe {
         let bytes_per_pixel = BPP / 8;
-        let fg = FG_COLOR;
 
         for (gy, &glyph_row) in glyph.iter().enumerate() {
             let y = pixel_y + gy;
@@ -243,15 +265,28 @@ fn dispatch_csi(cmd: u8) {
             }
             b'J' => {
                 if p0 == 2 {
+                    // Clear cell buffer
+                    for i in 0..(ROWS * MAX_CELL_COLS) {
+                        CELL_CH[i] = 0;
+                        CELL_FG[i] = 0;
+                    }
+                    // Clear framebuffer directly
                     let buf = FB as *mut u8;
                     let total = HEIGHT * PITCH;
                     for i in 0..total { buf.add(i).write_volatile(0); }
                     ROW = 0; COL = 0;
+                    DIRTY_MIN = usize::MAX;
+                    DIRTY_MAX = 0;
                 }
             }
             b'K' => {
                 if p0 == 0 {
-                    for c in COL..COLS { draw_glyph(c, ROW, b' '); }
+                    for c in COL..COLS {
+                        let idx = cell_idx(c, ROW);
+                        CELL_CH[idx] = 0;
+                        CELL_FG[idx] = 0;
+                    }
+                    mark_dirty(ROW);
                 }
             }
             b'm' => {
@@ -287,25 +322,50 @@ fn apply_sgr(code: u16) {
 
 fn scroll() {
     unsafe {
-        let buf = FB as *mut u64;
-        let row_bytes = GLYPH_H * PITCH;
-        let text_area = ROWS * row_bytes;
+        let stride = MAX_CELL_COLS;
+        let used = ROWS * stride;
 
-        // Copy in u64 chunks (8x fewer memory accesses)
-        let words = (text_area - row_bytes) / 8;
-        let src = (FB + row_bytes) as *const u64;
-        for i in 0..words {
-            let val = src.add(i).read_volatile();
-            buf.add(i).write_volatile(val);
-        }
+        // Shift cell arrays up by one row (fast — normal cached RAM)
+        core::ptr::copy(
+            CELL_CH.as_ptr().add(stride),
+            CELL_CH.as_mut_ptr(),
+            used - stride,
+        );
+        core::ptr::copy(
+            CELL_FG.as_ptr().add(stride),
+            CELL_FG.as_mut_ptr(),
+            used - stride,
+        );
 
-        let last_row_start = ((ROWS - 1) * row_bytes) / 8;
-        let last_row_words = row_bytes / 8;
-        for i in 0..last_row_words {
-            buf.add(last_row_start + i).write_volatile(0);
+        // Clear last row
+        let last = (ROWS - 1) * stride;
+        for i in last..last + COLS {
+            CELL_CH[i] = 0;
+            CELL_FG[i] = 0;
         }
 
         ROW = ROWS - 1;
+        // Mark entire screen dirty — flush will re-render from cell buffer
+        DIRTY_MIN = 0;
+        DIRTY_MAX = ROWS - 1;
+    }
+}
+
+fn flush_dirty() {
+    unsafe {
+        if !INITIALIZED || DIRTY_MIN > DIRTY_MAX {
+            return;
+        }
+        let min = DIRTY_MIN;
+        let max = if DIRTY_MAX >= ROWS { ROWS - 1 } else { DIRTY_MAX };
+        for row in min..=max {
+            for col in 0..COLS {
+                let idx = cell_idx(col, row);
+                draw_glyph(col, row, CELL_CH[idx], CELL_FG[idx]);
+            }
+        }
+        DIRTY_MIN = usize::MAX;
+        DIRTY_MAX = 0;
     }
 }
 
