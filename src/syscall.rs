@@ -52,6 +52,8 @@ pub const SYS_GET_UID: u64 = 100;
 pub const SYS_SET_UID: u64 = 101;
 pub const SYS_SET_GID: u64 = 102;
 pub const SYS_GET_TUID: u64 = 103;
+pub const SYS_TASK_KILL: u64 = 104;
+pub const SYS_TASK_INFO: u64 = 105;
 
 pub const SYS_MMAP: u64 = 70;
 
@@ -798,6 +800,41 @@ extern "C" fn syscall_dispatch(
             match scheduler::task_uid_gid(tid) {
                 Ok((uid, gid)) => ((uid as u64) << 32) | (gid as u64),
                 Err(()) => u64::MAX,
+            }
+        }
+        SYS_TASK_KILL => {
+            // arg0 = tid to kill. Requires CAP_TASK_MGMT or same UID.
+            let tid = arg0 as usize;
+            let caller_uid = scheduler::current_task_uid();
+            let has_cap = scheduler::current_task_has_cap(crate::task::CAP_TASK_MGMT);
+            let same_uid = scheduler::task_uid_gid(tid)
+                .map(|(uid, _)| uid == caller_uid)
+                .unwrap_or(false);
+            if !has_cap && !same_uid {
+                return u64::MAX;
+            }
+            match scheduler::kill_task(tid) {
+                Ok(()) => 0,
+                Err(()) => u64::MAX,
+            }
+        }
+        SYS_TASK_INFO => {
+            // arg0 = tid. Returns packed info or u64::MAX if no task.
+            // bits [3:0] = state (0=Ready,1=Running,2=Blocked,3=Dead)
+            // bits [31:4] = parent_tid
+            // bits [63:32] = uid
+            let tid = arg0 as usize;
+            match scheduler::task_info(tid) {
+                Some((state, uid, _gid, parent)) => {
+                    let state_bits = match state {
+                        crate::task::TaskState::Ready => 0u64,
+                        crate::task::TaskState::Running => 1,
+                        crate::task::TaskState::Blocked => 2,
+                        crate::task::TaskState::Dead => 3,
+                    };
+                    state_bits | ((parent as u64) << 4) | ((uid as u64) << 32)
+                }
+                None => u64::MAX,
             }
         }
         _ => u64::MAX,

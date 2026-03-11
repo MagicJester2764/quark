@@ -309,6 +309,38 @@ pub unsafe fn get_task_mut(tid: usize) -> Option<&'static mut Task> {
     }
 }
 
+/// Kill a task by TID. Marks it Dead and wakes its parent if waiting.
+/// Cannot kill TID 0 (idle) or TID 1 (init).
+pub fn kill_task(tid: usize) -> Result<(), ()> {
+    if tid <= 1 || tid >= MAX_TASKS {
+        return Err(());
+    }
+    unsafe {
+        match TASKS[tid].as_mut() {
+            Some(task) if task.state != TaskState::Dead => {
+                task.state = TaskState::Dead;
+                let parent = task.parent_tid;
+                if parent != 0 && WAIT_BLOCKED[parent] {
+                    WAIT_BLOCKED[parent] = false;
+                    WAIT_RESULT[parent] = tid;
+                    REAPED[tid] = true;
+                    unblock_task(parent);
+                }
+                Ok(())
+            }
+            _ => Err(()),
+        }
+    }
+}
+
+/// Get task info for enumeration. Returns (state, uid, gid, parent_tid) or None.
+pub fn task_info(tid: usize) -> Option<(TaskState, u32, u32, usize)> {
+    if tid >= MAX_TASKS { return None; }
+    unsafe {
+        TASKS[tid].as_ref().map(|t| (t.state, t.uid, t.gid, t.parent_tid))
+    }
+}
+
 /// Reap dead tasks (clean up IPC, IRQs, address space, and free stacks).
 /// Only reaps tasks that have been collected by sys_wait, have no parent,
 /// or whose parent is already gone.

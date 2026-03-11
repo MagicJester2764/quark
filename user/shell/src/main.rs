@@ -637,6 +637,19 @@ pub extern "C" fn _start() -> ! {
             continue;
         }
 
+        // Builtin: kill <tid>
+        if cmd == b"kill" {
+            let arg = args_str.trim_ascii();
+            if let Some(tid) = parse_usize(arg) {
+                if syscall::sys_task_kill(tid).is_err() {
+                    println!("kill: failed to kill task {}", tid);
+                }
+            } else {
+                println!("usage: kill <tid>");
+            }
+            continue;
+        }
+
         // Resolve `.` and `..` in arguments for external commands
         let mut resolved_args_buf = [0u8; 256];
         let resolved_args = resolve_args(cmd, args_str, &mut resolved_args_buf);
@@ -648,6 +661,16 @@ pub extern "C" fn _start() -> ! {
 
 /// For commands that take path arguments, resolve `.` and `..` relative to cwd.
 /// For `ls` with no args, inject cwd as the argument.
+fn parse_usize(s: &[u8]) -> Option<usize> {
+    if s.is_empty() { return None; }
+    let mut val: usize = 0;
+    for &b in s {
+        if b < b'0' || b > b'9' { return None; }
+        val = val.checked_mul(10)?.checked_add((b - b'0') as usize)?;
+    }
+    Some(val)
+}
+
 fn resolve_args<'a>(cmd: &[u8], args_str: &[u8], buf: &'a mut [u8; 256]) -> &'a [u8] {
     let trimmed = args_str.trim_ascii();
 

@@ -37,9 +37,9 @@ Scheduler, synchronous IPC, address spaces, capabilities, fd table, IRQ delegati
 
 13. ~~**Shell**~~ — **Done.** Interactive command interpreter (`user/shell`). Reads input, parses commands, loads ELFs from `/usr/bin/` via VFS, spawns tasks with fd wiring, waits for exit. Only builtin: `exit`. Loaded last by init so auto-run programs finish first.
 
-14. **`sys_kill` / signals** — Terminate tasks from userspace. Clean teardown (free pages, unblock IPC partners, notify parent via `sys_wait`).
+14. ~~**`sys_kill` / signals**~~ — **Partially done.** `sys_task_kill(tid)` (syscall 104) terminates tasks from userspace. Requires `CAP_TASK_MGMT` or same UID. Shell has `kill <tid>` builtin. POSIX signals not implemented.
 
-15. **Pipes** — Anonymous IPC channels (`sys_pipe` returns read/write fds). Enables `cmd1 | cmd2` in the shell.
+15. ~~**Pipes**~~ — **Partially done.** Kernel pipes (`sys_pipe_create`, `sys_pipe_fd_set`) exist and are used for console I/O transport. Shell `cmd1 | cmd2` syntax not yet implemented.
 
 16. ~~**Userspace utilities (`ls`, `cat`, `echo`)**~~ — **Done.** `echo` prints arguments; `ls` lists directories via VFS (default `/usr/bin`); `cat` reads and prints files via VFS with phys page buffer. All loadable from shell.
 
@@ -49,4 +49,6 @@ Scheduler, synchronous IPC, address spaces, capabilities, fd table, IRQ delegati
 
 19. **DNS resolver** — Name resolution so network programs can use hostnames.
 
-20. **Task listing (`ps`)** — Syscall to enumerate running tasks + userspace `ps` command.
+20. ~~**Task listing (`ps`)**~~ — **Done.** `sys_task_info(tid)` (syscall 105) returns task state, UID, and parent TID. `ps` command lists all running tasks.
+
+21. **Filesystem permissions** — FAT32 has no ownership/permissions. Options: sidecar `.permissions` files per directory, or switch to ext2. VFS would query caller UID via `SYS_GET_TUID(sender_tid)` and check against file ownership. Alternative: kernel includes sender UID in IPC messages (more secure). Also needed for setuid binaries.

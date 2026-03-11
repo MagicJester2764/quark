@@ -46,6 +46,8 @@ pub const SYS_GET_UID: u64 = 100;
 pub const SYS_SET_UID: u64 = 101;
 pub const SYS_SET_GID: u64 = 102;
 pub const SYS_GET_TUID: u64 = 103;
+pub const SYS_TASK_KILL: u64 = 104;
+pub const SYS_TASK_INFO: u64 = 105;
 
 pub const SYS_RECV_TIMEOUT: u64 = 80;
 pub const SYS_TICKS: u64 = 81;
@@ -227,6 +229,22 @@ pub fn sys_get_tuid(tid: usize) -> Result<(u32, u32), ()> {
     let uid = (ret >> 32) as u32;
     let gid = (ret & 0xFFFF_FFFF) as u32;
     Ok((uid, gid))
+}
+
+pub fn sys_task_kill(tid: usize) -> Result<(), ()> {
+    let ret = unsafe { syscall1(SYS_TASK_KILL, tid as u64) };
+    if ret == 0 { Ok(()) } else { Err(()) }
+}
+
+/// Returns (state, parent_tid, uid) or Err if no task at that TID.
+/// state: 0=Ready, 1=Running, 2=Blocked, 3=Dead
+pub fn sys_task_info(tid: usize) -> Result<(u8, usize, u32), ()> {
+    let ret = unsafe { syscall1(SYS_TASK_INFO, tid as u64) };
+    if ret == u64::MAX { return Err(()); }
+    let state = (ret & 0xF) as u8;
+    let parent = ((ret >> 4) & 0x0FFF_FFFF) as usize;
+    let uid = (ret >> 32) as u32;
+    Ok((state, parent, uid))
 }
 
 pub fn sys_send(dest: usize, msg: &crate::ipc::Message) -> Result<(), ()> {
