@@ -47,7 +47,6 @@ pub extern "C" fn kernel_main(multiboot_info: usize) -> ! {
     // Initialize console (VGA driver receives kernel services)
     console::init(fb);
     console::clear();
-    console::puts(b"Quark v0.1.0 - microkernel\n");
     unsafe { heap::init() };
     console::puts(b"Heap initialized.\n");
     unsafe { idt::init() };
@@ -125,6 +124,8 @@ pub extern "C" fn kernel_main(multiboot_info: usize) -> ! {
     } else {
         console::puts(b"No init module found.\n");
     }
+
+    console::puts(b"Welcome to Quark (v0.1.0)\n");
 
     // Idle loop — the scheduler returns here when no tasks are ready
     loop {
