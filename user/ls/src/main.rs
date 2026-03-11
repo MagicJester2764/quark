@@ -73,11 +73,11 @@ pub extern "C" fn _start() -> ! {
         }
     };
 
-    // Get path from argv[1], default to /usr/bin
+    // Get path from argv[1], default to /
     let path = if let Some(arg) = args::argv(1) {
         arg
     } else {
-        b"/usr/bin" as &[u8]
+        b"/" as &[u8]
     };
 
     // Open directory

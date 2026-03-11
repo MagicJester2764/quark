@@ -410,12 +410,138 @@ fn cmd_exec(
 }
 
 // ---------------------------------------------------------------------------
+// Current working directory
+// ---------------------------------------------------------------------------
+
+static mut CWD: [u8; 64] = [0; 64];
+static mut CWD_LEN: usize = 0;
+
+fn cwd_init() {
+    unsafe {
+        CWD[0] = b'/';
+        CWD_LEN = 1;
+    }
+}
+
+fn cwd_get() -> &'static [u8] {
+    unsafe { &CWD[..CWD_LEN] }
+}
+
+fn cwd_set(path: &[u8]) {
+    unsafe {
+        let len = path.len().min(64);
+        CWD[..len].copy_from_slice(&path[..len]);
+        CWD_LEN = len;
+    }
+}
+
+/// Resolve a path relative to cwd. Handles `.`, `..`, absolute paths.
+/// Returns the resolved path length written into `out`.
+fn resolve_path(arg: &[u8], out: &mut [u8; 128]) -> usize {
+    if arg.first() == Some(&b'/') {
+        // Absolute path — start fresh
+        out[0] = b'/';
+        resolve_components(&arg[1..], out, 1)
+    } else {
+        // Relative path — start from cwd
+        let cwd = cwd_get();
+        out[..cwd.len()].copy_from_slice(cwd);
+        let mut pos = cwd.len();
+        // Ensure trailing slash for joining
+        if pos > 0 && out[pos - 1] != b'/' && pos < 128 {
+            out[pos] = b'/';
+            pos += 1;
+        }
+        resolve_components(arg, out, pos)
+    }
+}
+
+fn resolve_components(components: &[u8], out: &mut [u8; 128], start: usize) -> usize {
+    let mut pos = start;
+    let mut i = 0;
+    while i <= components.len() {
+        // Find next component (split by '/')
+        let comp_start = i;
+        while i < components.len() && components[i] != b'/' {
+            i += 1;
+        }
+        let comp = &components[comp_start..i];
+        i += 1; // skip '/'
+
+        if comp.is_empty() || comp == b"." {
+            continue;
+        } else if comp == b".." {
+            // Go up: remove last component
+            if pos > 1 {
+                // Remove trailing slash
+                if out[pos - 1] == b'/' {
+                    pos -= 1;
+                }
+                // Find previous slash
+                while pos > 1 && out[pos - 1] != b'/' {
+                    pos -= 1;
+                }
+            }
+        } else {
+            // Append component
+            if pos > 0 && out[pos - 1] != b'/' && pos < 128 {
+                out[pos] = b'/';
+                pos += 1;
+            }
+            let len = comp.len().min(128 - pos);
+            out[pos..pos + len].copy_from_slice(&comp[..len]);
+            pos += len;
+        }
+    }
+    // Ensure at least "/"
+    if pos == 0 {
+        out[0] = b'/';
+        pos = 1;
+    }
+    pos
+}
+
+fn cmd_cd(args_str: &[u8], vfs_tid: usize) {
+    let arg = args_str.trim_ascii();
+    if arg.is_empty() {
+        // cd with no args goes to /
+        cwd_set(b"/");
+        return;
+    }
+
+    let mut resolved = [0u8; 128];
+    let len = resolve_path(arg, &mut resolved);
+    let path = &resolved[..len];
+
+    // Verify it's a valid directory via VFS
+    match vfs::open(vfs_tid, path) {
+        Ok((handle, _, is_dir)) => {
+            let _ = vfs::close(vfs_tid, handle);
+            if is_dir {
+                cwd_set(path);
+            } else {
+                if let Ok(s) = core::str::from_utf8(arg) {
+                    println!("cd: not a directory: {}", s);
+                }
+            }
+        }
+        Err(_) => {
+            if let Ok(s) = core::str::from_utf8(arg) {
+                println!("cd: no such directory: {}", s);
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
 
 #[unsafe(no_mangle)]
 #[link_section = ".text.entry"]
 pub extern "C" fn _start() -> ! {
+    cwd_init();
+
     // Discover services
     let vfs_tid = match lookup_service_with_retry(b"vfs", 50) {
         Some(tid) => tid,
@@ -477,9 +603,77 @@ pub extern "C" fn _start() -> ! {
             syscall::sys_exit();
         }
 
+        // Builtin: cd
+        if cmd == b"cd" {
+            cmd_cd(args_str, vfs_tid);
+            continue;
+        }
+
+        // Builtin: pwd
+        if cmd == b"pwd" {
+            if let Ok(s) = core::str::from_utf8(cwd_get()) {
+                println!("{}", s);
+            }
+            continue;
+        }
+
+        // Resolve `.` and `..` in arguments for external commands
+        let mut resolved_args_buf = [0u8; 256];
+        let resolved_args = resolve_args(cmd, args_str, &mut resolved_args_buf);
+
         // External command
-        cmd_exec(cmd, args_str, vfs_tid);
+        cmd_exec(cmd, resolved_args, vfs_tid);
     }
+}
+
+/// For commands that take path arguments, resolve `.` and `..` relative to cwd.
+/// For `ls` with no args, inject cwd as the argument.
+fn resolve_args<'a>(cmd: &[u8], args_str: &[u8], buf: &'a mut [u8; 256]) -> &'a [u8] {
+    let trimmed = args_str.trim_ascii();
+
+    // ls with no args → use cwd
+    if eq_ignore_case(cmd, b"ls") && trimmed.is_empty() {
+        let cwd = cwd_get();
+        buf[..cwd.len()].copy_from_slice(cwd);
+        return &buf[..cwd.len()];
+    }
+
+    // Resolve each argument that looks like a path (contains . or ..)
+    // For simplicity, resolve each space-separated token individually
+    let mut out_pos = 0;
+    let mut i = 0;
+    let bytes = args_str;
+    while i < bytes.len() {
+        // Copy leading spaces
+        while i < bytes.len() && bytes[i] == b' ' {
+            if out_pos < 256 { buf[out_pos] = b' '; out_pos += 1; }
+            i += 1;
+        }
+        if i >= bytes.len() { break; }
+
+        // Extract token
+        let tok_start = i;
+        while i < bytes.len() && bytes[i] != b' ' {
+            i += 1;
+        }
+        let token = &bytes[tok_start..i];
+
+        // Check if token needs path resolution (starts with . or ..)
+        if token == b"." || token == b".."
+            || token.starts_with(b"./") || token.starts_with(b"../")
+        {
+            let mut resolved = [0u8; 128];
+            let len = resolve_path(token, &mut resolved);
+            let copy_len = len.min(256 - out_pos);
+            buf[out_pos..out_pos + copy_len].copy_from_slice(&resolved[..copy_len]);
+            out_pos += copy_len;
+        } else {
+            let copy_len = token.len().min(256 - out_pos);
+            buf[out_pos..out_pos + copy_len].copy_from_slice(&token[..copy_len]);
+            out_pos += copy_len;
+        }
+    }
+    &buf[..out_pos]
 }
 
 #[panic_handler]
