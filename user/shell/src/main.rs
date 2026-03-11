@@ -554,6 +554,12 @@ pub extern "C" fn _start() -> ! {
     // Main loop
     let mut line_buf = [0u8; 256];
     loop {
+        if let Ok(s) = core::str::from_utf8(cwd_get()) {
+            print!("{}", s);
+            if !s.ends_with('/') {
+                print!("/");
+            }
+        }
         print!("$ ");
 
         let n = read_line(&mut line_buf);
