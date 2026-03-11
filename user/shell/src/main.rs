@@ -713,10 +713,8 @@ fn resolve_args<'a>(cmd: &[u8], args_str: &[u8], buf: &'a mut [u8; 256]) -> &'a 
         }
         let token = &bytes[tok_start..i];
 
-        // Check if token needs path resolution (starts with . or ..)
-        if token == b"." || token == b".."
-            || token.starts_with(b"./") || token.starts_with(b"../")
-        {
+        // Resolve relative paths (anything not starting with / or -)
+        if !token.is_empty() && token[0] != b'/' && token[0] != b'-' {
             let mut resolved = [0u8; 128];
             let len = resolve_path(token, &mut resolved);
             let copy_len = len.min(256 - out_pos);
