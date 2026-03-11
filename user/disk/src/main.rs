@@ -58,13 +58,20 @@ fn ata_read_status() -> u8 {
     syscall::sys_ioport_read(ATA_ALT_STATUS) as u8
 }
 
+/// Block until IRQ 14 fires (disk operation complete).
+fn wait_for_irq() {
+    let mut msg = Message::empty();
+    let _ = syscall::sys_recv(0, &mut msg);
+    syscall::sys_irq_ack(14);
+}
+
 fn ata_wait_not_busy() {
     loop {
         let status = ata_read_status();
         if status & ATA_SR_BSY == 0 {
             return;
         }
-        syscall::sys_yield();
+        wait_for_irq();
     }
 }
 
@@ -77,7 +84,7 @@ fn ata_wait_drq() -> bool {
         if status & ATA_SR_BSY == 0 && status & ATA_SR_DRQ != 0 {
             return true;
         }
-        syscall::sys_yield();
+        wait_for_irq();
     }
 }
 
