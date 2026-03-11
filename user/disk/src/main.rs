@@ -58,20 +58,13 @@ fn ata_read_status() -> u8 {
     syscall::sys_ioport_read(ATA_ALT_STATUS) as u8
 }
 
-/// Block until IRQ 14 fires (disk operation complete).
-fn wait_for_irq() {
-    let mut msg = Message::empty();
-    let _ = syscall::sys_recv(0, &mut msg);
-    syscall::sys_irq_ack(14);
-}
-
 fn ata_wait_not_busy() {
     loop {
         let status = ata_read_status();
         if status & ATA_SR_BSY == 0 {
             return;
         }
-        wait_for_irq();
+        syscall::sys_yield();
     }
 }
 
@@ -84,7 +77,7 @@ fn ata_wait_drq() -> bool {
         if status & ATA_SR_BSY == 0 && status & ATA_SR_DRQ != 0 {
             return true;
         }
-        wait_for_irq();
+        syscall::sys_yield();
     }
 }
 
@@ -304,12 +297,6 @@ fn register_with_nameserver() {
 pub extern "C" fn _start() -> ! {
     println!("[disk] Started.");
 
-    // Register for IRQ 14 (primary ATA)
-    if syscall::sys_irq_register(14).is_err() {
-        println!("[disk] Failed to register IRQ 14!");
-        syscall::sys_exit();
-    }
-
     // Identify drive
     if !ata_identify() {
         println!("[disk] No usable drive found. Exiting.");
@@ -323,12 +310,6 @@ pub extern "C" fn _start() -> ! {
     loop {
         let mut msg = Message::empty();
         if syscall::sys_recv(TID_ANY, &mut msg).is_err() {
-            continue;
-        }
-
-        if msg.sender == 0 {
-            // IRQ 14 notification — just ACK it
-            syscall::sys_irq_ack(14);
             continue;
         }
 
