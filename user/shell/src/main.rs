@@ -568,7 +568,19 @@ pub extern "C" fn _start() -> ! {
     // Main loop
     let mut line_buf = [0u8; 256];
     loop {
-        if let Ok(s) = core::str::from_utf8(cwd_get()) {
+        let cwd = cwd_get();
+        let home = home_get();
+        if cwd == home {
+            print!("~");
+        } else if cwd.starts_with(home) && cwd.len() > home.len() && cwd[home.len()] == b'/' {
+            print!("~");
+            if let Ok(rest) = core::str::from_utf8(&cwd[home.len()..]) {
+                print!("{}", rest);
+                if !rest.ends_with('/') {
+                    print!("/");
+                }
+            }
+        } else if let Ok(s) = core::str::from_utf8(cwd) {
             print!("{}", s);
             if !s.ends_with('/') {
                 print!("/");
