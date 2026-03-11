@@ -287,17 +287,21 @@ fn apply_sgr(code: u16) {
 
 fn scroll() {
     unsafe {
-        let buf = FB as *mut u8;
+        let buf = FB as *mut u64;
         let row_bytes = GLYPH_H * PITCH;
         let text_area = ROWS * row_bytes;
 
-        for i in 0..(text_area - row_bytes) {
-            let val = buf.add(i + row_bytes).read_volatile();
+        // Copy in u64 chunks (8x fewer memory accesses)
+        let words = (text_area - row_bytes) / 8;
+        let src = (FB + row_bytes) as *const u64;
+        for i in 0..words {
+            let val = src.add(i).read_volatile();
             buf.add(i).write_volatile(val);
         }
 
-        let last_row_start = (ROWS - 1) * row_bytes;
-        for i in 0..row_bytes {
+        let last_row_start = ((ROWS - 1) * row_bytes) / 8;
+        let last_row_words = row_bytes / 8;
+        for i in 0..last_row_words {
             buf.add(last_row_start + i).write_volatile(0);
         }
 
