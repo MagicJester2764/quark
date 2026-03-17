@@ -1,7 +1,7 @@
 # Missing Features
 
 ## What Quark has
-Scheduler, synchronous IPC, address spaces, capabilities, fd table, IRQ delegation, PMM, heap, futex/mutex, ELF loading, nameserver, console, keyboard, input, disk, VFS, network
+Scheduler, synchronous IPC, address spaces, capabilities, fd table, IRQ delegation, PMM, heap, futex/mutex, ELF loading, nameserver, console, keyboard, input, disk, VFS, network, signals
 
 ## High impact (blocking real programs)
 
@@ -43,7 +43,7 @@ Scheduler, synchronous IPC, address spaces, capabilities, fd table, IRQ delegati
 
 16. ~~**Userspace utilities (`ls`, `cat`, `echo`)**~~ — **Done.** `echo` prints arguments; `ls` lists directories via VFS (default `/usr/bin`); `cat` reads and prints files via VFS with phys page buffer. All loadable from shell.
 
-17. **Signal delivery** — Instead of `sys_task_kill` immediately destroying a task, deliver an IPC notification (or kernel-injected signal) that the task can handle. Tasks would register a signal handler; the kernel or input server sends a "please exit" message rather than killing outright. Enables graceful shutdown (finish printing, flush buffers, release resources). Needed for Ctrl+C to not corrupt in-progress I/O.
+17. ~~**Signal delivery**~~ — **Done.** `sys_signal(tid, sig)` (syscall 106) sends signals via the notification system. `SIG_INT` (Ctrl+C) and `SIG_TERM` deliver async notifications with a 2-second grace period before force-kill; `SIG_KILL` terminates immediately. Input server sends `SIG_INT` on Ctrl+C instead of instant kill. Shell `kill` builtin sends `SIG_TERM` by default, `kill -9` for `SIG_KILL`. `libquark::signal` provides `poll_signal()`, `extract_signal()`, and `default_handler()` for userspace signal handling.
 
 18. **TCP** — Extend the net driver with TCP (3-way handshake, sliding window, retransmit). Enables HTTP, telnet, etc.
 

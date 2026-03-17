@@ -676,15 +676,23 @@ pub extern "C" fn _start() -> ! {
             continue;
         }
 
-        // Builtin: kill <tid>
+        // Builtin: kill [-9] <tid>
         if cmd == b"kill" {
             let arg = args_str.trim_ascii();
-            if let Some(tid) = parse_usize(arg) {
-                if syscall::sys_task_kill(tid).is_err() {
-                    println!("kill: failed to kill task {}", tid);
+            let (sig, tid_arg) = if arg.starts_with(b"-9 ") {
+                (syscall::SIG_KILL, arg[3..].trim_ascii())
+            } else if arg == b"-9" {
+                println!("usage: kill [-9] <tid>");
+                continue;
+            } else {
+                (syscall::SIG_TERM, arg)
+            };
+            if let Some(tid) = parse_usize(tid_arg) {
+                if syscall::sys_signal(tid, sig).is_err() {
+                    println!("kill: failed to signal task {}", tid);
                 }
             } else {
-                println!("usage: kill <tid>");
+                println!("usage: kill [-9] <tid>");
             }
             continue;
         }

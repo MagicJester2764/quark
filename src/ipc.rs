@@ -72,8 +72,21 @@ static mut TASK_TIMEOUT: [u64; MAX_TASKS] = [0; MAX_TASKS];
 /// Atomically read-and-cleared when consumed by sys_recv/sys_recv_timeout.
 static mut TASK_NOTIFY: [u64; MAX_TASKS] = [0; MAX_TASKS];
 
+/// Per-task signal kill deadline (PIT tick). 0 = no pending signal deadline.
+/// When nonzero, the task will be force-killed after the deadline expires.
+static mut SIGNAL_DEADLINE: [u64; MAX_TASKS] = [0; MAX_TASKS];
+
 /// Tag for notification messages delivered to user space.
 pub const TAG_NOTIFICATION: u64 = 0xFFFF_0002;
+
+// Signal badge bits (use high bits to avoid collision with app badges)
+pub const SIG_INT: u64 = 1 << 16;
+pub const SIG_TERM: u64 = 1 << 17;
+pub const SIG_KILL: u64 = 1 << 18;
+pub const SIG_MASK: u64 = SIG_INT | SIG_TERM | SIG_KILL;
+
+/// Ticks before a signaled task is force-killed (2 seconds at 100 Hz).
+const SIGNAL_KILL_TIMEOUT: u64 = 200;
 
 /// Asynchronous notification: OR `badge` into dest's notification word.
 /// Non-blocking. Wakes the dest task if it is RecvBlocked(0) or RecvBlocked(TID_ANY).
@@ -96,6 +109,60 @@ pub fn sys_notify(dest: usize, badge: u64) -> Result<(), IpcError> {
     }
 
     Ok(())
+}
+
+/// Send a signal to a task. SIG_KILL immediately kills; other signals are
+/// delivered as notification badges with a force-kill deadline.
+/// Permission checking is done in syscall_dispatch (same as sys_task_kill).
+pub fn sys_signal(dest: usize, sig: u64) -> Result<(), IpcError> {
+    if dest >= MAX_TASKS || dest <= 1 {
+        return Err(IpcError::InvalidTid);
+    }
+    if sig == 0 {
+        return Err(IpcError::InvalidTid);
+    }
+
+    // SIG_KILL: immediate termination, no grace period
+    if sig & SIG_KILL != 0 {
+        let _ = scheduler::kill_task(dest);
+        return Ok(());
+    }
+
+    // Deliver signal bits via notification word
+    sys_notify(dest, sig)?;
+
+    // Set force-kill deadline (only if not already set — don't extend)
+    unsafe {
+        if SIGNAL_DEADLINE[dest] == 0 {
+            SIGNAL_DEADLINE[dest] = crate::pit::ticks() + SIGNAL_KILL_TIMEOUT;
+        }
+    }
+
+    Ok(())
+}
+
+/// Check signal deadlines and force-kill unresponsive tasks.
+/// Called from `pit::tick()` on every timer interrupt.
+pub fn check_signal_deadlines() {
+    let now = crate::pit::ticks();
+    unsafe {
+        for tid in 2..MAX_TASKS {
+            let deadline = SIGNAL_DEADLINE[tid];
+            if deadline != 0 && now >= deadline {
+                SIGNAL_DEADLINE[tid] = 0;
+                let _ = scheduler::kill_task(tid);
+            }
+        }
+    }
+}
+
+/// Clear signal deadline for a task (called when task exits or is killed).
+pub fn clear_signal_deadline(tid: usize) {
+    if tid < MAX_TASKS {
+        unsafe {
+            SIGNAL_DEADLINE[tid] = 0;
+        }
+    }
 }
 
 /// Synchronous send: blocks until receiver calls recv.
@@ -483,11 +550,12 @@ pub fn cleanup_task_ipc(dead_tid: usize) {
     }
 
     unsafe {
-        // Clear the dead task's own IPC state, timeout, and notifications
+        // Clear the dead task's own IPC state, timeout, notifications, and signal deadline
         TASK_IPC[dead_tid].state = IpcState::None;
         TASK_IPC[dead_tid].pending_msg = None;
         TASK_TIMEOUT[dead_tid] = 0;
         TASK_NOTIFY[dead_tid] = 0;
+        SIGNAL_DEADLINE[dead_tid] = 0;
 
         // Scan all tasks for those blocked on the dead task
         let error_msg = Message {

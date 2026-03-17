@@ -22,6 +22,7 @@ pub unsafe fn init(hz: u32) {
 pub fn tick() {
     TICKS.fetch_add(1, Ordering::Relaxed);
     crate::ipc::check_timeouts();
+    crate::ipc::check_signal_deadlines();
     crate::scheduler::timer_tick();
 }
 

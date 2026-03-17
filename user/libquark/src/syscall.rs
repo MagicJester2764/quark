@@ -49,6 +49,7 @@ pub const SYS_SET_GID: u64 = 102;
 pub const SYS_GET_TUID: u64 = 103;
 pub const SYS_TASK_KILL: u64 = 104;
 pub const SYS_TASK_INFO: u64 = 105;
+pub const SYS_SIGNAL: u64 = 106;
 
 pub const SYS_RECV_TIMEOUT: u64 = 80;
 pub const SYS_TICKS: u64 = 81;
@@ -539,6 +540,20 @@ pub fn sys_fd_dup(target_tid: usize, target_fd: usize, source_fd: usize) -> Resu
         syscall3(SYS_FD_DUP, target_tid as u64, target_fd as u64, source_fd as u64)
     };
     if ret == u64::MAX { Err(()) } else { Ok(()) }
+}
+
+// Signal constants (badge bits, high to avoid collision with app notifications)
+pub const SIG_INT: u64 = 1 << 16;
+pub const SIG_TERM: u64 = 1 << 17;
+pub const SIG_KILL: u64 = 1 << 18;
+pub const SIG_MASK: u64 = SIG_INT | SIG_TERM | SIG_KILL;
+
+/// Send a signal to a task. SIG_KILL is immediate; SIG_INT/SIG_TERM give the
+/// task a 2-second grace period to handle the signal before being force-killed.
+/// Same permissions as sys_task_kill (CAP_TASK_MGMT or same UID).
+pub fn sys_signal(tid: usize, sig: u64) -> Result<(), ()> {
+    let ret = unsafe { syscall2(SYS_SIGNAL, tid as u64, sig) };
+    if ret == 0 { Ok(()) } else { Err(()) }
 }
 
 // Capability bit constants

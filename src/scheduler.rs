@@ -89,6 +89,7 @@ pub fn exit() -> ! {
         let current = CURRENT_TID.load(Ordering::SeqCst);
         if let Some(ref mut task) = TASKS[current] {
             task.state = TaskState::Dead;
+            crate::ipc::clear_signal_deadline(current);
             let parent = task.parent_tid;
             // If parent is blocked in sys_wait, wake it with our TID
             if parent != 0 && WAIT_BLOCKED[parent] {
@@ -319,6 +320,7 @@ pub fn kill_task(tid: usize) -> Result<(), ()> {
         match TASKS[tid].as_mut() {
             Some(task) if task.state != TaskState::Dead => {
                 task.state = TaskState::Dead;
+                crate::ipc::clear_signal_deadline(tid);
                 let parent = task.parent_tid;
                 if parent != 0 && WAIT_BLOCKED[parent] {
                     WAIT_BLOCKED[parent] = false;

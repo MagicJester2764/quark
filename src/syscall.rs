@@ -55,6 +55,7 @@ pub const SYS_SET_GID: u64 = 102;
 pub const SYS_GET_TUID: u64 = 103;
 pub const SYS_TASK_KILL: u64 = 104;
 pub const SYS_TASK_INFO: u64 = 105;
+pub const SYS_SIGNAL: u64 = 106;
 
 pub const SYS_MMAP: u64 = 70;
 
@@ -851,6 +852,23 @@ extern "C" fn syscall_dispatch(
                     state_bits | ((parent as u64) << 4) | ((uid as u64) << 32)
                 }
                 None => u64::MAX,
+            }
+        }
+        SYS_SIGNAL => {
+            // arg0 = tid, arg1 = signal bits. Same permissions as sys_task_kill.
+            let tid = arg0 as usize;
+            let sig = arg1;
+            let caller_uid = scheduler::current_task_uid();
+            let has_cap = scheduler::current_task_has_cap(crate::task::CAP_TASK_MGMT);
+            let same_uid = scheduler::task_uid_gid(tid)
+                .map(|(uid, _)| uid == caller_uid)
+                .unwrap_or(false);
+            if !has_cap && !same_uid {
+                return u64::MAX;
+            }
+            match crate::ipc::sys_signal(tid, sig) {
+                Ok(()) => 0,
+                Err(_) => u64::MAX,
             }
         }
         _ => u64::MAX,
