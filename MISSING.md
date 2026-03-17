@@ -43,12 +43,14 @@ Scheduler, synchronous IPC, address spaces, capabilities, fd table, IRQ delegati
 
 16. ~~**Userspace utilities (`ls`, `cat`, `echo`)**~~ — **Done.** `echo` prints arguments; `ls` lists directories via VFS (default `/usr/bin`); `cat` reads and prints files via VFS with phys page buffer. All loadable from shell.
 
-17. **TCP** — Extend the net driver with TCP (3-way handshake, sliding window, retransmit). Enables HTTP, telnet, etc.
+17. **Signal delivery** — Instead of `sys_task_kill` immediately destroying a task, deliver an IPC notification (or kernel-injected signal) that the task can handle. Tasks would register a signal handler; the kernel or input server sends a "please exit" message rather than killing outright. Enables graceful shutdown (finish printing, flush buffers, release resources). Needed for Ctrl+C to not corrupt in-progress I/O.
 
-18. **DHCP client** — Auto-configure IP/netmask/gateway via DHCP instead of hardcoded 10.0.2.15.
+18. **TCP** — Extend the net driver with TCP (3-way handshake, sliding window, retransmit). Enables HTTP, telnet, etc.
 
-19. **DNS resolver** — Name resolution so network programs can use hostnames.
+19. **DHCP client** — Auto-configure IP/netmask/gateway via DHCP instead of hardcoded 10.0.2.15.
 
-20. ~~**Task listing (`ps`)**~~ — **Done.** `sys_task_info(tid)` (syscall 105) returns task state, UID, and parent TID. `ps` command lists all running tasks.
+20. **DNS resolver** — Name resolution so network programs can use hostnames.
 
-21. **Filesystem permissions** — FAT32 has no ownership/permissions. Options: sidecar `.permissions` files per directory, or switch to ext2. VFS would query caller UID via `SYS_GET_TUID(sender_tid)` and check against file ownership. Alternative: kernel includes sender UID in IPC messages (more secure). Also needed for setuid binaries.
+21. ~~**Task listing (`ps`)**~~ — **Done.** `sys_task_info(tid)` (syscall 105) returns task state, UID, and parent TID. `ps` command lists all running tasks.
+
+22. **Filesystem permissions** — FAT32 has no ownership/permissions. Options: sidecar `.permissions` files per directory, or switch to ext2. VFS would query caller UID via `SYS_GET_TUID(sender_tid)` and check against file ownership. Alternative: kernel includes sender UID in IPC messages (more secure). Also needed for setuid binaries.
