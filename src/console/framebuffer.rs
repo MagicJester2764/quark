@@ -144,9 +144,10 @@ pub unsafe fn init(
     state.b_pos = blue_pos;
 }
 
+/// Returns cursor position as (pixel_y, pixel_x) and disables kernel console.
 pub fn cursor_pos_and_disable() -> (usize, usize) {
     let mut state = FB_STATE.lock();
-    let pos = (state.row, state.col);
+    let pos = (state.row * GLYPH_H, state.col * GLYPH_W);
     state.disabled = true;
     pos
 }

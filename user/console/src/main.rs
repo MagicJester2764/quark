@@ -139,8 +139,9 @@ fn init_framebuffer(msg: &Message) {
     let rp = ((msg.data[3] >> 16) & 0xFF) as u8;
     let gp = ((msg.data[3] >> 8) & 0xFF) as u8;
     let bp = (msg.data[3] & 0xFF) as u8;
-    let cursor_row = (msg.data[4] >> 32) as usize;
-    let cursor_col = (msg.data[4] & 0xFFFF_FFFF) as usize;
+    // Kernel passes cursor as pixel coordinates (font-independent)
+    let cursor_pixel_y = (msg.data[4] >> 32) as usize;
+    let cursor_pixel_x = (msg.data[4] & 0xFFFF_FFFF) as usize;
 
     // Map the framebuffer into our address space
     let fb_size = pitch * h;
@@ -163,9 +164,9 @@ fn init_framebuffer(msg: &Message) {
         BPP = bpp;
         COLS = cols;
         ROWS = rows;
-        // Continue where the kernel console left off
-        COL = cursor_col.min(cols.saturating_sub(1));
-        ROW = cursor_row.min(rows.saturating_sub(1));
+        // Continue where the kernel console left off (convert pixels to our glyph grid)
+        COL = (cursor_pixel_x / GLYPH_W).min(cols.saturating_sub(1));
+        ROW = (cursor_pixel_y / GLYPH_H).min(rows.saturating_sub(1));
         R_POS = rp;
         G_POS = gp;
         B_POS = bp;
