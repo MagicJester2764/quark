@@ -61,27 +61,6 @@ pub extern "C" fn kernel_main(multiboot_info: usize) -> ! {
     }
     console::puts(b"Interrupts enabled.\n");
 
-    // Print boot modules
-    let mod_count = modules::count();
-    if mod_count > 0 {
-        console::puts(b"Boot modules:\n");
-        for i in 0..mod_count {
-            if let Some(m) = modules::get(i) {
-                console::puts(b"  Module: ");
-                console::puts(modules::name_str(m));
-                console::puts(b" [");
-                print_hex(m.start);
-                console::puts(b"..");
-                print_hex(m.end);
-                console::puts(b"] (");
-                print_dec(m.end - m.start);
-                console::puts(b" bytes)\n");
-            }
-        }
-    } else {
-        console::puts(b"No boot modules loaded.\n");
-    }
-
     // Initialize FAT32 driver (receives kernel services)
     fat32::init();
     if fat32::is_loaded() {
