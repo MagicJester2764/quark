@@ -345,6 +345,10 @@ fn apply_sgr(code: u16) {
 
 fn scroll() {
     unsafe {
+        // Flush any pending dirty rows to the framebuffer BEFORE scrolling pixels,
+        // so the FB is in sync when we copy pixels upward.
+        flush_dirty();
+
         let stride = MAX_CELL_COLS;
         let used = ROWS * stride;
 
@@ -360,17 +364,31 @@ fn scroll() {
             used - stride,
         );
 
-        // Clear last row
+        // Clear last cell row
         let last = (ROWS - 1) * stride;
         for i in last..last + COLS {
             CELL_CH[i] = 0;
             CELL_FG[i] = 0;
         }
 
+        // Scroll framebuffer pixels up by one text row instead of full redraw,
+        // so pre-existing content (e.g. kernel boot text) is preserved.
+        let shift = GLYPH_H * PITCH;
+        let total = ROWS * GLYPH_H * PITCH;
+        core::ptr::copy(
+            (FB + shift) as *const u8,
+            FB as *mut u8,
+            total - shift,
+        );
+
+        // Clear the last text row in the framebuffer
+        core::ptr::write_bytes(
+            (FB + (ROWS - 1) * GLYPH_H * PITCH) as *mut u8,
+            0,
+            GLYPH_H * PITCH,
+        );
+
         ROW = ROWS - 1;
-        // Mark entire screen dirty — flush will re-render from cell buffer
-        DIRTY_MIN = 0;
-        DIRTY_MAX = ROWS - 1;
     }
 }
 
