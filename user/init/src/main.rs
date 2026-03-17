@@ -584,15 +584,14 @@ fn load_essentials_from_boot_image(rootfs_phys: usize, rootfs_size: usize) -> Bo
     for i in 0..count {
         let e = &entries[i];
         if &e.name[0..8] == b"NAMESRVR" && &e.name[8..11] == b"ELF" {
-            println!("[init] Loading NAMESRVR.ELF");
             if let Ok(data) = read_file_to_buffer(rootfs, &bpb, e.first_cluster, e.file_size) {
                 match load_elf(data) {
                     Ok(info) => {
                         let _ = set_args(&info, &[b"nameserver"]);
                         let _ = info.start();
-                        println!("[init]   Spawned TID {}", info.tid);
+                        println!("[init] Spawned nameserver (TID {})", info.tid);
                     }
-                    Err(()) => println!("[init]   FAILED to spawn"),
+                    Err(()) => println!("[init] FAILED to spawn nameserver"),
                 }
             }
             break;
@@ -604,7 +603,6 @@ fn load_essentials_from_boot_image(rootfs_phys: usize, rootfs_size: usize) -> Bo
     for i in 0..count {
         let e = &entries[i];
         if &e.name[0..8] == b"CONSOLE " && &e.name[8..11] == b"ELF" {
-            println!("[init] Loading CONSOLE.ELF");
             if let Ok(data) = read_file_to_buffer(rootfs, &bpb, e.first_cluster, e.file_size) {
                 match load_elf(data) {
                     Ok(info) => {
@@ -621,9 +619,9 @@ fn load_essentials_from_boot_image(rootfs_phys: usize, rootfs_size: usize) -> Bo
                         }
                         let _ = info.start();
                         send_fb_info(info.tid);
-                        println!("[init]   Console spawned TID {}", info.tid);
+                        println!("[init] Spawned console (TID {})", info.tid);
                     }
-                    Err(()) => println!("[init]   FAILED to spawn console"),
+                    Err(()) => println!("[init] FAILED to spawn console"),
                 }
             }
             break;
@@ -655,10 +653,6 @@ fn load_essentials_from_boot_image(rootfs_phys: usize, rootfs_size: usize) -> Bo
 
         let mut namebuf = [0u8; 16];
         let namelen = fat_name_to_buf(&e.name, &mut namebuf);
-        if let Ok(fname) = core::str::from_utf8(&namebuf[..namelen]) {
-            println!("[init] Loading {}", fname);
-        }
-
         if let Ok(data) = read_file_to_buffer(rootfs, &bpb, e.first_cluster, e.file_size) {
             match load_elf(data) {
                 Ok(info) => {
@@ -674,9 +668,14 @@ fn load_essentials_from_boot_image(rootfs_phys: usize, rootfs_size: usize) -> Bo
                         spawned_tids[spawned_count] = tid;
                         spawned_count += 1;
                     }
-                    println!("[init]   Spawned TID {}", tid);
+                    let base_len = e.name[0..8].iter().rposition(|&b| b != b' ').map_or(0, |p| p + 1);
+                    let mut lbuf = [0u8; 8];
+                    for j in 0..base_len { lbuf[j] = e.name[j].to_ascii_lowercase(); }
+                    if let Ok(name) = core::str::from_utf8(&lbuf[..base_len]) {
+                        println!("[init] Spawned {} (TID {})", name, tid);
+                    }
                 }
-                Err(()) => println!("[init]   FAILED to spawn"),
+                Err(()) => println!("[init] FAILED to spawn"),
             }
         }
     }
@@ -686,7 +685,6 @@ fn load_essentials_from_boot_image(rootfs_phys: usize, rootfs_size: usize) -> Bo
     for i in 0..count {
         let e = &entries[i];
         if &e.name[0..8] == b"INPUT   " && &e.name[8..11] == b"ELF" {
-            println!("[init] Loading INPUT.ELF");
             if let Ok(data) = read_file_to_buffer(rootfs, &bpb, e.first_cluster, e.file_size) {
                 match load_elf(data) {
                     Ok(info) => {
@@ -697,9 +695,9 @@ fn load_essentials_from_boot_image(rootfs_phys: usize, rootfs_size: usize) -> Bo
                         }
                         let _ = set_args(&info, &[b"input"]);
                         let _ = info.start();
-                        println!("[init]   Input spawned TID {}", info.tid);
+                        println!("[init] Spawned input (TID {})", info.tid);
                     }
-                    Err(()) => println!("[init]   FAILED to spawn input"),
+                    Err(()) => println!("[init] FAILED to spawn input"),
                 }
             }
             break;
@@ -718,7 +716,6 @@ fn load_essentials_from_boot_image(rootfs_phys: usize, rootfs_size: usize) -> Bo
     for i in 0..count {
         let e = &entries[i];
         if &e.name[0..8] == b"VFS     " && &e.name[8..11] == b"ELF" {
-            println!("[init] Loading VFS.ELF (deferred start)");
             if let Ok(data) = read_file_to_buffer(rootfs, &bpb, e.first_cluster, e.file_size) {
                 match load_elf(data) {
                     Ok(info) => {
@@ -731,10 +728,10 @@ fn load_essentials_from_boot_image(rootfs_phys: usize, rootfs_size: usize) -> Bo
                             let _ = syscall::sys_fd_set(info.tid, 0, input_tid, 1);
                         }
                         let _ = set_args(&info, &[b"vfs"]);
-                        println!("[init]   VFS loaded as TID {}", info.tid);
+                        println!("[init] Spawned vfs (TID {}, deferred start)", info.tid);
                         vfs_spawn = Some(info);
                     }
-                    Err(()) => println!("[init]   FAILED to load VFS"),
+                    Err(()) => println!("[init] FAILED to spawn vfs"),
                 }
             }
             break;
@@ -811,18 +808,14 @@ fn load_from_vfs(vfs_tid: usize, console_pipe: usize, input_tid: usize) -> Defer
     let name = match login_name.or(shell_name) {
         Some(n) => n,
         None => {
-            println!("[init] LOGIN.ELF/SHELL.ELF not found in /usr/bin");
+            println!("[init] login/shell not found in /usr/bin");
             return deferred;
         }
     };
 
     let mut namebuf = [0u8; 16];
     let namelen = fat_name_to_buf(&name, &mut namebuf);
-    if login_name.is_some() {
-        println!("[init] Loading LOGIN.ELF from VFS");
-    } else {
-        println!("[init] Loading SHELL.ELF from VFS (login not found)");
-    }
+    let loading_name = if login_name.is_some() { "login" } else { "shell" };
 
     // Build path: "/usr/bin/SHELL.ELF"
     let mut path = [0u8; 48];
@@ -880,7 +873,7 @@ fn load_from_vfs(vfs_tid: usize, console_pipe: usize, input_tid: usize) -> Defer
                 let _ = syscall::sys_fd_set(tid, 0, input_tid, 1);
             }
             let _ = set_args(&info, &[&namebuf[..namelen]]);
-            println!("[init]   Loaded TID {} (deferred start)", tid);
+            println!("[init] Spawned {} (TID {}, deferred start)", loading_name, tid);
             if deferred.count < MAX_DEFERRED {
                 deferred.spawns[deferred.count] = Some(info);
                 deferred.count += 1;
