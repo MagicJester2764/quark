@@ -7,6 +7,7 @@ const TAG_UDP_SEND: u64 = 1;
 const TAG_UDP_RECV: u64 = 2;
 const TAG_NET_CONFIG: u64 = 3;
 const TAG_NET_INFO: u64 = 4;
+const TAG_ICMP_PING: u64 = 5;
 const TAG_ERROR: u64 = u64::MAX;
 
 /// Send a UDP datagram. `phys_addr` must point to a page with the payload.
@@ -75,6 +76,27 @@ pub fn info(net_tid: usize) -> Result<(u64, u32), u64> {
     }
     if reply.tag == TAG_ERROR { return Err(reply.data[0]); }
     Ok((reply.data[0], reply.data[1] as u32))
+}
+
+/// Send an ICMP echo request and wait for the reply.
+/// `dst_ip` is packed big-endian. Returns (rtt_ticks, ttl, reply_bytes) on success.
+pub fn icmp_ping(net_tid: usize, dst_ip: u32, id: u16, seq: u16) -> Result<(u64, u8, usize), u64> {
+    let msg = Message {
+        sender: 0,
+        tag: TAG_ICMP_PING,
+        data: [dst_ip as u64, id as u64, seq as u64, 0, 0, 0],
+    };
+    let mut reply = Message::empty();
+    if syscall::sys_call(net_tid, &msg, &mut reply).is_err() {
+        return Err(1);
+    }
+    if reply.tag == TAG_ERROR {
+        return Err(reply.data[0]);
+    }
+    let rtt = reply.data[0];
+    let ttl = reply.data[1] as u8;
+    let size = reply.data[2] as usize;
+    Ok((rtt, ttl, size))
 }
 
 /// Configure IP address, netmask, and gateway (all packed big-endian u32).

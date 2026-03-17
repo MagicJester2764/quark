@@ -16,6 +16,7 @@ const TAG_UDP_SEND: u64 = 1;
 const TAG_UDP_RECV: u64 = 2;
 const TAG_NET_CONFIG: u64 = 3;
 const TAG_NET_INFO: u64 = 4;
+const TAG_ICMP_PING: u64 = 5;
 const TAG_OK: u64 = 0;
 const TAG_ERROR: u64 = u64::MAX;
 
@@ -169,6 +170,13 @@ struct UdpReader {
     port: u16,
 }
 
+struct PendingIcmp {
+    tid: usize,
+    id: u16,
+    seq: u16,
+    send_tick: u64,
+}
+
 struct NetState {
     io_base: u16,
     irq: u8,
@@ -182,6 +190,7 @@ struct NetState {
     tx_phys: [usize; NUM_TX_DESC],
     arp_cache: [ArpEntry; 8],
     pending_udp: Option<UdpReader>,
+    pending_icmp: Option<PendingIcmp>,
     ip_id: u16,
 }
 
@@ -201,6 +210,7 @@ static mut NET: NetState = NetState {
         [EMPTY; 8]
     },
     pending_udp: None,
+    pending_icmp: None,
     ip_id: 0,
 };
 
@@ -502,11 +512,69 @@ fn is_same_subnet(ip: &[u8; 4]) -> bool {
 // ICMP
 // ---------------------------------------------------------------------------
 
-fn handle_icmp(data: &[u8], src_ip: &[u8; 4]) {
+fn handle_icmp(data: &[u8], src_ip: &[u8; 4], ttl: u8) {
     if data.len() < 8 { return; }
     if data[0] == ICMP_ECHO_REQUEST && data[1] == 0 {
         send_icmp_echo_reply(src_ip, data);
+    } else if data[0] == ICMP_ECHO_REPLY && data[1] == 0 {
+        let id = u16::from_be_bytes([data[4], data[5]]);
+        let seq = u16::from_be_bytes([data[6], data[7]]);
+        unsafe {
+            if let Some(ref pending) = NET.pending_icmp {
+                if pending.id == id && pending.seq == seq {
+                    let rtt = syscall::sys_ticks() - pending.send_tick;
+                    let reply = Message {
+                        sender: 0,
+                        tag: TAG_OK,
+                        data: [rtt, ttl as u64, data.len() as u64, 0, 0, 0],
+                    };
+                    let _ = syscall::sys_reply(pending.tid, &reply);
+                    NET.pending_icmp = None;
+                }
+            }
+        }
     }
+}
+
+fn send_icmp_echo_request(dst_ip: &[u8; 4], id: u16, seq: u16) {
+    let mac = unsafe { NET.mac };
+    let ip = unsafe { NET.ip };
+
+    let dst_mac = match resolve_mac(dst_ip) {
+        Some(m) => m,
+        None => return,
+    };
+
+    // ICMP echo request: type(1) + code(1) + checksum(2) + id(2) + seq(2) + 32 bytes payload
+    const ICMP_LEN: usize = 40;
+    let total = ETH_HLEN + IP_HLEN + ICMP_LEN;
+
+    let mut pkt = [0u8; MAX_PKT];
+
+    // Ethernet
+    pkt[0..6].copy_from_slice(&dst_mac);
+    pkt[6..12].copy_from_slice(&mac);
+    pkt[12..14].copy_from_slice(&ETHERTYPE_IP.to_be_bytes());
+
+    // IP
+    build_ip_header(&mut pkt[ETH_HLEN..], &ip, dst_ip, IP_PROTO_ICMP, ICMP_LEN as u16);
+
+    // ICMP
+    let off = ETH_HLEN + IP_HLEN;
+    pkt[off] = ICMP_ECHO_REQUEST;
+    pkt[off + 1] = 0; // code
+    pkt[off + 2] = 0; // checksum placeholder
+    pkt[off + 3] = 0;
+    pkt[off + 4..off + 6].copy_from_slice(&id.to_be_bytes());
+    pkt[off + 6..off + 8].copy_from_slice(&seq.to_be_bytes());
+    // Fill payload with sequence pattern
+    for i in 0..32 {
+        pkt[off + 8 + i] = i as u8;
+    }
+    let cksum = checksum(&pkt[off..off + ICMP_LEN]);
+    pkt[off + 2..off + 4].copy_from_slice(&cksum.to_be_bytes());
+
+    send_raw(&pkt[..total]);
 }
 
 fn send_icmp_echo_reply(dst_ip: &[u8; 4], request: &[u8]) {
@@ -555,6 +623,7 @@ fn handle_ip(data: &[u8]) {
     let total_len = u16::from_be_bytes([data[2], data[3]]) as usize;
     if data.len() < total_len || total_len < ihl { return; }
 
+    let ttl = data[8];
     let proto = data[9];
     let src_ip: [u8; 4] = data[12..16].try_into().unwrap();
     let dst_ip: [u8; 4] = data[16..20].try_into().unwrap();
@@ -565,7 +634,7 @@ fn handle_ip(data: &[u8]) {
 
     let payload = &data[ihl..total_len];
     match proto {
-        IP_PROTO_ICMP => handle_icmp(payload, &src_ip),
+        IP_PROTO_ICMP => handle_icmp(payload, &src_ip, ttl),
         IP_PROTO_UDP => handle_udp(payload, &src_ip),
         _ => {}
     }
@@ -740,6 +809,20 @@ pub extern "C" fn _start() -> ! {
                     process_rx();
                 }
             }
+            // Check ICMP ping timeout (300 ticks = 3 seconds at 100 Hz)
+            unsafe {
+                if let Some(ref pending) = NET.pending_icmp {
+                    if syscall::sys_ticks() - pending.send_tick > 300 {
+                        let reply = Message {
+                            sender: 0,
+                            tag: TAG_ERROR,
+                            data: [1, 0, 0, 0, 0, 0],
+                        };
+                        let _ = syscall::sys_reply(pending.tid, &reply);
+                        NET.pending_icmp = None;
+                    }
+                }
+            }
             syscall::sys_irq_ack(irq);
             continue;
         }
@@ -791,6 +874,21 @@ pub extern "C" fn _start() -> ! {
                 println!("[net] Config: {}.{}.{}.{}", new_ip[0], new_ip[1], new_ip[2], new_ip[3]);
                 let reply = Message { sender: 0, tag: TAG_OK, data: [0; 6] };
                 let _ = syscall::sys_reply(msg.sender, &reply);
+            }
+            TAG_ICMP_PING => {
+                let dst_ip = (msg.data[0] as u32).to_be_bytes();
+                let id = msg.data[1] as u16;
+                let seq = msg.data[2] as u16;
+                send_icmp_echo_request(&dst_ip, id, seq);
+                unsafe {
+                    NET.pending_icmp = Some(PendingIcmp {
+                        tid: msg.sender,
+                        id,
+                        seq,
+                        send_tick: syscall::sys_ticks(),
+                    });
+                }
+                // Deferred reply — do not reply now
             }
             TAG_NET_INFO => {
                 let mac = unsafe { NET.mac };

@@ -63,6 +63,9 @@ PS_ELF := $(PS_DIR)/target/$(TARGET)/release/ps
 IPCPING_DIR := user/ipcping
 IPCPING_ELF := $(IPCPING_DIR)/target/$(TARGET)/release/ipcping
 
+PING_DIR := user/ping
+PING_ELF := $(PING_DIR)/target/$(TARGET)/release/ping
+
 .PHONY: all clean iso run run-uefi drivers user FORCE
 
 all: $(KERNEL) drivers user
@@ -81,7 +84,7 @@ $(FAT32_DRV_BIN): FORCE
 	cd $(FAT32_DRV_DIR) && cargo build --release
 	objcopy -O binary $(FAT32_DRV_ELF) $(FAT32_DRV_BIN)
 
-user: $(INIT_ELF) $(HELLO_ELF) $(NS_ELF) $(KBD_ELF) $(CON_ELF) $(INP_ELF) $(DISK_ELF) $(DISKTEST_ELF) $(VFS_ELF) $(NET_ELF) $(SHELL_ELF) $(ECHO_ELF) $(LS_ELF) $(CAT_ELF) $(LOGIN_ELF) $(PS_ELF) $(IPCPING_ELF)
+user: $(INIT_ELF) $(HELLO_ELF) $(NS_ELF) $(KBD_ELF) $(CON_ELF) $(INP_ELF) $(DISK_ELF) $(DISKTEST_ELF) $(VFS_ELF) $(NET_ELF) $(SHELL_ELF) $(ECHO_ELF) $(LS_ELF) $(CAT_ELF) $(LOGIN_ELF) $(PS_ELF) $(IPCPING_ELF) $(PING_ELF)
 
 $(INIT_ELF): FORCE
 	cd $(INIT_DIR) && cargo build --release
@@ -134,6 +137,9 @@ $(PS_ELF): FORCE
 $(IPCPING_ELF): FORCE
 	cd $(IPCPING_DIR) && cargo build --release
 
+$(PING_ELF): FORCE
+	cd $(PING_DIR) && cargo build --release
+
 iso: $(KERNEL)
 	@mkdir -p isodir/boot/grub
 	@cp $(KERNEL) isodir/boot/kernel.bin
@@ -170,6 +176,7 @@ clean:
 	cd $(LOGIN_DIR) && cargo clean
 	cd $(PS_DIR) && cargo clean
 	cd $(IPCPING_DIR) && cargo clean
+	cd $(PING_DIR) && cargo clean
 	rm -rf $(KERNEL) $(VGA_DRV_BIN) $(FAT32_DRV_BIN) quark.iso isodir
 
 FORCE:
