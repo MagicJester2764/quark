@@ -278,12 +278,12 @@ pub extern "C" fn _start() -> ! {
             start += 1;
         }
 
-        // Default to root if empty
-        let username = if start >= end {
-            b"root" as &[u8]
-        } else {
-            &line_buf[start..end]
-        };
+        // Ctrl+C or empty input — re-prompt
+        if n == 0 || start >= end {
+            continue;
+        }
+
+        let username = &line_buf[start..end];
 
         // Read /etc/PASSWD
         let passwd_data = match load_passwd_file(vfs_tid) {
