@@ -469,6 +469,8 @@ fn grant_caps_by_name(name: &[u8; 11], tid: usize) {
     } else if base == b"NET     " {
         let _ = syscall::sys_grant_cap(tid,
             syscall::CAP_IOPORT | syscall::CAP_IRQ | syscall::CAP_PHYS_ALLOC | syscall::CAP_MAP_PHYS);
+    } else if base == b"INPUT   " {
+        let _ = syscall::sys_grant_cap(tid, syscall::CAP_TASK_MGMT);
     } else if base == b"SHELL   " {
         let _ = syscall::sys_grant_cap(tid,
             syscall::CAP_TASK_MGMT | syscall::CAP_PHYS_ALLOC | syscall::CAP_MAP_PHYS);

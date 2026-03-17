@@ -16,6 +16,13 @@ const TAG_KEY_EVENT: u64 = 2;
 
 // Input server protocol (serving readers)
 const TAG_READ: u64 = 1;
+const TAG_SET_FOREGROUND: u64 = 2;
+
+// Keyboard registration
+const TAG_REGISTER_SIGINT: u64 = 4;
+
+// Notification tag from kernel
+const TAG_NOTIFICATION: u64 = 0xFFFF_0002;
 
 const KEY_PRESS: u64 = 1;
 
@@ -36,85 +43,94 @@ pub extern "C" fn _start() -> ! {
 
     // Register as "input" with nameserver
     register_with_nameserver();
+
+    // Register with keyboard driver for Ctrl+C notifications
+    register_sigint(kbd_tid);
+
     println!("[input] Ready.");
 
     let mut line_buf = [0u8; LINE_BUF_SIZE];
     let mut line_len: usize = 0;
+    let mut foreground_tid: usize = 0;
 
-    // Main loop: multiplex between keyboard events and reader requests.
-    // We alternate between polling keyboard and checking for reader requests.
     loop {
-        // If we have a complete line and a waiting reader, deliver it
-        // (handled below after newline)
-
-        // Check for incoming reader requests (non-blocking would be nice,
-        // but we only have blocking recv). Strategy: if no reader is waiting,
-        // block on TID_ANY to get either a reader or we need to handle
-        // keyboard differently.
-        //
-        // The approach: always recv from TID_ANY.
-        // - If it's from a client (not keyboard, not kernel): it's a read request
-        // - Then we loop getting keys from keyboard until newline
-        // - Reply to the reader with the line
-
         let mut msg = Message::empty();
         if syscall::sys_recv(TID_ANY, &mut msg).is_err() {
             continue;
         }
 
-        // Got a read request from a client
-        if msg.tag == TAG_READ {
-            let max_bytes = (msg.data[0] as usize).min(40);
-            let reader_tid = msg.sender;
+        match msg.tag {
+            TAG_SET_FOREGROUND => {
+                foreground_tid = msg.data[0] as usize;
+                let reply = Message { sender: 0, tag: 0, data: [0; 6] };
+                let _ = syscall::sys_reply(msg.sender, &reply);
+            }
+            TAG_NOTIFICATION => {
+                // Ctrl+C notification from keyboard driver (while no one is reading)
+                handle_ctrl_c(&mut foreground_tid, &mut line_len);
+            }
+            TAG_READ => {
+                let max_bytes = (msg.data[0] as usize).min(40);
+                let reader_tid = msg.sender;
 
-            // Read keys until we have a newline
-            loop {
-                let ascii = get_key_blocking(kbd_tid);
-                if ascii == 0 {
-                    continue;
-                }
+                // Read keys until we have a newline
+                loop {
+                    let ascii = get_key_blocking(kbd_tid);
+                    if ascii == 0 {
+                        continue;
+                    }
 
-                match ascii {
-                    b'\n' | 13 => {
-                        // Newline — echo and deliver
-                        print!("\n");
-                        // Include newline in the buffer if room
-                        if line_len < LINE_BUF_SIZE {
-                            line_buf[line_len] = b'\n';
-                            line_len += 1;
+                    match ascii {
+                        0x03 => {
+                            // Ctrl+C while reading
+                            print!("^C\n");
+                            line_len = 0;
+                            if foreground_tid != 0 {
+                                let _ = syscall::sys_task_kill(foreground_tid);
+                                foreground_tid = 0;
+                            }
+                            // Reply with 0 bytes to unblock the reader
+                            let reply = pack_read_reply(&line_buf, 0);
+                            let _ = syscall::sys_reply(reader_tid, &reply);
+                            break;
                         }
-                        // Deliver to reader
-                        let deliver_len = line_len.min(max_bytes);
-                        let reply = pack_read_reply(&line_buf, deliver_len);
-                        let _ = syscall::sys_reply(reader_tid, &reply);
-                        line_len = 0;
-                        break;
-                    }
-                    8 | 127 => {
-                        // Backspace
-                        if line_len > 0 {
-                            line_len -= 1;
-                            // Erase on screen: backspace, space, backspace
-                            print!("\x08 \x08");
+                        b'\n' | 13 => {
+                            // Newline — echo and deliver
+                            print!("\n");
+                            if line_len < LINE_BUF_SIZE {
+                                line_buf[line_len] = b'\n';
+                                line_len += 1;
+                            }
+                            let deliver_len = line_len.min(max_bytes);
+                            let reply = pack_read_reply(&line_buf, deliver_len);
+                            let _ = syscall::sys_reply(reader_tid, &reply);
+                            line_len = 0;
+                            break;
                         }
-                    }
-                    c if c >= 0x20 => {
-                        // Printable character
-                        if line_len < LINE_BUF_SIZE - 1 {
-                            line_buf[line_len] = c;
-                            line_len += 1;
-                            // Echo
-                            let ch = [c];
-                            if let Ok(s) = core::str::from_utf8(&ch) {
-                                print!("{}", s);
+                        8 | 127 => {
+                            // Backspace
+                            if line_len > 0 {
+                                line_len -= 1;
+                                print!("\x08 \x08");
                             }
                         }
+                        c if c >= 0x20 => {
+                            // Printable character
+                            if line_len < LINE_BUF_SIZE - 1 {
+                                line_buf[line_len] = c;
+                                line_len += 1;
+                                let ch = [c];
+                                if let Ok(s) = core::str::from_utf8(&ch) {
+                                    print!("{}", s);
+                                }
+                            }
+                        }
+                        _ => {}
                     }
-                    _ => {}
                 }
             }
+            _ => {}
         }
-        // Ignore other message types
     }
 }
 
@@ -158,6 +174,25 @@ fn pack_read_reply(buf: &[u8], len: usize) -> Message {
         sender: 0,
         tag: TAG_READ,
         data,
+    }
+}
+
+fn register_sigint(kbd_tid: usize) {
+    let msg = Message {
+        sender: 0,
+        tag: TAG_REGISTER_SIGINT,
+        data: [0; 6],
+    };
+    let mut reply = Message::empty();
+    let _ = syscall::sys_call(kbd_tid, &msg, &mut reply);
+}
+
+fn handle_ctrl_c(foreground_tid: &mut usize, line_len: &mut usize) {
+    print!("^C\n");
+    *line_len = 0;
+    if *foreground_tid != 0 {
+        let _ = syscall::sys_task_kill(*foreground_tid);
+        *foreground_tid = 0;
     }
 }
 

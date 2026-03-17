@@ -8,6 +8,7 @@ use libquark::stdio::read_line;
 const PAGE_SIZE: usize = 4096;
 const NAMESERVER_TID: usize = 2;
 const TAG_NS_LOOKUP: u64 = 2;
+const TAG_SET_FOREGROUND: u64 = 2;
 
 // Shell temp address ranges (non-overlapping with init's 0x82-0x88)
 const FILE_BUF_BASE: usize = 0x90_0000_0000;
@@ -280,10 +281,21 @@ fn ends_with_elf(path: &[u8]) -> bool {
 // Command execution
 // ---------------------------------------------------------------------------
 
+fn set_foreground(input_tid: usize, child_tid: usize) {
+    let msg = Message {
+        sender: 0,
+        tag: TAG_SET_FOREGROUND,
+        data: [child_tid as u64, 0, 0, 0, 0, 0],
+    };
+    let mut reply = Message::empty();
+    let _ = syscall::sys_call(input_tid, &msg, &mut reply);
+}
+
 fn cmd_exec(
     cmd: &[u8],
     args_str: &[u8],
     vfs_tid: usize,
+    input_tid: usize,
 ) {
     let mut path = [0u8; 64];
     let pos = build_path(cmd, &mut path);
@@ -406,7 +418,13 @@ fn cmd_exec(
         return;
     }
 
+    if input_tid != 0 {
+        set_foreground(input_tid, tid);
+    }
     let _ = syscall::sys_wait();
+    if input_tid != 0 {
+        set_foreground(input_tid, 0);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -572,6 +590,8 @@ pub extern "C" fn _start() -> ! {
         }
     };
 
+    let input_tid = lookup_service(b"input").unwrap_or(0);
+
     // Main loop
     let mut line_buf = [0u8; 256];
     loop {
@@ -674,7 +694,7 @@ pub extern "C" fn _start() -> ! {
         let resolved_args = resolve_args(cmd, args_str, &mut resolved_args_buf);
 
         // External command
-        cmd_exec(cmd, resolved_args, vfs_tid);
+        cmd_exec(cmd, resolved_args, vfs_tid, input_tid);
     }
 }
 

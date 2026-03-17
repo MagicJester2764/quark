@@ -14,6 +14,7 @@ const TAG_NS_REGISTER: u64 = 1;
 const TAG_GET_KEY: u64 = 1;
 const TAG_KEY_EVENT: u64 = 2;
 const TAG_NO_KEY: u64 = 3;
+const TAG_REGISTER_SIGINT: u64 = 4;
 
 // Key event types
 const KEY_PRESS: u64 = 1;
@@ -131,6 +132,7 @@ pub extern "C" fn _start() -> ! {
     let mut modifiers: u8 = 0;
     let mut extended = false;
     let mut waiting_client: Option<usize> = None;
+    let mut sigint_tid: usize = 0;
 
     loop {
         let mut msg = Message::empty();
@@ -190,11 +192,21 @@ pub extern "C" fn _start() -> ! {
 
             // Translate to ASCII
             let use_shifted = (modifiers & MOD_SHIFT != 0) ^ (modifiers & MOD_CAPSLOCK != 0);
-            let ascii = if use_shifted {
+            let mut ascii = if use_shifted {
                 SCANCODE_SHIFTED[scancode as usize]
             } else {
                 SCANCODE_UNSHIFTED[scancode as usize]
             };
+
+            // Ctrl transformation: Ctrl+letter produces 0x01-0x1A
+            if modifiers & MOD_CTRL != 0 && ascii >= b'a' && ascii <= b'z' {
+                ascii &= 0x1F;
+            }
+
+            // Notify input server on Ctrl+C key press
+            if press && ascii == 0x03 && sigint_tid != 0 {
+                let _ = syscall::sys_notify(sigint_tid, 1);
+            }
 
             let ev = KeyEvent {
                 press,
@@ -224,6 +236,15 @@ pub extern "C" fn _start() -> ! {
                         // No key available — save client to reply later
                         waiting_client = Some(msg.sender);
                     }
+                }
+                TAG_REGISTER_SIGINT => {
+                    sigint_tid = msg.sender;
+                    let reply = Message {
+                        sender: 0,
+                        tag: 0,
+                        data: [0; 6],
+                    };
+                    let _ = syscall::sys_reply(msg.sender, &reply);
                 }
                 _ => {
                     let reply = Message {
