@@ -536,13 +536,13 @@ fn handle_icmp(data: &[u8], src_ip: &[u8; 4], ttl: u8) {
     }
 }
 
-fn send_icmp_echo_request(dst_ip: &[u8; 4], id: u16, seq: u16) {
+fn send_icmp_echo_request(dst_ip: &[u8; 4], id: u16, seq: u16) -> bool {
     let mac = unsafe { NET.mac };
     let ip = unsafe { NET.ip };
 
     let dst_mac = match resolve_mac(dst_ip) {
         Some(m) => m,
-        None => return,
+        None => return false,
     };
 
     // ICMP echo request: type(1) + code(1) + checksum(2) + id(2) + seq(2) + 32 bytes payload
@@ -575,6 +575,7 @@ fn send_icmp_echo_request(dst_ip: &[u8; 4], id: u16, seq: u16) {
     pkt[off + 2..off + 4].copy_from_slice(&cksum.to_be_bytes());
 
     send_raw(&pkt[..total]);
+    true
 }
 
 fn send_icmp_echo_reply(dst_ip: &[u8; 4], request: &[u8]) {
@@ -879,16 +880,52 @@ pub extern "C" fn _start() -> ! {
                 let dst_ip = (msg.data[0] as u32).to_be_bytes();
                 let id = msg.data[1] as u16;
                 let seq = msg.data[2] as u16;
-                send_icmp_echo_request(&dst_ip, id, seq);
-                unsafe {
-                    NET.pending_icmp = Some(PendingIcmp {
-                        tid: msg.sender,
-                        id,
-                        seq,
-                        send_tick: syscall::sys_ticks(),
-                    });
+
+                // If ARP isn't cached, resolve_mac sends a request and returns
+                // false.  Poll the NIC directly so the ARP reply can arrive
+                // before we give up.
+                let mut sent = send_icmp_echo_request(&dst_ip, id, seq);
+                if !sent {
+                    let io_base = unsafe { NET.io_base };
+                    let next_hop = if is_same_subnet(&dst_ip) {
+                        dst_ip
+                    } else {
+                        unsafe { NET.gateway }
+                    };
+                    for _ in 0..200 {
+                        syscall::sys_yield();
+                        let isr = inw(io_base + REG_ISR);
+                        if isr != 0 {
+                            outw(io_base + REG_ISR, isr);
+                            if isr & ISR_ROK != 0 {
+                                process_rx();
+                            }
+                        }
+                        if arp_lookup(&next_hop).is_some() {
+                            sent = send_icmp_echo_request(&dst_ip, id, seq);
+                            break;
+                        }
+                    }
                 }
-                // Deferred reply — do not reply now
+
+                if sent {
+                    unsafe {
+                        NET.pending_icmp = Some(PendingIcmp {
+                            tid: msg.sender,
+                            id,
+                            seq,
+                            send_tick: syscall::sys_ticks(),
+                        });
+                    }
+                    // Deferred reply — do not reply now
+                } else {
+                    let reply = Message {
+                        sender: 0,
+                        tag: TAG_ERROR,
+                        data: [2, 0, 0, 0, 0, 0],
+                    };
+                    let _ = syscall::sys_reply(msg.sender, &reply);
+                }
             }
             TAG_NET_INFO => {
                 let mac = unsafe { NET.mac };
