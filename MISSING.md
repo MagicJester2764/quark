@@ -54,3 +54,5 @@ Scheduler, synchronous IPC, address spaces, capabilities, fd table, IRQ delegati
 21. ~~**Task listing (`ps`)**~~ — **Done.** `sys_task_info(tid)` (syscall 105) returns task state, UID, and parent TID. `ps` command lists all running tasks.
 
 22. **Filesystem permissions** — FAT32 has no ownership/permissions. Options: sidecar `.permissions` files per directory, or switch to ext2. VFS would query caller UID via `SYS_GET_TUID(sender_tid)` and check against file ownership. Alternative: kernel includes sender UID in IPC messages (more secure). Also needed for setuid binaries.
+
+23. **`shutdown` program** — Userspace utility to cleanly shut down the system. Would notify running services to flush and exit, then invoke ACPI power-off (or QEMU `isa-debug-exit`). Needs signal delivery (#17) for graceful service teardown.
