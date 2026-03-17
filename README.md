@@ -34,7 +34,7 @@ User space provides:
 - **Init** (`user/init`) — Two-phase ELF loader: essential services from boot image, remaining programs from disk via GPT/FAT32. Passes program arguments, wires fds, grants capabilities, enforces sequential startup. Launches login (or shell as fallback).
 - **Login** (`user/login`) — multi-user login program: prompts for username, reads `/etc/PASSWD`, sets UID/GID, spawns shell with user's home directory
 - **Nameserver** (`user/nameserver`) — service discovery via name registration/lookup
-- **Console server** (`user/console`) — framebuffer text rendering via font8x8 with ANSI escape sequence support (cursor movement, colors, clear screen), blinking underline cursor, pipe-based I/O transport
+- **Console server** (`user/console`) — framebuffer text rendering via font8x16 with ANSI escape sequence support (cursor movement, colors, clear screen), blinking underline cursor, pipe-based I/O transport
 - **Keyboard driver** (`user/keyboard`) — PS/2 scancode translation, IRQ 1 handling
 - **Input server** (`user/input`) — line discipline (echo, backspace, newline) wrapping the keyboard driver
 - **Disk driver** (`user/disk`) — ATA PIO disk driver (read + write), multi-sector reads, registers as "disk" with nameserver
@@ -47,6 +47,7 @@ User space provides:
 - **Ps** (`user/ps`) — lists running tasks with TID, state, UID, and parent TID
 - **Ipcping** (`user/ipcping`) — measures IPC round-trip latency to named services via nameserver lookup
 - **Hello** (`user/hello`) — test program that exercises heap allocation and sleep
+- **Ping** (`user/ping`) — ICMP echo (ping) utility using the net driver
 - **Disktest** (`user/disktest`) — reads sector 0 from disk and prints hex dump
 
 ## How it works
@@ -122,11 +123,11 @@ drivers/
   fat32/              FAT32 filesystem driver (flat binary)
 
 user/
-  libquark/           User-space library (syscalls, IPC, stdio, allocator, sync, vfs, net, passwd, args)
+  libquark/           User-space library (syscalls, IPC, stdio, console, allocator, sync, vfs, net, passwd, args)
   init/               Init process (two-phase boot, GPT/FAT32 disk reader, service wiring)
   login/              Multi-user login program (passwd lookup, UID/GID, shell spawning)
   nameserver/         Service name registry
-  console/            Framebuffer console server (font8x8, blinking cursor, pipe I/O)
+  console/            Framebuffer console server (font8x16, blinking cursor, pipe I/O)
   keyboard/           PS/2 keyboard driver (IRQ 1, scancode set 1)
   input/              Line-discipline input server
   disk/               ATA PIO disk driver (primary master, LBA28, read + write, multi-sector, yield-polling)
@@ -138,6 +139,7 @@ user/
   cat/                File reader via VFS
   ps/                 Task list (TID, state, UID, parent)
   ipcping/            IPC latency measurement tool
+  ping/               ICMP echo (ping) utility
   disktest/           Disk test program (reads and dumps sector 0)
   hello/              Test program (heap allocation, sleep)
 ```
