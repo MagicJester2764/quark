@@ -2,7 +2,8 @@
 #![no_main]
 #![allow(static_mut_refs)]
 
-use font8x8::legacy::BASIC_LEGACY;
+mod font8x16;
+
 use libquark::ipc::{Message, TID_ANY};
 use libquark::{println, syscall};
 
@@ -15,7 +16,7 @@ const TAG_NS_REGISTER: u64 = 1;
 const TAG_FB_INIT: u64 = 100;
 
 const GLYPH_W: usize = 8;
-const GLYPH_H: usize = 8;
+const GLYPH_H: usize = 16;
 
 static mut FB: usize = 0;
 static mut PITCH: usize = 0;
@@ -238,11 +239,7 @@ fn putc(c: u8) {
 }
 
 fn draw_glyph(col: usize, row: usize, ch: u8, fg: u32) {
-    let glyph = if (ch as usize) < BASIC_LEGACY.len() {
-        BASIC_LEGACY[ch as usize]
-    } else {
-        BASIC_LEGACY[b'?' as usize]
-    };
+    let glyph = &font8x16::FONT[ch as usize];
 
     let pixel_x = col * GLYPH_W;
     let pixel_y = row * GLYPH_H;
@@ -254,8 +251,8 @@ fn draw_glyph(col: usize, row: usize, ch: u8, fg: u32) {
             let y = pixel_y + gy;
             let row_base = FB + y * PITCH + pixel_x * bytes_per_pixel;
 
-            for gx in 0..GLYPH_W {
-                let on = (glyph_row >> gx) & 1 != 0;
+            for gx in 0..8 {
+                let on = (glyph_row >> (7 - gx)) & 1 != 0;
                 let color = if on { fg } else { 0 };
                 let px = row_base + gx * bytes_per_pixel;
 
