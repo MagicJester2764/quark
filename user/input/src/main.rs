@@ -191,7 +191,7 @@ fn handle_ctrl_c(foreground_tid: &mut usize, line_len: &mut usize) {
     print!("^C\n");
     *line_len = 0;
     if *foreground_tid != 0 {
-        let _ = syscall::sys_task_kill(*foreground_tid);
+        let _ = syscall::sys_signal(*foreground_tid, syscall::SIG_INT);
         *foreground_tid = 0;
     }
 }

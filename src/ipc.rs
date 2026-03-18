@@ -85,8 +85,8 @@ pub const SIG_TERM: u64 = 1 << 17;
 pub const SIG_KILL: u64 = 1 << 18;
 pub const SIG_MASK: u64 = SIG_INT | SIG_TERM | SIG_KILL;
 
-/// Ticks before a signaled task is force-killed (2 seconds at 100 Hz).
-const SIGNAL_KILL_TIMEOUT: u64 = 200;
+/// Ticks before a signaled task is force-killed (5 seconds at 100 Hz).
+const SIGNAL_KILL_TIMEOUT: u64 = 500;
 
 /// Asynchronous notification: OR `badge` into dest's notification word.
 /// Non-blocking. Wakes the dest task if it is RecvBlocked(0) or RecvBlocked(TID_ANY).
