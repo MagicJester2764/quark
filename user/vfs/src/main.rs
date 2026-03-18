@@ -50,7 +50,7 @@ const SHMEM_BUF: usize = 0x8B_0000_0000;
 // Sector cache
 // ---------------------------------------------------------------------------
 
-const CACHE_ENTRIES: usize = 16;
+const CACHE_ENTRIES: usize = 64;
 
 struct CacheEntry {
     valid: bool,
@@ -1243,17 +1243,21 @@ pub extern "C" fn _start() -> ! {
         syscall::sys_exit();
     }
 
-    // Allocate sector cache buffer (2 pages = 8 KiB for 16 x 512-byte entries)
-    let cache_phys = match syscall::sys_phys_alloc(2) {
-        Ok(p) => p,
-        Err(()) => {
-            println!("[vfs] Failed to alloc cache pages.");
+    // Allocate sector cache buffer (8 pages = 32 KiB for 64 x 512-byte entries)
+    // Allocate one page at a time since phys_alloc doesn't guarantee contiguity.
+    let cache_pages = 8;
+    for i in 0..cache_pages {
+        let phys = match syscall::sys_phys_alloc(1) {
+            Ok(p) => p,
+            Err(()) => {
+                println!("[vfs] Failed to alloc cache page.");
+                syscall::sys_exit();
+            }
+        };
+        if syscall::sys_map_phys(phys, CACHE_BUF_BASE + i * PAGE_SIZE, 1).is_err() {
+            println!("[vfs] Failed to map cache buffer.");
             syscall::sys_exit();
         }
-    };
-    if syscall::sys_map_phys(cache_phys, CACHE_BUF_BASE, 2).is_err() {
-        println!("[vfs] Failed to map cache buffer.");
-        syscall::sys_exit();
     }
 
     // Find rootfs partition
