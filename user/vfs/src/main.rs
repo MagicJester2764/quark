@@ -50,20 +50,20 @@ const SHMEM_BUF: usize = 0x8B_0000_0000;
 // Sector cache
 // ---------------------------------------------------------------------------
 
-const CACHE_ENTRIES: usize = 64;
-const HASH_BUCKETS: usize = 32;
-const NONE: u8 = 0xFF; // sentinel for "no entry"
+const CACHE_ENTRIES: usize = 256;
+const HASH_BUCKETS: usize = 128;
+const NONE: u16 = 0xFFFF; // sentinel for "no entry"
 
 struct CacheEntry {
     valid: bool,
     used: bool,
     lba: u32,
-    hash_next: u8, // next slot in hash chain, NONE = end
+    hash_next: u16, // next slot in hash chain, NONE = end
 }
 
 struct SectorCache {
     entries: [CacheEntry; CACHE_ENTRIES],
-    buckets: [u8; HASH_BUCKETS],
+    buckets: [u16; HASH_BUCKETS],
     clock_hand: usize,
 }
 
@@ -145,13 +145,13 @@ impl SectorCache {
     fn link(&mut self, idx: usize) {
         let bucket = (self.entries[idx].lba as usize) % HASH_BUCKETS;
         self.entries[idx].hash_next = self.buckets[bucket];
-        self.buckets[bucket] = idx as u8;
+        self.buckets[bucket] = idx as u16;
     }
 
     /// Remove slot `idx` from its hash bucket chain.
     fn unlink(&mut self, idx: usize) {
         let bucket = (self.entries[idx].lba as usize) % HASH_BUCKETS;
-        let target = idx as u8;
+        let target = idx as u16;
         if self.buckets[bucket] == target {
             self.buckets[bucket] = self.entries[idx].hash_next;
         } else {
@@ -1291,9 +1291,9 @@ pub extern "C" fn _start() -> ! {
         syscall::sys_exit();
     }
 
-    // Allocate sector cache buffer (8 pages = 32 KiB for 64 x 512-byte entries)
+    // Allocate sector cache buffer (32 pages = 128 KiB for 256 x 512-byte entries)
     // Allocate one page at a time since phys_alloc doesn't guarantee contiguity.
-    let cache_pages = 8;
+    let cache_pages = 32;
     for i in 0..cache_pages {
         let phys = match syscall::sys_phys_alloc(1) {
             Ok(p) => p,
