@@ -114,6 +114,11 @@ pub fn sys_notify(dest: usize, badge: u64) -> Result<(), IpcError> {
 /// Send a signal to a task. SIG_KILL immediately kills; other signals are
 /// delivered as notification badges with a force-kill deadline.
 /// Permission checking is done in syscall_dispatch (same as sys_task_kill).
+///
+/// Unlike plain `sys_notify`, this also interrupts tasks blocked in IPC calls
+/// (CallBlocked, CallSendBlocked, SendBlocked, RecvBlocked with specific sender).
+/// The interrupted syscall returns an error, allowing the task to check its
+/// notification word and handle the signal.
 pub fn sys_signal(dest: usize, sig: u64) -> Result<(), IpcError> {
     if dest >= MAX_TASKS || dest <= 1 {
         return Err(IpcError::InvalidTid);
@@ -128,8 +133,30 @@ pub fn sys_signal(dest: usize, sig: u64) -> Result<(), IpcError> {
         return Ok(());
     }
 
-    // Deliver signal bits via notification word
+    // Deliver signal bits via notification word and wake if RecvBlocked(0|TID_ANY)
     sys_notify(dest, sig)?;
+
+    // Force-unblock from IPC states that sys_notify doesn't handle.
+    // The interrupted syscall will return an error to the caller:
+    //   - sys_call → Err(DeadTask) because pending_msg is None
+    //   - sys_send → returns Ok (harmless)
+    //   - sys_recv with specific sender → Err(WouldBlock)
+    // The signal bits remain in the notification word for the task to check.
+    unsafe {
+        match TASK_IPC[dest].state {
+            IpcState::CallBlocked(_) | IpcState::CallSendBlocked(_) | IpcState::SendBlocked(_) => {
+                TASK_IPC[dest].pending_msg = None;
+                TASK_IPC[dest].state = IpcState::None;
+                scheduler::unblock_task(dest);
+            }
+            IpcState::RecvBlocked(from) if from != 0 && from != TID_ANY => {
+                // sys_notify only handles RecvBlocked(0|TID_ANY); interrupt specific waits too
+                TASK_IPC[dest].state = IpcState::None;
+                scheduler::unblock_task(dest);
+            }
+            _ => {} // None or RecvBlocked(0|TID_ANY) already handled by sys_notify
+        }
+    }
 
     // Set force-kill deadline (only if not already set — don't extend)
     unsafe {

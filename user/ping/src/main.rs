@@ -2,7 +2,7 @@
 #![no_main]
 
 use libquark::ipc::Message;
-use libquark::{args, println, syscall};
+use libquark::{args, println, signal, syscall};
 use libquark::net;
 
 const NAMESERVER_TID: usize = 2;
@@ -142,8 +142,17 @@ pub extern "C" fn _start() -> ! {
     let mut total = 0u64;
     let mut ok = 0usize;
 
+    let mut sent = 0usize;
     for seq in 0..count {
-        match net::icmp_ping(net_tid, dst_ip, pid, seq as u16) {
+        sent += 1;
+        let ping_result = net::icmp_ping(net_tid, dst_ip, pid, seq as u16);
+
+        // Non-blocking check: did a signal arrive (possibly interrupting the IPC call)?
+        let mut msg = Message::empty();
+        let signaled = syscall::sys_recv_timeout(0, &mut msg, 0).is_ok()
+            && signal::extract_signal(&msg) != 0;
+
+        match ping_result {
             Ok((rtt_ticks, ttl, size)) => {
                 let ms = rtt_ticks * 10;
                 println!(
@@ -157,20 +166,31 @@ pub extern "C" fn _start() -> ! {
                 total += rtt_ticks;
                 ok += 1;
             }
-            Err(_) => {
+            Err(_) if !signaled => {
                 println!(
                     "Request timeout for icmp_seq={}",
                     seq
                 );
             }
+            Err(_) => {} // interrupted by signal, skip timeout message
+        }
+
+        if signaled {
+            break;
         }
 
         if seq + 1 < count {
-            syscall::sleep_ms(1000);
+            // Sleep 1 second, but wake on signal (recv from kernel with timeout)
+            let mut msg = Message::empty();
+            if syscall::sys_recv_timeout(0, &mut msg, 100).is_ok() {
+                if signal::extract_signal(&msg) != 0 {
+                    break;
+                }
+            }
         }
     }
 
-    let loss = ((count - ok) * 100) / count;
+    let loss = if sent > 0 { ((sent - ok) * 100) / sent } else { 100 };
     println!(
         "\n--- {}.{}.{}.{} ping statistics ---",
         ip_bytes[0], ip_bytes[1], ip_bytes[2], ip_bytes[3]
@@ -179,12 +199,12 @@ pub extern "C" fn _start() -> ! {
         let avg_ms = (total * 10) / ok as u64;
         println!(
             "{} packets transmitted, {} received, {}% loss, min/avg/max = {}/{}/{}ms",
-            count, ok, loss, min * 10, avg_ms, max * 10
+            sent, ok, loss, min * 10, avg_ms, max * 10
         );
     } else {
         println!(
             "{} packets transmitted, 0 received, 100% loss",
-            count
+            sent
         );
     }
 
