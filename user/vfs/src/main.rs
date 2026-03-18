@@ -1260,6 +1260,29 @@ fn extract_path(data: &[u64; 6]) -> &[u8] {
 }
 
 // ---------------------------------------------------------------------------
+// Cache warmup
+// ---------------------------------------------------------------------------
+
+/// Prefetch FAT table sectors and root directory cluster into the sector cache.
+/// This eliminates cold-miss IPC round-trips on the first readdir/ls.
+fn warm_cache(disk: &DiskState) {
+    let fat_start = disk.bpb.reserved_sectors;
+    let fat_sectors = disk.bpb.fat_size_32.min(64); // cap at 64 sectors (32 KiB of FAT)
+
+    // Prefetch FAT in 8-sector batches
+    let mut lba = 0u32;
+    while lba < fat_sectors {
+        let batch = (fat_sectors - lba).min(8);
+        disk.prefetch_sectors(fat_start + lba, batch);
+        lba += batch;
+    }
+
+    // Prefetch root directory's first cluster
+    let root_lba = disk.cluster_start_lba(disk.bpb.root_cluster);
+    disk.prefetch_sectors(root_lba, disk.bpb.sectors_per_cluster.min(8));
+}
+
+// ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
 
@@ -1339,6 +1362,10 @@ pub extern "C" fn _start() -> ! {
         part_lba,
         bpb,
     };
+
+    // Warm the sector cache with FAT table and root directory cluster.
+    // This eliminates cold-cache IPC round-trips on the first ls/readdir.
+    warm_cache(&disk);
 
     // Register with nameserver
     register_with_nameserver();
