@@ -70,6 +70,8 @@ pub const SYS_SHMEM_CREATE: u64 = 90;
 pub const SYS_SHMEM_MAP: u64 = 91;
 pub const SYS_SHMEM_GRANT: u64 = 92;
 pub const SYS_CAP_TRANSFER: u64 = 93;
+pub const SYS_SHMEM_UNMAP: u64 = 94;
+pub const SYS_SHMEM_DESTROY: u64 = 95;
 
 const SFMASK_VALUE: u64 = (1 << 9) | (1 << 10); // clear IF | DF
 
@@ -748,6 +750,14 @@ extern "C" fn syscall_dispatch(
         SYS_SHMEM_GRANT => {
             // arg0 = handle, arg1 = target tid
             crate::shmem::grant(arg0 as usize, arg1 as usize)
+        }
+        SYS_SHMEM_UNMAP => {
+            // arg0 = handle, arg1 = vaddr
+            crate::shmem::unmap(arg0 as usize, arg1 as usize)
+        }
+        SYS_SHMEM_DESTROY => {
+            // arg0 = handle
+            crate::shmem::destroy(arg0 as usize)
         }
         SYS_CAP_TRANSFER => {
             // arg0 = dest tid, arg1 = capability bits to transfer

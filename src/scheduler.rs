@@ -367,6 +367,8 @@ pub fn reap_dead() {
                     crate::irq_dispatch::unregister_task_irqs(i);
                     // Clean up futex waiters
                     crate::futex::cleanup_task(i);
+                    // Clean up shared memory regions created by this task
+                    crate::shmem::cleanup_task(i);
                     // Destroy user address space
                     let cr3 = task.cr3;
                     if cr3 != 0 && cr3 != crate::paging::kernel_cr3() {

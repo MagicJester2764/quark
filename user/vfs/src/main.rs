@@ -1651,6 +1651,9 @@ fn handle_readdir_bulk(disk: &DiskState, sender: usize, msg: &Message) {
         }
     }
 
+    // Unmap the shared memory before replying — client will destroy the region
+    let _ = syscall::sys_shmem_unmap(shmem_handle, SHMEM_BUF);
+
     let reply = Message {
         sender: 0,
         tag: TAG_OK,

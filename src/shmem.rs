@@ -148,3 +148,85 @@ pub fn grant(handle: usize, target_tid: usize) -> u64 {
         0
     }
 }
+
+/// Unmap a shared memory region from the caller's address space.
+/// Does NOT free physical pages (other tasks may still have it mapped).
+pub fn unmap(handle: usize, vaddr: usize) -> u64 {
+    if handle >= MAX_SHMEM {
+        return u64::MAX;
+    }
+    if vaddr & 0xFFF != 0 || vaddr < 0x80_0000_0000 {
+        return u64::MAX;
+    }
+
+    let tid = scheduler::current_tid();
+    let cr3 = paging::read_cr3();
+
+    unsafe {
+        let region = &REGIONS[handle];
+        if !region.in_use {
+            return u64::MAX;
+        }
+
+        // Check access
+        if region.access & (1u64 << tid) == 0 {
+            return u64::MAX;
+        }
+
+        for i in 0..region.page_count {
+            let v = vaddr + i * 4096;
+            // Ignore NotMapped errors — idempotent unmap
+            let _ = paging::unmap_page(cr3, v);
+        }
+
+        0
+    }
+}
+
+/// Destroy a shared memory region, freeing physical pages and reclaiming the handle.
+/// Caller must be the creator or have CAP_TASK_MGMT.
+/// Callers should unmap first — destroy does NOT walk other tasks' page tables.
+pub fn destroy(handle: usize) -> u64 {
+    if handle >= MAX_SHMEM {
+        return u64::MAX;
+    }
+
+    let tid = scheduler::current_tid();
+
+    unsafe {
+        let region = &mut REGIONS[handle];
+        if !region.in_use {
+            return u64::MAX;
+        }
+
+        // Only creator or CAP_TASK_MGMT holders can destroy
+        if region.creator != tid
+            && !scheduler::current_task_has_cap(crate::task::CAP_TASK_MGMT)
+        {
+            return u64::MAX;
+        }
+
+        for i in 0..region.page_count {
+            pmm::free(pmm::PhysFrame::from_address(region.pages[i]));
+        }
+
+        *region = ShmemRegion::empty();
+        0
+    }
+}
+
+/// Clean up shared memory regions owned by a dead task.
+/// Frees physical pages and reclaims handles for regions created by `tid`.
+pub fn cleanup_task(tid: usize) {
+    unsafe {
+        for i in 0..MAX_SHMEM {
+            let region = &mut REGIONS[i];
+            if region.in_use && region.creator == tid {
+                for j in 0..region.page_count {
+                    pmm::free(pmm::PhysFrame::from_address(region.pages[j]));
+                }
+                *region = ShmemRegion::empty();
+            }
+        }
+    }
+}

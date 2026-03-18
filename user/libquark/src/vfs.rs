@@ -166,6 +166,10 @@ pub fn readdir_bulk(vfs_tid: usize, handle: usize, out: &mut [DirEntry]) -> Resu
         out[i] = DirEntry { name, size, is_dir, cluster, attr };
     }
 
+    // Clean up shared memory to avoid leaking handles
+    let _ = syscall::sys_shmem_unmap(shmem, READDIR_SHMEM_ADDR);
+    let _ = syscall::sys_shmem_destroy(shmem);
+
     Ok(count)
 }
 

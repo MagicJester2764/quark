@@ -62,6 +62,8 @@ pub const SYS_SHMEM_CREATE: u64 = 90;
 pub const SYS_SHMEM_MAP: u64 = 91;
 pub const SYS_SHMEM_GRANT: u64 = 92;
 pub const SYS_CAP_TRANSFER: u64 = 93;
+pub const SYS_SHMEM_UNMAP: u64 = 94;
+pub const SYS_SHMEM_DESTROY: u64 = 95;
 
 #[inline(always)]
 pub unsafe fn syscall0(nr: u64) -> u64 {
@@ -469,6 +471,19 @@ pub fn sys_shmem_map(handle: usize, vaddr: usize) -> Result<(), ()> {
 /// Must be the region's creator or have CAP_TASK_MGMT.
 pub fn sys_shmem_grant(handle: usize, target_tid: usize) -> Result<(), ()> {
     let ret = unsafe { syscall2(SYS_SHMEM_GRANT, handle as u64, target_tid as u64) };
+    if ret == u64::MAX { Err(()) } else { Ok(()) }
+}
+
+/// Unmap a shared memory region from the caller's address space.
+pub fn sys_shmem_unmap(handle: usize, vaddr: usize) -> Result<(), ()> {
+    let ret = unsafe { syscall2(SYS_SHMEM_UNMAP, handle as u64, vaddr as u64) };
+    if ret == u64::MAX { Err(()) } else { Ok(()) }
+}
+
+/// Destroy a shared memory region, freeing physical pages and reclaiming the handle.
+/// Must be the region's creator or have CAP_TASK_MGMT.
+pub fn sys_shmem_destroy(handle: usize) -> Result<(), ()> {
+    let ret = unsafe { syscall1(SYS_SHMEM_DESTROY, handle as u64) };
     if ret == u64::MAX { Err(()) } else { Ok(()) }
 }
 
