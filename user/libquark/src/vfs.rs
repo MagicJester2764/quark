@@ -11,7 +11,11 @@ const TAG_READDIR: u64 = 4;
 const TAG_STAT: u64 = 5;
 const TAG_WRITE: u64 = 6;
 const TAG_CREATE: u64 = 7;
+const TAG_READDIR_BULK: u64 = 8;
 const TAG_ERROR: u64 = u64::MAX;
+
+/// Virtual address used by readdir_bulk for its shmem mapping.
+const READDIR_SHMEM_ADDR: usize = 0x88_0000_0000;
 
 // Error codes (match VFS server)
 pub const ERR_NOT_FOUND: u64 = 1;
@@ -22,6 +26,7 @@ pub const ERR_INVALID_PATH: u64 = 5;
 pub const ERR_NOT_DIR: u64 = 6;
 pub const ERR_IS_DIR: u64 = 7;
 
+#[derive(Clone, Copy)]
 pub struct DirEntry {
     pub name: [u8; 11],
     pub size: u32,
@@ -124,6 +129,44 @@ pub fn readdir(vfs_tid: usize, handle: usize, index: u32) -> Result<Option<DirEn
     let attr = reply.data[4] as u8;
 
     Ok(Some(DirEntry { name, size, is_dir, cluster, attr }))
+}
+
+/// Read all directory entries in one IPC call using shared memory.
+/// Returns the number of entries written into `out`.
+pub fn readdir_bulk(vfs_tid: usize, handle: usize, out: &mut [DirEntry]) -> Result<usize, u64> {
+    // Create shared memory (1 page = 170 entries max)
+    let shmem = syscall::sys_shmem_create(1).map_err(|_| ERR_IO)?;
+    syscall::sys_shmem_grant(shmem, vfs_tid).map_err(|_| ERR_IO)?;
+    syscall::sys_shmem_map(shmem, READDIR_SHMEM_ADDR).map_err(|_| ERR_IO)?;
+
+    let msg = Message {
+        sender: 0,
+        tag: TAG_READDIR_BULK,
+        data: [handle as u64, shmem as u64, 0, 0, 0, 0],
+    };
+    let mut reply = Message::empty();
+    if syscall::sys_call(vfs_tid, &msg, &mut reply).is_err() {
+        return Err(ERR_IO);
+    }
+    if reply.tag == TAG_ERROR {
+        return Err(reply.data[0]);
+    }
+
+    let count = (reply.data[0] as usize).min(out.len()).min(170);
+    let buf = unsafe { core::slice::from_raw_parts(READDIR_SHMEM_ADDR as *const u8, 4096) };
+
+    for i in 0..count {
+        let base = i * 24;
+        let mut name = [0u8; 11];
+        name.copy_from_slice(&buf[base..base + 11]);
+        let attr = buf[base + 11];
+        let size = u32::from_le_bytes(buf[base + 12..base + 16].try_into().unwrap());
+        let cluster = u32::from_le_bytes(buf[base + 16..base + 20].try_into().unwrap());
+        let is_dir = attr & 0x10 != 0;
+        out[i] = DirEntry { name, size, is_dir, cluster, attr };
+    }
+
+    Ok(count)
 }
 
 /// Write data from a client-owned physical page into a file.

@@ -105,26 +105,26 @@ pub extern "C" fn _start() -> ! {
         syscall::sys_exit();
     }
 
-    // Read directory entries
-    let mut idx = 0u32;
-    loop {
-        match vfs::readdir(vfs_tid, handle, idx) {
-            Ok(Some(entry)) => {
-                let mut nbuf = [0u8; 16];
-                let name = fat_name_to_str(&entry.name, &mut nbuf);
-                if let Ok(s) = core::str::from_utf8(name) {
-                    if entry.is_dir {
-                        println!("{}/ ", s);
-                    } else {
-                        println!("{}  {}", s, entry.size);
-                    }
-                }
-                idx += 1;
-            }
-            Ok(None) => break,
-            Err(e) => {
-                println!("ls: readdir error: {}", e);
-                break;
+    // Read all directory entries in one bulk IPC call
+    let mut entries = [vfs::DirEntry { name: [0; 11], size: 0, is_dir: false, cluster: 0, attr: 0 }; 128];
+    let count = match vfs::readdir_bulk(vfs_tid, handle, &mut entries) {
+        Ok(n) => n,
+        Err(e) => {
+            println!("ls: readdir error: {}", e);
+            let _ = vfs::close(vfs_tid, handle);
+            syscall::sys_exit();
+        }
+    };
+
+    for i in 0..count {
+        let entry = &entries[i];
+        let mut nbuf = [0u8; 16];
+        let name = fat_name_to_str(&entry.name, &mut nbuf);
+        if let Ok(s) = core::str::from_utf8(name) {
+            if entry.is_dir {
+                println!("{}/ ", s);
+            } else {
+                println!("{}  {}", s, entry.size);
             }
         }
     }

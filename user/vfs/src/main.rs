@@ -27,6 +27,7 @@ const TAG_READDIR: u64 = 4;
 const TAG_STAT: u64 = 5;
 const TAG_WRITE: u64 = 6;
 const TAG_CREATE: u64 = 7;
+const TAG_READDIR_BULK: u64 = 8;
 const TAG_OK: u64 = 0;
 const TAG_ERROR: u64 = u64::MAX;
 
@@ -43,6 +44,7 @@ const ERR_IS_DIR: u64 = 7;
 const DISK_IO_BUF: usize = 0x86_0000_0000;
 const CLIENT_BUF: usize = 0x87_0000_0000;
 const CACHE_BUF_BASE: usize = 0x8A_0000_0000;
+const SHMEM_BUF: usize = 0x8B_0000_0000;
 
 // ---------------------------------------------------------------------------
 // Sector cache
@@ -1306,6 +1308,7 @@ pub extern "C" fn _start() -> ! {
             TAG_STAT => handle_stat(sender, &msg),
             TAG_WRITE => handle_write(&disk, sender, &msg),
             TAG_CREATE => handle_create(&disk, sender, &msg),
+            TAG_READDIR_BULK => handle_readdir_bulk(&disk, sender, &msg),
             _ => error_reply(sender, 0xFF),
         }
     }
@@ -1561,6 +1564,99 @@ fn handle_create(disk: &DiskState, sender: usize, msg: &Message) {
         }
         Err(code) => error_reply(sender, code),
     }
+}
+
+/// TAG_READDIR_BULK: data[0]=handle, data[1]=shmem_handle
+/// VFS maps shmem, fills with packed 24-byte entries, replies with count.
+/// Entry format: [0..11] name, [11] attr, [12..16] size LE, [16..20] cluster LE, [20..24] pad
+fn handle_readdir_bulk(disk: &DiskState, sender: usize, msg: &Message) {
+    let handle = msg.data[0] as usize;
+    let shmem_handle = msg.data[1] as usize;
+
+    let dir_cluster = match get_handle(handle, sender) {
+        Some(file) => {
+            if !file.is_dir {
+                error_reply(sender, ERR_NOT_DIR);
+                return;
+            }
+            file.first_cluster
+        }
+        None => {
+            error_reply(sender, ERR_INVALID_HANDLE);
+            return;
+        }
+    };
+
+    // Map the shared memory page
+    if syscall::sys_shmem_map(shmem_handle, SHMEM_BUF).is_err() {
+        error_reply(sender, ERR_IO);
+        return;
+    }
+
+    let buf = unsafe { core::slice::from_raw_parts_mut(SHMEM_BUF as *mut u8, 4096) };
+    let max_entries = 4096 / 24; // 170
+    let mut count: u32 = 0;
+
+    let spc = disk.bpb.sectors_per_cluster;
+    let mut cluster = dir_cluster;
+
+    'outer: loop {
+        let start_lba = disk.cluster_start_lba(cluster);
+        disk.prefetch_sectors(start_lba, spc);
+        for s in 0..spc {
+            let sec_data = match disk.cached_read_sector(start_lba + s) {
+                Ok(d) => d,
+                Err(_) => break 'outer,
+            };
+            let mut sec_buf = [0u8; 512];
+            sec_buf.copy_from_slice(sec_data);
+
+            for e in 0..16 {
+                let off = e * 32;
+                let first_byte = sec_buf[off];
+                if first_byte == 0x00 {
+                    break 'outer;
+                }
+                if first_byte == 0xE5 {
+                    continue;
+                }
+                let attr = sec_buf[off + 11];
+                if attr & 0x0F == 0x0F {
+                    continue; // LFN
+                }
+                if attr & 0x08 != 0 {
+                    continue; // volume label
+                }
+
+                if (count as usize) >= max_entries {
+                    break 'outer;
+                }
+
+                let base = (count as usize) * 24;
+                buf[base..base + 11].copy_from_slice(&sec_buf[off..off + 11]);
+                buf[base + 11] = attr;
+                let size = read_u32(&sec_buf, off + 28);
+                buf[base + 12..base + 16].copy_from_slice(&size.to_le_bytes());
+                let hi = read_u16(&sec_buf, off + 20) as u32;
+                let lo = read_u16(&sec_buf, off + 26) as u32;
+                let entry_cluster = (hi << 16) | lo;
+                buf[base + 16..base + 20].copy_from_slice(&entry_cluster.to_le_bytes());
+                buf[base + 20..base + 24].fill(0);
+                count += 1;
+            }
+        }
+        match disk.fat_next(cluster) {
+            Some(next) => cluster = next,
+            None => break,
+        }
+    }
+
+    let reply = Message {
+        sender: 0,
+        tag: TAG_OK,
+        data: [count as u64, 0, 0, 0, 0, 0],
+    };
+    let _ = syscall::sys_reply(sender, &reply);
 }
 
 #[panic_handler]
