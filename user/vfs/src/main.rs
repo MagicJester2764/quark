@@ -51,34 +51,48 @@ const SHMEM_BUF: usize = 0x8B_0000_0000;
 // ---------------------------------------------------------------------------
 
 const CACHE_ENTRIES: usize = 64;
+const HASH_BUCKETS: usize = 32;
+const NONE: u8 = 0xFF; // sentinel for "no entry"
 
 struct CacheEntry {
     valid: bool,
     used: bool,
     lba: u32,
+    hash_next: u8, // next slot in hash chain, NONE = end
 }
 
 struct SectorCache {
     entries: [CacheEntry; CACHE_ENTRIES],
+    buckets: [u8; HASH_BUCKETS],
     clock_hand: usize,
 }
 
 impl SectorCache {
     const fn new() -> Self {
-        const EMPTY: CacheEntry = CacheEntry { valid: false, used: false, lba: 0 };
+        const EMPTY: CacheEntry = CacheEntry {
+            valid: false,
+            used: false,
+            lba: 0,
+            hash_next: NONE,
+        };
         SectorCache {
             entries: [EMPTY; CACHE_ENTRIES],
+            buckets: [NONE; HASH_BUCKETS],
             clock_hand: 0,
         }
     }
 
-    /// Look up a sector in the cache. Returns the slot index if found.
+    /// Look up a sector in the cache via hash chain. O(1) average.
     fn lookup(&mut self, lba: u32) -> Option<usize> {
-        for i in 0..CACHE_ENTRIES {
+        let bucket = (lba as usize) % HASH_BUCKETS;
+        let mut idx = self.buckets[bucket];
+        while idx != NONE {
+            let i = idx as usize;
             if self.entries[i].valid && self.entries[i].lba == lba {
                 self.entries[i].used = true;
                 return Some(i);
             }
+            idx = self.entries[i].hash_next;
         }
         None
     }
@@ -91,6 +105,7 @@ impl SectorCache {
         for i in 0..CACHE_ENTRIES {
             if !self.entries[i].valid {
                 self.fill_slot(i, lba, src);
+                self.link(i);
                 return i;
             }
         }
@@ -101,7 +116,9 @@ impl SectorCache {
             if self.entries[i].used {
                 self.entries[i].used = false;
             } else {
+                self.unlink(i);
                 self.fill_slot(i, lba, src);
+                self.link(i);
                 return i;
             }
         }
@@ -116,15 +133,46 @@ impl SectorCache {
                 512,
             );
         }
-        self.entries[idx] = CacheEntry { valid: true, used: true, lba };
+        self.entries[idx] = CacheEntry {
+            valid: true,
+            used: true,
+            lba,
+            hash_next: NONE,
+        };
+    }
+
+    /// Prepend slot `idx` to its LBA's hash bucket chain.
+    fn link(&mut self, idx: usize) {
+        let bucket = (self.entries[idx].lba as usize) % HASH_BUCKETS;
+        self.entries[idx].hash_next = self.buckets[bucket];
+        self.buckets[bucket] = idx as u8;
+    }
+
+    /// Remove slot `idx` from its hash bucket chain.
+    fn unlink(&mut self, idx: usize) {
+        let bucket = (self.entries[idx].lba as usize) % HASH_BUCKETS;
+        let target = idx as u8;
+        if self.buckets[bucket] == target {
+            self.buckets[bucket] = self.entries[idx].hash_next;
+        } else {
+            let mut prev = self.buckets[bucket];
+            while prev != NONE {
+                let p = prev as usize;
+                if self.entries[p].hash_next == target {
+                    self.entries[p].hash_next = self.entries[idx].hash_next;
+                    break;
+                }
+                prev = self.entries[p].hash_next;
+            }
+        }
+        self.entries[idx].hash_next = NONE;
     }
 
     /// Invalidate any cached copy of a given LBA.
     fn invalidate(&mut self, lba: u32) {
-        for i in 0..CACHE_ENTRIES {
-            if self.entries[i].valid && self.entries[i].lba == lba {
-                self.entries[i].valid = false;
-            }
+        if let Some(idx) = self.lookup(lba) {
+            self.unlink(idx);
+            self.entries[idx].valid = false;
         }
     }
 }
