@@ -42,6 +42,7 @@ pub const SYS_FUTEX_WAIT: u64 = 60;
 pub const SYS_FUTEX_WAKE: u64 = 61;
 
 pub const SYS_MMAP: u64 = 70;
+pub const SYS_MUNMAP: u64 = 71;
 
 pub const SYS_GET_UID: u64 = 100;
 pub const SYS_SET_UID: u64 = 101;
@@ -523,6 +524,14 @@ pub const TAG_PAGE_FAULT: u64 = 0xFFFF_0001;
 pub fn sys_mmap(vaddr: usize, pages: usize) -> Result<(), ()> {
     let ret = unsafe { syscall2(SYS_MMAP, vaddr as u64, pages as u64) };
     if ret == u64::MAX { Err(()) } else { Ok(()) }
+}
+
+/// Unmap pages from the caller's address space and free their physical frames.
+/// `vaddr` must be page-aligned and in user space (>= 0x80_0000_0000).
+/// Returns the number of pages actually freed, or u64::MAX on invalid arguments.
+pub fn sys_munmap(vaddr: usize, pages: usize) -> Result<usize, ()> {
+    let ret = unsafe { syscall2(SYS_MUNMAP, vaddr as u64, pages as u64) };
+    if ret == u64::MAX { Err(()) } else { Ok(ret as usize) }
 }
 
 /// Transfer capabilities to another task. The caller must hold all bits in `caps`.

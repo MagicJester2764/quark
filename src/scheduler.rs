@@ -637,6 +637,16 @@ pub fn current_task_charge_mem(pages: usize) {
     }
 }
 
+/// Subtract `pages` from the current task's memory usage counter.
+pub fn current_task_uncharge_mem(pages: usize) {
+    let tid = current_tid();
+    unsafe {
+        if let Some(ref mut task) = TASKS[tid] {
+            task.mem_pages = task.mem_pages.saturating_sub(pages);
+        }
+    }
+}
+
 /// Set the memory limit (in pages) for a task. 0 = unlimited.
 pub fn set_mem_limit(tid: usize, limit: usize) -> Result<(), ()> {
     unsafe {

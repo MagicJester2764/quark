@@ -58,6 +58,7 @@ pub const SYS_TASK_INFO: u64 = 105;
 pub const SYS_SIGNAL: u64 = 106;
 
 pub const SYS_MMAP: u64 = 70;
+pub const SYS_MUNMAP: u64 = 71;
 
 pub const SYS_RECV_TIMEOUT: u64 = 80;
 pub const SYS_TICKS: u64 = 81;
@@ -706,6 +707,44 @@ extern "C" fn syscall_dispatch(
             }
             scheduler::current_task_charge_mem(pages);
             0
+        }
+        SYS_MUNMAP => {
+            // arg0 = vaddr, arg1 = pages
+            // Unmaps pages and frees their physical frames.
+            let vaddr = arg0 as usize;
+            let pages = arg1 as usize;
+            if pages == 0 || pages > 256 {
+                return u64::MAX;
+            }
+            if vaddr & 0xFFF != 0 {
+                return u64::MAX;
+            }
+            if vaddr < 0x80_0000_0000 {
+                return u64::MAX;
+            }
+            let end = match (vaddr as u64).checked_add((pages as u64) * 4096) {
+                Some(e) => e,
+                None => return u64::MAX,
+            };
+            if end > USER_ADDR_LIMIT {
+                return u64::MAX;
+            }
+            let cr3 = paging::read_cr3();
+            let mut freed = 0usize;
+            for i in 0..pages {
+                let v = vaddr + i * 4096;
+                match unsafe { paging::unmap_page(cr3, v) } {
+                    Ok(frame_addr) => {
+                        crate::pmm::free(crate::pmm::PhysFrame::from_address(frame_addr));
+                        freed += 1;
+                    }
+                    Err(_) => {} // Not mapped — skip silently
+                }
+            }
+            if freed > 0 {
+                scheduler::current_task_uncharge_mem(freed);
+            }
+            freed as u64
         }
         SYS_RECV_TIMEOUT => {
             // arg0 = from, arg1 = msg_ptr, arg2 = timeout_ticks
