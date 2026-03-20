@@ -8,6 +8,11 @@ const TAG_UDP_RECV: u64 = 2;
 const TAG_NET_CONFIG: u64 = 3;
 const TAG_NET_INFO: u64 = 4;
 const TAG_ICMP_PING: u64 = 5;
+const TAG_TCP_CONNECT: u64 = 10;
+const TAG_TCP_LISTEN: u64 = 11;
+const TAG_TCP_SEND: u64 = 13;
+const TAG_TCP_RECV: u64 = 14;
+const TAG_TCP_CLOSE: u64 = 15;
 const TAG_ERROR: u64 = u64::MAX;
 
 /// Send a UDP datagram. `phys_addr` must point to a page with the payload.
@@ -105,6 +110,109 @@ pub fn configure(net_tid: usize, ip: u32, netmask: u32, gateway: u32) -> Result<
         sender: 0,
         tag: TAG_NET_CONFIG,
         data: [ip as u64, netmask as u64, gateway as u64, 0, 0, 0],
+    };
+    let mut reply = Message::empty();
+    if syscall::sys_call(net_tid, &msg, &mut reply).is_err() {
+        return Err(1);
+    }
+    if reply.tag == TAG_ERROR { Err(reply.data[0]) } else { Ok(()) }
+}
+
+// ---------------------------------------------------------------------------
+// TCP
+// ---------------------------------------------------------------------------
+
+/// Open a TCP connection to `dst_ip:dst_port`. Blocks until established or timeout.
+/// `src_port` of 0 uses an ephemeral port. Returns connection handle on success.
+pub fn tcp_connect(
+    net_tid: usize,
+    dst_ip: u32,
+    dst_port: u16,
+    src_port: u16,
+) -> Result<usize, u64> {
+    let msg = Message {
+        sender: 0,
+        tag: TAG_TCP_CONNECT,
+        data: [
+            dst_ip as u64,
+            ((dst_port as u64) << 16) | (src_port as u64),
+            0, 0, 0, 0,
+        ],
+    };
+    let mut reply = Message::empty();
+    if syscall::sys_call(net_tid, &msg, &mut reply).is_err() {
+        return Err(1);
+    }
+    if reply.tag == TAG_ERROR { Err(reply.data[0]) } else { Ok(reply.data[0] as usize) }
+}
+
+/// Listen for an incoming TCP connection on `port`. Blocks until a client connects.
+/// Returns (handle, remote_ip, remote_port).
+pub fn tcp_listen(
+    net_tid: usize,
+    port: u16,
+) -> Result<(usize, u32, u16), u64> {
+    let msg = Message {
+        sender: 0,
+        tag: TAG_TCP_LISTEN,
+        data: [port as u64, 0, 0, 0, 0, 0],
+    };
+    let mut reply = Message::empty();
+    if syscall::sys_call(net_tid, &msg, &mut reply).is_err() {
+        return Err(1);
+    }
+    if reply.tag == TAG_ERROR {
+        return Err(reply.data[0]);
+    }
+    Ok((reply.data[0] as usize, reply.data[1] as u32, reply.data[2] as u16))
+}
+
+/// Send data over a TCP connection. `phys_addr` points to a page with the payload.
+/// Returns the number of bytes actually queued.
+pub fn tcp_send(
+    net_tid: usize,
+    handle: usize,
+    phys_addr: usize,
+    len: usize,
+) -> Result<usize, u64> {
+    let msg = Message {
+        sender: 0,
+        tag: TAG_TCP_SEND,
+        data: [handle as u64, phys_addr as u64, len as u64, 0, 0, 0],
+    };
+    let mut reply = Message::empty();
+    if syscall::sys_call(net_tid, &msg, &mut reply).is_err() {
+        return Err(1);
+    }
+    if reply.tag == TAG_ERROR { Err(reply.data[0]) } else { Ok(reply.data[0] as usize) }
+}
+
+/// Receive data from a TCP connection. Blocks until data is available.
+/// `phys_addr` points to a page for the received data. Returns bytes read (0 = EOF).
+pub fn tcp_recv(
+    net_tid: usize,
+    handle: usize,
+    phys_addr: usize,
+    max_len: usize,
+) -> Result<usize, u64> {
+    let msg = Message {
+        sender: 0,
+        tag: TAG_TCP_RECV,
+        data: [handle as u64, phys_addr as u64, max_len as u64, 0, 0, 0],
+    };
+    let mut reply = Message::empty();
+    if syscall::sys_call(net_tid, &msg, &mut reply).is_err() {
+        return Err(1);
+    }
+    if reply.tag == TAG_ERROR { Err(reply.data[0]) } else { Ok(reply.data[0] as usize) }
+}
+
+/// Close a TCP connection gracefully.
+pub fn tcp_close(net_tid: usize, handle: usize) -> Result<(), u64> {
+    let msg = Message {
+        sender: 0,
+        tag: TAG_TCP_CLOSE,
+        data: [handle as u64, 0, 0, 0, 0, 0],
     };
     let mut reply = Message::empty();
     if syscall::sys_call(net_tid, &msg, &mut reply).is_err() {
