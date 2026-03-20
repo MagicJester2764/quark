@@ -580,6 +580,58 @@ pub fn sys_signal(tid: usize, sig: u64) -> Result<(), ()> {
     if ret == 0 { Ok(()) } else { Err(()) }
 }
 
+// Object capability syscalls
+pub const SYS_CAP_MINT: u64 = 110;
+pub const SYS_CAP_GRANT: u64 = 111;
+pub const SYS_CAP_REVOKE: u64 = 112;
+pub const SYS_CAP_INSPECT: u64 = 113;
+pub const SYS_CAP_DELETE: u64 = 114;
+
+// Object capability types
+pub const CAP_TYPE_IOPORT: u64 = 1;
+pub const CAP_TYPE_PHYS_RANGE: u64 = 2;
+pub const CAP_TYPE_IRQ: u64 = 3;
+pub const CAP_TYPE_TASK_MGMT: u64 = 4;
+pub const CAP_TYPE_PHYS_ALLOC: u64 = 5;
+pub const CAP_TYPE_SET_UID: u64 = 6;
+
+/// Mint a new capability in the caller's CSpace slot.
+/// The caller must already hold a cap of the same type whose params are a superset.
+pub fn sys_cap_mint(slot: usize, cap_type: u64, param0: u64, param1: u64) -> Result<(), ()> {
+    let ret = unsafe { syscall4(SYS_CAP_MINT, slot as u64, cap_type, param0, param1) };
+    if ret == u64::MAX { Err(()) } else { Ok(()) }
+}
+
+/// Delegate a capability from src_slot to dest_tid's dest_slot.
+pub fn sys_cap_grant(dest_tid: usize, src_slot: usize, dest_slot: usize) -> Result<(), ()> {
+    let ret = unsafe { syscall3(SYS_CAP_GRANT, dest_tid as u64, src_slot as u64, dest_slot as u64) };
+    if ret == u64::MAX { Err(()) } else { Ok(()) }
+}
+
+/// Revoke a capability slot, invalidating all derived caps.
+pub fn sys_cap_revoke(slot: usize) -> Result<(), ()> {
+    let ret = unsafe { syscall1(SYS_CAP_REVOKE, slot as u64) };
+    if ret == u64::MAX { Err(()) } else { Ok(()) }
+}
+
+/// Inspect a capability slot. Returns packed info:
+/// bits [7:0] = type, [23:8] = param0 low 16, [39:24] = param1 low 16.
+/// Returns u64::MAX on error.
+pub fn sys_cap_inspect(slot: usize) -> Result<(u8, u16, u16), ()> {
+    let ret = unsafe { syscall1(SYS_CAP_INSPECT, slot as u64) };
+    if ret == u64::MAX { return Err(()); }
+    let cap_type = (ret & 0xFF) as u8;
+    let param0 = ((ret >> 8) & 0xFFFF) as u16;
+    let param1 = ((ret >> 24) & 0xFFFF) as u16;
+    Ok((cap_type, param0, param1))
+}
+
+/// Delete a capability from the caller's CSpace slot.
+pub fn sys_cap_delete(slot: usize) -> Result<(), ()> {
+    let ret = unsafe { syscall1(SYS_CAP_DELETE, slot as u64) };
+    if ret == u64::MAX { Err(()) } else { Ok(()) }
+}
+
 // Capability bit constants
 pub const CAP_IOPORT: u32 = 1 << 0;
 pub const CAP_MAP_PHYS: u32 = 1 << 1;

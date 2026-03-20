@@ -71,6 +71,12 @@ pub const SYS_SHMEM_CREATE: u64 = 90;
 pub const SYS_SHMEM_MAP: u64 = 91;
 pub const SYS_SHMEM_GRANT: u64 = 92;
 pub const SYS_CAP_TRANSFER: u64 = 93;
+
+pub const SYS_CAP_MINT: u64 = 110;
+pub const SYS_CAP_GRANT: u64 = 111;
+pub const SYS_CAP_REVOKE: u64 = 112;
+pub const SYS_CAP_INSPECT: u64 = 113;
+pub const SYS_CAP_DELETE: u64 = 114;
 pub const SYS_SHMEM_UNMAP: u64 = 94;
 pub const SYS_SHMEM_DESTROY: u64 = 95;
 
@@ -285,10 +291,10 @@ extern "C" fn syscall_dispatch(
             }
         }
         SYS_IRQ_REGISTER => {
-            if !scheduler::current_task_has_cap(crate::task::CAP_IRQ) {
+            let irq = arg0 as u8;
+            if !crate::cap::task_has_irq(scheduler::current_tid(), irq) {
                 return u64::MAX;
             }
-            let irq = arg0 as u8;
             let tid = scheduler::current_tid();
             crate::irq_dispatch::register_irq_handler(irq, tid);
             unsafe { crate::pic::enable_irq(irq) };
@@ -302,10 +308,10 @@ extern "C" fn syscall_dispatch(
         }
         SYS_IOPORT => {
             // arg0=port, arg1=op (0=read8,1=write8,2=read16,3=write16,4=read32,5=write32), arg2=value (for writes)
-            if !scheduler::current_task_has_cap(crate::task::CAP_IOPORT) {
+            let port = arg0 as u16;
+            if !crate::cap::task_has_ioport(scheduler::current_tid(), port) {
                 return u64::MAX;
             }
-            let port = arg0 as u16;
             match arg1 {
                 0 => unsafe { crate::io::inb(port) as u64 },
                 1 => { unsafe { crate::io::outb(port, arg2 as u8) }; 0 }
@@ -318,10 +324,10 @@ extern "C" fn syscall_dispatch(
         }
         SYS_IOPORT_REP => {
             // arg0=port, arg1=user_buf_ptr, arg2=count (words), arg3=op (0=insw, 1=outsw)
-            if !scheduler::current_task_has_cap(crate::task::CAP_IOPORT) {
+            let port = arg0 as u16;
+            if !crate::cap::task_has_ioport(scheduler::current_tid(), port) {
                 return u64::MAX;
             }
-            let port = arg0 as u16;
             let buf = arg1;
             let count = arg2 as usize;
             let op = arg3;
@@ -344,12 +350,12 @@ extern "C" fn syscall_dispatch(
             }
         }
         SYS_MAP_PHYS => {
-            if !scheduler::current_task_has_cap(crate::task::CAP_MAP_PHYS) {
-                return u64::MAX;
-            }
             let phys = arg0 as usize;
             let virt = arg1 as usize;
             let pages = arg2 as usize;
+            if !crate::cap::task_has_phys_range(scheduler::current_tid(), phys, pages) {
+                return u64::MAX;
+            }
             let pml4 = paging::read_cr3();
             for i in 0..pages {
                 let p = phys + i * 4096;
@@ -362,7 +368,7 @@ extern "C" fn syscall_dispatch(
             0
         }
         SYS_TASK_CREATE => {
-            if !scheduler::current_task_has_cap(crate::task::CAP_TASK_MGMT) {
+            if !crate::cap::task_has_task_mgmt(scheduler::current_tid(), 0) {
                 return u64::MAX;
             }
             match scheduler::create_empty_task() {
@@ -371,7 +377,7 @@ extern "C" fn syscall_dispatch(
             }
         }
         SYS_ADDRSPACE_CREATE => {
-            if !scheduler::current_task_has_cap(crate::task::CAP_TASK_MGMT) {
+            if !crate::cap::task_has_task_mgmt(scheduler::current_tid(), 0) {
                 return u64::MAX;
             }
             match crate::userspace::create_address_space() {
@@ -381,7 +387,7 @@ extern "C" fn syscall_dispatch(
         }
         SYS_ADDRSPACE_MAP => {
             // arg0=cr3, arg1=virt, arg2=phys, arg3=pages, arg4=flags
-            if !scheduler::current_task_has_cap(crate::task::CAP_TASK_MGMT) {
+            if !crate::cap::task_has_task_mgmt(scheduler::current_tid(), 0) {
                 return u64::MAX;
             }
             let cr3 = arg0 as usize;
@@ -402,7 +408,7 @@ extern "C" fn syscall_dispatch(
         }
         SYS_TASK_START => {
             // arg0=tid, arg1=rip, arg2=rsp, arg3=cr3
-            if !scheduler::current_task_has_cap(crate::task::CAP_TASK_MGMT) {
+            if !crate::cap::task_has_task_mgmt(scheduler::current_tid(), 0) {
                 return u64::MAX;
             }
             let tid = arg0 as usize;
@@ -416,7 +422,7 @@ extern "C" fn syscall_dispatch(
         }
         SYS_PHYS_ALLOC => {
             // arg0 = number of contiguous pages to allocate
-            if !scheduler::current_task_has_cap(crate::task::CAP_PHYS_ALLOC) {
+            if !crate::cap::task_has_phys_alloc(scheduler::current_tid()) {
                 return u64::MAX;
             }
             let count = arg0 as usize;
@@ -455,7 +461,7 @@ extern "C" fn syscall_dispatch(
         }
         SYS_PHYS_FREE => {
             // arg0 = phys addr, arg1 = count
-            if !scheduler::current_task_has_cap(crate::task::CAP_PHYS_ALLOC) {
+            if !crate::cap::task_has_phys_alloc(scheduler::current_tid()) {
                 return u64::MAX;
             }
             let addr = arg0 as usize;
@@ -467,10 +473,11 @@ extern "C" fn syscall_dispatch(
         }
         SYS_GRANT_IOPORT => {
             // arg0 = tid to grant CAP_IOPORT
-            if !scheduler::current_task_has_cap(crate::task::CAP_TASK_MGMT) {
+            let caller = scheduler::current_tid();
+            if !crate::cap::task_has_task_mgmt(caller, 0) {
                 return u64::MAX;
             }
-            if !scheduler::current_task_has_cap(crate::task::CAP_IOPORT) {
+            if !crate::cap::task_has_ioport(caller, 0) {
                 return u64::MAX;
             }
             let tid = arg0 as usize;
@@ -481,10 +488,11 @@ extern "C" fn syscall_dispatch(
         }
         SYS_GRANT_IRQ => {
             // arg0 = tid, arg1 = irq
-            if !scheduler::current_task_has_cap(crate::task::CAP_TASK_MGMT) {
+            let caller = scheduler::current_tid();
+            if !crate::cap::task_has_task_mgmt(caller, 0) {
                 return u64::MAX;
             }
-            if !scheduler::current_task_has_cap(crate::task::CAP_IRQ) {
+            if !crate::cap::task_has_irq(caller, 0xFF) {
                 return u64::MAX;
             }
             let tid = arg0 as usize;
@@ -495,7 +503,7 @@ extern "C" fn syscall_dispatch(
         }
         SYS_GRANT_CAP => {
             // arg0 = tid, arg1 = capability bits to grant
-            if !scheduler::current_task_has_cap(crate::task::CAP_TASK_MGMT) {
+            if !crate::cap::task_has_task_mgmt(scheduler::current_tid(), 0) {
                 return u64::MAX;
             }
             let tid = arg0 as usize;
@@ -574,7 +582,7 @@ extern "C" fn syscall_dispatch(
         SYS_FD_SET => {
             // arg0 = target task tid, arg1 = fd, arg2 = service tid, arg3 = tag
             // Requires CAP_TASK_MGMT
-            if !scheduler::current_task_has_cap(crate::task::CAP_TASK_MGMT) {
+            if !crate::cap::task_has_task_mgmt(scheduler::current_tid(), 0) {
                 return u64::MAX;
             }
             let tid = arg0 as usize;
@@ -600,7 +608,7 @@ extern "C" fn syscall_dispatch(
         SYS_PIPE_FD_SET => {
             // arg0 = target tid, arg1 = fd index, arg2 = pipe handle, arg3 = is_write (0=read, 1=write)
             // Requires CAP_TASK_MGMT
-            if !scheduler::current_task_has_cap(crate::task::CAP_TASK_MGMT) {
+            if !crate::cap::task_has_task_mgmt(scheduler::current_tid(), 0) {
                 return u64::MAX;
             }
             let tid = arg0 as usize;
@@ -625,7 +633,7 @@ extern "C" fn syscall_dispatch(
             // Copies the caller's source fd to the target task's target fd.
             // Increments pipe refcount if the fd is a pipe endpoint.
             // Requires CAP_TASK_MGMT.
-            if !scheduler::current_task_has_cap(crate::task::CAP_TASK_MGMT) {
+            if !crate::cap::task_has_task_mgmt(scheduler::current_tid(), 0) {
                 return u64::MAX;
             }
             let target_tid = arg0 as usize;
@@ -768,7 +776,7 @@ extern "C" fn syscall_dispatch(
         }
         SYS_SET_MEM_LIMIT => {
             // arg0 = tid, arg1 = limit in pages (0 = unlimited)
-            if !scheduler::current_task_has_cap(crate::task::CAP_TASK_MGMT) {
+            if !crate::cap::task_has_task_mgmt(scheduler::current_tid(), 0) {
                 return u64::MAX;
             }
             let tid = arg0 as usize;
@@ -824,7 +832,7 @@ extern "C" fn syscall_dispatch(
         }
         SYS_SET_PAGER => {
             // arg0 = tid, arg1 = pager_tid
-            if !scheduler::current_task_has_cap(crate::task::CAP_TASK_MGMT) {
+            if !crate::cap::task_has_task_mgmt(scheduler::current_tid(), 0) {
                 return u64::MAX;
             }
             let tid = arg0 as usize;
@@ -840,7 +848,7 @@ extern "C" fn syscall_dispatch(
             ((uid as u64) << 32) | (gid as u64)
         }
         SYS_SET_UID => {
-            if !scheduler::current_task_has_cap(crate::task::CAP_SET_UID) {
+            if !crate::cap::task_has_set_uid(scheduler::current_tid()) {
                 return u64::MAX;
             }
             let tid = arg0 as usize;
@@ -851,7 +859,7 @@ extern "C" fn syscall_dispatch(
             }
         }
         SYS_SET_GID => {
-            if !scheduler::current_task_has_cap(crate::task::CAP_SET_UID) {
+            if !crate::cap::task_has_set_uid(scheduler::current_tid()) {
                 return u64::MAX;
             }
             let tid = arg0 as usize;
@@ -869,10 +877,11 @@ extern "C" fn syscall_dispatch(
             }
         }
         SYS_TASK_KILL => {
-            // arg0 = tid to kill. Requires CAP_TASK_MGMT or same UID.
+            // arg0 = tid to kill. Requires TaskMgmt cap for target or same UID.
             let tid = arg0 as usize;
+            let caller = scheduler::current_tid();
             let caller_uid = scheduler::current_task_uid();
-            let has_cap = scheduler::current_task_has_cap(crate::task::CAP_TASK_MGMT);
+            let has_cap = crate::cap::task_has_task_mgmt(caller, tid);
             let same_uid = scheduler::task_uid_gid(tid)
                 .map(|(uid, _)| uid == caller_uid)
                 .unwrap_or(false);
@@ -907,8 +916,9 @@ extern "C" fn syscall_dispatch(
             // arg0 = tid, arg1 = signal bits. Same permissions as sys_task_kill.
             let tid = arg0 as usize;
             let sig = arg1;
+            let caller = scheduler::current_tid();
             let caller_uid = scheduler::current_task_uid();
-            let has_cap = scheduler::current_task_has_cap(crate::task::CAP_TASK_MGMT);
+            let has_cap = crate::cap::task_has_task_mgmt(caller, tid);
             let same_uid = scheduler::task_uid_gid(tid)
                 .map(|(uid, _)| uid == caller_uid)
                 .unwrap_or(false);
@@ -919,6 +929,148 @@ extern "C" fn syscall_dispatch(
                 Ok(()) => 0,
                 Err(_) => u64::MAX,
             }
+        }
+        SYS_CAP_MINT => {
+            // arg0 = slot, arg1 = type, arg2 = param0, arg3 = param1
+            // Create a root cap in caller's slot (requires existing authority)
+            let slot = arg0 as usize;
+            let cap_type_raw = arg1 as u8;
+            let param0 = arg2;
+            let param1 = arg3;
+            if slot >= crate::cap::MAX_CAPS {
+                return u64::MAX;
+            }
+            let cap_type = match cap_type_raw {
+                1 => crate::cap::CapType::IoPort,
+                2 => crate::cap::CapType::PhysRange,
+                3 => crate::cap::CapType::Irq,
+                4 => crate::cap::CapType::TaskMgmt,
+                5 => crate::cap::CapType::PhysAlloc,
+                6 => crate::cap::CapType::SetUid,
+                _ => return u64::MAX,
+            };
+            let tid = scheduler::current_tid();
+            unsafe {
+                let task = match scheduler::get_task_mut(tid) {
+                    Some(t) => t,
+                    None => return u64::MAX,
+                };
+                // Caller must hold a cap of the same type whose params are a superset
+                if !crate::cap::can_mint(&task.cspace, cap_type, param0, param1) {
+                    return u64::MAX;
+                }
+                // Target slot must be empty
+                if task.cspace[slot].cap_type as u8 != crate::cap::CapType::Empty as u8 {
+                    return u64::MAX;
+                }
+                task.cspace[slot] = crate::cap::CapSlot {
+                    cap_type,
+                    generation: 0,
+                    root_slot: slot as u8,
+                    root_tid: tid as u8,
+                    param0,
+                    param1,
+                };
+            }
+            0
+        }
+        SYS_CAP_GRANT => {
+            // arg0 = dest_tid, arg1 = src_slot, arg2 = dest_slot
+            // Delegate cap to another task (with attenuation tracking)
+            let dest_tid = arg0 as usize;
+            let src_slot = arg1 as usize;
+            let dest_slot = arg2 as usize;
+            if src_slot >= crate::cap::MAX_CAPS || dest_slot >= crate::cap::MAX_CAPS {
+                return u64::MAX;
+            }
+            let caller_tid = scheduler::current_tid();
+            unsafe {
+                let src_cap = match scheduler::get_task_mut(caller_tid) {
+                    Some(t) => t.cspace[src_slot],
+                    None => return u64::MAX,
+                };
+                if src_cap.cap_type as u8 == crate::cap::CapType::Empty as u8 {
+                    return u64::MAX;
+                }
+                let dest_task = match scheduler::get_task_mut(dest_tid) {
+                    Some(t) => t,
+                    None => return u64::MAX,
+                };
+                if dest_task.cspace[dest_slot].cap_type as u8 != crate::cap::CapType::Empty as u8 {
+                    return u64::MAX;
+                }
+                // Derive: copy cap but track provenance for revocation
+                let root_tid = if src_cap.root_tid == 0 {
+                    // Kernel-minted cap: the granter becomes the root
+                    caller_tid as u8
+                } else {
+                    src_cap.root_tid
+                };
+                let root_slot = if src_cap.root_tid == 0 {
+                    src_slot as u8
+                } else {
+                    src_cap.root_slot
+                };
+                let gen = crate::cap::current_generation(root_tid as usize, root_slot as usize);
+                dest_task.cspace[dest_slot] = crate::cap::CapSlot {
+                    cap_type: src_cap.cap_type,
+                    generation: gen,
+                    root_slot,
+                    root_tid,
+                    param0: src_cap.param0,
+                    param1: src_cap.param1,
+                };
+            }
+            0
+        }
+        SYS_CAP_REVOKE => {
+            // arg0 = slot
+            // Bump generation, invalidate all derived caps
+            let slot = arg0 as usize;
+            if slot >= crate::cap::MAX_CAPS {
+                return u64::MAX;
+            }
+            let tid = scheduler::current_tid();
+            crate::cap::revoke(tid, slot);
+            0
+        }
+        SYS_CAP_INSPECT => {
+            // arg0 = slot
+            // Return packed info: type in bits [7:0], param0 in upper bits
+            // For full inspection, use two calls or a buffer.
+            // Simple: return type | (param0 << 8) truncated to u64
+            let slot = arg0 as usize;
+            if slot >= crate::cap::MAX_CAPS {
+                return u64::MAX;
+            }
+            let tid = scheduler::current_tid();
+            unsafe {
+                let task = match scheduler::get_task_mut(tid) {
+                    Some(t) => t,
+                    None => return u64::MAX,
+                };
+                let cap = &task.cspace[slot];
+                let cap_type = cap.cap_type as u64;
+                // Pack: [7:0]=type, [23:8]=param0 low 16, [39:24]=param1 low 16
+                cap_type | ((cap.param0 & 0xFFFF) << 8) | ((cap.param1 & 0xFFFF) << 24)
+            }
+        }
+        SYS_CAP_DELETE => {
+            // arg0 = slot
+            // Delete cap from own CSpace
+            let slot = arg0 as usize;
+            if slot >= crate::cap::MAX_CAPS {
+                return u64::MAX;
+            }
+            let tid = scheduler::current_tid();
+            unsafe {
+                let task = match scheduler::get_task_mut(tid) {
+                    Some(t) => t,
+                    None => return u64::MAX,
+                };
+                task.cspace[slot] = crate::cap::CapSlot::empty();
+            }
+            0
         }
         _ => u64::MAX,
     }

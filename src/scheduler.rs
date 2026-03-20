@@ -44,6 +44,7 @@ pub fn init() {
             priority: 255, // lowest priority
             cr3: crate::paging::read_cr3(),
             caps: crate::task::CAP_ALL,
+            cspace: crate::cap::empty_cspace(),
             fds: [crate::task::FdKind::empty(); crate::task::MAX_FDS],
             pager_tid: 0,
             parent_tid: 0,
@@ -505,6 +506,7 @@ pub fn create_empty_task() -> Option<usize> {
             priority: 0,
             cr3: 0,
             caps: 0,
+            cspace: crate::cap::empty_cspace(),
             fds: [crate::task::FdKind::empty(); crate::task::MAX_FDS],
             pager_tid: 0,
             parent_tid: parent,
@@ -562,6 +564,8 @@ pub fn grant_cap(tid: usize, cap: u32) -> Result<(), ()> {
         match TASKS[tid].as_mut() {
             Some(task) => {
                 task.caps |= cap;
+                // Also populate CSpace with wildcard/full-range caps
+                crate::cap::populate_from_bitmask(&mut task.cspace, cap);
                 Ok(())
             }
             None => Err(()),

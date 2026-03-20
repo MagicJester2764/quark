@@ -246,6 +246,15 @@ fn eq_ignore_case(a: &[u8], b: &[u8]) -> bool {
 
 fn grant_caps_by_name(name: &[u8], tid: usize) {
     if eq_ignore_case(name, b"cat") || eq_ignore_case(name, b"disktest") || eq_ignore_case(name, b"httpget") {
+        // Fine-grained: PhysAlloc(64), PhysRange(0, 4G)
+        const SCRATCH: usize = 14;
+        let _ = syscall::sys_cap_mint(SCRATCH, syscall::CAP_TYPE_PHYS_ALLOC, 64, 0);
+        let _ = syscall::sys_cap_grant(tid, SCRATCH, 0);
+        let _ = syscall::sys_cap_delete(SCRATCH);
+        let _ = syscall::sys_cap_mint(SCRATCH, syscall::CAP_TYPE_PHYS_RANGE, 0, 0x1_0000_0000);
+        let _ = syscall::sys_cap_grant(tid, SCRATCH, 1);
+        let _ = syscall::sys_cap_delete(SCRATCH);
+        // Old-style compat
         let _ = syscall::sys_grant_cap(tid, syscall::CAP_PHYS_ALLOC | syscall::CAP_MAP_PHYS);
     }
 }

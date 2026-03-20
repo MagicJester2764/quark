@@ -2,6 +2,7 @@
 ///
 /// Each task has a unique TID, its own kernel stack, and saved CPU context.
 
+use crate::cap::{self, CSpace, MAX_CAPS};
 use crate::context::CpuContext;
 use alloc::alloc::{alloc, dealloc, Layout};
 
@@ -56,6 +57,8 @@ pub struct Task {
     pub priority: u8,
     pub cr3: usize,
     pub caps: u32,
+    /// Object capability space (16 slots).
+    pub cspace: CSpace,
     /// File descriptor table. fd 0=stdin, 1=stdout, 2=stderr.
     pub fds: [FdKind; MAX_FDS],
     /// Pager task TID for exception forwarding. 0 = no pager (kill on fault).
@@ -123,6 +126,7 @@ impl Task {
             priority: 0,
             cr3: crate::paging::read_cr3(),
             caps: 0,
+            cspace: cap::empty_cspace(),
             fds: [FdKind::empty(); MAX_FDS],
             pager_tid: 0,
             parent_tid: 0,

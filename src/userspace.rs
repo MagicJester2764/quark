@@ -240,6 +240,7 @@ pub fn spawn_init(elf_data: &[u8], fb: Option<crate::multiboot2::FramebufferInfo
         let task = scheduler::get_task_mut(tid)?;
         task.cr3 = pml4;
         task.caps = crate::task::CAP_ALL;
+        crate::cap::populate_from_bitmask(&mut task.cspace, crate::task::CAP_ALL);
         task.context.rip = enter_user_trampoline as *const () as u64;
         task.context.r12 = entry;
         task.context.r13 = stack_top;

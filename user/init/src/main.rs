@@ -454,27 +454,65 @@ fn is_essential_elf(name: &[u8; 11]) -> bool {
         || base == b"NET     "
 }
 
-/// Grant capabilities based on FAT 8.3 name.
+/// Mint a cap in a temporary slot, grant it to a child task, then delete it.
+/// Uses slot 14 as a scratch slot for minting.
+fn mint_and_grant(tid: usize, dest_slot: usize, cap_type: u64, param0: u64, param1: u64) {
+    const SCRATCH_SLOT: usize = 14;
+    let _ = syscall::sys_cap_mint(SCRATCH_SLOT, cap_type, param0, param1);
+    let _ = syscall::sys_cap_grant(tid, SCRATCH_SLOT, dest_slot);
+    let _ = syscall::sys_cap_delete(SCRATCH_SLOT);
+}
+
+/// Grant capabilities based on FAT 8.3 name using fine-grained object capabilities.
 fn grant_caps_by_name(name: &[u8; 11], tid: usize) {
     let base = &name[0..8];
     if base == b"KEYBOARD" {
+        // IoPort(0x60, 0x64), Irq(1)
+        mint_and_grant(tid, 0, syscall::CAP_TYPE_IOPORT, 0x60, 0x64);
+        mint_and_grant(tid, 1, syscall::CAP_TYPE_IRQ, 1, 0);
+        // Also grant old-style for backward compat during transition
         let _ = syscall::sys_grant_ioport(tid);
         let _ = syscall::sys_grant_irq(tid, 1);
     } else if base == b"DISK    " {
+        // IoPort(0x1F0, 0x1F7), IoPort(0x3F6, 0x3F6), Irq(14), PhysRange(0, 4G)
+        mint_and_grant(tid, 0, syscall::CAP_TYPE_IOPORT, 0x1F0, 0x1F7);
+        mint_and_grant(tid, 1, syscall::CAP_TYPE_IOPORT, 0x3F6, 0x3F6);
+        mint_and_grant(tid, 2, syscall::CAP_TYPE_IRQ, 14, 0);
+        mint_and_grant(tid, 3, syscall::CAP_TYPE_PHYS_RANGE, 0, 0x1_0000_0000);
+        // Old-style compat
         let _ = syscall::sys_grant_ioport(tid);
         let _ = syscall::sys_grant_irq(tid, 14);
         let _ = syscall::sys_grant_cap(tid, syscall::CAP_MAP_PHYS);
     } else if base == b"VFS     " {
+        // PhysAlloc(256), PhysRange(0, 4G)
+        mint_and_grant(tid, 0, syscall::CAP_TYPE_PHYS_ALLOC, 256, 0);
+        mint_and_grant(tid, 1, syscall::CAP_TYPE_PHYS_RANGE, 0, 0x1_0000_0000);
         let _ = syscall::sys_grant_cap(tid, syscall::CAP_PHYS_ALLOC | syscall::CAP_MAP_PHYS);
     } else if base == b"NET     " {
+        // IoPort(0xC000, 0xC0FF), Irq(0xFF wildcard), PhysAlloc(64), PhysRange(0, 4G)
+        mint_and_grant(tid, 0, syscall::CAP_TYPE_IOPORT, 0, 0xFFFF);
+        mint_and_grant(tid, 1, syscall::CAP_TYPE_IRQ, 0xFF, 0);
+        mint_and_grant(tid, 2, syscall::CAP_TYPE_PHYS_ALLOC, 64, 0);
+        mint_and_grant(tid, 3, syscall::CAP_TYPE_PHYS_RANGE, 0, 0x1_0000_0000);
         let _ = syscall::sys_grant_cap(tid,
             syscall::CAP_IOPORT | syscall::CAP_IRQ | syscall::CAP_PHYS_ALLOC | syscall::CAP_MAP_PHYS);
     } else if base == b"INPUT   " {
+        // TaskMgmt(0)
+        mint_and_grant(tid, 0, syscall::CAP_TYPE_TASK_MGMT, 0, 0);
         let _ = syscall::sys_grant_cap(tid, syscall::CAP_TASK_MGMT);
     } else if base == b"SHELL   " {
+        // TaskMgmt(0), PhysAlloc(64), PhysRange(0, 4G)
+        mint_and_grant(tid, 0, syscall::CAP_TYPE_TASK_MGMT, 0, 0);
+        mint_and_grant(tid, 1, syscall::CAP_TYPE_PHYS_ALLOC, 64, 0);
+        mint_and_grant(tid, 2, syscall::CAP_TYPE_PHYS_RANGE, 0, 0x1_0000_0000);
         let _ = syscall::sys_grant_cap(tid,
             syscall::CAP_TASK_MGMT | syscall::CAP_PHYS_ALLOC | syscall::CAP_MAP_PHYS);
     } else if base == b"LOGIN   " {
+        // TaskMgmt(0), PhysAlloc(64), PhysRange(0, 4G), SetUid
+        mint_and_grant(tid, 0, syscall::CAP_TYPE_TASK_MGMT, 0, 0);
+        mint_and_grant(tid, 1, syscall::CAP_TYPE_PHYS_ALLOC, 64, 0);
+        mint_and_grant(tid, 2, syscall::CAP_TYPE_PHYS_RANGE, 0, 0x1_0000_0000);
+        mint_and_grant(tid, 3, syscall::CAP_TYPE_SET_UID, 0, 0);
         let _ = syscall::sys_grant_cap(tid,
             syscall::CAP_TASK_MGMT | syscall::CAP_PHYS_ALLOC | syscall::CAP_MAP_PHYS | syscall::CAP_SET_UID);
     }
@@ -606,6 +644,8 @@ fn load_essentials_from_boot_image(rootfs_phys: usize, rootfs_size: usize) -> Bo
             if let Ok(data) = read_file_to_buffer(rootfs, &bpb, e.first_cluster, e.file_size) {
                 match load_elf(data) {
                     Ok(info) => {
+                        // Console: PhysRange(0, 4G) for framebuffer mapping
+                        mint_and_grant(info.tid, 0, syscall::CAP_TYPE_PHYS_RANGE, 0, 0x1_0000_0000);
                         let _ = syscall::sys_grant_cap(info.tid, syscall::CAP_MAP_PHYS);
                         let _ = set_args(&info, &[b"console"]);
                         // Create console pipe and set fds BEFORE starting console

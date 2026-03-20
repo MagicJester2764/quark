@@ -4,6 +4,7 @@
 
 extern crate alloc;
 
+pub mod cap;
 mod console;
 mod context;
 mod fat32;

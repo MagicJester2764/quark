@@ -139,7 +139,7 @@ pub fn grant(handle: usize, target_tid: usize) -> u64 {
 
         // Only creator or CAP_TASK_MGMT holders can grant
         if region.creator != tid
-            && !scheduler::current_task_has_cap(crate::task::CAP_TASK_MGMT)
+            && !crate::cap::task_has_task_mgmt(scheduler::current_tid(), 0)
         {
             return u64::MAX;
         }
@@ -201,7 +201,7 @@ pub fn destroy(handle: usize) -> u64 {
 
         // Only creator or CAP_TASK_MGMT holders can destroy
         if region.creator != tid
-            && !scheduler::current_task_has_cap(crate::task::CAP_TASK_MGMT)
+            && !crate::cap::task_has_task_mgmt(scheduler::current_tid(), 0)
         {
             return u64::MAX;
         }
