@@ -6,3 +6,6 @@
 /drivers/*/*.drv
 /user/*/target
 /user/*/Cargo.lock
+/rootfs
+/rootfs/etc
+/rootfs/etc/passwd
