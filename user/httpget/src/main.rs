@@ -95,18 +95,10 @@ fn alloc_data_buf() -> usize {
 #[unsafe(no_mangle)]
 #[link_section = ".text.entry"]
 pub extern "C" fn _start() -> ! {
-    let ip_arg = match args::argv(1) {
+    let host_arg = match args::argv(1) {
         Some(arg) => arg,
         None => {
-            println!("Usage: httpget <ip> [port] [path]");
-            syscall::sys_exit();
-        }
-    };
-
-    let dst_ip = match parse_ip(ip_arg) {
-        Some(ip) => ip,
-        None => {
-            println!("httpget: invalid IP address");
+            println!("Usage: httpget <host> [port] [path]");
             syscall::sys_exit();
         }
     };
@@ -124,6 +116,20 @@ pub extern "C" fn _start() -> ! {
         None => {
             println!("httpget: net service not found");
             syscall::sys_exit();
+        }
+    };
+
+    // Try parsing as IP first, then resolve via DNS
+    let dst_ip = match parse_ip(host_arg) {
+        Some(ip) => ip,
+        None => {
+            match net::dns_resolve(net_tid, host_arg) {
+                Ok(ip) => ip,
+                Err(_) => {
+                    println!("httpget: failed to resolve host");
+                    syscall::sys_exit();
+                }
+            }
         }
     };
 
@@ -163,11 +169,9 @@ pub extern "C" fn _start() -> ! {
         len += path.len();
         core::ptr::copy_nonoverlapping(req_mid.as_ptr(), buf.add(len), req_mid.len());
         len += req_mid.len();
-        // Write IP as host
-        let host = format_ip_str(&ip_bytes);
-        let host_len = host.iter().position(|&b| b == 0).unwrap_or(host.len());
-        core::ptr::copy_nonoverlapping(host.as_ptr(), buf.add(len), host_len);
-        len += host_len;
+        // Write host (original argument — hostname or IP)
+        core::ptr::copy_nonoverlapping(host_arg.as_ptr(), buf.add(len), host_arg.len());
+        len += host_arg.len();
         core::ptr::copy_nonoverlapping(req_suffix.as_ptr(), buf.add(len), req_suffix.len());
         len += req_suffix.len();
     }
@@ -213,36 +217,6 @@ pub extern "C" fn _start() -> ! {
 
     let _ = net::tcp_close(net_tid, handle);
     syscall::sys_exit();
-}
-
-fn format_ip_str(ip: &[u8; 4]) -> [u8; 15] {
-    let mut buf = [0u8; 15];
-    let mut pos = 0;
-    for i in 0..4 {
-        if i > 0 {
-            buf[pos] = b'.';
-            pos += 1;
-        }
-        let mut v = ip[i];
-        if v >= 100 {
-            buf[pos] = b'0' + v / 100;
-            pos += 1;
-            v %= 100;
-            buf[pos] = b'0' + v / 10;
-            pos += 1;
-            buf[pos] = b'0' + v % 10;
-            pos += 1;
-        } else if v >= 10 {
-            buf[pos] = b'0' + v / 10;
-            pos += 1;
-            buf[pos] = b'0' + v % 10;
-            pos += 1;
-        } else {
-            buf[pos] = b'0' + v;
-            pos += 1;
-        }
-    }
-    buf
 }
 
 fn print_char(b: u8) {

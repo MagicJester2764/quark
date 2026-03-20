@@ -9,6 +9,7 @@ const TAG_NET_CONFIG: u64 = 3;
 const TAG_NET_INFO: u64 = 4;
 const TAG_ICMP_PING: u64 = 5;
 const TAG_NET_DHCP: u64 = 6;
+const TAG_DNS_RESOLVE: u64 = 7;
 const TAG_TCP_CONNECT: u64 = 10;
 const TAG_TCP_LISTEN: u64 = 11;
 const TAG_TCP_SEND: u64 = 13;
@@ -117,6 +118,35 @@ pub fn configure(net_tid: usize, ip: u32, netmask: u32, gateway: u32) -> Result<
         return Err(1);
     }
     if reply.tag == TAG_ERROR { Err(reply.data[0]) } else { Ok(()) }
+}
+
+/// Resolve a hostname to an IPv4 address via DNS.
+/// Returns the IP as a packed big-endian u32 on success.
+/// Hostname must be <= 48 bytes.
+pub fn dns_resolve(net_tid: usize, hostname: &[u8]) -> Result<u32, u64> {
+    if hostname.is_empty() || hostname.len() > 48 {
+        return Err(1);
+    }
+    let mut name_buf = [0u8; 48];
+    name_buf[..hostname.len()].copy_from_slice(hostname);
+    let msg = Message {
+        sender: 0,
+        tag: TAG_DNS_RESOLVE,
+        data: [
+            u64::from_le_bytes(name_buf[0..8].try_into().unwrap()),
+            u64::from_le_bytes(name_buf[8..16].try_into().unwrap()),
+            u64::from_le_bytes(name_buf[16..24].try_into().unwrap()),
+            u64::from_le_bytes(name_buf[24..32].try_into().unwrap()),
+            u64::from_le_bytes(name_buf[32..40].try_into().unwrap()),
+            u64::from_le_bytes(name_buf[40..48].try_into().unwrap()),
+        ],
+    };
+    let mut reply = Message::empty();
+    if syscall::sys_call(net_tid, &msg, &mut reply).is_err() {
+        return Err(1);
+    }
+    if reply.tag == TAG_ERROR { return Err(reply.data[0]); }
+    Ok(reply.data[0] as u32)
 }
 
 /// Trigger DHCP renewal. Returns the new IP address (packed big-endian) on success.

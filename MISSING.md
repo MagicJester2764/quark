@@ -49,7 +49,7 @@ Scheduler, synchronous IPC, address spaces, capabilities, fd table, IRQ delegati
 
 19. ~~**DHCP client**~~ — **Done.** Built into net driver. Sends DHCP DISCOVER at startup, negotiates OFFER→REQUEST→ACK, applies IP/netmask/gateway. Falls back to static 10.0.2.15 after 5-second timeout. `TAG_NET_DHCP` (6) IPC for renewal. `libquark::net::dhcp_renew()` client API.
 
-20. **DNS resolver** — Name resolution so network programs can use hostnames.
+20. ~~**DNS resolver**~~ — **Done.** Built into net driver. Sends DNS A-record queries via UDP to configured DNS server (from DHCP option 6, default 10.0.2.3). 8-entry cache. `TAG_DNS_RESOLVE` (7) IPC with 48-byte hostname. `libquark::net::dns_resolve()` client API. `httpget` and `ping` accept hostnames via DNS fallback. 3-second query timeout.
 
 21. ~~**Task listing (`ps`)**~~ — **Done.** `sys_task_info(tid)` (syscall 105) returns task state, UID, and parent TID. `ps` command lists all running tasks.
 

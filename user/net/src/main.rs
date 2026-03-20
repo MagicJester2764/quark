@@ -18,6 +18,7 @@ const TAG_NET_CONFIG: u64 = 3;
 const TAG_NET_INFO: u64 = 4;
 const TAG_ICMP_PING: u64 = 5;
 const TAG_NET_DHCP: u64 = 6;
+const TAG_DNS_RESOLVE: u64 = 7;
 const TAG_TCP_CONNECT: u64 = 10;
 const TAG_TCP_LISTEN: u64 = 11;
 const TAG_TCP_SEND: u64 = 13;
@@ -180,10 +181,17 @@ const DHCP_REQUEST: u8 = 3;
 const DHCP_ACK: u8 = 5;
 const DHCP_NAK: u8 = 6;
 
+// DNS
+const DNS_SERVER_PORT: u16 = 53;
+const DNS_CLIENT_PORT: u16 = 10053; // fixed source port for DNS queries
+const DNS_CACHE_SIZE: usize = 8;
+const DNS_TIMEOUT_TICKS: u64 = 300; // 3 seconds at 100 Hz
+
 // Default config for QEMU user-mode networking
 const DEFAULT_IP: [u8; 4] = [10, 0, 2, 15];
 const DEFAULT_GATEWAY: [u8; 4] = [10, 0, 2, 2];
 const DEFAULT_NETMASK: [u8; 4] = [255, 255, 255, 0];
+const DEFAULT_DNS: [u8; 4] = [10, 0, 2, 3]; // QEMU user-mode DNS relay
 
 // ---------------------------------------------------------------------------
 // Driver state
@@ -249,6 +257,13 @@ struct TcpConn {
     fin_received: bool,
 }
 
+struct DnsCacheEntry {
+    name: [u8; 48],
+    name_len: u8,
+    ip: [u8; 4],
+    valid: bool,
+}
+
 struct NetState {
     io_base: u16,
     irq: u8,
@@ -256,6 +271,7 @@ struct NetState {
     ip: [u8; 4],
     netmask: [u8; 4],
     gateway: [u8; 4],
+    dns_server: [u8; 4],
     rx_offset: usize,
     tx_cur: usize,
     rx_phys: usize,
@@ -271,6 +287,13 @@ struct NetState {
     dhcp_server_ip: [u8; 4],
     dhcp_offered_ip: [u8; 4],
     dhcp_lease_time: u32,
+    dns_cache: [DnsCacheEntry; DNS_CACHE_SIZE],
+    dns_pending_tid: usize,
+    dns_pending_id: u16,
+    dns_pending_active: bool,
+    dns_pending_tick: u64,
+    dns_pending_name: [u8; 48],
+    dns_pending_name_len: u8,
 }
 
 static mut NET: NetState = NetState {
@@ -280,6 +303,7 @@ static mut NET: NetState = NetState {
     ip: DEFAULT_IP,
     netmask: DEFAULT_NETMASK,
     gateway: DEFAULT_GATEWAY,
+    dns_server: DEFAULT_DNS,
     rx_offset: 0,
     tx_cur: 0,
     rx_phys: 0,
@@ -307,6 +331,18 @@ static mut NET: NetState = NetState {
     dhcp_server_ip: [0; 4],
     dhcp_offered_ip: [0; 4],
     dhcp_lease_time: 0,
+    dns_cache: {
+        const EMPTY: DnsCacheEntry = DnsCacheEntry {
+            name: [0; 48], name_len: 0, ip: [0; 4], valid: false,
+        };
+        [EMPTY; DNS_CACHE_SIZE]
+    },
+    dns_pending_tid: 0,
+    dns_pending_id: 0,
+    dns_pending_active: false,
+    dns_pending_tick: 0,
+    dns_pending_name: [0; 48],
+    dns_pending_name_len: 0,
 };
 
 // ---------------------------------------------------------------------------
@@ -758,6 +794,12 @@ fn handle_udp(data: &[u8], src_ip: &[u8; 4]) {
     // Intercept DHCP replies (port 68)
     if dst_port == DHCP_CLIENT_PORT {
         dhcp_handle_reply(payload);
+        return;
+    }
+
+    // Intercept DNS responses (to our fixed DNS client port)
+    if dst_port == DNS_CLIENT_PORT && src_port == DNS_SERVER_PORT {
+        dns_handle_response(payload);
         return;
     }
 
@@ -1503,8 +1545,10 @@ fn dhcp_handle_reply(data: &[u8]) {
     let mut server_id: [u8; 4] = [0; 4];
     let mut subnet_mask: [u8; 4] = [255, 255, 255, 0];
     let mut router: [u8; 4] = [0; 4];
+    let mut dns: [u8; 4] = [0; 4];
     let mut lease_time: u32 = 0;
     let mut has_router = false;
+    let mut has_dns = false;
 
     let mut i = 240;
     while i < data.len() {
@@ -1521,6 +1565,7 @@ fn dhcp_handle_reply(data: &[u8]) {
             54 if len >= 4 => server_id.copy_from_slice(&val[..4]),
             1 if len >= 4 => subnet_mask.copy_from_slice(&val[..4]),
             3 if len >= 4 => { router.copy_from_slice(&val[..4]); has_router = true; },
+            6 if len >= 4 => { dns.copy_from_slice(&val[..4]); has_dns = true; },
             51 if len >= 4 => lease_time = u32::from_be_bytes([val[0], val[1], val[2], val[3]]),
             _ => {}
         }
@@ -1561,6 +1606,9 @@ fn dhcp_handle_reply(data: &[u8]) {
                 NET.ip = offered_ip;
                 NET.netmask = subnet_mask;
                 NET.gateway = router;
+                if has_dns {
+                    NET.dns_server = dns;
+                }
                 NET.dhcp_lease_time = lease_time;
                 NET.dhcp_state = 3;
             }
@@ -1595,6 +1643,234 @@ fn dhcp_discover() {
     let bcast_ip = [255u8; 4];
     send_udp_packet_raw(&zero_ip, &bcast_ip, DHCP_CLIENT_PORT, DHCP_SERVER_PORT, &pkt_buf[..pkt_len]);
     println!("[net] DHCP: discover sent (xid={:#x})", xid);
+}
+
+// ---------------------------------------------------------------------------
+// DNS
+// ---------------------------------------------------------------------------
+
+fn dns_cache_lookup(name: &[u8]) -> Option<[u8; 4]> {
+    unsafe {
+        for e in &NET.dns_cache {
+            if e.valid && e.name_len as usize == name.len()
+                && e.name[..e.name_len as usize] == *name
+            {
+                return Some(e.ip);
+            }
+        }
+    }
+    None
+}
+
+fn dns_cache_store(name: &[u8], ip: &[u8; 4]) {
+    unsafe {
+        // Look for existing entry or first free slot
+        let mut slot = None;
+        for i in 0..DNS_CACHE_SIZE {
+            if !NET.dns_cache[i].valid {
+                slot = Some(i);
+                break;
+            }
+            if NET.dns_cache[i].name_len as usize == name.len()
+                && NET.dns_cache[i].name[..NET.dns_cache[i].name_len as usize] == *name
+            {
+                slot = Some(i);
+                break;
+            }
+        }
+        let idx = slot.unwrap_or(0); // Overwrite first if full
+        let len = name.len().min(48);
+        NET.dns_cache[idx].name[..len].copy_from_slice(&name[..len]);
+        NET.dns_cache[idx].name_len = len as u8;
+        NET.dns_cache[idx].ip = *ip;
+        NET.dns_cache[idx].valid = true;
+    }
+}
+
+/// Encode a hostname into DNS wire format (e.g., "example.com" → \x07example\x03com\x00)
+fn dns_encode_name(name: &[u8], buf: &mut [u8]) -> usize {
+    let mut pos = 0;
+    let mut label_start = 0;
+
+    for i in 0..=name.len() {
+        if i == name.len() || name[i] == b'.' {
+            let label_len = i - label_start;
+            if label_len == 0 || label_len > 63 || pos + 1 + label_len >= buf.len() {
+                return 0;
+            }
+            buf[pos] = label_len as u8;
+            pos += 1;
+            buf[pos..pos + label_len].copy_from_slice(&name[label_start..i]);
+            pos += label_len;
+            label_start = i + 1;
+        }
+    }
+    if pos >= buf.len() { return 0; }
+    buf[pos] = 0; // root label
+    pos + 1
+}
+
+/// Skip a DNS name in wire format (handling compression pointers)
+fn dns_skip_name(data: &[u8], mut pos: usize) -> usize {
+    loop {
+        if pos >= data.len() { return data.len(); }
+        let len = data[pos];
+        if len == 0 { return pos + 1; }
+        if len & 0xC0 == 0xC0 { return pos + 2; } // compression pointer
+        pos += 1 + len as usize;
+    }
+}
+
+/// Build a DNS A-record query. Returns total packet length.
+fn dns_build_query(buf: &mut [u8], id: u16, name: &[u8]) -> usize {
+    if buf.len() < 512 { return 0; }
+    for b in buf.iter_mut() { *b = 0; }
+
+    // Header (12 bytes)
+    buf[0..2].copy_from_slice(&id.to_be_bytes());
+    buf[2] = 0x01; buf[3] = 0x00; // flags: standard query, recursion desired
+    buf[4..6].copy_from_slice(&1u16.to_be_bytes()); // QDCOUNT = 1
+    // ANCOUNT, NSCOUNT, ARCOUNT = 0
+
+    // Question
+    let name_len = dns_encode_name(name, &mut buf[12..]);
+    if name_len == 0 { return 0; }
+
+    let qoff = 12 + name_len;
+    buf[qoff..qoff + 2].copy_from_slice(&1u16.to_be_bytes());   // QTYPE = A
+    buf[qoff + 2..qoff + 4].copy_from_slice(&1u16.to_be_bytes()); // QCLASS = IN
+
+    qoff + 4
+}
+
+/// Send a DNS query for hostname to the configured DNS server
+fn dns_send_query(name: &[u8]) -> bool {
+    let id = (syscall::sys_ticks() as u16) ^ 0xBEEF;
+    let dns_server = unsafe { NET.dns_server };
+
+    let mut query_buf = [0u8; 512];
+    let query_len = dns_build_query(&mut query_buf, id, name);
+    if query_len == 0 { return false; }
+
+    unsafe {
+        NET.dns_pending_id = id;
+        NET.dns_pending_active = true;
+        NET.dns_pending_tick = syscall::sys_ticks();
+    }
+
+    // Try sending; if ARP isn't cached, poll for ARP reply and retry
+    let mut sent = send_udp_packet(&dns_server, DNS_CLIENT_PORT, DNS_SERVER_PORT, &query_buf[..query_len]);
+    if !sent {
+        let next_hop = if is_same_subnet(&dns_server) {
+            dns_server
+        } else {
+            unsafe { NET.gateway }
+        };
+        for _ in 0..200 {
+            syscall::sys_yield();
+            poll_nic_once();
+            if arp_lookup(&next_hop).is_some() {
+                sent = send_udp_packet(&dns_server, DNS_CLIENT_PORT, DNS_SERVER_PORT, &query_buf[..query_len]);
+                break;
+            }
+        }
+    }
+    sent
+}
+
+/// Handle an incoming DNS response
+fn dns_handle_response(data: &[u8]) {
+    if data.len() < 12 { return; }
+
+    // Check header
+    let id = u16::from_be_bytes([data[0], data[1]]);
+    let pending_id = unsafe { NET.dns_pending_id };
+    let pending_active = unsafe { NET.dns_pending_active };
+    if !pending_active || id != pending_id { return; }
+
+    let flags = u16::from_be_bytes([data[2], data[3]]);
+    if flags & 0x8000 == 0 { return; } // Not a response
+    let rcode = flags & 0x000F;
+    if rcode != 0 {
+        // DNS error — reply with error
+        unsafe {
+            if NET.dns_pending_active {
+                let reply = Message {
+                    sender: 0,
+                    tag: TAG_ERROR,
+                    data: [rcode as u64, 0, 0, 0, 0, 0],
+                };
+                let _ = syscall::sys_reply(NET.dns_pending_tid, &reply);
+                NET.dns_pending_active = false;
+            }
+        }
+        return;
+    }
+
+    let qdcount = u16::from_be_bytes([data[4], data[5]]) as usize;
+    let ancount = u16::from_be_bytes([data[6], data[7]]) as usize;
+
+    // Skip question section
+    let mut pos = 12;
+    for _ in 0..qdcount {
+        pos = dns_skip_name(data, pos);
+        pos += 4; // QTYPE + QCLASS
+    }
+
+    // Parse answers looking for A record
+    for _ in 0..ancount {
+        if pos >= data.len() { break; }
+        pos = dns_skip_name(data, pos);
+        if pos + 10 > data.len() { break; }
+
+        let rtype = u16::from_be_bytes([data[pos], data[pos + 1]]);
+        let rclass = u16::from_be_bytes([data[pos + 2], data[pos + 3]]);
+        // TTL at pos+4..pos+8
+        let rdlength = u16::from_be_bytes([data[pos + 8], data[pos + 9]]) as usize;
+        pos += 10;
+
+        if pos + rdlength > data.len() { break; }
+
+        if rtype == 1 && rclass == 1 && rdlength == 4 {
+            // A record — got our IP
+            let ip: [u8; 4] = [data[pos], data[pos + 1], data[pos + 2], data[pos + 3]];
+
+            // Cache the result
+            unsafe {
+                let nlen = NET.dns_pending_name_len as usize;
+                dns_cache_store(&NET.dns_pending_name[..nlen], &ip);
+            }
+
+            unsafe {
+                if NET.dns_pending_active {
+                    let ip_packed = u32::from_be_bytes(ip) as u64;
+                    let reply = Message {
+                        sender: 0,
+                        tag: TAG_OK,
+                        data: [ip_packed, 0, 0, 0, 0, 0],
+                    };
+                    let _ = syscall::sys_reply(NET.dns_pending_tid, &reply);
+                    NET.dns_pending_active = false;
+                }
+            }
+            return;
+        }
+
+        pos += rdlength;
+    }
+
+    // No A record found
+    unsafe {
+        if NET.dns_pending_active {
+            let reply = Message {
+                sender: 0,
+                tag: TAG_ERROR,
+                data: [2, 0, 0, 0, 0, 0],
+            };
+            let _ = syscall::sys_reply(NET.dns_pending_tid, &reply);
+            NET.dns_pending_active = false;
+        }
+    }
 }
 
 fn poll_nic_once() {
@@ -1721,6 +1997,20 @@ pub extern "C" fn _start() -> ! {
                         };
                         let _ = syscall::sys_reply(pending.tid, &reply);
                         NET.pending_icmp = None;
+                    }
+                }
+            }
+            // Check DNS timeout
+            unsafe {
+                if NET.dns_pending_active {
+                    if syscall::sys_ticks() - NET.dns_pending_tick > DNS_TIMEOUT_TICKS {
+                        let reply = Message {
+                            sender: 0,
+                            tag: TAG_ERROR,
+                            data: [3, 0, 0, 0, 0, 0], // timeout
+                        };
+                        let _ = syscall::sys_reply(NET.dns_pending_tid, &reply);
+                        NET.dns_pending_active = false;
                     }
                 }
             }
@@ -1864,6 +2154,39 @@ pub extern "C" fn _start() -> ! {
                     let ip_packed = u32::from_be_bytes(ip) as u64;
                     let reply = Message { sender: 0, tag: TAG_OK, data: [ip_packed, 0, 0, 0, 0, 0] };
                     let _ = syscall::sys_reply(msg.sender, &reply);
+                }
+            }
+            TAG_DNS_RESOLVE => {
+                // Unpack hostname from IPC data (48 bytes, null-terminated)
+                let mut name = [0u8; 48];
+                for i in 0..6 {
+                    name[i * 8..(i + 1) * 8].copy_from_slice(&msg.data[i].to_le_bytes());
+                }
+                let name_len = name.iter().position(|&b| b == 0).unwrap_or(48);
+                let hostname = &name[..name_len];
+
+                // Check cache first
+                if let Some(ip) = dns_cache_lookup(hostname) {
+                    let ip_packed = u32::from_be_bytes(ip) as u64;
+                    let reply = Message { sender: 0, tag: TAG_OK, data: [ip_packed, 0, 0, 0, 0, 0] };
+                    let _ = syscall::sys_reply(msg.sender, &reply);
+                } else if unsafe { NET.dns_pending_active } {
+                    // Already a DNS query in flight — reject
+                    let reply = Message { sender: 0, tag: TAG_ERROR, data: [4, 0, 0, 0, 0, 0] };
+                    let _ = syscall::sys_reply(msg.sender, &reply);
+                } else {
+                    // Send DNS query — reply deferred
+                    unsafe {
+                        NET.dns_pending_tid = msg.sender;
+                        NET.dns_pending_name = [0; 48];
+                        NET.dns_pending_name[..name_len].copy_from_slice(hostname);
+                        NET.dns_pending_name_len = name_len as u8;
+                    }
+                    if !dns_send_query(hostname) {
+                        let reply = Message { sender: 0, tag: TAG_ERROR, data: [5, 0, 0, 0, 0, 0] };
+                        let _ = syscall::sys_reply(msg.sender, &reply);
+                        unsafe { NET.dns_pending_active = false; }
+                    }
                 }
             }
             TAG_TCP_CONNECT => {

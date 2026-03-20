@@ -99,18 +99,10 @@ fn format_ip(ip: u32) -> [u8; 4] {
 #[unsafe(no_mangle)]
 #[link_section = ".text.entry"]
 pub extern "C" fn _start() -> ! {
-    let ip_arg = match args::argv(1) {
+    let host_arg = match args::argv(1) {
         Some(arg) => arg,
         None => {
-            println!("Usage: ping <ip> [count]");
-            syscall::sys_exit();
-        }
-    };
-
-    let dst_ip = match parse_ip(ip_arg) {
-        Some(ip) => ip,
-        None => {
-            println!("ping: invalid IP address");
+            println!("Usage: ping <host> [count]");
             syscall::sys_exit();
         }
     };
@@ -126,6 +118,20 @@ pub extern "C" fn _start() -> ! {
         None => {
             println!("ping: net service not found");
             syscall::sys_exit();
+        }
+    };
+
+    // Try parsing as IP first, then resolve via DNS
+    let dst_ip = match parse_ip(host_arg) {
+        Some(ip) => ip,
+        None => {
+            match net::dns_resolve(net_tid, host_arg) {
+                Ok(ip) => ip,
+                Err(_) => {
+                    println!("ping: failed to resolve host");
+                    syscall::sys_exit();
+                }
+            }
         }
     };
 
