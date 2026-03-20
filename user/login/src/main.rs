@@ -336,11 +336,28 @@ pub extern "C" fn _start() -> ! {
         let _ = syscall::sys_set_uid(tid, entry.uid);
         let _ = syscall::sys_set_gid(tid, entry.gid);
 
-        // Grant shell capabilities (task mgmt + phys for spawning child programs)
+        // Grant shell capabilities (task mgmt + phys for spawning + ioport for shutdown)
         let _ = syscall::sys_grant_cap(
             tid,
-            syscall::CAP_TASK_MGMT | syscall::CAP_PHYS_ALLOC | syscall::CAP_MAP_PHYS,
+            syscall::CAP_TASK_MGMT | syscall::CAP_PHYS_ALLOC | syscall::CAP_MAP_PHYS | syscall::CAP_IOPORT,
         );
+        // Fine-grained caps for shell: TaskMgmt, PhysAlloc, PhysRange, IOPORT (ACPI shutdown)
+        const SCRATCH: usize = 14;
+        let _ = syscall::sys_cap_mint(SCRATCH, syscall::CAP_TYPE_TASK_MGMT, 0, 0);
+        let _ = syscall::sys_cap_grant(tid, SCRATCH, 0);
+        let _ = syscall::sys_cap_delete(SCRATCH);
+        let _ = syscall::sys_cap_mint(SCRATCH, syscall::CAP_TYPE_PHYS_ALLOC, 64, 0);
+        let _ = syscall::sys_cap_grant(tid, SCRATCH, 1);
+        let _ = syscall::sys_cap_delete(SCRATCH);
+        let _ = syscall::sys_cap_mint(SCRATCH, syscall::CAP_TYPE_PHYS_RANGE, 0, 0x1_0000_0000);
+        let _ = syscall::sys_cap_grant(tid, SCRATCH, 2);
+        let _ = syscall::sys_cap_delete(SCRATCH);
+        let _ = syscall::sys_cap_mint(SCRATCH, syscall::CAP_TYPE_IOPORT, 0x604, 0x604);
+        let _ = syscall::sys_cap_grant(tid, SCRATCH, 3);
+        let _ = syscall::sys_cap_delete(SCRATCH);
+        let _ = syscall::sys_cap_mint(SCRATCH, syscall::CAP_TYPE_IOPORT, 0xB004, 0xB004);
+        let _ = syscall::sys_cap_grant(tid, SCRATCH, 4);
+        let _ = syscall::sys_cap_delete(SCRATCH);
 
         // Wire file descriptors
         let _ = syscall::sys_fd_dup(tid, 0, 0); // stdin

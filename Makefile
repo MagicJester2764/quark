@@ -69,6 +69,9 @@ PING_ELF := $(PING_DIR)/target/$(TARGET)/release/ping
 HTTPGET_DIR := user/httpget
 HTTPGET_ELF := $(HTTPGET_DIR)/target/$(TARGET)/release/httpget
 
+SHUTDOWN_DIR := user/shutdown
+SHUTDOWN_ELF := $(SHUTDOWN_DIR)/target/$(TARGET)/release/shutdown
+
 .PHONY: all clean iso run run-uefi drivers user rootfs FORCE
 
 all: $(KERNEL) drivers user rootfs
@@ -87,7 +90,7 @@ $(FAT32_DRV_BIN): FORCE
 	cd $(FAT32_DRV_DIR) && cargo build --release
 	objcopy -O binary $(FAT32_DRV_ELF) $(FAT32_DRV_BIN)
 
-user: $(INIT_ELF) $(HELLO_ELF) $(NS_ELF) $(KBD_ELF) $(CON_ELF) $(INP_ELF) $(DISK_ELF) $(DISKTEST_ELF) $(VFS_ELF) $(NET_ELF) $(SHELL_ELF) $(ECHO_ELF) $(LS_ELF) $(CAT_ELF) $(LOGIN_ELF) $(PS_ELF) $(IPCPING_ELF) $(PING_ELF) $(HTTPGET_ELF)
+user: $(INIT_ELF) $(HELLO_ELF) $(NS_ELF) $(KBD_ELF) $(CON_ELF) $(INP_ELF) $(DISK_ELF) $(DISKTEST_ELF) $(VFS_ELF) $(NET_ELF) $(SHELL_ELF) $(ECHO_ELF) $(LS_ELF) $(CAT_ELF) $(LOGIN_ELF) $(PS_ELF) $(IPCPING_ELF) $(PING_ELF) $(HTTPGET_ELF) $(SHUTDOWN_ELF)
 
 $(INIT_ELF): FORCE
 	cd $(INIT_DIR) && cargo build --release
@@ -146,6 +149,9 @@ $(PING_ELF): FORCE
 $(HTTPGET_ELF): FORCE
 	cd $(HTTPGET_DIR) && cargo build --release
 
+$(SHUTDOWN_ELF): FORCE
+	cd $(SHUTDOWN_DIR) && cargo build --release
+
 rootfs:
 	@mkdir -p rootfs/etc
 	@echo 'root:0:0:/home/root:/usr/bin/SHELL.ELF' > rootfs/etc/passwd
@@ -188,6 +194,7 @@ clean:
 	cd $(IPCPING_DIR) && cargo clean
 	cd $(PING_DIR) && cargo clean
 	cd $(HTTPGET_DIR) && cargo clean
+	cd $(SHUTDOWN_DIR) && cargo clean
 	rm -rf $(KERNEL) $(VGA_DRV_BIN) $(FAT32_DRV_BIN) quark.iso isodir
 
 FORCE:

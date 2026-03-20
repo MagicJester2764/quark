@@ -256,6 +256,20 @@ fn grant_caps_by_name(name: &[u8], tid: usize) {
         let _ = syscall::sys_cap_delete(SCRATCH);
         // Old-style compat
         let _ = syscall::sys_grant_cap(tid, syscall::CAP_PHYS_ALLOC | syscall::CAP_MAP_PHYS);
+    } else if eq_ignore_case(name, b"shutdown") {
+        // TaskMgmt for signaling, IoPort for ACPI power-off
+        const SCRATCH: usize = 14;
+        let _ = syscall::sys_cap_mint(SCRATCH, syscall::CAP_TYPE_TASK_MGMT, 0, 0);
+        let _ = syscall::sys_cap_grant(tid, SCRATCH, 0);
+        let _ = syscall::sys_cap_delete(SCRATCH);
+        let _ = syscall::sys_cap_mint(SCRATCH, syscall::CAP_TYPE_IOPORT, 0x604, 0x604);
+        let _ = syscall::sys_cap_grant(tid, SCRATCH, 1);
+        let _ = syscall::sys_cap_delete(SCRATCH);
+        let _ = syscall::sys_cap_mint(SCRATCH, syscall::CAP_TYPE_IOPORT, 0xB004, 0xB004);
+        let _ = syscall::sys_cap_grant(tid, SCRATCH, 2);
+        let _ = syscall::sys_cap_delete(SCRATCH);
+        // Old-style compat
+        let _ = syscall::sys_grant_cap(tid, syscall::CAP_TASK_MGMT | syscall::CAP_IOPORT);
     }
 }
 

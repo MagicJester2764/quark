@@ -55,4 +55,4 @@ Scheduler, synchronous IPC, address spaces, capabilities, fd table, IRQ delegati
 
 22. **Filesystem permissions** — FAT32 has no ownership/permissions. Options: sidecar `.permissions` files per directory, or switch to ext2. VFS would query caller UID via `SYS_GET_TUID(sender_tid)` and check against file ownership. Alternative: kernel includes sender UID in IPC messages (more secure). Also needed for setuid binaries.
 
-23. **`shutdown` program** — Userspace utility to cleanly shut down the system. Would notify running services to flush and exit, then invoke ACPI power-off (or QEMU `isa-debug-exit`). Needs signal delivery (#17) for graceful service teardown.
+23. ~~**`shutdown` program**~~ — **Done.** Userspace utility (`user/shutdown`) for clean system shutdown. Phase 1: sends `SIG_TERM` to all user tasks (skip TID 0-1 and self), waits 2.5s for graceful exit. Phase 2: `SIG_KILL` any survivors. Phase 3: ACPI S5 power-off via PM1a_CNT port (0x604 / 0xB004). `-f` flag skips graceful phase and sends `SIG_KILL` immediately. Init grants `CAP_TASK_MGMT` + `CAP_IOPORT` (ports 0x604, 0xB004).

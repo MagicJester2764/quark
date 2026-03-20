@@ -501,20 +501,30 @@ fn grant_caps_by_name(name: &[u8; 11], tid: usize) {
         mint_and_grant(tid, 0, syscall::CAP_TYPE_TASK_MGMT, 0, 0);
         let _ = syscall::sys_grant_cap(tid, syscall::CAP_TASK_MGMT);
     } else if base == b"SHELL   " {
-        // TaskMgmt(0), PhysAlloc(64), PhysRange(0, 4G)
+        // TaskMgmt(0), PhysAlloc(64), PhysRange(0, 4G), IoPort(ACPI shutdown ports)
         mint_and_grant(tid, 0, syscall::CAP_TYPE_TASK_MGMT, 0, 0);
         mint_and_grant(tid, 1, syscall::CAP_TYPE_PHYS_ALLOC, 64, 0);
         mint_and_grant(tid, 2, syscall::CAP_TYPE_PHYS_RANGE, 0, 0x1_0000_0000);
+        mint_and_grant(tid, 3, syscall::CAP_TYPE_IOPORT, 0x604, 0x604);
+        mint_and_grant(tid, 4, syscall::CAP_TYPE_IOPORT, 0xB004, 0xB004);
         let _ = syscall::sys_grant_cap(tid,
-            syscall::CAP_TASK_MGMT | syscall::CAP_PHYS_ALLOC | syscall::CAP_MAP_PHYS);
+            syscall::CAP_TASK_MGMT | syscall::CAP_PHYS_ALLOC | syscall::CAP_MAP_PHYS | syscall::CAP_IOPORT);
+    } else if base == b"SHUTDOWN" {
+        // TaskMgmt(0) for signaling tasks, IoPort(0x604,0xB004) for ACPI power-off
+        mint_and_grant(tid, 0, syscall::CAP_TYPE_TASK_MGMT, 0, 0);
+        mint_and_grant(tid, 1, syscall::CAP_TYPE_IOPORT, 0x604, 0x604);
+        mint_and_grant(tid, 2, syscall::CAP_TYPE_IOPORT, 0xB004, 0xB004);
+        let _ = syscall::sys_grant_cap(tid, syscall::CAP_TASK_MGMT | syscall::CAP_IOPORT);
     } else if base == b"LOGIN   " {
-        // TaskMgmt(0), PhysAlloc(64), PhysRange(0, 4G), SetUid
+        // TaskMgmt(0), PhysAlloc(64), PhysRange(0, 4G), SetUid, IoPort(ACPI shutdown ports)
         mint_and_grant(tid, 0, syscall::CAP_TYPE_TASK_MGMT, 0, 0);
         mint_and_grant(tid, 1, syscall::CAP_TYPE_PHYS_ALLOC, 64, 0);
         mint_and_grant(tid, 2, syscall::CAP_TYPE_PHYS_RANGE, 0, 0x1_0000_0000);
         mint_and_grant(tid, 3, syscall::CAP_TYPE_SET_UID, 0, 0);
+        mint_and_grant(tid, 4, syscall::CAP_TYPE_IOPORT, 0x604, 0x604);
+        mint_and_grant(tid, 5, syscall::CAP_TYPE_IOPORT, 0xB004, 0xB004);
         let _ = syscall::sys_grant_cap(tid,
-            syscall::CAP_TASK_MGMT | syscall::CAP_PHYS_ALLOC | syscall::CAP_MAP_PHYS | syscall::CAP_SET_UID);
+            syscall::CAP_TASK_MGMT | syscall::CAP_PHYS_ALLOC | syscall::CAP_MAP_PHYS | syscall::CAP_SET_UID | syscall::CAP_IOPORT);
     }
 }
 
