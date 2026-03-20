@@ -47,7 +47,7 @@ Scheduler, synchronous IPC, address spaces, capabilities, fd table, IRQ delegati
 
 18. ~~**TCP**~~ — **Done.** TCP protocol implemented in the net driver. 3-way handshake (active connect + passive listen/accept), data transfer with sequence numbers and ACKs, retransmission on timeout (3s), graceful close (FIN handshake), RST handling, TIME_WAIT. Up to 8 concurrent connections with 4 KiB send/receive buffers each. IPC: `TAG_TCP_CONNECT` (10), `TAG_TCP_LISTEN` (11), `TAG_TCP_SEND` (13), `TAG_TCP_RECV` (14), `TAG_TCP_CLOSE` (15). `libquark::net` provides `tcp_connect()`, `tcp_listen()`, `tcp_send()`, `tcp_recv()`, `tcp_close()`. `httpget` utility demonstrates TCP with HTTP/1.0 GET requests. QEMU: connect to external hosts via user-mode NAT.
 
-19. **DHCP client** — Auto-configure IP/netmask/gateway via DHCP instead of hardcoded 10.0.2.15.
+19. ~~**DHCP client**~~ — **Done.** Built into net driver. Sends DHCP DISCOVER at startup, negotiates OFFER→REQUEST→ACK, applies IP/netmask/gateway. Falls back to static 10.0.2.15 after 5-second timeout. `TAG_NET_DHCP` (6) IPC for renewal. `libquark::net::dhcp_renew()` client API.
 
 20. **DNS resolver** — Name resolution so network programs can use hostnames.
 

@@ -8,6 +8,7 @@ const TAG_UDP_RECV: u64 = 2;
 const TAG_NET_CONFIG: u64 = 3;
 const TAG_NET_INFO: u64 = 4;
 const TAG_ICMP_PING: u64 = 5;
+const TAG_NET_DHCP: u64 = 6;
 const TAG_TCP_CONNECT: u64 = 10;
 const TAG_TCP_LISTEN: u64 = 11;
 const TAG_TCP_SEND: u64 = 13;
@@ -116,6 +117,18 @@ pub fn configure(net_tid: usize, ip: u32, netmask: u32, gateway: u32) -> Result<
         return Err(1);
     }
     if reply.tag == TAG_ERROR { Err(reply.data[0]) } else { Ok(()) }
+}
+
+/// Trigger DHCP renewal. Returns the new IP address (packed big-endian) on success.
+pub fn dhcp_renew(net_tid: usize) -> Result<[u8; 4], u64> {
+    let msg = Message { sender: 0, tag: TAG_NET_DHCP, data: [0; 6] };
+    let mut reply = Message::empty();
+    if syscall::sys_call(net_tid, &msg, &mut reply).is_err() {
+        return Err(1);
+    }
+    if reply.tag == TAG_ERROR { return Err(reply.data[0]); }
+    let ip_packed = reply.data[0] as u32;
+    Ok(ip_packed.to_be_bytes())
 }
 
 // ---------------------------------------------------------------------------

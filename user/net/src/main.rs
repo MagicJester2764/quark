@@ -17,6 +17,7 @@ const TAG_UDP_RECV: u64 = 2;
 const TAG_NET_CONFIG: u64 = 3;
 const TAG_NET_INFO: u64 = 4;
 const TAG_ICMP_PING: u64 = 5;
+const TAG_NET_DHCP: u64 = 6;
 const TAG_TCP_CONNECT: u64 = 10;
 const TAG_TCP_LISTEN: u64 = 11;
 const TAG_TCP_SEND: u64 = 13;
@@ -169,6 +170,16 @@ const TCP_BUF_SIZE: usize = 4096;
 const TCP_RECV_BUF_BASE: usize = 0x8B_0000_0000;
 const TCP_SEND_BUF_BASE: usize = 0x8B_0010_0000;
 
+// DHCP
+const DHCP_SERVER_PORT: u16 = 67;
+const DHCP_CLIENT_PORT: u16 = 68;
+const DHCP_MAGIC: [u8; 4] = [99, 130, 83, 99]; // RFC 2132
+const DHCP_DISCOVER: u8 = 1;
+const DHCP_OFFER: u8 = 2;
+const DHCP_REQUEST: u8 = 3;
+const DHCP_ACK: u8 = 5;
+const DHCP_NAK: u8 = 6;
+
 // Default config for QEMU user-mode networking
 const DEFAULT_IP: [u8; 4] = [10, 0, 2, 15];
 const DEFAULT_GATEWAY: [u8; 4] = [10, 0, 2, 2];
@@ -255,6 +266,11 @@ struct NetState {
     ip_id: u16,
     tcp_conns: [TcpConn; MAX_TCP_CONNS],
     next_ephemeral_port: u16,
+    dhcp_state: u8,        // 0=disabled, 1=discover_sent, 2=request_sent, 3=bound
+    dhcp_xid: u32,
+    dhcp_server_ip: [u8; 4],
+    dhcp_offered_ip: [u8; 4],
+    dhcp_lease_time: u32,
 }
 
 static mut NET: NetState = NetState {
@@ -286,6 +302,11 @@ static mut NET: NetState = NetState {
         [EMPTY; MAX_TCP_CONNS]
     },
     next_ephemeral_port: 49152,
+    dhcp_state: 0,
+    dhcp_xid: 0,
+    dhcp_server_ip: [0; 4],
+    dhcp_offered_ip: [0; 4],
+    dhcp_lease_time: 0,
 };
 
 // ---------------------------------------------------------------------------
@@ -562,6 +583,9 @@ fn handle_arp(data: &[u8]) {
 
 /// Resolve destination MAC, routing through gateway if needed.
 fn resolve_mac(dst_ip: &[u8; 4]) -> Option<[u8; 6]> {
+    if *dst_ip == [255, 255, 255, 255] {
+        return Some([0xFF; 6]);
+    }
     let next_hop = if is_same_subnet(dst_ip) {
         *dst_ip
     } else {
@@ -703,7 +727,8 @@ fn handle_ip(data: &[u8]) {
     let src_ip: [u8; 4] = data[12..16].try_into().unwrap();
     let dst_ip: [u8; 4] = data[16..20].try_into().unwrap();
 
-    if dst_ip != unsafe { NET.ip } && dst_ip != [255, 255, 255, 255] {
+    let my_ip = unsafe { NET.ip };
+    if dst_ip != my_ip && dst_ip != [255, 255, 255, 255] && my_ip != [0, 0, 0, 0] {
         return;
     }
 
@@ -729,6 +754,12 @@ fn handle_udp(data: &[u8], src_ip: &[u8; 4]) {
     if udp_len < UDP_HLEN || data.len() < udp_len { return; }
 
     let payload = &data[UDP_HLEN..udp_len];
+
+    // Intercept DHCP replies (port 68)
+    if dst_port == DHCP_CLIENT_PORT {
+        dhcp_handle_reply(payload);
+        return;
+    }
 
     // Deliver to pending reader if port matches
     unsafe {
@@ -762,9 +793,8 @@ fn handle_udp(data: &[u8], src_ip: &[u8; 4]) {
     }
 }
 
-fn send_udp_packet(dst_ip: &[u8; 4], src_port: u16, dst_port: u16, payload: &[u8]) -> bool {
+fn send_udp_packet_raw(src_ip: &[u8; 4], dst_ip: &[u8; 4], src_port: u16, dst_port: u16, payload: &[u8]) -> bool {
     let mac = unsafe { NET.mac };
-    let ip = unsafe { NET.ip };
 
     let dst_mac = match resolve_mac(dst_ip) {
         Some(m) => m,
@@ -783,7 +813,7 @@ fn send_udp_packet(dst_ip: &[u8; 4], src_port: u16, dst_port: u16, payload: &[u8
     pkt[12..14].copy_from_slice(&ETHERTYPE_IP.to_be_bytes());
 
     // IP
-    build_ip_header(&mut pkt[ETH_HLEN..], &ip, dst_ip, IP_PROTO_UDP, udp_len as u16);
+    build_ip_header(&mut pkt[ETH_HLEN..], src_ip, dst_ip, IP_PROTO_UDP, udp_len as u16);
 
     // UDP
     let off = ETH_HLEN + IP_HLEN;
@@ -795,6 +825,11 @@ fn send_udp_packet(dst_ip: &[u8; 4], src_port: u16, dst_port: u16, payload: &[u8
 
     send_raw(&pkt[..total]);
     true
+}
+
+fn send_udp_packet(dst_ip: &[u8; 4], src_port: u16, dst_port: u16, payload: &[u8]) -> bool {
+    let ip = unsafe { NET.ip };
+    send_udp_packet_raw(&ip, dst_ip, src_port, dst_port, payload)
 }
 
 // ---------------------------------------------------------------------------
@@ -1389,6 +1424,191 @@ fn tcp_check_timers() {
 }
 
 // ---------------------------------------------------------------------------
+// DHCP
+// ---------------------------------------------------------------------------
+
+fn dhcp_build_packet(buf: &mut [u8], msg_type: u8, xid: u32, mac: &[u8; 6],
+                     requested_ip: Option<&[u8; 4]>, server_ip: Option<&[u8; 4]>) -> usize {
+    // Zero the buffer first
+    for b in buf.iter_mut() { *b = 0; }
+
+    // BOOTP header
+    buf[0] = 1;    // op: BOOTREQUEST
+    buf[1] = 1;    // htype: Ethernet
+    buf[2] = 6;    // hlen: MAC length
+    buf[3] = 0;    // hops
+    buf[4..8].copy_from_slice(&xid.to_be_bytes());
+    // secs = 0 (bytes 8-9)
+    buf[10] = 0x80; buf[11] = 0x00; // flags: broadcast
+    // ciaddr, yiaddr, siaddr, giaddr = 0 (bytes 12-27)
+    // chaddr: MAC + padding (bytes 28-43)
+    buf[28..34].copy_from_slice(mac);
+    // sname(64) + file(128) = 192 bytes of zeros (bytes 44-235)
+
+    // Magic cookie at offset 236
+    buf[236..240].copy_from_slice(&DHCP_MAGIC);
+
+    // Options start at offset 240
+    let mut off = 240;
+
+    // Option 53: DHCP message type
+    buf[off] = 53; buf[off + 1] = 1; buf[off + 2] = msg_type;
+    off += 3;
+
+    // Option 50: Requested IP (for REQUEST)
+    if let Some(ip) = requested_ip {
+        buf[off] = 50; buf[off + 1] = 4;
+        buf[off + 2..off + 6].copy_from_slice(ip);
+        off += 6;
+    }
+
+    // Option 54: Server identifier (for REQUEST)
+    if let Some(ip) = server_ip {
+        buf[off] = 54; buf[off + 1] = 4;
+        buf[off + 2..off + 6].copy_from_slice(ip);
+        off += 6;
+    }
+
+    // Option 55: Parameter request list (subnet, router, DNS)
+    buf[off] = 55; buf[off + 1] = 3;
+    buf[off + 2] = 1;  // subnet mask
+    buf[off + 3] = 3;  // router
+    buf[off + 4] = 6;  // DNS
+    off += 5;
+
+    // End option
+    buf[off] = 255;
+    off += 1;
+
+    off
+}
+
+fn dhcp_handle_reply(data: &[u8]) {
+    // Minimum BOOTP reply: 236 bytes header + 4 bytes magic cookie
+    if data.len() < 240 { return; }
+
+    // Verify magic cookie
+    if data[236..240] != DHCP_MAGIC { return; }
+
+    // Verify xid match
+    let xid = u32::from_be_bytes([data[4], data[5], data[6], data[7]]);
+    let our_xid = unsafe { NET.dhcp_xid };
+    if xid != our_xid { return; }
+
+    // Extract yiaddr (offered IP) at offset 16
+    let offered_ip: [u8; 4] = [data[16], data[17], data[18], data[19]];
+
+    // Parse DHCP options starting at offset 240
+    let mut msg_type: u8 = 0;
+    let mut server_id: [u8; 4] = [0; 4];
+    let mut subnet_mask: [u8; 4] = [255, 255, 255, 0];
+    let mut router: [u8; 4] = [0; 4];
+    let mut lease_time: u32 = 0;
+    let mut has_router = false;
+
+    let mut i = 240;
+    while i < data.len() {
+        let opt = data[i];
+        if opt == 255 { break; }     // end
+        if opt == 0 { i += 1; continue; } // padding
+        if i + 1 >= data.len() { break; }
+        let len = data[i + 1] as usize;
+        if i + 2 + len > data.len() { break; }
+        let val = &data[i + 2..i + 2 + len];
+
+        match opt {
+            53 if len >= 1 => msg_type = val[0],
+            54 if len >= 4 => server_id.copy_from_slice(&val[..4]),
+            1 if len >= 4 => subnet_mask.copy_from_slice(&val[..4]),
+            3 if len >= 4 => { router.copy_from_slice(&val[..4]); has_router = true; },
+            51 if len >= 4 => lease_time = u32::from_be_bytes([val[0], val[1], val[2], val[3]]),
+            _ => {}
+        }
+        i += 2 + len;
+    }
+
+    let state = unsafe { NET.dhcp_state };
+
+    match msg_type {
+        DHCP_OFFER if state == 1 => {
+            // Got an offer — send REQUEST
+            unsafe {
+                NET.dhcp_offered_ip = offered_ip;
+                NET.dhcp_server_ip = server_id;
+            }
+            println!("[net] DHCP: offer {}.{}.{}.{} from {}.{}.{}.{}",
+                offered_ip[0], offered_ip[1], offered_ip[2], offered_ip[3],
+                server_id[0], server_id[1], server_id[2], server_id[3]);
+
+            let mac = unsafe { NET.mac };
+            let mut pkt_buf = [0u8; 512];
+            let pkt_len = dhcp_build_packet(
+                &mut pkt_buf, DHCP_REQUEST, xid, &mac,
+                Some(&offered_ip), Some(&server_id),
+            );
+            let zero_ip = [0u8; 4];
+            let bcast_ip = [255u8; 4];
+            send_udp_packet_raw(&zero_ip, &bcast_ip, DHCP_CLIENT_PORT, DHCP_SERVER_PORT, &pkt_buf[..pkt_len]);
+            unsafe { NET.dhcp_state = 2; }
+        }
+        DHCP_ACK if state == 2 => {
+            // Bound — apply configuration
+            if !has_router {
+                // Default gateway: first 3 octets of offered IP + .2 (common for QEMU)
+                router = [offered_ip[0], offered_ip[1], offered_ip[2], 2];
+            }
+            unsafe {
+                NET.ip = offered_ip;
+                NET.netmask = subnet_mask;
+                NET.gateway = router;
+                NET.dhcp_lease_time = lease_time;
+                NET.dhcp_state = 3;
+            }
+            println!("[net] DHCP: acquired {}.{}.{}.{}/{}.{}.{}.{} gw {}.{}.{}.{}",
+                offered_ip[0], offered_ip[1], offered_ip[2], offered_ip[3],
+                subnet_mask[0], subnet_mask[1], subnet_mask[2], subnet_mask[3],
+                router[0], router[1], router[2], router[3]);
+
+            // Gratuitous ARP to announce our new IP
+            send_arp(ARP_REQUEST, &offered_ip, &[0; 6]);
+        }
+        DHCP_NAK => {
+            // Rejected — restart discovery
+            println!("[net] DHCP: NAK received, retrying...");
+            dhcp_discover();
+        }
+        _ => {}
+    }
+}
+
+fn dhcp_discover() {
+    let xid = (syscall::sys_ticks() as u32).wrapping_mul(0x19660D).wrapping_add(0x3C6EF35F);
+    unsafe {
+        NET.dhcp_xid = xid;
+        NET.dhcp_state = 1;
+    }
+
+    let mac = unsafe { NET.mac };
+    let mut pkt_buf = [0u8; 512];
+    let pkt_len = dhcp_build_packet(&mut pkt_buf, DHCP_DISCOVER, xid, &mac, None, None);
+    let zero_ip = [0u8; 4];
+    let bcast_ip = [255u8; 4];
+    send_udp_packet_raw(&zero_ip, &bcast_ip, DHCP_CLIENT_PORT, DHCP_SERVER_PORT, &pkt_buf[..pkt_len]);
+    println!("[net] DHCP: discover sent (xid={:#x})", xid);
+}
+
+fn poll_nic_once() {
+    let io_base = unsafe { NET.io_base };
+    let isr = inw(io_base + REG_ISR);
+    if isr != 0 {
+        outw(io_base + REG_ISR, isr);
+        if isr & ISR_ROK != 0 {
+            process_rx();
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Packet dispatch
 // ---------------------------------------------------------------------------
 
@@ -1451,13 +1671,27 @@ pub extern "C" fn _start() -> ! {
         syscall::sys_exit();
     }
 
+    // Try DHCP before falling back to static config
+    dhcp_discover();
+    let start = syscall::sys_ticks();
+    while unsafe { NET.dhcp_state } != 3 {
+        if syscall::sys_ticks() - start > 500 { // 5 seconds at 100 Hz
+            println!("[net] DHCP timeout, using static config.");
+            break;
+        }
+        poll_nic_once();
+        syscall::sys_yield();
+    }
+
     register_with_nameserver();
 
     let ip = unsafe { NET.ip };
     println!("[net] IP {}.{}.{}.{} — ready.", ip[0], ip[1], ip[2], ip[3]);
 
-    // Announce ourselves via gratuitous ARP
-    send_arp(ARP_REQUEST, &ip, &[0; 6]);
+    // Announce ourselves via gratuitous ARP (if DHCP didn't already)
+    if unsafe { NET.dhcp_state } != 3 {
+        send_arp(ARP_REQUEST, &ip, &[0; 6]);
+    }
 
     // Service loop
     loop {
@@ -1611,6 +1845,26 @@ pub extern "C" fn _start() -> ! {
                     data: [mac_packed, ip_packed, 0, 0, 0, 0],
                 };
                 let _ = syscall::sys_reply(msg.sender, &reply);
+            }
+            TAG_NET_DHCP => {
+                // Trigger DHCP renewal
+                dhcp_discover();
+                let dhcp_start = syscall::sys_ticks();
+                while unsafe { NET.dhcp_state } != 3 {
+                    if syscall::sys_ticks() - dhcp_start > 500 {
+                        let reply = Message { sender: 0, tag: TAG_ERROR, data: [1, 0, 0, 0, 0, 0] };
+                        let _ = syscall::sys_reply(msg.sender, &reply);
+                        break;
+                    }
+                    poll_nic_once();
+                    syscall::sys_yield();
+                }
+                if unsafe { NET.dhcp_state } == 3 {
+                    let ip = unsafe { NET.ip };
+                    let ip_packed = u32::from_be_bytes(ip) as u64;
+                    let reply = Message { sender: 0, tag: TAG_OK, data: [ip_packed, 0, 0, 0, 0, 0] };
+                    let _ = syscall::sys_reply(msg.sender, &reply);
+                }
             }
             TAG_TCP_CONNECT => {
                 let dst_ip = (msg.data[0] as u32).to_be_bytes();
