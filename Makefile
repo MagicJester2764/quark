@@ -69,9 +69,9 @@ PING_ELF := $(PING_DIR)/target/$(TARGET)/release/ping
 HTTPGET_DIR := user/httpget
 HTTPGET_ELF := $(HTTPGET_DIR)/target/$(TARGET)/release/httpget
 
-.PHONY: all clean iso run run-uefi drivers user FORCE
+.PHONY: all clean iso run run-uefi drivers user rootfs FORCE
 
-all: $(KERNEL) drivers user
+all: $(KERNEL) drivers user rootfs
 
 $(KERNEL): FORCE
 	cargo build --release
@@ -145,6 +145,10 @@ $(PING_ELF): FORCE
 
 $(HTTPGET_ELF): FORCE
 	cd $(HTTPGET_DIR) && cargo build --release
+
+rootfs:
+	@mkdir -p rootfs/etc
+	@echo 'root:0:0:/home/root:/usr/bin/SHELL.ELF' > rootfs/etc/passwd
 
 iso: $(KERNEL)
 	@mkdir -p isodir/boot/grub
