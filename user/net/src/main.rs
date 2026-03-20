@@ -1344,11 +1344,26 @@ fn tcp_check_timers() {
                     free_tcp_conn(i);
                 }
             }
-            TcpState::SynSent | TcpState::SynReceived => {
+            TcpState::SynSent => {
                 if c.retransmit_tick != 0 && now - c.retransmit_tick > TCP_RETRANSMIT_TICKS {
-                    // Connection timeout
-                    tcp_notify_error(i, 3); // timeout
-                    free_tcp_conn(i);
+                    // Retransmit SYN (ARP may now be cached)
+                    let c = unsafe { &NET.tcp_conns[i] };
+                    send_tcp_segment(
+                        &c.remote_ip, c.local_port, c.remote_port,
+                        c.snd_una, 0, TCP_SYN, TCP_BUF_SIZE as u16, &[],
+                    );
+                    unsafe { NET.tcp_conns[i].retransmit_tick = syscall::sys_ticks(); }
+                }
+            }
+            TcpState::SynReceived => {
+                if c.retransmit_tick != 0 && now - c.retransmit_tick > TCP_RETRANSMIT_TICKS {
+                    // Retransmit SYN-ACK
+                    let c = unsafe { &NET.tcp_conns[i] };
+                    send_tcp_segment(
+                        &c.remote_ip, c.local_port, c.remote_port,
+                        c.snd_una, c.rcv_nxt, TCP_SYN | TCP_ACK, TCP_BUF_SIZE as u16, &[],
+                    );
+                    unsafe { NET.tcp_conns[i].retransmit_tick = syscall::sys_ticks(); }
                 }
             }
             TcpState::Established | TcpState::CloseWait => {
@@ -1643,11 +1658,36 @@ pub extern "C" fn _start() -> ! {
                     };
                 }
 
-                // Send SYN
-                send_tcp_segment(
+                // Send SYN (with ARP resolution retry, like ping)
+                let mut sent = send_tcp_segment(
                     &dst_ip, src_port, dst_port,
                     iss, 0, TCP_SYN, TCP_BUF_SIZE as u16, &[],
                 );
+                if !sent {
+                    let io_base = unsafe { NET.io_base };
+                    let next_hop = if is_same_subnet(&dst_ip) {
+                        dst_ip
+                    } else {
+                        unsafe { NET.gateway }
+                    };
+                    for _ in 0..200 {
+                        syscall::sys_yield();
+                        let isr = inw(io_base + REG_ISR);
+                        if isr != 0 {
+                            outw(io_base + REG_ISR, isr);
+                            if isr & ISR_ROK != 0 {
+                                process_rx();
+                            }
+                        }
+                        if arp_lookup(&next_hop).is_some() {
+                            sent = send_tcp_segment(
+                                &dst_ip, src_port, dst_port,
+                                iss, 0, TCP_SYN, TCP_BUF_SIZE as u16, &[],
+                            );
+                            break;
+                        }
+                    }
+                }
                 // Deferred reply — will reply when ESTABLISHED or timeout
             }
             TAG_TCP_LISTEN => {
