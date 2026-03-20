@@ -77,6 +77,8 @@ pub const SYS_CAP_GRANT: u64 = 111;
 pub const SYS_CAP_REVOKE: u64 = 112;
 pub const SYS_CAP_INSPECT: u64 = 113;
 pub const SYS_CAP_DELETE: u64 = 114;
+pub const SYS_SET_USER_CAPS: u64 = 115;
+pub const SYS_GET_USER_CAPS: u64 = 116;
 pub const SYS_SHMEM_UNMAP: u64 = 94;
 pub const SYS_SHMEM_DESTROY: u64 = 95;
 
@@ -508,9 +510,12 @@ extern "C" fn syscall_dispatch(
             }
             let tid = arg0 as usize;
             let caps = arg1 as u32;
-            let caller_caps = scheduler::current_task_caps();
-            if caps & !caller_caps != 0 {
-                return u64::MAX;
+            // Root can grant any caps without holding them
+            if scheduler::current_task_uid() != 0 {
+                let caller_caps = scheduler::current_task_caps();
+                if caps & !caller_caps != 0 {
+                    return u64::MAX;
+                }
             }
             match scheduler::grant_cap(tid, caps) {
                 Ok(()) => 0,
@@ -955,8 +960,8 @@ extern "C" fn syscall_dispatch(
                     Some(t) => t,
                     None => return u64::MAX,
                 };
-                // Caller must hold a cap of the same type whose params are a superset
-                if !crate::cap::can_mint(&task.cspace, cap_type, param0, param1) {
+                // Root can mint any cap; others must hold a superset cap
+                if task.uid != 0 && !crate::cap::can_mint(&task.cspace, cap_type, param0, param1) {
                     return u64::MAX;
                 }
                 // Target slot must be empty
@@ -1071,6 +1076,22 @@ extern "C" fn syscall_dispatch(
                 task.cspace[slot] = crate::cap::CapSlot::empty();
             }
             0
+        }
+        SYS_SET_USER_CAPS => {
+            // arg0 = uid, arg1 = capability bitmask
+            // Requires CAP_SET_UID (root gets it via UID bypass)
+            if !crate::cap::task_has_set_uid(scheduler::current_tid()) {
+                return u64::MAX;
+            }
+            let uid = arg0 as u32;
+            let caps = arg1 as u32;
+            crate::cap::set_user_caps(uid, caps);
+            0
+        }
+        SYS_GET_USER_CAPS => {
+            // arg0 = uid
+            let uid = arg0 as u32;
+            crate::cap::user_caps(uid) as u64
         }
         _ => u64::MAX,
     }

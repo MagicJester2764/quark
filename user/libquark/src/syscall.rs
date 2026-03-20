@@ -582,6 +582,8 @@ pub fn sys_signal(tid: usize, sig: u64) -> Result<(), ()> {
 
 // Object capability syscalls
 pub const SYS_CAP_MINT: u64 = 110;
+pub const SYS_SET_USER_CAPS: u64 = 115;
+pub const SYS_GET_USER_CAPS: u64 = 116;
 pub const SYS_CAP_GRANT: u64 = 111;
 pub const SYS_CAP_REVOKE: u64 = 112;
 pub const SYS_CAP_INSPECT: u64 = 113;
@@ -630,6 +632,18 @@ pub fn sys_cap_inspect(slot: usize) -> Result<(u8, u16, u16), ()> {
 pub fn sys_cap_delete(slot: usize) -> Result<(), ()> {
     let ret = unsafe { syscall1(SYS_CAP_DELETE, slot as u64) };
     if ret == u64::MAX { Err(()) } else { Ok(()) }
+}
+
+/// Set the per-user default capability bitmask for a UID.
+/// Requires CAP_SET_UID (root gets it automatically via UID bypass).
+pub fn sys_set_user_caps(uid: u32, caps: u32) -> Result<(), ()> {
+    let ret = unsafe { syscall2(SYS_SET_USER_CAPS, uid as u64, caps as u64) };
+    if ret == u64::MAX { Err(()) } else { Ok(()) }
+}
+
+/// Query the per-user default capability bitmask for a UID.
+pub fn sys_get_user_caps(uid: u32) -> u32 {
+    unsafe { syscall1(SYS_GET_USER_CAPS, uid as u64) as u32 }
 }
 
 // Capability bit constants

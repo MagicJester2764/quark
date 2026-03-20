@@ -8,6 +8,43 @@
 use crate::task::MAX_TASKS;
 
 pub const MAX_CAPS: usize = 16;
+pub const MAX_USERS: usize = 64;
+
+/// Per-user default capability bitmask table.
+/// USER_CAPS[uid] holds the default cap bits for all tasks running as that UID.
+static mut USER_CAPS: [u32; MAX_USERS] = [0; MAX_USERS];
+
+/// Get the UID for a given task TID.
+fn task_uid(tid: usize) -> u32 {
+    unsafe {
+        crate::scheduler::get_task_mut(tid)
+            .map(|t| t.uid)
+            .unwrap_or(u32::MAX)
+    }
+}
+
+/// Get the per-user capability bitmask for a UID.
+pub fn user_caps(uid: u32) -> u32 {
+    let uid = uid as usize;
+    if uid >= MAX_USERS { return 0; }
+    unsafe { USER_CAPS[uid] }
+}
+
+/// Set the per-user capability bitmask for a UID.
+pub fn set_user_caps(uid: u32, caps: u32) {
+    let uid = uid as usize;
+    if uid >= MAX_USERS { return; }
+    unsafe { USER_CAPS[uid] = caps; }
+}
+
+/// Check if a task's UID grants a specific capability bit.
+fn user_has_cap_bit(tid: usize, bit: u32) -> bool {
+    let uid = task_uid(tid);
+    if uid == u32::MAX { return false; }
+    let uid_idx = uid as usize;
+    if uid_idx >= MAX_USERS { return false; }
+    unsafe { USER_CAPS[uid_idx] & bit != 0 }
+}
 
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,6 +111,8 @@ fn is_valid(cap: &CapSlot) -> bool {
 /// Check if a task has IoPort capability covering the given port.
 pub fn task_has_ioport(tid: usize, port: u16) -> bool {
     if tid >= MAX_TASKS { return false; }
+    if task_uid(tid) == 0 { return true; }
+    if user_has_cap_bit(tid, crate::task::CAP_IOPORT) { return true; }
     unsafe {
         let cspace = task_cspace(tid);
         match cspace {
@@ -91,6 +130,8 @@ pub fn task_has_ioport(tid: usize, port: u16) -> bool {
 /// Check if a task has Irq capability for the given IRQ number.
 pub fn task_has_irq(tid: usize, irq: u8) -> bool {
     if tid >= MAX_TASKS { return false; }
+    if task_uid(tid) == 0 { return true; }
+    if user_has_cap_bit(tid, crate::task::CAP_IRQ) { return true; }
     unsafe {
         let cspace = task_cspace(tid);
         match cspace {
@@ -107,6 +148,8 @@ pub fn task_has_irq(tid: usize, irq: u8) -> bool {
 /// Check if a task has PhysRange capability covering [phys, phys + pages*4096).
 pub fn task_has_phys_range(tid: usize, phys: usize, pages: usize) -> bool {
     if tid >= MAX_TASKS { return false; }
+    if task_uid(tid) == 0 { return true; }
+    if user_has_cap_bit(tid, crate::task::CAP_MAP_PHYS) { return true; }
     let phys_end = phys + pages * 4096;
     unsafe {
         let cspace = task_cspace(tid);
@@ -126,6 +169,8 @@ pub fn task_has_phys_range(tid: usize, phys: usize, pages: usize) -> bool {
 /// target=0 means "any task" (for create/generic operations).
 pub fn task_has_task_mgmt(tid: usize, target: usize) -> bool {
     if tid >= MAX_TASKS { return false; }
+    if task_uid(tid) == 0 { return true; }
+    if user_has_cap_bit(tid, crate::task::CAP_TASK_MGMT) { return true; }
     unsafe {
         let cspace = task_cspace(tid);
         match cspace {
@@ -142,6 +187,8 @@ pub fn task_has_task_mgmt(tid: usize, target: usize) -> bool {
 /// Check if a task has PhysAlloc capability.
 pub fn task_has_phys_alloc(tid: usize) -> bool {
     if tid >= MAX_TASKS { return false; }
+    if task_uid(tid) == 0 { return true; }
+    if user_has_cap_bit(tid, crate::task::CAP_PHYS_ALLOC) { return true; }
     unsafe {
         let cspace = task_cspace(tid);
         match cspace {
@@ -157,6 +204,8 @@ pub fn task_has_phys_alloc(tid: usize) -> bool {
 /// Check if a task has SetUid capability.
 pub fn task_has_set_uid(tid: usize) -> bool {
     if tid >= MAX_TASKS { return false; }
+    if task_uid(tid) == 0 { return true; }
+    if user_has_cap_bit(tid, crate::task::CAP_SET_UID) { return true; }
     unsafe {
         let cspace = task_cspace(tid);
         match cspace {
