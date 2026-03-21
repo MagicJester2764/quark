@@ -414,6 +414,81 @@ fn starts_with(haystack: &[u8], needle: &[u8]) -> bool {
     haystack[..needle.len()] == *needle
 }
 
+/// Match a readdir entry name against a base name and extension.
+/// Handles both FAT32 8.3 format ("LOGIN   ELF") and ext2 ("LOGIN.ELF   ").
+/// Comparison is case-insensitive.
+fn name_matches(entry_name: &[u8; 11], base: &[u8], ext: &[u8]) -> bool {
+    // Try FAT32 8.3 format: base padded to 8 bytes + ext padded to 3 bytes
+    let base_len = base.len().min(8);
+    let ext_len = ext.len().min(3);
+    let mut fat_ok = true;
+    for i in 0..8 {
+        let expected = if i < base_len { to_upper(base[i]) } else { b' ' };
+        if to_upper(entry_name[i]) != expected { fat_ok = false; break; }
+    }
+    if fat_ok {
+        for i in 0..3 {
+            let expected = if i < ext_len { to_upper(ext[i]) } else { b' ' };
+            if to_upper(entry_name[8 + i]) != expected { fat_ok = false; break; }
+        }
+    }
+    if fat_ok { return true; }
+
+    // Try ext2 format: "BASE.EXT" padded with spaces/nulls
+    // Build expected: "LOGIN.ELF"
+    let mut expected = [0u8; 11];
+    let mut pos = 0;
+    for &b in base { if pos < 11 { expected[pos] = to_upper(b); pos += 1; } }
+    if pos < 11 && ext_len > 0 { expected[pos] = b'.'; pos += 1; }
+    for &b in ext { if pos < 11 { expected[pos] = to_upper(b); pos += 1; } }
+    // Compare up to pos, rest should be spaces or null
+    for i in 0..pos {
+        if to_upper(entry_name[i]) != expected[i] { return false; }
+    }
+    for i in pos..11 {
+        if entry_name[i] != b' ' && entry_name[i] != 0 { return false; }
+    }
+    true
+}
+
+fn to_upper(b: u8) -> u8 {
+    if b >= b'a' && b <= b'z' { b - 32 } else { b }
+}
+
+/// Extract the base name (without extension) from either format.
+/// Returns uppercase base name for grant_caps_by_name compatibility.
+fn extract_base_name(entry_name: &[u8; 11]) -> [u8; 8] {
+    let mut base = [b' '; 8];
+    // Check if it's ext2 format (contains a dot)
+    if let Some(dot_pos) = entry_name.iter().position(|&b| b == b'.') {
+        let len = dot_pos.min(8);
+        for i in 0..len {
+            base[i] = to_upper(entry_name[i]);
+        }
+    } else {
+        // FAT32 8.3 format — first 8 bytes are the base name
+        for i in 0..8 {
+            base[i] = to_upper(entry_name[i]);
+        }
+    }
+    base
+}
+
+/// Convert a readdir entry name (either FAT32 8.3 or ext2) to a filename buffer.
+/// Returns the length of the filename written to buf.
+fn entry_name_to_buf(name: &[u8; 11], buf: &mut [u8; 16]) -> usize {
+    // Check if it's ext2 format (contains a dot or no trailing spaces in base)
+    if name.iter().any(|&b| b == b'.') {
+        // ext2 format: "LOGIN.ELF  " — trim trailing spaces/nulls
+        let len = name.iter().rposition(|&b| b != b' ' && b != 0).map_or(0, |p| p + 1);
+        let len = len.min(buf.len());
+        buf[..len].copy_from_slice(&name[..len]);
+        return len;
+    }
+    // FAT32 8.3 format
+    fat_name_to_buf(name, buf)
+}
+
 fn fat_name_to_buf(name: &[u8; 11], buf: &mut [u8; 16]) -> usize {
     let base_len = name[0..8]
         .iter()
@@ -465,7 +540,8 @@ fn mint_and_grant(tid: usize, dest_slot: usize, cap_type: u64, param0: u64, para
 
 /// Grant capabilities based on FAT 8.3 name using fine-grained object capabilities.
 fn grant_caps_by_name(name: &[u8; 11], tid: usize) {
-    let base = &name[0..8];
+    let base_arr = extract_base_name(name);
+    let base = &base_arr[..8];
     if base == b"KEYBOARD" {
         // IoPort(0x60, 0x64), Irq(1)
         mint_and_grant(tid, 0, syscall::CAP_TYPE_IOPORT, 0x60, 0x64);
@@ -824,10 +900,11 @@ fn load_from_vfs(vfs_tid: usize, console_pipe: usize, input_tid: usize) -> Defer
     let mut deferred = DeferredTasks::new();
 
     // Open /usr/bin directory via VFS
+    println!("[init] Opening /usr/bin via VFS...");
     let (dir_handle, _, _) = match vfs::open(vfs_tid, b"/usr/bin") {
-        Ok(h) => h,
-        Err(_) => {
-            println!("[init] /usr/bin not found on VFS.");
+        Ok(h) => { println!("[init] /usr/bin opened (handle={})", h.0); h }
+        Err(e) => {
+            println!("[init] /usr/bin not found on VFS (err={}).", e);
             return deferred;
         }
     };
@@ -840,11 +917,11 @@ fn load_from_vfs(vfs_tid: usize, console_pipe: usize, input_tid: usize) -> Defer
     loop {
         match vfs::readdir(vfs_tid, dir_handle, index) {
             Ok(Some(entry)) => {
-                if &entry.name[0..8] == b"LOGIN   " && &entry.name[8..11] == b"ELF" && !entry.is_dir {
+                if !entry.is_dir && name_matches(&entry.name, b"LOGIN", b"ELF") {
                     login_name = Some(entry.name);
                     break;
                 }
-                if &entry.name[0..8] == b"SHELL   " && &entry.name[8..11] == b"ELF" && !entry.is_dir {
+                if !entry.is_dir && name_matches(&entry.name, b"SHELL", b"ELF") {
                     shell_name = Some(entry.name);
                 }
                 index += 1;
@@ -864,10 +941,10 @@ fn load_from_vfs(vfs_tid: usize, console_pipe: usize, input_tid: usize) -> Defer
     };
 
     let mut namebuf = [0u8; 16];
-    let namelen = fat_name_to_buf(&name, &mut namebuf);
+    let namelen = entry_name_to_buf(&name, &mut namebuf);
     let loading_name = if login_name.is_some() { "login" } else { "shell" };
 
-    // Build path: "/usr/bin/SHELL.ELF"
+    // Build path: "/usr/bin/SHELL.ELF" or "/usr/bin/LOGIN.ELF"
     let mut path = [0u8; 48];
     let prefix = b"/usr/bin/";
     path[..prefix.len()].copy_from_slice(prefix);
