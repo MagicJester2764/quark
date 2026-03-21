@@ -446,19 +446,14 @@ extern "C" fn syscall_dispatch(
                     None => u64::MAX,
                 }
             } else {
-                // Allocate count pages, return first address
-                // Caller must accept they may not be contiguous
-                let first = match crate::pmm::alloc() {
-                    Some(frame) => frame.address(),
-                    None => return u64::MAX,
-                };
-                for _ in 1..count {
-                    if crate::pmm::alloc().is_none() {
-                        return u64::MAX;
+                // Allocate count physically contiguous pages
+                match crate::pmm::alloc_contiguous(count) {
+                    Some(frame) => {
+                        scheduler::current_task_charge_mem(count);
+                        frame.address() as u64
                     }
+                    None => u64::MAX,
                 }
-                scheduler::current_task_charge_mem(count);
-                first as u64
             }
         }
         SYS_PHYS_FREE => {

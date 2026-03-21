@@ -218,6 +218,7 @@ struct PendingIcmp {
 }
 
 #[derive(Clone, Copy, PartialEq)]
+#[repr(u8)]
 enum TcpState {
     Closed,
     Listen,
@@ -350,25 +351,15 @@ static mut NET: NetState = NetState {
 // ---------------------------------------------------------------------------
 
 fn alloc_dma_pages(count: usize, vaddr: usize) -> usize {
-    let first = match syscall::sys_phys_alloc(1) {
+    // Allocate physically contiguous pages (required for DMA)
+    let first = match syscall::sys_phys_alloc(count) {
         Ok(f) => f,
         Err(()) => return 0,
     };
-    if syscall::sys_map_phys(first, vaddr, 1).is_err() { return 0; }
-    unsafe { core::ptr::write_bytes(vaddr as *mut u8, 0, 4096); }
-
-    for i in 1..count {
-        let frame = match syscall::sys_phys_alloc(1) {
-            Ok(f) => f,
-            Err(()) => return 0,
-        };
-        if frame != first + i * 4096 {
-            println!("[net] WARNING: DMA pages not contiguous");
-        }
-        if syscall::sys_map_phys(frame, vaddr + i * 4096, 1).is_err() { return 0; }
+    for i in 0..count {
+        if syscall::sys_map_phys(first + i * 4096, vaddr + i * 4096, 1).is_err() { return 0; }
         unsafe { core::ptr::write_bytes((vaddr + i * 4096) as *mut u8, 0, 4096); }
     }
-
     first
 }
 
@@ -1056,6 +1047,7 @@ fn tcp_deliver_recv(idx: usize) {
         if c.recv_len == 0 && !c.fin_received { return; }
 
         let n = c.recv_len.min(c.pending_max);
+        let old_recv_len = c.recv_len;
         if n > 0 && syscall::sys_map_phys(c.pending_phys, CLIENT_BUF, 1).is_ok() {
             let rv = tcp_recv_buf_vaddr(idx);
             core::ptr::copy_nonoverlapping(rv as *const u8, CLIENT_BUF as *mut u8, n);
@@ -1073,6 +1065,20 @@ fn tcp_deliver_recv(idx: usize) {
         let _ = syscall::sys_reply(c.pending_tid, &reply);
         NET.tcp_conns[idx].recv_len -= n;
         NET.tcp_conns[idx].pending_op = TCP_PENDING_NONE;
+
+        // Send a window update if consuming data opened significant buffer space.
+        // Without this, the remote peer stalls on a zero (or small) window that
+        // was advertised in the last ACK from process_tcp_data.
+        if n > 0 {
+            let state = NET.tcp_conns[idx].state;
+            if state == TcpState::Established || state == TcpState::CloseWait {
+                let new_window = TCP_BUF_SIZE - NET.tcp_conns[idx].recv_len;
+                let old_window = TCP_BUF_SIZE - old_recv_len;
+                if new_window > old_window {
+                    tcp_conn_send_segment(idx, TCP_ACK, &[]);
+                }
+            }
+        }
     }
 }
 
@@ -1368,7 +1374,9 @@ fn process_tcp_data(idx: usize, seq: u32, payload: &[u8]) {
     let c = unsafe { &mut NET.tcp_conns[idx] };
 
     // Only accept in-order data
-    if seq != c.rcv_nxt { return; }
+    if seq != c.rcv_nxt {
+        return;
+    }
 
     let free = TCP_BUF_SIZE - c.recv_len;
     let n = payload.len().min(free);
@@ -1972,8 +1980,14 @@ pub extern "C" fn _start() -> ! {
     // Service loop
     loop {
         let mut msg = Message::empty();
-        if syscall::sys_recv(TID_ANY, &mut msg).is_err() {
-            continue;
+        match syscall::sys_recv_timeout(TID_ANY, &mut msg, 200) {
+            Ok(()) => {},
+            Err(_) => {
+                // Timeout — check for pending RX and TCP timers
+                process_rx();
+                tcp_check_timers();
+                continue;
+            }
         }
 
         if msg.sender == 0 {
@@ -2392,6 +2406,7 @@ pub extern "C" fn _start() -> ! {
                 // If data available or FIN received, reply immediately
                 if c.recv_len > 0 || c.fin_received {
                     let n = c.recv_len.min(max_len);
+                    let old_recv_len = c.recv_len;
                     if n > 0 && syscall::sys_map_phys(phys_addr, CLIENT_BUF, 1).is_ok() {
                         let rv = tcp_recv_buf_vaddr(handle);
                         unsafe {
@@ -2410,6 +2425,17 @@ pub extern "C" fn _start() -> ! {
                             NET.tcp_conns[handle].recv_len -= n;
                         }
                     }
+                    // Send window update if consuming data freed buffer space
+                    if n > 0 {
+                        let state = unsafe { NET.tcp_conns[handle].state };
+                        if state == TcpState::Established || state == TcpState::CloseWait {
+                            let new_window = TCP_BUF_SIZE - unsafe { NET.tcp_conns[handle].recv_len };
+                            let old_window = TCP_BUF_SIZE - old_recv_len;
+                            if new_window > old_window {
+                                tcp_conn_send_segment(handle, TCP_ACK, &[]);
+                            }
+                        }
+                    }
                     let reply = Message {
                         sender: 0,
                         tag: TAG_OK,
@@ -2417,7 +2443,7 @@ pub extern "C" fn _start() -> ! {
                     };
                     let _ = syscall::sys_reply(msg.sender, &reply);
                 } else {
-                    // Defer reply
+                    // Defer reply — will be completed when data arrives
                     unsafe {
                         NET.tcp_conns[handle].pending_tid = msg.sender;
                         NET.tcp_conns[handle].pending_op = TCP_PENDING_RECV;

@@ -442,11 +442,21 @@ extern "C" fn irq_handler(frame: &InterruptFrame) {
     let irq = frame.vector as u8;
 
     match irq {
-        0 => pit::tick(),
+        0 => {
+            // Send EOI BEFORE pit::tick() because tick() may context-switch
+            // via schedule_inner.  If the preempted task blocks, the deferred
+            // EOI would stall the timer indefinitely.
+            unsafe { pic::send_eoi(0) };
+            pit::tick();
+            return; // EOI already sent
+        }
         1 => {
-            // Check if a user-space handler is registered
+            // Check if a user-space handler is registered.
+            // Do NOT send EOI here — the user-space driver sends EOI via
+            // sys_irq_ack after clearing the device condition.  Sending EOI
+            // before the device ISR is cleared causes an IRQ storm because
+            // level-triggered PCI interrupts re-fire immediately.
             if crate::irq_dispatch::dispatch_irq(1) {
-                unsafe { pic::send_eoi(irq) };
                 return;
             }
             // No user-space handler — consume and discard the scancode
@@ -469,9 +479,10 @@ extern "C" fn irq_handler(frame: &InterruptFrame) {
             }
         }
         _ => {
-            // Try user-space dispatch for all other IRQs
+            // Try user-space dispatch for all other IRQs.
+            // Do NOT send EOI — user-space driver does it via sys_irq_ack
+            // after clearing the device ISR (prevents IRQ storm).
             if crate::irq_dispatch::dispatch_irq(irq) {
-                unsafe { pic::send_eoi(irq) };
                 return;
             }
         }

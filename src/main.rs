@@ -109,7 +109,7 @@ pub extern "C" fn kernel_main(multiboot_info: usize) -> ! {
 
     // Idle loop — the scheduler returns here when no tasks are ready
     loop {
-        unsafe { core::arch::asm!("hlt", options(nostack, nomem)) };
+        unsafe { core::arch::asm!("sti; hlt", options(nostack, nomem)) };
         scheduler::reap_dead();
     }
 }

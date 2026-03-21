@@ -139,12 +139,6 @@ pub extern "C" fn _start() -> ! {
         syscall::sys_exit();
     }
 
-    let ip_bytes = dst_ip.to_be_bytes();
-    println!(
-        "Connecting to {}.{}.{}.{}:{}...",
-        ip_bytes[0], ip_bytes[1], ip_bytes[2], ip_bytes[3], port
-    );
-
     let handle = match net::tcp_connect(net_tid, dst_ip, port, 0) {
         Ok(h) => h,
         Err(e) => {
@@ -152,8 +146,6 @@ pub extern "C" fn _start() -> ! {
             syscall::sys_exit();
         }
     };
-
-    println!("Connected. Sending request...");
 
     // Build HTTP request in the data buffer
     let req_prefix = b"GET ";

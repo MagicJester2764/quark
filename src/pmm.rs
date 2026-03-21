@@ -150,6 +150,37 @@ pub fn alloc() -> Option<PhysFrame> {
     None
 }
 
+/// Allocate `count` physically contiguous 4 KiB frames.
+/// Returns the first frame on success, or None if no contiguous run is found.
+pub fn alloc_contiguous(count: usize) -> Option<PhysFrame> {
+    if count == 0 {
+        return None;
+    }
+    if count == 1 {
+        return alloc();
+    }
+    let mut pmm = PMM.lock();
+    let max_frame = BITMAP_SIZE * 8;
+    let mut run_start = 0;
+    let mut run_len = 0;
+    for frame_idx in 0..max_frame {
+        if pmm.is_used(frame_idx) {
+            run_start = frame_idx + 1;
+            run_len = 0;
+        } else {
+            run_len += 1;
+            if run_len == count {
+                for i in run_start..run_start + count {
+                    pmm.set_used(i);
+                    pmm.free_frames -= 1;
+                }
+                return Some(PhysFrame(run_start * PAGE_SIZE));
+            }
+        }
+    }
+    None
+}
+
 /// Free a previously allocated physical frame.
 pub fn free(frame: PhysFrame) {
     let mut pmm = PMM.lock();
