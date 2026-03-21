@@ -3,10 +3,14 @@
 #![allow(dead_code)]
 #![allow(static_mut_refs)]
 
+pub mod ext2;
+pub mod ext2_alloc;
+pub mod ext2_dir;
+
 use libquark::ipc::{Message, TID_ANY};
 use libquark::{println, syscall};
 
-const PAGE_SIZE: usize = 4096;
+pub const PAGE_SIZE: usize = 4096;
 const NAMESERVER_TID: usize = 2;
 
 // Nameserver protocol
@@ -14,10 +18,10 @@ const TAG_NS_REGISTER: u64 = 1;
 const TAG_NS_LOOKUP: u64 = 2;
 
 // Disk driver protocol
-const TAG_READ_SECTOR: u64 = 1;
-const TAG_WRITE_SECTOR: u64 = 2;
-const TAG_DISK_OK: u64 = 0;
-const TAG_READ_SECTORS: u64 = 4;
+pub const TAG_READ_SECTOR: u64 = 1;
+pub const TAG_WRITE_SECTOR: u64 = 2;
+pub const TAG_DISK_OK: u64 = 0;
+pub const TAG_READ_SECTORS: u64 = 4;
 
 // VFS IPC tags
 const TAG_OPEN: u64 = 1;
@@ -32,19 +36,41 @@ const TAG_OK: u64 = 0;
 const TAG_ERROR: u64 = u64::MAX;
 
 // Error codes in reply data[0]
-const ERR_NOT_FOUND: u64 = 1;
-const ERR_INVALID_HANDLE: u64 = 2;
-const ERR_IO: u64 = 3;
-const ERR_TOO_MANY_OPEN: u64 = 4;
-const ERR_INVALID_PATH: u64 = 5;
-const ERR_NOT_DIR: u64 = 6;
-const ERR_IS_DIR: u64 = 7;
+pub const ERR_NOT_FOUND: u64 = 1;
+pub const ERR_INVALID_HANDLE: u64 = 2;
+pub const ERR_IO: u64 = 3;
+pub const ERR_TOO_MANY_OPEN: u64 = 4;
+pub const ERR_INVALID_PATH: u64 = 5;
+pub const ERR_NOT_DIR: u64 = 6;
+pub const ERR_IS_DIR: u64 = 7;
+pub const ERR_PERMISSION: u64 = 8;
+
+// ---------------------------------------------------------------------------
+// Filesystem type detection
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy, PartialEq)]
+enum FsType {
+    Fat32,
+    Ext2,
+}
+
+static mut FS_TYPE: FsType = FsType::Fat32;
+static mut EXT2_STATE: Option<ext2::Ext2State> = None;
+
+fn ext2_state() -> &'static ext2::Ext2State {
+    unsafe { EXT2_STATE.as_ref().unwrap() }
+}
+
+fn ext2_state_mut() -> &'static mut ext2::Ext2State {
+    unsafe { EXT2_STATE.as_mut().unwrap() }
+}
 
 // Virtual addresses for temp mappings
-const DISK_IO_BUF: usize = 0x86_0000_0000;
-const CLIENT_BUF: usize = 0x87_0000_0000;
-const CACHE_BUF_BASE: usize = 0x8A_0000_0000;
-const SHMEM_BUF: usize = 0x8B_0000_0000;
+pub const DISK_IO_BUF: usize = 0x86_0000_0000;
+pub const CLIENT_BUF: usize = 0x87_0000_0000;
+pub const CACHE_BUF_BASE: usize = 0x8A_0000_0000;
+pub const SHMEM_BUF: usize = 0x8B_0000_0000;
 
 // ---------------------------------------------------------------------------
 // Sector cache
@@ -54,21 +80,21 @@ const CACHE_ENTRIES: usize = 256;
 const HASH_BUCKETS: usize = 128;
 const NONE: u16 = 0xFFFF; // sentinel for "no entry"
 
-struct CacheEntry {
+pub struct CacheEntry {
     valid: bool,
     used: bool,
     lba: u32,
     hash_next: u16, // next slot in hash chain, NONE = end
 }
 
-struct SectorCache {
+pub struct SectorCache {
     entries: [CacheEntry; CACHE_ENTRIES],
     buckets: [u16; HASH_BUCKETS],
     clock_hand: usize,
 }
 
 impl SectorCache {
-    const fn new() -> Self {
+    pub const fn new() -> Self {
         const EMPTY: CacheEntry = CacheEntry {
             valid: false,
             used: false,
@@ -83,7 +109,7 @@ impl SectorCache {
     }
 
     /// Look up a sector in the cache via hash chain. O(1) average.
-    fn lookup(&mut self, lba: u32) -> Option<usize> {
+    pub fn lookup(&mut self, lba: u32) -> Option<usize> {
         let bucket = (lba as usize) % HASH_BUCKETS;
         let mut idx = self.buckets[bucket];
         while idx != NONE {
@@ -100,7 +126,7 @@ impl SectorCache {
     /// Find a victim slot using clock eviction and insert a new sector.
     /// `src` is the memory address containing the 512-byte sector data.
     /// Returns the slot index.
-    fn insert(&mut self, lba: u32, src: usize) -> usize {
+    pub fn insert(&mut self, lba: u32, src: usize) -> usize {
         // First check for an invalid (empty) slot
         for i in 0..CACHE_ENTRIES {
             if !self.entries[i].valid {
@@ -169,7 +195,7 @@ impl SectorCache {
     }
 
     /// Invalidate any cached copy of a given LBA.
-    fn invalidate(&mut self, lba: u32) {
+    pub fn invalidate(&mut self, lba: u32) {
         if let Some(idx) = self.lookup(lba) {
             self.unlink(idx);
             self.entries[idx].valid = false;
@@ -177,7 +203,7 @@ impl SectorCache {
     }
 }
 
-static mut SECTOR_CACHE: SectorCache = SectorCache::new();
+pub static mut SECTOR_CACHE: SectorCache = SectorCache::new();
 
 // ---------------------------------------------------------------------------
 // FAT32 structures
@@ -203,11 +229,11 @@ fn parse_bpb(data: &[u8]) -> Bpb {
     }
 }
 
-fn read_u16(data: &[u8], off: usize) -> u16 {
+pub fn read_u16(data: &[u8], off: usize) -> u16 {
     u16::from_le_bytes([data[off], data[off + 1]])
 }
 
-fn read_u32(data: &[u8], off: usize) -> u32 {
+pub fn read_u32(data: &[u8], off: usize) -> u32 {
     u32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]])
 }
 
@@ -493,39 +519,46 @@ impl DiskState {
 
 const MAX_OPEN_FILES: usize = 32;
 
+enum FsFileData {
+    Fat32 {
+        first_cluster: u32,
+        cur_cluster: u32,
+        cur_cluster_offset: u32,
+        dir_cluster: u32,
+        fat_name: [u8; 11],
+    },
+    Ext2 {
+        inode_num: u32,
+        inode: ext2::Ext2Inode,
+        parent_inode: u32,
+    },
+    None,
+}
+
 struct OpenFile {
     in_use: bool,
     owner_tid: usize,
-    first_cluster: u32,
     file_size: u32,
     is_dir: bool,
-    // Current read position for sequential reads
+    writable: bool,
     read_offset: u32,
-    // Cache current cluster position to avoid re-traversing chain
-    cur_cluster: u32,
-    cur_cluster_offset: u32, // byte offset corresponding to cur_cluster start
-    // Parent directory cluster and 8.3 name for updating dir entry on write
-    dir_cluster: u32,
-    fat_name: [u8; 11],
+    fs: FsFileData,
 }
 
 static mut FILE_TABLE: [OpenFile; MAX_OPEN_FILES] = {
     const EMPTY: OpenFile = OpenFile {
         in_use: false,
         owner_tid: 0,
-        first_cluster: 0,
         file_size: 0,
         is_dir: false,
+        writable: true,
         read_offset: 0,
-        cur_cluster: 0,
-        cur_cluster_offset: 0,
-        dir_cluster: 0,
-        fat_name: [0; 11],
+        fs: FsFileData::None,
     };
     [EMPTY; MAX_OPEN_FILES]
 };
 
-fn alloc_handle(
+fn alloc_handle_fat32(
     tid: usize,
     cluster: u32,
     size: u32,
@@ -539,14 +572,47 @@ fn alloc_handle(
                 FILE_TABLE[i] = OpenFile {
                     in_use: true,
                     owner_tid: tid,
-                    first_cluster: cluster,
                     file_size: size,
                     is_dir,
+                    writable: true, // FAT32: no permission checks
                     read_offset: 0,
-                    cur_cluster: cluster,
-                    cur_cluster_offset: 0,
-                    dir_cluster,
-                    fat_name: *fat_name,
+                    fs: FsFileData::Fat32 {
+                        first_cluster: cluster,
+                        cur_cluster: cluster,
+                        cur_cluster_offset: 0,
+                        dir_cluster,
+                        fat_name: *fat_name,
+                    },
+                };
+                return Some(i);
+            }
+        }
+    }
+    None
+}
+
+fn alloc_handle_ext2(
+    tid: usize,
+    inode_num: u32,
+    inode: &ext2::Ext2Inode,
+    parent_inode: u32,
+    writable: bool,
+) -> Option<usize> {
+    unsafe {
+        for i in 0..MAX_OPEN_FILES {
+            if !FILE_TABLE[i].in_use {
+                FILE_TABLE[i] = OpenFile {
+                    in_use: true,
+                    owner_tid: tid,
+                    file_size: inode.i_size,
+                    is_dir: inode.is_dir(),
+                    writable,
+                    read_offset: 0,
+                    fs: FsFileData::Ext2 {
+                        inode_num,
+                        inode: *inode,
+                        parent_inode,
+                    },
                 };
                 return Some(i);
             }
@@ -749,6 +815,12 @@ fn read_file_data(
         return Ok(0);
     }
 
+    let (first_cluster, cur_cluster, cur_cluster_offset) = match &file.fs {
+        FsFileData::Fat32 { first_cluster, cur_cluster, cur_cluster_offset, .. } =>
+            (*first_cluster, *cur_cluster, *cur_cluster_offset),
+        _ => return Err(ERR_IO),
+    };
+
     let available = file.file_size - offset;
     let to_read = max_bytes.min(available).min(PAGE_SIZE as u32);
     if to_read == 0 {
@@ -767,11 +839,11 @@ fn read_file_data(
     let mut byte_pos;
 
     // Use cached position if we can advance from it
-    if offset >= file.cur_cluster_offset && file.cur_cluster != 0 {
-        cluster = file.cur_cluster;
-        byte_pos = file.cur_cluster_offset;
+    if offset >= cur_cluster_offset && cur_cluster != 0 {
+        cluster = cur_cluster;
+        byte_pos = cur_cluster_offset;
     } else {
-        cluster = file.first_cluster;
+        cluster = first_cluster;
         byte_pos = 0;
     }
 
@@ -787,8 +859,10 @@ fn read_file_data(
     }
 
     // Cache the position
-    file.cur_cluster = cluster;
-    file.cur_cluster_offset = byte_pos;
+    if let FsFileData::Fat32 { cur_cluster: cc, cur_cluster_offset: co, .. } = &mut file.fs {
+        *cc = cluster;
+        *co = byte_pos;
+    }
 
     // Prefetch all sectors in the current cluster
     let cluster_lba = disk.cluster_start_lba(cluster);
@@ -824,8 +898,10 @@ fn read_file_data(
                 Some(next) => {
                     cluster = next;
                     byte_pos += cluster_bytes;
-                    file.cur_cluster = cluster;
-                    file.cur_cluster_offset = byte_pos;
+                    if let FsFileData::Fat32 { cur_cluster: cc, cur_cluster_offset: co, .. } = &mut file.fs {
+                        *cc = cluster;
+                        *co = byte_pos;
+                    }
                     // Prefetch next cluster's sectors
                     let next_lba = disk.cluster_start_lba(cluster);
                     disk.prefetch_sectors(next_lba, disk.bpb.sectors_per_cluster);
@@ -1085,6 +1161,11 @@ fn write_file_data(
         return Err(ERR_IS_DIR);
     }
 
+    let first_cluster = match &file.fs {
+        FsFileData::Fat32 { first_cluster, .. } => *first_cluster,
+        _ => return Err(ERR_IO),
+    };
+
     let to_write = len.min(PAGE_SIZE as u32);
     if to_write == 0 {
         return Ok(0);
@@ -1098,7 +1179,7 @@ fn write_file_data(
     let cluster_bytes = disk.bpb.sectors_per_cluster * disk.bpb.bytes_per_sector;
 
     // Navigate to the cluster containing `offset`, allocating as needed
-    let mut cluster = file.first_cluster;
+    let mut cluster = first_cluster;
     let mut byte_pos: u32 = 0;
 
     // Skip clusters until we reach the one containing `offset`
@@ -1169,8 +1250,10 @@ fn write_file_data(
     }
 
     // Update cached position
-    file.cur_cluster = cluster;
-    file.cur_cluster_offset = byte_pos;
+    if let FsFileData::Fat32 { cur_cluster: cc, cur_cluster_offset: co, .. } = &mut file.fs {
+        *cc = cluster;
+        *co = byte_pos;
+    }
 
     // Update file size if we wrote past the end
     let new_end = offset + written;
@@ -1341,31 +1424,67 @@ pub extern "C" fn _start() -> ! {
     };
     println!("[vfs] Rootfs partition at LBA {}", part_lba);
 
-    // Read BPB
-    if part_lba > 0 {
-        if DiskState::raw_read_sector(disk_tid, buf_phys, part_lba).is_err() {
-            println!("[vfs] Failed to read BPB.");
-            syscall::sys_exit();
+    // Detect filesystem type: check for ext2 magic at partition offset 1024 (sector 2)
+    if DiskState::raw_read_sector(disk_tid, buf_phys, part_lba + 2).is_ok() {
+        let sb_data = unsafe { core::slice::from_raw_parts(DISK_IO_BUF as *const u8, 512) };
+        let magic = read_u16(sb_data, 56);
+        if magic == ext2::EXT2_MAGIC {
+            println!("[vfs] ext2 detected.");
+            match ext2::init_ext2(disk_tid, buf_phys, part_lba) {
+                Ok(state) => {
+                    println!(
+                        "[vfs] ext2: blocks={} inodes={} block_size={} groups={}",
+                        state.total_blocks, state.total_inodes,
+                        state.block_size, state.num_block_groups
+                    );
+                    unsafe {
+                        FS_TYPE = FsType::Ext2;
+                        EXT2_STATE = Some(state);
+                    }
+                }
+                Err(()) => {
+                    println!("[vfs] ext2 init failed, falling back to FAT32.");
+                }
+            }
         }
     }
-    let data = unsafe { core::slice::from_raw_parts(DISK_IO_BUF as *const u8, 512) };
-    let bpb = parse_bpb(data);
-    println!(
-        "[vfs] FAT32: bps={} spc={} reserved={} root={}",
-        bpb.bytes_per_sector, bpb.sectors_per_cluster,
-        bpb.reserved_sectors, bpb.root_cluster
-    );
 
-    let disk = DiskState {
-        disk_tid,
-        buf_phys,
-        part_lba,
-        bpb,
+    // Create a dummy DiskState for FAT32 (needed even in ext2 mode for the service loop signature)
+    let disk = if unsafe { FS_TYPE } == FsType::Fat32 {
+        // Read BPB
+        if part_lba > 0 {
+            if DiskState::raw_read_sector(disk_tid, buf_phys, part_lba).is_err() {
+                println!("[vfs] Failed to read BPB.");
+                syscall::sys_exit();
+            }
+        }
+        let data = unsafe { core::slice::from_raw_parts(DISK_IO_BUF as *const u8, 512) };
+        let bpb = parse_bpb(data);
+        println!(
+            "[vfs] FAT32: bps={} spc={} reserved={} root={}",
+            bpb.bytes_per_sector, bpb.sectors_per_cluster,
+            bpb.reserved_sectors, bpb.root_cluster
+        );
+
+        let d = DiskState { disk_tid, buf_phys, part_lba, bpb };
+        warm_cache(&d);
+        d
+    } else {
+        // Dummy — won't be used for ext2 path
+        DiskState {
+            disk_tid,
+            buf_phys,
+            part_lba,
+            bpb: Bpb {
+                bytes_per_sector: 512,
+                sectors_per_cluster: 1,
+                reserved_sectors: 0,
+                num_fats: 0,
+                fat_size_32: 0,
+                root_cluster: 0,
+            },
+        }
     };
-
-    // Warm the sector cache with FAT table and root directory cluster.
-    // This eliminates cold-cache IPC round-trips on the first ls/readdir.
-    warm_cache(&disk);
 
     // Register with nameserver
     register_with_nameserver();
@@ -1400,6 +1519,11 @@ pub extern "C" fn _start() -> ! {
 /// TAG_OPEN: data[0..6] = path (up to 48 bytes, null-terminated)
 /// Reply: tag=TAG_OK, data[0]=handle  OR  tag=TAG_ERROR, data[0]=error_code
 fn handle_open(disk: &DiskState, sender: usize, msg: &Message) {
+    if unsafe { FS_TYPE } == FsType::Ext2 {
+        handle_open_ext2(sender, msg);
+        return;
+    }
+
     let path = extract_path(&msg.data);
     if path.is_empty() {
         error_reply(sender, ERR_INVALID_PATH);
@@ -1415,7 +1539,7 @@ fn handle_open(disk: &DiskState, sender: usize, msg: &Message) {
                 error_reply(sender, ERR_NOT_DIR);
                 return;
             }
-            match alloc_handle(sender, cluster, size, is_dir, dir_cluster, &fat_name) {
+            match alloc_handle_fat32(sender, cluster, size, is_dir, dir_cluster, &fat_name) {
                 Some(handle) => {
                     let reply = Message {
                         sender: 0,
@@ -1434,6 +1558,11 @@ fn handle_open(disk: &DiskState, sender: usize, msg: &Message) {
 /// TAG_READ: data[0]=handle, data[1]=phys_addr, data[2]=offset, data[3]=max_bytes
 /// Reply: tag=TAG_OK, data[0]=bytes_read  OR  tag=TAG_ERROR, data[0]=error_code
 fn handle_read(disk: &DiskState, sender: usize, msg: &Message) {
+    if unsafe { FS_TYPE } == FsType::Ext2 {
+        handle_read_ext2(sender, msg);
+        return;
+    }
+
     let handle = msg.data[0] as usize;
     let phys_addr = msg.data[1] as usize;
     let offset = msg.data[2] as u32;
@@ -1477,6 +1606,11 @@ fn handle_close(sender: usize, msg: &Message) {
 /// Reply: tag=TAG_OK, data[0..1]=name (11 bytes), data[2]=size, data[3]=flags, data[4]=cluster
 ///    OR: tag=TAG_ERROR with ERR_NOT_FOUND when no more entries
 fn handle_readdir(disk: &DiskState, sender: usize, msg: &Message) {
+    if unsafe { FS_TYPE } == FsType::Ext2 {
+        handle_readdir_ext2(sender, msg);
+        return;
+    }
+
     let handle = msg.data[0] as usize;
     let index = msg.data[1] as u32;
 
@@ -1486,7 +1620,10 @@ fn handle_readdir(disk: &DiskState, sender: usize, msg: &Message) {
                 error_reply(sender, ERR_NOT_DIR);
                 return;
             }
-            file.first_cluster
+            match &file.fs {
+                FsFileData::Fat32 { first_cluster, .. } => *first_cluster,
+                _ => { error_reply(sender, ERR_IO); return; }
+            }
         }
         None => {
             error_reply(sender, ERR_INVALID_HANDLE);
@@ -1527,13 +1664,18 @@ fn handle_stat(sender: usize, msg: &Message) {
     let handle = msg.data[0] as usize;
     match get_handle(handle, sender) {
         Some(file) => {
+            let id = match &file.fs {
+                FsFileData::Fat32 { first_cluster, .. } => *first_cluster as u64,
+                FsFileData::Ext2 { inode_num, .. } => *inode_num as u64,
+                FsFileData::None => 0,
+            };
             let reply = Message {
                 sender: 0,
                 tag: TAG_OK,
                 data: [
                     file.file_size as u64,
                     file.is_dir as u64,
-                    file.first_cluster as u64,
+                    id,
                     0, 0, 0,
                 ],
             };
@@ -1546,6 +1688,11 @@ fn handle_stat(sender: usize, msg: &Message) {
 /// TAG_WRITE: data[0]=handle, data[1]=phys_addr, data[2]=offset, data[3]=len
 /// Reply: tag=TAG_OK, data[0]=bytes_written  OR  tag=TAG_ERROR, data[0]=error_code
 fn handle_write(disk: &DiskState, sender: usize, msg: &Message) {
+    if unsafe { FS_TYPE } == FsType::Ext2 {
+        handle_write_ext2(sender, msg);
+        return;
+    }
+
     let handle = msg.data[0] as usize;
     let phys_addr = msg.data[1] as usize;
     let offset = msg.data[2] as u32;
@@ -1553,8 +1700,10 @@ fn handle_write(disk: &DiskState, sender: usize, msg: &Message) {
 
     match get_handle(handle, sender) {
         Some(file) => {
-            let dir_cluster = file.dir_cluster;
-            let fat_name = file.fat_name;
+            let (dir_cluster, fat_name) = match &file.fs {
+                FsFileData::Fat32 { dir_cluster, fat_name, .. } => (*dir_cluster, *fat_name),
+                _ => { error_reply(sender, ERR_IO); return; }
+            };
             match write_file_data(disk, file, phys_addr, offset, len) {
                 Ok(bytes_written) => {
                     // Update directory entry with new size
@@ -1579,6 +1728,11 @@ fn handle_write(disk: &DiskState, sender: usize, msg: &Message) {
 ///   If data[5] bit 0 is set, create a directory.
 /// Reply: tag=TAG_OK, data[0]=handle, data[1]=0 (size)  OR  tag=TAG_ERROR
 fn handle_create(disk: &DiskState, sender: usize, msg: &Message) {
+    if unsafe { FS_TYPE } == FsType::Ext2 {
+        handle_create_ext2(sender, msg);
+        return;
+    }
+
     // data[5] is used for flags — extract before treating data as path
     let flags = msg.data[5];
     let is_dir = flags & 1 != 0;
@@ -1629,7 +1783,7 @@ fn handle_create(disk: &DiskState, sender: usize, msg: &Message) {
     // Create the directory entry
     match create_dir_entry(disk, parent_cluster, &fat_name, is_dir) {
         Ok(new_cluster) => {
-            match alloc_handle(sender, new_cluster, 0, is_dir, parent_cluster, &fat_name) {
+            match alloc_handle_fat32(sender, new_cluster, 0, is_dir, parent_cluster, &fat_name) {
                 Some(handle) => {
                     let reply = Message {
                         sender: 0,
@@ -1649,6 +1803,11 @@ fn handle_create(disk: &DiskState, sender: usize, msg: &Message) {
 /// VFS maps shmem, fills with packed 24-byte entries, replies with count.
 /// Entry format: [0..11] name, [11] attr, [12..16] size LE, [16..20] cluster LE, [20..24] pad
 fn handle_readdir_bulk(disk: &DiskState, sender: usize, msg: &Message) {
+    if unsafe { FS_TYPE } == FsType::Ext2 {
+        handle_readdir_bulk_ext2(sender, msg);
+        return;
+    }
+
     let handle = msg.data[0] as usize;
     let shmem_handle = msg.data[1] as usize;
 
@@ -1658,7 +1817,10 @@ fn handle_readdir_bulk(disk: &DiskState, sender: usize, msg: &Message) {
                 error_reply(sender, ERR_NOT_DIR);
                 return;
             }
-            file.first_cluster
+            match &file.fs {
+                FsFileData::Fat32 { first_cluster, .. } => *first_cluster,
+                _ => { error_reply(sender, ERR_IO); return; }
+            }
         }
         None => {
             error_reply(sender, ERR_INVALID_HANDLE);
@@ -1739,6 +1901,379 @@ fn handle_readdir_bulk(disk: &DiskState, sender: usize, msg: &Message) {
         data: [count as u64, 0, 0, 0, 0, 0],
     };
     let _ = syscall::sys_reply(sender, &reply);
+}
+
+// ---------------------------------------------------------------------------
+// ext2 IPC handlers
+// ---------------------------------------------------------------------------
+
+fn get_sender_uid_gid(sender: usize) -> (u32, u32) {
+    syscall::sys_get_tuid(sender).unwrap_or((0, 0))
+}
+
+fn handle_open_ext2(sender: usize, msg: &Message) {
+    let path = extract_path(&msg.data);
+    if path.is_empty() {
+        error_reply(sender, ERR_INVALID_PATH);
+        return;
+    }
+
+    let trailing_slash = path.len() > 1 && path[path.len() - 1] == b'/';
+    let (uid, gid) = get_sender_uid_gid(sender);
+    let e2 = ext2_state();
+
+    match ext2_dir::resolve_path(e2, path, uid, gid) {
+        Ok((inode_num, inode, parent_ino)) => {
+            if trailing_slash && !inode.is_dir() {
+                error_reply(sender, ERR_NOT_DIR);
+                return;
+            }
+            // Check read permission
+            if !ext2::check_permission(&inode, uid, gid, 4) {
+                error_reply(sender, ERR_PERMISSION);
+                return;
+            }
+            let writable = ext2::check_permission(&inode, uid, gid, 2);
+            match alloc_handle_ext2(sender, inode_num, &inode, parent_ino, writable) {
+                Some(handle) => {
+                    let reply = Message {
+                        sender: 0,
+                        tag: TAG_OK,
+                        data: [
+                            handle as u64,
+                            inode.i_size as u64,
+                            inode.is_dir() as u64,
+                            0, 0, 0,
+                        ],
+                    };
+                    let _ = syscall::sys_reply(sender, &reply);
+                }
+                None => error_reply(sender, ERR_TOO_MANY_OPEN),
+            }
+        }
+        Err(code) => error_reply(sender, code),
+    }
+}
+
+fn handle_read_ext2(sender: usize, msg: &Message) {
+    let handle = msg.data[0] as usize;
+    let phys_addr = msg.data[1] as usize;
+    let offset = msg.data[2] as u32;
+    let max_bytes = msg.data[3] as u32;
+
+    match get_handle(handle, sender) {
+        Some(file) => {
+            let inode = match &file.fs {
+                FsFileData::Ext2 { inode, .. } => *inode,
+                _ => { error_reply(sender, ERR_IO); return; }
+            };
+            let e2 = ext2_state();
+            match ext2::read_file_data(e2, &inode, phys_addr, offset, max_bytes) {
+                Ok(bytes_read) => {
+                    let reply = Message {
+                        sender: 0,
+                        tag: TAG_OK,
+                        data: [bytes_read as u64, 0, 0, 0, 0, 0],
+                    };
+                    let _ = syscall::sys_reply(sender, &reply);
+                }
+                Err(code) => error_reply(sender, code),
+            }
+        }
+        None => error_reply(sender, ERR_INVALID_HANDLE),
+    }
+}
+
+fn handle_write_ext2(sender: usize, msg: &Message) {
+    let handle = msg.data[0] as usize;
+    let phys_addr = msg.data[1] as usize;
+    let offset = msg.data[2] as u32;
+    let len = msg.data[3] as u32;
+
+    match get_handle(handle, sender) {
+        Some(file) => {
+            if !file.writable {
+                error_reply(sender, ERR_PERMISSION);
+                return;
+            }
+            let (inode_num, mut inode, _parent_inode) = match &file.fs {
+                FsFileData::Ext2 { inode_num, inode, parent_inode } =>
+                    (*inode_num, *inode, *parent_inode),
+                _ => { error_reply(sender, ERR_IO); return; }
+            };
+            let e2 = ext2_state_mut();
+            match ext2::write_file_data(e2, &mut inode, inode_num, phys_addr, offset, len) {
+                Ok(bytes_written) => {
+                    // Update cached inode and file size in handle
+                    file.file_size = inode.i_size;
+                    if let FsFileData::Ext2 { inode: ref mut ino, .. } = &mut file.fs {
+                        *ino = inode;
+                    }
+                    let reply = Message {
+                        sender: 0,
+                        tag: TAG_OK,
+                        data: [bytes_written as u64, 0, 0, 0, 0, 0],
+                    };
+                    let _ = syscall::sys_reply(sender, &reply);
+                }
+                Err(code) => error_reply(sender, code),
+            }
+        }
+        None => error_reply(sender, ERR_INVALID_HANDLE),
+    }
+}
+
+fn handle_readdir_ext2(sender: usize, msg: &Message) {
+    let handle = msg.data[0] as usize;
+    let index = msg.data[1] as u32;
+
+    let dir_inode = match get_handle(handle, sender) {
+        Some(file) => {
+            if !file.is_dir {
+                error_reply(sender, ERR_NOT_DIR);
+                return;
+            }
+            match &file.fs {
+                FsFileData::Ext2 { inode, .. } => *inode,
+                _ => { error_reply(sender, ERR_IO); return; }
+            }
+        }
+        None => {
+            error_reply(sender, ERR_INVALID_HANDLE);
+            return;
+        }
+    };
+
+    let e2 = ext2_state();
+    match ext2_dir::read_dir_entry(e2, &dir_inode, index) {
+        Ok(Some(entry)) => {
+            // Pack name into FAT-compatible 11-byte format for existing client code
+            // Truncate/pad to 11 bytes
+            let mut name_bytes = [b' '; 16];
+            let copy_len = entry.name_len.min(11);
+            name_bytes[..copy_len].copy_from_slice(&entry.name[..copy_len]);
+            let w0 = u64::from_le_bytes(name_bytes[0..8].try_into().unwrap());
+            let w1 = u64::from_le_bytes(name_bytes[8..16].try_into().unwrap());
+
+            let is_dir = entry.file_type == ext2::FT_DIR;
+            let attr: u8 = if is_dir { 0x10 } else { 0x20 };
+
+            let reply = Message {
+                sender: 0,
+                tag: TAG_OK,
+                data: [
+                    w0,
+                    w1,
+                    entry.file_size as u64,
+                    ((is_dir as u64) << 32) | (entry.inode_num as u64),
+                    attr as u64,
+                    0,
+                ],
+            };
+            let _ = syscall::sys_reply(sender, &reply);
+        }
+        Ok(None) => error_reply(sender, ERR_NOT_FOUND),
+        Err(code) => error_reply(sender, code),
+    }
+}
+
+fn handle_readdir_bulk_ext2(sender: usize, msg: &Message) {
+    let handle = msg.data[0] as usize;
+    let shmem_handle = msg.data[1] as usize;
+
+    let dir_inode = match get_handle(handle, sender) {
+        Some(file) => {
+            if !file.is_dir {
+                error_reply(sender, ERR_NOT_DIR);
+                return;
+            }
+            match &file.fs {
+                FsFileData::Ext2 { inode, .. } => *inode,
+                _ => { error_reply(sender, ERR_IO); return; }
+            }
+        }
+        None => {
+            error_reply(sender, ERR_INVALID_HANDLE);
+            return;
+        }
+    };
+
+    // Map the shared memory page
+    if syscall::sys_shmem_map(shmem_handle, SHMEM_BUF).is_err() {
+        error_reply(sender, ERR_IO);
+        return;
+    }
+
+    let buf = unsafe { core::slice::from_raw_parts_mut(SHMEM_BUF as *mut u8, 4096) };
+    let max_entries = 4096 / 24; // 170
+    let mut count: u32 = 0;
+    let e2 = ext2_state();
+
+    // Iterate directory entries
+    let mut idx = 0u32;
+    loop {
+        if count as usize >= max_entries {
+            break;
+        }
+        match ext2_dir::read_dir_entry(e2, &dir_inode, idx) {
+            Ok(Some(entry)) => {
+                let base = (count as usize) * 24;
+                // Pack name (up to 11 bytes, space-padded)
+                let mut name_buf = [b' '; 11];
+                let copy_len = entry.name_len.min(11);
+                name_buf[..copy_len].copy_from_slice(&entry.name[..copy_len]);
+                buf[base..base + 11].copy_from_slice(&name_buf);
+
+                let attr: u8 = if entry.file_type == ext2::FT_DIR { 0x10 } else { 0x20 };
+                buf[base + 11] = attr;
+                buf[base + 12..base + 16].copy_from_slice(&entry.file_size.to_le_bytes());
+                buf[base + 16..base + 20].copy_from_slice(&entry.inode_num.to_le_bytes());
+                buf[base + 20..base + 24].fill(0);
+                count += 1;
+                idx += 1;
+            }
+            Ok(None) => break,
+            Err(_) => break,
+        }
+    }
+
+    let _ = syscall::sys_shmem_unmap(shmem_handle, SHMEM_BUF);
+
+    let reply = Message {
+        sender: 0,
+        tag: TAG_OK,
+        data: [count as u64, 0, 0, 0, 0, 0],
+    };
+    let _ = syscall::sys_reply(sender, &reply);
+}
+
+fn handle_create_ext2(sender: usize, msg: &Message) {
+    let flags = msg.data[5];
+    let is_dir = flags & 1 != 0;
+
+    // Limit to 40 bytes — data[5] holds flags, not path data
+    let full_path = extract_path(&msg.data);
+    let path = if full_path.len() > 40 { &full_path[..40] } else { full_path };
+    if path.is_empty() {
+        error_reply(sender, ERR_INVALID_PATH);
+        return;
+    }
+
+    let path_trimmed = if !path.is_empty() && path[0] == b'/' {
+        &path[1..]
+    } else {
+        path
+    };
+
+    // Split into parent path + file name
+    let (parent_path, file_name) = match path_trimmed.iter().rposition(|&b| b == b'/') {
+        Some(pos) => (&path[..pos + 1], &path_trimmed[pos + 1..]),
+        None => (b"/" as &[u8], path_trimmed),
+    };
+
+    if file_name.is_empty() {
+        error_reply(sender, ERR_INVALID_PATH);
+        return;
+    }
+
+    let (uid, gid) = get_sender_uid_gid(sender);
+    let e2 = ext2_state_mut();
+
+    // Resolve parent directory
+    let (parent_ino, mut parent_inode, _grandparent) =
+        match ext2_dir::resolve_path(e2, parent_path, uid, gid) {
+            Ok(result) => result,
+            Err(code) => { error_reply(sender, code); return; }
+        };
+
+    if !parent_inode.is_dir() {
+        error_reply(sender, ERR_NOT_DIR);
+        return;
+    }
+
+    // Check write+execute permission on parent directory
+    if !ext2::check_permission(&parent_inode, uid, gid, 3) {
+        error_reply(sender, ERR_PERMISSION);
+        return;
+    }
+
+    // Check if name already exists
+    if let Ok(Some(_)) = ext2_dir::find_entry(e2, &parent_inode, file_name) {
+        error_reply(sender, ERR_INVALID_PATH);
+        return;
+    }
+
+    // Allocate new inode
+    let new_ino = match ext2_alloc::alloc_inode(e2) {
+        Ok(ino) => ino,
+        Err(code) => { error_reply(sender, code); return; }
+    };
+
+    // Initialize the inode
+    let mode = if is_dir {
+        ext2::S_IFDIR | 0o755
+    } else {
+        ext2::S_IFREG | 0o644
+    };
+
+    let mut new_inode = ext2::Ext2Inode::empty();
+    new_inode.i_mode = mode;
+    new_inode.i_uid = uid as u16;
+    new_inode.i_gid = gid as u16;
+    new_inode.i_links_count = if is_dir { 2 } else { 1 };
+
+    if is_dir {
+        // Allocate a block for the directory and write . and .. entries
+        let block = match ext2_alloc::alloc_block(e2) {
+            Ok(b) => b,
+            Err(code) => { error_reply(sender, code); return; }
+        };
+        new_inode.i_block[0] = block;
+        new_inode.i_size = e2.block_size;
+        new_inode.i_blocks = e2.block_size / 512;
+
+        if ext2_dir::init_dir_block(e2, block, new_ino, parent_ino).is_err() {
+            error_reply(sender, ERR_IO);
+            return;
+        }
+
+        // Increment parent's link count (for ".." entry)
+        parent_inode.i_links_count += 1;
+        let _ = ext2::write_inode(e2, parent_ino, &parent_inode);
+
+        // Increment bg_used_dirs_count for the block group containing the new inode
+        let group = (new_ino - 1) / e2.inodes_per_group;
+        e2.bgd_table[group as usize].bg_used_dirs_count += 1;
+        let _ = ext2::flush_bgd(e2, group);
+    }
+
+    // Write the new inode to disk
+    if ext2::write_inode(e2, new_ino, &new_inode).is_err() {
+        error_reply(sender, ERR_IO);
+        return;
+    }
+
+    // Create directory entry in parent
+    let file_type = if is_dir { ext2::FT_DIR } else { ext2::FT_REG_FILE };
+    if ext2_dir::create_dir_entry(e2, parent_ino, &mut parent_inode, file_name, new_ino, file_type)
+        .is_err()
+    {
+        error_reply(sender, ERR_IO);
+        return;
+    }
+
+    // Allocate handle
+    match alloc_handle_ext2(sender, new_ino, &new_inode, parent_ino, true) {
+        Some(handle) => {
+            let reply = Message {
+                sender: 0,
+                tag: TAG_OK,
+                data: [handle as u64, 0, is_dir as u64, 0, 0, 0],
+            };
+            let _ = syscall::sys_reply(sender, &reply);
+        }
+        None => error_reply(sender, ERR_TOO_MANY_OPEN),
+    }
 }
 
 #[panic_handler]

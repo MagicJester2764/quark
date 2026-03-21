@@ -25,6 +25,7 @@ pub const ERR_TOO_MANY_OPEN: u64 = 4;
 pub const ERR_INVALID_PATH: u64 = 5;
 pub const ERR_NOT_DIR: u64 = 6;
 pub const ERR_IS_DIR: u64 = 7;
+pub const ERR_PERMISSION: u64 = 8;
 
 #[derive(Clone, Copy)]
 pub struct DirEntry {
