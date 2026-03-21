@@ -190,10 +190,12 @@ unsafe fn schedule_inner(from_irq: bool) {
     let old_ctx = &raw mut TASKS[current_tid].as_mut().unwrap().context;
     let new_ctx = &raw const TASKS[next_tid].as_ref().unwrap().context;
 
-    // Restore interrupt flag before switching (new task may need interrupts)
-    restore_flags(flags);
+    // Do NOT restore interrupts here — context_switch restores RFLAGS from
+    // the new context, which atomically re-enables interrupts with the switch.
+    // Enabling interrupts before context_switch creates a race where a nested
+    // timer interrupt can re-enter schedule_inner with stale old_ctx/new_ctx.
 
-    // Perform the context switch
+    // Perform the context switch (restores RFLAGS from new context)
     context::context_switch(old_ctx, new_ctx);
 }
 

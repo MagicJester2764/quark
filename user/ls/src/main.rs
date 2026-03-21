@@ -29,29 +29,40 @@ fn lookup_service(name: &[u8]) -> Option<usize> {
     }
 }
 
-fn fat_name_to_str<'a>(name: &[u8; 11], buf: &'a mut [u8; 16]) -> &'a [u8] {
-    let base_len = name[0..8]
-        .iter()
-        .rposition(|&b| b != b' ')
-        .map_or(0, |p| p + 1);
-    let mut pos = 0;
-    for i in 0..base_len {
-        buf[pos] = name[i];
-        pos += 1;
-    }
-    let ext_len = name[8..11]
-        .iter()
-        .rposition(|&b| b != b' ')
-        .map_or(0, |p| p + 1);
-    if ext_len > 0 {
-        buf[pos] = b'.';
-        pos += 1;
-        for i in 0..ext_len {
-            buf[pos] = name[8 + i];
+/// Convert a DirEntry name to a displayable string.
+/// For FAT32 8.3 names (name_len=11 with spaces), converts to "NAME.EXT" format.
+/// For ext2 names, uses the name directly.
+fn entry_name_to_str<'a>(entry: &vfs::DirEntry, buf: &'a mut [u8; 48]) -> &'a [u8] {
+    let name = entry.name_bytes();
+    // Detect FAT32 8.3 format: exactly 11 bytes, no dot, has trailing spaces
+    if entry.name_len == 11 && !name.contains(&b'.') {
+        let base_len = name[0..8]
+            .iter()
+            .rposition(|&b| b != b' ')
+            .map_or(0, |p| p + 1);
+        let mut pos = 0;
+        for i in 0..base_len {
+            buf[pos] = name[i];
             pos += 1;
         }
+        let ext_len = name[8..11]
+            .iter()
+            .rposition(|&b| b != b' ')
+            .map_or(0, |p| p + 1);
+        if ext_len > 0 {
+            buf[pos] = b'.';
+            pos += 1;
+            for i in 0..ext_len {
+                buf[pos] = name[8 + i];
+                pos += 1;
+            }
+        }
+        &buf[..pos]
+    } else {
+        // ext2 or other: use name directly
+        buf[..name.len()].copy_from_slice(name);
+        &buf[..name.len()]
     }
-    &buf[..pos]
 }
 
 #[unsafe(no_mangle)]
@@ -105,9 +116,10 @@ pub extern "C" fn _start() -> ! {
         syscall::sys_exit();
     }
 
-    // Read all directory entries in one bulk IPC call
-    let mut entries = [vfs::DirEntry { name: [0; 11], size: 0, is_dir: false, cluster: 0, attr: 0 }; 128];
-    let count = match vfs::readdir_bulk(vfs_tid, handle, &mut entries) {
+    // Read all directory entries in one bulk IPC call (static to avoid stack overflow)
+    static mut ENTRIES: [vfs::DirEntry; 64] = [vfs::DirEntry::empty(); 64];
+    let entries = unsafe { &mut ENTRIES };
+    let count = match vfs::readdir_bulk(vfs_tid, handle, entries) {
         Ok(n) => n,
         Err(e) => {
             println!("ls: readdir error: {}", e);
@@ -118,8 +130,7 @@ pub extern "C" fn _start() -> ! {
 
     for i in 0..count {
         let entry = &entries[i];
-        let mut nbuf = [0u8; 16];
-        let name = fat_name_to_str(&entry.name, &mut nbuf);
+        let name = entry.name_bytes();
         if let Ok(s) = core::str::from_utf8(name) {
             if entry.is_dir {
                 println!("{}/ ", s);

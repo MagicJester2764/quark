@@ -282,14 +282,20 @@ fn build_path(cmd: &[u8], path_buf: &mut [u8; 64]) -> usize {
         path_buf[..len].copy_from_slice(&cmd[..len]);
         len
     } else {
-        // Bare command — prepend /usr/bin/, append .ELF
+        // Bare command — prepend /usr/bin/, uppercase name, append .ELF
         let prefix = b"/usr/bin/";
         let suffix = b".ELF";
         let cmd_len = cmd.len().min(64 - prefix.len() - suffix.len());
         path_buf[..prefix.len()].copy_from_slice(prefix);
         let mut pos = prefix.len();
-        path_buf[pos..pos + cmd_len].copy_from_slice(&cmd[..cmd_len]);
-        pos += cmd_len;
+        for i in 0..cmd_len {
+            path_buf[pos] = if cmd[i] >= b'a' && cmd[i] <= b'z' {
+                cmd[i] - 32
+            } else {
+                cmd[i]
+            };
+            pos += 1;
+        }
         path_buf[pos..pos + suffix.len()].copy_from_slice(suffix);
         pos += suffix.len();
         pos

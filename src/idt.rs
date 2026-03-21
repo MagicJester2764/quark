@@ -228,8 +228,14 @@ irq_stub!(14);
 irq_stub!(15);
 
 // IRQ common handler: save GPRs, call Rust handler, restore, iretq
+// Stack at entry: [vector, error_code, RIP, CS, RFLAGS, RSP, SS]
+// If from user mode (CS & 3 != 0), swapgs to get kernel GS.
 core::arch::global_asm!(
     "irq_common:",
+    "    testl $3, 0x18(%rsp)",       // check CS RPL (at RSP+0x18)
+    "    jz 1f",
+    "    swapgs",                      // from user: swap to kernel GS
+    "1:",
     "    pushq %rax",
     "    pushq %rbx",
     "    pushq %rcx",
@@ -264,14 +270,24 @@ core::arch::global_asm!(
     "    popq %rcx",
     "    popq %rbx",
     "    popq %rax",
-    "    addq $16, %rsp",
+    "    addq $16, %rsp",             // skip vector + error_code
+    "    testl $3, 0x08(%rsp)",       // check CS again before iretq
+    "    jz 2f",
+    "    swapgs",                      // returning to user: restore user GS
+    "2:",
     "    iretq",
     options(att_syntax)
 );
 
-// Common handler: save GPRs, call Rust handler, restore, iretq
+// Common exception handler: save GPRs, call Rust handler, restore, iretq
+// Stack at entry: [vector, error_code, RIP, CS, RFLAGS, RSP, SS]
+// If from user mode (CS & 3 != 0), swapgs to get kernel GS.
 core::arch::global_asm!(
     "exception_common:",
+    "    testl $3, 0x18(%rsp)",       // check CS RPL (at RSP+0x18)
+    "    jz 1f",
+    "    swapgs",                      // from user: swap to kernel GS
+    "1:",
     "    pushq %rax",
     "    pushq %rbx",
     "    pushq %rcx",
@@ -306,7 +322,11 @@ core::arch::global_asm!(
     "    popq %rcx",
     "    popq %rbx",
     "    popq %rax",
-    "    addq $16, %rsp",
+    "    addq $16, %rsp",             // skip vector + error_code
+    "    testl $3, 0x08(%rsp)",       // check CS again before iretq
+    "    jz 2f",
+    "    swapgs",                      // returning to user: restore user GS
+    "2:",
     "    iretq",
     options(att_syntax)
 );
@@ -376,6 +396,26 @@ extern "C" fn exception_handler(frame: &InterruptFrame) {
     }
 
     // All other exceptions (or kernel page faults): fatal
+    // DEBUG: serial trace for kernel exceptions
+    crate::serial::puts(b"[KFAULT vec=");
+    crate::serial::put_usize(vec);
+    crate::serial::puts(b" rip=0x");
+    crate::serial::put_hex_usize(frame.rip as usize);
+    crate::serial::puts(b" rsp=0x");
+    crate::serial::put_hex_usize(frame.rsp as usize);
+    crate::serial::puts(b" cs=0x");
+    crate::serial::put_hex_usize(frame.cs as usize);
+    crate::serial::puts(b" err=0x");
+    crate::serial::put_hex_usize(frame.error_code as usize);
+    if vec == 14 {
+        let cr2_k: u64;
+        unsafe { core::arch::asm!("mov {}, cr2", out(reg) cr2_k, options(nostack, nomem)) };
+        crate::serial::puts(b" cr2=0x");
+        crate::serial::put_hex_usize(cr2_k as usize);
+    }
+    crate::serial::puts(b" tid=");
+    crate::serial::put_usize(crate::scheduler::current_tid());
+    crate::serial::puts(b"]\n");
     console::puts(b"\n!!! EXCEPTION: ");
     if vec < 32 {
         console::puts(EXCEPTION_NAMES[vec]);

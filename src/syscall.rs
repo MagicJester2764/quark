@@ -225,7 +225,9 @@ extern "C" fn syscall_dispatch(
     arg4: u64,
 ) -> u64 {
     match nr {
-        SYS_EXIT => scheduler::exit(),
+        SYS_EXIT => {
+            scheduler::exit()
+        }
         SYS_YIELD => {
             scheduler::yield_now();
             0
@@ -277,7 +279,9 @@ extern "C" fn syscall_dispatch(
                 || !validate_user_ptr(arg2, msg_size) { return u64::MAX; }
             let msg = unsafe { &*msg_ptr };
             match crate::ipc::sys_call(dest, msg) {
-                Ok(reply) => { unsafe { *reply_ptr = reply }; 0 }
+                Ok(reply) => {
+                    unsafe { *reply_ptr = reply }; 0
+                }
                 Err(_) => u64::MAX,
             }
         }

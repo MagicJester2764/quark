@@ -7,7 +7,7 @@ use crate::context::CpuContext;
 use alloc::alloc::{alloc, dealloc, Layout};
 
 pub const MAX_TASKS: usize = 64;
-pub const KERNEL_STACK_SIZE: usize = 16384; // 16 KiB per task
+pub const KERNEL_STACK_SIZE: usize = 65536; // 64 KiB per task
 const STACK_ALIGN: usize = 16;
 pub const MAX_FDS: usize = 8;
 

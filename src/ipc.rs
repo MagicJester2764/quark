@@ -2,6 +2,10 @@
 ///
 /// Tasks communicate by sending/receiving fixed-size messages.
 /// Messages fit in registers for zero-copy small transfers.
+///
+/// All IPC operations disable interrupts around critical sections to prevent
+/// races: the timer interrupt can preempt syscall handlers and context-switch
+/// to another task that accesses the same IPC state.
 
 use crate::scheduler;
 
@@ -88,6 +92,24 @@ pub const SIG_MASK: u64 = SIG_INT | SIG_TERM | SIG_KILL;
 /// Ticks before a signaled task is force-killed (5 seconds at 100 Hz).
 const SIGNAL_KILL_TIMEOUT: u64 = 500;
 
+/// Save RFLAGS and disable interrupts. Returns saved flags.
+#[inline(always)]
+fn irq_save() -> u64 {
+    let flags: u64;
+    unsafe {
+        core::arch::asm!("pushfq; pop {}; cli", out(reg) flags, options(nostack));
+    }
+    flags
+}
+
+/// Restore RFLAGS (re-enabling interrupts if they were enabled before).
+#[inline(always)]
+fn irq_restore(flags: u64) {
+    unsafe {
+        core::arch::asm!("push {}; popfq", in(reg) flags, options(nostack));
+    }
+}
+
 /// Asynchronous notification: OR `badge` into dest's notification word.
 /// Non-blocking. Wakes the dest task if it is RecvBlocked(0) or RecvBlocked(TID_ANY).
 pub fn sys_notify(dest: usize, badge: u64) -> Result<(), IpcError> {
@@ -95,6 +117,7 @@ pub fn sys_notify(dest: usize, badge: u64) -> Result<(), IpcError> {
         return Err(IpcError::InvalidTid);
     }
 
+    let flags = irq_save();
     unsafe {
         TASK_NOTIFY[dest] |= badge;
 
@@ -107,6 +130,7 @@ pub fn sys_notify(dest: usize, badge: u64) -> Result<(), IpcError> {
             _ => {}
         }
     }
+    irq_restore(flags);
 
     Ok(())
 }
@@ -137,11 +161,7 @@ pub fn sys_signal(dest: usize, sig: u64) -> Result<(), IpcError> {
     sys_notify(dest, sig)?;
 
     // Force-unblock from IPC states that sys_notify doesn't handle.
-    // The interrupted syscall will return an error to the caller:
-    //   - sys_call → Err(DeadTask) because pending_msg is None
-    //   - sys_send → returns Ok (harmless)
-    //   - sys_recv with specific sender → Err(WouldBlock)
-    // The signal bits remain in the notification word for the task to check.
+    let flags = irq_save();
     unsafe {
         match TASK_IPC[dest].state {
             IpcState::CallBlocked(_) | IpcState::CallSendBlocked(_) | IpcState::SendBlocked(_) => {
@@ -157,6 +177,7 @@ pub fn sys_signal(dest: usize, sig: u64) -> Result<(), IpcError> {
             _ => {} // None or RecvBlocked(0|TID_ANY) already handled by sys_notify
         }
     }
+    irq_restore(flags);
 
     // Set force-kill deadline (only if not already set — don't extend)
     unsafe {
@@ -171,6 +192,7 @@ pub fn sys_signal(dest: usize, sig: u64) -> Result<(), IpcError> {
 /// Check signal deadlines and force-kill unresponsive tasks.
 /// Called from `pit::tick()` on every timer interrupt.
 pub fn check_signal_deadlines() {
+    // Already in interrupt context (IRQ handler), so no need for irq_save.
     let now = crate::pit::ticks();
     unsafe {
         for tid in 2..MAX_TASKS {
@@ -199,6 +221,7 @@ pub fn sys_send(dest: usize, msg: &Message) -> Result<(), IpcError> {
     }
     let sender = scheduler::current_tid();
 
+    let flags = irq_save();
     unsafe {
         // Check if dest is blocked waiting to receive from us (or from ANY)
         let dest_state = TASK_IPC[dest].state;
@@ -210,6 +233,7 @@ pub fn sys_send(dest: usize, msg: &Message) -> Result<(), IpcError> {
                 TASK_IPC[dest].pending_msg = Some(delivered);
                 TASK_IPC[dest].state = IpcState::None;
                 scheduler::unblock_task(dest);
+                irq_restore(flags);
                 return Ok(());
             }
             _ => {}
@@ -221,12 +245,15 @@ pub fn sys_send(dest: usize, msg: &Message) -> Result<(), IpcError> {
         TASK_IPC[sender].pending_msg = Some(to_send);
         TASK_IPC[sender].state = IpcState::SendBlocked(dest);
         scheduler::block_task(sender);
-        scheduler::yield_now();
+    }
+    irq_restore(flags);
+    scheduler::yield_now();
 
+    unsafe {
         // When we wake up, send was completed
         TASK_IPC[sender].state = IpcState::None;
-        Ok(())
     }
+    Ok(())
 }
 
 /// Synchronous receive: blocks until a message arrives.
@@ -234,6 +261,7 @@ pub fn sys_send(dest: usize, msg: &Message) -> Result<(), IpcError> {
 pub fn sys_recv(from: usize) -> Result<Message, IpcError> {
     let receiver = scheduler::current_tid();
 
+    let flags = irq_save();
     unsafe {
         // Check if any sender is blocked waiting to send to us
         for tid in 0..MAX_TASKS {
@@ -264,6 +292,7 @@ pub fn sys_recv(from: usize) -> Result<Message, IpcError> {
                     TASK_IPC[tid].state = IpcState::None;
                     scheduler::unblock_task(tid);
                 }
+                irq_restore(flags);
                 return Ok(msg);
             }
         }
@@ -272,6 +301,7 @@ pub fn sys_recv(from: usize) -> Result<Message, IpcError> {
         // (from=0 means kernel, TID_ANY matches any)
         if from == 0 || from == TID_ANY {
             if let Some(msg) = crate::irq_dispatch::poll_irq_message(receiver) {
+                irq_restore(flags);
                 return Ok(msg);
             }
         }
@@ -281,6 +311,7 @@ pub fn sys_recv(from: usize) -> Result<Message, IpcError> {
             let word = TASK_NOTIFY[receiver];
             if word != 0 {
                 TASK_NOTIFY[receiver] = 0;
+                irq_restore(flags);
                 return Ok(Message {
                     sender: 0,
                     tag: TAG_NOTIFICATION,
@@ -292,14 +323,19 @@ pub fn sys_recv(from: usize) -> Result<Message, IpcError> {
         // No sender ready — block receiver
         TASK_IPC[receiver].state = IpcState::RecvBlocked(from);
         scheduler::block_task(receiver);
-        scheduler::yield_now();
+    }
+    irq_restore(flags);
+    scheduler::yield_now();
 
+    let flags = irq_save();
+    let result = unsafe {
         // When we wake up, check if an IPC message was delivered first.
         // This must come before IRQ polling — otherwise an IRQ arriving
         // between the IPC delivery and our resume would cause us to
         // return the IRQ message and orphan the IPC message.
         if let Some(msg) = TASK_IPC[receiver].pending_msg.take() {
             TASK_IPC[receiver].state = IpcState::None;
+            irq_restore(flags);
             return Ok(msg);
         }
 
@@ -307,6 +343,7 @@ pub fn sys_recv(from: usize) -> Result<Message, IpcError> {
         if from == 0 || from == TID_ANY {
             if let Some(msg) = crate::irq_dispatch::poll_irq_message(receiver) {
                 TASK_IPC[receiver].state = IpcState::None;
+                irq_restore(flags);
                 return Ok(msg);
             }
         }
@@ -317,6 +354,7 @@ pub fn sys_recv(from: usize) -> Result<Message, IpcError> {
             if word != 0 {
                 TASK_NOTIFY[receiver] = 0;
                 TASK_IPC[receiver].state = IpcState::None;
+                irq_restore(flags);
                 return Ok(Message {
                     sender: 0,
                     tag: TAG_NOTIFICATION,
@@ -328,7 +366,9 @@ pub fn sys_recv(from: usize) -> Result<Message, IpcError> {
         // Should not reach here — either IPC, IRQ, or notification should have woken us
         TASK_IPC[receiver].state = IpcState::None;
         Err(IpcError::WouldBlock)
-    }
+    };
+    irq_restore(flags);
+    result
 }
 
 /// Synchronous RPC: send a message and wait for a reply.
@@ -338,53 +378,50 @@ pub fn sys_call(dest: usize, msg: &Message) -> Result<Message, IpcError> {
     }
     let caller = scheduler::current_tid();
 
+    let flags = irq_save();
     unsafe {
         let mut to_send = *msg;
         to_send.sender = caller;
 
         // Check if dest is recv-blocked
         let dest_state = TASK_IPC[dest].state;
-        let need_wait = match dest_state {
+        match dest_state {
             IpcState::RecvBlocked(from) if from == caller || from == TID_ANY => {
-                // Fast path: deliver message directly to receiver
+                // Fast path: deliver message directly to receiver.
+                TASK_IPC[caller].state = IpcState::CallBlocked(dest);
+                TASK_IPC[caller].pending_msg = None;
                 TASK_IPC[dest].pending_msg = Some(to_send);
                 TASK_IPC[dest].state = IpcState::None;
                 scheduler::unblock_task(dest);
-                true // Receiver hasn't processed yet, need to wait for reply
+                scheduler::block_task(caller);
             }
             _ => {
                 // Slow path: receiver not ready, block as CallSendBlocked.
-                // When sys_recv picks this up, it will transition us to
-                // CallBlocked (keeping us blocked). sys_reply then delivers
-                // the reply and unblocks us — we resume here with reply ready.
                 TASK_IPC[caller].pending_msg = Some(to_send);
                 TASK_IPC[caller].state = IpcState::CallSendBlocked(dest);
                 scheduler::block_task(caller);
-                scheduler::yield_now();
-                false // Reply already delivered by the time we resume
             }
         };
+    }
+    irq_restore(flags);
+    scheduler::yield_now();
 
-        if need_wait {
-            // Wait for reply (fast path only — receiver was unblocked but
-            // hasn't replied yet; interrupts are off so no race here)
-            TASK_IPC[caller].state = IpcState::CallBlocked(dest);
-            TASK_IPC[caller].pending_msg = None;
-            scheduler::block_task(caller);
-            scheduler::yield_now();
-        }
-
-        // Reply arrived
+    // Reply arrived
+    let flags = irq_save();
+    let result = unsafe {
         let reply = match TASK_IPC[caller].pending_msg.take() {
             Some(m) => m,
             None => {
                 TASK_IPC[caller].state = IpcState::None;
+                irq_restore(flags);
                 return Err(IpcError::DeadTask);
             }
         };
         TASK_IPC[caller].state = IpcState::None;
         Ok(reply)
-    }
+    };
+    irq_restore(flags);
+    result
 }
 
 /// Reply to a caller that is blocked in sys_call.
@@ -394,7 +431,8 @@ pub fn sys_reply(dest: usize, msg: &Message) -> Result<(), IpcError> {
     }
     let replier = scheduler::current_tid();
 
-    unsafe {
+    let flags = irq_save();
+    let result = unsafe {
         match TASK_IPC[dest].state {
             IpcState::CallBlocked(expected_replier) if expected_replier == replier => {
                 let mut reply = *msg;
@@ -404,9 +442,13 @@ pub fn sys_reply(dest: usize, msg: &Message) -> Result<(), IpcError> {
                 scheduler::unblock_task(dest);
                 Ok(())
             }
-            _ => Err(IpcError::NotWaiting),
+            _ => {
+                Err(IpcError::NotWaiting)
+            }
         }
-    }
+    };
+    irq_restore(flags);
+    result
 }
 
 /// Synchronous receive with timeout: blocks until a message arrives or deadline expires.
@@ -415,6 +457,7 @@ pub fn sys_reply(dest: usize, msg: &Message) -> Result<(), IpcError> {
 pub fn sys_recv_timeout(from: usize, timeout_ticks: u64) -> Result<Message, IpcError> {
     let receiver = scheduler::current_tid();
 
+    let flags = irq_save();
     unsafe {
         // Check if any sender is blocked waiting to send to us (same as sys_recv)
         for tid in 0..MAX_TASKS {
@@ -442,6 +485,7 @@ pub fn sys_recv_timeout(from: usize, timeout_ticks: u64) -> Result<Message, IpcE
                     TASK_IPC[tid].state = IpcState::None;
                     scheduler::unblock_task(tid);
                 }
+                irq_restore(flags);
                 return Ok(msg);
             }
         }
@@ -449,6 +493,7 @@ pub fn sys_recv_timeout(from: usize, timeout_ticks: u64) -> Result<Message, IpcE
         // Check for pending IRQ messages
         if from == 0 || from == TID_ANY {
             if let Some(msg) = crate::irq_dispatch::poll_irq_message(receiver) {
+                irq_restore(flags);
                 return Ok(msg);
             }
         }
@@ -458,6 +503,7 @@ pub fn sys_recv_timeout(from: usize, timeout_ticks: u64) -> Result<Message, IpcE
             let word = TASK_NOTIFY[receiver];
             if word != 0 {
                 TASK_NOTIFY[receiver] = 0;
+                irq_restore(flags);
                 return Ok(Message {
                     sender: 0,
                     tag: TAG_NOTIFICATION,
@@ -468,6 +514,7 @@ pub fn sys_recv_timeout(from: usize, timeout_ticks: u64) -> Result<Message, IpcE
 
         // Non-blocking poll: return immediately if timeout is 0
         if timeout_ticks == 0 {
+            irq_restore(flags);
             return Err(IpcError::Timeout);
         }
 
@@ -475,14 +522,19 @@ pub fn sys_recv_timeout(from: usize, timeout_ticks: u64) -> Result<Message, IpcE
         TASK_TIMEOUT[receiver] = crate::pit::ticks() + timeout_ticks;
         TASK_IPC[receiver].state = IpcState::RecvBlocked(from);
         scheduler::block_task(receiver);
-        scheduler::yield_now();
+    }
+    irq_restore(flags);
+    scheduler::yield_now();
 
+    let flags = irq_save();
+    unsafe {
         // Clear timeout (may already be 0 if expired)
         TASK_TIMEOUT[receiver] = 0;
 
         // Check if an IPC message was delivered
         if let Some(msg) = TASK_IPC[receiver].pending_msg.take() {
             TASK_IPC[receiver].state = IpcState::None;
+            irq_restore(flags);
             return Ok(msg);
         }
 
@@ -490,6 +542,7 @@ pub fn sys_recv_timeout(from: usize, timeout_ticks: u64) -> Result<Message, IpcE
         if from == 0 || from == TID_ANY {
             if let Some(msg) = crate::irq_dispatch::poll_irq_message(receiver) {
                 TASK_IPC[receiver].state = IpcState::None;
+                irq_restore(flags);
                 return Ok(msg);
             }
         }
@@ -500,6 +553,7 @@ pub fn sys_recv_timeout(from: usize, timeout_ticks: u64) -> Result<Message, IpcE
             if word != 0 {
                 TASK_NOTIFY[receiver] = 0;
                 TASK_IPC[receiver].state = IpcState::None;
+                irq_restore(flags);
                 return Ok(Message {
                     sender: 0,
                     tag: TAG_NOTIFICATION,
@@ -510,8 +564,9 @@ pub fn sys_recv_timeout(from: usize, timeout_ticks: u64) -> Result<Message, IpcE
 
         // No message — must have been a timeout
         TASK_IPC[receiver].state = IpcState::None;
-        Err(IpcError::Timeout)
     }
+    irq_restore(flags);
+    Err(IpcError::Timeout)
 }
 
 /// Kernel-initiated IPC call on behalf of a faulting task.
@@ -521,18 +576,19 @@ pub fn sys_recv_timeout(from: usize, timeout_ticks: u64) -> Result<Message, IpcE
 /// Must be called with the faulting task as the current task.
 /// After this returns, the pager has replied and the faulting task can resume.
 pub fn fault_call(faulting_tid: usize, pager_tid: usize, msg: Message) {
+    let flags = irq_save();
     unsafe {
         // Check if pager is recv-blocked waiting for us (or TID_ANY)
         let pager_state = TASK_IPC[pager_tid].state;
         match pager_state {
             IpcState::RecvBlocked(from) if from == faulting_tid || from == TID_ANY => {
-                // Fast path: deliver directly to pager
+                // Fast path: deliver directly to pager.
+                // Set CallBlocked BEFORE unblocking pager to prevent race.
+                TASK_IPC[faulting_tid].state = IpcState::CallBlocked(pager_tid);
+                TASK_IPC[faulting_tid].pending_msg = None;
                 TASK_IPC[pager_tid].pending_msg = Some(msg);
                 TASK_IPC[pager_tid].state = IpcState::None;
                 scheduler::unblock_task(pager_tid);
-                // Faulting task waits for reply
-                TASK_IPC[faulting_tid].state = IpcState::CallBlocked(pager_tid);
-                TASK_IPC[faulting_tid].pending_msg = None;
             }
             _ => {
                 // Slow path: pager not waiting — queue as CallSendBlocked.
@@ -542,17 +598,23 @@ pub fn fault_call(faulting_tid: usize, pager_tid: usize, msg: Message) {
             }
         }
         scheduler::block_task(faulting_tid);
-        scheduler::yield_now();
+    }
+    irq_restore(flags);
+    scheduler::yield_now();
 
-        // Resumed — pager replied. Clean up.
+    // Resumed — pager replied. Clean up.
+    let flags = irq_save();
+    unsafe {
         TASK_IPC[faulting_tid].pending_msg = None;
         TASK_IPC[faulting_tid].state = IpcState::None;
     }
+    irq_restore(flags);
 }
 
 /// Check all task timeouts and unblock expired ones.
 /// Called from `pit::tick()` on every timer interrupt.
 pub fn check_timeouts() {
+    // Already in interrupt context (IRQ handler), interrupts are implicitly off.
     let now = crate::pit::ticks();
     unsafe {
         for tid in 0..MAX_TASKS {
@@ -576,6 +638,7 @@ pub fn cleanup_task_ipc(dead_tid: usize) {
         return;
     }
 
+    let flags = irq_save();
     unsafe {
         // Clear the dead task's own IPC state, timeout, notifications, and signal deadline
         TASK_IPC[dead_tid].state = IpcState::None;
@@ -619,4 +682,5 @@ pub fn cleanup_task_ipc(dead_tid: usize) {
             }
         }
     }
+    irq_restore(flags);
 }

@@ -33,30 +33,7 @@ fn lookup_service(name: &[u8]) -> Option<usize> {
     }
 }
 
-fn fat_name_to_str<'a>(name: &[u8; 11], buf: &'a mut [u8; 16]) -> &'a [u8] {
-    let base_len = name[0..8]
-        .iter()
-        .rposition(|&b| b != b' ')
-        .map_or(0, |p| p + 1);
-    let mut pos = 0;
-    for i in 0..base_len {
-        buf[pos] = name[i];
-        pos += 1;
-    }
-    let ext_len = name[8..11]
-        .iter()
-        .rposition(|&b| b != b' ')
-        .map_or(0, |p| p + 1);
-    if ext_len > 0 {
-        buf[pos] = b'.';
-        pos += 1;
-        for i in 0..ext_len {
-            buf[pos] = name[8 + i];
-            pos += 1;
-        }
-    }
-    &buf[..pos]
-}
+
 
 #[unsafe(no_mangle)]
 #[link_section = ".text.entry"]
@@ -101,8 +78,7 @@ pub extern "C" fn _start() -> ! {
             loop {
                 match vfs::readdir(vfs_tid, handle, idx) {
                     Ok(Some(entry)) => {
-                        let mut nbuf = [0u8; 16];
-                        let name = fat_name_to_str(&entry.name, &mut nbuf);
+                        let name = entry.name_bytes();
                         let kind = if entry.is_dir { "DIR " } else { "FILE" };
                         if let Ok(s) = core::str::from_utf8(name) {
                             println!("  {} {} ({} bytes)", kind, s, entry.size);

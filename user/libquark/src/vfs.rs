@@ -29,11 +29,30 @@ pub const ERR_PERMISSION: u64 = 8;
 
 #[derive(Clone, Copy)]
 pub struct DirEntry {
-    pub name: [u8; 11],
+    pub name: [u8; 48],
+    pub name_len: u8,
     pub size: u32,
     pub is_dir: bool,
     pub cluster: u32,
     pub attr: u8,
+}
+
+impl DirEntry {
+    pub const fn empty() -> Self {
+        Self {
+            name: [0u8; 48],
+            name_len: 0,
+            size: 0,
+            is_dir: false,
+            cluster: 0,
+            attr: 0,
+        }
+    }
+
+    /// Return the name as a byte slice.
+    pub fn name_bytes(&self) -> &[u8] {
+        &self.name[..self.name_len as usize]
+    }
 }
 
 /// Open a file or directory by path (up to 47 bytes, null-terminated).
@@ -116,26 +135,33 @@ pub fn readdir(vfs_tid: usize, handle: usize, index: u32) -> Result<Option<DirEn
         return Err(reply.data[0]);
     }
 
-    // Unpack name from 2 u64 words
-    let mut name_bytes = [0u8; 16];
-    name_bytes[0..8].copy_from_slice(&reply.data[0].to_le_bytes());
-    name_bytes[8..16].copy_from_slice(&reply.data[1].to_le_bytes());
-    let mut name = [0u8; 11];
-    name.copy_from_slice(&name_bytes[..11]);
+    // Unpack name from first 4 u64 words (32 bytes, name_len in data[4] low byte)
+    let mut name = [0u8; 48];
+    let name_data = [
+        reply.data[0].to_le_bytes(),
+        reply.data[1].to_le_bytes(),
+        reply.data[2].to_le_bytes(),
+        reply.data[3].to_le_bytes(),
+    ];
+    for (i, chunk) in name_data.iter().enumerate() {
+        name[i * 8..(i + 1) * 8].copy_from_slice(chunk);
+    }
 
-    let size = reply.data[2] as u32;
-    let flags_cluster = reply.data[3];
-    let is_dir = (flags_cluster >> 32) != 0;
-    let cluster = (flags_cluster & 0xFFFF_FFFF) as u32;
-    let attr = reply.data[4] as u8;
+    let packed = reply.data[4];
+    let name_len = (packed & 0xFF) as u8;
+    let attr = ((packed >> 8) & 0xFF) as u8;
+    let is_dir = attr & 0x10 != 0;
 
-    Ok(Some(DirEntry { name, size, is_dir, cluster, attr }))
+    let size = reply.data[5] as u32;
+    let cluster = 0u32; // not used for ext2
+
+    Ok(Some(DirEntry { name, name_len, size, is_dir, cluster, attr }))
 }
 
 /// Read all directory entries in one IPC call using shared memory.
 /// Returns the number of entries written into `out`.
 pub fn readdir_bulk(vfs_tid: usize, handle: usize, out: &mut [DirEntry]) -> Result<usize, u64> {
-    // Create shared memory (1 page = 170 entries max)
+    // Create shared memory (1 page = 4096 bytes)
     let shmem = syscall::sys_shmem_create(1).map_err(|_| ERR_IO)?;
     syscall::sys_shmem_grant(shmem, vfs_tid).map_err(|_| ERR_IO)?;
     syscall::sys_shmem_map(shmem, READDIR_SHMEM_ADDR).map_err(|_| ERR_IO)?;
@@ -153,18 +179,21 @@ pub fn readdir_bulk(vfs_tid: usize, handle: usize, out: &mut [DirEntry]) -> Resu
         return Err(reply.data[0]);
     }
 
-    let count = (reply.data[0] as usize).min(out.len()).min(170);
+    // Entry layout: 64 bytes each (48 name + 1 name_len + 1 attr + 2 pad + 4 size + 4 cluster + 4 pad)
+    let max_per_page = 4096 / 64; // 64
+    let count = (reply.data[0] as usize).min(out.len()).min(max_per_page);
     let buf = unsafe { core::slice::from_raw_parts(READDIR_SHMEM_ADDR as *const u8, 4096) };
 
     for i in 0..count {
-        let base = i * 24;
-        let mut name = [0u8; 11];
-        name.copy_from_slice(&buf[base..base + 11]);
-        let attr = buf[base + 11];
-        let size = u32::from_le_bytes(buf[base + 12..base + 16].try_into().unwrap());
-        let cluster = u32::from_le_bytes(buf[base + 16..base + 20].try_into().unwrap());
+        let base = i * 64;
+        let mut name = [0u8; 48];
+        name.copy_from_slice(&buf[base..base + 48]);
+        let name_len = buf[base + 48];
+        let attr = buf[base + 49];
+        let size = u32::from_le_bytes(buf[base + 52..base + 56].try_into().unwrap());
+        let cluster = u32::from_le_bytes(buf[base + 56..base + 60].try_into().unwrap());
         let is_dir = attr & 0x10 != 0;
-        out[i] = DirEntry { name, size, is_dir, cluster, attr };
+        out[i] = DirEntry { name, name_len, size, is_dir, cluster, attr };
     }
 
     // Clean up shared memory to avoid leaking handles

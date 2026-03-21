@@ -2,6 +2,10 @@
 ///
 /// Anonymous byte-stream channels with a fixed-size ring buffer.
 /// Blocking semantics: reader blocks if empty, writer blocks if full.
+///
+/// All pipe operations disable interrupts to prevent data races:
+/// the timer interrupt can preempt syscall handlers and context-switch
+/// to another task that accesses the same pipe concurrently.
 
 use crate::scheduler;
 use crate::task::{FdKind, MAX_FDS};
@@ -47,44 +51,74 @@ static mut PIPES: [Pipe; MAX_PIPES] = {
     [P; MAX_PIPES]
 };
 
+/// Save RFLAGS and disable interrupts. Returns saved flags.
+#[inline(always)]
+fn irq_save() -> u64 {
+    let flags: u64;
+    unsafe {
+        core::arch::asm!("pushfq; pop {}; cli", out(reg) flags, options(nostack));
+    }
+    flags
+}
+
+/// Restore RFLAGS (re-enabling interrupts if they were enabled before).
+#[inline(always)]
+fn irq_restore(flags: u64) {
+    unsafe {
+        core::arch::asm!("push {}; popfq", in(reg) flags, options(nostack));
+    }
+}
+
 /// Create a new pipe. Returns the pipe handle index.
 /// Handles start at 1 (slot 0 is reserved so that 0 can mean "no pipe").
 pub fn create() -> Option<usize> {
-    unsafe {
+    let flags = irq_save();
+    let result = unsafe {
+        let mut found = None;
         for i in 1..MAX_PIPES {
             if !PIPES[i].in_use {
                 PIPES[i] = Pipe::new();
                 PIPES[i].in_use = true;
-                return Some(i);
+                found = Some(i);
+                break;
             }
         }
-        None
-    }
+        found
+    };
+    irq_restore(flags);
+    result
 }
 
 /// Increment the reader or writer refcount for a pipe.
 pub fn add_ref(handle: usize, is_write: bool) -> Result<(), ()> {
-    unsafe {
+    let flags = irq_save();
+    let result = unsafe {
         if handle >= MAX_PIPES || !PIPES[handle].in_use {
-            return Err(());
-        }
-        if is_write {
-            PIPES[handle].writers += 1;
+            Err(())
         } else {
-            PIPES[handle].readers += 1;
+            if is_write {
+                PIPES[handle].writers += 1;
+            } else {
+                PIPES[handle].readers += 1;
+            }
+            Ok(())
         }
-        Ok(())
-    }
+    };
+    irq_restore(flags);
+    result
 }
 
 /// Read from a pipe. Blocks if empty and writers exist. Returns bytes read (0 = EOF).
 pub fn read(handle: usize, buf: *mut u8, max_len: usize) -> u64 {
     unsafe {
-        if handle >= MAX_PIPES || !PIPES[handle].in_use {
-            return u64::MAX;
-        }
-
         loop {
+            let flags = irq_save();
+
+            if handle >= MAX_PIPES || !PIPES[handle].in_use {
+                irq_restore(flags);
+                return u64::MAX;
+            }
+
             let pipe = &mut PIPES[handle];
 
             if pipe.len > 0 {
@@ -107,11 +141,13 @@ pub fn read(handle: usize, buf: *mut u8, max_len: usize) -> u64 {
                     scheduler::unblock_task(tid);
                 }
 
+                irq_restore(flags);
                 return to_copy as u64;
             }
 
             // Buffer empty
             if pipe.writers == 0 {
+                irq_restore(flags);
                 return 0; // EOF
             }
 
@@ -122,8 +158,10 @@ pub fn read(handle: usize, buf: *mut u8, max_len: usize) -> u64 {
                 pipe.read_waiter_count += 1;
             }
             scheduler::block_task(tid);
+
+            irq_restore(flags);
             scheduler::yield_now();
-            // Loop back to retry
+            // Loop back to retry (will re-acquire irq_save at top)
         }
     }
 }
@@ -133,49 +171,46 @@ pub fn read(handle: usize, buf: *mut u8, max_len: usize) -> u64 {
 /// To distinguish empty-with-writers from EOF, we use a convention:
 /// 0 = EOF (no writers), 0xFFFF_FFFE = would block (empty but writers exist).
 pub fn read_nonblock(handle: usize, buf: *mut u8, max_len: usize) -> u64 {
-    unsafe {
+    let flags = irq_save();
+    let result = unsafe {
         if handle >= MAX_PIPES || !PIPES[handle].in_use {
-            return u64::MAX;
-        }
+            u64::MAX
+        } else {
+            let pipe = &mut PIPES[handle];
 
-        let pipe = &mut PIPES[handle];
-
-        if pipe.len > 0 {
-            let to_copy = pipe.len.min(max_len);
-            for i in 0..to_copy {
-                let pos = (pipe.read_pos + i) % PIPE_BUF_SIZE;
-                buf.add(i).write(pipe.buf[pos]);
-            }
-            pipe.read_pos = (pipe.read_pos + to_copy) % PIPE_BUF_SIZE;
-            pipe.len -= to_copy;
-
-            if pipe.write_waiter_count > 0 {
-                let tid = pipe.write_waiters[0];
-                pipe.write_waiter_count -= 1;
-                for j in 0..pipe.write_waiter_count {
-                    pipe.write_waiters[j] = pipe.write_waiters[j + 1];
+            if pipe.len > 0 {
+                let to_copy = pipe.len.min(max_len);
+                for i in 0..to_copy {
+                    let pos = (pipe.read_pos + i) % PIPE_BUF_SIZE;
+                    buf.add(i).write(pipe.buf[pos]);
                 }
-                scheduler::unblock_task(tid);
+                pipe.read_pos = (pipe.read_pos + to_copy) % PIPE_BUF_SIZE;
+                pipe.len -= to_copy;
+
+                if pipe.write_waiter_count > 0 {
+                    let tid = pipe.write_waiters[0];
+                    pipe.write_waiter_count -= 1;
+                    for j in 0..pipe.write_waiter_count {
+                        pipe.write_waiters[j] = pipe.write_waiters[j + 1];
+                    }
+                    scheduler::unblock_task(tid);
+                }
+
+                to_copy as u64
+            } else if pipe.writers == 0 {
+                0 // EOF
+            } else {
+                0xFFFF_FFFE // would block
             }
-
-            return to_copy as u64;
         }
-
-        if pipe.writers == 0 {
-            return 0; // EOF
-        }
-
-        0xFFFF_FFFE // would block
-    }
+    };
+    irq_restore(flags);
+    result
 }
 
 /// Write to a pipe. Blocks if full and readers exist. Returns bytes written.
 pub fn write(handle: usize, buf: *const u8, len: usize) -> u64 {
     unsafe {
-        if handle >= MAX_PIPES || !PIPES[handle].in_use {
-            return u64::MAX;
-        }
-
         if len == 0 {
             return 0;
         }
@@ -183,10 +218,18 @@ pub fn write(handle: usize, buf: *const u8, len: usize) -> u64 {
         let mut offset = 0usize;
 
         while offset < len {
+            let flags = irq_save();
+
+            if handle >= MAX_PIPES || !PIPES[handle].in_use {
+                irq_restore(flags);
+                return u64::MAX;
+            }
+
             let pipe = &mut PIPES[handle];
 
             // Broken pipe — no readers
             if pipe.readers == 0 {
+                irq_restore(flags);
                 return if offset > 0 { offset as u64 } else { u64::MAX };
             }
 
@@ -210,6 +253,8 @@ pub fn write(handle: usize, buf: *const u8, len: usize) -> u64 {
                     }
                     scheduler::unblock_task(tid);
                 }
+
+                irq_restore(flags);
             } else {
                 // Buffer full — block until space available
                 let tid = scheduler::current_tid();
@@ -218,8 +263,10 @@ pub fn write(handle: usize, buf: *const u8, len: usize) -> u64 {
                     pipe.write_waiter_count += 1;
                 }
                 scheduler::block_task(tid);
+
+                irq_restore(flags);
                 scheduler::yield_now();
-                // Loop back to retry
+                // Loop back to retry (will re-acquire irq_save at top)
             }
         }
 
@@ -240,8 +287,10 @@ pub fn cleanup_task_fds(fds: &[FdKind; MAX_FDS]) {
 }
 
 fn drop_ref(handle: usize, is_write: bool) {
+    let flags = irq_save();
     unsafe {
         if handle >= MAX_PIPES || !PIPES[handle].in_use {
+            irq_restore(flags);
             return;
         }
         let pipe = &mut PIPES[handle];
@@ -269,4 +318,5 @@ fn drop_ref(handle: usize, is_write: bool) {
             pipe.in_use = false;
         }
     }
+    irq_restore(flags);
 }

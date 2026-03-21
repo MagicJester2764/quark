@@ -1633,23 +1633,21 @@ fn handle_readdir(disk: &DiskState, sender: usize, msg: &Message) {
 
     match read_dir_entry(disk, dir_cluster, index) {
         Ok(Some((_cluster, name, size, is_dir, attr))) => {
-            // Pack 11-byte name into 2 u64 words
-            let mut name_bytes = [0u8; 16];
+            // Pack 11-byte FAT name into 4 u64 words (32 bytes, padded with zeros)
+            let mut name_bytes = [0u8; 32];
             name_bytes[..11].copy_from_slice(&name);
             let w0 = u64::from_le_bytes(name_bytes[0..8].try_into().unwrap());
             let w1 = u64::from_le_bytes(name_bytes[8..16].try_into().unwrap());
+            let w2 = u64::from_le_bytes(name_bytes[16..24].try_into().unwrap());
+            let w3 = u64::from_le_bytes(name_bytes[24..32].try_into().unwrap());
+
+            // data[4]: name_len(8) | attr(8) | ...
+            let packed = 11u64 | ((attr as u64) << 8);
 
             let reply = Message {
                 sender: 0,
                 tag: TAG_OK,
-                data: [
-                    w0,
-                    w1,
-                    size as u64,
-                    ((is_dir as u64) << 32) | (_cluster as u64),
-                    attr as u64,
-                    0,
-                ],
+                data: [w0, w1, w2, w3, packed, size as u64],
             };
             let _ = syscall::sys_reply(sender, &reply);
         }
@@ -1835,7 +1833,7 @@ fn handle_readdir_bulk(disk: &DiskState, sender: usize, msg: &Message) {
     }
 
     let buf = unsafe { core::slice::from_raw_parts_mut(SHMEM_BUF as *mut u8, 4096) };
-    let max_entries = 4096 / 24; // 170
+    let max_entries = 4096 / 64; // 64
     let mut count: u32 = 0;
 
     let spc = disk.bpb.sectors_per_cluster;
@@ -1873,16 +1871,19 @@ fn handle_readdir_bulk(disk: &DiskState, sender: usize, msg: &Message) {
                     break 'outer;
                 }
 
-                let base = (count as usize) * 24;
+                // 64-byte entry: 48 name + 1 name_len + 1 attr + 2 pad + 4 size + 4 cluster + 4 pad
+                let base = (count as usize) * 64;
+                buf[base..base + 48].fill(0);
                 buf[base..base + 11].copy_from_slice(&sec_buf[off..off + 11]);
-                buf[base + 11] = attr;
+                buf[base + 48] = 11; // name_len
+                buf[base + 49] = attr;
                 let size = read_u32(&sec_buf, off + 28);
-                buf[base + 12..base + 16].copy_from_slice(&size.to_le_bytes());
+                buf[base + 52..base + 56].copy_from_slice(&size.to_le_bytes());
                 let hi = read_u16(&sec_buf, off + 20) as u32;
                 let lo = read_u16(&sec_buf, off + 26) as u32;
                 let entry_cluster = (hi << 16) | lo;
-                buf[base + 16..base + 20].copy_from_slice(&entry_cluster.to_le_bytes());
-                buf[base + 20..base + 24].fill(0);
+                buf[base + 56..base + 60].copy_from_slice(&entry_cluster.to_le_bytes());
+                buf[base + 60..base + 64].fill(0);
                 count += 1;
             }
         }
@@ -2047,28 +2048,24 @@ fn handle_readdir_ext2(sender: usize, msg: &Message) {
     let e2 = ext2_state();
     match ext2_dir::read_dir_entry(e2, &dir_inode, index) {
         Ok(Some(entry)) => {
-            // Pack name into FAT-compatible 11-byte format for existing client code
-            // Truncate/pad to 11 bytes
-            let mut name_bytes = [b' '; 16];
-            let copy_len = entry.name_len.min(11);
-            name_bytes[..copy_len].copy_from_slice(&entry.name[..copy_len]);
-            let w0 = u64::from_le_bytes(name_bytes[0..8].try_into().unwrap());
-            let w1 = u64::from_le_bytes(name_bytes[8..16].try_into().unwrap());
-
             let is_dir = entry.file_type == ext2::FT_DIR;
             let attr: u8 = if is_dir { 0x10 } else { 0x20 };
+            let name_len = entry.name_len.min(32) as u8; // 32 bytes fit in 4 u64 words
+
+            // Pack name into 4 u64 words (32 bytes)
+            let mut name_bytes = [0u8; 32];
+            name_bytes[..name_len as usize].copy_from_slice(&entry.name[..name_len as usize]);
+            let w0 = u64::from_le_bytes(name_bytes[0..8].try_into().unwrap());
+            let w1 = u64::from_le_bytes(name_bytes[8..16].try_into().unwrap());
+            let w2 = u64::from_le_bytes(name_bytes[16..24].try_into().unwrap());
+            let w3 = u64::from_le_bytes(name_bytes[24..32].try_into().unwrap());
+
+            let packed = name_len as u64 | ((attr as u64) << 8);
 
             let reply = Message {
                 sender: 0,
                 tag: TAG_OK,
-                data: [
-                    w0,
-                    w1,
-                    entry.file_size as u64,
-                    ((is_dir as u64) << 32) | (entry.inode_num as u64),
-                    attr as u64,
-                    0,
-                ],
+                data: [w0, w1, w2, w3, packed, entry.file_size as u64],
             };
             let _ = syscall::sys_reply(sender, &reply);
         }
@@ -2105,7 +2102,7 @@ fn handle_readdir_bulk_ext2(sender: usize, msg: &Message) {
     }
 
     let buf = unsafe { core::slice::from_raw_parts_mut(SHMEM_BUF as *mut u8, 4096) };
-    let max_entries = 4096 / 24; // 170
+    let max_entries = 4096 / 64; // 64
     let mut count: u32 = 0;
     let e2 = ext2_state();
 
@@ -2117,18 +2114,19 @@ fn handle_readdir_bulk_ext2(sender: usize, msg: &Message) {
         }
         match ext2_dir::read_dir_entry(e2, &dir_inode, idx) {
             Ok(Some(entry)) => {
-                let base = (count as usize) * 24;
-                // Pack name (up to 11 bytes, space-padded)
-                let mut name_buf = [b' '; 11];
-                let copy_len = entry.name_len.min(11);
-                name_buf[..copy_len].copy_from_slice(&entry.name[..copy_len]);
-                buf[base..base + 11].copy_from_slice(&name_buf);
+                // 64-byte entry: 48 name + 1 name_len + 1 attr + 2 pad + 4 size + 4 cluster + 4 pad
+                let base = (count as usize) * 64;
+                buf[base..base + 48].fill(0);
+                let copy_len = entry.name_len.min(48);
+                buf[base..base + copy_len].copy_from_slice(&entry.name[..copy_len]);
+                buf[base + 48] = copy_len as u8;
 
                 let attr: u8 = if entry.file_type == ext2::FT_DIR { 0x10 } else { 0x20 };
-                buf[base + 11] = attr;
-                buf[base + 12..base + 16].copy_from_slice(&entry.file_size.to_le_bytes());
-                buf[base + 16..base + 20].copy_from_slice(&entry.inode_num.to_le_bytes());
-                buf[base + 20..base + 24].fill(0);
+                buf[base + 49] = attr;
+                buf[base + 50..base + 52].fill(0);
+                buf[base + 52..base + 56].copy_from_slice(&entry.file_size.to_le_bytes());
+                buf[base + 56..base + 60].copy_from_slice(&entry.inode_num.to_le_bytes());
+                buf[base + 60..base + 64].fill(0);
                 count += 1;
                 idx += 1;
             }

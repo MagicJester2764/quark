@@ -70,6 +70,12 @@ pub unsafe extern "C" fn context_switch(old: *mut CpuContext, new: *const CpuCon
         "mov r15, [rsi + 0x28]",
         "mov rsp, [rsi + 0x30]",
 
+        // Restore RFLAGS from new context (re-enables interrupts
+        // atomically with the context switch — no window for
+        // nested timer interrupts between flag restore and switch)
+        "push QWORD PTR [rsi + 0x40]",
+        "popfq",
+
         // Push new RIP and ret into it
         "push QWORD PTR [rsi + 0x38]",
         "ret",

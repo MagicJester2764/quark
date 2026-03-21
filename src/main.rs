@@ -27,6 +27,7 @@ mod futex;
 mod services;
 mod shmem;
 pub mod pipe;
+pub mod serial;
 pub mod task;
 mod userspace;
 
@@ -36,6 +37,10 @@ core::arch::global_asm!(include_str!("boot.s"), options(att_syntax));
 
 #[no_mangle]
 pub extern "C" fn kernel_main(multiboot_info: usize) -> ! {
+    // Initialize serial debug output early
+    serial::init();
+    serial::puts(b"[serial] Quark booting\n");
+
     // Parse multiboot2 info (modules list, memory map, framebuffer)
     unsafe { modules::init(multiboot_info) };
     let fb = unsafe { multiboot2::parse_framebuffer(multiboot_info) };
