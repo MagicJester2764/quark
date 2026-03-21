@@ -282,22 +282,19 @@ fn build_path(cmd: &[u8], path_buf: &mut [u8; 64]) -> usize {
         path_buf[..len].copy_from_slice(&cmd[..len]);
         len
     } else {
-        // Bare command — prepend /usr/bin/, uppercase name, append .ELF
+        // Bare command — prepend /usr/bin/, lowercase name (ext2 format)
         let prefix = b"/usr/bin/";
-        let suffix = b".ELF";
-        let cmd_len = cmd.len().min(64 - prefix.len() - suffix.len());
+        let cmd_len = cmd.len().min(64 - prefix.len());
         path_buf[..prefix.len()].copy_from_slice(prefix);
         let mut pos = prefix.len();
         for i in 0..cmd_len {
-            path_buf[pos] = if cmd[i] >= b'a' && cmd[i] <= b'z' {
-                cmd[i] - 32
+            path_buf[pos] = if cmd[i] >= b'A' && cmd[i] <= b'Z' {
+                cmd[i] + 32
             } else {
                 cmd[i]
             };
             pos += 1;
         }
-        path_buf[pos..pos + suffix.len()].copy_from_slice(suffix);
-        pos += suffix.len();
         pos
     }
 }
@@ -330,12 +327,39 @@ fn cmd_exec(
     let pos = build_path(cmd, &mut path);
     let has_slash = cmd.iter().any(|&b| b == b'/');
 
-    // Open ELF file via VFS — try exact path first, then with .ELF appended
+    // Open ELF file via VFS — try exact path first, then fallbacks
     let (file_handle, file_size, _) = match vfs::open(vfs_tid, &path[..pos]) {
         Ok(h) => h,
         Err(_) => {
-            // If path had a slash and doesn't end in .ELF, retry with .ELF appended
-            if has_slash && !ends_with_elf(&path[..pos]) && pos + 4 <= 64 {
+            if !has_slash {
+                // Bare command: tried lowercase (ext2), now try uppercase .ELF (FAT32)
+                let mut fat_path = [0u8; 64];
+                let prefix = b"/usr/bin/";
+                let suffix = b".ELF";
+                let cmd_len = cmd.len().min(64 - prefix.len() - suffix.len());
+                fat_path[..prefix.len()].copy_from_slice(prefix);
+                let mut p = prefix.len();
+                for i in 0..cmd_len {
+                    fat_path[p] = if cmd[i] >= b'a' && cmd[i] <= b'z' {
+                        cmd[i] - 32
+                    } else {
+                        cmd[i]
+                    };
+                    p += 1;
+                }
+                fat_path[p..p + suffix.len()].copy_from_slice(suffix);
+                p += suffix.len();
+                match vfs::open(vfs_tid, &fat_path[..p]) {
+                    Ok(h) => h,
+                    Err(_) => {
+                        if let Ok(s) = core::str::from_utf8(cmd) {
+                            println!("{}: not found", s);
+                        }
+                        return;
+                    }
+                }
+            } else if !ends_with_elf(&path[..pos]) && pos + 4 <= 64 {
+                // Slash path without .ELF: retry with .ELF appended
                 let suffix = b".ELF";
                 path[pos..pos + 4].copy_from_slice(suffix);
                 match vfs::open(vfs_tid, &path[..pos + 4]) {

@@ -310,15 +310,33 @@ pub extern "C" fn _start() -> ! {
         let _ = syscall::sys_set_uid(my_tid, entry.uid);
         let _ = syscall::sys_set_gid(my_tid, entry.gid);
 
-        // Load the user's shell
+        // Load the user's shell — try as-is, then lowercase without extension
         let shell_path = entry.shell();
         let elf_data = match load_file(vfs_tid, shell_path) {
             Ok(data) => data,
             Err(()) => {
-                if let Ok(s) = core::str::from_utf8(shell_path) {
-                    println!("login: cannot load shell: {}", s);
+                // Try lowercase path without .ELF extension (ext2 format)
+                let mut alt = [0u8; 64];
+                let mut alt_len = 0;
+                for &b in shell_path.iter() {
+                    if alt_len < 64 {
+                        alt[alt_len] = if b >= b'A' && b <= b'Z' { b + 32 } else { b };
+                        alt_len += 1;
+                    }
                 }
-                continue;
+                // Strip .elf suffix if present
+                if alt_len >= 4 && &alt[alt_len - 4..alt_len] == b".elf" {
+                    alt_len -= 4;
+                }
+                match load_file(vfs_tid, &alt[..alt_len]) {
+                    Ok(data) => data,
+                    Err(()) => {
+                        if let Ok(s) = core::str::from_utf8(shell_path) {
+                            println!("login: cannot load shell: {}", s);
+                        }
+                        continue;
+                    }
+                }
             }
         };
 
@@ -385,7 +403,9 @@ pub extern "C" fn _start() -> ! {
 }
 
 fn load_passwd_file(vfs_tid: usize) -> Option<&'static [u8]> {
-    let (handle, file_size, _) = vfs::open(vfs_tid, b"/etc/PASSWD").ok()?;
+    let (handle, file_size, _) = vfs::open(vfs_tid, b"/etc/passwd")
+        .or_else(|_| vfs::open(vfs_tid, b"/etc/PASSWD"))
+        .ok()?;
     let size = file_size as usize;
     if size == 0 || size > PAGE_SIZE {
         let _ = vfs::close(vfs_tid, handle);

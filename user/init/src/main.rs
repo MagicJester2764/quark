@@ -436,6 +436,14 @@ fn name_matches_entry(entry: &vfs::DirEntry, base: &[u8], ext: &[u8]) -> bool {
             if ok { return true; }
         }
     }
+    // Try matching bare name without extension (ext2 lowercase format, e.g., "login")
+    if name.len() == base.len() {
+        let mut ok = true;
+        for i in 0..base.len() {
+            if to_upper(name[i]) != to_upper(base[i]) { ok = false; break; }
+        }
+        if ok { return true; }
+    }
     // Try FAT32 8.3 format
     if name.len() >= 11 {
         let mut fat_ok = true;
