@@ -7,8 +7,8 @@ pub mod ext2;
 pub mod ext2_alloc;
 pub mod ext2_dir;
 
-use libquark::ipc::{Message, TID_ANY};
-use libquark::{println, syscall};
+use quark_rt::ipc::{Message, TID_ANY};
+use quark_rt::{println, syscall};
 
 pub const PAGE_SIZE: usize = 4096;
 const NAMESERVER_TID: usize = 2;

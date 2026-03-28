@@ -1,8 +1,8 @@
 #![no_std]
 #![no_main]
 
-use libquark::ipc::Message;
-use libquark::{println, syscall, vfs};
+use quark_rt::ipc::Message;
+use quark_rt::{println, syscall, vfs};
 
 const PAGE_SIZE: usize = 4096;
 const BOOT_INFO_ADDR: usize = 0x80_4000_0000;

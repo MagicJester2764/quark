@@ -1,9 +1,9 @@
 #![no_std]
 #![no_main]
 
-use libquark::ipc::Message;
-use libquark::{args, print, println, syscall, vfs};
-use libquark::stdio::read_line;
+use quark_rt::ipc::Message;
+use quark_rt::{args, print, println, syscall, vfs};
+use quark_rt::stdio::read_line;
 
 const PAGE_SIZE: usize = 4096;
 const NAMESERVER_TID: usize = 2;

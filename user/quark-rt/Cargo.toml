@@ -1,0 +1,18 @@
+[package]
+name = "quark-rt"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = []
+rustc-dep-of-std = ["core", "alloc"]
+
+[dependencies]
+core = { version = "1.0.0", optional = true, package = "rustc-std-workspace-core" }
+alloc = { version = "1.0.0", optional = true, package = "rustc-std-workspace-alloc" }
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"

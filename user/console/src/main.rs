@@ -4,8 +4,8 @@
 
 mod font8x16;
 
-use libquark::ipc::{Message, TID_ANY};
-use libquark::{println, syscall};
+use quark_rt::ipc::{Message, TID_ANY};
+use quark_rt::{println, syscall};
 
 const NAMESERVER_TID: usize = 2;
 

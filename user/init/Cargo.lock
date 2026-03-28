@@ -6,9 +6,9 @@ version = 4
 name = "init"
 version = "0.1.0"
 dependencies = [
- "libquark",
+ "quark-rt",
 ]
 
 [[package]]
-name = "libquark"
+name = "quark-rt"
 version = "0.1.0"

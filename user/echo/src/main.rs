@@ -1,7 +1,7 @@
 #![no_std]
 #![no_main]
 
-use libquark::{args, print, println, syscall};
+use quark_rt::{args, print, println, syscall};
 
 #[unsafe(no_mangle)]
 #[link_section = ".text.entry"]

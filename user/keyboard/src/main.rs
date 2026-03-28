@@ -1,8 +1,8 @@
 #![no_std]
 #![no_main]
 
-use libquark::ipc::{Message, TID_ANY};
-use libquark::{println, syscall};
+use quark_rt::ipc::{Message, TID_ANY};
+use quark_rt::{println, syscall};
 
 // Nameserver well-known TID (init spawns nameserver first to guarantee this)
 const NAMESERVER_TID: usize = 2;

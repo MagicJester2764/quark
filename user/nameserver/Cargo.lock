@@ -3,12 +3,12 @@
 version = 4
 
 [[package]]
-name = "libquark"
-version = "0.1.0"
-
-[[package]]
 name = "nameserver"
 version = "0.1.0"
 dependencies = [
- "libquark",
+ "quark-rt",
 ]
+
+[[package]]
+name = "quark-rt"
+version = "0.1.0"

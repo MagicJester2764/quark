@@ -1,8 +1,8 @@
 #![no_std]
 #![no_main]
 
-use libquark::ipc::Message;
-use libquark::{args, println, syscall, vfs};
+use quark_rt::ipc::Message;
+use quark_rt::{args, println, syscall, vfs};
 
 const NAMESERVER_TID: usize = 2;
 const TAG_NS_LOOKUP: u64 = 2;

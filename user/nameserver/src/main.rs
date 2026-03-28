@@ -1,8 +1,8 @@
 #![no_std]
 #![no_main]
 
-use libquark::ipc::{Message, TID_ANY};
-use libquark::{println, syscall};
+use quark_rt::ipc::{Message, TID_ANY};
+use quark_rt::{println, syscall};
 
 const TAG_REGISTER: u64 = 1;
 const TAG_LOOKUP: u64 = 2;

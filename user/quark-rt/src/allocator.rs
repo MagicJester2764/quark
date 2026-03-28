@@ -215,3 +215,8 @@ unsafe impl GlobalAlloc for QuarkAllocator {
         inner.dealloc_inner(ptr);
     }
 }
+
+/// Standalone allocator instance for use by the std PAL's GlobalAlloc impl.
+/// When building as part of std (rustc-dep-of-std), std's System allocator
+/// delegates to this. For no_std programs, lib.rs sets up its own #[global_allocator].
+pub static SYSTEM_ALLOC: QuarkAllocator = QuarkAllocator::new();

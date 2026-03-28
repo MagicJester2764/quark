@@ -1,7 +1,7 @@
 #![no_std]
 #![no_main]
 
-use libquark::{args, println, syscall};
+use quark_rt::{args, println, syscall};
 
 const MAX_TASKS: usize = 64;
 

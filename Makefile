@@ -1,6 +1,10 @@
 KERNEL := kernel.bin
 TARGET := x86_64-unknown-none
 BINARY := target/$(TARGET)/release/quark
+
+# Hosted target (requires std fork at QUARK_RUST_STD_PATH)
+HOSTED_TARGET := x86_64-unknown-quark
+QUARK_RUST_STD_PATH ?= $(CURDIR)/../rust/library
 GRUB_MKRESCUE := $(shell command -v grub-mkrescue 2>/dev/null || command -v grub2-mkrescue 2>/dev/null)
 
 VGA_DRV_DIR := drivers/vga
@@ -16,7 +20,7 @@ INIT_DIR := user/init
 INIT_ELF := $(INIT_DIR)/target/$(TARGET)/release/init
 
 HELLO_DIR := user/hello
-HELLO_ELF := $(HELLO_DIR)/target/$(TARGET)/release/hello
+HELLO_ELF := $(HELLO_DIR)/target/$(HOSTED_TARGET)/release/hello
 
 NS_DIR := user/nameserver
 NS_ELF := $(NS_DIR)/target/$(TARGET)/release/nameserver
@@ -96,7 +100,7 @@ $(INIT_ELF): FORCE
 	cd $(INIT_DIR) && cargo build --release
 
 $(HELLO_ELF): FORCE
-	cd $(HELLO_DIR) && cargo build --release
+	cd $(HELLO_DIR) && __CARGO_TESTS_ONLY_SRC_ROOT=$(realpath $(QUARK_RUST_STD_PATH)) cargo build --release --target ../../x86_64-unknown-quark.json -Z build-std=std,panic_abort -Z build-std-features=compiler-builtins-mem -Z json-target-spec
 
 $(NS_ELF): FORCE
 	cd $(NS_DIR) && cargo build --release

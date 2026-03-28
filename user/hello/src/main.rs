@@ -1,34 +1,18 @@
-#![no_std]
-#![no_main]
+#![feature(restricted_std)]
 
-extern crate alloc;
-
-use alloc::string::String;
-use alloc::vec::Vec;
-use libquark::{args, println, syscall};
-
-#[unsafe(no_mangle)]
-#[link_section = ".text.entry"]
-pub extern "C" fn _start() -> ! {
+fn main() {
     // Print program arguments
-    let argc = args::argc();
-    println!("argc={}", argc);
-    for i in 0..argc {
-        if let Some(arg) = args::argv(i) {
-            if let Ok(s) = core::str::from_utf8(arg) {
-                println!("  argv[{}] = \"{}\"", i, s);
-            }
-        }
+    let args: Vec<String> = std::env::args().collect();
+    println!("argc={}", args.len());
+    for (i, arg) in args.iter().enumerate() {
+        println!("  argv[{}] = \"{}\"", i, arg);
     }
 
     println!("Hello from user space!");
 
     // Test Vec
-    let mut v: Vec<u32> = Vec::new();
-    for i in 0..10 {
-        v.push(i * i);
-    }
-    println!("Vec: {:?}", v.as_slice());
+    let v: Vec<u32> = (0..10).map(|i| i * i).collect();
+    println!("Vec: {:?}", v);
 
     // Test String
     let mut s = String::from("Quark");
@@ -36,10 +20,7 @@ pub extern "C" fn _start() -> ! {
     println!("{}", s);
 
     // Test larger allocation
-    let mut big: Vec<u8> = Vec::with_capacity(8192);
-    for i in 0..8192u16 {
-        big.push((i & 0xFF) as u8);
-    }
+    let big: Vec<u8> = (0..8192u16).map(|i| (i & 0xFF) as u8).collect();
     println!("Big vec len: {}", big.len());
 
     // Test deallocation + reuse
@@ -50,19 +31,9 @@ pub extern "C" fn _start() -> ! {
     println!("Heap test passed!");
 
     // Test sleep
-    let t0 = syscall::sys_ticks();
-    println!("Sleeping 500ms (tick {})...", t0);
-    syscall::sleep_ms(500);
-    let t1 = syscall::sys_ticks();
-    println!("Woke up at tick {} ({}ms elapsed)", t1, (t1 - t0) * 10);
-
-    syscall::sys_exit();
-}
-
-#[panic_handler]
-fn panic(info: &core::panic::PanicInfo) -> ! {
-    println!("[hello] PANIC: {}", info);
-    loop {
-        core::hint::spin_loop();
-    }
+    let t0 = std::time::Instant::now();
+    println!("Sleeping 500ms...");
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    let elapsed = t0.elapsed();
+    println!("Woke up ({}ms elapsed)", elapsed.as_millis());
 }

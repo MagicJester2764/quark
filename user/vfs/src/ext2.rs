@@ -8,8 +8,8 @@ use crate::{
     ERR_NOT_FOUND, PAGE_SIZE, SECTOR_CACHE, TAG_DISK_OK, TAG_READ_SECTOR,
     TAG_READ_SECTORS, TAG_WRITE_SECTOR,
 };
-use libquark::ipc::Message;
-use libquark::syscall;
+use quark_rt::ipc::Message;
+use quark_rt::syscall;
 
 // ---------------------------------------------------------------------------
 // Constants
