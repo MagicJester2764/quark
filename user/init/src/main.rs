@@ -354,7 +354,9 @@ fn load_elf(elf_data: &[u8]) -> Result<SpawnInfo, ()> {
         syscall::sys_addrspace_map(cr3, stack_bottom + p * PAGE_SIZE, frame, 1, 1)?;
     }
 
-    Ok(SpawnInfo { tid, entry, stack_top: stack_top as u64, cr3 })
+    // Subtract 8 so RSP ≡ 8 mod 16 on entry to _start (x86_64 ABI:
+    // RSP+8 must be 16-byte aligned at function entry, as if call pushed a return address)
+    Ok(SpawnInfo { tid, entry, stack_top: (stack_top - 8) as u64, cr3 })
 }
 
 // ---------------------------------------------------------------------------

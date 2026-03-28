@@ -419,7 +419,9 @@ extern "C" fn syscall_dispatch(
             }
             let tid = arg0 as usize;
             let rip = arg1;
-            let rsp = arg2;
+            // Ensure RSP ≡ 8 mod 16 for x86_64 ABI (as if call pushed return addr).
+            // Align DOWN to 16, then subtract 8 — never go above the caller's value.
+            let rsp = (arg2 & !0xF) - 8;
             let cr3 = arg3 as usize;
             match scheduler::start_task(tid, rip, rsp, cr3) {
                 Ok(()) => 0,

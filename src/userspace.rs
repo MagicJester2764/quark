@@ -102,7 +102,11 @@ pub fn setup_user_stack(pml4_phys: usize) -> Option<u64> {
             core::ptr::write_bytes(frame.address() as *mut u8, 0, PAGE_SIZE);
         }
     }
-    Some(USER_STACK_TOP)
+    // Subtract 8 so RSP ≡ 8 mod 16 on entry to _start.
+    // The x86_64 ABI requires RSP+8 be 16-byte aligned at function entry
+    // (as if a `call` had just pushed a return address). Since iretq sets
+    // RSP directly (no push), we pre-bias it here.
+    Some(USER_STACK_TOP - 8)
 }
 
 /// Load user code bytes into a user address space at USER_CODE_BASE.

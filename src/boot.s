@@ -137,9 +137,9 @@ _start:
     mov $pml4, %eax
     mov %eax, %cr3
 
-    // Enable PAE
+    // Enable PAE + OSFXSR + OSXMMEXCPT (SSE support)
     mov %cr4, %eax
-    or $(1 << 5), %eax
+    or $((1 << 5) | (1 << 9) | (1 << 10)), %eax
     mov %eax, %cr4
 
     // Set long mode enable + NX enable in EFER MSR
@@ -148,9 +148,10 @@ _start:
     or $((1 << 8) | (1 << 11)), %eax
     wrmsr
 
-    // Enable paging (enters IA-32e compatibility mode)
+    // Enable paging + SSE setup in CR0: set PG+MP, clear EM
     mov %cr0, %eax
-    or $(1 << 31), %eax
+    or $((1 << 31) | (1 << 1)), %eax   // PG + MP
+    and $~(1 << 2), %eax               // clear EM
     mov %eax, %cr0
 
     // Load 64-bit GDT
@@ -172,6 +173,17 @@ _start64:
     mov %ax, %fs
     mov %ax, %gs
     mov %ax, %ss
+
+    // Enable SSE: clear CR0.EM (bit 2), set CR0.MP (bit 1)
+    mov %cr0, %rax
+    and $~(1 << 2), %rax
+    or $(1 << 1), %rax
+    mov %rax, %cr0
+
+    // Set CR4.OSFXSR (bit 9) + CR4.OSXMMEXCPT (bit 10)
+    mov %cr4, %rax
+    or $((1 << 9) | (1 << 10)), %rax
+    mov %rax, %cr4
 
     // Set up 64-bit stack
     mov $stack_top, %rsp

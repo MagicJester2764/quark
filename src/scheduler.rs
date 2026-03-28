@@ -88,6 +88,9 @@ pub fn yield_now() {
 pub fn exit() -> ! {
     unsafe {
         let current = CURRENT_TID.load(Ordering::SeqCst);
+        crate::serial::puts(b"[exit tid=");
+        crate::serial::put_usize(current);
+        crate::serial::puts(b"]\n");
         if let Some(ref mut task) = TASKS[current] {
             task.state = TaskState::Dead;
             crate::ipc::clear_signal_deadline(current);
