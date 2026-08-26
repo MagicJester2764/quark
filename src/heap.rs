@@ -16,6 +16,12 @@ use crate::sync::IrqSpinLock;
 
 const PAGE_SIZE: usize = 4096;
 const HEAP_START: usize = 0x1_0000_0000;
+/// One PDPT entry covers 1 GiB. Keeping the heap inside a single entry means
+/// every page directory it grows into is one `create_address_space` already
+/// shares, so a page mapped after an address space was created still appears in
+/// it. Crossing the boundary would allocate a new PDPT entry that only exists
+/// in whichever address space happened to trigger the growth.
+const HEAP_MAX_END: usize = HEAP_START + 0x4000_0000;
 const INIT_PAGES: usize = 16; // 64 KiB initial heap
 const GROW_PAGES: usize = 16; // 64 KiB growth increment
 const HEADER_SIZE: usize = core::mem::size_of::<AllocHeader>(); // 16
@@ -219,10 +225,18 @@ unsafe fn dealloc_inner(heap: &mut HeapInner, ptr: *mut u8) { unsafe {
 
 /// Grow the heap by mapping new pages at `heap_end`.
 unsafe fn grow(heap: &mut HeapInner, min_bytes: usize) { unsafe {
-    let min_pages = (min_bytes + PAGE_SIZE - 1) / PAGE_SIZE;
+    let min_pages = min_bytes.div_ceil(PAGE_SIZE);
     let pages = min_pages.max(GROW_PAGES);
 
-    let pml4 = paging::read_cr3();
+    // Refuse to cross out of the shared page-directory range.
+    if heap.heap_end + pages * PAGE_SIZE > HEAP_MAX_END {
+        return;
+    }
+
+    // Always map into the kernel's own tables. grow() runs on whatever address
+    // space the allocating task happens to be using, and mapping there would
+    // put the new page table entry in that task's copy of the hierarchy.
+    let pml4 = paging::kernel_cr3();
 
     for i in 0..pages {
         let frame = match pmm::alloc() {

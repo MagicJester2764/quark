@@ -52,6 +52,7 @@ pub extern "C" fn kernel_main(multiboot_info: usize) -> ! {
     unsafe { pmm::init(&mmap_regions, mmap_count, multiboot_info, mb_info_size) };
 
     // Initialize console (VGA driver receives kernel services)
+    paging::save_kernel_cr3();
     console::init(fb);
     console::clear();
     unsafe { heap::init() };
@@ -86,7 +87,6 @@ pub extern "C" fn kernel_main(multiboot_info: usize) -> ! {
     console::puts(b" KiB)\n");
 
     // Save kernel CR3 before any user address spaces are created
-    paging::save_kernel_cr3();
 
     // Initialize syscall/sysret mechanism
     unsafe { syscall::init() };
