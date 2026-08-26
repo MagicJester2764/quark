@@ -100,10 +100,21 @@ pub fn load_elf(data: &[u8]) -> Result<(usize, u64, u64), ElfError> {
     let phnum = hdr.e_phnum as usize;
     let mut loaded = false;
 
+    if phentsize < core::mem::size_of::<Elf64Phdr>() {
+        return Err(ElfError::NoLoadSegments);
+    }
+
     for i in 0..phnum {
-        let offset = phoff + i * phentsize;
-        if offset + phentsize > data.len() {
-            break;
+        // Checked: e_phoff/e_phnum/e_phentsize come from the file, and release
+        // builds wrap on overflow — an overflowed offset passed the bounds
+        // check and read a program header from an arbitrary address.
+        let offset = match i.checked_mul(phentsize).and_then(|o| phoff.checked_add(o)) {
+            Some(o) => o,
+            None => break,
+        };
+        match offset.checked_add(phentsize) {
+            Some(end) if end <= data.len() => {}
+            _ => break,
         }
         let phdr = unsafe { &*(data.as_ptr().add(offset) as *const Elf64Phdr) };
 
@@ -117,9 +128,20 @@ pub fn load_elf(data: &[u8]) -> Result<(usize, u64, u64), ElfError> {
         let file_offset = phdr.p_offset as usize;
         let writable = phdr.p_flags & 2 != 0; // PF_W
 
-        // Correct page range: from page-aligned start to page-aligned end
+        // Reject segments that are not entirely in user space, or whose
+        // extents overflow. Without this a crafted init.elf could get the
+        // kernel to map pages into its own half of the address space.
+        if filesz > memsz {
+            return Err(ElfError::MapFailed);
+        }
         let vaddr_page_start = vaddr & !0xFFF;
-        let vaddr_end = vaddr + memsz;
+        let vaddr_end = match vaddr.checked_add(memsz) {
+            Some(e) => e,
+            None => return Err(ElfError::MapFailed),
+        };
+        if (vaddr_end as u64) > userspace::USER_ADDR_LIMIT || vaddr_end < vaddr_page_start {
+            return Err(ElfError::MapFailed);
+        }
         let pages = (vaddr_end - vaddr_page_start + PAGE_SIZE - 1) / PAGE_SIZE;
 
         // File data range in virtual address space
@@ -144,9 +166,12 @@ pub fn load_elf(data: &[u8]) -> Result<(usize, u64, u64), ElfError> {
                     let copy_vend = file_end.min(page_end);
                     let copy_len = copy_vend - copy_vstart;
                     let dst_offset = copy_vstart - page_vaddr;
-                    let src_offset = file_offset + (copy_vstart - vaddr);
+                    let src_offset = match file_offset.checked_add(copy_vstart - vaddr) {
+                        Some(o) => o,
+                        None => continue,
+                    };
 
-                    if src_offset + copy_len <= data.len() {
+                    if src_offset.checked_add(copy_len).is_some_and(|e| e <= data.len()) {
                         core::ptr::copy_nonoverlapping(
                             data.as_ptr().add(src_offset),
                             (frame.address() + dst_offset) as *mut u8,

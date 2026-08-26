@@ -11,7 +11,55 @@ const PAGE_SIZE: usize = 4096;
 /// User code/data lives in the lower half (below 0x0000_8000_0000_0000).
 pub const USER_STACK_TOP: u64 = 0x0000_7FFF_FFFF_F000;
 pub const USER_STACK_PAGES: usize = 4; // 16 KiB user stack
-pub const USER_CODE_BASE: u64 = 0x0000_0080_0000_0000; // 512 GiB (PML4[1])
+/// Highest address a user segment may occupy (exclusive).
+pub const USER_ADDR_LIMIT: u64 = paging::USER_ADDR_LIMIT;
+
+/// Registry of user address spaces and the task that created each one.
+///
+/// `sys_addrspace_map` and `sys_task_start` take a CR3 straight from user
+/// space. Without this, CAP_TASK_MGMT let a task reinterpret *any* physical
+/// address as a PML4 and have the kernel walk and write to it.
+const MAX_ADDRESS_SPACES: usize = crate::task::MAX_TASKS * 2;
+static mut ADDRESS_SPACES: [(usize, usize); MAX_ADDRESS_SPACES] =
+    [(0, 0); MAX_ADDRESS_SPACES];
+
+/// Record `cr3` as an address space created by `owner`.
+/// Returns false if the registry is full.
+fn register_address_space(cr3: usize, owner: usize) -> bool {
+    unsafe {
+        let table = &mut *core::ptr::addr_of_mut!(ADDRESS_SPACES);
+        for slot in table.iter_mut() {
+            if slot.0 == 0 {
+                *slot = (cr3, owner);
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Drop `cr3` from the registry (called when the address space is destroyed).
+pub fn unregister_address_space(cr3: usize) {
+    unsafe {
+        let table = &mut *core::ptr::addr_of_mut!(ADDRESS_SPACES);
+        for slot in table.iter_mut() {
+            if slot.0 == cr3 {
+                *slot = (0, 0);
+            }
+        }
+    }
+}
+
+/// True if `cr3` is an address space that `tid` created.
+pub fn is_owned_address_space(tid: usize, cr3: usize) -> bool {
+    if cr3 == 0 {
+        return false;
+    }
+    unsafe {
+        let table = &*core::ptr::addr_of!(ADDRESS_SPACES);
+        table.iter().any(|&(c, owner)| c == cr3 && owner == tid)
+    }
+}
 
 /// Create a new user address space.
 ///
@@ -52,7 +100,14 @@ pub fn create_address_space() -> Option<usize> {
             let kernel_pdpt_phys = kernel_pml4.entries[0].frame_address();
             let kernel_pdpt = paging::table_at(kernel_pdpt_phys);
 
-            let new_pdpt_phys = pmm::alloc()?.address();
+            let new_pdpt_phys = match pmm::alloc() {
+                Some(f) => f.address(),
+                None => {
+                    // Don't leak the PML4 we just took.
+                    pmm::free(pmm::PhysFrame::from_address(new_pml4_phys));
+                    return None;
+                }
+            };
             core::ptr::write_bytes(new_pdpt_phys as *mut u8, 0, PAGE_SIZE);
             let new_pdpt = paging::table_at(new_pdpt_phys);
 
@@ -70,6 +125,11 @@ pub fn create_address_space() -> Option<usize> {
         }
     }
 
+    if !register_address_space(new_pml4_phys, scheduler::current_tid()) {
+        unsafe { paging::destroy_address_space(new_pml4_phys) };
+        return None;
+    }
+
     Some(new_pml4_phys)
 }
 
@@ -80,7 +140,7 @@ pub fn map_user_page(
     phys: usize,
     writable: bool,
 ) -> Result<(), paging::PagingError> {
-    let mut flags = paging::PRESENT | paging::USER;
+    let mut flags = paging::PRESENT | paging::USER | paging::OWNED;
     if writable {
         flags |= paging::WRITABLE;
     }
@@ -107,62 +167,6 @@ pub fn setup_user_stack(pml4_phys: usize) -> Option<u64> {
     // (as if a `call` had just pushed a return address). Since iretq sets
     // RSP directly (no push), we pre-bias it here.
     Some(USER_STACK_TOP - 8)
-}
-
-/// Load user code bytes into a user address space at USER_CODE_BASE.
-/// Returns the entry point address.
-pub fn load_user_code(pml4_phys: usize, code: &[u8]) -> Option<u64> {
-    let pages_needed = (code.len() + PAGE_SIZE - 1) / PAGE_SIZE;
-    for i in 0..pages_needed {
-        let frame = pmm::alloc()?;
-        let virt = USER_CODE_BASE as usize + i * PAGE_SIZE;
-        map_user_page(pml4_phys, virt, frame.address(), false).ok()?;
-
-        // Copy code to the physical frame (identity-mapped)
-        let offset = i * PAGE_SIZE;
-        let remaining = code.len() - offset;
-        let copy_len = remaining.min(PAGE_SIZE);
-        unsafe {
-            core::ptr::copy_nonoverlapping(
-                code.as_ptr().add(offset),
-                frame.address() as *mut u8,
-                copy_len,
-            );
-            // Zero remainder of page
-            if copy_len < PAGE_SIZE {
-                core::ptr::write_bytes(
-                    (frame.address() + copy_len) as *mut u8,
-                    0,
-                    PAGE_SIZE - copy_len,
-                );
-            }
-        }
-    }
-    Some(USER_CODE_BASE)
-}
-
-/// Spawn a user-mode task from raw code bytes.
-/// Creates an address space, loads code, sets up stack, and enters ring 3.
-pub fn spawn_user_task(code: &[u8]) -> Option<usize> {
-    let pml4 = create_address_space()?;
-    let entry = load_user_code(pml4, code)?;
-    let stack_top = setup_user_stack(pml4)?;
-
-    // Spawn a kernel task that will transition to user mode
-    let tid = scheduler::spawn(idle_stub);
-
-    // Patch the task to use the new address space and jump to usermode
-    unsafe {
-        let task = scheduler::get_task_mut(tid)?;
-        task.cr3 = pml4;
-        task.context.rip = enter_user_trampoline as *const () as u64;
-        // Store user entry and stack in callee-saved registers for the trampoline
-        task.context.r12 = entry;
-        task.context.r13 = stack_top;
-        task.context.r14 = pml4 as u64;
-    }
-
-    Some(tid)
 }
 
 /// Naked trampoline stub: moves r12/r13/r14 into argument registers

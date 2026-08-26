@@ -36,13 +36,11 @@ pub fn init() {
 // ---- Process lifecycle ----
 
 pub fn exit(code: i32) -> ! {
-    // Quark's sys_exit doesn't take a code yet; just exit.
-    let _ = code;
-    syscall::sys_exit();
+    syscall::sys_exit_code(code);
 }
 
 pub fn abort() -> ! {
-    syscall::sys_exit();
+    syscall::sys_exit_code(-1);
 }
 
 // ---- I/O (file descriptor read/write) ----
@@ -59,10 +57,12 @@ pub fn fd_read(fd: usize, buf: &mut [u8]) -> Result<usize, i32> {
 pub fn fd_write(fd: usize, buf: &[u8]) -> Result<usize, i32> {
     let ret = syscall::sys_fd_write(fd, buf);
     if ret == u64::MAX {
-        // Fall back to kernel console for stdout/stderr
+        // stdout/stderr fall back to the raw kernel console so panics and
+        // early boot output are never lost. This is reported as an error
+        // anyway: claiming success here hid broken pipes and dead console
+        // servers from every std::io caller.
         if fd == FD_STDOUT || fd == FD_STDERR {
             syscall::sys_write(buf);
-            return Ok(buf.len());
         }
         Err(E_IO)
     } else {
@@ -86,18 +86,54 @@ pub mod futex {
     /// Must be the underlying type of SmallFutex.
     pub type SmallPrimitive = u32;
 
-    pub fn futex_wait(futex: &AtomicU32, expected: u32, _timeout: Option<core::time::Duration>) -> bool {
+    /// Wait on `futex` while it still holds `expected`.
+    ///
+    /// std's contract: return `false` if the wait timed out, `true` otherwise.
+    /// This used to ignore `timeout` and always return `true`, so
+    /// `Condvar::wait_timeout` and `thread::park_timeout` blocked forever
+    /// instead of expiring.
+    pub fn futex_wait(
+        futex: &AtomicU32,
+        expected: u32,
+        timeout: Option<core::time::Duration>,
+    ) -> bool {
+        use core::sync::atomic::Ordering;
+
         let ptr = futex as *const AtomicU32 as *const u32;
-        syscall::sys_futex_wait(ptr, expected);
-        // Quark futex doesn't return a meaningful error for "wrong value",
-        // it just returns immediately. Return true (woken).
-        true
+
+        let Some(timeout) = timeout else {
+            syscall::sys_futex_wait(ptr, expected);
+            return true;
+        };
+
+        // The kernel futex has no timeout form, so bound the wait here: poll
+        // the word against the PIT tick counter (100 Hz, 10 ms per tick) and
+        // yield in between.
+        let deadline = syscall::sys_ticks() + ticks_for(timeout);
+        loop {
+            if futex.load(Ordering::Relaxed) != expected {
+                return true;
+            }
+            if syscall::sys_ticks() >= deadline {
+                // One last check to close the race between the load above and
+                // the deadline expiring.
+                return futex.load(Ordering::Relaxed) != expected;
+            }
+            syscall::sys_yield();
+        }
     }
 
+    /// Convert a duration to PIT ticks (100 Hz), rounding up so a sub-tick
+    /// timeout still waits at least one tick.
+    fn ticks_for(d: core::time::Duration) -> u64 {
+        let ms = d.as_millis().min(u64::MAX as u128) as u64;
+        ms.div_ceil(10).max(1)
+    }
+
+    /// Wake one waiter. Returns true if a task was actually woken.
     pub fn futex_wake(futex: &AtomicU32) -> bool {
         let ptr = futex as *const AtomicU32 as *const u32;
-        syscall::sys_futex_wake(ptr, 1);
-        true
+        syscall::sys_futex_wake(ptr, 1) > 0
     }
 
     pub fn futex_wake_all(futex: &AtomicU32) {

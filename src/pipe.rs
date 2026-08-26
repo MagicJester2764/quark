@@ -151,12 +151,16 @@ pub fn read(handle: usize, buf: *mut u8, max_len: usize) -> u64 {
                 return 0; // EOF
             }
 
-            // Block until data is available
+            // Block until data is available. If the waiter table is full we
+            // must NOT block -- an unregistered waiter is never woken, so the
+            // 9th reader used to sleep forever.
             let tid = scheduler::current_tid();
-            if pipe.read_waiter_count < MAX_WAITERS {
-                pipe.read_waiters[pipe.read_waiter_count] = tid;
-                pipe.read_waiter_count += 1;
+            if pipe.read_waiter_count >= MAX_WAITERS {
+                irq_restore(flags);
+                return u64::MAX;
             }
+            pipe.read_waiters[pipe.read_waiter_count] = tid;
+            pipe.read_waiter_count += 1;
             scheduler::block_task(tid);
 
             irq_restore(flags);
@@ -256,12 +260,15 @@ pub fn write(handle: usize, buf: *const u8, len: usize) -> u64 {
 
                 irq_restore(flags);
             } else {
-                // Buffer full — block until space available
+                // Buffer full — block until space available. Same rule as the
+                // read path: no waiter slot means no wakeup, so fail instead.
                 let tid = scheduler::current_tid();
-                if pipe.write_waiter_count < MAX_WAITERS {
-                    pipe.write_waiters[pipe.write_waiter_count] = tid;
-                    pipe.write_waiter_count += 1;
+                if pipe.write_waiter_count >= MAX_WAITERS {
+                    irq_restore(flags);
+                    return if offset > 0 { offset as u64 } else { u64::MAX };
                 }
+                pipe.write_waiters[pipe.write_waiter_count] = tid;
+                pipe.write_waiter_count += 1;
                 scheduler::block_task(tid);
 
                 irq_restore(flags);

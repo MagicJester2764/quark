@@ -119,6 +119,7 @@ pub extern "C" fn kernel_main(multiboot_info: usize) -> ! {
     }
 }
 
+#[allow(dead_code)] // panic/exception diagnostic helper
 fn print_hex(val: usize) {
     console::puts(b"0x");
     if val == 0 {
@@ -164,8 +165,14 @@ fn print_dec(val: usize) {
 
 #[panic_handler]
 fn panic(_info: &PanicInfo) -> ! {
+    // Stop the machine. The old handler spun with interrupts still enabled, so
+    // the timer kept firing and the scheduler kept switching tasks *after* a
+    // panic — running the rest of the system on top of whatever inconsistent
+    // kernel state caused it.
+    unsafe { core::arch::asm!("cli", options(nostack, nomem)) };
+    serial::puts(b"\nKERNEL PANIC!\n");
     console::puts(b"\nKERNEL PANIC!");
     loop {
-        core::hint::spin_loop();
+        unsafe { core::arch::asm!("hlt", options(nostack, nomem)) };
     }
 }

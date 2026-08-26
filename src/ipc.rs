@@ -219,6 +219,9 @@ pub fn sys_send(dest: usize, msg: &Message) -> Result<(), IpcError> {
     if dest >= MAX_TASKS {
         return Err(IpcError::InvalidTid);
     }
+    if !scheduler::task_is_live(dest) {
+        return Err(IpcError::DeadTask);
+    }
     let sender = scheduler::current_tid();
 
     let flags = irq_save();
@@ -249,11 +252,21 @@ pub fn sys_send(dest: usize, msg: &Message) -> Result<(), IpcError> {
     irq_restore(flags);
     scheduler::yield_now();
 
-    unsafe {
-        // When we wake up, send was completed
+    let flags = irq_save();
+    let result = unsafe {
+        // Woken. If our message is still queued, nobody took it — the receiver
+        // died or we were interrupted by a signal, so report failure rather
+        // than pretending the send landed.
+        let undelivered = TASK_IPC[sender].pending_msg.take().is_some();
         TASK_IPC[sender].state = IpcState::None;
-    }
-    Ok(())
+        if undelivered {
+            Err(IpcError::DeadTask)
+        } else {
+            Ok(())
+        }
+    };
+    irq_restore(flags);
+    result
 }
 
 /// Synchronous receive: blocks until a message arrives.
@@ -375,6 +388,9 @@ pub fn sys_recv(from: usize) -> Result<Message, IpcError> {
 pub fn sys_call(dest: usize, msg: &Message) -> Result<Message, IpcError> {
     if dest >= MAX_TASKS {
         return Err(IpcError::InvalidTid);
+    }
+    if !scheduler::task_is_live(dest) {
+        return Err(IpcError::DeadTask);
     }
     let caller = scheduler::current_tid();
 
@@ -576,6 +592,9 @@ pub fn sys_recv_timeout(from: usize, timeout_ticks: u64) -> Result<Message, IpcE
 /// Must be called with the faulting task as the current task.
 /// After this returns, the pager has replied and the faulting task can resume.
 pub fn fault_call(faulting_tid: usize, pager_tid: usize, msg: Message) {
+    if faulting_tid >= MAX_TASKS || pager_tid >= MAX_TASKS {
+        return;
+    }
     let flags = irq_save();
     unsafe {
         // Check if pager is recv-blocked waiting for us (or TID_ANY)

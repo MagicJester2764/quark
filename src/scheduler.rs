@@ -20,7 +20,6 @@ static mut READY_TAIL: usize = 0;
 static mut READY_COUNT: usize = 0;
 
 static CURRENT_TID: AtomicUsize = AtomicUsize::new(0);
-static NEXT_TID: AtomicUsize = AtomicUsize::new(1); // TID 0 is idle
 static INITIALIZED: AtomicBool = AtomicBool::new(false);
 
 /// Per-task wait state. If true, the task is blocked in sys_wait.
@@ -50,6 +49,7 @@ pub fn init() {
             parent_tid: 0,
             mem_pages: 0,
             mem_limit: 0,
+            exit_code: 0,
             uid: 0,
             gid: 0,
         });
@@ -58,22 +58,72 @@ pub fn init() {
     INITIALIZED.store(true, Ordering::SeqCst);
 }
 
+/// Find a free slot in the task table, skipping TID 0 (the idle task).
+///
+/// The table slot *is* the TID, and slots are reused once `reap_dead` clears
+/// them. TIDs used to come from a monotonic counter that reaping never gave
+/// back, so the system could only ever create `MAX_TASKS - 1` tasks across its
+/// entire uptime — after ~63 shell commands nothing could spawn again.
+///
+/// # Safety
+/// Caller must hold interrupts off across the search and the subsequent
+/// install, or another task can claim the same slot.
+unsafe fn find_free_tid() -> Option<usize> {
+    (1..MAX_TASKS).find(|&i| TASKS[i].is_none())
+}
+
 /// Spawn a new kernel task that begins at `entry_fn`.
 /// Returns the new task's TID.
 pub fn spawn(entry_fn: fn()) -> usize {
-    let tid = NEXT_TID.fetch_add(1, Ordering::SeqCst);
-    if tid >= MAX_TASKS {
-        panic!("scheduler: too many tasks");
+    // Reserve a slot, then build the task. `Task::new` allocates a kernel
+    // stack, which takes the heap lock and re-enables interrupts on release —
+    // so the slot is re-checked before installing.
+    loop {
+        let flags = irq_save();
+        let tid = match unsafe { find_free_tid() } {
+            Some(t) => t,
+            None => {
+                irq_restore(flags);
+                panic!("scheduler: too many tasks");
+            }
+        };
+        irq_restore(flags);
+
+        let task = Task::new(tid, entry_fn);
+
+        let flags = irq_save();
+        unsafe {
+            if TASKS[tid].is_some() {
+                // Raced with another spawn; release this task's stack and retry.
+                irq_restore(flags);
+                let mut task = task;
+                task.free_stack();
+                continue;
+            }
+            TASKS[tid] = Some(task);
+            enqueue(tid);
+        }
+        irq_restore(flags);
+        return tid;
     }
+}
 
-    let task = Task::new(tid, entry_fn);
-
+/// Save RFLAGS and disable interrupts. Returns saved flags.
+#[inline(always)]
+fn irq_save() -> u64 {
+    let flags: u64;
     unsafe {
-        TASKS[tid] = Some(task);
-        enqueue(tid);
+        core::arch::asm!("pushfq; pop {}; cli", out(reg) flags, options(nostack));
     }
+    flags
+}
 
-    tid
+/// Restore RFLAGS (re-enabling interrupts if they were enabled before).
+#[inline(always)]
+fn irq_restore(flags: u64) {
+    unsafe {
+        core::arch::asm!("push {}; popfq", in(reg) flags, options(nostack));
+    }
 }
 
 /// Voluntary yield — put current task at back of ready queue and reschedule.
@@ -86,6 +136,11 @@ pub fn yield_now() {
 
 /// Mark current task as Dead and reschedule. Never returns.
 pub fn exit() -> ! {
+    exit_with(0)
+}
+
+/// Mark current task as Dead with an exit status and reschedule. Never returns.
+pub fn exit_with(code: i32) -> ! {
     unsafe {
         let current = CURRENT_TID.load(Ordering::SeqCst);
         crate::serial::puts(b"[exit tid=");
@@ -93,6 +148,7 @@ pub fn exit() -> ! {
         crate::serial::puts(b"]\n");
         if let Some(ref mut task) = TASKS[current] {
             task.state = TaskState::Dead;
+            task.exit_code = code;
             crate::ipc::clear_signal_deadline(current);
             let parent = task.parent_tid;
             // If parent is blocked in sys_wait, wake it with our TID
@@ -244,6 +300,9 @@ pub fn current_tid() -> usize {
 
 /// Mark a task as blocked. Used by IPC.
 pub fn block_task(tid: usize) {
+    if tid >= MAX_TASKS {
+        return;
+    }
     unsafe {
         if let Some(ref mut task) = TASKS[tid] {
             task.state = TaskState::Blocked;
@@ -253,6 +312,9 @@ pub fn block_task(tid: usize) {
 
 /// Unblock a task and put it back in the ready queue. Used by IPC.
 pub fn unblock_task(tid: usize) {
+    if tid >= MAX_TASKS {
+        return;
+    }
     unsafe {
         if let Some(ref mut task) = TASKS[tid] {
             if task.state == TaskState::Blocked {
@@ -263,18 +325,29 @@ pub fn unblock_task(tid: usize) {
     }
 }
 
-/// Block the current task until a child exits. Returns the dead child's TID.
-/// Returns u64::MAX if the caller has no children.
+/// Read a dead child's exit status. Interrupts must be off.
+unsafe fn child_exit_code(tid: usize) -> i32 {
+    TASKS[tid].as_ref().map(|t| t.exit_code).unwrap_or(0)
+}
+
+/// Block the current task until a child exits.
+///
+/// Returns the dead child's TID in bits [31:0] and its exit status in bits
+/// [63:32], or u64::MAX if the caller has no children. The status used to be
+/// dropped entirely, so `process::exit(1)` was indistinguishable from success.
 pub fn sys_wait() -> u64 {
     let parent = current_tid();
 
+    let flags = irq_save();
     unsafe {
         // Check if any child is already dead (zombie) and not yet reaped
         for i in 1..MAX_TASKS {
             if let Some(ref task) = TASKS[i] {
                 if task.parent_tid == parent && task.state == TaskState::Dead && !REAPED[i] {
                     REAPED[i] = true;
-                    return i as u64;
+                    let code = child_exit_code(i);
+                    irq_restore(flags);
+                    return (i as u64) | ((code as u32 as u64) << 32);
                 }
             }
         }
@@ -284,20 +357,24 @@ pub fn sys_wait() -> u64 {
             TASKS[i].as_ref().is_some_and(|t| t.parent_tid == parent)
         });
         if !has_children {
+            irq_restore(flags);
             return u64::MAX;
         }
 
-        // Block until a child exits
+        // Block until a child exits. Marking and blocking must both happen
+        // before interrupts come back on, or exit() can slip in between them.
         WAIT_BLOCKED[parent] = true;
         WAIT_RESULT[parent] = 0;
         block_task(parent);
+        irq_restore(flags);
         yield_now();
 
         // Woken up — WAIT_RESULT has the dead child's TID
         let child_tid = WAIT_RESULT[parent];
         WAIT_RESULT[parent] = 0;
         if child_tid != 0 {
-            child_tid as u64
+            let code = child_exit_code(child_tid);
+            (child_tid as u64) | ((code as u32 as u64) << 32)
         } else {
             u64::MAX
         }
@@ -326,6 +403,7 @@ pub fn kill_task(tid: usize) -> Result<(), ()> {
         match TASKS[tid].as_mut() {
             Some(task) if task.state != TaskState::Dead => {
                 task.state = TaskState::Dead;
+                task.exit_code = -1; // killed
                 crate::ipc::clear_signal_deadline(tid);
                 let parent = task.parent_tid;
                 if parent != 0 && WAIT_BLOCKED[parent] {
@@ -338,6 +416,22 @@ pub fn kill_task(tid: usize) -> Result<(), ()> {
             }
             _ => Err(()),
         }
+    }
+}
+
+/// True if `tid` names a live (not-yet-reaped, not-dead) task.
+///
+/// IPC uses this to reject sends to slots that were never filled: previously
+/// `sys_send`/`sys_call` only range-checked the TID, so sending to an empty
+/// slot took the slow path and blocked forever with nothing able to wake it.
+pub fn task_is_live(tid: usize) -> bool {
+    if tid >= MAX_TASKS {
+        return false;
+    }
+    unsafe {
+        TASKS[tid]
+            .as_ref()
+            .is_some_and(|t| t.state != TaskState::Dead)
     }
 }
 
@@ -379,6 +473,7 @@ pub fn reap_dead() {
                     let cr3 = task.cr3;
                     if cr3 != 0 && cr3 != crate::paging::kernel_cr3() {
                         crate::paging::destroy_address_space(cr3);
+                        crate::userspace::unregister_address_space(cr3);
                     }
                     task.free_stack();
                     REAPED[i] = false;
@@ -482,17 +577,24 @@ pub fn set_task_gid(tid: usize, gid: u32) -> Result<(), ()> {
 
 /// Create an empty task slot (Blocked, cr3=0, caps=0). Returns TID.
 pub fn create_empty_task() -> Option<usize> {
-    let tid = NEXT_TID.fetch_add(1, Ordering::SeqCst);
-    if tid >= MAX_TASKS {
-        return None;
-    }
-
+    // Allocate the stack up front: this takes the heap lock and can re-enable
+    // interrupts, so it must happen before the slot is claimed.
     let layout = core::alloc::Layout::from_size_align(KERNEL_STACK_SIZE, 16)
         .expect("scheduler: invalid stack layout");
     let stack_base = unsafe { alloc::alloc::alloc(layout) };
     if stack_base.is_null() {
         return None;
     }
+
+    let flags = irq_save();
+    let tid = match unsafe { find_free_tid() } {
+        Some(t) => t,
+        None => {
+            irq_restore(flags);
+            unsafe { alloc::alloc::dealloc(stack_base, layout) };
+            return None;
+        }
+    };
 
     let parent = current_tid();
     let (parent_uid, parent_gid) = unsafe {
@@ -517,16 +619,21 @@ pub fn create_empty_task() -> Option<usize> {
             parent_tid: parent,
             mem_pages: 0,
             mem_limit: 0,
+            exit_code: 0,
             uid: parent_uid,
             gid: parent_gid,
         });
     }
+    irq_restore(flags);
 
     Some(tid)
 }
 
 /// Configure and start a previously created empty task for userspace entry.
 pub fn start_task(tid: usize, rip: u64, rsp: u64, cr3: usize) -> Result<(), ()> {
+    if tid >= MAX_TASKS {
+        return Err(());
+    }
     unsafe {
         let task = match TASKS[tid].as_mut() {
             Some(t) => t,
@@ -565,6 +672,9 @@ pub fn start_task(tid: usize, rip: u64, rsp: u64, cr3: usize) -> Result<(), ()> 
 
 /// Grant a capability to a task.
 pub fn grant_cap(tid: usize, cap: u32) -> Result<(), ()> {
+    if tid >= MAX_TASKS {
+        return Err(());
+    }
     unsafe {
         match TASKS[tid].as_mut() {
             Some(task) => {
@@ -580,7 +690,7 @@ pub fn grant_cap(tid: usize, cap: u32) -> Result<(), ()> {
 
 /// Set a file descriptor entry on a task.
 pub fn set_fd(tid: usize, fd: usize, entry: crate::task::FdKind) -> Result<(), ()> {
-    if fd >= crate::task::MAX_FDS {
+    if tid >= MAX_TASKS || fd >= crate::task::MAX_FDS {
         return Err(());
     }
     unsafe {
@@ -596,6 +706,11 @@ pub fn set_fd(tid: usize, fd: usize, entry: crate::task::FdKind) -> Result<(), (
 
 /// Set the pager task for a given task.
 pub fn set_pager(tid: usize, pager_tid: usize) -> Result<(), ()> {
+    // pager_tid is used to index TASK_IPC in ipc::fault_call, so it has to be
+    // in range too -- not just tid.
+    if tid >= MAX_TASKS || pager_tid >= MAX_TASKS {
+        return Err(());
+    }
     unsafe {
         match TASKS[tid].as_mut() {
             Some(task) => {
@@ -658,6 +773,9 @@ pub fn current_task_uncharge_mem(pages: usize) {
 
 /// Set the memory limit (in pages) for a task. 0 = unlimited.
 pub fn set_mem_limit(tid: usize, limit: usize) -> Result<(), ()> {
+    if tid >= MAX_TASKS {
+        return Err(());
+    }
     unsafe {
         match TASKS[tid].as_mut() {
             Some(task) => {

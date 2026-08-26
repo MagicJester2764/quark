@@ -2,11 +2,22 @@
 ///
 /// Tasks create a shared region (kernel allocates physical pages),
 /// grant access to other tasks, and each maps it into their own address space.
+///
+/// Destroying a region only returns its frames to the PMM once nobody has it
+/// mapped. Freeing them while another task still held a mapping left that task
+/// with live PTEs pointing at frames the allocator would hand out again as page
+/// tables or kernel heap — a direct route from ring 3 to arbitrary kernel
+/// memory. Regions destroyed while still mapped are therefore marked
+/// `pending_destroy` and reclaimed by the last unmapper.
 
 use crate::{paging, pmm, scheduler};
+use crate::task::MAX_TASKS;
 
 const MAX_SHMEM: usize = 32;
 const MAX_PAGES_PER_REGION: usize = 16;
+
+/// `access`/`mapped` are TID bitmasks, one bit per task.
+const _: () = assert!(MAX_TASKS <= u64::BITS as usize);
 
 struct ShmemRegion {
     in_use: bool,
@@ -15,6 +26,11 @@ struct ShmemRegion {
     creator: usize,
     /// Bitmask of TIDs with access (bit N = TID N can map).
     access: u64,
+    /// Bitmask of TIDs that currently have the region mapped.
+    mapped: u64,
+    /// Set when destroy was requested while the region was still mapped.
+    /// The last task to unmap frees the frames and releases the handle.
+    pending_destroy: bool,
 }
 
 impl ShmemRegion {
@@ -25,6 +41,8 @@ impl ShmemRegion {
             page_count: 0,
             creator: 0,
             access: 0,
+            mapped: 0,
+            pending_destroy: false,
         }
     }
 }
@@ -34,6 +52,40 @@ static mut REGIONS: [ShmemRegion; MAX_SHMEM] = {
     [INIT; MAX_SHMEM]
 };
 
+/// Save RFLAGS and disable interrupts. Returns saved flags.
+#[inline(always)]
+fn irq_save() -> u64 {
+    let flags: u64;
+    unsafe {
+        core::arch::asm!("pushfq; pop {}; cli", out(reg) flags, options(nostack));
+    }
+    flags
+}
+
+/// Restore RFLAGS (re-enabling interrupts if they were enabled before).
+#[inline(always)]
+fn irq_restore(flags: u64) {
+    unsafe {
+        core::arch::asm!("push {}; popfq", in(reg) flags, options(nostack));
+    }
+}
+
+/// Borrow the region table. Callers must already hold interrupts off.
+#[inline(always)]
+unsafe fn regions() -> &'static mut [ShmemRegion; MAX_SHMEM] {
+    &mut *core::ptr::addr_of_mut!(REGIONS)
+}
+
+/// Release a region's frames and reset the slot. Interrupts must be off.
+unsafe fn release(region: &mut ShmemRegion) {
+    for j in 0..region.page_count {
+        if region.pages[j] != 0 {
+            pmm::free(pmm::PhysFrame::from_address(region.pages[j]));
+        }
+    }
+    *region = ShmemRegion::empty();
+}
+
 /// Create a shared memory region. Returns handle (0..31) or u64::MAX on error.
 pub fn create(pages: usize) -> u64 {
     if pages == 0 || pages > MAX_PAGES_PER_REGION {
@@ -41,43 +93,55 @@ pub fn create(pages: usize) -> u64 {
     }
 
     let tid = scheduler::current_tid();
+    if tid >= MAX_TASKS {
+        return u64::MAX;
+    }
 
-    unsafe {
-        // Find a free slot
-        let handle = match REGIONS.iter().position(|r| !r.in_use) {
+    // Claim the slot before allocating. pmm::alloc takes a lock that re-enables
+    // interrupts on release, so a preempting task used to be able to pick the
+    // same "free" handle and scribble over this region.
+    let flags = irq_save();
+    let handle = unsafe {
+        match regions().iter().position(|r| !r.in_use) {
             Some(h) => h,
-            None => return u64::MAX,
-        };
-
-        let region = &mut REGIONS[handle];
-
-        // Allocate physical pages
-        for i in 0..pages {
-            match pmm::alloc() {
-                Some(frame) => {
-                    let phys = frame.address();
-                    // Zero the frame (identity-mapped)
-                    core::ptr::write_bytes(phys as *mut u8, 0, 4096);
-                    region.pages[i] = phys;
-                }
-                None => {
-                    // Free already-allocated pages
-                    for j in 0..i {
-                        pmm::free(pmm::PhysFrame::from_address(region.pages[j]));
-                        region.pages[j] = 0;
-                    }
-                    return u64::MAX;
-                }
+            None => {
+                irq_restore(flags);
+                return u64::MAX;
             }
         }
-
+    };
+    unsafe {
+        let region = &mut regions()[handle];
+        *region = ShmemRegion::empty();
         region.in_use = true;
-        region.page_count = pages;
         region.creator = tid;
-        region.access = 1u64 << tid; // creator has access
-
-        handle as u64
+        region.access = 1u64 << tid;
+        region.page_count = pages;
     }
+    irq_restore(flags);
+
+    // Allocate backing frames. On failure, roll the whole region back.
+    for i in 0..pages {
+        match pmm::alloc() {
+            Some(frame) => {
+                let phys = frame.address();
+                // Zero the frame (identity-mapped) so it cannot leak whatever
+                // the previous owner left behind.
+                unsafe { core::ptr::write_bytes(phys as *mut u8, 0, 4096) };
+                let flags = irq_save();
+                unsafe { regions()[handle].pages[i] = phys };
+                irq_restore(flags);
+            }
+            None => {
+                let flags = irq_save();
+                unsafe { release(&mut regions()[handle]) };
+                irq_restore(flags);
+                return u64::MAX;
+            }
+        }
+    }
+
+    handle as u64
 }
 
 /// Map a shared memory region into the caller's address space.
@@ -86,147 +150,190 @@ pub fn map(handle: usize, vaddr: usize) -> u64 {
     if handle >= MAX_SHMEM {
         return u64::MAX;
     }
-    if vaddr & 0xFFF != 0 || vaddr < 0x80_0000_0000 {
-        return u64::MAX;
-    }
 
     let tid = scheduler::current_tid();
+    if tid >= MAX_TASKS {
+        return u64::MAX;
+    }
     let cr3 = paging::read_cr3();
 
-    unsafe {
-        let region = &REGIONS[handle];
-        if !region.in_use {
+    let flags = irq_save();
+    let result = unsafe {
+        let region = &mut regions()[handle];
+        if !region.in_use || region.pending_destroy {
+            irq_restore(flags);
             return u64::MAX;
         }
 
         // Check access
         if region.access & (1u64 << tid) == 0 {
+            irq_restore(flags);
             return u64::MAX;
         }
 
-        // Check end address is in user space
-        match (vaddr as u64).checked_add((region.page_count as u64) * 4096) {
-            Some(e) if e <= 0x0000_8000_0000_0000 => {}
-            _ => return u64::MAX,
+        let page_count = region.page_count;
+        if !paging::user_range_ok(vaddr, page_count) {
+            irq_restore(flags);
+            return u64::MAX;
         }
 
-        let flags = paging::PRESENT | paging::WRITABLE | paging::USER;
-        for i in 0..region.page_count {
+        // No OWNED bit: these frames belong to the region, not to this address
+        // space. munmap and address-space teardown must not free them.
+        let pte_flags = paging::PRESENT | paging::WRITABLE | paging::USER;
+        for i in 0..page_count {
             let v = vaddr + i * 4096;
-            if paging::map_page(cr3, v, region.pages[i], flags).is_err() {
+            if paging::map_page(cr3, v, region.pages[i], pte_flags).is_err() {
+                for j in 0..i {
+                    let _ = paging::unmap_page(cr3, vaddr + j * 4096);
+                }
+                irq_restore(flags);
                 return u64::MAX;
             }
         }
-
+        region.mapped |= 1u64 << tid;
         0
-    }
+    };
+    irq_restore(flags);
+    result
 }
 
 /// Grant access to a shared memory region to another task.
 /// Must be the creator or have CAP_TASK_MGMT.
 pub fn grant(handle: usize, target_tid: usize) -> u64 {
-    if handle >= MAX_SHMEM || target_tid >= 64 {
+    if handle >= MAX_SHMEM || target_tid >= MAX_TASKS {
         return u64::MAX;
     }
 
     let tid = scheduler::current_tid();
+    let has_mgmt = crate::cap::task_has_task_mgmt(tid, 0);
 
-    unsafe {
-        let region = &mut REGIONS[handle];
-        if !region.in_use {
-            return u64::MAX;
+    let flags = irq_save();
+    let result = unsafe {
+        let region = &mut regions()[handle];
+        if !region.in_use || region.pending_destroy {
+            u64::MAX
+        } else if region.creator != tid && !has_mgmt {
+            // Only creator or CAP_TASK_MGMT holders can grant
+            u64::MAX
+        } else {
+            region.access |= 1u64 << target_tid;
+            0
         }
-
-        // Only creator or CAP_TASK_MGMT holders can grant
-        if region.creator != tid
-            && !crate::cap::task_has_task_mgmt(scheduler::current_tid(), 0)
-        {
-            return u64::MAX;
-        }
-
-        region.access |= 1u64 << target_tid;
-        0
-    }
+    };
+    irq_restore(flags);
+    result
 }
 
 /// Unmap a shared memory region from the caller's address space.
-/// Does NOT free physical pages (other tasks may still have it mapped).
+///
+/// Frees the physical pages only if this was the last mapping and the region
+/// was already marked for destruction.
 pub fn unmap(handle: usize, vaddr: usize) -> u64 {
     if handle >= MAX_SHMEM {
         return u64::MAX;
     }
-    if vaddr & 0xFFF != 0 || vaddr < 0x80_0000_0000 {
-        return u64::MAX;
-    }
 
     let tid = scheduler::current_tid();
+    if tid >= MAX_TASKS {
+        return u64::MAX;
+    }
     let cr3 = paging::read_cr3();
 
-    unsafe {
-        let region = &REGIONS[handle];
+    let flags = irq_save();
+    let result = unsafe {
+        let region = &mut regions()[handle];
         if !region.in_use {
+            irq_restore(flags);
             return u64::MAX;
         }
-
-        // Check access
         if region.access & (1u64 << tid) == 0 {
+            irq_restore(flags);
+            return u64::MAX;
+        }
+        if !paging::user_range_ok(vaddr, region.page_count) {
+            irq_restore(flags);
             return u64::MAX;
         }
 
         for i in 0..region.page_count {
-            let v = vaddr + i * 4096;
-            // Ignore NotMapped errors — idempotent unmap
-            let _ = paging::unmap_page(cr3, v);
+            // Ignore NotMapped errors — idempotent unmap. Never free the
+            // frame: it belongs to the region, not to this address space.
+            let _ = paging::unmap_page(cr3, vaddr + i * 4096);
         }
+        region.mapped &= !(1u64 << tid);
 
+        if region.pending_destroy && region.mapped == 0 {
+            release(region);
+        }
         0
-    }
+    };
+    irq_restore(flags);
+    result
 }
 
-/// Destroy a shared memory region, freeing physical pages and reclaiming the handle.
-/// Caller must be the creator or have CAP_TASK_MGMT.
-/// Callers should unmap first — destroy does NOT walk other tasks' page tables.
+/// Destroy a shared memory region.
+///
+/// Caller must be the creator or hold CAP_TASK_MGMT. If other tasks still have
+/// the region mapped, the frames are not released yet — the region is marked
+/// `pending_destroy` and the last task to unmap reclaims it.
 pub fn destroy(handle: usize) -> u64 {
     if handle >= MAX_SHMEM {
         return u64::MAX;
     }
 
     let tid = scheduler::current_tid();
-
-    unsafe {
-        let region = &mut REGIONS[handle];
-        if !region.in_use {
-            return u64::MAX;
-        }
-
-        // Only creator or CAP_TASK_MGMT holders can destroy
-        if region.creator != tid
-            && !crate::cap::task_has_task_mgmt(scheduler::current_tid(), 0)
-        {
-            return u64::MAX;
-        }
-
-        for i in 0..region.page_count {
-            pmm::free(pmm::PhysFrame::from_address(region.pages[i]));
-        }
-
-        *region = ShmemRegion::empty();
-        0
+    if tid >= MAX_TASKS {
+        return u64::MAX;
     }
+    let has_mgmt = crate::cap::task_has_task_mgmt(tid, 0);
+
+    let flags = irq_save();
+    let result = unsafe {
+        let region = &mut regions()[handle];
+        if !region.in_use {
+            u64::MAX
+        } else if region.creator != tid && !has_mgmt {
+            u64::MAX
+        } else {
+            // No further mappings may be created.
+            region.pending_destroy = true;
+            region.access = 0;
+            if region.mapped == 0 {
+                release(region);
+            }
+            0
+        }
+    };
+    irq_restore(flags);
+    result
 }
 
-/// Clean up shared memory regions owned by a dead task.
-/// Frees physical pages and reclaims handles for regions created by `tid`.
+/// Clean up shared memory for a dead task.
+///
+/// The task's address space is being torn down, so drop its mapping bit
+/// everywhere, then retire any region it created. A region another live task
+/// still has mapped stays alive until that task unmaps it.
 pub fn cleanup_task(tid: usize) {
+    if tid >= MAX_TASKS {
+        return;
+    }
+    let flags = irq_save();
     unsafe {
-        for i in 0..MAX_SHMEM {
-            let region = &mut REGIONS[i];
-            if region.in_use && region.creator == tid {
-                for j in 0..region.page_count {
-                    pmm::free(pmm::PhysFrame::from_address(region.pages[j]));
-                }
-                *region = ShmemRegion::empty();
+        for region in regions().iter_mut() {
+            if !region.in_use {
+                continue;
+            }
+            region.mapped &= !(1u64 << tid);
+            region.access &= !(1u64 << tid);
+
+            if region.creator == tid {
+                region.pending_destroy = true;
+                region.access = 0;
+            }
+            if region.pending_destroy && region.mapped == 0 {
+                release(region);
             }
         }
     }
+    irq_restore(flags);
 }

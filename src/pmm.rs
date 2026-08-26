@@ -197,6 +197,7 @@ pub fn free_count() -> usize {
 }
 
 /// Total number of frames that were initially available.
+#[allow(dead_code)] // memory statistics API
 pub fn total_count() -> usize {
     PMM.lock().total_frames
 }

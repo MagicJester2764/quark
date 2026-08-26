@@ -10,6 +10,7 @@ pub const SYS_EXIT: u64 = 0;
 pub const SYS_YIELD: u64 = 1;
 pub const SYS_WRITE: u64 = 2;
 pub const SYS_CONSOLE_POS: u64 = 3;
+pub const SYS_EXIT_CODE: u64 = 4;
 pub const SYS_SEND: u64 = 10;
 pub const SYS_RECV: u64 = 11;
 pub const SYS_CALL: u64 = 12;
@@ -186,6 +187,14 @@ pub unsafe fn syscall5(nr: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4
 
 pub fn sys_exit() -> ! {
     unsafe { syscall0(SYS_EXIT) };
+    loop {
+        core::hint::spin_loop();
+    }
+}
+
+/// Exit with a status code, reported to a parent waiting in `sys_wait`.
+pub fn sys_exit_code(code: i32) -> ! {
+    unsafe { syscall1(SYS_EXIT_CODE, code as u32 as u64) };
     loop {
         core::hint::spin_loop();
     }
@@ -488,11 +497,15 @@ pub fn sys_shmem_destroy(handle: usize) -> Result<(), ()> {
     if ret == u64::MAX { Err(()) } else { Ok(()) }
 }
 
-/// Wait for a child task to exit. Returns the dead child's TID.
+/// Wait for a child task to exit. Returns `(tid, exit_code)`.
 /// Returns Err(()) if the caller has no children.
-pub fn sys_wait() -> Result<usize, ()> {
+pub fn sys_wait() -> Result<(usize, i32), ()> {
     let ret = unsafe { syscall0(SYS_WAIT) };
-    if ret == u64::MAX { Err(()) } else { Ok(ret as usize) }
+    if ret == u64::MAX {
+        Err(())
+    } else {
+        Ok(((ret & 0xFFFF_FFFF) as usize, (ret >> 32) as u32 as i32))
+    }
 }
 
 /// Set the pager task for exception forwarding (requires CAP_TASK_MGMT).

@@ -45,6 +45,13 @@ pub fn futex_wait(addr: u64, expected: u32) -> u64 {
     let tid = scheduler::current_tid();
     let cr3 = scheduler::current_task_cr3();
 
+    // Confirm the word is actually mapped *before* taking the lock. Faulting on
+    // it while holding FUTEX with interrupts disabled would deadlock: the fault
+    // path wants to reschedule to the pager.
+    if !unsafe { crate::paging::user_range_accessible(cr3, addr, 4, false) } {
+        return u64::MAX;
+    }
+
     let mut state = FUTEX.lock();
 
     // Read the user word — we're in the same address space (syscall context)
@@ -72,6 +79,19 @@ pub fn futex_wait(addr: u64, expected: u32) -> u64 {
 
     // Yield to let the scheduler pick another task
     scheduler::yield_now();
+
+    // Woken. Release our slot unconditionally: futex_wake clears it, but a
+    // signal-driven unblock does not, and a stale active slot both leaks the
+    // entry and lets a later futex_wake unblock a task that is not waiting.
+    let mut state = FUTEX.lock();
+    if let Some(w) = state
+        .waiters
+        .iter_mut()
+        .find(|w| w.active && w.tid == tid && w.vaddr == addr as usize && w.cr3 == cr3)
+    {
+        w.active = false;
+    }
+    drop(state);
 
     0
 }

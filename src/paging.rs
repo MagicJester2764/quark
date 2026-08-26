@@ -19,8 +19,50 @@ pub const HUGE_PAGE: u64 = 1 << 7;
 pub const GLOBAL: u64 = 1 << 8;
 pub const NO_EXECUTE: u64 = 1 << 63;
 
+/// PTE available bit 9: this address space *owns* the mapped frame and is
+/// responsible for returning it to the PMM when the page is unmapped or the
+/// address space is destroyed.
+///
+/// Set for anonymous memory (`sys_mmap`, ELF segments, stacks, boot info).
+/// Deliberately NOT set for device MMIO (`sys_map_phys`), shared memory
+/// (`shmem::map`), or frames supplied by another task (`sys_addrspace_map`) —
+/// freeing those would hand device addresses or still-shared frames back to
+/// the frame allocator.
+pub const OWNED: u64 = 1 << 9;
+
+/// Highest canonical user address (exclusive). Everything at or above this is
+/// kernel/non-canonical and must never be mapped on behalf of user space.
+pub const USER_ADDR_LIMIT: u64 = 0x0000_8000_0000_0000;
+
+/// Lowest virtual address a user address space may map into.
+///
+/// `userspace::create_address_space` deep-copies only PML4[0]'s PDPT; the page
+/// directories and tables below it stay shared with the kernel. Mapping under
+/// PML4[0] would therefore write PTEs into tables every address space shares
+/// and promote the intermediate entries to USER, exposing the kernel identity
+/// map to ring 3 system-wide. PML4[1] starts at 512 GiB.
+pub const USER_MIN_ADDR: u64 = 0x80_0000_0000;
+
 const ADDR_MASK: u64 = 0x000F_FFFF_FFFF_F000;
 const PAGE_SIZE: usize = 4096;
+
+/// Validate that `[virt, virt + pages * 4096)` is a legal range for a user
+/// mapping: page-aligned, non-empty, no overflow, and entirely inside the
+/// per-address-space user window.
+pub fn user_range_ok(virt: usize, pages: usize) -> bool {
+    if pages == 0 || virt & 0xFFF != 0 {
+        return false;
+    }
+    let len = match (pages as u64).checked_mul(PAGE_SIZE as u64) {
+        Some(l) => l,
+        None => return false,
+    };
+    let end = match (virt as u64).checked_add(len) {
+        Some(e) => e,
+        None => return false,
+    };
+    virt as u64 >= USER_MIN_ADDR && end <= USER_ADDR_LIMIT
+}
 
 #[derive(Debug)]
 pub enum PagingError {
@@ -220,11 +262,122 @@ pub unsafe fn map_page(
     // Level 1: PT
     let pt_phys = pd.entries[pdi].frame_address();
     let pt = table_at(pt_phys);
+
+    // Replacing a live mapping: if this address space owned the old frame and
+    // we are pointing the PTE somewhere else, return the old frame to the PMM
+    // rather than leaking it.
+    let old = pt.entries[pti];
+    if old.is_present() && old.raw() & OWNED != 0 && old.frame_address() != phys_addr {
+        pmm::free(pmm::PhysFrame::from_address(old.frame_address()));
+    }
+
     pt.entries[pti].set(phys_addr, flags);
 
     invlpg(virt_addr);
 
     Ok(())
+}
+
+/// Look up the leaf PTE flags for `virt` in the address space rooted at
+/// `pml4_phys`. Returns `None` if any level along the walk is absent.
+///
+/// Huge pages are reported with their own flags; the caller only cares about
+/// PRESENT/USER/WRITABLE, which are meaningful at every level.
+///
+/// # Safety
+/// `pml4_phys` must point to a valid, identity-mapped PML4 table.
+pub unsafe fn walk_flags(pml4_phys: usize, virt: usize) -> Option<u64> {
+    let (pml4i, pdpti, pdi, pti) = table_indices(virt);
+
+    // A page is user-accessible only if USER is set at *every* level of the
+    // walk, and writable only if WRITABLE is set at every level. Track both
+    // as running ANDs rather than trusting the leaf entry alone.
+    let mut user = true;
+    let mut writable = true;
+
+    macro_rules! descend {
+        ($entry:expr) => {{
+            let e = $entry;
+            if !e.is_present() {
+                return None;
+            }
+            user &= e.raw() & USER != 0;
+            writable &= e.raw() & WRITABLE != 0;
+            e
+        }};
+    }
+
+    let e = descend!(table_at(pml4_phys).entries[pml4i]);
+
+    let e = descend!(table_at(e.frame_address()).entries[pdpti]);
+    if e.is_huge() {
+        return Some(synth_flags(user, writable));
+    }
+
+    let e = descend!(table_at(e.frame_address()).entries[pdi]);
+    if e.is_huge() {
+        return Some(synth_flags(user, writable));
+    }
+
+    let _ = descend!(table_at(e.frame_address()).entries[pti]);
+    Some(synth_flags(user, writable))
+}
+
+/// Build a flags word carrying just the effective PRESENT/USER/WRITABLE bits
+/// produced by a page-table walk.
+fn synth_flags(user: bool, writable: bool) -> u64 {
+    PRESENT
+        | if user { USER } else { 0 }
+        | if writable { WRITABLE } else { 0 }
+}
+
+/// Check that every page of `[addr, addr + len)` is currently mapped, present,
+/// and user-accessible in the address space rooted at `pml4_phys` — and
+/// writable too when `write` is set.
+///
+/// The kernel dereferences user pointers directly (it runs on the faulting
+/// task's CR3), so without this a bad pointer faults *inside* the kernel,
+/// often with a lock held and interrupts disabled. Range-checking the address
+/// alone is not enough; the pages have to actually be there.
+///
+/// # Safety
+/// `pml4_phys` must point to a valid, identity-mapped PML4 table.
+pub unsafe fn user_range_accessible(
+    pml4_phys: usize,
+    addr: u64,
+    len: u64,
+    write: bool,
+) -> bool {
+    if len == 0 {
+        return true;
+    }
+    let end = match addr.checked_add(len) {
+        Some(e) => e,
+        None => return false,
+    };
+    if end > USER_ADDR_LIMIT {
+        return false;
+    }
+
+    let first = addr & !0xFFF;
+    let last = (end - 1) & !0xFFF;
+    let mut page = first;
+    loop {
+        let flags = match walk_flags(pml4_phys, page as usize) {
+            Some(f) => f,
+            None => return false,
+        };
+        if flags & USER == 0 {
+            return false;
+        }
+        if write && flags & WRITABLE == 0 {
+            return false;
+        }
+        if page == last {
+            return true;
+        }
+        page += PAGE_SIZE as u64;
+    }
 }
 
 /// Destroy a user address space, freeing all user page tables and mapped frames.
@@ -293,7 +446,11 @@ unsafe fn free_pd_tree(pd_phys: usize) {
 unsafe fn free_pt_leaves(pt_phys: usize) {
     let pt = table_at(pt_phys);
     for i in 0..512 {
-        if pt.entries[i].is_present() {
+        // Only return frames this address space owns. Device MMIO mapped via
+        // sys_map_phys, shared-memory pages, and frames handed over by another
+        // task are all mapped without OWNED — freeing them would push device
+        // addresses into the frame allocator or double-free shared pages.
+        if pt.entries[i].is_present() && pt.entries[i].raw() & OWNED != 0 {
             let frame_phys = pt.entries[i].frame_address();
             pmm::free(pmm::PhysFrame::from_address(frame_phys));
         }
@@ -301,16 +458,19 @@ unsafe fn free_pt_leaves(pt_phys: usize) {
     pmm::free(pmm::PhysFrame::from_address(pt_phys));
 }
 
-/// Unmap a 4 KiB virtual page. Returns the physical frame address that was mapped.
+/// Unmap a 4 KiB virtual page. Returns `(frame_address, pte_flags)`.
 ///
-/// The caller is responsible for freeing the returned frame if desired.
+/// The caller is responsible for freeing the returned frame if desired — and
+/// must only do so when `flags & OWNED != 0`, otherwise it would be handing
+/// the PMM a device address or a still-shared page. See [`unmap_page_owned`]
+/// for the common case.
 ///
 /// # Safety
 /// `pml4_phys` must point to a valid, identity-mapped PML4 table.
 pub unsafe fn unmap_page(
     pml4_phys: usize,
     virt_addr: usize,
-) -> Result<usize, PagingError> {
+) -> Result<(usize, u64), PagingError> {
     let (pml4i, pdpti, pdi, pti) = table_indices(virt_addr);
 
     let pml4 = table_at(pml4_phys);
@@ -334,9 +494,25 @@ pub unsafe fn unmap_page(
     }
 
     let frame_addr = pt.entries[pti].frame_address();
+    let flags = pt.entries[pti].flags();
     pt.entries[pti].clear();
 
     invlpg(virt_addr);
 
-    Ok(frame_addr)
+    Ok((frame_addr, flags))
+}
+
+/// Unmap a 4 KiB page and return its frame to the PMM, but only if this
+/// address space owned it. Returns `true` if a frame was actually freed.
+///
+/// # Safety
+/// `pml4_phys` must point to a valid, identity-mapped PML4 table.
+pub unsafe fn unmap_page_owned(pml4_phys: usize, virt_addr: usize) -> bool {
+    match unmap_page(pml4_phys, virt_addr) {
+        Ok((frame_addr, flags)) if flags & OWNED != 0 => {
+            pmm::free(pmm::PhysFrame::from_address(frame_addr));
+            true
+        }
+        _ => false,
+    }
 }

@@ -1,6 +1,12 @@
+// Driver-facing shims over the registered FAT32 vtable. The userspace VFS
+// serves the root filesystem now, so several of these are unused from inside
+// the kernel — they remain the driver interface.
+#![allow(dead_code)]
+
 /// FAT32 filesystem driver interface.
 ///
 /// Loads the fat32.drv boot module and dispatches operations through its vtable.
+
 
 use core::ptr;
 

@@ -2,7 +2,7 @@
 ///
 /// Each task has a unique TID, its own kernel stack, and saved CPU context.
 
-use crate::cap::{self, CSpace, MAX_CAPS};
+use crate::cap::{self, CSpace};
 use crate::context::CpuContext;
 use alloc::alloc::{alloc, dealloc, Layout};
 
@@ -69,6 +69,9 @@ pub struct Task {
     pub mem_pages: usize,
     /// Maximum pages this task may allocate. 0 = unlimited.
     pub mem_limit: usize,
+    /// Exit status reported to a parent waiting in sys_wait.
+    /// Negative values indicate abnormal termination (killed/signalled).
+    pub exit_code: i32,
     /// User ID. 0 = root.
     pub uid: u32,
     /// Group ID. 0 = root.
@@ -132,6 +135,7 @@ impl Task {
             parent_tid: 0,
             mem_pages: 0,
             mem_limit: 0,
+            exit_code: 0,
             uid: 0,
             gid: 0,
         }

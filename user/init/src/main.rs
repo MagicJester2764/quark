@@ -538,19 +538,12 @@ fn grant_caps_by_name(name: &[u8; 11], tid: usize) {
         // IoPort(0x60, 0x64), Irq(1)
         mint_and_grant(tid, 0, syscall::CAP_TYPE_IOPORT, 0x60, 0x64);
         mint_and_grant(tid, 1, syscall::CAP_TYPE_IRQ, 1, 0);
-        // Also grant old-style for backward compat during transition
-        let _ = syscall::sys_grant_ioport(tid);
-        let _ = syscall::sys_grant_irq(tid, 1);
     } else if base == b"DISK    " {
         // IoPort(0x1F0, 0x1F7), IoPort(0x3F6, 0x3F6), Irq(14), PhysRange(0, 4G)
         mint_and_grant(tid, 0, syscall::CAP_TYPE_IOPORT, 0x1F0, 0x1F7);
         mint_and_grant(tid, 1, syscall::CAP_TYPE_IOPORT, 0x3F6, 0x3F6);
         mint_and_grant(tid, 2, syscall::CAP_TYPE_IRQ, 14, 0);
         mint_and_grant(tid, 3, syscall::CAP_TYPE_PHYS_RANGE, 0, 0x1_0000_0000);
-        // Old-style compat
-        let _ = syscall::sys_grant_ioport(tid);
-        let _ = syscall::sys_grant_irq(tid, 14);
-        let _ = syscall::sys_grant_cap(tid, syscall::CAP_MAP_PHYS);
     } else if base == b"VFS     " {
         // PhysAlloc(256), PhysRange(0, 4G)
         mint_and_grant(tid, 0, syscall::CAP_TYPE_PHYS_ALLOC, 256, 0);

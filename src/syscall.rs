@@ -17,6 +17,9 @@ pub const SYS_EXIT: u64 = 0;
 pub const SYS_YIELD: u64 = 1;
 pub const SYS_WRITE: u64 = 2;
 pub const SYS_CONSOLE_POS: u64 = 3;
+/// Exit with a status. Separate from SYS_EXIT because `syscall0` leaves RDI
+/// undefined, so the existing zero-argument SYS_EXIT cannot grow an argument.
+pub const SYS_EXIT_CODE: u64 = 4;
 pub const SYS_SEND: u64 = 10;
 pub const SYS_RECV: u64 = 11;
 pub const SYS_CALL: u64 = 12;
@@ -138,11 +141,48 @@ pub unsafe fn init() {
     console::puts(b"Syscall/sysret initialized.\n");
 }
 
-const USER_ADDR_LIMIT: u64 = 0x0000_8000_0000_0000;
+const USER_ADDR_LIMIT: u64 = paging::USER_ADDR_LIMIT;
 
-/// Validate that a user pointer range is entirely in user space.
+/// Validate that a user pointer range is entirely in user space *and* actually
+/// mapped in the calling task's address space.
+///
+/// The range check alone is not enough. The kernel dereferences user pointers
+/// directly (it runs on the caller's CR3), so an in-range but unmapped address
+/// faults inside the kernel — frequently with a spin lock held and interrupts
+/// disabled, where the fault path cannot safely reschedule.
+///
+/// `write` additionally requires the pages be writable, so a syscall cannot be
+/// tricked into writing through a read-only user mapping.
+fn validate_user_range(addr: u64, len: u64, write: bool) -> bool {
+    if len == 0 {
+        return true;
+    }
+    if addr == 0 {
+        return false;
+    }
+    match addr.checked_add(len) {
+        Some(end) if end <= USER_ADDR_LIMIT => {}
+        _ => return false,
+    }
+    unsafe { paging::user_range_accessible(paging::read_cr3(), addr, len, write) }
+}
+
+/// Read-only user buffer check.
 fn validate_user_ptr(addr: u64, len: u64) -> bool {
-    addr.checked_add(len).map_or(false, |end| end <= USER_ADDR_LIMIT)
+    validate_user_range(addr, len, false)
+}
+
+/// Writable user buffer check.
+fn validate_user_ptr_mut(addr: u64, len: u64) -> bool {
+    validate_user_range(addr, len, true)
+}
+
+/// Unmap `pages` pages starting at `vaddr`, returning owned frames to the PMM.
+/// Used to roll back a partially completed mapping loop.
+fn unmap_range_owned(cr3: usize, vaddr: usize, pages: usize) {
+    for i in 0..pages {
+        unsafe { paging::unmap_page_owned(cr3, vaddr + i * 4096) };
+    }
 }
 
 /// Maximum bytes per IPC write message (5 data words × 8 bytes).
@@ -228,6 +268,9 @@ extern "C" fn syscall_dispatch(
         SYS_EXIT => {
             scheduler::exit()
         }
+        SYS_EXIT_CODE => {
+            scheduler::exit_with(arg0 as i32)
+        }
         SYS_YIELD => {
             scheduler::yield_now();
             0
@@ -235,12 +278,14 @@ extern "C" fn syscall_dispatch(
         SYS_WRITE => {
             let ptr = arg0 as *const u8;
             let len = arg1 as usize;
-            if len > 0 && !ptr.is_null() && validate_user_ptr(arg0, arg1) {
-                let slice = unsafe { core::slice::from_raw_parts(ptr, len) };
-                console::puts(slice);
-            } else if !validate_user_ptr(arg0, arg1) {
+            if len == 0 {
+                return 0;
+            }
+            if !validate_user_ptr(arg0, arg1) {
                 return u64::MAX;
             }
+            let slice = unsafe { core::slice::from_raw_parts(ptr, len) };
+            console::puts(slice);
             len as u64
         }
         SYS_CONSOLE_POS => {
@@ -252,7 +297,7 @@ extern "C" fn syscall_dispatch(
             let dest = arg0 as usize;
             let msg_ptr = arg1 as *const crate::ipc::Message;
             let msg_size = core::mem::size_of::<crate::ipc::Message>() as u64;
-            if msg_ptr.is_null() || !validate_user_ptr(arg1, msg_size) { return u64::MAX; }
+            if !validate_user_ptr(arg1, msg_size) { return u64::MAX; }
             let msg = unsafe { &*msg_ptr };
             match crate::ipc::sys_send(dest, msg) {
                 Ok(()) => 0,
@@ -263,7 +308,7 @@ extern "C" fn syscall_dispatch(
             let from = arg0 as usize;
             let msg_ptr = arg1 as *mut crate::ipc::Message;
             let msg_size = core::mem::size_of::<crate::ipc::Message>() as u64;
-            if msg_ptr.is_null() || !validate_user_ptr(arg1, msg_size) { return u64::MAX; }
+            if !validate_user_ptr_mut(arg1, msg_size) { return u64::MAX; }
             match crate::ipc::sys_recv(from) {
                 Ok(msg) => { unsafe { *msg_ptr = msg }; 0 }
                 Err(_) => u64::MAX,
@@ -274,9 +319,8 @@ extern "C" fn syscall_dispatch(
             let msg_ptr = arg1 as *const crate::ipc::Message;
             let reply_ptr = arg2 as *mut crate::ipc::Message;
             let msg_size = core::mem::size_of::<crate::ipc::Message>() as u64;
-            if msg_ptr.is_null() || reply_ptr.is_null()
-                || !validate_user_ptr(arg1, msg_size)
-                || !validate_user_ptr(arg2, msg_size) { return u64::MAX; }
+            if !validate_user_ptr(arg1, msg_size)
+                || !validate_user_ptr_mut(arg2, msg_size) { return u64::MAX; }
             let msg = unsafe { &*msg_ptr };
             match crate::ipc::sys_call(dest, msg) {
                 Ok(reply) => {
@@ -289,7 +333,7 @@ extern "C" fn syscall_dispatch(
             let dest = arg0 as usize;
             let msg_ptr = arg1 as *const crate::ipc::Message;
             let msg_size = core::mem::size_of::<crate::ipc::Message>() as u64;
-            if msg_ptr.is_null() || !validate_user_ptr(arg1, msg_size) { return u64::MAX; }
+            if !validate_user_ptr(arg1, msg_size) { return u64::MAX; }
             let msg = unsafe { &*msg_ptr };
             match crate::ipc::sys_reply(dest, msg) {
                 Ok(()) => 0,
@@ -309,6 +353,11 @@ extern "C" fn syscall_dispatch(
         SYS_IRQ_ACK => {
             // arg0 = IRQ number
             let irq = arg0 as u8;
+            // Acking an IRQ you do not own lets any task interfere with the
+            // PIC's in-service state and stall another driver's interrupts.
+            if !crate::cap::task_has_irq(scheduler::current_tid(), irq) {
+                return u64::MAX;
+            }
             unsafe { crate::pic::send_eoi(irq) };
             0
         }
@@ -340,7 +389,14 @@ extern "C" fn syscall_dispatch(
             if count == 0 {
                 return 0;
             }
-            if !validate_user_ptr(buf, (count as u64).saturating_mul(2)) {
+            // insw writes into the buffer, outsw only reads it.
+            let bytes = (count as u64).saturating_mul(2);
+            let ok = match op {
+                0 => validate_user_ptr_mut(buf, bytes),
+                1 => validate_user_ptr(buf, bytes),
+                _ => return u64::MAX,
+            };
+            if !ok {
                 return u64::MAX;
             }
             match op {
@@ -359,15 +415,28 @@ extern "C" fn syscall_dispatch(
             let phys = arg0 as usize;
             let virt = arg1 as usize;
             let pages = arg2 as usize;
+            if !paging::user_range_ok(virt, pages) {
+                return u64::MAX;
+            }
+            if phys & 0xFFF != 0 || phys.checked_add(pages * 4096).is_none() {
+                return u64::MAX;
+            }
             if !crate::cap::task_has_phys_range(scheduler::current_tid(), phys, pages) {
                 return u64::MAX;
             }
             let pml4 = paging::read_cr3();
+            // No OWNED bit: these frames belong to a device, not to this
+            // address space. Freeing them on unmap/teardown would push MMIO
+            // addresses into the frame allocator.
+            let flags = paging::PRESENT | paging::WRITABLE | paging::USER;
             for i in 0..pages {
                 let p = phys + i * 4096;
                 let v = virt + i * 4096;
-                let flags = paging::PRESENT | paging::WRITABLE | paging::USER;
                 if unsafe { paging::map_page(pml4, v, p, flags) }.is_err() {
+                    // Roll back the pages mapped so far.
+                    for j in 0..i {
+                        let _ = unsafe { paging::unmap_page(pml4, virt + j * 4096) };
+                    }
                     return u64::MAX;
                 }
             }
@@ -401,12 +470,35 @@ extern "C" fn syscall_dispatch(
             let phys = arg2 as usize;
             let pages = arg3 as usize;
             let flags = arg4;
+            if !paging::user_range_ok(virt, pages) {
+                return u64::MAX;
+            }
+            if phys & 0xFFF != 0 || phys.checked_add(pages * 4096).is_none() {
+                return u64::MAX;
+            }
+            // The caller supplies both the target address space and the
+            // backing frames, so it must actually hold authority over that
+            // physical range — otherwise CAP_TASK_MGMT silently implied full
+            // physical read/write.
+            if !crate::cap::task_has_phys_range(scheduler::current_tid(), phys, pages) {
+                return u64::MAX;
+            }
+            // cr3 must be an address space this task created, not an arbitrary
+            // physical address reinterpreted as a PML4.
+            if !crate::userspace::is_owned_address_space(scheduler::current_tid(), cr3) {
+                return u64::MAX;
+            }
+            // No OWNED bit: the frames came from the caller (via sys_phys_alloc),
+            // which stays responsible for them.
             let pte_flags = paging::PRESENT | paging::USER
                 | if flags & 1 != 0 { paging::WRITABLE } else { 0 };
             for i in 0..pages {
                 let v = virt + i * 4096;
                 let p = phys + i * 4096;
                 if unsafe { paging::map_page(cr3, v, p, pte_flags) }.is_err() {
+                    for j in 0..i {
+                        let _ = unsafe { paging::unmap_page(cr3, virt + j * 4096) };
+                    }
                     return u64::MAX;
                 }
             }
@@ -421,8 +513,19 @@ extern "C" fn syscall_dispatch(
             let rip = arg1;
             // Ensure RSP ≡ 8 mod 16 for x86_64 ABI (as if call pushed return addr).
             // Align DOWN to 16, then subtract 8 — never go above the caller's value.
-            let rsp = (arg2 & !0xF) - 8;
+            // `checked_sub` because arg2 < 8 used to wrap to a kernel address.
+            let rsp = match (arg2 & !0xF).checked_sub(8) {
+                Some(r) => r,
+                None => return u64::MAX,
+            };
+            // Entry point and stack must both live in user space.
+            if rip >= USER_ADDR_LIMIT || rsp >= USER_ADDR_LIMIT {
+                return u64::MAX;
+            }
             let cr3 = arg3 as usize;
+            if !crate::userspace::is_owned_address_space(scheduler::current_tid(), cr3) {
+                return u64::MAX;
+            }
             match scheduler::start_task(tid, rip, rsp, cr3) {
                 Ok(()) => 0,
                 Err(()) => u64::MAX,
@@ -434,7 +537,7 @@ extern "C" fn syscall_dispatch(
                 return u64::MAX;
             }
             let count = arg0 as usize;
-            if count == 0 {
+            if count == 0 || count > 1024 {
                 return u64::MAX;
             }
             // Check memory quota
@@ -469,9 +572,23 @@ extern "C" fn syscall_dispatch(
             }
             let addr = arg0 as usize;
             let count = arg1 as usize;
+            if count == 0 || addr & 0xFFF != 0 {
+                return u64::MAX;
+            }
+            let end = match count.checked_mul(4096).and_then(|l| addr.checked_add(l)) {
+                Some(e) => e,
+                None => return u64::MAX,
+            };
+            // The caller must hold authority over the range it is releasing.
+            if !crate::cap::task_has_phys_range(scheduler::current_tid(), addr, count) {
+                return u64::MAX;
+            }
+            let _ = end;
             for i in 0..count {
                 crate::pmm::free(crate::pmm::PhysFrame::from_address(addr + i * 4096));
             }
+            // Refund the quota charged by sys_phys_alloc.
+            scheduler::current_task_uncharge_mem(count);
             0
         }
         SYS_GRANT_IOPORT => {
@@ -480,13 +597,23 @@ extern "C" fn syscall_dispatch(
             if !crate::cap::task_has_task_mgmt(caller, 0) {
                 return u64::MAX;
             }
-            if !crate::cap::task_has_ioport(caller, 0) {
+            // Must hold both ends of the range being delegated, not just port 0.
+            if !crate::cap::task_has_ioport(caller, 0)
+                || !crate::cap::task_has_ioport(caller, 0xFFFF)
+            {
                 return u64::MAX;
             }
             let tid = arg0 as usize;
-            match scheduler::grant_cap(tid, crate::task::CAP_IOPORT) {
-                Ok(()) => 0,
-                Err(()) => u64::MAX,
+            if crate::cap::grant_slot(
+                tid,
+                crate::cap::CapType::IoPort,
+                0,
+                0xFFFF,
+                caller,
+            ) {
+                0
+            } else {
+                u64::MAX
             }
         }
         SYS_GRANT_IRQ => {
@@ -495,13 +622,24 @@ extern "C" fn syscall_dispatch(
             if !crate::cap::task_has_task_mgmt(caller, 0) {
                 return u64::MAX;
             }
-            if !crate::cap::task_has_irq(caller, 0xFF) {
+            let tid = arg0 as usize;
+            let irq = arg1 as u8;
+            // Delegate exactly the IRQ named in arg1. This used to hand over
+            // the blanket CAP_IRQ bit, which expands to the 0xFF wildcard --
+            // so delegating IRQ 1 delegated every IRQ on the machine.
+            if !crate::cap::task_has_irq(caller, irq) {
                 return u64::MAX;
             }
-            let tid = arg0 as usize;
-            match scheduler::grant_cap(tid, crate::task::CAP_IRQ) {
-                Ok(()) => 0,
-                Err(()) => u64::MAX,
+            if crate::cap::grant_slot(
+                tid,
+                crate::cap::CapType::Irq,
+                irq as u64,
+                0,
+                caller,
+            ) {
+                0
+            } else {
+                u64::MAX
             }
         }
         SYS_GRANT_CAP => {
@@ -528,7 +666,7 @@ extern "C" fn syscall_dispatch(
             let fd = arg0 as usize;
             let ptr = arg1 as *const u8;
             let len = arg2 as usize;
-            if len > 0 && !ptr.is_null() && !validate_user_ptr(arg1, arg2) {
+            if len > 0 && !validate_user_ptr(arg1, arg2) {
                 return u64::MAX;
             }
             match scheduler::current_fd(fd) {
@@ -541,7 +679,7 @@ extern "C" fn syscall_dispatch(
                 crate::task::FdKind::PipeRead(_) => u64::MAX,
                 crate::task::FdKind::Empty => {
                     // fd not connected — fall back to kernel console for fd 1/2
-                    if (fd == 1 || fd == 2) && len > 0 && !ptr.is_null() {
+                    if (fd == 1 || fd == 2) && len > 0 {
                         let slice = unsafe { core::slice::from_raw_parts(ptr, len) };
                         crate::console::puts(slice);
                         len as u64
@@ -556,7 +694,7 @@ extern "C" fn syscall_dispatch(
             let fd = arg0 as usize;
             let ptr = arg1 as *mut u8;
             let max_len = arg2 as usize;
-            if max_len > 0 && !ptr.is_null() && !validate_user_ptr(arg1, arg2) {
+            if max_len > 0 && !validate_user_ptr_mut(arg1, arg2) {
                 return u64::MAX;
             }
             match scheduler::current_fd(fd) {
@@ -575,7 +713,7 @@ extern "C" fn syscall_dispatch(
             let fd = arg0 as usize;
             let ptr = arg1 as *mut u8;
             let max_len = arg2 as usize;
-            if max_len > 0 && !ptr.is_null() && !validate_user_ptr(arg1, arg2) {
+            if max_len > 0 && !validate_user_ptr_mut(arg1, arg2) {
                 return u64::MAX;
             }
             match scheduler::current_fd(fd) {
@@ -685,41 +823,41 @@ extern "C" fn syscall_dispatch(
             if pages == 0 || pages > 256 {
                 return u64::MAX;
             }
-            // Must be page-aligned
-            if vaddr & 0xFFF != 0 {
+            // Page-aligned, no overflow, and clear of PML4[0] (whose page
+            // directories are shared with the kernel).
+            if !paging::user_range_ok(vaddr, pages) {
                 return u64::MAX;
             }
-            // Must be in user space and NOT in PML4[0] (kernel identity map / heap)
-            let end = match (vaddr as u64).checked_add((pages as u64) * 4096) {
-                Some(e) => e,
-                None => return u64::MAX,
-            };
-            if end > USER_ADDR_LIMIT {
-                return u64::MAX;
-            }
-            // Reject PML4[0] range (0 .. 0x80_0000_0000) — collides with kernel heap
-            if vaddr < 0x80_0000_0000 {
-                return u64::MAX;
-            }
-            // Check memory quota
+            // Charge up front so a partial failure can't leave pages mapped
+            // but unaccounted; the rollback path refunds.
             if !scheduler::current_task_check_mem(pages) {
                 return u64::MAX;
             }
+            scheduler::current_task_charge_mem(pages);
+
             let cr3 = paging::read_cr3();
-            let flags = paging::PRESENT | paging::WRITABLE | paging::USER;
+            // OWNED: anonymous memory this address space must free on teardown.
+            let flags =
+                paging::PRESENT | paging::WRITABLE | paging::USER | paging::OWNED;
             for i in 0..pages {
+                let v = vaddr + i * 4096;
                 let phys = match crate::pmm::alloc() {
                     Some(frame) => frame.address(),
-                    None => return u64::MAX, // TODO: unmap already-mapped pages on failure
+                    None => {
+                        unmap_range_owned(cr3, vaddr, i);
+                        scheduler::current_task_uncharge_mem(pages);
+                        return u64::MAX;
+                    }
                 };
                 // Zero the frame (identity-mapped)
                 unsafe { core::ptr::write_bytes(phys as *mut u8, 0, 4096) };
-                let v = vaddr + i * 4096;
                 if unsafe { paging::map_page(cr3, v, phys, flags) }.is_err() {
+                    crate::pmm::free(crate::pmm::PhysFrame::from_address(phys));
+                    unmap_range_owned(cr3, vaddr, i);
+                    scheduler::current_task_uncharge_mem(pages);
                     return u64::MAX;
                 }
             }
-            scheduler::current_task_charge_mem(pages);
             0
         }
         SYS_MUNMAP => {
@@ -730,29 +868,19 @@ extern "C" fn syscall_dispatch(
             if pages == 0 || pages > 256 {
                 return u64::MAX;
             }
-            if vaddr & 0xFFF != 0 {
-                return u64::MAX;
-            }
-            if vaddr < 0x80_0000_0000 {
-                return u64::MAX;
-            }
-            let end = match (vaddr as u64).checked_add((pages as u64) * 4096) {
-                Some(e) => e,
-                None => return u64::MAX,
-            };
-            if end > USER_ADDR_LIMIT {
+            if !paging::user_range_ok(vaddr, pages) {
                 return u64::MAX;
             }
             let cr3 = paging::read_cr3();
             let mut freed = 0usize;
             for i in 0..pages {
                 let v = vaddr + i * 4096;
-                match unsafe { paging::unmap_page(cr3, v) } {
-                    Ok(frame_addr) => {
-                        crate::pmm::free(crate::pmm::PhysFrame::from_address(frame_addr));
-                        freed += 1;
-                    }
-                    Err(_) => {} // Not mapped — skip silently
+                // Only frames this address space owns are returned to the PMM.
+                // Shared-memory pages and device MMIO are unmapped but never
+                // freed — otherwise munmap double-frees a shmem region or
+                // hands the allocator a device physical address.
+                if unsafe { paging::unmap_page_owned(cr3, v) } {
+                    freed += 1;
                 }
             }
             if freed > 0 {
@@ -766,7 +894,7 @@ extern "C" fn syscall_dispatch(
             let msg_ptr = arg1 as *mut crate::ipc::Message;
             let timeout = arg2;
             let msg_size = core::mem::size_of::<crate::ipc::Message>() as u64;
-            if msg_ptr.is_null() || !validate_user_ptr(arg1, msg_size) { return u64::MAX; }
+            if !validate_user_ptr_mut(arg1, msg_size) { return u64::MAX; }
             match crate::ipc::sys_recv_timeout(from, timeout) {
                 Ok(msg) => { unsafe { *msg_ptr = msg }; 0 }
                 Err(crate::ipc::IpcError::Timeout) => 1,
@@ -969,9 +1097,12 @@ extern "C" fn syscall_dispatch(
                 if task.cspace[slot].cap_type as u8 != crate::cap::CapType::Empty as u8 {
                     return u64::MAX;
                 }
+                // Must adopt the slot's *current* generation. Hardcoding 0
+                // meant that after a single sys_cap_revoke on this slot every
+                // subsequently minted cap was born already-invalid.
                 task.cspace[slot] = crate::cap::CapSlot {
                     cap_type,
-                    generation: 0,
+                    generation: crate::cap::current_generation(tid, slot),
                     root_slot: slot as u8,
                     root_tid: tid as u8,
                     param0,
@@ -998,6 +1129,10 @@ extern "C" fn syscall_dispatch(
                 if src_cap.cap_type as u8 == crate::cap::CapType::Empty as u8 {
                     return u64::MAX;
                 }
+                // A revoked cap must not be re-delegatable.
+                if !crate::cap::slot_is_valid(&src_cap) {
+                    return u64::MAX;
+                }
                 let dest_task = match scheduler::get_task_mut(dest_tid) {
                     Some(t) => t,
                     None => return u64::MAX,
@@ -1006,13 +1141,14 @@ extern "C" fn syscall_dispatch(
                     return u64::MAX;
                 }
                 // Derive: copy cap but track provenance for revocation
-                let root_tid = if src_cap.root_tid == 0 {
+                let kernel_minted = src_cap.root_tid == crate::cap::KERNEL_ROOT_TID;
+                let root_tid = if kernel_minted {
                     // Kernel-minted cap: the granter becomes the root
                     caller_tid as u8
                 } else {
                     src_cap.root_tid
                 };
-                let root_slot = if src_cap.root_tid == 0 {
+                let root_slot = if kernel_minted {
                     src_slot as u8
                 } else {
                     src_cap.root_slot
@@ -1148,7 +1284,15 @@ core::arch::global_asm!(
     "    movq %rax, %rdi",             // nr → rdi (1st C arg)
     "    call syscall_dispatch",
 
-    // Return value is in %rax
+    // Return value is in %rax.
+    // Scrub the caller-saved scratch registers the ABI lets us clobber: they
+    // still hold kernel values here and sysret would hand them to ring 3.
+    // (rcx/r11 are overwritten below with the user's saved RIP/RFLAGS,
+    // rsi/rdi are restored from the user's own saved args.)
+    "    xorl %edx, %edx",
+    "    xorl %r8d, %r8d",
+    "    xorl %r9d, %r9d",
+    "    xorl %r10d, %r10d",
 
     // Restore saved arg registers (we pushed rdi, rsi)
     "    popq %rsi",

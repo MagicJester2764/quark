@@ -10,6 +10,14 @@ use crate::task::MAX_TASKS;
 pub const MAX_CAPS: usize = 16;
 pub const MAX_USERS: usize = 64;
 
+/// `CapSlot::root_tid` value meaning "minted by the kernel, never revocable".
+///
+/// This must not collide with a real TID. It used to be 0, but TID 0 is the
+/// idle task — so any cap it minted was silently unrevocable, and
+/// `sys_cap_grant` mistook its caps for kernel-minted ones and re-rooted them
+/// at the granter. `MAX_TASKS` is 64, so 0xFF can never be a live TID.
+pub const KERNEL_ROOT_TID: u8 = 0xFF;
+
 /// Per-user default capability bitmask table.
 /// USER_CAPS[uid] holds the default cap bits for all tasks running as that UID.
 static mut USER_CAPS: [u32; MAX_USERS] = [0; MAX_USERS];
@@ -61,9 +69,9 @@ pub enum CapType {
 #[derive(Debug, Clone, Copy)]
 pub struct CapSlot {
     pub cap_type: CapType,
-    pub generation: u16,
+    pub generation: u32,
     pub root_slot: u8,  // slot in root_tid's CSpace
-    pub root_tid: u8,   // TID that minted this cap (0=kernel)
+    pub root_tid: u8,   // TID that minted this cap (KERNEL_ROOT_TID = kernel)
     pub param0: u64,
     pub param1: u64,
 }
@@ -74,7 +82,7 @@ impl CapSlot {
             cap_type: CapType::Empty,
             generation: 0,
             root_slot: 0,
-            root_tid: 0,
+            root_tid: KERNEL_ROOT_TID,
             param0: 0,
             param1: 0,
         }
@@ -89,15 +97,15 @@ pub const fn empty_cspace() -> CSpace {
 
 /// Global generation counters for O(1) revocation.
 /// CAP_GENERATIONS[tid][slot] tracks the current generation for caps minted by tid at slot.
-static mut CAP_GENERATIONS: [[u16; MAX_CAPS]; MAX_TASKS] = [[0; MAX_CAPS]; MAX_TASKS];
+static mut CAP_GENERATIONS: [[u32; MAX_CAPS]; MAX_TASKS] = [[0; MAX_CAPS]; MAX_TASKS];
 
 /// Validate that a cap slot is still valid (not revoked).
 fn is_valid(cap: &CapSlot) -> bool {
     if cap.cap_type as u8 == CapType::Empty as u8 {
         return false;
     }
-    // Kernel-minted caps (root_tid=0) are always valid
-    if cap.root_tid == 0 {
+    // Kernel-minted caps are always valid — nothing can revoke them.
+    if cap.root_tid == KERNEL_ROOT_TID {
         return true;
     }
     let tid = cap.root_tid as usize;
@@ -150,7 +158,15 @@ pub fn task_has_phys_range(tid: usize, phys: usize, pages: usize) -> bool {
     if tid >= MAX_TASKS { return false; }
     if task_uid(tid) == 0 { return true; }
     if user_has_cap_bit(tid, crate::task::CAP_MAP_PHYS) { return true; }
-    let phys_end = phys + pages * 4096;
+    // Checked: a wrapped `phys_end` would compare below `cap.param1` and let
+    // an arbitrary physical range through.
+    let phys_end = match pages
+        .checked_mul(4096)
+        .and_then(|len| phys.checked_add(len))
+    {
+        Some(e) => e as u64,
+        None => return false,
+    };
     unsafe {
         let cspace = task_cspace(tid);
         match cspace {
@@ -158,7 +174,7 @@ pub fn task_has_phys_range(tid: usize, phys: usize, pages: usize) -> bool {
                 cap.cap_type as u8 == CapType::PhysRange as u8
                     && is_valid(cap)
                     && phys as u64 >= cap.param0
-                    && phys_end as u64 <= cap.param1
+                    && phys_end <= cap.param1
             }),
             None => false,
         }
@@ -218,6 +234,46 @@ pub fn task_has_set_uid(tid: usize) -> bool {
     }
 }
 
+/// Public wrapper over the revocation check, for callers outside this module.
+pub fn slot_is_valid(cap: &CapSlot) -> bool {
+    is_valid(cap)
+}
+
+/// Insert a typed capability into the first free slot of `tid`'s CSpace,
+/// rooted at `granter` so it can be revoked later.
+///
+/// Returns false if the task does not exist or has no free slot.
+pub fn grant_slot(
+    tid: usize,
+    cap_type: CapType,
+    param0: u64,
+    param1: u64,
+    granter: usize,
+) -> bool {
+    if tid >= MAX_TASKS || granter >= MAX_TASKS {
+        return false;
+    }
+    unsafe {
+        let task = match crate::scheduler::get_task_mut(tid) {
+            Some(t) => t,
+            None => return false,
+        };
+        let slot = match find_empty_slot(&task.cspace) {
+            Some(s) => s,
+            None => return false,
+        };
+        task.cspace[slot] = CapSlot {
+            cap_type,
+            generation: current_generation(granter, slot),
+            root_slot: slot as u8,
+            root_tid: granter as u8,
+            param0,
+            param1,
+        };
+    }
+    true
+}
+
 /// Find an empty slot in a task's CSpace. Returns slot index or None.
 pub fn find_empty_slot(cspace: &CSpace) -> Option<usize> {
     cspace.iter().position(|cap| cap.cap_type as u8 == CapType::Empty as u8)
@@ -239,7 +295,7 @@ pub fn populate_from_bitmask(cspace: &mut CSpace, caps: u32) {
                 cap_type: CapType::IoPort,
                 generation: 0,
                 root_slot: 0,
-                root_tid: 0,
+                root_tid: KERNEL_ROOT_TID,
                 param0: 0,        // port_start
                 param1: 0xFFFF,   // port_end
             };
@@ -251,7 +307,7 @@ pub fn populate_from_bitmask(cspace: &mut CSpace, caps: u32) {
                 cap_type: CapType::PhysRange,
                 generation: 0,
                 root_slot: 0,
-                root_tid: 0,
+                root_tid: KERNEL_ROOT_TID,
                 param0: 0,
                 param1: 0x1_0000_0000, // 4 GiB
             };
@@ -263,7 +319,7 @@ pub fn populate_from_bitmask(cspace: &mut CSpace, caps: u32) {
                 cap_type: CapType::Irq,
                 generation: 0,
                 root_slot: 0,
-                root_tid: 0,
+                root_tid: KERNEL_ROOT_TID,
                 param0: 0xFF, // wildcard
                 param1: 0,
             };
@@ -275,7 +331,7 @@ pub fn populate_from_bitmask(cspace: &mut CSpace, caps: u32) {
                 cap_type: CapType::TaskMgmt,
                 generation: 0,
                 root_slot: 0,
-                root_tid: 0,
+                root_tid: KERNEL_ROOT_TID,
                 param0: 0, // any target
                 param1: 0,
             };
@@ -287,7 +343,7 @@ pub fn populate_from_bitmask(cspace: &mut CSpace, caps: u32) {
                 cap_type: CapType::PhysAlloc,
                 generation: 0,
                 root_slot: 0,
-                root_tid: 0,
+                root_tid: KERNEL_ROOT_TID,
                 param0: 0, // unlimited
                 param1: 0,
             };
@@ -299,7 +355,7 @@ pub fn populate_from_bitmask(cspace: &mut CSpace, caps: u32) {
                 cap_type: CapType::SetUid,
                 generation: 0,
                 root_slot: 0,
-                root_tid: 0,
+                root_tid: KERNEL_ROOT_TID,
                 param0: 0,
                 param1: 0,
             };
@@ -326,16 +382,18 @@ pub fn validate_attenuation(source: &CapSlot, new_type: CapType, new_p0: u64, ne
     match new_type {
         CapType::Empty => false,
         CapType::IoPort => {
-            // new range must be within source range
-            new_p0 >= source.param0 && new_p1 <= source.param1
+            // new range must be non-inverted and within the source range
+            new_p0 <= new_p1 && new_p0 >= source.param0 && new_p1 <= source.param1
         }
         CapType::PhysRange => {
-            new_p0 >= source.param0 && new_p1 <= source.param1
+            new_p0 <= new_p1 && new_p0 >= source.param0 && new_p1 <= source.param1
         }
         CapType::Irq => {
             // wildcard can narrow to specific; specific must match
             if source.param0 as u8 == 0xFF {
-                true // any narrowing is fine
+                // Narrowing from the wildcard must name a concrete IRQ,
+                // otherwise "narrowing" hands back the wildcard again.
+                new_p0 as u8 != 0xFF
             } else {
                 new_p0 == source.param0
             }
@@ -343,7 +401,7 @@ pub fn validate_attenuation(source: &CapSlot, new_type: CapType, new_p0: u64, ne
         CapType::TaskMgmt => {
             // any (0) can narrow to specific; specific must match
             if source.param0 == 0 {
-                true
+                new_p0 != 0
             } else {
                 new_p0 == source.param0
             }
@@ -380,7 +438,7 @@ pub fn can_mint(cspace: &CSpace, cap_type: CapType, param0: u64, param1: u64) ->
 }
 
 /// Get the current generation for a given tid/slot pair (for creating derived caps).
-pub fn current_generation(tid: usize, slot: usize) -> u16 {
+pub fn current_generation(tid: usize, slot: usize) -> u32 {
     if tid >= MAX_TASKS || slot >= MAX_CAPS {
         return 0;
     }
