@@ -344,7 +344,7 @@ const PF_INSN_FETCH: u64 = 1 << 4;
 /// IPC tag for page fault messages sent to pager tasks.
 pub const TAG_PAGE_FAULT: u64 = 0xFFFF_0001;
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 extern "C" fn exception_handler(frame: &InterruptFrame) {
     let vec = frame.vector as usize;
     let from_user = frame.cs & 3 != 0;
@@ -484,7 +484,7 @@ extern "C" fn exception_handler(frame: &InterruptFrame) {
 // IRQ handler
 // ---------------------------------------------------------------------------
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 extern "C" fn irq_handler(frame: &InterruptFrame) {
     let irq = frame.vector as u8;
 
@@ -592,14 +592,14 @@ fn print_dec(val: usize) {
 // Extern symbols from boot.s and exception stubs
 // ---------------------------------------------------------------------------
 
-extern "C" {
+unsafe extern "C" {
     static tss: u8;
     static ist1_stack_top: u8;
     static gdt64: u8;
     static gdt64_ptr: u8;
 }
 
-extern "C" {
+unsafe extern "C" {
     fn exception_stub_0();
     fn exception_stub_1();
     fn exception_stub_2();
@@ -655,7 +655,7 @@ extern "C" {
 // Initialization
 // ---------------------------------------------------------------------------
 
-pub unsafe fn init() {
+pub unsafe fn init() { unsafe {
     setup_tss();
     install_tss_in_gdt();
     reload_gdt();
@@ -663,9 +663,9 @@ pub unsafe fn init() {
     setup_idt();
     load_idt();
     console::puts(b"IDT initialized.\n");
-}
+}}
 
-unsafe fn setup_tss() {
+unsafe fn setup_tss() { unsafe {
     let tss_ptr = &tss as *const u8 as *mut u8;
     core::ptr::write_bytes(tss_ptr, 0, 104);
     // IST1 at offset 36 (8 bytes)
@@ -673,7 +673,7 @@ unsafe fn setup_tss() {
     core::ptr::write_unaligned(tss_ptr.add(36) as *mut u64, ist1_addr);
     // IOMAP base at offset 102 (2 bytes) — points past TSS end (no IOMAP)
     core::ptr::write_unaligned(tss_ptr.add(102) as *mut u16, 104u16);
-}
+}}
 
 /// Update TSS RSP0 — the kernel stack used for ring 3→0 transitions on
 /// hardware exceptions and interrupts. Must be called whenever we switch
@@ -681,13 +681,13 @@ unsafe fn setup_tss() {
 ///
 /// # Safety
 /// `rsp0` must point to the top of a valid, mapped kernel stack.
-pub unsafe fn update_tss_rsp0(rsp0: u64) {
+pub unsafe fn update_tss_rsp0(rsp0: u64) { unsafe {
     let tss_ptr = &tss as *const u8 as *mut u8;
     // RSP0 is at offset 4 in the x86-64 TSS
     core::ptr::write_unaligned(tss_ptr.add(4) as *mut u64, rsp0);
-}
+}}
 
-unsafe fn install_tss_in_gdt() {
+unsafe fn install_tss_in_gdt() { unsafe {
     let base = &tss as *const u8 as u64;
     let limit: u64 = 103;
     let gdt_ptr = &gdt64 as *const u8 as *mut u8;
@@ -705,26 +705,26 @@ unsafe fn install_tss_in_gdt() {
 
     core::ptr::write_unaligned(tss_desc as *mut u64, low);
     core::ptr::write_unaligned(tss_desc.add(8) as *mut u64, high);
-}
+}}
 
-unsafe fn reload_gdt() {
+unsafe fn reload_gdt() { unsafe {
     let ptr = &gdt64_ptr as *const u8;
     core::arch::asm!(
         "lgdt ({0})",
         in(reg) ptr,
         options(att_syntax, nostack)
     );
-}
+}}
 
-unsafe fn load_tss() {
+unsafe fn load_tss() { unsafe {
     core::arch::asm!(
         "ltr %ax",
         in("ax") 0x18u16,
         options(att_syntax, nostack, nomem)
     );
-}
+}}
 
-unsafe fn setup_idt() {
+unsafe fn setup_idt() { unsafe {
     let stubs: [unsafe extern "C" fn(); 32] = [
         exception_stub_0,
         exception_stub_1,
@@ -789,9 +789,9 @@ unsafe fn setup_idt() {
     for i in 0..16 {
         (*idt_ptr).entries[32 + i].set_handler(irq_stubs[i] as u64, 0x08, 0);
     }
-}
+}}
 
-unsafe fn load_idt() {
+unsafe fn load_idt() { unsafe {
     let idt_ptr = IdtPtr {
         limit: (core::mem::size_of::<Idt>() - 1) as u16,
         base: &raw const IDT as u64,
@@ -801,4 +801,4 @@ unsafe fn load_idt() {
         in(reg) &idt_ptr as *const IdtPtr,
         options(att_syntax, nostack)
     );
-}
+}}

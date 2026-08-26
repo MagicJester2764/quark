@@ -80,7 +80,7 @@ impl ModuleInfo {
 ///
 /// # Safety
 /// `info_addr` must point to a valid multiboot2 boot information structure.
-pub unsafe fn parse_modules(info_addr: usize) -> (usize, [ModuleInfo; MAX_MODULES]) {
+pub unsafe fn parse_modules(info_addr: usize) -> (usize, [ModuleInfo; MAX_MODULES]) { unsafe {
     let ptr = info_addr as *const u8;
     let total_size = (ptr as *const u32).read_unaligned() as usize;
     let mut offset: usize = 8;
@@ -132,7 +132,7 @@ pub unsafe fn parse_modules(info_addr: usize) -> (usize, [ModuleInfo; MAX_MODULE
     }
 
     (count, modules)
-}
+}}
 
 /// Parse memory map tags (type 6) from the multiboot2 info structure.
 ///
@@ -140,7 +140,7 @@ pub unsafe fn parse_modules(info_addr: usize) -> (usize, [ModuleInfo; MAX_MODULE
 /// `info_addr` must point to a valid multiboot2 boot information structure.
 pub unsafe fn parse_memory_map(
     info_addr: usize,
-) -> (usize, [MemoryRegion; MAX_MEMORY_REGIONS]) {
+) -> (usize, [MemoryRegion; MAX_MEMORY_REGIONS]) { unsafe {
     let ptr = info_addr as *const u8;
     let total_size = (ptr as *const u32).read_unaligned() as usize;
     let mut offset: usize = 8;
@@ -190,13 +190,13 @@ pub unsafe fn parse_memory_map(
     }
 
     (count, regions)
-}
+}}
 
 /// Parse the multiboot2 info structure and return framebuffer info if present.
 ///
 /// # Safety
 /// `info_addr` must point to a valid multiboot2 boot information structure.
-pub unsafe fn parse_framebuffer(info_addr: usize) -> Option<FramebufferInfo> {
+pub unsafe fn parse_framebuffer(info_addr: usize) -> Option<FramebufferInfo> { unsafe {
     let ptr = info_addr as *const u8;
 
     // First 8 bytes: total_size (u32) + reserved (u32)
@@ -277,4 +277,4 @@ pub unsafe fn parse_framebuffer(info_addr: usize) -> Option<FramebufferInfo> {
 
         offset += tag_size as usize;
     }
-}
+}}

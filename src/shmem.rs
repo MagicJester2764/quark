@@ -72,9 +72,9 @@ fn irq_restore(flags: u64) {
 
 /// Borrow the region table. Callers must already hold interrupts off.
 #[inline(always)]
-unsafe fn regions() -> &'static mut [ShmemRegion; MAX_SHMEM] {
+unsafe fn regions() -> &'static mut [ShmemRegion; MAX_SHMEM] { unsafe {
     &mut *core::ptr::addr_of_mut!(REGIONS)
-}
+}}
 
 /// Release a region's frames and reset the slot. Interrupts must be off.
 unsafe fn release(region: &mut ShmemRegion) {

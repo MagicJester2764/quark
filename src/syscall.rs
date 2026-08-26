@@ -116,7 +116,7 @@ pub fn write_msr(msr: u32, val: u64) {
     }
 }
 
-extern "C" {
+unsafe extern "C" {
     fn syscall_entry();
 }
 
@@ -272,7 +272,7 @@ fn fd_read_ipc(target_tid: usize, tag: u64, ptr: *mut u8, max_len: usize) -> u64
 }
 
 /// Called from assembly with 6 args mapped from user registers.
-#[no_mangle]
+#[unsafe(no_mangle)]
 extern "C" fn syscall_dispatch(
     nr: u64,
     arg0: u64,
@@ -1191,10 +1191,11 @@ extern "C" fn syscall_dispatch(
                 } else {
                     src_cap.root_slot
                 };
-                let gen = crate::cap::current_generation(root_tid as usize, root_slot as usize);
+                let generation =
+                    crate::cap::current_generation(root_tid as usize, root_slot as usize);
                 dest_task.cspace[dest_slot] = crate::cap::CapSlot {
                     cap_type: src_cap.cap_type,
-                    generation: gen,
+                    generation,
                     root_slot,
                     root_tid,
                     param0: src_cap.param0,
@@ -1370,11 +1371,11 @@ static mut PER_CPU: PerCpuData = PerCpuData {
 ///
 /// # Safety
 /// Must be called after syscall init.
-pub unsafe fn setup_percpu(kernel_stack_top: u64) {
+pub unsafe fn setup_percpu(kernel_stack_top: u64) { unsafe {
     PER_CPU.kernel_rsp = kernel_stack_top;
     let addr = &raw const PER_CPU as u64;
     write_msr(0xC000_0101, addr); // IA32_KERNEL_GS_BASE (for swapgs)
-}
+}}
 
 /// Update the kernel RSP in per-CPU data (used by scheduler on context switch).
 pub fn update_kernel_rsp(rsp: u64) {
@@ -1387,7 +1388,7 @@ pub fn update_kernel_rsp(rsp: u64) {
 ///
 /// # Safety
 /// `rip` must point to valid user code, `rsp` to a valid user stack.
-pub unsafe fn enter_usermode(rip: u64, rsp: u64) -> ! {
+pub unsafe fn enter_usermode(rip: u64, rsp: u64) -> ! { unsafe {
     core::arch::asm!(
         "pushq {user_ss}",             // SS
         "pushq {user_rsp}",            // RSP
@@ -1405,4 +1406,4 @@ pub unsafe fn enter_usermode(rip: u64, rsp: u64) -> ! {
         user_rip = in(reg) rip,
         options(att_syntax, nostack, noreturn)
     );
-}
+}}

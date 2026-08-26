@@ -145,14 +145,14 @@ impl Task {
     ///
     /// # Safety
     /// Must not be called while this task is running or its stack is in use.
-    pub unsafe fn free_stack(&mut self) {
+    pub unsafe fn free_stack(&mut self) { unsafe {
         if !self.kernel_stack_base.is_null() {
             let layout = Layout::from_size_align(self.kernel_stack_size, STACK_ALIGN)
                 .expect("task: invalid stack layout");
             dealloc(self.kernel_stack_base, layout);
             self.kernel_stack_base = core::ptr::null_mut();
         }
-    }
+    }}
 }
 
 /// Trampoline that runs when a task function returns.

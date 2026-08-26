@@ -23,7 +23,7 @@ static mut VTABLE: Option<ConsoleVtable> = None;
 ///
 /// # Safety
 /// `module_start` must point to a valid VGA driver flat binary.
-pub unsafe fn init_from_driver(module_start: usize) {
+pub unsafe fn init_from_driver(module_start: usize) { unsafe {
     type EntryFn = unsafe extern "C" fn(*mut ConsoleVtable, *const KernelServices);
     let entry: EntryFn = core::mem::transmute(module_start);
 
@@ -32,7 +32,7 @@ pub unsafe fn init_from_driver(module_start: usize) {
 
     let vt_ptr = &raw mut VTABLE;
     ptr::write(vt_ptr, Some(vtable.assume_init()));
-}
+}}
 
 /// Returns true if the VGA driver was loaded successfully.
 pub fn is_loaded() -> bool {

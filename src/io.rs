@@ -1,17 +1,17 @@
 //! x86-64 port I/O helpers.
 
 /// Write a byte to an I/O port.
-pub unsafe fn outb(port: u16, val: u8) {
+pub unsafe fn outb(port: u16, val: u8) { unsafe {
     core::arch::asm!(
         "out %al, %dx",
         in("dx") port,
         in("al") val,
         options(att_syntax, nostack, nomem)
     );
-}
+}}
 
 /// Read a byte from an I/O port.
-pub unsafe fn inb(port: u16) -> u8 {
+pub unsafe fn inb(port: u16) -> u8 { unsafe {
     let val: u8;
     core::arch::asm!(
         "in %dx, %al",
@@ -20,20 +20,20 @@ pub unsafe fn inb(port: u16) -> u8 {
         options(att_syntax, nostack, nomem)
     );
     val
-}
+}}
 
 /// Write a 16-bit word to an I/O port.
-pub unsafe fn outw(port: u16, val: u16) {
+pub unsafe fn outw(port: u16, val: u16) { unsafe {
     core::arch::asm!(
         "out %ax, %dx",
         in("dx") port,
         in("ax") val,
         options(att_syntax, nostack, nomem)
     );
-}
+}}
 
 /// Read a 16-bit word from an I/O port.
-pub unsafe fn inw(port: u16) -> u16 {
+pub unsafe fn inw(port: u16) -> u16 { unsafe {
     let val: u16;
     core::arch::asm!(
         "in %dx, %ax",
@@ -42,20 +42,20 @@ pub unsafe fn inw(port: u16) -> u16 {
         options(att_syntax, nostack, nomem)
     );
     val
-}
+}}
 
 /// Write a 32-bit dword to an I/O port.
-pub unsafe fn outl(port: u16, val: u32) {
+pub unsafe fn outl(port: u16, val: u32) { unsafe {
     core::arch::asm!(
         "out %eax, %dx",
         in("dx") port,
         in("eax") val,
         options(att_syntax, nostack, nomem)
     );
-}
+}}
 
 /// Read a 32-bit dword from an I/O port.
-pub unsafe fn inl(port: u16) -> u32 {
+pub unsafe fn inl(port: u16) -> u32 { unsafe {
     let val: u32;
     core::arch::asm!(
         "in %dx, %eax",
@@ -64,13 +64,13 @@ pub unsafe fn inl(port: u16) -> u32 {
         options(att_syntax, nostack, nomem)
     );
     val
-}
+}}
 
 /// Read `count` 16-bit words from an I/O port into a buffer using `rep insw`.
 ///
 /// # Safety
 /// `buf` must point to at least `count * 2` writable bytes.
-pub unsafe fn rep_insw(port: u16, buf: *mut u16, count: usize) {
+pub unsafe fn rep_insw(port: u16, buf: *mut u16, count: usize) { unsafe {
     core::arch::asm!(
         "rep insw",
         in("dx") port,
@@ -78,13 +78,13 @@ pub unsafe fn rep_insw(port: u16, buf: *mut u16, count: usize) {
         inout("rcx") count => _,
         options(att_syntax, nostack)
     );
-}
+}}
 
 /// Write `count` 16-bit words from a buffer to an I/O port using `rep outsw`.
 ///
 /// # Safety
 /// `buf` must point to at least `count * 2` readable bytes.
-pub unsafe fn rep_outsw(port: u16, buf: *const u16, count: usize) {
+pub unsafe fn rep_outsw(port: u16, buf: *const u16, count: usize) { unsafe {
     core::arch::asm!(
         "rep outsw",
         in("dx") port,
@@ -92,9 +92,9 @@ pub unsafe fn rep_outsw(port: u16, buf: *const u16, count: usize) {
         inout("rcx") count => _,
         options(att_syntax, nostack)
     );
-}
+}}
 
 /// Small delay for PIC initialization timing (write to unused port 0x80).
-pub unsafe fn io_wait() {
+pub unsafe fn io_wait() { unsafe {
     outb(0x80, 0);
-}
+}}

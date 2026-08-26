@@ -364,9 +364,9 @@ pub fn populate_from_bitmask(cspace: &mut CSpace, caps: u32) {
 ///
 /// # Safety
 /// Must be called with the task table accessible.
-unsafe fn task_cspace(tid: usize) -> Option<&'static CSpace> {
+unsafe fn task_cspace(tid: usize) -> Option<&'static CSpace> { unsafe {
     crate::scheduler::get_task_mut(tid).map(|t| &t.cspace)
-}
+}}
 
 /// Validate attenuation: new cap must be a subset of source cap.
 pub fn validate_attenuation(source: &CapSlot, new_type: CapType, new_p0: u64, new_p1: u64) -> bool {

@@ -156,9 +156,9 @@ pub fn read_cr3() -> usize {
 ///
 /// # Safety
 /// The address must point to a valid, identity-mapped PML4 table.
-pub unsafe fn write_cr3(addr: usize) {
+pub unsafe fn write_cr3(addr: usize) { unsafe {
     asm!("mov cr3, {}", in(reg) addr as u64, options(nomem, nostack));
-}
+}}
 
 /// Invalidate the TLB entry for a virtual address.
 pub fn invlpg(vaddr: usize) {
@@ -180,9 +180,9 @@ fn table_indices(vaddr: usize) -> (usize, usize, usize, usize) {
 ///
 /// # Safety
 /// The address must be identity-mapped and point to a valid PageTable.
-pub unsafe fn table_at(phys: usize) -> &'static mut PageTable {
+pub unsafe fn table_at(phys: usize) -> &'static mut PageTable { unsafe {
     &mut *(phys as *mut PageTable)
-}
+}}
 
 /// Allocate a new zeroed page table from the PMM.
 fn alloc_table() -> Result<usize, PagingError> {
@@ -212,7 +212,7 @@ pub unsafe fn map_page(
     virt_addr: usize,
     phys_addr: usize,
     flags: u64,
-) -> Result<(), PagingError> {
+) -> Result<(), PagingError> { unsafe {
     let (pml4i, pdpti, pdi, pti) = table_indices(virt_addr);
     let user = flags & USER;
 
@@ -276,7 +276,7 @@ pub unsafe fn map_page(
     invlpg(virt_addr);
 
     Ok(())
-}
+}}
 
 /// Look up the leaf PTE flags for `virt` in the address space rooted at
 /// `pml4_phys`. Returns `None` if any level along the walk is absent.
@@ -286,7 +286,7 @@ pub unsafe fn map_page(
 ///
 /// # Safety
 /// `pml4_phys` must point to a valid, identity-mapped PML4 table.
-pub unsafe fn walk_flags(pml4_phys: usize, virt: usize) -> Option<u64> {
+pub unsafe fn walk_flags(pml4_phys: usize, virt: usize) -> Option<u64> { unsafe {
     let (pml4i, pdpti, pdi, pti) = table_indices(virt);
 
     // A page is user-accessible only if USER is set at *every* level of the
@@ -321,7 +321,7 @@ pub unsafe fn walk_flags(pml4_phys: usize, virt: usize) -> Option<u64> {
 
     let _ = descend!(table_at(e.frame_address()).entries[pti]);
     Some(synth_flags(user, writable))
-}
+}}
 
 /// Build a flags word carrying just the effective PRESENT/USER/WRITABLE bits
 /// produced by a page-table walk.
@@ -339,7 +339,7 @@ fn synth_flags(user: bool, writable: bool) -> u64 {
 ///
 /// # Safety
 /// `pml4_phys` must point to a valid, identity-mapped PML4 table.
-pub unsafe fn translate(pml4_phys: usize, virt: usize) -> Option<usize> {
+pub unsafe fn translate(pml4_phys: usize, virt: usize) -> Option<usize> { unsafe {
     let (pml4i, pdpti, pdi, pti) = table_indices(virt);
 
     let e = table_at(pml4_phys).entries[pml4i];
@@ -365,7 +365,7 @@ pub unsafe fn translate(pml4_phys: usize, virt: usize) -> Option<usize> {
         return None;
     }
     Some(e.frame_address() + (virt & 0xFFF))
-}
+}}
 
 /// Check that every page of `[addr, addr + len)` is currently mapped, present,
 /// and user-accessible in the address space rooted at `pml4_phys` — and
@@ -383,7 +383,7 @@ pub unsafe fn user_range_accessible(
     addr: u64,
     len: u64,
     write: bool,
-) -> bool {
+) -> bool { unsafe {
     if len == 0 {
         return true;
     }
@@ -414,7 +414,7 @@ pub unsafe fn user_range_accessible(
         }
         page += PAGE_SIZE as u64;
     }
-}
+}}
 
 /// Destroy a user address space, freeing all user page tables and mapped frames.
 ///
@@ -425,7 +425,7 @@ pub unsafe fn user_range_accessible(
 ///
 /// # Safety
 /// `pml4_phys` must be a valid user address space (not the kernel CR3).
-pub unsafe fn destroy_address_space(pml4_phys: usize) {
+pub unsafe fn destroy_address_space(pml4_phys: usize) { unsafe {
     if pml4_phys == 0 || pml4_phys == kernel_cr3() {
         return;
     }
@@ -450,9 +450,9 @@ pub unsafe fn destroy_address_space(pml4_phys: usize) {
 
     // Free the PML4 frame itself
     pmm::free(pmm::PhysFrame::from_address(pml4_phys));
-}
+}}
 
-unsafe fn free_pdpt_tree(pdpt_phys: usize) {
+unsafe fn free_pdpt_tree(pdpt_phys: usize) { unsafe {
     let pdpt = table_at(pdpt_phys);
     for i in 0..512 {
         if pdpt.entries[i].is_present() && !pdpt.entries[i].is_huge() {
@@ -461,9 +461,9 @@ unsafe fn free_pdpt_tree(pdpt_phys: usize) {
         }
     }
     pmm::free(pmm::PhysFrame::from_address(pdpt_phys));
-}
+}}
 
-unsafe fn free_pd_tree(pd_phys: usize) {
+unsafe fn free_pd_tree(pd_phys: usize) { unsafe {
     let pd = table_at(pd_phys);
     for i in 0..512 {
         if pd.entries[i].is_present() {
@@ -477,9 +477,9 @@ unsafe fn free_pd_tree(pd_phys: usize) {
         }
     }
     pmm::free(pmm::PhysFrame::from_address(pd_phys));
-}
+}}
 
-unsafe fn free_pt_leaves(pt_phys: usize) {
+unsafe fn free_pt_leaves(pt_phys: usize) { unsafe {
     let pt = table_at(pt_phys);
     for i in 0..512 {
         // Only return frames this address space owns. Device MMIO mapped via
@@ -492,7 +492,7 @@ unsafe fn free_pt_leaves(pt_phys: usize) {
         }
     }
     pmm::free(pmm::PhysFrame::from_address(pt_phys));
-}
+}}
 
 /// Unmap a 4 KiB virtual page. Returns `(frame_address, pte_flags)`.
 ///
@@ -506,7 +506,7 @@ unsafe fn free_pt_leaves(pt_phys: usize) {
 pub unsafe fn unmap_page(
     pml4_phys: usize,
     virt_addr: usize,
-) -> Result<(usize, u64), PagingError> {
+) -> Result<(usize, u64), PagingError> { unsafe {
     let (pml4i, pdpti, pdi, pti) = table_indices(virt_addr);
 
     let pml4 = table_at(pml4_phys);
@@ -543,15 +543,15 @@ pub unsafe fn unmap_page(
     }
 
     Ok((frame_addr, flags))
-}
+}}
 
 /// True if every entry in the table at `phys` is absent.
-unsafe fn table_is_empty(phys: usize) -> bool {
+unsafe fn table_is_empty(phys: usize) -> bool { unsafe {
     table_at(phys).entries.iter().all(|e| !e.is_present())
-}
+}}
 
 /// Walk back up from a just-cleared PTE, freeing each level that is now empty.
-unsafe fn reclaim_empty_tables(pml4_phys: usize, virt_addr: usize) {
+unsafe fn reclaim_empty_tables(pml4_phys: usize, virt_addr: usize) { unsafe {
     let (pml4i, pdpti, pdi, _) = table_indices(virt_addr);
 
     let pml4 = table_at(pml4_phys);
@@ -587,14 +587,14 @@ unsafe fn reclaim_empty_tables(pml4_phys: usize, virt_addr: usize) {
     }
     pml4.entries[pml4i].clear();
     pmm::free(pmm::PhysFrame::from_address(pdpt_phys));
-}
+}}
 
 /// Unmap a 4 KiB page and return its frame to the PMM, but only if this
 /// address space owned it. Returns `true` if a frame was actually freed.
 ///
 /// # Safety
 /// `pml4_phys` must point to a valid, identity-mapped PML4 table.
-pub unsafe fn unmap_page_owned(pml4_phys: usize, virt_addr: usize) -> bool {
+pub unsafe fn unmap_page_owned(pml4_phys: usize, virt_addr: usize) -> bool { unsafe {
     match unmap_page(pml4_phys, virt_addr) {
         Ok((frame_addr, flags)) if flags & OWNED != 0 => {
             pmm::free(pmm::PhysFrame::from_address(frame_addr));
@@ -602,4 +602,4 @@ pub unsafe fn unmap_page_owned(pml4_phys: usize, virt_addr: usize) -> bool {
         }
         _ => false,
     }
-}
+}}

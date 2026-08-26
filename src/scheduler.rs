@@ -75,9 +75,9 @@ pub fn init() {
 /// # Safety
 /// Caller must hold interrupts off across the search and the subsequent
 /// install, or another task can claim the same slot.
-unsafe fn find_free_tid() -> Option<usize> {
+unsafe fn find_free_tid() -> Option<usize> { unsafe {
     (1..MAX_TASKS).find(|&i| TASKS[i].is_none())
-}
+}}
 
 /// Spawn a new kernel task that begins at `entry_fn`.
 /// Returns the new task's TID.
@@ -187,7 +187,7 @@ pub fn timer_tick() {
 /// # Safety
 /// Must be called with interrupts disabled (from IRQ handler) or willing
 /// to be preempted (yield_now).
-unsafe fn schedule_inner(from_irq: bool) {
+unsafe fn schedule_inner(from_irq: bool) { unsafe {
     let _ = from_irq;
 
     // Disable interrupts during scheduling
@@ -249,7 +249,7 @@ unsafe fn schedule_inner(from_irq: bool) {
         let kernel_stack_top =
             new_task.kernel_stack_base as u64 + new_task.kernel_stack_size as u64;
         crate::syscall::update_kernel_rsp(kernel_stack_top);
-        unsafe { crate::idt::update_tss_rsp0(kernel_stack_top); }
+        crate::idt::update_tss_rsp0(kernel_stack_top);
     }
 
     // Get raw pointers to contexts
@@ -263,10 +263,10 @@ unsafe fn schedule_inner(from_irq: bool) {
 
     // Perform the context switch (restores RFLAGS from new context)
     context::context_switch(old_ctx, new_ctx);
-}
+}}
 
 /// Dequeue the next ready task from the ready queue.
-unsafe fn dequeue_ready() -> Option<usize> {
+unsafe fn dequeue_ready() -> Option<usize> { unsafe {
     while READY_COUNT > 0 {
         let tid = READY_QUEUE[READY_HEAD];
         READY_HEAD = (READY_HEAD + 1) % MAX_TASKS;
@@ -280,10 +280,10 @@ unsafe fn dequeue_ready() -> Option<usize> {
         }
     }
     None
-}
+}}
 
 /// Add a task TID to the back of the ready queue.
-unsafe fn enqueue(tid: usize) {
+unsafe fn enqueue(tid: usize) { unsafe {
     if READY_COUNT >= MAX_TASKS {
         crate::console::puts(b"scheduler: ready queue full, dropping task\n");
         return;
@@ -291,14 +291,14 @@ unsafe fn enqueue(tid: usize) {
     READY_QUEUE[READY_TAIL] = tid;
     READY_TAIL = (READY_TAIL + 1) % MAX_TASKS;
     READY_COUNT += 1;
-}
+}}
 
 /// Restore interrupt flag from saved RFLAGS.
-unsafe fn restore_flags(flags: u64) {
+unsafe fn restore_flags(flags: u64) { unsafe {
     if flags & (1 << 9) != 0 {
         core::arch::asm!("sti", options(nostack, nomem));
     }
-}
+}}
 
 /// Get the current task's TID.
 pub fn current_tid() -> usize {
@@ -333,9 +333,9 @@ pub fn unblock_task(tid: usize) {
 }
 
 /// Read a dead child's exit status. Interrupts must be off.
-unsafe fn child_exit_code(tid: usize) -> i32 {
+unsafe fn child_exit_code(tid: usize) -> i32 { unsafe {
     TASKS[tid].as_ref().map(|t| t.exit_code).unwrap_or(0)
-}
+}}
 
 /// Block the current task until a child exits.
 ///
@@ -392,13 +392,13 @@ pub fn sys_wait() -> u64 {
 ///
 /// # Safety
 /// Caller must ensure no aliasing.
-pub unsafe fn get_task_mut(tid: usize) -> Option<&'static mut Task> {
+pub unsafe fn get_task_mut(tid: usize) -> Option<&'static mut Task> { unsafe {
     if tid < MAX_TASKS {
         TASKS[tid].as_mut()
     } else {
         None
     }
-}
+}}
 
 /// Kill a task by TID. Marks it Dead and wakes its parent if waiting.
 /// Cannot kill TID 0 (idle) or TID 1 (init).

@@ -78,15 +78,15 @@ impl LockedHeap {
 static ALLOCATOR: LockedHeap = LockedHeap::new();
 
 unsafe impl GlobalAlloc for LockedHeap {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 { unsafe {
         let mut inner = self.inner.lock();
         alloc_inner(&mut inner, layout)
-    }
+    }}
 
-    unsafe fn dealloc(&self, ptr: *mut u8, _layout: Layout) {
+    unsafe fn dealloc(&self, ptr: *mut u8, _layout: Layout) { unsafe {
         let mut inner = self.inner.lock();
         dealloc_inner(&mut inner, ptr);
-    }
+    }}
 }
 
 // ---------------------------------------------------------------------------
@@ -98,7 +98,7 @@ const fn align_up(addr: usize, align: usize) -> usize {
 }
 
 /// First-fit allocation with alignment handling.
-unsafe fn alloc_inner(heap: &mut HeapInner, layout: Layout) -> *mut u8 {
+unsafe fn alloc_inner(heap: &mut HeapInner, layout: Layout) -> *mut u8 { unsafe {
     let user_size = layout.size().max(MIN_BLOCK_SIZE);
     let align = layout.align().max(8);
 
@@ -169,10 +169,10 @@ unsafe fn alloc_inner(heap: &mut HeapInner, layout: Layout) -> *mut u8 {
     }
 
     ptr::null_mut()
-}
+}}
 
 /// Return a block to the free list with sorted-address insertion and coalescing.
-unsafe fn dealloc_inner(heap: &mut HeapInner, ptr: *mut u8) {
+unsafe fn dealloc_inner(heap: &mut HeapInner, ptr: *mut u8) { unsafe {
     let header = (ptr as usize - HEADER_SIZE) as *const AllocHeader;
     let block_start = (*header).block_start;
     let block_size = (*header).block_size;
@@ -215,10 +215,10 @@ unsafe fn dealloc_inner(heap: &mut HeapInner, ptr: *mut u8) {
             (*prev).next = (*new_block).next;
         }
     }
-}
+}}
 
 /// Grow the heap by mapping new pages at `heap_end`.
-unsafe fn grow(heap: &mut HeapInner, min_bytes: usize) {
+unsafe fn grow(heap: &mut HeapInner, min_bytes: usize) { unsafe {
     let min_pages = (min_bytes + PAGE_SIZE - 1) / PAGE_SIZE;
     let pages = min_pages.max(GROW_PAGES);
 
@@ -278,7 +278,7 @@ unsafe fn grow(heap: &mut HeapInner, min_bytes: usize) {
         }
         (*prev).next = new_block;
     }
-}
+}}
 
 // ---------------------------------------------------------------------------
 // Public init
@@ -289,7 +289,7 @@ unsafe fn grow(heap: &mut HeapInner, min_bytes: usize) {
 ///
 /// # Safety
 /// Must be called exactly once, after PMM and paging are available.
-pub unsafe fn init() {
+pub unsafe fn init() { unsafe {
     let mut inner = ALLOCATOR.inner.lock();
     if inner.initialized {
         return;
@@ -321,7 +321,7 @@ pub unsafe fn init() {
     inner.heap_end = HEAP_START + total;
     inner.total_size = total;
     inner.initialized = true;
-}
+}}
 
 // ---------------------------------------------------------------------------
 // OOM handler

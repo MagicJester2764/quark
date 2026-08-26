@@ -12,7 +12,7 @@ const PAGE_SIZE: usize = 4096;
 /// 4 GiB / 4 KiB = 1048576 frames, 1048576 / 8 = 131072 bytes.
 const BITMAP_SIZE: usize = 131072;
 
-extern "C" {
+unsafe extern "C" {
     static __bss_end: u8;
 }
 
@@ -81,7 +81,7 @@ pub unsafe fn init(
     count: usize,
     mb_info_addr: usize,
     mb_info_size: usize,
-) {
+) { unsafe {
     let mut pmm = PMM.lock();
 
     // Step 1: For each available region, clear bits (mark free).
@@ -137,7 +137,7 @@ pub unsafe fn init(
             pmm.mark_range_used(m.start, m.end);
         }
     }
-}
+}}
 
 /// Allocate a single 4 KiB physical frame.
 pub fn alloc() -> Option<PhysFrame> {

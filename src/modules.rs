@@ -7,11 +7,11 @@ static mut MODULES: [ModuleInfo; MAX_MODULES] = [ModuleInfo::empty(); MAX_MODULE
 ///
 /// # Safety
 /// Must be called once with a valid multiboot2 info address.
-pub unsafe fn init(info_addr: usize) {
+pub unsafe fn init(info_addr: usize) { unsafe {
     let (count, parsed) = multiboot2::parse_modules(info_addr);
     MODULE_COUNT = count;
     MODULES = parsed;
-}
+}}
 
 /// Number of loaded modules.
 pub fn count() -> usize {
@@ -43,10 +43,10 @@ pub fn find(name: &[u8]) -> Option<&'static ModuleInfo> {
 ///
 /// # Safety
 /// The module's memory region must be valid and identity-mapped.
-pub unsafe fn data(module: &ModuleInfo) -> &'static [u8] {
+pub unsafe fn data(module: &ModuleInfo) -> &'static [u8] { unsafe {
     let len = module.end - module.start;
     core::slice::from_raw_parts(module.start as *const u8, len)
-}
+}}
 
 /// Check if `haystack` starts with `needle` (stops at null in haystack).
 fn starts_with(haystack: &[u8], needle: &[u8]) -> bool {

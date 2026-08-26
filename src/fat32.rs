@@ -41,7 +41,7 @@ static mut VTABLE: Option<Fat32Vtable> = None;
 ///
 /// # Safety
 /// `module_start` must point to a valid FAT32 driver flat binary.
-unsafe fn init_from_driver(module_start: usize) {
+unsafe fn init_from_driver(module_start: usize) { unsafe {
     type EntryFn = unsafe extern "C" fn(*mut Fat32Vtable, *const KernelServices);
     let entry: EntryFn = core::mem::transmute(module_start);
 
@@ -50,7 +50,7 @@ unsafe fn init_from_driver(module_start: usize) {
 
     let vt_ptr = &raw mut VTABLE;
     ptr::write(vt_ptr, Some(vtable.assume_init()));
-}
+}}
 
 /// Try to load the FAT32 driver from boot modules.
 pub fn init() {

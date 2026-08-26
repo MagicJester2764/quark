@@ -17,7 +17,7 @@ const PIC_EOI: u8 = 0x20;
 const PIC_READ_ISR: u8 = 0x0B;
 
 /// Initialize both PICs: remap IRQs, mask all lines.
-pub unsafe fn init() {
+pub unsafe fn init() { unsafe {
     // Save current masks
     let mask1 = io::inb(PIC1_DATA);
     let mask2 = io::inb(PIC2_DATA);
@@ -52,10 +52,10 @@ pub unsafe fn init() {
 
     // Suppress unused-variable warnings — masks saved for reference
     let _ = (mask1, mask2);
-}
+}}
 
 /// Enable (unmask) a specific IRQ line (0–15).
-pub unsafe fn enable_irq(irq: u8) {
+pub unsafe fn enable_irq(irq: u8) { unsafe {
     if irq < 8 {
         let mask = io::inb(PIC1_DATA) & !(1 << irq);
         io::outb(PIC1_DATA, mask);
@@ -66,11 +66,11 @@ pub unsafe fn enable_irq(irq: u8) {
         let master = io::inb(PIC1_DATA) & !(1 << 2);
         io::outb(PIC1_DATA, master);
     }
-}
+}}
 
 /// Disable (mask) a specific IRQ line (0–15).
 #[allow(dead_code)]
-pub unsafe fn disable_irq(irq: u8) {
+pub unsafe fn disable_irq(irq: u8) { unsafe {
     if irq < 8 {
         let mask = io::inb(PIC1_DATA) | (1 << irq);
         io::outb(PIC1_DATA, mask);
@@ -78,22 +78,22 @@ pub unsafe fn disable_irq(irq: u8) {
         let mask = io::inb(PIC2_DATA) | (1 << (irq - 8));
         io::outb(PIC2_DATA, mask);
     }
-}
+}}
 
 /// Send End-Of-Interrupt. For IRQ >= 8, send to both slave and master.
-pub unsafe fn send_eoi(irq: u8) {
+pub unsafe fn send_eoi(irq: u8) { unsafe {
     if irq >= 8 {
         io::outb(PIC2_CMD, PIC_EOI);
     }
     io::outb(PIC1_CMD, PIC_EOI);
-}
+}}
 
 /// Read the combined 16-bit In-Service Register (ISR).
 /// Bits 0–7 = master, bits 8–15 = slave.
-pub unsafe fn read_isr() -> u16 {
+pub unsafe fn read_isr() -> u16 { unsafe {
     io::outb(PIC1_CMD, PIC_READ_ISR);
     io::outb(PIC2_CMD, PIC_READ_ISR);
     let lo = io::inb(PIC1_CMD) as u16;
     let hi = io::inb(PIC2_CMD) as u16;
     lo | (hi << 8)
-}
+}}

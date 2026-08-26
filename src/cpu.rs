@@ -46,9 +46,9 @@ fn read_cr4() -> u64 {
 
 /// # Safety
 /// Caller must not clear bits the kernel depends on (PAE, OSFXSR, ...).
-unsafe fn write_cr4(val: u64) {
+unsafe fn write_cr4(val: u64) { unsafe {
     core::arch::asm!("mov cr4, {}", in(reg) val, options(nomem, nostack));
-}
+}}
 
 /// Enable SMEP and SMAP if the CPU supports them.
 ///
@@ -59,7 +59,7 @@ unsafe fn write_cr4(val: u64) {
 ///
 /// # Safety
 /// Must be called once, during boot, on the bootstrap CPU.
-pub unsafe fn init_protections() {
+pub unsafe fn init_protections() { unsafe {
     let features = cpuid_7_0_ebx();
     let smep = features & (1 << 7) != 0;
     let smap = features & (1 << 20) != 0;
@@ -90,7 +90,7 @@ pub unsafe fn init_protections() {
         out(smap_s);
         out(b".\n");
     }
-}
+}}
 
 /// Scoped permission for the kernel to touch user memory.
 ///
