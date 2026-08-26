@@ -16,6 +16,11 @@ const MAX_WAITERS: usize = 8;
 
 struct Pipe {
     in_use: bool,
+    /// Task that created this pipe, so an orphan (created but never wired to
+    /// any fd, hence refcount 0) can be reclaimed when its creator dies.
+    /// Without this, sys_pipe_create leaked a slot permanently on every
+    /// failed spawn and the 31 slots could be exhausted for good.
+    creator: usize,
     buf: [u8; PIPE_BUF_SIZE],
     read_pos: usize,
     write_pos: usize,
@@ -32,6 +37,7 @@ impl Pipe {
     const fn new() -> Self {
         Pipe {
             in_use: false,
+            creator: 0,
             buf: [0; PIPE_BUF_SIZE],
             read_pos: 0,
             write_pos: 0,
@@ -69,24 +75,59 @@ fn irq_restore(flags: u64) {
     }
 }
 
+/// Maximum pipes a single task may hold open at once.
+const MAX_PIPES_PER_TASK: usize = 8;
+
 /// Create a new pipe. Returns the pipe handle index.
 /// Handles start at 1 (slot 0 is reserved so that 0 can mean "no pipe").
 pub fn create() -> Option<usize> {
+    let creator = scheduler::current_tid();
     let flags = irq_save();
     let result = unsafe {
-        let mut found = None;
-        for i in 1..MAX_PIPES {
-            if !PIPES[i].in_use {
-                PIPES[i] = Pipe::new();
-                PIPES[i].in_use = true;
-                found = Some(i);
-                break;
+        // Per-task cap: sys_pipe_create needs no capability (the shell needs
+        // it for `|`), so bound it here rather than letting one task drain the
+        // global table.
+        let held = (1..MAX_PIPES)
+            .filter(|&i| PIPES[i].in_use && PIPES[i].creator == creator)
+            .count();
+        if held >= MAX_PIPES_PER_TASK {
+            None
+        } else {
+            let mut found = None;
+            for i in 1..MAX_PIPES {
+                if !PIPES[i].in_use {
+                    PIPES[i] = Pipe::new();
+                    PIPES[i].in_use = true;
+                    PIPES[i].creator = creator;
+                    found = Some(i);
+                    break;
+                }
             }
+            found
         }
-        found
     };
     irq_restore(flags);
     result
+}
+
+/// Release pipes created by a dying task that were never wired to an fd.
+///
+/// Pipes with live endpoints are refcounted through `cleanup_task_fds`; this
+/// only reclaims the ones that never got a reference at all.
+pub fn cleanup_orphans(tid: usize) {
+    let flags = irq_save();
+    unsafe {
+        for i in 1..MAX_PIPES {
+            if PIPES[i].in_use
+                && PIPES[i].creator == tid
+                && PIPES[i].readers == 0
+                && PIPES[i].writers == 0
+            {
+                PIPES[i].in_use = false;
+            }
+        }
+    }
+    irq_restore(flags);
 }
 
 /// Increment the reader or writer refcount for a pipe.

@@ -546,24 +546,21 @@ extern "C" fn syscall_dispatch(
             }
             // For simplicity, allocate pages one at a time and return the first
             // (Only single-page alloc is reliable with bitmap allocator)
-            if count == 1 {
-                match crate::pmm::alloc() {
-                    Some(frame) => {
-                        scheduler::current_task_charge_mem(1);
-                        frame.address() as u64
-                    }
-                    None => u64::MAX,
-                }
+            let frame = if count == 1 {
+                crate::pmm::alloc()
             } else {
                 // Allocate count physically contiguous pages
-                match crate::pmm::alloc_contiguous(count) {
-                    Some(frame) => {
-                        scheduler::current_task_charge_mem(count);
-                        frame.address() as u64
-                    }
-                    None => u64::MAX,
-                }
-            }
+                crate::pmm::alloc_contiguous(count)
+            };
+            let base = match frame {
+                Some(f) => f.address(),
+                None => return u64::MAX,
+            };
+            // Record who owns these frames so sys_phys_free can verify the
+            // caller actually holds them, and so reaping can reclaim them.
+            crate::pmm::set_owner(base, count, scheduler::current_tid());
+            scheduler::current_task_charge_mem(count);
+            base as u64
         }
         SYS_PHYS_FREE => {
             // arg0 = phys addr, arg1 = count
@@ -575,15 +572,16 @@ extern "C" fn syscall_dispatch(
             if count == 0 || addr & 0xFFF != 0 {
                 return u64::MAX;
             }
-            let end = match count.checked_mul(4096).and_then(|l| addr.checked_add(l)) {
-                Some(e) => e,
-                None => return u64::MAX,
-            };
-            // The caller must hold authority over the range it is releasing.
-            if !crate::cap::task_has_phys_range(scheduler::current_tid(), addr, count) {
+            if count.checked_mul(4096).and_then(|l| addr.checked_add(l)).is_none() {
                 return u64::MAX;
             }
-            let _ = end;
+            // Every frame in the range must belong to this task. Anything
+            // else — a kernel frame, another task's frames, or a partially
+            // owned range — is rejected rather than pushed into the allocator.
+            if !crate::pmm::owns_range(addr, count, scheduler::current_tid()) {
+                return u64::MAX;
+            }
+            crate::pmm::clear_owner(addr, count);
             for i in 0..count {
                 crate::pmm::free(crate::pmm::PhysFrame::from_address(addr + i * 4096));
             }
@@ -649,12 +647,12 @@ extern "C" fn syscall_dispatch(
             }
             let tid = arg0 as usize;
             let caps = arg1 as u32;
-            // Root can grant any caps without holding them
-            if scheduler::current_task_uid() != 0 {
-                let caller_caps = scheduler::current_task_caps();
-                if caps & !caller_caps != 0 {
-                    return u64::MAX;
-                }
+            // The granter must hold every bit it delegates. UID 0 used to skip
+            // this entirely, which made the check meaningless for the only
+            // tasks that call it.
+            let caller_caps = scheduler::current_task_caps();
+            if caps & !caller_caps != 0 {
+                return u64::MAX;
             }
             match scheduler::grant_cap(tid, caps) {
                 Ok(()) => 0,
@@ -1089,8 +1087,9 @@ extern "C" fn syscall_dispatch(
                     Some(t) => t,
                     None => return u64::MAX,
                 };
-                // Root can mint any cap; others must hold a superset cap
-                if task.uid != 0 && !crate::cap::can_mint(&task.cspace, cap_type, param0, param1) {
+                // The caller must already hold a capability that covers what
+                // it is minting. This used to be skipped for UID 0.
+                if !crate::cap::can_mint(&task.cspace, cap_type, param0, param1) {
                     return u64::MAX;
                 }
                 // Target slot must be empty
@@ -1353,10 +1352,10 @@ pub unsafe fn enter_usermode(rip: u64, rsp: u64) -> ! {
     core::arch::asm!(
         "pushq {user_ss}",             // SS
         "pushq {user_rsp}",            // RSP
-        "pushfq",                       // RFLAGS (will set IF below)
-        "popq %rax",
-        "orq $0x200, %rax",            // set IF
-        "pushq %rax",
+        // RFLAGS built from scratch: bit 1 (reserved, always set) + IF.
+        // Deriving it from the kernel's current RFLAGS handed user mode
+        // whatever DF/AC/IOPL state the kernel happened to be in.
+        "pushq $0x202",                // RFLAGS
         "pushq {user_cs}",             // CS
         "pushq {user_rip}",            // RIP
         "swapgs",                       // set up GS for next syscall

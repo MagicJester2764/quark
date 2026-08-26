@@ -11,8 +11,12 @@ const MAX_FUTEX_WAITERS: usize = 64;
 #[derive(Clone, Copy)]
 struct FutexWaiter {
     tid: usize,
-    cr3: usize,
-    vaddr: usize,
+    /// Physical address of the futex word.
+    ///
+    /// Keying on (cr3, vaddr) made a futex inside a shared-memory region a
+    /// *different* object in every task that mapped it, so cross-process
+    /// synchronisation through shmem silently never woke anyone.
+    paddr: usize,
     active: bool,
 }
 
@@ -23,8 +27,7 @@ struct FutexState {
 static FUTEX: IrqSpinLock<FutexState> = IrqSpinLock::new(FutexState {
     waiters: [FutexWaiter {
         tid: 0,
-        cr3: 0,
-        vaddr: 0,
+        paddr: 0,
         active: false,
     }; MAX_FUTEX_WAITERS],
 });
@@ -51,6 +54,10 @@ pub fn futex_wait(addr: u64, expected: u32) -> u64 {
     if !unsafe { crate::paging::user_range_accessible(cr3, addr, 4, false) } {
         return u64::MAX;
     }
+    let paddr = match unsafe { crate::paging::translate(cr3, addr as usize) } {
+        Some(p) => p,
+        None => return u64::MAX,
+    };
 
     let mut state = FUTEX.lock();
 
@@ -68,8 +75,7 @@ pub fn futex_wait(addr: u64, expected: u32) -> u64 {
 
     state.waiters[slot] = FutexWaiter {
         tid,
-        cr3,
-        vaddr: addr as usize,
+        paddr,
         active: true,
     };
 
@@ -87,7 +93,7 @@ pub fn futex_wait(addr: u64, expected: u32) -> u64 {
     if let Some(w) = state
         .waiters
         .iter_mut()
-        .find(|w| w.active && w.tid == tid && w.vaddr == addr as usize && w.cr3 == cr3)
+        .find(|w| w.active && w.tid == tid && w.paddr == paddr)
     {
         w.active = false;
     }
@@ -104,7 +110,10 @@ pub fn futex_wake(addr: u64, max_wake: u64) -> u64 {
     }
 
     let cr3 = scheduler::current_task_cr3();
-    let vaddr = addr as usize;
+    let paddr = match unsafe { crate::paging::translate(cr3, addr as usize) } {
+        Some(p) => p,
+        None => return 0,
+    };
     let mut woken = 0u64;
 
     let mut state = FUTEX.lock();
@@ -112,7 +121,7 @@ pub fn futex_wake(addr: u64, max_wake: u64) -> u64 {
         if woken >= max_wake {
             break;
         }
-        if waiter.active && waiter.cr3 == cr3 && waiter.vaddr == vaddr {
+        if waiter.active && waiter.paddr == paddr {
             waiter.active = false;
             scheduler::unblock_task(waiter.tid);
             woken += 1;

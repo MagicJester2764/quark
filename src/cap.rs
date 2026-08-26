@@ -23,6 +23,9 @@ pub const KERNEL_ROOT_TID: u8 = 0xFF;
 static mut USER_CAPS: [u32; MAX_USERS] = [0; MAX_USERS];
 
 /// Get the UID for a given task TID.
+///
+/// Used only to look up the per-UID default capability bitmask. UID 0 no
+/// longer short-circuits the capability checks themselves.
 fn task_uid(tid: usize) -> u32 {
     unsafe {
         crate::scheduler::get_task_mut(tid)
@@ -119,7 +122,6 @@ fn is_valid(cap: &CapSlot) -> bool {
 /// Check if a task has IoPort capability covering the given port.
 pub fn task_has_ioport(tid: usize, port: u16) -> bool {
     if tid >= MAX_TASKS { return false; }
-    if task_uid(tid) == 0 { return true; }
     if user_has_cap_bit(tid, crate::task::CAP_IOPORT) { return true; }
     unsafe {
         let cspace = task_cspace(tid);
@@ -138,7 +140,6 @@ pub fn task_has_ioport(tid: usize, port: u16) -> bool {
 /// Check if a task has Irq capability for the given IRQ number.
 pub fn task_has_irq(tid: usize, irq: u8) -> bool {
     if tid >= MAX_TASKS { return false; }
-    if task_uid(tid) == 0 { return true; }
     if user_has_cap_bit(tid, crate::task::CAP_IRQ) { return true; }
     unsafe {
         let cspace = task_cspace(tid);
@@ -156,7 +157,6 @@ pub fn task_has_irq(tid: usize, irq: u8) -> bool {
 /// Check if a task has PhysRange capability covering [phys, phys + pages*4096).
 pub fn task_has_phys_range(tid: usize, phys: usize, pages: usize) -> bool {
     if tid >= MAX_TASKS { return false; }
-    if task_uid(tid) == 0 { return true; }
     if user_has_cap_bit(tid, crate::task::CAP_MAP_PHYS) { return true; }
     // Checked: a wrapped `phys_end` would compare below `cap.param1` and let
     // an arbitrary physical range through.
@@ -185,7 +185,6 @@ pub fn task_has_phys_range(tid: usize, phys: usize, pages: usize) -> bool {
 /// target=0 means "any task" (for create/generic operations).
 pub fn task_has_task_mgmt(tid: usize, target: usize) -> bool {
     if tid >= MAX_TASKS { return false; }
-    if task_uid(tid) == 0 { return true; }
     if user_has_cap_bit(tid, crate::task::CAP_TASK_MGMT) { return true; }
     unsafe {
         let cspace = task_cspace(tid);
@@ -203,7 +202,6 @@ pub fn task_has_task_mgmt(tid: usize, target: usize) -> bool {
 /// Check if a task has PhysAlloc capability.
 pub fn task_has_phys_alloc(tid: usize) -> bool {
     if tid >= MAX_TASKS { return false; }
-    if task_uid(tid) == 0 { return true; }
     if user_has_cap_bit(tid, crate::task::CAP_PHYS_ALLOC) { return true; }
     unsafe {
         let cspace = task_cspace(tid);
@@ -220,7 +218,6 @@ pub fn task_has_phys_alloc(tid: usize) -> bool {
 /// Check if a task has SetUid capability.
 pub fn task_has_set_uid(tid: usize) -> bool {
     if tid >= MAX_TASKS { return false; }
-    if task_uid(tid) == 0 { return true; }
     if user_has_cap_bit(tid, crate::task::CAP_SET_UID) { return true; }
     unsafe {
         let cspace = task_cspace(tid);
@@ -391,17 +388,16 @@ pub fn validate_attenuation(source: &CapSlot, new_type: CapType, new_p0: u64, ne
         CapType::Irq => {
             // wildcard can narrow to specific; specific must match
             if source.param0 as u8 == 0xFF {
-                // Narrowing from the wildcard must name a concrete IRQ,
-                // otherwise "narrowing" hands back the wildcard again.
-                new_p0 as u8 != 0xFF
+                // Wildcard source covers every IRQ, so any request is a subset.
+                true
             } else {
                 new_p0 == source.param0
             }
         }
         CapType::TaskMgmt => {
-            // any (0) can narrow to specific; specific must match
+            // any (0) covers every target, so any request is a subset
             if source.param0 == 0 {
-                new_p0 != 0
+                true
             } else {
                 new_p0 == source.param0
             }

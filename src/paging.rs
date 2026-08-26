@@ -331,6 +331,42 @@ fn synth_flags(user: bool, writable: bool) -> u64 {
         | if writable { WRITABLE } else { 0 }
 }
 
+/// Resolve `virt` to its backing physical address in `pml4_phys`.
+///
+/// Returns `None` if the page is not mapped. Used to key futexes on physical
+/// memory so a futex word inside a shared-memory region is the same object to
+/// every task that maps it.
+///
+/// # Safety
+/// `pml4_phys` must point to a valid, identity-mapped PML4 table.
+pub unsafe fn translate(pml4_phys: usize, virt: usize) -> Option<usize> {
+    let (pml4i, pdpti, pdi, pti) = table_indices(virt);
+
+    let e = table_at(pml4_phys).entries[pml4i];
+    if !e.is_present() {
+        return None;
+    }
+    let e = table_at(e.frame_address()).entries[pdpti];
+    if !e.is_present() {
+        return None;
+    }
+    if e.is_huge() {
+        return Some(e.frame_address() + (virt & 0x3FFF_FFFF));
+    }
+    let e = table_at(e.frame_address()).entries[pdi];
+    if !e.is_present() {
+        return None;
+    }
+    if e.is_huge() {
+        return Some(e.frame_address() + (virt & 0x1F_FFFF));
+    }
+    let e = table_at(e.frame_address()).entries[pti];
+    if !e.is_present() {
+        return None;
+    }
+    Some(e.frame_address() + (virt & 0xFFF))
+}
+
 /// Check that every page of `[addr, addr + len)` is currently mapped, present,
 /// and user-accessible in the address space rooted at `pml4_phys` — and
 /// writable too when `write` is set.
@@ -499,7 +535,58 @@ pub unsafe fn unmap_page(
 
     invlpg(virt_addr);
 
+    // Release page tables that just became empty. Restricted to the per-address
+    // -space user window: the tables under PML4[0] are shared with the kernel
+    // and must never be freed here.
+    if (virt_addr as u64) >= USER_MIN_ADDR {
+        reclaim_empty_tables(pml4_phys, virt_addr);
+    }
+
     Ok((frame_addr, flags))
+}
+
+/// True if every entry in the table at `phys` is absent.
+unsafe fn table_is_empty(phys: usize) -> bool {
+    table_at(phys).entries.iter().all(|e| !e.is_present())
+}
+
+/// Walk back up from a just-cleared PTE, freeing each level that is now empty.
+unsafe fn reclaim_empty_tables(pml4_phys: usize, virt_addr: usize) {
+    let (pml4i, pdpti, pdi, _) = table_indices(virt_addr);
+
+    let pml4 = table_at(pml4_phys);
+    if !pml4.entries[pml4i].is_present() {
+        return;
+    }
+    let pdpt_phys = pml4.entries[pml4i].frame_address();
+    let pdpt = table_at(pdpt_phys);
+    if !pdpt.entries[pdpti].is_present() || pdpt.entries[pdpti].is_huge() {
+        return;
+    }
+    let pd_phys = pdpt.entries[pdpti].frame_address();
+    let pd = table_at(pd_phys);
+    if !pd.entries[pdi].is_present() || pd.entries[pdi].is_huge() {
+        return;
+    }
+    let pt_phys = pd.entries[pdi].frame_address();
+
+    if !table_is_empty(pt_phys) {
+        return;
+    }
+    pd.entries[pdi].clear();
+    pmm::free(pmm::PhysFrame::from_address(pt_phys));
+
+    if !table_is_empty(pd_phys) {
+        return;
+    }
+    pdpt.entries[pdpti].clear();
+    pmm::free(pmm::PhysFrame::from_address(pd_phys));
+
+    if !table_is_empty(pdpt_phys) {
+        return;
+    }
+    pml4.entries[pml4i].clear();
+    pmm::free(pmm::PhysFrame::from_address(pdpt_phys));
 }
 
 /// Unmap a 4 KiB page and return its frame to the PMM, but only if this

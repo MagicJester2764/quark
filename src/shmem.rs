@@ -78,11 +78,15 @@ unsafe fn regions() -> &'static mut [ShmemRegion; MAX_SHMEM] {
 
 /// Release a region's frames and reset the slot. Interrupts must be off.
 unsafe fn release(region: &mut ShmemRegion) {
+    let mut freed = 0;
     for j in 0..region.page_count {
         if region.pages[j] != 0 {
             pmm::free(pmm::PhysFrame::from_address(region.pages[j]));
+            freed += 1;
         }
     }
+    // Refund the creator's quota.
+    scheduler::uncharge_task_mem(region.creator, freed);
     *region = ShmemRegion::empty();
 }
 
@@ -94,6 +98,11 @@ pub fn create(pages: usize) -> u64 {
 
     let tid = scheduler::current_tid();
     if tid >= MAX_TASKS {
+        return u64::MAX;
+    }
+    // Shared pages are charged to their creator, so a task cannot sidestep its
+    // memory limit by parking allocations in shared regions.
+    if !scheduler::current_task_check_mem(pages) {
         return u64::MAX;
     }
 
@@ -141,6 +150,7 @@ pub fn create(pages: usize) -> u64 {
         }
     }
 
+    scheduler::current_task_charge_mem(pages);
     handle as u64
 }
 

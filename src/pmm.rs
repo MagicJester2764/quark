@@ -93,7 +93,11 @@ pub unsafe fn init(
 
         let base = r.base as usize;
         let length = r.length as usize;
-        let end = base + length;
+        // A bogus firmware entry must not wrap the end address.
+        let end = match base.checked_add(length) {
+            Some(e) => e,
+            None => continue,
+        };
 
         let first = PmmInner::frame_index((base + PAGE_SIZE - 1) & !(PAGE_SIZE - 1));
         let last = PmmInner::frame_index(end.saturating_sub(1));
@@ -103,7 +107,10 @@ pub unsafe fn init(
         }
 
         for f in first..=last {
-            if f < BITMAP_SIZE * 8 {
+            // Guard on the current bit: overlapping or duplicated entries in
+            // the firmware memory map would otherwise inflate both counters
+            // and, worse, let free_frames underflow later.
+            if f < BITMAP_SIZE * 8 && pmm.is_used(f) {
                 pmm.set_free(f);
                 pmm.free_frames += 1;
                 pmm.total_frames += 1;
@@ -189,6 +196,105 @@ pub fn free(frame: PhysFrame) {
         pmm.set_free(idx);
         pmm.free_frames += 1;
     }
+}
+
+// ---------------------------------------------------------------------------
+// Frame ownership
+// ---------------------------------------------------------------------------
+
+/// Number of frames the bitmap covers.
+const MAX_FRAMES: usize = BITMAP_SIZE * 8;
+
+/// Owner of each frame handed to user space by `sys_phys_alloc`, stored as
+/// `tid + 1` so that 0 means "not owned by any task" and the whole table lands
+/// in .bss rather than .data.
+///
+/// `sys_phys_free` takes a raw physical address from user space. Without this
+/// the kernel could not distinguish a task's own frames from the kernel's, so a
+/// CAP_PHYS_ALLOC holder could feed the allocator any address at all — and
+/// frames were never reclaimed when their owner died.
+///
+/// Tracking is per frame rather than per allocation because callers allocate a
+/// page at a time (init maps ELF images page by page), so any fixed table of
+/// (base, count) reservations is exhausted almost immediately.
+struct FrameOwners {
+    table: [u8; MAX_FRAMES],
+}
+
+static FRAME_OWNER: IrqSpinLock<FrameOwners> = IrqSpinLock::new(FrameOwners {
+    table: [0u8; MAX_FRAMES],
+});
+
+/// Record that `owner` holds the `count` frames starting at `base`.
+pub fn set_owner(base: usize, count: usize, owner: usize) {
+    if owner >= 0xFF {
+        return;
+    }
+    let mut owners = FRAME_OWNER.lock();
+    for i in 0..count {
+        let idx = PmmInner::frame_index(base + i * PAGE_SIZE);
+        if idx < MAX_FRAMES {
+            owners.table[idx] = owner as u8 + 1;
+        }
+    }
+}
+
+/// True if every frame in `[base, base + count)` is owned by `owner`.
+pub fn owns_range(base: usize, count: usize, owner: usize) -> bool {
+    if owner >= 0xFF {
+        return false;
+    }
+    let want = owner as u8 + 1;
+    let owners = FRAME_OWNER.lock();
+    (0..count).all(|i| {
+        let idx = PmmInner::frame_index(base + i * PAGE_SIZE);
+        idx < MAX_FRAMES && owners.table[idx] == want
+    })
+}
+
+/// Drop the ownership record for `[base, base + count)`.
+pub fn clear_owner(base: usize, count: usize) {
+    let mut owners = FRAME_OWNER.lock();
+    for i in 0..count {
+        let idx = PmmInner::frame_index(base + i * PAGE_SIZE);
+        if idx < MAX_FRAMES {
+            owners.table[idx] = 0;
+        }
+    }
+}
+
+/// Free every frame still owned by `owner`. Returns the number reclaimed.
+/// Called when a task is reaped so its `sys_phys_alloc` frames are not leaked.
+pub fn release_task_frames(owner: usize) -> usize {
+    if owner >= 0xFF {
+        return 0;
+    }
+    let want = owner as u8 + 1;
+    let mut reclaimed = 0;
+
+    // Collect under the ownership lock, free outside it: pmm::free takes the
+    // PMM lock and nesting the two would risk a deadlock.
+    let mut idx = 0;
+    while idx < MAX_FRAMES {
+        let mut batch = [0usize; 64];
+        let mut n = 0;
+        {
+            let mut owners = FRAME_OWNER.lock();
+            while idx < MAX_FRAMES && n < batch.len() {
+                if owners.table[idx] == want {
+                    owners.table[idx] = 0;
+                    batch[n] = idx * PAGE_SIZE;
+                    n += 1;
+                }
+                idx += 1;
+            }
+        }
+        for &addr in batch.iter().take(n) {
+            free(PhysFrame::from_address(addr));
+        }
+        reclaimed += n;
+    }
+    reclaimed
 }
 
 /// Number of free 4 KiB frames.

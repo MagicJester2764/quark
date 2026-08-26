@@ -43,7 +43,14 @@ pub fn init() {
             priority: 255, // lowest priority
             cr3: crate::paging::read_cr3(),
             caps: crate::task::CAP_ALL,
-            cspace: crate::cap::empty_cspace(),
+            // Mirror the bitmask into real capabilities: with the UID 0 bypass
+            // gone, TID 0's authority has to come from its CSpace like anyone
+            // else's.
+            cspace: {
+                let mut cs = crate::cap::empty_cspace();
+                crate::cap::populate_from_bitmask(&mut cs, crate::task::CAP_ALL);
+                cs
+            },
             fds: [crate::task::FdKind::empty(); crate::task::MAX_FDS],
             pager_tid: 0,
             parent_tid: 0,
@@ -399,6 +406,13 @@ pub fn kill_task(tid: usize) -> Result<(), ()> {
     if tid <= 1 || tid >= MAX_TASKS {
         return Err(());
     }
+    // Killing yourself must not return: the old code marked the task Dead and
+    // then let it sysret back to user space, where it kept running until the
+    // next preemption dropped it — on an address space reaping was free to
+    // tear down underneath it.
+    if tid == current_tid() {
+        exit_with(-1);
+    }
     unsafe {
         match TASKS[tid].as_mut() {
             Some(task) if task.state != TaskState::Dead => {
@@ -461,6 +475,8 @@ pub fn reap_dead() {
                     }
                     // Clean up pipe refcounts and wake blocked tasks
                     crate::pipe::cleanup_task_fds(&task.fds);
+                    // Reclaim pipes it created but never attached to an fd
+                    crate::pipe::cleanup_orphans(i);
                     // Clean up IPC state and unblock tasks waiting on this one
                     crate::ipc::cleanup_task_ipc(i);
                     // Unregister any IRQ handlers
@@ -469,6 +485,8 @@ pub fn reap_dead() {
                     crate::futex::cleanup_task(i);
                     // Clean up shared memory regions created by this task
                     crate::shmem::cleanup_task(i);
+                    // Reclaim sys_phys_alloc reservations it never released
+                    crate::pmm::release_task_frames(i);
                     // Destroy user address space
                     let cr3 = task.cr3;
                     if cr3 != 0 && cr3 != crate::paging::kernel_cr3() {
@@ -764,6 +782,18 @@ pub fn current_task_charge_mem(pages: usize) {
 /// Subtract `pages` from the current task's memory usage counter.
 pub fn current_task_uncharge_mem(pages: usize) {
     let tid = current_tid();
+    unsafe {
+        if let Some(ref mut task) = TASKS[tid] {
+            task.mem_pages = task.mem_pages.saturating_sub(pages);
+        }
+    }
+}
+
+/// Subtract `pages` from a specific task's memory usage counter.
+pub fn uncharge_task_mem(tid: usize, pages: usize) {
+    if tid >= MAX_TASKS {
+        return;
+    }
     unsafe {
         if let Some(ref mut task) = TASKS[tid] {
             task.mem_pages = task.mem_pages.saturating_sub(pages);
