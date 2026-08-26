@@ -116,12 +116,45 @@ pub fn sys_notify(dest: usize, badge: u64) -> Result<(), IpcError> {
     if dest >= MAX_TASKS || badge == 0 {
         return Err(IpcError::InvalidTid);
     }
+    // Reserved signal bits may only be raised through sys_signal, which checks
+    // the caller's authority over the target. Allowing them here let any task
+    // forge a signal into any other task's notification word.
+    if badge & SIG_MASK != 0 {
+        return Err(IpcError::InvalidTid);
+    }
+    if !scheduler::task_is_live(dest) {
+        return Err(IpcError::DeadTask);
+    }
 
     let flags = irq_save();
     unsafe {
         TASK_NOTIFY[dest] |= badge;
 
         // Wake the task if it's recv-blocked and would accept a notification
+        match TASK_IPC[dest].state {
+            IpcState::RecvBlocked(from) if from == 0 || from == TID_ANY => {
+                TASK_IPC[dest].state = IpcState::None;
+                scheduler::unblock_task(dest);
+            }
+            _ => {}
+        }
+    }
+    irq_restore(flags);
+
+    Ok(())
+}
+
+/// Raise `badge` in `dest`'s notification word without filtering reserved
+/// bits. Only `sys_signal` may use this, after its own permission check.
+fn notify_raw(dest: usize, badge: u64) -> Result<(), IpcError> {
+    if dest >= MAX_TASKS || badge == 0 {
+        return Err(IpcError::InvalidTid);
+    }
+
+    let flags = irq_save();
+    unsafe {
+        TASK_NOTIFY[dest] |= badge;
+
         match TASK_IPC[dest].state {
             IpcState::RecvBlocked(from) if from == 0 || from == TID_ANY => {
                 TASK_IPC[dest].state = IpcState::None;
@@ -157,8 +190,9 @@ pub fn sys_signal(dest: usize, sig: u64) -> Result<(), IpcError> {
         return Ok(());
     }
 
-    // Deliver signal bits via notification word and wake if RecvBlocked(0|TID_ANY)
-    sys_notify(dest, sig)?;
+    // Deliver signal bits via notification word and wake if RecvBlocked(0|TID_ANY).
+    // Uses the privileged form: sys_notify refuses reserved signal bits.
+    notify_raw(dest, sig)?;
 
     // Force-unblock from IPC states that sys_notify doesn't handle.
     let flags = irq_save();

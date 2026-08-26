@@ -24,17 +24,24 @@ impl<T> IrqSpinLock<T> {
         }
     }
 
+    /// Acquire the lock with interrupts disabled.
+    ///
+    /// Quark is uniprocessor and this lock holds `cli` for its whole lifetime,
+    /// so no other execution context can be running while it is held. Finding
+    /// it already taken therefore means *this* code path is re-entering a lock
+    /// it already owns — which as a spin would be an unbreakable hang with
+    /// interrupts off and no output. Report it instead.
     pub fn lock(&self) -> IrqSpinLockGuard<'_, T> {
         let saved_flags: u64;
         unsafe {
             core::arch::asm!("pushfq; pop {}; cli", out(reg) saved_flags, options(nostack));
         }
-        while self
+        if self
             .locked
-            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
             .is_err()
         {
-            core::hint::spin_loop();
+            panic!("IrqSpinLock: re-entrant acquire (deadlock)");
         }
         IrqSpinLockGuard {
             lock: self,
