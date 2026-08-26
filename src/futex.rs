@@ -62,7 +62,10 @@ pub fn futex_wait(addr: u64, expected: u32) -> u64 {
     let mut state = FUTEX.lock();
 
     // Read the user word — we're in the same address space (syscall context)
-    let current_val = unsafe { *(addr as *const u32) };
+    let current_val = {
+        let _ua = crate::cpu::UserAccess::begin();
+        unsafe { *(addr as *const u32) }
+    };
     if current_val != expected {
         return 1;
     }

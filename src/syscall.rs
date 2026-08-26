@@ -85,7 +85,7 @@ pub const SYS_GET_USER_CAPS: u64 = 116;
 pub const SYS_SHMEM_UNMAP: u64 = 94;
 pub const SYS_SHMEM_DESTROY: u64 = 95;
 
-const SFMASK_VALUE: u64 = (1 << 9) | (1 << 10); // clear IF | DF
+const SFMASK_VALUE: u64 = (1 << 9) | (1 << 10) | (1 << 18); // clear IF | DF | AC
 
 fn read_msr(msr: u32) -> u64 {
     let lo: u32;
@@ -194,10 +194,20 @@ fn fd_write_ipc(target_tid: usize, tag: u64, ptr: *const u8, len: usize) -> u64 
     if len == 0 {
         return 0;
     }
-    let buf = unsafe { core::slice::from_raw_parts(ptr, len) };
     let mut offset = 0usize;
     while offset < len {
         let chunk = (len - offset).min(FD_WRITE_MAX_CHUNK);
+
+        // Snapshot this chunk while the SMAP window is open, then close it
+        // before doing anything that can block.
+        let mut staged = [0u8; FD_WRITE_MAX_CHUNK];
+        {
+            let _ua = crate::cpu::UserAccess::begin();
+            unsafe {
+                core::ptr::copy_nonoverlapping(ptr.add(offset), staged.as_mut_ptr(), chunk);
+            }
+        }
+
         // Pack bytes into data[1..6]
         let mut data = [0u64; 6];
         data[0] = chunk as u64;
@@ -206,7 +216,7 @@ fn fd_write_ipc(target_tid: usize, tag: u64, ptr: *const u8, len: usize) -> u64 
             let mut w = [0u8; 8];
             for j in 0..8 {
                 if base + j < chunk {
-                    w[j] = buf[offset + base + j];
+                    w[j] = staged[base + j];
                 }
             }
             data[i + 1] = u64::from_le_bytes(w);
@@ -237,15 +247,22 @@ fn fd_read_ipc(target_tid: usize, tag: u64, ptr: *mut u8, max_len: usize) -> u64
     match crate::ipc::sys_call(target_tid, &msg) {
         Ok(reply) => {
             let actual = (reply.data[0] as usize).min(request_len);
-            // Unpack bytes from reply.data[1..6]
-            let buf = unsafe { core::slice::from_raw_parts_mut(ptr, actual) };
+            // Unpack bytes from reply.data[1..6] into a staging buffer, then
+            // copy out under a short SMAP window.
+            let mut staged = [0u8; FD_WRITE_MAX_CHUNK];
             for i in 0..5 {
                 let base = i * 8;
                 let bytes = reply.data[i + 1].to_le_bytes();
                 for j in 0..8 {
                     if base + j < actual {
-                        buf[base + j] = bytes[j];
+                        staged[base + j] = bytes[j];
                     }
+                }
+            }
+            {
+                let _ua = crate::cpu::UserAccess::begin();
+                unsafe {
+                    core::ptr::copy_nonoverlapping(staged.as_ptr(), ptr, actual);
                 }
             }
             actual as u64
@@ -284,6 +301,7 @@ extern "C" fn syscall_dispatch(
             if !validate_user_ptr(arg0, arg1) {
                 return u64::MAX;
             }
+            let _ua = crate::cpu::UserAccess::begin();
             let slice = unsafe { core::slice::from_raw_parts(ptr, len) };
             console::puts(slice);
             len as u64
@@ -298,8 +316,11 @@ extern "C" fn syscall_dispatch(
             let msg_ptr = arg1 as *const crate::ipc::Message;
             let msg_size = core::mem::size_of::<crate::ipc::Message>() as u64;
             if !validate_user_ptr(arg1, msg_size) { return u64::MAX; }
-            let msg = unsafe { &*msg_ptr };
-            match crate::ipc::sys_send(dest, msg) {
+            let msg = {
+                let _ua = crate::cpu::UserAccess::begin();
+                unsafe { *msg_ptr }
+            };
+            match crate::ipc::sys_send(dest, &msg) {
                 Ok(()) => 0,
                 Err(_) => u64::MAX,
             }
@@ -310,7 +331,11 @@ extern "C" fn syscall_dispatch(
             let msg_size = core::mem::size_of::<crate::ipc::Message>() as u64;
             if !validate_user_ptr_mut(arg1, msg_size) { return u64::MAX; }
             match crate::ipc::sys_recv(from) {
-                Ok(msg) => { unsafe { *msg_ptr = msg }; 0 }
+                Ok(msg) => {
+                    let _ua = crate::cpu::UserAccess::begin();
+                    unsafe { *msg_ptr = msg };
+                    0
+                }
                 Err(_) => u64::MAX,
             }
         }
@@ -321,10 +346,15 @@ extern "C" fn syscall_dispatch(
             let msg_size = core::mem::size_of::<crate::ipc::Message>() as u64;
             if !validate_user_ptr(arg1, msg_size)
                 || !validate_user_ptr_mut(arg2, msg_size) { return u64::MAX; }
-            let msg = unsafe { &*msg_ptr };
-            match crate::ipc::sys_call(dest, msg) {
+            let msg = {
+                let _ua = crate::cpu::UserAccess::begin();
+                unsafe { *msg_ptr }
+            };
+            match crate::ipc::sys_call(dest, &msg) {
                 Ok(reply) => {
-                    unsafe { *reply_ptr = reply }; 0
+                    let _ua = crate::cpu::UserAccess::begin();
+                    unsafe { *reply_ptr = reply };
+                    0
                 }
                 Err(_) => u64::MAX,
             }
@@ -334,8 +364,11 @@ extern "C" fn syscall_dispatch(
             let msg_ptr = arg1 as *const crate::ipc::Message;
             let msg_size = core::mem::size_of::<crate::ipc::Message>() as u64;
             if !validate_user_ptr(arg1, msg_size) { return u64::MAX; }
-            let msg = unsafe { &*msg_ptr };
-            match crate::ipc::sys_reply(dest, msg) {
+            let msg = {
+                let _ua = crate::cpu::UserAccess::begin();
+                unsafe { *msg_ptr }
+            };
+            match crate::ipc::sys_reply(dest, &msg) {
                 Ok(()) => 0,
                 Err(_) => u64::MAX,
             }
@@ -399,6 +432,7 @@ extern "C" fn syscall_dispatch(
             if !ok {
                 return u64::MAX;
             }
+            let _ua = crate::cpu::UserAccess::begin();
             match op {
                 0 => {
                     unsafe { crate::io::rep_insw(port, buf as *mut u16, count) };
@@ -678,6 +712,7 @@ extern "C" fn syscall_dispatch(
                 crate::task::FdKind::Empty => {
                     // fd not connected — fall back to kernel console for fd 1/2
                     if (fd == 1 || fd == 2) && len > 0 {
+                        let _ua = crate::cpu::UserAccess::begin();
                         let slice = unsafe { core::slice::from_raw_parts(ptr, len) };
                         crate::console::puts(slice);
                         len as u64
@@ -894,7 +929,11 @@ extern "C" fn syscall_dispatch(
             let msg_size = core::mem::size_of::<crate::ipc::Message>() as u64;
             if !validate_user_ptr_mut(arg1, msg_size) { return u64::MAX; }
             match crate::ipc::sys_recv_timeout(from, timeout) {
-                Ok(msg) => { unsafe { *msg_ptr = msg }; 0 }
+                Ok(msg) => {
+                    let _ua = crate::cpu::UserAccess::begin();
+                    unsafe { *msg_ptr = msg };
+                    0
+                }
                 Err(crate::ipc::IpcError::Timeout) => 1,
                 Err(_) => u64::MAX,
             }

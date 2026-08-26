@@ -165,9 +165,12 @@ pub fn read(handle: usize, buf: *mut u8, max_len: usize) -> u64 {
             if pipe.len > 0 {
                 // Copy data out of ring buffer
                 let to_copy = pipe.len.min(max_len);
-                for i in 0..to_copy {
-                    let pos = (pipe.read_pos + i) % PIPE_BUF_SIZE;
-                    buf.add(i).write(pipe.buf[pos]);
+                {
+                    let _ua = crate::cpu::UserAccess::begin();
+                    for i in 0..to_copy {
+                        let pos = (pipe.read_pos + i) % PIPE_BUF_SIZE;
+                        buf.add(i).write(pipe.buf[pos]);
+                    }
                 }
                 pipe.read_pos = (pipe.read_pos + to_copy) % PIPE_BUF_SIZE;
                 pipe.len -= to_copy;
@@ -225,9 +228,12 @@ pub fn read_nonblock(handle: usize, buf: *mut u8, max_len: usize) -> u64 {
 
             if pipe.len > 0 {
                 let to_copy = pipe.len.min(max_len);
-                for i in 0..to_copy {
-                    let pos = (pipe.read_pos + i) % PIPE_BUF_SIZE;
-                    buf.add(i).write(pipe.buf[pos]);
+                {
+                    let _ua = crate::cpu::UserAccess::begin();
+                    for i in 0..to_copy {
+                        let pos = (pipe.read_pos + i) % PIPE_BUF_SIZE;
+                        buf.add(i).write(pipe.buf[pos]);
+                    }
                 }
                 pipe.read_pos = (pipe.read_pos + to_copy) % PIPE_BUF_SIZE;
                 pipe.len -= to_copy;
@@ -281,9 +287,12 @@ pub fn write(handle: usize, buf: *const u8, len: usize) -> u64 {
             let space = PIPE_BUF_SIZE - pipe.len;
             if space > 0 {
                 let to_copy = space.min(len - offset);
-                for i in 0..to_copy {
-                    let pos = (pipe.write_pos + i) % PIPE_BUF_SIZE;
-                    pipe.buf[pos] = buf.add(offset + i).read();
+                {
+                    let _ua = crate::cpu::UserAccess::begin();
+                    for i in 0..to_copy {
+                        let pos = (pipe.write_pos + i) % PIPE_BUF_SIZE;
+                        pipe.buf[pos] = buf.add(offset + i).read();
+                    }
                 }
                 pipe.write_pos = (pipe.write_pos + to_copy) % PIPE_BUF_SIZE;
                 pipe.len += to_copy;

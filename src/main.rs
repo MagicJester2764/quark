@@ -6,6 +6,7 @@ extern crate alloc;
 
 pub mod cap;
 mod console;
+mod cpu;
 mod context;
 mod fat32;
 mod heap;
@@ -56,6 +57,10 @@ pub extern "C" fn kernel_main(multiboot_info: usize) -> ! {
     unsafe { heap::init() };
     console::puts(b"Heap initialized.\n");
     unsafe { idt::init() };
+
+    // SMEP/SMAP: block ring 0 from executing or casually touching user pages.
+    // Must follow paging setup and precede the first user-mode entry.
+    unsafe { cpu::init_protections() };
 
     // Initialize hardware interrupts
     unsafe {
