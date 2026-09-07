@@ -26,6 +26,13 @@ static INITIALIZED: AtomicBool = AtomicBool::new(false);
 static mut WAIT_BLOCKED: [bool; MAX_TASKS] = [false; MAX_TASKS];
 /// TID of the dead child collected for a waiting parent. 0 = none yet.
 static mut WAIT_RESULT: [usize; MAX_TASKS] = [0; MAX_TASKS];
+
+/// Exit code of the child that woke a waiter, captured at wake time.
+///
+/// It cannot be read from the task afterwards: waking the parent also sets
+/// REAPED, which makes `reap_dead` free the slot, and `child_exit_code` then
+/// falls back to 0. Every non-zero status was being lost that way.
+static mut WAIT_CODE: [i32; MAX_TASKS] = [0; MAX_TASKS];
 /// Per-task "reaped" flag. If true, parent has collected the exit via sys_wait (or has no parent).
 static mut REAPED: [bool; MAX_TASKS] = [false; MAX_TASKS];
 
@@ -162,6 +169,7 @@ pub fn exit_with(code: i32) -> ! {
             if parent != 0 && WAIT_BLOCKED[parent] {
                 WAIT_BLOCKED[parent] = false;
                 WAIT_RESULT[parent] = current;
+                WAIT_CODE[parent] = code;
                 REAPED[current] = true;
                 unblock_task(parent);
             }
@@ -372,6 +380,7 @@ pub fn sys_wait() -> u64 {
         // before interrupts come back on, or exit() can slip in between them.
         WAIT_BLOCKED[parent] = true;
         WAIT_RESULT[parent] = 0;
+        WAIT_CODE[parent] = 0;
         block_task(parent);
         irq_restore(flags);
         yield_now();
@@ -380,7 +389,7 @@ pub fn sys_wait() -> u64 {
         let child_tid = WAIT_RESULT[parent];
         WAIT_RESULT[parent] = 0;
         if child_tid != 0 {
-            let code = child_exit_code(child_tid);
+            let code = WAIT_CODE[parent];
             (child_tid as u64) | ((code as u32 as u64) << 32)
         } else {
             u64::MAX
