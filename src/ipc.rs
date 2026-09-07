@@ -72,6 +72,10 @@ static mut TASK_IPC: [TaskIpc; MAX_TASKS] = {
 /// Per-task timeout deadline (PIT tick count). 0 = no timeout.
 static mut TASK_TIMEOUT: [u64; MAX_TASKS] = [0; MAX_TASKS];
 
+/// Set by `check_timeouts` when it abandons a task's blocking call, so the
+/// caller can tell "nobody answered in time" from "the target died".
+static mut TASK_TIMED_OUT: [bool; MAX_TASKS] = [false; MAX_TASKS];
+
 /// Per-task notification word (seL4-style). Bits are OR'd in by sys_notify().
 /// Atomically read-and-cleared when consumed by sys_recv/sys_recv_timeout.
 static mut TASK_NOTIFY: [u64; MAX_TASKS] = [0; MAX_TASKS];
@@ -420,6 +424,29 @@ pub fn sys_recv(from: usize) -> Result<Message, IpcError> {
 
 /// Synchronous RPC: send a message and wait for a reply.
 pub fn sys_call(dest: usize, msg: &Message) -> Result<Message, IpcError> {
+    call_inner(dest, msg, 0)
+}
+
+/// Synchronous call that gives up after `timeout_ticks`.
+///
+/// A call has two blocking points and a target that is alive but not serving
+/// can hang either one: it may never reach sys_recv, leaving us in
+/// CallSendBlocked with the message still undelivered, or it may receive and
+/// never reply, leaving us in CallBlocked. Both are abandoned on expiry.
+///
+/// Dropping out of CallBlocked is safe because sys_reply only delivers to a
+/// task still in CallBlocked on that replier; a reply that lands after we have
+/// given up is discarded rather than written into a caller that moved on.
+pub fn sys_call_timeout(
+    dest: usize,
+    msg: &Message,
+    timeout_ticks: u64,
+) -> Result<Message, IpcError> {
+    call_inner(dest, msg, timeout_ticks)
+}
+
+/// `timeout_ticks` of 0 means block indefinitely.
+fn call_inner(dest: usize, msg: &Message, timeout_ticks: u64) -> Result<Message, IpcError> {
     if dest >= MAX_TASKS {
         return Err(IpcError::InvalidTid);
     }
@@ -452,6 +479,13 @@ pub fn sys_call(dest: usize, msg: &Message) -> Result<Message, IpcError> {
                 scheduler::block_task(caller);
             }
         };
+
+        TASK_TIMED_OUT[caller] = false;
+        TASK_TIMEOUT[caller] = if timeout_ticks == 0 {
+            0
+        } else {
+            crate::pit::ticks() + timeout_ticks
+        };
     }
     irq_restore(flags);
     scheduler::yield_now();
@@ -459,12 +493,15 @@ pub fn sys_call(dest: usize, msg: &Message) -> Result<Message, IpcError> {
     // Reply arrived
     let flags = irq_save();
     let result = unsafe {
+        TASK_TIMEOUT[caller] = 0;
         let reply = match TASK_IPC[caller].pending_msg.take() {
             Some(m) => m,
             None => {
                 TASK_IPC[caller].state = IpcState::None;
+                let timed_out = TASK_TIMED_OUT[caller];
+                TASK_TIMED_OUT[caller] = false;
                 irq_restore(flags);
-                return Err(IpcError::DeadTask);
+                return Err(if timed_out { IpcError::Timeout } else { IpcError::DeadTask });
             }
         };
         TASK_IPC[caller].state = IpcState::None;
@@ -674,10 +711,22 @@ pub fn check_timeouts() {
             let deadline = TASK_TIMEOUT[tid];
             if deadline != 0 && now >= deadline {
                 TASK_TIMEOUT[tid] = 0;
-                // Only unblock if still RecvBlocked (could have been woken by IPC already)
-                if matches!(TASK_IPC[tid].state, IpcState::RecvBlocked(_)) {
-                    TASK_IPC[tid].state = IpcState::None;
-                    scheduler::unblock_task(tid);
+                // Only unblock if still blocked on the thing we timed (it could
+                // have been woken by IPC already, between deadline and now).
+                match TASK_IPC[tid].state {
+                    IpcState::RecvBlocked(_) => {
+                        TASK_IPC[tid].state = IpcState::None;
+                        scheduler::unblock_task(tid);
+                    }
+                    IpcState::CallSendBlocked(_) | IpcState::CallBlocked(_) => {
+                        // Drop the undelivered message so no receiver can pick
+                        // it up after we have stopped waiting for the reply.
+                        TASK_IPC[tid].pending_msg = None;
+                        TASK_IPC[tid].state = IpcState::None;
+                        TASK_TIMED_OUT[tid] = true;
+                        scheduler::unblock_task(tid);
+                    }
+                    _ => {}
                 }
             }
         }
@@ -697,6 +746,7 @@ pub fn cleanup_task_ipc(dead_tid: usize) {
         TASK_IPC[dead_tid].state = IpcState::None;
         TASK_IPC[dead_tid].pending_msg = None;
         TASK_TIMEOUT[dead_tid] = 0;
+        TASK_TIMED_OUT[dead_tid] = false;
         TASK_NOTIFY[dead_tid] = 0;
         SIGNAL_DEADLINE[dead_tid] = 0;
 

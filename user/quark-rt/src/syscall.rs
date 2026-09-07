@@ -15,6 +15,7 @@ pub const SYS_SEND: u64 = 10;
 pub const SYS_RECV: u64 = 11;
 pub const SYS_CALL: u64 = 12;
 pub const SYS_REPLY: u64 = 13;
+pub const SYS_CALL_TIMEOUT: u64 = 14;
 pub const SYS_GETPID: u64 = 21;
 pub const SYS_IRQ_REGISTER: u64 = 30;
 pub const SYS_IRQ_ACK: u64 = 31;
@@ -276,6 +277,44 @@ pub fn sys_call(dest: usize, msg: &crate::ipc::Message, reply: &mut crate::ipc::
         syscall3(SYS_CALL, dest as u64, msg as *const _ as u64, reply as *mut _ as u64)
     };
     if ret == u64::MAX { Err(()) } else { Ok(()) }
+}
+
+/// Outcome of a call that carries a deadline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CallOutcome {
+    /// The target replied; `reply` holds its message.
+    Replied,
+    /// The deadline passed with no reply.
+    TimedOut,
+    /// The call could not be made at all (bad target, no capability, dead task).
+    Failed,
+}
+
+/// Synchronous call that gives up after `timeout_ticks` (100 Hz, so 10ms each).
+///
+/// Use this rather than [`sys_call`] for any destination that is not known to
+/// be a running server: a task that never reaches sys_recv leaves a plain
+/// sys_call blocked forever.
+pub fn sys_call_timeout(
+    dest: usize,
+    msg: &crate::ipc::Message,
+    reply: &mut crate::ipc::Message,
+    timeout_ticks: u64,
+) -> CallOutcome {
+    let ret = unsafe {
+        syscall4(
+            SYS_CALL_TIMEOUT,
+            dest as u64,
+            msg as *const _ as u64,
+            reply as *mut _ as u64,
+            timeout_ticks,
+        )
+    };
+    match ret {
+        0 => CallOutcome::Replied,
+        1 => CallOutcome::TimedOut,
+        _ => CallOutcome::Failed,
+    }
 }
 
 pub fn sys_reply(dest: usize, msg: &crate::ipc::Message) -> Result<(), ()> {

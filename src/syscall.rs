@@ -24,6 +24,7 @@ pub const SYS_SEND: u64 = 10;
 pub const SYS_RECV: u64 = 11;
 pub const SYS_CALL: u64 = 12;
 pub const SYS_REPLY: u64 = 13;
+pub const SYS_CALL_TIMEOUT: u64 = 14;
 pub const SYS_GETPID: u64 = 21;
 pub const SYS_IRQ_REGISTER: u64 = 30;
 pub const SYS_IRQ_ACK: u64 = 31;
@@ -378,6 +379,33 @@ extern "C" fn syscall_dispatch(
                     unsafe { *msg_ptr = msg };
                     0
                 }
+                Err(_) => u64::MAX,
+            }
+        }
+        SYS_CALL_TIMEOUT => {
+            // arg0 = dest, arg1 = msg, arg2 = reply, arg3 = timeout in ticks.
+            // Returns 0 on reply, 1 on timeout, u64::MAX on error — a timeout
+            // is an answer ("nobody responded"), not a failure to ask.
+            let dest = arg0 as usize;
+            if !crate::cap::task_has_endpoint(scheduler::current_tid(), dest) {
+                return deny_ipc(scheduler::current_tid(), dest, b"call");
+            }
+            let msg_ptr = arg1 as *const crate::ipc::Message;
+            let reply_ptr = arg2 as *mut crate::ipc::Message;
+            let msg_size = core::mem::size_of::<crate::ipc::Message>() as u64;
+            if !validate_user_ptr(arg1, msg_size)
+                || !validate_user_ptr_mut(arg2, msg_size) { return u64::MAX; }
+            let msg = {
+                let _ua = crate::cpu::UserAccess::begin();
+                unsafe { *msg_ptr }
+            };
+            match crate::ipc::sys_call_timeout(dest, &msg, arg3) {
+                Ok(reply) => {
+                    let _ua = crate::cpu::UserAccess::begin();
+                    unsafe { *reply_ptr = reply };
+                    0
+                }
+                Err(crate::ipc::IpcError::Timeout) => 1,
                 Err(_) => u64::MAX,
             }
         }
