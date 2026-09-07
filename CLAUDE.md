@@ -16,19 +16,33 @@ other than a flat sibling layout breaks the build.
 
 ## Toolchain
 
-Pinned to `nightly-2026-08-26` in `rust-toolchain.toml`. The pin is load
-bearing: the fork's `library/` tracks a specific rustc vintage, and a floating
-`nightly` channel drifts out from under it. Note the off-by-one — the date in a
-rustup channel is the *publish* date, so `nightly-2026-08-26` is the build
-dated 08-25. Pinning to `nightly-2026-08-25` selects an *older* compiler that
-is missing built-ins `library/` needs.
+Pinned to `nightly-2026-03-01` in `rust-toolchain.toml`, in both this repo and
+`../bang` — the same `make sync-quark` run builds both, so they must agree.
+
+**The pin must equal the commit the fork is based on.** `../rust`'s `library/`
+is a checkout of upstream at one commit and only compiles with the rustc built
+from it; a newer compiler rejects its own `core` (`impl const Trait for Type`
+becomes "expected a trait, found type", features get removed). This is
+checkable rather than guessable:
+
+```bash
+rustc --version                 # ... (38c0de8dc 2026-02-28)
+git -C ../rust log -1 --format=%H $(git -C ../rust merge-base HEAD upstream/main 2>/dev/null || echo HEAD~2)
+```
+
+The short hash in `rustc --version` must match the fork's base commit. It does:
+`38c0de8dc` for both. If you rebase the fork, move both pins in the same commit.
+
+Note the off-by-one — the date in a rustup channel is the *publish* date, so
+`nightly-2026-03-01` is the build dated 02-28. A floating `nightly` channel is
+what to avoid: it drifts forward and silently leaves the fork behind.
 
 Fresh machine:
 
 ```bash
-rustup toolchain install nightly-2026-08-26
-rustup component add rust-src llvm-tools-preview --toolchain nightly-2026-08-26
-rustup target add x86_64-unknown-none x86_64-unknown-uefi --toolchain nightly-2026-08-26
+rustup toolchain install nightly-2026-03-01
+rustup component add rust-src llvm-tools-preview --toolchain nightly-2026-03-01
+rustup target add x86_64-unknown-none x86_64-unknown-uefi --toolchain nightly-2026-03-01
 git -C ../rust submodule update --init --depth 1 library/backtrace
 ```
 
