@@ -44,20 +44,60 @@ fn lookup_service(name: &[u8]) -> Option<usize> {
     }
 }
 
-/// Report whether this task may originate IPC to `tid`.
+/// Ping a task named by TID rather than by service name.
 ///
-/// Uses sys_notify rather than sys_call: it is gated by the same Endpoint
-/// capability, but does not block, so a probe that is unexpectedly *permitted*
-/// prints and exits instead of hanging on a reply that never comes. Badge bit 0
-/// is outside SIG_MASK, which sys_notify rejects on its own account.
+/// Reachability is checked first with sys_notify, which is gated by the same
+/// Endpoint capability as sys_call but does not block. A task we may not talk
+/// to is reported immediately, rather than after a send that will never be
+/// received. Badge bit 0 is outside SIG_MASK, which sys_notify rejects on its
+/// own account. The kernel logs a refusal to serial as
+/// `[cap] tid N denied notify`, which also tells a capability refusal apart
+/// from the other ways sys_notify fails (dead or out-of-range target).
 ///
-/// A refusal here is the Endpoint check firing; the kernel logs the reason to
-/// serial as `[cap] tid N denied notify`, which also distinguishes it from the
-/// other ways sys_notify can fail (dead or out-of-range target).
-fn probe_tid(tid: usize) {
-    match syscall::sys_notify(tid, 1) {
-        Ok(()) => println!("ipcping: tid {} PERMITTED", tid),
-        Err(()) => println!("ipcping: tid {} REFUSED (see serial for reason)", tid),
+/// If that succeeds we do real timed round-trips to `tid` itself — unlike the
+/// service path, which measures the nameserver. A task that receives but never
+/// replies will block us here; it is the foreground task, so Ctrl-C reaches it.
+fn probe_tid(tid: usize, count: usize) {
+    if syscall::sys_notify(tid, 1).is_err() {
+        println!("ipcping: tid {} unreachable (no endpoint capability)", tid);
+        return;
+    }
+
+    println!("PING tid {} — {} requests", tid, count);
+    let mut min = u64::MAX;
+    let mut max = 0u64;
+    let mut total = 0u64;
+    let mut ok = 0usize;
+
+    for seq in 0..count {
+        let t0 = syscall::sys_ticks();
+        let msg = Message { sender: 0, tag: TAG_NS_LOOKUP, data: [0; 6] };
+        let mut reply = Message::empty();
+
+        if syscall::sys_call(tid, &msg, &mut reply).is_ok() {
+            let dt = syscall::sys_ticks() - t0;
+            println!("seq={}: reply from tid {} time={}ms ({}t)", seq, tid, dt * 10, dt);
+            if dt < min { min = dt; }
+            if dt > max { max = dt; }
+            total += dt;
+            ok += 1;
+        } else {
+            println!("seq={}: no reply", seq);
+        }
+
+        if seq + 1 < count {
+            syscall::sleep_ms(100);
+        }
+    }
+
+    println!("--- tid {} ping stats ---", tid);
+    if ok > 0 {
+        println!(
+            "{} sent, {} ok, min={}ms avg={}ms max={}ms",
+            count, ok, min * 10, (total * 10) / ok as u64, max * 10
+        );
+    } else {
+        println!("{} sent, 0 ok", count);
     }
 }
 
@@ -131,19 +171,19 @@ pub extern "C" fn _start() -> ! {
         b"vfs" as &[u8]
     };
 
-    // A numeric argument names a TID directly, so reachability can be probed
-    // for a task the nameserver does not know about — the shell, or another
-    // user program. No service name is numeric, so this is unambiguous.
-    if let Some(tid) = parse_usize(service_name) {
-        probe_tid(tid);
-        syscall::sys_exit();
-    }
-
     let count = if let Some(arg) = args::argv(2) {
         parse_usize(arg).unwrap_or(DEFAULT_COUNT)
     } else {
         DEFAULT_COUNT
     };
+
+    // A numeric argument names a TID directly, so a task the nameserver does
+    // not know about — the shell, or another user program — can be reached.
+    // No service name is numeric, so this is unambiguous.
+    if let Some(tid) = parse_usize(service_name) {
+        probe_tid(tid, count);
+        syscall::sys_exit();
+    }
 
     match lookup_service(service_name) {
         Some(tid) => ping_service(tid, count, service_name),
