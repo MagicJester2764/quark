@@ -77,7 +77,7 @@ pub extern "C" fn _start() -> ! {
         attempts += 1;
         if attempts >= 20 {
             println!("ls: vfs not found");
-            syscall::sys_exit();
+            syscall::sys_exit_code(1);
         }
         for _ in 0..100 {
             syscall::sys_yield();
@@ -98,7 +98,7 @@ pub extern "C" fn _start() -> ! {
             if let Ok(s) = core::str::from_utf8(path) {
                 println!("ls: cannot open '{}': error {}", s, e);
             }
-            syscall::sys_exit();
+            syscall::sys_exit_code(1);
         }
     };
 
@@ -124,7 +124,7 @@ pub extern "C" fn _start() -> ! {
         Err(e) => {
             println!("ls: readdir error: {}", e);
             let _ = vfs::close(vfs_tid, handle);
-            syscall::sys_exit();
+            syscall::sys_exit_code(1);
         }
     };
 

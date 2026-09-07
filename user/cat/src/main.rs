@@ -36,9 +36,22 @@ fn lookup_service(name: &[u8]) -> Option<usize> {
 pub extern "C" fn _start() -> ! {
     let argc = args::argc();
     if argc < 2 {
-        println!("usage: cat <file> [file...]");
+        // No operands: copy stdin to stdout, as cat has always done. This is
+        // what makes it usable as the sink of a shell pipeline — fd 0 is the
+        // read end, and pipe reads return 0 once the last writer exits.
+        let mut buf = [0u8; 256];
+        loop {
+            let n = syscall::sys_fd_read(0, &mut buf);
+            if n == 0 || n == u64::MAX {
+                break;
+            }
+            let _ = syscall::sys_fd_write(1, &buf[..n as usize]);
+        }
         syscall::sys_exit();
     }
+
+    // Any operand that cannot be read makes the whole run fail, as in POSIX cat.
+    let mut failed = false;
 
     // Discover VFS
     let mut attempts = 0;
@@ -49,7 +62,7 @@ pub extern "C" fn _start() -> ! {
         attempts += 1;
         if attempts >= 20 {
             println!("cat: vfs not found");
-            syscall::sys_exit();
+            syscall::sys_exit_code(1);
         }
         for _ in 0..100 {
             syscall::sys_yield();
@@ -61,12 +74,12 @@ pub extern "C" fn _start() -> ! {
         Ok(addr) => addr,
         Err(()) => {
             println!("cat: failed to allocate buffer");
-            syscall::sys_exit();
+            syscall::sys_exit_code(1);
         }
     };
     if syscall::sys_map_phys(phys, BUF_VADDR, 1).is_err() {
         println!("cat: failed to map buffer");
-        syscall::sys_exit();
+        syscall::sys_exit_code(1);
     }
 
     for i in 1..argc {
@@ -81,6 +94,7 @@ pub extern "C" fn _start() -> ! {
                 if let Ok(s) = core::str::from_utf8(path) {
                     println!("cat: {}: not found", s);
                 }
+                failed = true;
                 continue;
             }
         };
@@ -88,6 +102,7 @@ pub extern "C" fn _start() -> ! {
         if is_dir {
             if let Ok(s) = core::str::from_utf8(path) {
                 println!("cat: {}: is a directory", s);
+                failed = true;
             }
             let _ = vfs::close(vfs_tid, handle);
             continue;
@@ -122,6 +137,7 @@ pub extern "C" fn _start() -> ! {
                 }
                 Err(e) => {
                     println!("\ncat: read error: {}", e);
+                    failed = true;
                     break;
                 }
             }
@@ -130,7 +146,7 @@ pub extern "C" fn _start() -> ! {
         let _ = vfs::close(vfs_tid, handle);
     }
 
-    syscall::sys_exit();
+    syscall::sys_exit_code(if failed { 1 } else { 0 });
 }
 
 #[panic_handler]

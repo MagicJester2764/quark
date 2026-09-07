@@ -93,6 +93,7 @@ fn lookup_service_with_retry(name: &[u8], max_attempts: usize) -> Option<usize> 
 // ELF loader (mirrors init's load_elf using shell temp addresses)
 // ---------------------------------------------------------------------------
 
+#[derive(Clone, Copy)]
 struct SpawnInfo {
     tid: usize,
     entry: u64,
@@ -322,12 +323,18 @@ fn set_foreground(input_tid: usize, child_tid: usize) {
     let _ = syscall::sys_call(input_tid, &msg, &mut reply);
 }
 
-fn cmd_exec(
+/// Load a command and prepare it to run, without starting it.
+///
+/// Separated from running so a pipeline can create every stage, wire the pipes
+/// between them, and only then start them — a stage started before its reader
+/// exists would write into a pipe with no reader.
+fn cmd_spawn(
     cmd: &[u8],
     args_str: &[u8],
     vfs_tid: usize,
-    input_tid: usize,
-) {
+    inherit_stdin: bool,
+    inherit_stdout: bool,
+) -> Option<SpawnInfo> {
     let mut path = [0u8; 64];
     let pos = build_path(cmd, &mut path);
     let has_slash = cmd.iter().any(|&b| b == b'/');
@@ -360,7 +367,7 @@ fn cmd_exec(
                         if let Ok(s) = core::str::from_utf8(cmd) {
                             println!("{}: not found", s);
                         }
-                        return;
+                        return None;
                     }
                 }
             } else if !ends_with_elf(&path[..pos]) && pos + 4 <= 64 {
@@ -373,14 +380,14 @@ fn cmd_exec(
                         if let Ok(s) = core::str::from_utf8(cmd) {
                             println!("{}: not found", s);
                         }
-                        return;
+                        return None;
                     }
                 }
             } else {
                 if let Ok(s) = core::str::from_utf8(cmd) {
                     println!("{}: not found", s);
                 }
-                return;
+                return None;
             }
         }
     };
@@ -408,7 +415,7 @@ fn cmd_exec(
 
     if !success {
         println!("shell: failed to read ELF");
-        return;
+        return None;
     }
 
     let elf_data = unsafe { core::slice::from_raw_parts(FILE_BUF_BASE as *const u8, size) };
@@ -418,7 +425,7 @@ fn cmd_exec(
         Ok(i) => i,
         Err(()) => {
             println!("shell: failed to load ELF");
-            return;
+            return None;
         }
     };
 
@@ -437,10 +444,20 @@ fn cmd_exec(
     };
     grant_caps_by_name(name, tid);
 
-    // Wire file descriptors — duplicate shell's own fds to child
-    let _ = syscall::sys_fd_dup(tid, 0, 0); // stdin
-    let _ = syscall::sys_fd_dup(tid, 1, 1); // stdout
-    let _ = syscall::sys_fd_dup(tid, 2, 2); // stderr
+    // Wire file descriptors — duplicate the shell's own fds to the child.
+    //
+    // A pipeline stage skips whichever end is about to be replaced by a pipe:
+    // sys_pipe_fd_set overwrites the slot without releasing what was already
+    // there, so inheriting first would strand a reference on the console pipe
+    // that nothing ever drops. stderr is never redirected, so it always comes
+    // from the shell.
+    if inherit_stdin {
+        let _ = syscall::sys_fd_dup(tid, 0, 0);
+    }
+    if inherit_stdout {
+        let _ = syscall::sys_fd_dup(tid, 1, 1);
+    }
+    let _ = syscall::sys_fd_dup(tid, 2, 2);
 
     // Build argv: [command_name, ...split args]
     let mut argv_bufs: [&[u8]; 16] = [b""; 16];
@@ -470,24 +487,179 @@ fn cmd_exec(
 
     let _ = set_args(&info, &argv_bufs[..argc]);
 
-    // Start and wait
+    Some(info)
+}
+
+/// Longest pipeline accepted. Each stage beyond the first needs a pipe, and a
+/// task may hold MAX_PIPES_PER_TASK (8) of them, so this is well inside the
+/// kernel's limit while covering anything typed by hand.
+const MAX_STAGES: usize = 4;
+
+/// Builtins run inside the shell process, so they have no fds of their own to
+/// redirect and cannot be a pipeline stage.
+fn is_builtin(cmd: &[u8]) -> bool {
+    cmd == b"exit" || cmd == b"cd" || cmd == b"pwd" || cmd == b"kill" || cmd == b"status"
+}
+
+/// Split a stage into its command word and the rest.
+fn split_cmd(stage: &[u8]) -> (&[u8], &[u8]) {
+    let stage = stage.trim_ascii();
+    match stage.iter().position(|&b| b == b' ') {
+        Some(i) => (&stage[..i], stage[i + 1..].trim_ascii()),
+        None => (stage, &[] as &[u8]),
+    }
+}
+
+/// Run one command to completion. Returns its exit status.
+fn cmd_exec(cmd: &[u8], args_str: &[u8], vfs_tid: usize, input_tid: usize) -> i32 {
+    let info = match cmd_spawn(cmd, args_str, vfs_tid, true, true) {
+        Some(i) => i,
+        None => return -1,
+    };
     if info.start().is_err() {
         println!("shell: failed to start task");
-        return;
+        return -1;
     }
 
     if input_tid != 0 {
-        set_foreground(input_tid, tid);
+        set_foreground(input_tid, info.tid);
     }
-    let _ = syscall::sys_wait();
+    let status = syscall::sys_wait().map(|(_, code)| code).unwrap_or(-1);
     if input_tid != 0 {
         set_foreground(input_tid, 0);
     }
+    status
+}
+
+/// Run a pipeline: stage i's stdout becomes stage i+1's stdin.
+///
+/// Every stage is created first and started only once all the pipes are wired,
+/// so no stage can run against an endpoint that does not exist yet. The shell
+/// installs each end on a child and holds neither itself — a write end left in
+/// the shell would keep the writer count above zero, and the reader would wait
+/// for an EOF that never came.
+///
+/// Returns the last stage's status, as a POSIX shell does.
+fn cmd_pipeline(stages: &[&[u8]], vfs_tid: usize, input_tid: usize) -> i32 {
+    let n = stages.len();
+    if n > MAX_STAGES {
+        println!("shell: pipeline too long (max {} stages)", MAX_STAGES);
+        return -1;
+    }
+
+    let mut pipes = [0usize; MAX_STAGES - 1];
+    let mut npipes = 0;
+    for i in 0..n - 1 {
+        match syscall::sys_pipe_create() {
+            Ok(h) => { pipes[i] = h; npipes += 1; }
+            Err(()) => {
+                println!("shell: out of pipes");
+                return -1;
+            }
+        }
+    }
+    let _ = npipes;
+
+    let mut infos = [SpawnInfo { tid: 0, entry: 0, stack_top: 0, cr3: 0 }; MAX_STAGES];
+    let mut spawned = 0;
+
+    for i in 0..n {
+        let (cmd, args_str) = split_cmd(stages[i]);
+        if cmd.is_empty() {
+            println!("shell: empty pipeline stage");
+            break;
+        }
+        if is_builtin(cmd) {
+            if let Ok(c) = core::str::from_utf8(cmd) {
+                println!("shell: {}: builtin cannot be used in a pipeline", c);
+            }
+            break;
+        }
+
+        let mut arg_buf = [0u8; 256];
+        let resolved = resolve_args(cmd, args_str, &mut arg_buf);
+        let info = match cmd_spawn(cmd, resolved, vfs_tid, i == 0, i + 1 == n) {
+            Some(v) => v,
+            None => break,
+        };
+
+        // Reading end from the previous stage, writing end to the next. The
+        // ends replace the stdin/stdout cmd_spawn duplicated from the shell.
+        if i > 0 {
+            let _ = syscall::sys_pipe_fd_set(info.tid, 0, pipes[i - 1], false);
+        }
+        if i + 1 < n {
+            let _ = syscall::sys_pipe_fd_set(info.tid, 1, pipes[i], true);
+        }
+
+        infos[i] = info;
+        spawned += 1;
+    }
+
+    // A stage that never loaded leaves the pipeline unrunnable; tear down the
+    // tasks already created rather than leaking their slots.
+    if spawned != n {
+        for i in 0..spawned {
+            let _ = syscall::sys_task_kill(infos[i].tid);
+        }
+        return -1;
+    }
+
+    for i in 0..n {
+        if infos[i].start().is_err() {
+            println!("shell: failed to start pipeline stage");
+            for j in 0..n {
+                let _ = syscall::sys_task_kill(infos[j].tid);
+            }
+            return -1;
+        }
+    }
+
+    let last_tid = infos[n - 1].tid;
+    if input_tid != 0 {
+        set_foreground(input_tid, last_tid);
+    }
+
+    // Reap every stage; the pipeline's status is the last stage's.
+    let mut status = -1;
+    for _ in 0..n {
+        match syscall::sys_wait() {
+            Ok((tid, code)) => {
+                if tid == last_tid {
+                    status = code;
+                }
+            }
+            Err(()) => break,
+        }
+    }
+
+    if input_tid != 0 {
+        set_foreground(input_tid, 0);
+    }
+    status
 }
 
 // ---------------------------------------------------------------------------
 // Current working directory
 // ---------------------------------------------------------------------------
+
+/// Status of the last command run, reported by the `status` builtin.
+static mut LAST_STATUS: i32 = 0;
+
+/// Record a command's exit status and report a failure.
+///
+/// The kernel has carried exit codes through sys_wait since the syscall
+/// boundary audit, but every caller discarded them, so a program had no way to
+/// report failure. Non-zero is printed as it happens; `status` reads back the
+/// last one either way.
+fn set_status(name: &[u8], code: i32) {
+    unsafe { LAST_STATUS = code; }
+    if code != 0 {
+        if let Ok(s) = core::str::from_utf8(name) {
+            println!("{}: exit {}", s, code);
+        }
+    }
+}
 
 static mut CWD: [u8; 64] = [0; 64];
 static mut CWD_LEN: usize = 0;
@@ -700,6 +872,29 @@ pub extern "C" fn _start() -> ! {
         }
         let line = &line[start..];
 
+        // Pipeline: split on '|' before anything else, since the first word of
+        // `a | b` is a stage command rather than a builtin.
+        if line.contains(&b'|') {
+            let mut stages: [&[u8]; MAX_STAGES] = [b""; MAX_STAGES];
+            let mut n = 0;
+            let mut too_long = false;
+            for part in line.split(|&b| b == b'|') {
+                if n >= MAX_STAGES {
+                    too_long = true;
+                    break;
+                }
+                stages[n] = part;
+                n += 1;
+            }
+            if too_long {
+                println!("shell: pipeline too long (max {} stages)", MAX_STAGES);
+            } else {
+                let code = cmd_pipeline(&stages[..n], vfs_tid, input_tid);
+                set_status(b"pipeline", code);
+            }
+            continue;
+        }
+
         // Split into command and args
         let mut split = line.len();
         for i in 0..line.len() {
@@ -734,6 +929,12 @@ pub extern "C" fn _start() -> ! {
             continue;
         }
 
+        // Builtin: status
+        if cmd == b"status" {
+            println!("{}", unsafe { LAST_STATUS });
+            continue;
+        }
+
         // Builtin: kill [-9] <tid>
         if cmd == b"kill" {
             let arg = args_str.trim_ascii();
@@ -760,7 +961,8 @@ pub extern "C" fn _start() -> ! {
         let resolved_args = resolve_args(cmd, args_str, &mut resolved_args_buf);
 
         // External command
-        cmd_exec(cmd, resolved_args, vfs_tid, input_tid);
+        let code = cmd_exec(cmd, resolved_args, vfs_tid, input_tid);
+        set_status(cmd, code);
     }
 }
 
