@@ -7,6 +7,7 @@ use quark_rt::{args, println, syscall};
 const NAMESERVER_TID: usize = 2;
 const TAG_NS_LOOKUP: u64 = 2;
 const DEFAULT_COUNT: usize = 4;
+const NAME_LEN: usize = 24; // 3 x u64, as the nameserver stores it
 
 fn parse_usize(s: &[u8]) -> Option<usize> {
     let mut n: usize = 0;
@@ -44,26 +45,50 @@ fn lookup_service(name: &[u8]) -> Option<usize> {
     }
 }
 
+/// Nameserver reverse lookup: what name did this TID register under?
+const TAG_NS_LOOKUP_TID: u64 = 3;
+const TAG_NS_OK: u64 = 0;
+
+/// Seconds to wait for a reply before giving up, in 100 Hz PIT ticks.
+const PING_TIMEOUT_TICKS: u64 = 300;
+
+/// Look up the service name a TID registered under, if any.
+fn service_name_for(tid: usize, buf: &mut [u8; NAME_LEN]) -> Option<usize> {
+    let msg = Message {
+        sender: 0,
+        tag: TAG_NS_LOOKUP_TID,
+        data: [tid as u64, 0, 0, 0, 0, 0],
+    };
+    let mut reply = Message::empty();
+    if syscall::sys_call(NAMESERVER_TID, &msg, &mut reply).is_ok() && reply.tag == TAG_NS_OK {
+        buf[0..8].copy_from_slice(&reply.data[0].to_le_bytes());
+        buf[8..16].copy_from_slice(&reply.data[1].to_le_bytes());
+        buf[16..24].copy_from_slice(&reply.data[2].to_le_bytes());
+        Some((reply.data[3] as usize).min(NAME_LEN))
+    } else {
+        None
+    }
+}
+
 /// Ping a task named by TID rather than by service name.
 ///
-/// Reachability is checked first with sys_notify, which is gated by the same
-/// Endpoint capability as sys_call but does not block. A task we may not talk
-/// to is reported immediately, rather than after a send that will never be
-/// received. Badge bit 0 is outside SIG_MASK, which sys_notify rejects on its
-/// own account. The kernel logs a refusal to serial as
-/// `[cap] tid N denied notify`, which also tells a capability refusal apart
-/// from the other ways sys_notify fails (dead or out-of-range target).
+/// Uses sys_call_timeout because a TID is not a promise that anything is
+/// listening: init spends its life in sys_wait, so a plain sys_call to it
+/// blocks with no reply ever coming. Giving up after a few seconds turns that
+/// into an answer instead of a hang the user has to interrupt.
 ///
-/// If that succeeds we do real timed round-trips to `tid` itself — unlike the
-/// service path, which measures the nameserver. A task that receives but never
-/// replies will block us here; it is the foreground task, so Ctrl-C reaches it.
+/// The name the target registered under is shown when it has one, so pinging
+/// by TID reads the same as pinging by name.
 fn probe_tid(tid: usize, count: usize) {
-    if syscall::sys_notify(tid, 1).is_err() {
-        println!("ipcping: tid {} unreachable (no endpoint capability)", tid);
-        return;
+    let mut name_buf = [0u8; NAME_LEN];
+    let name_len = service_name_for(tid, &mut name_buf);
+    let name = name_len.and_then(|n| core::str::from_utf8(&name_buf[..n]).ok());
+
+    match name {
+        Some(n) => println!("PING {} (tid {}) — {} requests", n, tid, count),
+        None => println!("PING tid {} — {} requests", tid, count),
     }
 
-    println!("PING tid {} — {} requests", tid, count);
     let mut min = u64::MAX;
     let mut max = 0u64;
     let mut total = 0u64;
@@ -74,15 +99,25 @@ fn probe_tid(tid: usize, count: usize) {
         let msg = Message { sender: 0, tag: TAG_NS_LOOKUP, data: [0; 6] };
         let mut reply = Message::empty();
 
-        if syscall::sys_call(tid, &msg, &mut reply).is_ok() {
-            let dt = syscall::sys_ticks() - t0;
-            println!("seq={}: reply from tid {} time={}ms ({}t)", seq, tid, dt * 10, dt);
-            if dt < min { min = dt; }
-            if dt > max { max = dt; }
-            total += dt;
-            ok += 1;
-        } else {
-            println!("seq={}: no reply", seq);
+        match syscall::sys_call_timeout(tid, &msg, &mut reply, PING_TIMEOUT_TICKS) {
+            syscall::CallOutcome::Replied => {
+                let dt = syscall::sys_ticks() - t0;
+                println!("seq={}: reply from tid {} time={}ms ({}t)", seq, tid, dt * 10, dt);
+                if dt < min { min = dt; }
+                if dt > max { max = dt; }
+                total += dt;
+                ok += 1;
+            }
+            syscall::CallOutcome::TimedOut => {
+                println!("seq={}: no reply within {}ms", seq, PING_TIMEOUT_TICKS * 10);
+            }
+            syscall::CallOutcome::Failed => {
+                match name {
+                    Some(n) => println!("ipcping: {} (tid {}) unreachable", n, tid),
+                    None => println!("ipcping: tid {} unreachable", tid),
+                }
+                return;
+            }
         }
 
         if seq + 1 < count {
@@ -90,7 +125,10 @@ fn probe_tid(tid: usize, count: usize) {
         }
     }
 
-    println!("--- tid {} ping stats ---", tid);
+    match name {
+        Some(n) => println!("--- {} ping stats ---", n),
+        None => println!("--- tid {} ping stats ---", tid),
+    }
     if ok > 0 {
         println!(
             "{} sent, {} ok, min={}ms avg={}ms max={}ms",

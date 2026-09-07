@@ -6,6 +6,10 @@ use quark_rt::{println, syscall};
 
 const TAG_REGISTER: u64 = 1;
 const TAG_LOOKUP: u64 = 2;
+/// Reverse lookup: given a TID in data[0], reply with that service's name.
+/// Diagnostics work from TIDs — `ps` output, a kernel log line — and had no way
+/// to turn one back into the name it registered under.
+const TAG_LOOKUP_TID: u64 = 3;
 const TAG_OK: u64 = 0;
 const TAG_NOT_FOUND: u64 = u64::MAX;
 
@@ -27,6 +31,20 @@ pub extern "C" fn _start() -> ! {
         const NONE: Option<ServiceEntry> = None;
         [NONE; MAX_SERVICES]
     };
+
+    // Register ourselves, so a reverse lookup of the nameserver's own TID
+    // resolves like any other service. Nothing looks the nameserver up by
+    // name — its TID is well known — but diagnostics that go the other way
+    // would otherwise show a bare number for it alone.
+    {
+        let mut name = [0u8; NAME_LEN];
+        name[..b"nameserver".len()].copy_from_slice(b"nameserver");
+        services[0] = Some(ServiceEntry {
+            name,
+            name_len: b"nameserver".len(),
+            tid: syscall::sys_getpid() as usize,
+        });
+    }
 
     loop {
         let mut msg = Message::empty();
@@ -80,6 +98,31 @@ pub extern "C" fn _start() -> ! {
                     tag: found_tid.map_or(TAG_NOT_FOUND, |t| t as u64),
                     data: [0; 6],
                 };
+                let _ = syscall::sys_reply(sender, &reply);
+            }
+            TAG_LOOKUP_TID => {
+                let sender = msg.sender;
+                let want = msg.data[0] as usize;
+
+                let mut reply = Message {
+                    sender: 0,
+                    tag: TAG_NOT_FOUND,
+                    data: [0; 6],
+                };
+                for slot in services.iter() {
+                    if let Some(entry) = slot {
+                        if entry.tid == want {
+                            let mut buf = [0u8; NAME_LEN];
+                            buf[..entry.name_len].copy_from_slice(&entry.name[..entry.name_len]);
+                            reply.tag = TAG_OK;
+                            reply.data[0] = u64::from_le_bytes(buf[0..8].try_into().unwrap());
+                            reply.data[1] = u64::from_le_bytes(buf[8..16].try_into().unwrap());
+                            reply.data[2] = u64::from_le_bytes(buf[16..24].try_into().unwrap());
+                            reply.data[3] = entry.name_len as u64;
+                            break;
+                        }
+                    }
+                }
                 let _ = syscall::sys_reply(sender, &reply);
             }
             _ => {
