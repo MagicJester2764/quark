@@ -82,6 +82,14 @@ These were established deliberately. Breaking one silently re-opens a hole.
 - **Validate user pointers with `validate_user_ptr{,_mut}`, not a range check.**
   The kernel runs on the caller's CR3; an in-range but unmapped address faults
   *inside* the kernel, sometimes with a lock held and interrupts off.
+- **Mapping authority is ownership first, `PhysRange` second.** `sys_map_phys`
+  and `sys_addrspace_map` accept frames the caller owns (`pmm::owns_range`), so
+  a task that allocated a frame may map it holding no capability at all. That is
+  what almost every mapper does. A `PhysRange` grant is for frames the allocator
+  never owned — the framebuffer, device MMIO — and for a page another task
+  allocated and passed over IPC. Never grant `CAP_MAP_PHYS` to narrow it:
+  `populate_from_bitmask` expands that bit into a full-range `PhysRange`, which
+  silently reopens everything the explicit grants closed.
 - **IPC needs an Endpoint capability.** `sys_send`/`sys_call`/`sys_notify` are
   gated by a destination bitmask. IPC the kernel performs through an installed
   fd bypasses this on purpose: the fd is the authorisation, and only a
@@ -97,8 +105,12 @@ as the UID bypass hid it.
 
 ## Known gaps
 
-- `sys_phys_free` verifies ownership per frame, but `init` hands services
-  `PhysRange(0, 4 GiB)`, so that capability constrains little in practice.
+- `PhysRange` is narrow where it can be: console holds exactly the framebuffer,
+  and login, the shell and everything they spawn hold none at all. DISK, VFS and
+  NET still hold `PhysRange(0, 4 GiB)`, because each maps a DMA page the
+  *client* allocated and named over IPC, which has no static extent to grant.
+  Closing that needs the frames handed over explicitly — shared memory, or an
+  ownership transfer on the IPC — rather than a range grant.
 - Endpoint sets are TID bitmasks, not true endpoint objects. A service and its
   clients are named by slot number, not identity.
 - The rust fork is one commit on `upstream/main`. Rebasing it means re-checking

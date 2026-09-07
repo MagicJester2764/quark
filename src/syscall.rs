@@ -177,6 +177,23 @@ fn validate_user_ptr_mut(addr: u64, len: u64) -> bool {
     validate_user_range(addr, len, true)
 }
 
+/// Authority to map a physical range into a page table.
+///
+/// Owning the frames is sufficient. `sys_phys_alloc` records the caller as
+/// their owner, so handing back memory the allocator just gave you conveys no
+/// authority you did not already hold. That is what almost every mapper is
+/// doing: init, the shell and login allocate a frame, map it to stage an ELF
+/// page or a stack, then map it into the child.
+///
+/// A `PhysRange` capability is therefore only needed for frames the allocator
+/// never owned — device MMIO and the framebuffer — and for a page another
+/// task allocated and passed over IPC for DMA. Separating the two is what lets
+/// those grants be narrow, instead of the blanket 0-4 GiB that every mapper
+/// previously had to hold.
+fn may_map_phys(tid: usize, phys: usize, pages: usize) -> bool {
+    crate::pmm::owns_range(phys, pages, tid) || crate::cap::task_has_phys_range(tid, phys, pages)
+}
+
 /// Report an IPC destination the caller lacks an Endpoint capability for.
 ///
 /// Bounded: serial output busy-waits on the UART, so a task looping on a
@@ -483,7 +500,7 @@ extern "C" fn syscall_dispatch(
             if phys & 0xFFF != 0 || phys.checked_add(pages * 4096).is_none() {
                 return u64::MAX;
             }
-            if !crate::cap::task_has_phys_range(scheduler::current_tid(), phys, pages) {
+            if !may_map_phys(scheduler::current_tid(), phys, pages) {
                 return u64::MAX;
             }
             let pml4 = paging::read_cr3();
@@ -542,7 +559,7 @@ extern "C" fn syscall_dispatch(
             // backing frames, so it must actually hold authority over that
             // physical range — otherwise CAP_TASK_MGMT silently implied full
             // physical read/write.
-            if !crate::cap::task_has_phys_range(scheduler::current_tid(), phys, pages) {
+            if !may_map_phys(scheduler::current_tid(), phys, pages) {
                 return u64::MAX;
             }
             // cr3 must be an address space this task created, not an arbitrary

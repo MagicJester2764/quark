@@ -571,37 +571,45 @@ fn grant_caps_by_name(name: &[u8; 11], tid: usize) {
         mint_and_grant(tid, 0, syscall::CAP_TYPE_IOPORT, 0x60, 0x64);
         mint_and_grant(tid, 1, syscall::CAP_TYPE_IRQ, 1, 0);
     } else if base == b"DISK    " {
-        // IoPort(0x1F0, 0x1F7), IoPort(0x3F6, 0x3F6), Irq(14), PhysRange(0, 4G)
+        // IoPort(0x1F0, 0x1F7), IoPort(0x3F6, 0x3F6), Irq(14), PhysRange(0, 4G).
+        // The range stays broad: the driver maps a DMA page the *client*
+        // allocated and named over IPC, so there is no static extent to grant.
         mint_and_grant(tid, 0, syscall::CAP_TYPE_IOPORT, 0x1F0, 0x1F7);
         mint_and_grant(tid, 1, syscall::CAP_TYPE_IOPORT, 0x3F6, 0x3F6);
         mint_and_grant(tid, 2, syscall::CAP_TYPE_IRQ, 14, 0);
         mint_and_grant(tid, 3, syscall::CAP_TYPE_PHYS_RANGE, 0, 0x1_0000_0000);
     } else if base == b"VFS     " {
-        // PhysAlloc(256), PhysRange(0, 4G)
+        // PhysAlloc(256), PhysRange(0, 4G) — broad for the same reason as DISK:
+        // VFS maps client-allocated pages. Its own cache frames are covered by
+        // ownership. CAP_MAP_PHYS withheld so this grant is the only one.
         mint_and_grant(tid, 0, syscall::CAP_TYPE_PHYS_ALLOC, 256, 0);
         mint_and_grant(tid, 1, syscall::CAP_TYPE_PHYS_RANGE, 0, 0x1_0000_0000);
-        let _ = syscall::sys_grant_cap(tid, syscall::CAP_PHYS_ALLOC | syscall::CAP_MAP_PHYS);
+        let _ = syscall::sys_grant_cap(tid, syscall::CAP_PHYS_ALLOC);
     } else if base == b"NET     " {
         // IoPort(0xC000, 0xC0FF), Irq(0xFF wildcard), PhysAlloc(64), PhysRange(0, 4G)
         mint_and_grant(tid, 0, syscall::CAP_TYPE_IOPORT, 0, 0xFFFF);
         mint_and_grant(tid, 1, syscall::CAP_TYPE_IRQ, 0xFF, 0);
         mint_and_grant(tid, 2, syscall::CAP_TYPE_PHYS_ALLOC, 64, 0);
         mint_and_grant(tid, 3, syscall::CAP_TYPE_PHYS_RANGE, 0, 0x1_0000_0000);
+        // CAP_MAP_PHYS withheld: the explicit PhysRange above is the grant.
         let _ = syscall::sys_grant_cap(tid,
-            syscall::CAP_IOPORT | syscall::CAP_IRQ | syscall::CAP_PHYS_ALLOC | syscall::CAP_MAP_PHYS);
+            syscall::CAP_IOPORT | syscall::CAP_IRQ | syscall::CAP_PHYS_ALLOC);
     } else if base == b"INPUT   " {
         // TaskMgmt(0)
         mint_and_grant(tid, 0, syscall::CAP_TYPE_TASK_MGMT, 0, 0);
         let _ = syscall::sys_grant_cap(tid, syscall::CAP_TASK_MGMT);
     } else if base == b"SHELL   " {
-        // TaskMgmt(0), PhysAlloc(64), PhysRange(0, 4G), IoPort(ACPI shutdown ports)
+        // TaskMgmt(0), PhysAlloc(64), IoPort(ACPI shutdown ports).
+        // No PhysRange: the shell only ever maps frames it allocated itself to
+        // stage a child's ELF pages, stack and args, and frame ownership
+        // authorises those. It runs arbitrary user code, so it is exactly the
+        // task that should not hold a physical-memory capability.
         mint_and_grant(tid, 0, syscall::CAP_TYPE_TASK_MGMT, 0, 0);
         mint_and_grant(tid, 1, syscall::CAP_TYPE_PHYS_ALLOC, 64, 0);
-        mint_and_grant(tid, 2, syscall::CAP_TYPE_PHYS_RANGE, 0, 0x1_0000_0000);
-        mint_and_grant(tid, 3, syscall::CAP_TYPE_IOPORT, 0x604, 0x604);
-        mint_and_grant(tid, 4, syscall::CAP_TYPE_IOPORT, 0xB004, 0xB004);
+        mint_and_grant(tid, 2, syscall::CAP_TYPE_IOPORT, 0x604, 0x604);
+        mint_and_grant(tid, 3, syscall::CAP_TYPE_IOPORT, 0xB004, 0xB004);
         let _ = syscall::sys_grant_cap(tid,
-            syscall::CAP_TASK_MGMT | syscall::CAP_PHYS_ALLOC | syscall::CAP_MAP_PHYS | syscall::CAP_IOPORT);
+            syscall::CAP_TASK_MGMT | syscall::CAP_PHYS_ALLOC | syscall::CAP_IOPORT);
     } else if base == b"SHUTDOWN" {
         // TaskMgmt(0) for signaling tasks, IoPort(0x604,0xB004) for ACPI power-off
         mint_and_grant(tid, 0, syscall::CAP_TYPE_TASK_MGMT, 0, 0);
@@ -609,15 +617,16 @@ fn grant_caps_by_name(name: &[u8; 11], tid: usize) {
         mint_and_grant(tid, 2, syscall::CAP_TYPE_IOPORT, 0xB004, 0xB004);
         let _ = syscall::sys_grant_cap(tid, syscall::CAP_TASK_MGMT | syscall::CAP_IOPORT);
     } else if base == b"LOGIN   " {
-        // TaskMgmt(0), PhysAlloc(64), PhysRange(0, 4G), SetUid, IoPort(ACPI shutdown ports)
+        // TaskMgmt(0), PhysAlloc(64), SetUid, IoPort(ACPI shutdown ports).
+        // No PhysRange, for the same reason as SHELL: login stages its child
+        // out of frames it allocated itself.
         mint_and_grant(tid, 0, syscall::CAP_TYPE_TASK_MGMT, 0, 0);
         mint_and_grant(tid, 1, syscall::CAP_TYPE_PHYS_ALLOC, 64, 0);
-        mint_and_grant(tid, 2, syscall::CAP_TYPE_PHYS_RANGE, 0, 0x1_0000_0000);
-        mint_and_grant(tid, 3, syscall::CAP_TYPE_SET_UID, 0, 0);
-        mint_and_grant(tid, 4, syscall::CAP_TYPE_IOPORT, 0x604, 0x604);
-        mint_and_grant(tid, 5, syscall::CAP_TYPE_IOPORT, 0xB004, 0xB004);
+        mint_and_grant(tid, 2, syscall::CAP_TYPE_SET_UID, 0, 0);
+        mint_and_grant(tid, 3, syscall::CAP_TYPE_IOPORT, 0x604, 0x604);
+        mint_and_grant(tid, 4, syscall::CAP_TYPE_IOPORT, 0xB004, 0xB004);
         let _ = syscall::sys_grant_cap(tid,
-            syscall::CAP_TASK_MGMT | syscall::CAP_PHYS_ALLOC | syscall::CAP_MAP_PHYS | syscall::CAP_SET_UID | syscall::CAP_IOPORT);
+            syscall::CAP_TASK_MGMT | syscall::CAP_PHYS_ALLOC | syscall::CAP_SET_UID | syscall::CAP_IOPORT);
     }
 }
 
@@ -662,6 +671,19 @@ fn lookup_service_with_retry(name: &[u8], max_attempts: usize) -> Option<usize> 
 // ---------------------------------------------------------------------------
 // Framebuffer info handoff to console server
 // ---------------------------------------------------------------------------
+
+/// Physical extent of the framebuffer, page aligned.
+///
+/// Console maps exactly this and nothing else, so this is exactly what it is
+/// granted. Deriving it here rather than hardcoding a range keeps the grant
+/// correct across whatever mode the bootloader actually set.
+fn framebuffer_range() -> (u64, u64) {
+    let info = unsafe { &*(BOOT_INFO_ADDR as *const BootInfo) };
+    let size = (info.fb_pitch as u64) * (info.fb_height as u64);
+    let base = info.fb_addr & !0xFFF;
+    let end = (info.fb_addr + size + 0xFFF) & !0xFFF;
+    (base, end)
+}
 
 fn send_fb_info(console_tid: usize) {
     let info = unsafe { &*(BOOT_INFO_ADDR as *const BootInfo) };
@@ -747,9 +769,13 @@ fn load_essentials_from_boot_image(rootfs_phys: usize, rootfs_size: usize) -> Bo
             if let Ok(data) = read_file_to_buffer(rootfs, &bpb, e.first_cluster, e.file_size) {
                 match load_elf(data) {
                     Ok(info) => {
-                        // Console: PhysRange(0, 4G) for framebuffer mapping
-                        mint_and_grant(info.tid, 0, syscall::CAP_TYPE_PHYS_RANGE, 0, 0x1_0000_0000);
-                        let _ = syscall::sys_grant_cap(info.tid, syscall::CAP_MAP_PHYS);
+                        // Console maps the framebuffer and nothing else, so
+                        // grant precisely that. CAP_MAP_PHYS is deliberately
+                        // withheld: sys_grant_cap runs populate_from_bitmask,
+                        // which mints a second, full-range PhysRange that would
+                        // make this one moot.
+                        let (fb_base, fb_end) = framebuffer_range();
+                        mint_and_grant(info.tid, 0, syscall::CAP_TYPE_PHYS_RANGE, fb_base, fb_end);
                         add_service(info.tid);
                         grant_endpoints(info.tid, syscall::SLOT_ENDPOINT);
                         let _ = set_args(&info, &[b"console"]);

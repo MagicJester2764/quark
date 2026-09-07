@@ -355,16 +355,20 @@ pub extern "C" fn _start() -> ! {
         let _ = syscall::sys_set_gid(tid, entry.gid);
 
         // Grant shell capabilities (task mgmt + phys for spawning + ioport for shutdown)
+        // Not CAP_MAP_PHYS: it mints a full-range PhysRange into the shell,
+        // which would undo the narrowing below and in init.
         let _ = syscall::sys_grant_cap(
             tid,
-            syscall::CAP_TASK_MGMT | syscall::CAP_PHYS_ALLOC | syscall::CAP_MAP_PHYS | syscall::CAP_IOPORT,
+            syscall::CAP_TASK_MGMT | syscall::CAP_PHYS_ALLOC | syscall::CAP_IOPORT,
         );
         // Pass on our own IPC reach. Delegating the capability itself rather
         // than minting a new one means we do not need to know which services
         // it names — sys_cap_inspect cannot report a 64-bit destination set.
         let _ = syscall::sys_cap_grant(tid, syscall::SLOT_ENDPOINT, syscall::SLOT_ENDPOINT);
 
-        // Fine-grained caps for shell: TaskMgmt, PhysAlloc, PhysRange, IOPORT (ACPI shutdown)
+        // Fine-grained caps for shell: TaskMgmt, PhysAlloc, IOPORT (ACPI
+        // shutdown). No PhysRange: the shell stages its children out of frames
+        // it allocated itself, and login holds none to mint from in any case.
         const SCRATCH: usize = 14;
         let _ = syscall::sys_cap_mint(SCRATCH, syscall::CAP_TYPE_TASK_MGMT, 0, 0);
         let _ = syscall::sys_cap_grant(tid, SCRATCH, 0);
@@ -372,14 +376,11 @@ pub extern "C" fn _start() -> ! {
         let _ = syscall::sys_cap_mint(SCRATCH, syscall::CAP_TYPE_PHYS_ALLOC, 64, 0);
         let _ = syscall::sys_cap_grant(tid, SCRATCH, 1);
         let _ = syscall::sys_cap_delete(SCRATCH);
-        let _ = syscall::sys_cap_mint(SCRATCH, syscall::CAP_TYPE_PHYS_RANGE, 0, 0x1_0000_0000);
+        let _ = syscall::sys_cap_mint(SCRATCH, syscall::CAP_TYPE_IOPORT, 0x604, 0x604);
         let _ = syscall::sys_cap_grant(tid, SCRATCH, 2);
         let _ = syscall::sys_cap_delete(SCRATCH);
-        let _ = syscall::sys_cap_mint(SCRATCH, syscall::CAP_TYPE_IOPORT, 0x604, 0x604);
-        let _ = syscall::sys_cap_grant(tid, SCRATCH, 3);
-        let _ = syscall::sys_cap_delete(SCRATCH);
         let _ = syscall::sys_cap_mint(SCRATCH, syscall::CAP_TYPE_IOPORT, 0xB004, 0xB004);
-        let _ = syscall::sys_cap_grant(tid, SCRATCH, 4);
+        let _ = syscall::sys_cap_grant(tid, SCRATCH, 3);
         let _ = syscall::sys_cap_delete(SCRATCH);
 
         // Wire file descriptors
