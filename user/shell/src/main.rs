@@ -245,6 +245,11 @@ fn eq_ignore_case(a: &[u8], b: &[u8]) -> bool {
 }
 
 fn grant_caps_by_name(name: &[u8], tid: usize) {
+    // Every child inherits the shell's IPC reach, so it can find and call the
+    // services. Delegated rather than minted: the shell cannot read back the
+    // 64-bit destination set to re-mint it.
+    let _ = syscall::sys_cap_grant(tid, syscall::SLOT_ENDPOINT, syscall::SLOT_ENDPOINT);
+
     if eq_ignore_case(name, b"cat") || eq_ignore_case(name, b"disktest") || eq_ignore_case(name, b"httpget") {
         // Fine-grained: PhysAlloc(64), PhysRange(0, 4G)
         const SCRATCH: usize = 14;

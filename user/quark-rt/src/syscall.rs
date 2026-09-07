@@ -609,6 +609,21 @@ pub const CAP_TYPE_IRQ: u64 = 3;
 pub const CAP_TYPE_TASK_MGMT: u64 = 4;
 pub const CAP_TYPE_PHYS_ALLOC: u64 = 5;
 pub const CAP_TYPE_SET_UID: u64 = 6;
+/// Endpoint: param0 is a bitmask of destination TIDs this task may
+/// sys_send / sys_call / sys_notify. Bit N = TID N.
+pub const CAP_TYPE_ENDPOINT: u64 = 7;
+
+/// CSpace slot conventions shared by init, login and the shell.
+///
+/// The endpoint capability lives at a fixed slot so a parent can delegate it
+/// to a child with sys_cap_grant without having to know the mask it carries;
+/// sys_cap_inspect truncates params and cannot report a 64-bit set.
+pub const SLOT_ENDPOINT: usize = 15;
+/// Second endpoint slot, used by init to top up services that were started
+/// before their peers existed.
+pub const SLOT_ENDPOINT_EXTRA: usize = 13;
+/// Scratch slot used for the mint-grant-delete idiom.
+pub const SLOT_SCRATCH: usize = 14;
 
 /// Mint a new capability in the caller's CSpace slot.
 /// The caller must already hold a cap of the same type whose params are a superset.
@@ -666,3 +681,4 @@ pub const CAP_IRQ: u32 = 1 << 2;
 pub const CAP_TASK_MGMT: u32 = 1 << 3;
 pub const CAP_PHYS_ALLOC: u32 = 1 << 4;
 pub const CAP_SET_UID: u32 = 1 << 5;
+pub const CAP_ENDPOINT: u32 = 1 << 6;

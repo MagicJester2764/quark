@@ -522,6 +522,33 @@ fn is_essential_elf(name: &[u8; 11]) -> bool {
         || base == b"NET     "
 }
 
+/// Set of TIDs that programs are allowed to originate IPC to.
+///
+/// Grows as system services are spawned. Everything init starts gets an
+/// Endpoint capability carrying this mask, which is what lets a program reach
+/// the nameserver and the services — and nothing else. Two user programs are
+/// never in each other's mask, so they cannot talk to one another directly.
+static mut SERVICE_MASK: u64 = (1 << INIT_TID) | (1 << NAMESERVER_TID);
+
+/// init is always TID 1; NAMESERVER_TID is defined at the top of this file.
+const INIT_TID: usize = 1;
+
+/// Record `tid` as a system service reachable by everything init starts.
+fn add_service(tid: usize) {
+    if tid < 64 {
+        unsafe { SERVICE_MASK |= 1u64 << tid };
+    }
+}
+
+fn service_mask() -> u64 {
+    unsafe { SERVICE_MASK }
+}
+
+/// Give `tid` permission to send to the current service set.
+fn grant_endpoints(tid: usize, slot: usize) {
+    mint_and_grant(tid, slot, syscall::CAP_TYPE_ENDPOINT, service_mask(), 0);
+}
+
 /// Mint a cap in a temporary slot, grant it to a child task, then delete it.
 /// Uses slot 14 as a scratch slot for minting.
 fn mint_and_grant(tid: usize, dest_slot: usize, cap_type: u64, param0: u64, param1: u64) {
@@ -533,6 +560,11 @@ fn mint_and_grant(tid: usize, dest_slot: usize, cap_type: u64, param0: u64, para
 
 /// Grant capabilities based on FAT 8.3 name using fine-grained object capabilities.
 fn grant_caps_by_name(name: &[u8; 11], tid: usize) {
+    // Everything init starts may reach the service set. Without this no
+    // program could even look up a name, since the nameserver is itself an
+    // IPC destination.
+    grant_endpoints(tid, syscall::SLOT_ENDPOINT);
+
     let base = &name[0..8];
     if base == b"KEYBOARD" {
         // IoPort(0x60, 0x64), Irq(1)
@@ -718,6 +750,8 @@ fn load_essentials_from_boot_image(rootfs_phys: usize, rootfs_size: usize) -> Bo
                         // Console: PhysRange(0, 4G) for framebuffer mapping
                         mint_and_grant(info.tid, 0, syscall::CAP_TYPE_PHYS_RANGE, 0, 0x1_0000_0000);
                         let _ = syscall::sys_grant_cap(info.tid, syscall::CAP_MAP_PHYS);
+                        add_service(info.tid);
+                        grant_endpoints(info.tid, syscall::SLOT_ENDPOINT);
                         let _ = set_args(&info, &[b"console"]);
                         // Create console pipe and set fds BEFORE starting console
                         // to avoid race where console reaches main loop before fd 0 is set
@@ -768,6 +802,7 @@ fn load_essentials_from_boot_image(rootfs_phys: usize, rootfs_size: usize) -> Bo
             match load_elf(data) {
                 Ok(info) => {
                     let tid = info.tid;
+                    add_service(tid);
                     grant_caps_by_name(&e.name, tid);
                     if console_pipe != 0 {
                         let _ = syscall::sys_pipe_fd_set(tid, 1, console_pipe, true);
@@ -800,6 +835,11 @@ fn load_essentials_from_boot_image(rootfs_phys: usize, rootfs_size: usize) -> Bo
                 match load_elf(data) {
                     Ok(info) => {
                         input_tid = info.tid;
+                        // This pass predates grant_caps_by_name and never
+                        // called it, so input was running with an empty
+                        // CSpace — invisible while UID 0 bypassed the checks.
+                        add_service(info.tid);
+                        grant_caps_by_name(&e.name, info.tid);
                         if console_pipe != 0 {
                             let _ = syscall::sys_pipe_fd_set(info.tid, 1, console_pipe, true);
                             let _ = syscall::sys_pipe_fd_set(info.tid, 2, console_pipe, true);
@@ -830,6 +870,7 @@ fn load_essentials_from_boot_image(rootfs_phys: usize, rootfs_size: usize) -> Bo
             if let Ok(data) = read_file_to_buffer(rootfs, &bpb, e.first_cluster, e.file_size) {
                 match load_elf(data) {
                     Ok(info) => {
+                        add_service(info.tid);
                         grant_caps_by_name(&e.name, info.tid);
                         if console_pipe != 0 {
                             let _ = syscall::sys_pipe_fd_set(info.tid, 1, console_pipe, true);
@@ -1055,6 +1096,23 @@ pub extern "C" fn _start() -> ! {
             };
 
             // Phase 4: Start non-essential programs
+            // Services are started as they are spawned, so an early one holds a
+            // mask that predates its peers. Hand every service a second
+            // Endpoint capability carrying the completed set; task_has_endpoint
+            // takes the union across a CSpace, so this only ever widens.
+            let final_mask = service_mask();
+            for tid in 0..64usize {
+                if tid > NAMESERVER_TID && final_mask & (1u64 << tid) != 0 {
+                    mint_and_grant(
+                        tid,
+                        syscall::SLOT_ENDPOINT_EXTRA,
+                        syscall::CAP_TYPE_ENDPOINT,
+                        final_mask,
+                        0,
+                    );
+                }
+            }
+
             println!("[init] All programs loaded. Starting deferred tasks.");
             deferred.start_sequentially();
 

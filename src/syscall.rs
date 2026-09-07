@@ -177,6 +177,28 @@ fn validate_user_ptr_mut(addr: u64, len: u64) -> bool {
     validate_user_range(addr, len, true)
 }
 
+/// Report an IPC destination the caller lacks an Endpoint capability for.
+///
+/// Bounded: serial output busy-waits on the UART, so a task looping on a
+/// forbidden destination could otherwise stall the machine by spamming this.
+/// The first few reports are what matter when diagnosing a policy gap.
+fn deny_ipc(caller: usize, dest: usize, what: &[u8]) -> u64 {
+    const MAX_REPORTS: u32 = 32;
+    static REPORTS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+    if REPORTS.fetch_add(1, core::sync::atomic::Ordering::Relaxed) >= MAX_REPORTS {
+        return u64::MAX;
+    }
+
+    crate::serial::puts(b"[cap] tid ");
+    crate::serial::put_usize(caller);
+    crate::serial::puts(b" denied ");
+    crate::serial::puts(what);
+    crate::serial::puts(b" -> tid ");
+    crate::serial::put_usize(dest);
+    crate::serial::puts(b"\n");
+    u64::MAX
+}
+
 /// Unmap `pages` pages starting at `vaddr`, returning owned frames to the PMM.
 /// Used to roll back a partially completed mapping loop.
 fn unmap_range_owned(cr3: usize, vaddr: usize, pages: usize) {
@@ -313,6 +335,9 @@ extern "C" fn syscall_dispatch(
         SYS_GETPID => scheduler::current_tid() as u64,
         SYS_SEND => {
             let dest = arg0 as usize;
+            if !crate::cap::task_has_endpoint(scheduler::current_tid(), dest) {
+                return deny_ipc(scheduler::current_tid(), dest, b"send");
+            }
             let msg_ptr = arg1 as *const crate::ipc::Message;
             let msg_size = core::mem::size_of::<crate::ipc::Message>() as u64;
             if !validate_user_ptr(arg1, msg_size) { return u64::MAX; }
@@ -341,6 +366,9 @@ extern "C" fn syscall_dispatch(
         }
         SYS_CALL => {
             let dest = arg0 as usize;
+            if !crate::cap::task_has_endpoint(scheduler::current_tid(), dest) {
+                return deny_ipc(scheduler::current_tid(), dest, b"call");
+            }
             let msg_ptr = arg1 as *const crate::ipc::Message;
             let reply_ptr = arg2 as *mut crate::ipc::Message;
             let msg_size = core::mem::size_of::<crate::ipc::Message>() as u64;
@@ -996,6 +1024,9 @@ extern "C" fn syscall_dispatch(
             // arg0 = dest tid, arg1 = badge (bits to OR into notification word)
             let dest = arg0 as usize;
             let badge = arg1;
+            if !crate::cap::task_has_endpoint(scheduler::current_tid(), dest) {
+                return deny_ipc(scheduler::current_tid(), dest, b"notify");
+            }
             match crate::ipc::sys_notify(dest, badge) {
                 Ok(()) => 0,
                 Err(_) => u64::MAX,
@@ -1118,6 +1149,7 @@ extern "C" fn syscall_dispatch(
                 4 => crate::cap::CapType::TaskMgmt,
                 5 => crate::cap::CapType::PhysAlloc,
                 6 => crate::cap::CapType::SetUid,
+                7 => crate::cap::CapType::Endpoint,
                 _ => return u64::MAX,
             };
             let tid = scheduler::current_tid();

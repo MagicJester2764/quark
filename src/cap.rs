@@ -67,6 +67,13 @@ pub enum CapType {
     TaskMgmt = 4,   // param0=target_tid (0=any)
     PhysAlloc = 5,  // param0=max_pages (0=unlimited)
     SetUid = 6,     // no params
+    /// Permission to originate IPC to a set of tasks.
+    ///
+    /// param0 is a bitmask of destination TIDs (bit N = may send to TID N),
+    /// which fits exactly because MAX_TASKS is 64. A bitmask rather than one
+    /// capability per target keeps this to a single CSpace slot, which matters
+    /// when a program needs to reach half a dozen services.
+    Endpoint = 7,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -215,6 +222,56 @@ pub fn task_has_phys_alloc(tid: usize) -> bool {
     }
 }
 
+/// Check if `tid` may originate IPC to `dest`.
+///
+/// Only gates messages where the sender names the destination itself
+/// (sys_send/sys_call/sys_notify). IPC the kernel performs on a task's behalf
+/// through an installed file descriptor is authorised by the fd itself, which
+/// only a CAP_TASK_MGMT holder can install.
+pub fn task_has_endpoint(tid: usize, dest: usize) -> bool {
+    if tid >= MAX_TASKS || dest >= MAX_TASKS {
+        return false;
+    }
+    if user_has_cap_bit(tid, crate::task::CAP_ENDPOINT) {
+        return true;
+    }
+    let bit = 1u64 << dest;
+    unsafe {
+        match task_cspace(tid) {
+            Some(cs) => cs.iter().any(|cap| {
+                cap.cap_type as u8 == CapType::Endpoint as u8
+                    && is_valid(cap)
+                    && cap.param0 & bit != 0
+            }),
+            None => false,
+        }
+    }
+}
+
+/// Withdraw permission to send to `dead_tid` from every task.
+///
+/// TIDs are reused once a task is reaped, so an Endpoint bitmask naming a
+/// dead service would otherwise silently transfer to whatever task next
+/// occupies that slot. Permission to talk to a service dies with it; a new
+/// occupant requires a fresh grant.
+pub fn revoke_endpoints_to(dead_tid: usize) {
+    if dead_tid >= MAX_TASKS {
+        return;
+    }
+    let bit = 1u64 << dead_tid;
+    for tid in 0..MAX_TASKS {
+        unsafe {
+            if let Some(task) = crate::scheduler::get_task_mut(tid) {
+                for cap in task.cspace.iter_mut() {
+                    if cap.cap_type as u8 == CapType::Endpoint as u8 {
+                        cap.param0 &= !bit;
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Check if a task has SetUid capability.
 pub fn task_has_set_uid(tid: usize) -> bool {
     if tid >= MAX_TASKS { return false; }
@@ -346,6 +403,18 @@ pub fn populate_from_bitmask(cspace: &mut CSpace, caps: u32) {
             };
         }
     }
+    if caps & crate::task::CAP_ENDPOINT != 0 {
+        if let Some(slot) = find_empty_slot(cspace) {
+            cspace[slot] = CapSlot {
+                cap_type: CapType::Endpoint,
+                generation: 0,
+                root_slot: 0,
+                root_tid: KERNEL_ROOT_TID,
+                param0: u64::MAX, // every destination
+                param1: 0,
+            };
+        }
+    }
     if caps & crate::task::CAP_SET_UID != 0 {
         if let Some(slot) = find_empty_slot(cspace) {
             cspace[slot] = CapSlot {
@@ -414,6 +483,10 @@ pub fn validate_attenuation(source: &CapSlot, new_type: CapType, new_p0: u64, ne
             }
         }
         CapType::SetUid => true,
+        CapType::Endpoint => {
+            // The delegated destination set must be a subset of the source's.
+            new_p0 & !source.param0 == 0
+        }
     }
 }
 

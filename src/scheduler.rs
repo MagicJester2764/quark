@@ -487,6 +487,9 @@ pub fn reap_dead() {
                     crate::shmem::cleanup_task(i);
                     // Reclaim sys_phys_alloc reservations it never released
                     crate::pmm::release_task_frames(i);
+                    // Withdraw everyone's permission to send to this TID before
+                    // the slot can be handed to a different task.
+                    crate::cap::revoke_endpoints_to(i);
                     // Destroy user address space
                     let cr3 = task.cr3;
                     if cr3 != 0 && cr3 != crate::paging::kernel_cr3() {

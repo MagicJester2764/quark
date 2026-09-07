@@ -37,7 +37,16 @@ pub const CAP_IRQ: u32 = 1 << 2;
 pub const CAP_TASK_MGMT: u32 = 1 << 3;
 pub const CAP_PHYS_ALLOC: u32 = 1 << 4;
 pub const CAP_SET_UID: u32 = 1 << 5;
-pub const CAP_ALL: u32 = CAP_IOPORT | CAP_MAP_PHYS | CAP_IRQ | CAP_TASK_MGMT | CAP_PHYS_ALLOC | CAP_SET_UID;
+/// Permission to originate IPC. Expands to an Endpoint capability naming every
+/// destination; narrower sets are minted with sys_cap_mint.
+pub const CAP_ENDPOINT: u32 = 1 << 6;
+pub const CAP_ALL: u32 = CAP_IOPORT
+    | CAP_MAP_PHYS
+    | CAP_IRQ
+    | CAP_TASK_MGMT
+    | CAP_PHYS_ALLOC
+    | CAP_SET_UID
+    | CAP_ENDPOINT;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TaskState {

@@ -359,6 +359,11 @@ pub extern "C" fn _start() -> ! {
             tid,
             syscall::CAP_TASK_MGMT | syscall::CAP_PHYS_ALLOC | syscall::CAP_MAP_PHYS | syscall::CAP_IOPORT,
         );
+        // Pass on our own IPC reach. Delegating the capability itself rather
+        // than minting a new one means we do not need to know which services
+        // it names — sys_cap_inspect cannot report a 64-bit destination set.
+        let _ = syscall::sys_cap_grant(tid, syscall::SLOT_ENDPOINT, syscall::SLOT_ENDPOINT);
+
         // Fine-grained caps for shell: TaskMgmt, PhysAlloc, PhysRange, IOPORT (ACPI shutdown)
         const SCRATCH: usize = 14;
         let _ = syscall::sys_cap_mint(SCRATCH, syscall::CAP_TYPE_TASK_MGMT, 0, 0);
