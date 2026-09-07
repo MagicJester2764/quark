@@ -44,6 +44,23 @@ fn lookup_service(name: &[u8]) -> Option<usize> {
     }
 }
 
+/// Report whether this task may originate IPC to `tid`.
+///
+/// Uses sys_notify rather than sys_call: it is gated by the same Endpoint
+/// capability, but does not block, so a probe that is unexpectedly *permitted*
+/// prints and exits instead of hanging on a reply that never comes. Badge bit 0
+/// is outside SIG_MASK, which sys_notify rejects on its own account.
+///
+/// A refusal here is the Endpoint check firing; the kernel logs the reason to
+/// serial as `[cap] tid N denied notify`, which also distinguishes it from the
+/// other ways sys_notify can fail (dead or out-of-range target).
+fn probe_tid(tid: usize) {
+    match syscall::sys_notify(tid, 1) {
+        Ok(()) => println!("ipcping: tid {} PERMITTED", tid),
+        Err(()) => println!("ipcping: tid {} REFUSED (see serial for reason)", tid),
+    }
+}
+
 fn ping_service(tid: usize, count: usize, name: &[u8]) {
     let name_str = core::str::from_utf8(name).unwrap_or("???");
     println!("PING {} (tid {}) — {} requests", name_str, tid, count);
@@ -107,12 +124,20 @@ fn ping_service(tid: usize, count: usize, name: &[u8]) {
 #[unsafe(no_mangle)]
 #[link_section = ".text.entry"]
 pub extern "C" fn _start() -> ! {
-    // Usage: ipcping [service] [count]
+    // Usage: ipcping [service|tid] [count]
     let service_name = if let Some(arg) = args::argv(1) {
         arg
     } else {
         b"vfs" as &[u8]
     };
+
+    // A numeric argument names a TID directly, so reachability can be probed
+    // for a task the nameserver does not know about — the shell, or another
+    // user program. No service name is numeric, so this is unambiguous.
+    if let Some(tid) = parse_usize(service_name) {
+        probe_tid(tid);
+        syscall::sys_exit();
+    }
 
     let count = if let Some(arg) = args::argv(2) {
         parse_usize(arg).unwrap_or(DEFAULT_COUNT)
