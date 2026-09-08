@@ -145,24 +145,33 @@ INPUT's pass once granted nothing at all, which the UID bypass hid.
 
 ## The screen
 
-`user/wm` owns the framebuffer. Everything that draws asks it for a window,
-gets shared memory back, writes pixels into it and sends a commit; the display
-server composites. The console is a client like any other, so the shell and
-everything it runs live inside a window.
+`user/fb` is the framebuffer device: it owns the hardware the way `/dev/fb0`
+does, knows the mode, and decides who draws. It has no opinion about windows.
 
-Two consequences worth knowing before changing any of it:
+Everything else is a client of it. The text console claims the display at boot
+and draws fullscreen — that is what the machine boots into, a plain TTY.
+`user/wm` is a compositor you *run*: `wm <program>` takes the display, starts
+that program, composites its windows, and gives the display back when it exits.
 
-- **Only one program may map the framebuffer.** `init` grants the `PhysRange`
-  to `wm`, and to the console only so it can fall back to drawing directly when
-  there is no display server. If both drew, they would overwrite each other.
-- **`init` sends framebuffer geometry to exactly one of them.** The console
-  waits for that message only when it is going to use it; `send_fb_info` is a
-  blocking call, so sending it to a console that is waiting for a window
-  instead stops `init` part way through starting the system.
+Three things to know before changing any of it:
+
+- **The display is lent, not shared.** `init` grants the framebuffer
+  `PhysRange` to `fb` and nowhere else; `fb` mints a derived capability per
+  claimant and revokes it to take the display back. Revocation governs the
+  right to *map*, not mappings that already exist, so the outgoing owner is
+  told and answers before the new one is let in — and must empty its
+  capability slot, since granting into an occupied one fails.
+- **Guard every framebuffer write on still owning the display**, not just the
+  flush. The console gated its flush and not `hide_cursor` or `scroll`, and
+  carried on writing into memory it had just unmapped.
+- **Composite into a back buffer.** Painting onto the visible surface means the
+  cleared screen is briefly the one on the monitor, once per frame; a cursor
+  blink is enough to make that a visible flash. `sys_mmap`/`sys_munmap` take at
+  most 256 pages, so a screenful takes a loop.
 
 ## Known gaps
 
-- `PhysRange` is narrow where it can be: `wm` holds exactly the framebuffer,
+- `PhysRange` is narrow where it can be: `fb` holds exactly the framebuffer,
   and login, the shell and everything they spawn hold none at all. DISK, VFS and
   NET still hold `PhysRange(0, 4 GiB)`, because each maps a DMA page the
   *client* allocated and named over IPC, which has no static extent to grant.
@@ -170,10 +179,10 @@ Two consequences worth knowing before changing any of it:
   ownership transfer on the IPC — rather than a range grant.
 - Endpoint sets are TID bitmasks, not true endpoint objects. A service and its
   clients are named by slot number, not identity.
-- Input goes to the input server and out to the shell. The display server
-  tracks which window has focus and shows it, but nothing routes events by it,
-  and a window whose owner exits without saying so stays on the screen. Both
-  want a task-death notification the kernel does not send.
+- Input goes to the input server and out to the shell. The compositor tracks
+  which window has focus and shows it, but nothing routes events by it, and a
+  window whose owner exits without saying so stays on the screen. Both want a
+  task-death notification the kernel does not send.
 - The rust fork is one commit on `upstream/main`. Rebasing it means re-checking
   the PAL against std's internals, which move: the allocator PAL shape, the
   futex module location, `RawOsError`'s home and `BorrowedCursor`'s parameters
