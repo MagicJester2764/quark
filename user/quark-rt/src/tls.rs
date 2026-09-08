@@ -34,6 +34,7 @@ unsafe extern "C" {
     static __tdata_start: u8;
     static __tdata_size: u8;
     static __tls_size: u8;
+    static __tls_align: u8;
 }
 
 #[inline]
@@ -46,7 +47,17 @@ pub fn template_size() -> usize {
     unsafe { linker_value(&__tls_size) }
 }
 
-/// Alignment the template is laid out at. Matches the linker script.
+/// Alignment the linker gave the TLS segment.
+///
+/// Not a constant: it varies with what a program actually puts in thread-local
+/// storage, and the placement below depends on the real value. Never zero, so
+/// a program without a TLS segment still gets a usable alignment.
+pub fn template_align() -> usize {
+    let a = unsafe { linker_value(&__tls_align) };
+    if a == 0 { 8 } else { a }
+}
+
+/// Alignment callers should give the region they pass to [`init_in`].
 pub const TLS_ALIGN: usize = 64;
 
 /// Bytes of the TCB following the thread pointer. Only the self-pointer is
@@ -55,7 +66,10 @@ pub const TCB_SIZE: usize = 16;
 
 /// How much memory [`init_in`] needs for the current program.
 pub fn required_bytes() -> usize {
-    align_up(template_size(), TLS_ALIGN) + TCB_SIZE
+    // The block is sized to the *linker's* alignment, because that is what its
+    // offsets were computed against. The extra TLS_ALIGN covers rounding the
+    // caller's region up to a suitable base.
+    align_up(template_size(), template_align()) + TCB_SIZE + TLS_ALIGN
 }
 
 const fn align_up(v: usize, a: usize) -> usize {
@@ -82,19 +96,24 @@ pub unsafe fn init_in(region: *mut u8, len: usize) -> Result<(), ()> {
         return Err(());
     }
 
-    // Round the base up so the variables land on the template's alignment.
-    let base = align_up(region as usize, TLS_ALIGN);
+    // Round the base up to whichever is stricter: what the template asks for,
+    // or the region alignment callers are told to provide.
+    let base = align_up(region as usize, template_align().max(TLS_ALIGN));
     if base + need > region as usize + len {
         return Err(());
     }
 
-    let tp = base + align_up(tls_size, TLS_ALIGN);
+    // The block starts at TP - ALIGN_UP(size, align), not TP - size: the
+    // linker computed every offset against the padded figure, so anything else
+    // puts each variable off by the padding.
+    let block = align_up(tls_size, template_align());
+    let tp = base + block;
 
     unsafe {
-        // Variables occupy [tp - tls_size, tp): the initialised image first,
-        // then the zeroed tail.
-        let vars = (tp - tls_size) as *mut u8;
-        core::ptr::write_bytes(vars, 0, tls_size);
+        // Variables occupy [tp - block, tp): the initialised image first, then
+        // the zeroed tail, then the alignment padding.
+        let vars = (tp - block) as *mut u8;
+        core::ptr::write_bytes(vars, 0, block);
         if tdata_size > 0 {
             core::ptr::copy_nonoverlapping(tdata_start, vars, tdata_size);
         }

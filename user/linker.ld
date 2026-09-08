@@ -63,6 +63,12 @@ SECTIONS {
         __tbss_end = .;
     }
 
+    /* The alignment the linker gave the TLS segment. Variant II places the
+     * block at TP - ALIGN_UP(size, align), so the runtime needs the real
+     * value: assuming one puts every thread-local off by the padding.
+     */
+    __tls_align = ALIGNOF(.tdata);
+
     __tdata_size = __tdata_end - __tdata_start;
     __tbss_size = __tbss_end - __tbss_start;
     __tls_size = __tbss_end - __tdata_start;

@@ -13,7 +13,10 @@ HAVE_STD_FORK := $(wildcard $(QUARK_RUST_STD_PATH)/std/Cargo.toml)
 ifeq ($(HAVE_STD_FORK),)
 HOSTED_ELF :=
 else
-HOSTED_ELF := $(HELLO_ELF)
+# Deferred, not immediate: HELLO_ELF is defined further down, so `:=` here
+# expanded to nothing and quietly dropped the hosted program from `make all`.
+# It kept building only because it was also invoked directly.
+HOSTED_ELF = $(HELLO_ELF)
 endif
 GRUB_MKRESCUE := $(shell command -v grub-mkrescue 2>/dev/null || command -v grub2-mkrescue 2>/dev/null)
 
@@ -130,7 +133,11 @@ $(INIT_ELF): FORCE
 # genuinely has to be recompiled in that case — it links quark-rt — so the cost
 # is inherent, not overhead. The stamp is written only after a successful
 # build, so an interrupted one does not mark itself current.
-QUARK_RT_SRCS := $(wildcard user/quark-rt/src/*.rs) user/quark-rt/Cargo.toml
+QUARK_RT_SRCS := $(wildcard user/quark-rt/src/*.rs) user/quark-rt/Cargo.toml \
+                 $(wildcard $(QUARK_RUST_STD_PATH)/std/src/sys/pal/quark/*.rs) \
+                 $(wildcard $(QUARK_RUST_STD_PATH)/std/src/sys/*/quark.rs) \
+                 $(wildcard $(QUARK_RUST_STD_PATH)/std/src/sys/io/*/quark.rs) \
+                 $(wildcard $(QUARK_RUST_STD_PATH)/std/src/sys/net/connection/quark.rs)
 HELLO_STAMP := $(HELLO_DIR)/target/.quark-rt-stamp
 
 $(HELLO_ELF): FORCE

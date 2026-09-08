@@ -28,9 +28,32 @@ pub const FD_STDERR: usize = 2;
 // ---- Runtime initialization ----
 
 /// Initialize the Quark runtime. Called once from _start before main.
+/// Thread-local storage for the main thread.
+///
+/// Static rather than allocated because this runs before the allocator has
+/// been touched, and because the main thread's storage has to outlive
+/// everything. Programs needing more than this declare it and find out at
+/// startup rather than corrupting memory later — see the check below.
+const MAIN_TLS_BYTES: usize = 4096;
+static mut MAIN_TLS: [u8; MAIN_TLS_BYTES] = [0; MAIN_TLS_BYTES];
+
 pub fn init() {
-    // Currently a no-op; the allocator self-initializes on first alloc.
-    // Future: pre-discover VFS/net service TIDs, set up TLS, etc.
+    // Set up thread-locals before anything else: std reaches for them early,
+    // and reading one through an unset FS base faults.
+    unsafe {
+        let need = crate::tls::required_bytes();
+        if need > MAIN_TLS_BYTES {
+            // Nothing useful can run without its thread-locals, and carrying
+            // on would write past this buffer.
+            crate::syscall::sys_write(b"quark-rt: TLS template exceeds the main thread's buffer\n");
+            crate::syscall::sys_exit_code(1);
+        }
+        let region = core::ptr::addr_of_mut!(MAIN_TLS) as *mut u8;
+        if crate::tls::init_in(region, MAIN_TLS_BYTES).is_err() {
+            crate::syscall::sys_write(b"quark-rt: failed to set up thread-local storage\n");
+            crate::syscall::sys_exit_code(1);
+        }
+    }
 }
 
 // ---- Process lifecycle ----

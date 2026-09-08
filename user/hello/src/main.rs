@@ -28,6 +28,8 @@ fn main() {
     let reuse: Vec<u64> = (0..100).collect();
     println!("Reuse vec len: {}", reuse.len());
 
+    // std::thread is not usable yet — see ROADMAP phase 3.
+
     println!("Heap test passed!");
 
     // Test sleep
