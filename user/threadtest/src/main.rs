@@ -61,7 +61,7 @@ extern "C" fn worker() -> ! {
 pub extern "C" fn _start() -> ! {
     println!("threadtest: main tid {}", syscall::sys_getpid());
 
-    let t = match thread::spawn(worker, 0) {
+    let t = match thread::spawn(worker) {
         Ok(t) => t,
         Err(()) => {
             println!("  spawn -> FAILED");
@@ -90,7 +90,7 @@ pub extern "C" fn _start() -> ! {
         MAIN_TLS = 0xAAAA_AAAA;
         let _ = syscall::sys_set_fs_base(core::ptr::addr_of!(MAIN_TLS) as usize);
     }
-    match thread::spawn_with_arg(arg_worker, 0x1234_5678, 1, 4) {
+    match thread::spawn_with_arg(arg_worker, 0x1234_5678, 4) {
         Ok(t) => {
             t.join();
             println!("  entry argument   = 0x{:x} (expected 0x12345678)",

@@ -19,9 +19,19 @@ use crate::syscall;
 pub const DEFAULT_STACK_PAGES: usize = 4;
 
 /// Where thread stacks are placed, growing *down* from just below the main
-/// task's stack. Each thread gets its own slot so they cannot collide.
+/// task's stack, one megabyte apart so an overflow runs into unmapped memory
+/// rather than into the next thread's stack.
 const THREAD_STACK_BASE: usize = 0x7FFF_0000_0000;
-const THREAD_STACK_STRIDE: usize = 0x10_0000; // 1 MiB apart
+const THREAD_STACK_STRIDE: usize = 0x10_0000;
+
+/// Hands out stack regions. Callers used to pass a slot number, which meant
+/// every caller had to know what every other caller had used — unworkable for
+/// a runtime that spawns threads on behalf of code it does not control.
+static NEXT_SLOT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+fn take_slot() -> usize {
+    NEXT_SLOT.fetch_add(1, core::sync::atomic::Ordering::Relaxed)
+}
 
 /// A running thread.
 pub struct Thread {
@@ -57,32 +67,22 @@ impl Thread {
 pub fn spawn_with_arg(
     entry: extern "C" fn(usize) -> !,
     arg: usize,
-    slot: usize,
     stack_pages: usize,
 ) -> Result<Thread, ()> {
-    start(entry as usize as u64, arg as u64, slot, stack_pages)
+    start(entry as usize as u64, arg as u64, take_slot(), stack_pages)
 }
 
 /// Start `entry` on a new thread in this address space.
 ///
-/// `slot` distinguishes this thread's stack from other threads' — pass a
-/// different small integer for each live thread. It exists because there is no
-/// allocator down here to hand out stack regions, and picking an address
-/// without one would either collide or need a lock.
-///
 /// The entry point takes no arguments and must not return: there is nowhere to
 /// return to, so it has to exit the task itself.
-pub fn spawn(entry: extern "C" fn() -> !, slot: usize) -> Result<Thread, ()> {
-    spawn_with_stack(entry, slot, DEFAULT_STACK_PAGES)
+pub fn spawn(entry: extern "C" fn() -> !) -> Result<Thread, ()> {
+    spawn_with_stack(entry, DEFAULT_STACK_PAGES)
 }
 
 /// As [`spawn`], with a stack size in pages.
-pub fn spawn_with_stack(
-    entry: extern "C" fn() -> !,
-    slot: usize,
-    stack_pages: usize,
-) -> Result<Thread, ()> {
-    start(entry as usize as u64, 0, slot, stack_pages)
+pub fn spawn_with_stack(entry: extern "C" fn() -> !, stack_pages: usize) -> Result<Thread, ()> {
+    start(entry as usize as u64, 0, take_slot(), stack_pages)
 }
 
 fn start(entry: u64, arg: u64, slot: usize, stack_pages: usize) -> Result<Thread, ()> {
