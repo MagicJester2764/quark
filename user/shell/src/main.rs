@@ -6,6 +6,18 @@ use quark_rt::spawn::{self, Scratch, Spawned};
 use quark_rt::{args, print, println, syscall, vfs};
 use quark_rt::stdio::read_line;
 
+use quark_rt::manifest::CapReq;
+
+// No physical range: the shell only maps frames it allocated itself to stage a
+// child, and frame ownership authorises those. It runs arbitrary user code, so
+// it is exactly the task that should not hold one. The ports are ACPI poweroff.
+quark_rt::manifest!([
+    CapReq::task_mgmt(0),
+    CapReq::phys_alloc(64),
+    CapReq::ioport(0x604, 0x604),
+    CapReq::ioport(0xB004, 0xB004),
+]);
+
 const PAGE_SIZE: usize = 4096;
 const NAMESERVER_TID: usize = 2;
 const TAG_NS_LOOKUP: u64 = 2;
@@ -99,37 +111,23 @@ fn eq_ignore_case(a: &[u8], b: &[u8]) -> bool {
     true
 }
 
-fn grant_caps_by_name(name: &[u8], tid: usize) {
+/// Grant a child what its manifest asks for, from what the shell itself holds.
+///
+/// This was a name match too — `cat`, `disktest`, `httpget`, `shutdown` — so a
+/// program the shell had not heard of got nothing, whatever it needed. The
+/// shell now reads the request out of the image and mints what it can.
+///
+/// It deliberately holds no PhysRange, so a child asking for one is refused:
+/// the shell runs arbitrary user code and cannot hand out authority it was
+/// never given. That refusal is the kernel's, not a check here.
+fn grant_caps_from_manifest(image: &[u8], tid: usize) {
     // Every child inherits the shell's IPC reach, so it can find and call the
     // services. Delegated rather than minted: the shell cannot read back the
     // 64-bit destination set to re-mint it.
     let _ = syscall::sys_cap_grant(tid, syscall::SLOT_ENDPOINT, syscall::SLOT_ENDPOINT);
 
-    if eq_ignore_case(name, b"cat") || eq_ignore_case(name, b"disktest") || eq_ignore_case(name, b"httpget") {
-        // PhysAlloc(64) only. Each of these allocates a frame and maps that
-        // same frame, which frame ownership authorises, so none of them needs
-        // a PhysRange — and the shell no longer holds one to pass on.
-        const SCRATCH: usize = 14;
-        let _ = syscall::sys_cap_mint(SCRATCH, syscall::CAP_TYPE_PHYS_ALLOC, 64, 0);
-        let _ = syscall::sys_cap_grant(tid, SCRATCH, 0);
-        let _ = syscall::sys_cap_delete(SCRATCH);
-        // Old-style compat. Not CAP_MAP_PHYS: that mints a full-range
-        // PhysRange, which is the whole thing being removed here.
-        let _ = syscall::sys_grant_cap(tid, syscall::CAP_PHYS_ALLOC);
-    } else if eq_ignore_case(name, b"shutdown") {
-        // TaskMgmt for signaling, IoPort for ACPI power-off
-        const SCRATCH: usize = 14;
-        let _ = syscall::sys_cap_mint(SCRATCH, syscall::CAP_TYPE_TASK_MGMT, 0, 0);
-        let _ = syscall::sys_cap_grant(tid, SCRATCH, 0);
-        let _ = syscall::sys_cap_delete(SCRATCH);
-        let _ = syscall::sys_cap_mint(SCRATCH, syscall::CAP_TYPE_IOPORT, 0x604, 0x604);
-        let _ = syscall::sys_cap_grant(tid, SCRATCH, 1);
-        let _ = syscall::sys_cap_delete(SCRATCH);
-        let _ = syscall::sys_cap_mint(SCRATCH, syscall::CAP_TYPE_IOPORT, 0xB004, 0xB004);
-        let _ = syscall::sys_cap_grant(tid, SCRATCH, 2);
-        let _ = syscall::sys_cap_delete(SCRATCH);
-        // Old-style compat
-        let _ = syscall::sys_grant_cap(tid, syscall::CAP_TASK_MGMT | syscall::CAP_IOPORT);
+    if let Some(reqs) = quark_rt::manifest::find(image) {
+        quark_rt::manifest::grant(tid, reqs, 12);
     }
 }
 
@@ -286,17 +284,7 @@ fn cmd_spawn(
     let tid = info.tid;
 
     // Grant capabilities based on command basename (strip path and .ELF extension)
-    let basename = if let Some(slash_pos) = cmd.iter().rposition(|&b| b == b'/') {
-        &cmd[slash_pos + 1..]
-    } else {
-        cmd
-    };
-    let name = if ends_with_elf(basename) {
-        &basename[..basename.len() - 4]
-    } else {
-        basename
-    };
-    grant_caps_by_name(name, tid);
+    grant_caps_from_manifest(elf_data, tid);
 
     // Wire file descriptors — duplicate the shell's own fds to the child.
     //

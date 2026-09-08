@@ -4,6 +4,13 @@
 use quark_rt::ipc::{Message, TID_ANY};
 use quark_rt::{print, println, syscall};
 
+use quark_rt::manifest::CapReq;
+
+// Sets the foreground task so Ctrl-C reaches the right one.
+quark_rt::manifest!([
+    CapReq::task_mgmt(0),
+]);
+
 const NAMESERVER_TID: usize = 2;
 
 // Nameserver protocol

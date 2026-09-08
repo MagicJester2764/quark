@@ -124,6 +124,13 @@ These were established deliberately. Breaking one silently re-opens a hole.
   allocated and passed over IPC. Never grant `CAP_MAP_PHYS` to narrow it:
   `populate_from_bitmask` expands that bit into a full-range `PhysRange`, which
   silently reopens everything the explicit grants closed.
+- **A program declares what it needs; a spawner grants from that.** Capabilities
+  come from a `quark_rt::manifest!` block compiled into the image, found by
+  scanning for its magic, not from a table of names in `init`. A spawner mints
+  each request from a capability it already holds, so it can never hand out more
+  than it has — the shell holds no `PhysRange` and therefore cannot give one
+  away. The framebuffer is the one exception: its address comes from the
+  bootloader at runtime, so `init` grants it directly.
 - **IPC needs an Endpoint capability.** `sys_send`/`sys_call`/`sys_notify` are
   gated by a destination bitmask. IPC the kernel performs through an installed
   fd bypasses this on purpose: the fd is the authorisation, and only a
@@ -131,11 +138,10 @@ These were established deliberately. Breaking one silently re-opens a hole.
   every CSpace, because TIDs are recycled and a stale bit would otherwise
   transfer to the slot's next occupant.
 
-`init` grants capabilities per program in `grant_caps_by_name`. Note that
-`CONSOLE`, `INPUT` and `VFS` are each spawned in their own pass — if a program
+`init` spawns `CONSOLE`, `INPUT` and `VFS` in passes of their own. If a program
 misbehaves for lack of a capability, check that its pass actually calls
-`grant_caps_by_name`. INPUT's did not, and ran with an empty CSpace for as long
-as the UID bypass hid it.
+`grant_caps_from_manifest` — there is no shared path that does it for them, and
+INPUT's pass once granted nothing at all, which the UID bypass hid.
 
 ## Known gaps
 

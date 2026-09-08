@@ -5,6 +5,18 @@
 use quark_rt::ipc::{Message, TID_ANY};
 use quark_rt::{println, syscall};
 
+use quark_rt::manifest::CapReq;
+
+// ATA primary channel: command block, control port, and IRQ 14. The physical
+// range stays broad because the driver maps a DMA page the *client* allocated
+// and named over IPC, which has no static extent.
+quark_rt::manifest!([
+    CapReq::ioport(0x1F0, 0x1F7),
+    CapReq::ioport(0x3F6, 0x3F6),
+    CapReq::irq(14),
+    CapReq::phys_range(0, 0x1_0000_0000),
+]);
+
 const NAMESERVER_TID: usize = 2;
 
 // Nameserver protocol

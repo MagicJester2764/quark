@@ -5,6 +5,17 @@
 use quark_rt::ipc::{Message, TID_ANY};
 use quark_rt::{println, syscall};
 
+use quark_rt::manifest::CapReq;
+
+// The RTL8139's I/O window is assigned by PCI, so the port range cannot be
+// narrowed here; likewise its interrupt line.
+quark_rt::manifest!([
+    CapReq::ioport(0, 0xFFFF),
+    CapReq::irq(0xFF),
+    CapReq::phys_alloc(64),
+    CapReq::phys_range(0, 0x1_0000_0000),
+]);
+
 // ---------------------------------------------------------------------------
 // IPC protocol
 // ---------------------------------------------------------------------------

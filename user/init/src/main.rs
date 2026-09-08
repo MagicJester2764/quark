@@ -305,22 +305,6 @@ fn name_matches_entry(entry: &vfs::DirEntry, base: &[u8], ext: &[u8]) -> bool {
     false
 }
 
-/// Grant capabilities based on a filename slice (for VFS-loaded programs).
-fn grant_caps_by_name_slice(name: &[u8], tid: usize) {
-    // Extract base name (before the dot, or strip .ELF suffix)
-    let base = if let Some(dot_pos) = name.iter().position(|&b| b == b'.') {
-        &name[..dot_pos]
-    } else {
-        name
-    };
-    // Convert to 8-byte padded uppercase for grant_caps_by_name
-    let mut padded = [b' '; 11];
-    let len = base.len().min(8);
-    for i in 0..len {
-        padded[i] = to_upper(base[i]);
-    }
-    grant_caps_by_name(&padded, tid);
-}
 
 
 fn fat_name_to_buf(name: &[u8; 11], buf: &mut [u8; 16]) -> usize {
@@ -400,76 +384,31 @@ fn mint_and_grant(tid: usize, dest_slot: usize, cap_type: u64, param0: u64, para
 }
 
 /// Grant capabilities based on FAT 8.3 name using fine-grained object capabilities.
-fn grant_caps_by_name(name: &[u8; 11], tid: usize) {
+/// Grant a freshly loaded program the capabilities its manifest asks for.
+///
+/// This used to be a chain of `base == b"KEYBOARD"` comparisons — eleven
+/// branches naming every program the tree shipped. A package installed later
+/// had no branch and could not be given one without rebuilding init, which is
+/// not a thing a distro can live with.
+///
+/// The program now says what it needs and init reads it out of the image. init
+/// holds every capability, so it can satisfy any request; a spawner that holds
+/// less simply cannot mint what it does not have, and the kernel enforces that
+/// rather than trusting the caller.
+fn grant_caps_from_manifest(image: &[u8], tid: usize) {
     // Everything init starts may reach the service set. Without this no
     // program could even look up a name, since the nameserver is itself an
     // IPC destination.
     grant_endpoints(tid, syscall::SLOT_ENDPOINT);
 
-    let base = &name[0..8];
-    if base == b"KEYBOARD" {
-        // IoPort(0x60, 0x64), Irq(1)
-        mint_and_grant(tid, 0, syscall::CAP_TYPE_IOPORT, 0x60, 0x64);
-        mint_and_grant(tid, 1, syscall::CAP_TYPE_IRQ, 1, 0);
-    } else if base == b"DISK    " {
-        // IoPort(0x1F0, 0x1F7), IoPort(0x3F6, 0x3F6), Irq(14), PhysRange(0, 4G).
-        // The range stays broad: the driver maps a DMA page the *client*
-        // allocated and named over IPC, so there is no static extent to grant.
-        mint_and_grant(tid, 0, syscall::CAP_TYPE_IOPORT, 0x1F0, 0x1F7);
-        mint_and_grant(tid, 1, syscall::CAP_TYPE_IOPORT, 0x3F6, 0x3F6);
-        mint_and_grant(tid, 2, syscall::CAP_TYPE_IRQ, 14, 0);
-        mint_and_grant(tid, 3, syscall::CAP_TYPE_PHYS_RANGE, 0, 0x1_0000_0000);
-    } else if base == b"VFS     " {
-        // PhysAlloc(256), PhysRange(0, 4G) — broad for the same reason as DISK:
-        // VFS maps client-allocated pages. Its own cache frames are covered by
-        // ownership. CAP_MAP_PHYS withheld so this grant is the only one.
-        mint_and_grant(tid, 0, syscall::CAP_TYPE_PHYS_ALLOC, 256, 0);
-        mint_and_grant(tid, 1, syscall::CAP_TYPE_PHYS_RANGE, 0, 0x1_0000_0000);
-        let _ = syscall::sys_grant_cap(tid, syscall::CAP_PHYS_ALLOC);
-    } else if base == b"NET     " {
-        // IoPort(0xC000, 0xC0FF), Irq(0xFF wildcard), PhysAlloc(64), PhysRange(0, 4G)
-        mint_and_grant(tid, 0, syscall::CAP_TYPE_IOPORT, 0, 0xFFFF);
-        mint_and_grant(tid, 1, syscall::CAP_TYPE_IRQ, 0xFF, 0);
-        mint_and_grant(tid, 2, syscall::CAP_TYPE_PHYS_ALLOC, 64, 0);
-        mint_and_grant(tid, 3, syscall::CAP_TYPE_PHYS_RANGE, 0, 0x1_0000_0000);
-        // CAP_MAP_PHYS withheld: the explicit PhysRange above is the grant.
-        let _ = syscall::sys_grant_cap(tid,
-            syscall::CAP_IOPORT | syscall::CAP_IRQ | syscall::CAP_PHYS_ALLOC);
-    } else if base == b"INPUT   " {
-        // TaskMgmt(0)
-        mint_and_grant(tid, 0, syscall::CAP_TYPE_TASK_MGMT, 0, 0);
-        let _ = syscall::sys_grant_cap(tid, syscall::CAP_TASK_MGMT);
-    } else if base == b"SHELL   " {
-        // TaskMgmt(0), PhysAlloc(64), IoPort(ACPI shutdown ports).
-        // No PhysRange: the shell only ever maps frames it allocated itself to
-        // stage a child's ELF pages, stack and args, and frame ownership
-        // authorises those. It runs arbitrary user code, so it is exactly the
-        // task that should not hold a physical-memory capability.
-        mint_and_grant(tid, 0, syscall::CAP_TYPE_TASK_MGMT, 0, 0);
-        mint_and_grant(tid, 1, syscall::CAP_TYPE_PHYS_ALLOC, 64, 0);
-        mint_and_grant(tid, 2, syscall::CAP_TYPE_IOPORT, 0x604, 0x604);
-        mint_and_grant(tid, 3, syscall::CAP_TYPE_IOPORT, 0xB004, 0xB004);
-        let _ = syscall::sys_grant_cap(tid,
-            syscall::CAP_TASK_MGMT | syscall::CAP_PHYS_ALLOC | syscall::CAP_IOPORT);
-    } else if base == b"SHUTDOWN" {
-        // TaskMgmt(0) for signaling tasks, IoPort(0x604,0xB004) for ACPI power-off
-        mint_and_grant(tid, 0, syscall::CAP_TYPE_TASK_MGMT, 0, 0);
-        mint_and_grant(tid, 1, syscall::CAP_TYPE_IOPORT, 0x604, 0x604);
-        mint_and_grant(tid, 2, syscall::CAP_TYPE_IOPORT, 0xB004, 0xB004);
-        let _ = syscall::sys_grant_cap(tid, syscall::CAP_TASK_MGMT | syscall::CAP_IOPORT);
-    } else if base == b"LOGIN   " {
-        // TaskMgmt(0), PhysAlloc(64), SetUid, IoPort(ACPI shutdown ports).
-        // No PhysRange, for the same reason as SHELL: login stages its child
-        // out of frames it allocated itself.
-        mint_and_grant(tid, 0, syscall::CAP_TYPE_TASK_MGMT, 0, 0);
-        mint_and_grant(tid, 1, syscall::CAP_TYPE_PHYS_ALLOC, 64, 0);
-        mint_and_grant(tid, 2, syscall::CAP_TYPE_SET_UID, 0, 0);
-        mint_and_grant(tid, 3, syscall::CAP_TYPE_IOPORT, 0x604, 0x604);
-        mint_and_grant(tid, 4, syscall::CAP_TYPE_IOPORT, 0xB004, 0xB004);
-        let _ = syscall::sys_grant_cap(tid,
-            syscall::CAP_TASK_MGMT | syscall::CAP_PHYS_ALLOC | syscall::CAP_SET_UID | syscall::CAP_IOPORT);
+    if let Some(reqs) = quark_rt::manifest::find(image) {
+        quark_rt::manifest::grant(tid, reqs, MANIFEST_SCRATCH_SLOT);
     }
 }
+
+/// Slot in init's own CSpace used to hold a capability while handing it over.
+/// Below SLOT_ENDPOINT_EXTRA (13) so it cannot tread on the endpoint sets.
+const MANIFEST_SCRATCH_SLOT: usize = 12;
 
 /// Look up a named service via the nameserver.
 fn lookup_service(name: &[u8]) -> Option<usize> {
@@ -615,8 +554,13 @@ fn load_essentials_from_boot_image(rootfs_phys: usize, rootfs_size: usize) -> Bo
                         // withheld: sys_grant_cap runs populate_from_bitmask,
                         // which mints a second, full-range PhysRange that would
                         // make this one moot.
+                        // The framebuffer is the one grant a manifest cannot
+                        // express: its address comes from the bootloader at
+                        // runtime, not from anything knowable when the console
+                        // was built. Everything else console needs, it asks for.
                         let (fb_base, fb_end) = framebuffer_range();
                         mint_and_grant(info.tid, 0, syscall::CAP_TYPE_PHYS_RANGE, fb_base, fb_end);
+                        grant_caps_from_manifest(data, info.tid);
                         add_service(info.tid);
                         grant_endpoints(info.tid, syscall::SLOT_ENDPOINT);
                         let _ = spawn::set_args(&info, &[b"console"], &SPAWN_SCRATCH);
@@ -670,7 +614,7 @@ fn load_essentials_from_boot_image(rootfs_phys: usize, rootfs_size: usize) -> Bo
                 Ok(info) => {
                     let tid = info.tid;
                     add_service(tid);
-                    grant_caps_by_name(&e.name, tid);
+                    grant_caps_from_manifest(data, tid);
                     if console_pipe != 0 {
                         let _ = syscall::sys_pipe_fd_set(tid, 1, console_pipe, true);
                         let _ = syscall::sys_pipe_fd_set(tid, 2, console_pipe, true);
@@ -702,11 +646,12 @@ fn load_essentials_from_boot_image(rootfs_phys: usize, rootfs_size: usize) -> Bo
                 match spawn::load(data, &SPAWN_SCRATCH) {
                     Ok(info) => {
                         input_tid = info.tid;
-                        // This pass predates grant_caps_by_name and never
-                        // called it, so input was running with an empty
-                        // CSpace — invisible while UID 0 bypassed the checks.
+                        // This pass once granted nothing at all, so input ran
+                        // with an empty CSpace — invisible while UID 0 bypassed
+                        // every check. Each pass must grant; there is no shared
+                        // path that does it for them.
                         add_service(info.tid);
-                        grant_caps_by_name(&e.name, info.tid);
+                        grant_caps_from_manifest(data, info.tid);
                         if console_pipe != 0 {
                             let _ = syscall::sys_pipe_fd_set(info.tid, 1, console_pipe, true);
                             let _ = syscall::sys_pipe_fd_set(info.tid, 2, console_pipe, true);
@@ -738,7 +683,7 @@ fn load_essentials_from_boot_image(rootfs_phys: usize, rootfs_size: usize) -> Bo
                 match spawn::load(data, &SPAWN_SCRATCH) {
                     Ok(info) => {
                         add_service(info.tid);
-                        grant_caps_by_name(&e.name, info.tid);
+                        grant_caps_from_manifest(data, info.tid);
                         if console_pipe != 0 {
                             let _ = syscall::sys_pipe_fd_set(info.tid, 1, console_pipe, true);
                             let _ = syscall::sys_pipe_fd_set(info.tid, 2, console_pipe, true);
@@ -886,7 +831,7 @@ fn load_from_vfs(vfs_tid: usize, console_pipe: usize, input_tid: usize) -> Defer
     match spawn::load(data, &SPAWN_SCRATCH) {
         Ok(info) => {
             let tid = info.tid;
-            grant_caps_by_name_slice(name_bytes, tid);
+            grant_caps_from_manifest(data, tid);
             if console_pipe != 0 {
                 let _ = syscall::sys_pipe_fd_set(tid, 1, console_pipe, true);
                 let _ = syscall::sys_pipe_fd_set(tid, 2, console_pipe, true);

@@ -6,6 +6,17 @@ use quark_rt::stdio::read_line;
 use quark_rt::spawn::{self, Scratch};
 use quark_rt::{passwd, print, println, syscall, vfs};
 
+use quark_rt::manifest::CapReq;
+
+// SetUid is the point of login; the rest mirrors the shell it spawns.
+quark_rt::manifest!([
+    CapReq::task_mgmt(0),
+    CapReq::phys_alloc(64),
+    CapReq::set_uid(),
+    CapReq::ioport(0x604, 0x604),
+    CapReq::ioport(0xB004, 0xB004),
+]);
+
 const PAGE_SIZE: usize = 4096;
 const NAMESERVER_TID: usize = 2;
 const TAG_NS_LOOKUP: u64 = 2;

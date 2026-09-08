@@ -3,6 +3,15 @@
 
 use quark_rt::{args, println, syscall};
 
+use quark_rt::manifest::CapReq;
+
+// Signals every task to exit, then writes the ACPI poweroff ports.
+quark_rt::manifest!([
+    CapReq::task_mgmt(0),
+    CapReq::ioport(0x604, 0x604),
+    CapReq::ioport(0xB004, 0xB004),
+]);
+
 const MAX_TASKS: usize = 64;
 
 /// ACPI PM1a Control register port (QEMU PIIX4 / i440fx).

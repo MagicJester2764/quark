@@ -10,6 +10,15 @@ pub mod ext2_dir;
 use quark_rt::ipc::{Message, TID_ANY};
 use quark_rt::{println, syscall};
 
+use quark_rt::manifest::CapReq;
+
+// Broad physical range for the same reason as the disk driver: VFS maps
+// client-allocated pages. Its own sector cache is covered by frame ownership.
+quark_rt::manifest!([
+    CapReq::phys_alloc(256),
+    CapReq::phys_range(0, 0x1_0000_0000),
+]);
+
 pub const PAGE_SIZE: usize = 4096;
 const NAMESERVER_TID: usize = 2;
 
