@@ -76,9 +76,12 @@ HTTPGET_ELF := $(HTTPGET_DIR)/target/$(TARGET)/release/httpget
 SHUTDOWN_DIR := user/shutdown
 SHUTDOWN_ELF := $(SHUTDOWN_DIR)/target/$(TARGET)/release/shutdown
 
-.PHONY: all clean iso run run-uefi drivers user rootfs FORCE
+.PHONY: check-abi all clean iso run run-uefi drivers user rootfs FORCE
 
-all: $(KERNEL) drivers user rootfs
+check-abi:
+	@./tools/check-abi.sh
+
+all: check-abi $(KERNEL) drivers user rootfs
 
 $(KERNEL): FORCE
 	cargo build --release

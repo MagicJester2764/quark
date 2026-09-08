@@ -13,78 +13,107 @@ const MSR_EFER: u32 = 0xC000_0080;
 
 const KERNEL_CS: u64 = 0x08;
 
+/// Syscall numbers are assigned in 16-slot blocks, one subsystem per block, so
+/// a new call lands beside its relatives instead of in whatever gap is free.
+/// The unused slots in each block are reserved for that subsystem.
+///
+///   0x00  0-15     process lifecycle
+///   0x10  16-31    IPC
+///   0x20  32-47    memory
+///   0x30  48-63    shared memory
+///   0x40  64-79    file descriptors and pipes
+///   0x50  80-95    capabilities
+///   0x60  96-111   task lifecycle and identity
+///   0x70  112-127  hardware and drivers
+///   0x80  128-143  synchronisation
+///   0x90  144-159  time
+///   0xA0  160-175  kernel debug console
+///   0xF0  240-255  ABI introspection
+///
+/// Numbers are stable within an ABI version: they are never reused, and a
+/// withdrawn call leaves its slot empty rather than being backfilled. See
+/// `docs/abi.md` for the full contract.
 pub const SYS_EXIT: u64 = 0;
-pub const SYS_YIELD: u64 = 1;
-pub const SYS_WRITE: u64 = 2;
-pub const SYS_CONSOLE_POS: u64 = 3;
+pub const SYS_YIELD: u64 = 2;
+pub const SYS_WRITE: u64 = 160;
+pub const SYS_CONSOLE_POS: u64 = 161;
+
+/// Current syscall ABI version, as (major << 16) | minor.
+///
+/// Major changes when a call's meaning or signature changes incompatibly;
+/// minor when calls are added. User space can refuse to run against a major it
+/// does not know, which is the point of exposing it at all.
+pub const ABI_VERSION_MAJOR: u64 = 1;
+pub const ABI_VERSION_MINOR: u64 = 0;
+pub const SYS_ABI_VERSION: u64 = 240;
 /// Exit with a status. Separate from SYS_EXIT because `syscall0` leaves RDI
 /// undefined, so the existing zero-argument SYS_EXIT cannot grow an argument.
-pub const SYS_EXIT_CODE: u64 = 4;
-pub const SYS_SEND: u64 = 10;
-pub const SYS_RECV: u64 = 11;
-pub const SYS_CALL: u64 = 12;
-pub const SYS_REPLY: u64 = 13;
-pub const SYS_CALL_TIMEOUT: u64 = 14;
-pub const SYS_GETPID: u64 = 21;
-pub const SYS_IRQ_REGISTER: u64 = 30;
-pub const SYS_IRQ_ACK: u64 = 31;
-pub const SYS_IOPORT: u64 = 32;
-pub const SYS_MAP_PHYS: u64 = 33;
-pub const SYS_IOPORT_REP: u64 = 34;
+pub const SYS_EXIT_CODE: u64 = 1;
+pub const SYS_SEND: u64 = 16;
+pub const SYS_RECV: u64 = 17;
+pub const SYS_CALL: u64 = 18;
+pub const SYS_REPLY: u64 = 19;
+pub const SYS_CALL_TIMEOUT: u64 = 20;
+pub const SYS_GETPID: u64 = 3;
+pub const SYS_IRQ_REGISTER: u64 = 112;
+pub const SYS_IRQ_ACK: u64 = 113;
+pub const SYS_IOPORT: u64 = 114;
+pub const SYS_MAP_PHYS: u64 = 38;
+pub const SYS_IOPORT_REP: u64 = 115;
 
-pub const SYS_TASK_CREATE: u64 = 40;
-pub const SYS_ADDRSPACE_CREATE: u64 = 41;
-pub const SYS_ADDRSPACE_MAP: u64 = 42;
-pub const SYS_TASK_START: u64 = 43;
-pub const SYS_PHYS_ALLOC: u64 = 44;
-pub const SYS_PHYS_FREE: u64 = 45;
-pub const SYS_GRANT_IOPORT: u64 = 46;
-pub const SYS_GRANT_IRQ: u64 = 47;
-pub const SYS_GRANT_CAP: u64 = 48;
+pub const SYS_TASK_CREATE: u64 = 96;
+pub const SYS_ADDRSPACE_CREATE: u64 = 36;
+pub const SYS_ADDRSPACE_MAP: u64 = 37;
+pub const SYS_TASK_START: u64 = 97;
+pub const SYS_PHYS_ALLOC: u64 = 34;
+pub const SYS_PHYS_FREE: u64 = 35;
+pub const SYS_GRANT_IOPORT: u64 = 87;
+pub const SYS_GRANT_IRQ: u64 = 88;
+pub const SYS_GRANT_CAP: u64 = 86;
 
-pub const SYS_FD_WRITE: u64 = 50;
-pub const SYS_FD_READ: u64 = 51;
-pub const SYS_FD_SET: u64 = 52;
-pub const SYS_PIPE_CREATE: u64 = 53;
-pub const SYS_PIPE_FD_SET: u64 = 54;
-pub const SYS_FD_DUP: u64 = 55;
-pub const SYS_FD_READ_NB: u64 = 56;
+pub const SYS_FD_WRITE: u64 = 65;
+pub const SYS_FD_READ: u64 = 64;
+pub const SYS_FD_SET: u64 = 67;
+pub const SYS_PIPE_CREATE: u64 = 69;
+pub const SYS_PIPE_FD_SET: u64 = 70;
+pub const SYS_FD_DUP: u64 = 68;
+pub const SYS_FD_READ_NB: u64 = 66;
 
-pub const SYS_FUTEX_WAIT: u64 = 60;
-pub const SYS_FUTEX_WAKE: u64 = 61;
+pub const SYS_FUTEX_WAIT: u64 = 128;
+pub const SYS_FUTEX_WAKE: u64 = 129;
 
-pub const SYS_GET_UID: u64 = 100;
-pub const SYS_SET_UID: u64 = 101;
-pub const SYS_SET_GID: u64 = 102;
-pub const SYS_GET_TUID: u64 = 103;
-pub const SYS_TASK_KILL: u64 = 104;
-pub const SYS_TASK_INFO: u64 = 105;
-pub const SYS_SIGNAL: u64 = 106;
+pub const SYS_GET_UID: u64 = 98;
+pub const SYS_SET_UID: u64 = 99;
+pub const SYS_SET_GID: u64 = 100;
+pub const SYS_GET_TUID: u64 = 101;
+pub const SYS_TASK_KILL: u64 = 5;
+pub const SYS_TASK_INFO: u64 = 7;
+pub const SYS_SIGNAL: u64 = 6;
 
-pub const SYS_MMAP: u64 = 70;
-pub const SYS_MUNMAP: u64 = 71;
+pub const SYS_MMAP: u64 = 32;
+pub const SYS_MUNMAP: u64 = 33;
 
-pub const SYS_RECV_TIMEOUT: u64 = 80;
-pub const SYS_TICKS: u64 = 81;
-pub const SYS_SET_PAGER: u64 = 82;
-pub const SYS_WAIT: u64 = 83;
-pub const SYS_SET_MEM_LIMIT: u64 = 84;
-pub const SYS_NOTIFY: u64 = 85;
+pub const SYS_RECV_TIMEOUT: u64 = 21;
+pub const SYS_TICKS: u64 = 144;
+pub const SYS_SET_PAGER: u64 = 40;
+pub const SYS_WAIT: u64 = 4;
+pub const SYS_SET_MEM_LIMIT: u64 = 39;
+pub const SYS_NOTIFY: u64 = 22;
 
-pub const SYS_SHMEM_CREATE: u64 = 90;
-pub const SYS_SHMEM_MAP: u64 = 91;
-pub const SYS_SHMEM_GRANT: u64 = 92;
-pub const SYS_CAP_TRANSFER: u64 = 93;
+pub const SYS_SHMEM_CREATE: u64 = 48;
+pub const SYS_SHMEM_MAP: u64 = 49;
+pub const SYS_SHMEM_GRANT: u64 = 51;
+pub const SYS_CAP_TRANSFER: u64 = 85;
 
-pub const SYS_CAP_MINT: u64 = 110;
-pub const SYS_CAP_GRANT: u64 = 111;
-pub const SYS_CAP_REVOKE: u64 = 112;
-pub const SYS_CAP_INSPECT: u64 = 113;
-pub const SYS_CAP_DELETE: u64 = 114;
-pub const SYS_SET_USER_CAPS: u64 = 115;
-pub const SYS_GET_USER_CAPS: u64 = 116;
-pub const SYS_SHMEM_UNMAP: u64 = 94;
-pub const SYS_SHMEM_DESTROY: u64 = 95;
+pub const SYS_CAP_MINT: u64 = 80;
+pub const SYS_CAP_GRANT: u64 = 81;
+pub const SYS_CAP_REVOKE: u64 = 82;
+pub const SYS_CAP_INSPECT: u64 = 83;
+pub const SYS_CAP_DELETE: u64 = 84;
+pub const SYS_SET_USER_CAPS: u64 = 89;
+pub const SYS_GET_USER_CAPS: u64 = 90;
+pub const SYS_SHMEM_UNMAP: u64 = 50;
+pub const SYS_SHMEM_DESTROY: u64 = 52;
 
 const SFMASK_VALUE: u64 = (1 << 9) | (1 << 10) | (1 << 18); // clear IF | DF | AC
 
@@ -328,6 +357,7 @@ extern "C" fn syscall_dispatch(
         SYS_EXIT_CODE => {
             scheduler::exit_with(arg0 as i32)
         }
+        SYS_ABI_VERSION => (ABI_VERSION_MAJOR << 16) | ABI_VERSION_MINOR,
         SYS_YIELD => {
             scheduler::yield_now();
             0
