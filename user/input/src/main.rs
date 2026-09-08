@@ -33,6 +33,7 @@ use quark_rt::manifest::CapReq;
 
 // Sets the foreground task so Ctrl-C reaches the right one.
 quark_rt::manifest!([
+    CapReq::priority(quark_rt::syscall::PRIO_SERVER),
     CapReq::task_mgmt(0),
 ]);
 

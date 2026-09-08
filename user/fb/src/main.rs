@@ -31,9 +31,15 @@
 use quark_rt::ipc::{Message, TAG_TASK_DIED, TID_ANY};
 use quark_rt::{nameserver, println, syscall};
 
-// No manifest. The framebuffer's address is whatever mode the bootloader set,
-// which nothing knowable at build time can name, so `init` mints the range and
-// grants it directly — the one capability a manifest cannot express.
+// No capabilities here. The framebuffer's address is whatever mode the
+// bootloader set, which nothing knowable at build time can name, so `init`
+// mints the range and grants it directly — the one capability a manifest
+// cannot express. The band it runs in is expressible, and is asked for like
+// anything else: programs wait on this server, so it goes ahead of them and
+// behind the drivers.
+quark_rt::manifest!([
+    quark_rt::manifest::CapReq::priority(quark_rt::syscall::PRIO_SERVER),
+]);
 
 /// From `init`: the mode, alongside the capability in [`MASTER_SLOT`].
 const TAG_FB_INIT: u64 = 100;

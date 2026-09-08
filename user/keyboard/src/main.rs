@@ -7,6 +7,7 @@ use quark_rt::{println, syscall};
 
 // PS/2 controller data and status ports, and the keyboard interrupt line.
 quark_rt::manifest!([
+    quark_rt::manifest::CapReq::priority(quark_rt::syscall::PRIO_DRIVER),
     quark_rt::manifest::CapReq::ioport(0x60, 0x64),
     quark_rt::manifest::CapReq::irq(1),
 ]);

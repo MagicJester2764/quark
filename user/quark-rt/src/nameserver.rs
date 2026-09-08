@@ -55,9 +55,13 @@ pub fn lookup_retry(name: &[u8], attempts: usize) -> Option<usize> {
         if let Some(tid) = lookup(name) {
             return Some(tid);
         }
-        for _ in 0..100 {
-            syscall::sys_yield();
-        }
+        // Asleep between tries, not spinning. What this waits for is another
+        // task starting up, so the one thing the wait must do is let that task
+        // run — and a yield loop asks to be rescheduled immediately, which
+        // starves anything the scheduler ranks below the waiter. That is how a
+        // caller in a driver band came to wait out a server that could never
+        // reach the nameserver to answer it.
+        syscall::sleep_ticks(1);
     }
     None
 }

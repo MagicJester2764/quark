@@ -90,6 +90,7 @@ so it is built from calls that already existed.
 | 1.2 | `SYS_FUTEX_WAIT_TIMEOUT` (130). |
 | 1.3 | `SYS_SOCK_FD` (176), `SYS_SOCK_INFO` (177) — a network connection as a file descriptor. |
 | 1.4 | `SYS_TASK_WATCH` (104) — be told when a task dies, so what it was lent can be taken back. |
+| 1.5 | `SYS_TASK_PRIORITY` (105) — which scheduling band a task runs in. |
 
 A capability may only be minted from one the caller already holds, and only
 narrowed — with one exception. **An `Endpoint` naming only the caller may
@@ -281,6 +282,7 @@ cannot resurrect a revoked capability in practice.
 | 100 | `SYS_SET_GID` | arg0 = tid, arg1 = gid | 0 / `u64::MAX` | `SetUid` |
 | 101 | `SYS_GET_TUID` | arg0 = tid | that task's UID | — |
 | 104 | `SYS_TASK_WATCH` | arg0 = tid | 0, or `u64::MAX` if that task is already gone | — |
+| 105 | `SYS_TASK_PRIORITY` | arg0 = tid, arg1 = band | 0 / `u64::MAX` | `TaskMgmt` for target, and the caller's own band or worse |
 
 There is no fork or exec. A parent creates a task, builds its address space,
 loads its image, sets its arguments and capabilities, then starts it. TIDs are
@@ -306,6 +308,25 @@ Registrations are dropped when either task dies, so a watcher is never told
 about the next occupant of a recycled TID. A watcher that lets eight
 notifications go uncollected loses the ninth; a server whose whole job is to
 reclaim on death should not be one of them.
+
+`SYS_TASK_PRIORITY` puts a task in a scheduling band: 0 drivers, 1 servers,
+2 ordinary programs, 3 the idle task. A task runs only when nothing in a better
+band is waiting, and takes turns within its own; a task woken into a better band
+than the running one preempts it at the next tick rather than waiting out its
+slice.
+
+It follows the same narrowing rule as capabilities — a caller cannot grant a
+better band than it is in itself — so a shell running as an ordinary program
+cannot promote what it starts. Programs ask for a band in their manifest, and
+only a spawner already in that band can satisfy the request. `init` starts in
+the driver band for exactly that reason and steps down to an ordinary one once
+it has finished starting things.
+
+**A driver that spins is a driver that starves the system.** Bands make a
+`sys_yield` loop fatal rather than merely wasteful: a task in a better band that
+yields is immediately runnable again, so nothing below it ever runs. Wait by
+blocking — `sys_recv_timeout`, or `sleep_ticks`, which is that call with nobody
+to hear from.
 
 ### Hardware and drivers (0x70)
 

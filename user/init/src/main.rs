@@ -487,6 +487,11 @@ fn load_essentials_from_boot_image(rootfs_phys: usize, rootfs_size: usize) -> Bo
             if let Ok(data) = read_file_to_buffer(rootfs, &bpb, e.first_cluster, e.file_size) {
                 match spawn::load(data, &SPAWN_SCRATCH) {
                     Ok(info) => {
+                        // Every pass has to do this for itself; there is no
+                        // shared path that does it for them. The nameserver
+                        // asks for no capabilities, but it does ask to be
+                        // scheduled as a server, and that arrives the same way.
+                        grant_caps_from_manifest(data, info.tid);
                         let _ = spawn::set_args(&info, &[b"nameserver"], &SPAWN_SCRATCH);
                         let _ = info.start();
                         println!("[init] Spawned nameserver (TID {})", info.tid);
@@ -934,8 +939,17 @@ pub extern "C" fn _start() -> ! {
         println!("[init] ERROR: boot image module not found!");
     }
 
+    // Everything is started, so step out of the band that let those grants be
+    // made — nothing init does from here needs to come before a driver.
+    let me = syscall::sys_getpid() as usize;
+    let _ = syscall::sys_task_priority(me, syscall::PRIO_NORMAL);
+
+    // Asleep rather than spinning. init has nothing left to do, and a yield
+    // loop is a task asking to be run again as fast as the machine can manage
+    // in order to ask once more.
+    let mut msg = Message::empty();
     loop {
-        syscall::sys_yield();
+        let _ = syscall::sys_recv(quark_rt::ipc::TID_ANY, &mut msg);
     }
 }
 

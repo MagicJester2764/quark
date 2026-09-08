@@ -14,10 +14,30 @@ static mut TASKS: [Option<Task>; MAX_TASKS] = {
 };
 
 // Simple circular ready queue (array of TIDs)
-static mut READY_QUEUE: [usize; MAX_TASKS] = [0; MAX_TASKS];
-static mut READY_HEAD: usize = 0;
-static mut READY_TAIL: usize = 0;
-static mut READY_COUNT: usize = 0;
+/// Scheduling bands, best first. A task runs only when nothing better is
+/// waiting; within a band they take turns.
+///
+/// The bands exist because round-robin gives a program burning CPU exactly the
+/// same share as the keyboard driver, which has nothing to do until a key
+/// arrives and everything to do the moment one does. What separates them is
+/// not how much CPU they want but how soon they need it, and that is a
+/// property of the job rather than of its recent behaviour — so it is declared
+/// rather than inferred.
+pub const NUM_PRIORITIES: usize = 4;
+/// Interrupt-driven hardware: it must answer the device before the buffer
+/// behind it overflows.
+pub const PRIO_DRIVER: u8 = 0;
+/// The system's servers, which programs are usually blocked waiting on.
+pub const PRIO_SERVER: u8 = 1;
+/// Ordinary programs, and the default for anything that asks for nothing.
+pub const PRIO_NORMAL: u8 = 2;
+/// The idle task, and nothing else.
+pub const PRIO_IDLE: u8 = 3;
+
+static mut READY_QUEUE: [[usize; MAX_TASKS]; NUM_PRIORITIES] = [[0; MAX_TASKS]; NUM_PRIORITIES];
+static mut READY_HEAD: [usize; NUM_PRIORITIES] = [0; NUM_PRIORITIES];
+static mut READY_TAIL: [usize; NUM_PRIORITIES] = [0; NUM_PRIORITIES];
+static mut READY_COUNT: [usize; NUM_PRIORITIES] = [0; NUM_PRIORITIES];
 
 static CURRENT_TID: AtomicUsize = AtomicUsize::new(0);
 static INITIALIZED: AtomicBool = AtomicBool::new(false);
@@ -62,7 +82,7 @@ pub fn init() {
             context: context::CpuContext::empty(),
             kernel_stack_base: core::ptr::null_mut(), // uses boot stack
             kernel_stack_size: 0,
-            priority: 255, // lowest priority
+            priority: PRIO_IDLE,
             cr3: crate::paging::read_cr3(),
             caps: crate::task::CAP_ALL,
             // Mirror the bitmask into real capabilities: with the UID 0 bypass
@@ -210,6 +230,19 @@ pub fn timer_tick() {
     }
     unsafe {
         let current = CURRENT_TID.load(Ordering::SeqCst);
+
+        // A task in a better band is waiting, so the running one has had its
+        // turn whether or not its slice is spent. Without this a driver woken
+        // by its device waits out whatever was running, and the slice that
+        // makes CPU-bound work cheaper would make interrupt-driven work worse.
+        if let Some(best) = best_ready_band() {
+            if best < priority_of(current) {
+                SLICE_LEFT[current] = 0;
+                schedule_inner(true);
+                return;
+            }
+        }
+
         if SLICE_LEFT[current] > 1 {
             SLICE_LEFT[current] -= 1;
             return; // still has time to run
@@ -322,6 +355,26 @@ unsafe fn switch_to(current_tid: usize, next_tid: usize, flags: u64) { unsafe {
     context::context_switch(old_ctx, new_ctx);
 }}
 
+/// Move a task into a scheduling band.
+///
+/// Takes effect from its next turn: a task already running keeps the slice it
+/// is on, which is at most a few ticks and saves reasoning about a queue entry
+/// filed under the band it used to be in.
+pub fn set_priority(tid: usize, band: u8) -> Result<(), ()> {
+    if tid >= MAX_TASKS || band as usize >= NUM_PRIORITIES {
+        return Err(());
+    }
+    unsafe {
+        match TASKS[tid] {
+            Some(ref mut task) => {
+                task.priority = band;
+                Ok(())
+            }
+            None => Err(()),
+        }
+    }
+}
+
 /// Make a blocked task runnable without putting it in the ready queue.
 ///
 /// For the task that is about to be switched to directly. Queueing it as well
@@ -359,9 +412,21 @@ pub fn donate_to(tid: usize) {
         core::arch::asm!("pushfq; pop {}; cli", out(reg) flags, options(nostack));
         let current_tid = CURRENT_TID.load(Ordering::SeqCst);
 
-        let takeable = tid < MAX_TASKS
+        let mut takeable = tid < MAX_TASKS
             && tid != current_tid
             && TASKS[tid].as_ref().map(|t| t.state == TaskState::Ready).unwrap_or(false);
+        // Handing the CPU straight to the callee skips the scheduler, so it
+        // must not be used to run a worse band ahead of a better one. When
+        // something better is waiting, go through the queue instead — the
+        // callee is ready and will be picked in its turn.
+        if takeable {
+            if let Some(best) = best_ready_band() {
+                if best < priority_of(tid) {
+                    enqueue(tid);
+                    takeable = false;
+                }
+            }
+        }
         if !takeable {
             restore_flags(flags);
             yield_now();
@@ -376,17 +441,40 @@ pub fn donate_to(tid: usize) {
     }
 }
 
-/// Dequeue the next ready task from the ready queue.
-unsafe fn dequeue_ready() -> Option<usize> { unsafe {
-    while READY_COUNT > 0 {
-        let tid = READY_QUEUE[READY_HEAD];
-        READY_HEAD = (READY_HEAD + 1) % MAX_TASKS;
-        READY_COUNT -= 1;
+/// Which band a task is in. Anything out of range is treated as ordinary.
+pub fn priority_of(tid: usize) -> usize {
+    if tid >= MAX_TASKS {
+        return PRIO_NORMAL as usize;
+    }
+    unsafe {
+        TASKS[tid]
+            .as_ref()
+            .map(|t| (t.priority as usize).min(NUM_PRIORITIES - 1))
+            .unwrap_or(PRIO_NORMAL as usize)
+    }
+}
 
-        // Skip dead/blocked tasks that may still be in the queue
-        if let Some(ref task) = TASKS[tid] {
-            if task.state == TaskState::Ready {
-                return Some(tid);
+/// The best band with a task waiting in it, if any.
+///
+/// # Safety
+/// Interrupts must be off.
+unsafe fn best_ready_band() -> Option<usize> { unsafe {
+    (0..NUM_PRIORITIES).find(|&p| READY_COUNT[p] > 0)
+}}
+
+/// Dequeue the next ready task, best band first.
+unsafe fn dequeue_ready() -> Option<usize> { unsafe {
+    for p in 0..NUM_PRIORITIES {
+        while READY_COUNT[p] > 0 {
+            let tid = READY_QUEUE[p][READY_HEAD[p]];
+            READY_HEAD[p] = (READY_HEAD[p] + 1) % MAX_TASKS;
+            READY_COUNT[p] -= 1;
+
+            // Skip dead/blocked tasks that may still be in the queue
+            if let Some(ref task) = TASKS[tid] {
+                if task.state == TaskState::Ready {
+                    return Some(tid);
+                }
             }
         }
     }
@@ -395,24 +483,26 @@ unsafe fn dequeue_ready() -> Option<usize> { unsafe {
 
 /// Add a task TID to the back of the ready queue.
 unsafe fn enqueue(tid: usize) { unsafe {
-    if READY_COUNT >= MAX_TASKS {
+    let p = priority_of(tid);
+    if READY_COUNT[p] >= MAX_TASKS {
         crate::console::puts(b"scheduler: ready queue full, dropping task\n");
         return;
     }
-    READY_QUEUE[READY_TAIL] = tid;
-    READY_TAIL = (READY_TAIL + 1) % MAX_TASKS;
-    READY_COUNT += 1;
+    READY_QUEUE[p][READY_TAIL[p]] = tid;
+    READY_TAIL[p] = (READY_TAIL[p] + 1) % MAX_TASKS;
+    READY_COUNT[p] += 1;
 }}
 
 /// Put a task at the *front* of the ready queue, so it runs next.
 unsafe fn enqueue_front(tid: usize) { unsafe {
-    if READY_COUNT >= MAX_TASKS {
+    let p = priority_of(tid);
+    if READY_COUNT[p] >= MAX_TASKS {
         crate::console::puts(b"scheduler: ready queue full, dropping task\n");
         return;
     }
-    READY_HEAD = (READY_HEAD + MAX_TASKS - 1) % MAX_TASKS;
-    READY_QUEUE[READY_HEAD] = tid;
-    READY_COUNT += 1;
+    READY_HEAD[p] = (READY_HEAD[p] + MAX_TASKS - 1) % MAX_TASKS;
+    READY_QUEUE[p][READY_HEAD[p]] = tid;
+    READY_COUNT[p] += 1;
 }}
 
 /// Restore interrupt flag from saved RFLAGS.
@@ -803,7 +893,7 @@ pub fn create_empty_task() -> Option<usize> {
             context: context::CpuContext::empty(),
             kernel_stack_base: stack_base,
             kernel_stack_size: KERNEL_STACK_SIZE,
-            priority: 0,
+            priority: crate::scheduler::PRIO_NORMAL,
             cr3: 0,
             caps: 0,
             cspace: crate::cap::empty_cspace(),

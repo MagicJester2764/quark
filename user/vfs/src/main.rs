@@ -19,6 +19,7 @@ use quark_rt::manifest::CapReq;
 // Broad physical range for the same reason as the disk driver: VFS maps
 // client-allocated pages. Its own sector cache is covered by frame ownership.
 quark_rt::manifest!([
+    CapReq::priority(quark_rt::syscall::PRIO_SERVER),
     CapReq::phys_alloc(256),
     CapReq::phys_range(0, 0x1_0000_0000),
 ]);

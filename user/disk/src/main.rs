@@ -12,6 +12,7 @@ use quark_rt::manifest::CapReq;
 // range stays broad because the driver maps a DMA page the *client* allocated
 // and named over IPC, which has no static extent.
 quark_rt::manifest!([
+    CapReq::priority(quark_rt::syscall::PRIO_DRIVER),
     CapReq::ioport(0x1F0, 0x1F7),
     CapReq::ioport(0x3F6, 0x3F6),
     CapReq::irq(14),

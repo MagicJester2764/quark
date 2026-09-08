@@ -147,7 +147,7 @@ impl Task {
             context: ctx,
             kernel_stack_base: stack_base,
             kernel_stack_size: KERNEL_STACK_SIZE,
-            priority: 0,
+            priority: crate::scheduler::PRIO_NORMAL,
             cr3: crate::paging::read_cr3(),
             caps: 0,
             cspace: cap::empty_cspace(),

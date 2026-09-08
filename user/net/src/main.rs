@@ -11,6 +11,7 @@ use quark_rt::manifest::CapReq;
 // The RTL8139's I/O window is assigned by PCI, so the port range cannot be
 // narrowed here; likewise its interrupt line.
 quark_rt::manifest!([
+    CapReq::priority(quark_rt::syscall::PRIO_DRIVER),
     CapReq::ioport(0, 0xFFFF),
     CapReq::irq(0xFF),
     CapReq::phys_alloc(64),

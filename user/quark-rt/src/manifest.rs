@@ -30,6 +30,10 @@ pub const MANIFEST_MAGIC: u64 = 0x4649_4E41_4D4B_5251; // "QRKMANIF", little end
 /// Current manifest layout version.
 pub const MANIFEST_VERSION: u64 = 1;
 
+/// A scheduling band rather than a capability. Numbered above the `CAP_TYPE_*`
+/// values so a spawner can tell it apart from something to mint.
+pub const PRIORITY_REQ: u64 = 0x100;
+
 /// One capability a program is asking for.
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -46,6 +50,17 @@ impl CapReq {
     /// Port-mapped I/O over an inclusive range.
     pub const fn ioport(first: u16, last: u16) -> Self {
         CapReq { cap_type: syscall::CAP_TYPE_IOPORT, param0: first as u64, param1: last as u64 }
+    }
+
+    /// Which scheduling band to run in — see `syscall::PRIO_*`.
+    ///
+    /// Not a capability: nothing is minted and no slot is used. It is here
+    /// because it is the same kind of statement as the rest of the manifest —
+    /// what the program needs in order to do its job — and because a spawner
+    /// applies it under the same rule, unable to grant a better band than it
+    /// is in itself.
+    pub const fn priority(band: u8) -> Self {
+        CapReq { cap_type: PRIORITY_REQ, param0: band as u64, param1: 0 }
     }
 
     /// A hardware interrupt line. 0xFF is the wildcard.
@@ -151,6 +166,15 @@ pub fn grant(child: usize, reqs: &[CapReq], scratch_slot: usize) -> usize {
     let mut granted = 0;
     for (i, req) in reqs.iter().enumerate() {
         if req.cap_type == 0 {
+            continue;
+        }
+        if req.cap_type == PRIORITY_REQ {
+            // Nothing to mint: this asks to be scheduled differently, not to
+            // be allowed to do something. Refused rather than granted if the
+            // spawner is not in a good enough band itself.
+            if syscall::sys_task_priority(child, req.param0 as u8).is_ok() {
+                granted += 1;
+            }
             continue;
         }
         if syscall::sys_cap_mint(scratch_slot, req.cap_type, req.param0, req.param1).is_err() {

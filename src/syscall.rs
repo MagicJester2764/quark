@@ -116,6 +116,10 @@ pub const SYS_SET_FS_BASE: u64 = 102;
 /// one. Added rather than extending SYS_TASK_START, whose callers pass four
 /// arguments and would leave the fifth register undefined.
 pub const SYS_TASK_START_ARG: u64 = 103;
+/// Put a task in a scheduling band. Requires `TaskMgmt` over the target, and
+/// refuses to grant a better band than the caller is in itself.
+pub const SYS_TASK_PRIORITY: u64 = 105;
+
 /// Be told when a task dies, so that whatever it was lent can be taken back.
 /// Takes no capability: SYS_TASK_INFO already answers the same question by
 /// polling, so this only removes the polling.
@@ -165,7 +169,7 @@ pub const SYS_ABI_VERSION: u64 = 240;
 /// minor when calls are added. User space can refuse to run against a major it
 /// does not know, which is the point of exposing it at all.
 pub const ABI_VERSION_MAJOR: u64 = 1;
-pub const ABI_VERSION_MINOR: u64 = 4;
+pub const ABI_VERSION_MINOR: u64 = 5;
 
 
 
@@ -459,6 +463,27 @@ extern "C" fn syscall_dispatch(
             match crate::ipc::sys_task_watch(scheduler::current_tid(), arg0 as usize) {
                 Ok(()) => 0,
                 Err(_) => u64::MAX,
+            }
+        }
+        SYS_TASK_PRIORITY => {
+            let tid = arg0 as usize;
+            let band = arg1;
+            let caller = scheduler::current_tid();
+            if !crate::cap::task_has_task_mgmt(caller, tid) {
+                return u64::MAX;
+            }
+            // The same rule capabilities follow: a spawner may narrow what it
+            // holds and never widen it. A shell running as an ordinary program
+            // cannot promote what it starts into a driver band, so a program
+            // asking for one gets it only from a spawner that is already there.
+            if band as usize >= scheduler::NUM_PRIORITIES
+                || (band as usize) < scheduler::priority_of(caller)
+            {
+                return u64::MAX;
+            }
+            match scheduler::set_priority(tid, band as u8) {
+                Ok(()) => 0,
+                Err(()) => u64::MAX,
             }
         }
         SYS_ABI_VERSION => (ABI_VERSION_MAJOR << 16) | ABI_VERSION_MINOR,

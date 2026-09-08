@@ -6,6 +6,13 @@ use quark_rt::ipc::{Message, TID_ANY};
 use quark_rt::nameserver;
 use quark_rt::{println, syscall};
 
+// A server: programs are usually blocked waiting on this, so it runs
+// ahead of them and behind the drivers. No capabilities — everything
+// this needs it is given directly or asks another server for.
+quark_rt::manifest!([
+    quark_rt::manifest::CapReq::priority(quark_rt::syscall::PRIO_SERVER),
+]);
+
 
 const GLYPH_W: usize = 8;
 const GLYPH_H: usize = 16;

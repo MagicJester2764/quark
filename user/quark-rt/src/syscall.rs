@@ -76,6 +76,7 @@ pub const SYS_GET_TUID: u64 = 101;
 pub const SYS_SET_FS_BASE: u64 = 102;
 pub const SYS_TASK_START_ARG: u64 = 103;
 pub const SYS_TASK_WATCH: u64 = 104;
+pub const SYS_TASK_PRIORITY: u64 = 105;
 
 // --- 0x70  hardware and drivers ---
 pub const SYS_IRQ_REGISTER: u64 = 112;
@@ -293,6 +294,22 @@ pub fn sys_task_kill(tid: usize) -> Result<(), ()> {
 
 /// Returns (state, parent_tid, uid) or Err if no task at that TID.
 /// state: 0=Ready, 1=Running, 2=Blocked, 3=Dead
+/// Scheduling bands, best first. A task runs only when nothing better is
+/// waiting; within a band they take turns.
+pub const PRIO_DRIVER: u8 = 0;
+pub const PRIO_SERVER: u8 = 1;
+pub const PRIO_NORMAL: u8 = 2;
+pub const PRIO_IDLE: u8 = 3;
+
+/// Put `tid` in a scheduling band.
+///
+/// Needs `TaskMgmt` over the target, and cannot grant a better band than the
+/// caller is in — the same narrowing rule capabilities follow.
+pub fn sys_task_priority(tid: usize, band: u8) -> Result<(), ()> {
+    let ret = unsafe { syscall2(SYS_TASK_PRIORITY, tid as u64, band as u64) };
+    if ret == u64::MAX { Err(()) } else { Ok(()) }
+}
+
 /// Ask to be told when `tid` dies.
 ///
 /// The notification arrives at the caller's next receive as a message from the

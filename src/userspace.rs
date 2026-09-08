@@ -297,6 +297,11 @@ pub fn spawn_init(elf_data: &[u8], fb: Option<crate::multiboot2::FramebufferInfo
     // Patch the task
     unsafe {
         let task = scheduler::get_task_mut(tid)?;
+        // init is the root of authority: it holds every capability, and it is
+        // the only spawner that can put a driver in the driver band, since a
+        // spawner may never grant a better band than it is in. It steps down
+        // to an ordinary one once it has finished starting things.
+        task.priority = scheduler::PRIO_DRIVER;
         task.cr3 = pml4;
         task.caps = crate::task::CAP_ALL;
         crate::cap::populate_from_bitmask(&mut task.cspace, crate::task::CAP_ALL);
