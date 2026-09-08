@@ -51,8 +51,9 @@
 //! the back buffer is what makes it invisible.
 
 use quark_rt::font::FONT;
-use quark_rt::ipc::{Message, TID_ANY};
+use quark_rt::ipc::{Message, TAG_TASK_DIED, TID_ANY};
 use quark_rt::spawn::{self, Scratch};
+use quark_rt::wm as proto;
 use quark_rt::{args, nameserver, println, syscall, vfs};
 
 // The back buffer is ordinary memory, so this needs to allocate pages. The
@@ -97,43 +98,13 @@ const TAG_INPUT_RELEASE: u64 = 0x201;
 const TAG_INPUT_POLL: u64 = 0x202;
 const TAG_INPUT_KEY: u64 = 0x203;
 
-/// Ask for a window. `data[0] = (width << 32) | height`, `data[1..]` the title.
-///
-/// Replies with `data[0] = window id`, `data[1] = shared memory handle`,
-/// `data[2] = (stride << 32) | bytes per pixel`.
-const TAG_WM_CREATE: u64 = 1;
-/// This window's contents have changed: `data[0] = id`.
-const TAG_WM_COMMIT: u64 = 2;
-/// Put a window somewhere: `data[0] = id`, `data[1] = (x << 32) | y`.
-const TAG_WM_MOVE: u64 = 3;
-/// Raise a window and give it focus: `data[0] = id`.
-const TAG_WM_FOCUS: u64 = 4;
-/// Give a window back: `data[0] = id`.
-///
-/// A client has to say so. There is no notification when a task dies, so a
-/// window whose owner simply exited stays on the screen until something else
-/// needs the slot — which is a thing to fix with a death notification, not
-/// with guesswork here.
-const TAG_WM_DESTROY: u64 = 6;
-/// Anything happened to this window? `data[0] = id`. Answers now, either way.
-///
-/// Replies `data[0] = 1` when there was an event and 0 when there was not,
-/// then `data[1] = ascii`, `data[2] = scancode`, `data[3] = modifiers`,
-/// `data[4] = 1` for a press and 0 for a release. `data[5]` says whether this
-/// window currently has focus, which the client would otherwise have to ask
-/// for separately and which changes underneath it without warning.
-const TAG_WM_POLL_EVENT: u64 = 7;
-
-/// How big is the screen, and how are its pixels laid out?
-///
-/// Replies `data[0] = (width << 32) | height` and
-/// `data[1] = (red << 16) | (green << 8) | blue`, the bit position of each
-/// channel. A client needs the second as much as the first: a window buffer is
-/// copied to the screen verbatim, so it has to be in the screen's format.
-const TAG_WM_SCREEN: u64 = 5;
-
-const TAG_OK: u64 = 0;
-const TAG_ERROR: u64 = u64::MAX;
+// The window protocol itself lives in `quark_rt::wm`, with the client half
+// that speaks it. Two copies of a wire format drift; this one is the server.
+use proto::{
+    TAG_COMMIT as TAG_WM_COMMIT, TAG_CREATE as TAG_WM_CREATE, TAG_DESTROY as TAG_WM_DESTROY,
+    TAG_ERROR, TAG_FOCUS as TAG_WM_FOCUS, TAG_MOVE as TAG_WM_MOVE, TAG_OK,
+    TAG_POLL_EVENT as TAG_WM_POLL_EVENT, TAG_SCREEN as TAG_WM_SCREEN,
+};
 
 const GLYPH_W: usize = 8;
 const GLYPH_H: usize = 16;
@@ -246,6 +217,40 @@ const MAX_SESSION: usize = 4;
 static mut SESSION: [usize; MAX_SESSION] = [0; MAX_SESSION];
 static mut SESSION_LEN: usize = 0;
 
+/// A half-open region of the screen.
+#[derive(Clone, Copy)]
+struct Rect {
+    x0: usize,
+    y0: usize,
+    x1: usize,
+    y1: usize,
+}
+
+impl Rect {
+    fn is_empty(&self) -> bool {
+        self.x0 >= self.x1 || self.y0 >= self.y1
+    }
+
+    /// The part of this rectangle that is also in `other`.
+    fn clip_to(&self, other: &Rect) -> Rect {
+        Rect {
+            x0: self.x0.max(other.x0),
+            y0: self.y0.max(other.y0),
+            x1: self.x1.min(other.x1),
+            y1: self.y1.min(other.y1),
+        }
+    }
+}
+
+/// The region currently being repainted. Everything that draws clips to it.
+///
+/// This is what makes a commit cost the size of one window rather than the
+/// size of the screen. Repainting a whole screenful to find out that a 420x260
+/// window changed is a megapixel of backdrop and a four-megabyte copy per
+/// update — enough that a keystroke waits behind the compositor, which is
+/// exactly how it felt.
+static mut CLIP: Rect = Rect { x0: 0, y0: 0, x1: 0, y1: 0 };
+
 fn pack_colour(r: u8, g: u8, b: u8) -> u32 {
     let s = unsafe { &SCREEN };
     ((r as u32) << s.r_pos) | ((g as u32) << s.g_pos) | ((b as u32) << s.b_pos)
@@ -253,7 +258,8 @@ fn pack_colour(r: u8, g: u8, b: u8) -> u32 {
 
 fn put_pixel(x: usize, y: usize, colour: u32) {
     let s = unsafe { &SCREEN };
-    if x >= s.width || y >= s.height {
+    let clip = unsafe { CLIP };
+    if x < clip.x0 || x >= clip.x1 || y < clip.y0 || y >= clip.y1 {
         return;
     }
     let bpp = s.bpp / 8;
@@ -288,15 +294,14 @@ fn fill_rect(x: usize, y: usize, w: usize, h: usize, colour: u32) {
         return;
     }
 
-    let x1 = (x + w).min(s.width);
-    let y1 = (y + h).min(s.height);
-    if x >= x1 || y >= y1 {
+    let r = Rect { x0: x, y0: y, x1: x + w, y1: y + h }.clip_to(unsafe { &CLIP });
+    if r.is_empty() {
         return;
     }
 
-    for row in y..y1 {
-        let start = s.back + row * s.pitch + x * 4;
-        let pixels = unsafe { core::slice::from_raw_parts_mut(start as *mut u32, x1 - x) };
+    for row in r.y0..r.y1 {
+        let start = s.back + row * s.pitch + r.x0 * 4;
+        let pixels = unsafe { core::slice::from_raw_parts_mut(start as *mut u32, r.x1 - r.x0) };
         pixels.fill(colour);
     }
 }
@@ -319,9 +324,20 @@ fn framed_size(w: &Window) -> (usize, usize) {
     (w.w + BORDER * 2, w.h + TITLE_H + BORDER * 2)
 }
 
+/// Where a window sits on the screen, frame included.
+fn framed_rect(idx: usize) -> Rect {
+    let win = unsafe { &WINDOWS[idx] };
+    let (fw, fh) = framed_size(win);
+    Rect { x0: win.x, y0: win.y, x1: win.x + fw, y1: win.y + fh }
+}
+
 fn draw_window(idx: usize) {
     let win = unsafe { WINDOWS[idx] };
     if !win.used {
+        return;
+    }
+    // Nothing of this window is in the region being painted.
+    if framed_rect(idx).clip_to(unsafe { &CLIP }).is_empty() {
         return;
     }
     let focused = unsafe { FOCUS } == idx;
@@ -339,60 +355,109 @@ fn draw_window(idx: usize) {
 
     draw_text(win.x + BORDER + 3, win.y + 3, &win.title[..win.title_len], title_fg);
 
-    // The client's pixels, straight out of the memory it shares with us.
+    // The client's pixels, straight out of the memory it shares with us —
+    // only the rows and columns the region being painted actually covers.
     let s = unsafe { &SCREEN };
     let bpp = s.bpp / 8;
     let ox = win.x + BORDER;
     let oy = win.y + TITLE_H + BORDER;
-    for row in 0..win.h {
-        let src = win.buf + row * win.stride;
+    let clip = unsafe { CLIP };
+    let x_from = clip.x0.saturating_sub(ox);
+    let x_to = win.w.min(clip.x1.saturating_sub(ox));
+    let y_from = clip.y0.saturating_sub(oy);
+    let y_to = win.h.min(clip.y1.saturating_sub(oy));
+    if x_from >= x_to || y_from >= y_to {
+        return;
+    }
+    let bytes = (x_to - x_from) * bpp;
+    for row in y_from..y_to {
         let dst_y = oy + row;
         if dst_y >= s.height {
             break;
         }
-        let dst = s.back + dst_y * s.pitch + ox * bpp;
-        let bytes = (win.w * bpp).min(s.pitch.saturating_sub(ox * bpp));
+        let src = win.buf + row * win.stride + x_from * bpp;
+        let dst = s.back + dst_y * s.pitch + (ox + x_from) * bpp;
         unsafe {
             core::ptr::copy_nonoverlapping(src as *const u8, dst as *mut u8, bytes);
         }
     }
 }
 
-/// Redraw everything, bottom window first.
+/// Repaint one region: backdrop, then every window that reaches into it,
+/// bottom first — then put that region, and only that region, on the screen.
 ///
-/// Whole windows rather than damaged regions: at one screenful it is a copy
-/// per window, and tracking damage across a shared buffer the client writes
-/// whenever it likes needs the client to say what changed. Worth doing when a
-/// client updates faster than this can keep up.
-fn composite() {
+/// Whole windows rather than damaged sub-regions of them. A client shares a
+/// buffer it writes whenever it likes, so what changed inside a window is
+/// something only the client could say; what this does know is *which* window
+/// committed, and that is where nearly all of the saving is.
+fn refresh(region: Rect) {
     let s = unsafe { &SCREEN };
     if s.fb == 0 || s.back == 0 {
         return; // the display is somebody else's at the moment
     }
+    let screen = Rect { x0: 0, y0: 0, x1: s.width, y1: s.height };
+    let region = region.clip_to(&screen);
+    if region.is_empty() {
+        return;
+    }
+    unsafe { CLIP = region };
 
     let backdrop = pack_colour(0x10, 0x14, 0x1C);
-    fill_rect(0, 0, s.width, s.height, backdrop);
+    fill_rect(region.x0, region.y0, region.x1 - region.x0, region.y1 - region.y0, backdrop);
 
     unsafe {
         for i in 0..STACK_LEN {
             draw_window(STACK[i]);
         }
     }
-    present();
+    present(region);
 }
 
-/// Put the finished frame on the screen, in one pass.
+/// Redraw the whole screen. For anything structural — a window appearing,
+/// moving, being raised or going away — where what changed is not one window's
+/// contents.
+fn composite() {
+    let s = unsafe { &SCREEN };
+    refresh(Rect { x0: 0, y0: 0, x1: s.width, y1: s.height });
+}
+
+/// Redraw one window and whatever overlaps it. What a commit costs.
+fn refresh_window(idx: usize) {
+    refresh(framed_rect(idx));
+}
+
+/// Put the finished region on the screen.
 ///
 /// Everything above drew into the back buffer. This is the only write to the
 /// framebuffer, which is why the cleared backdrop is never what anybody sees.
-fn present() {
+fn present(region: Rect) {
     let s = unsafe { &SCREEN };
-    unsafe {
-        core::ptr::copy_nonoverlapping(
-            s.back as *const u8,
-            s.fb as *mut u8,
-            s.pitch * s.height,
-        );
+    let bpp = s.bpp / 8;
+    let bytes = (region.x1 - region.x0) * bpp;
+
+    // Whole rows with no padding between them are one run, so a full repaint
+    // stays the single copy it always was rather than becoming eight hundred.
+    if region.x0 == 0 && bytes == s.pitch {
+        let off = region.y0 * s.pitch;
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                (s.back + off) as *const u8,
+                (s.fb + off) as *mut u8,
+                (region.y1 - region.y0) * s.pitch,
+            );
+        }
+        return;
+    }
+
+    for row in region.y0..region.y1 {
+        let off = row * s.pitch + region.x0 * bpp;
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                (s.back + off) as *const u8,
+                (s.fb + off) as *mut u8,
+                bytes,
+            );
+        }
     }
 }
 
@@ -645,6 +710,10 @@ fn handle_create(sender: usize, msg: &Message) -> Message {
     }
     unsafe { core::ptr::write_bytes(buf as *mut u8, 0, bytes) };
 
+    // A window would otherwise outlive its owner: nothing else says the memory
+    // can go back, and the picture stays on the screen.
+    let _ = syscall::sys_task_watch(sender);
+
     let mut title = [0u8; MAX_TITLE];
     let mut title_len = 0;
     // The title rides in the remaining five data words, as bytes.
@@ -773,6 +842,9 @@ pub extern "C" fn _start() -> ! {
             SESSION[n] = tid;
             SESSION_LEN += 1;
         }
+        // Watched from the start rather than from its first window: a program
+        // that dies before it draws anything still ends the session.
+        let _ = syscall::sys_task_watch(tid);
         n += 1;
     }
 
@@ -812,10 +884,11 @@ pub extern "C" fn _start() -> ! {
         let reply = match msg.tag {
             TAG_WM_CREATE => handle_create(sender, &msg),
             TAG_WM_COMMIT => match window_of(msg.data[0] as usize, sender) {
-                // Redraw everything: a window below this one may overlap it,
-                // and only a full pass gets the stacking right.
-                Some(_) => {
-                    composite();
+                // Just this window's patch of screen. Windows above it are
+                // redrawn within that patch, so the stacking still comes out
+                // right without touching the rest of the display.
+                Some(i) => {
+                    refresh_window(i);
                     ok()
                 }
                 None => error(1),
@@ -872,6 +945,32 @@ pub extern "C" fn _start() -> ! {
                 }
                 None => error(1),
             },
+            // A client has gone. Its windows go with it, and the session ends
+            // when the last of its programs has stopped.
+            TAG_TASK_DIED => {
+                let dead = msg.data[0] as usize;
+                for i in 0..MAX_WINDOWS {
+                    if unsafe { WINDOWS[i].used && WINDOWS[i].owner == dead } {
+                        destroy_window(i);
+                    }
+                }
+                unsafe {
+                    let mut out = 0;
+                    for i in 0..SESSION_LEN {
+                        if SESSION[i] != dead {
+                            SESSION[out] = SESSION[i];
+                            out += 1;
+                        }
+                    }
+                    SESSION_LEN = out;
+                    if SESSION_LEN == 0 {
+                        quit();
+                    }
+                }
+                composite();
+                continue; // the kernel is not waiting for a reply
+            }
+
             // The framebuffer device wants the display back for somebody
             // else. There is nowhere for a compositor to go without a screen,
             // so acknowledge and quit rather than linger invisibly.
@@ -958,11 +1057,12 @@ fn init_screen(reply: &Message) -> bool {
 const POLL_TICKS: u64 = 1;
 /// How long between checks on whether the session is over, in the same ticks.
 ///
-/// The keyboard wants asking every one of them — ten milliseconds is below
-/// what a typist notices and a hundred is not — but whether a program has
-/// exited does not change on that scale, and asking costs a system call per
-/// task in the session.
-const SESSION_CHECK_TICKS: u64 = 25;
+/// A backstop, not the mechanism: the kernel says when a session program dies
+/// and that is what normally ends things. This stays because a compositor that
+/// never gives the screen back leaves a machine with no way out, and one
+/// dropped notification should not be able to cause that. Two seconds, since
+/// nothing is waiting on the answer.
+const SESSION_CHECK_TICKS: u64 = 200;
 
 /// Have all the session's programs stopped?
 ///

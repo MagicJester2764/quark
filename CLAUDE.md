@@ -138,7 +138,7 @@ These were established deliberately. Breaking one silently re-opens a hole.
   every CSpace, because TIDs are recycled and a stale bit would otherwise
   transfer to the slot's next occupant.
 
-`init` spawns `WM`, `CONSOLE`, `INPUT` and `VFS` in passes of their own. If a
+`init` spawns `FB`, `CONSOLE`, `INPUT` and `VFS` in passes of their own. If a
 program misbehaves for lack of a capability, check that its pass actually calls
 `grant_caps_from_manifest` — there is no shared path that does it for them, and
 INPUT's pass once granted nothing at all, which the UID bypass hid.
@@ -152,6 +152,12 @@ Everything else is a client of it. The text console claims the display at boot
 and draws fullscreen — that is what the machine boots into, a plain TTY.
 `user/wm` is a compositor you *run*: `wm <program>` takes the display, starts
 that program, composites its windows, and gives the display back when it exits.
+
+The keyboard goes with it. `user/input` has the same claim protocol: while a
+program holds it, raw key events go to that program and line readers wait. The
+compositor claims the keyboard when it claims the display and hands each key to
+the focused window — whoever owns the screen owns the keyboard, the way
+switching virtual terminals has always worked.
 
 Three things to know before changing any of it:
 
@@ -168,6 +174,15 @@ Three things to know before changing any of it:
   cleared screen is briefly the one on the monitor, once per frame; a cursor
   blink is enough to make that a visible flash. `sys_mmap`/`sys_munmap` take at
   most 256 pages, so a screenful takes a loop.
+- **Repaint the region that changed, not the screen.** A commit says which
+  window changed; repainting all of it costs a megapixel of backdrop and a
+  four-megabyte copy, which a client committing a dozen times a second turns
+  into a compositor with no time left to read the keyboard. `wm` clips every
+  drawing primitive to a region and copies only that region out.
+- **Events are pulled, not pushed.** A server cannot originate IPC to a program
+  it spawned: `sys_send`/`sys_call` need an `Endpoint` naming the destination,
+  and a TID that did not exist at spawn time cannot be minted into one. A reply
+  needs no capability, so every hop here is the client asking.
 
 ## Known gaps
 
@@ -179,10 +194,8 @@ Three things to know before changing any of it:
   ownership transfer on the IPC — rather than a range grant.
 - Endpoint sets are TID bitmasks, not true endpoint objects. A service and its
   clients are named by slot number, not identity.
-- Input goes to the input server and out to the shell. The compositor tracks
-  which window has focus and shows it, but nothing routes events by it, and a
-  window whose owner exits without saying so stays on the screen. Both want a
-  task-death notification the kernel does not send.
+- Focus is a single stack with no policy: Tab cycles, a new window takes it,
+  and there is no click-to-focus because there is no pointer driver.
 - The rust fork is one commit on `upstream/main`. Rebasing it means re-checking
   the PAL against std's internals, which move: the allocator PAL shape, the
   futex module location, `RawOsError`'s home and `BorrowedCursor`'s parameters

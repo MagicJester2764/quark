@@ -1,75 +1,47 @@
 #![no_std]
 #![no_main]
-#![allow(static_mut_refs)]
 
-//! A window you can type into.
+//! A second thing on the screen.
 //!
 //! There is not much to a display server client: ask for a window, map the
-//! memory it gives you, write pixels into it, say when you have finished, and
-//! ask what has happened to you. The last of those is the interesting one when
-//! two of these are running — only one window has focus, so only one of them
-//! sees what is typed, and which one that is changes with Tab.
+//! memory it gives you, write pixels into it, and say when you have finished.
+//! This does exactly that, in a loop, so the result is visibly animated rather
+//! than merely present — a still image proves the buffer was shared, and a
+//! moving one proves it stayed shared.
 //!
-//! Events are pulled rather than pushed. The compositor cannot send to a
-//! program it spawned: originating IPC needs an Endpoint capability naming the
-//! destination, and a task ID that did not exist when the compositor started
-//! is not one it can mint. Answering a caller needs no capability, so the
-//! client does the asking — which is the same shape as `XNextEvent` anyway.
+//! Its companion `wmtype` is the same idea with the events attached: this one
+//! shows that a window is a shared buffer, that one shows where keys go.
 
 use quark_rt::font::FONT;
-use quark_rt::ipc::Message;
-use quark_rt::{args, nameserver, println, syscall};
+use quark_rt::wm;
+use quark_rt::{args, println, syscall};
 
 // Nothing to declare: the window's memory belongs to the display server, and
 // this only maps what it is given.
-
-const TAG_WM_CREATE: u64 = 1;
-const TAG_WM_COMMIT: u64 = 2;
-const TAG_WM_DESTROY: u64 = 6;
-const TAG_WM_POLL_EVENT: u64 = 7;
-const TAG_ERROR: u64 = u64::MAX;
 
 const W: usize = 420;
 const H: usize = 260;
 const BUF: usize = 0x84_0000_0000;
 
 const GLYPH_W: usize = 8;
-const GLYPH_H: usize = 16;
 
-/// PIT ticks between animation frames — 100 Hz, so about twelve a second.
-/// Typing is drawn as it arrives; this only paces the moving background.
+/// PIT ticks between frames — 100 Hz, so this is about twelve frames a second.
 const TICKS_PER_FRAME: u64 = 8;
+/// How long the demo runs before giving its window back: long enough to look
+/// at, short enough that the shell comes back on its own.
+const FRAMES: u32 = 150;
 
-/// How much typing is kept on screen.
-const COLS: usize = 46;
-const ROWS: usize = 6;
+static mut WIN: Option<wm::Window> = None;
 
-static mut STRIDE: usize = 0;
-static mut R_POS: u8 = 16;
-static mut G_POS: u8 = 8;
-static mut B_POS: u8 = 0;
-
-static mut TEXT: [[u8; COLS]; ROWS] = [[b' '; COLS]; ROWS];
-static mut CUR_ROW: usize = 0;
-static mut CUR_COL: usize = 0;
-
-fn colour(r: u8, g: u8, b: u8) -> u32 {
-    unsafe { ((r as u32) << R_POS) | ((g as u32) << G_POS) | ((b as u32) << B_POS) }
+fn win() -> &'static mut wm::Window {
+    unsafe { (&mut *core::ptr::addr_of_mut!(WIN)).as_mut().unwrap() }
 }
 
 fn pixel(x: usize, y: usize, c: u32) {
     if x >= W || y >= H {
         return;
     }
-    unsafe { ((BUF + y * STRIDE + x * 4) as *mut u32).write_volatile(c) };
-}
-
-fn fill(x: usize, y: usize, w: usize, h: usize, c: u32) {
-    for dy in 0..h {
-        for dx in 0..w {
-            pixel(x + dx, y + dy, c);
-        }
-    }
+    win().row(y)[x] = c;
 }
 
 fn text(x: usize, y: usize, s: &[u8], c: u32) {
@@ -84,190 +56,85 @@ fn text(x: usize, y: usize, s: &[u8], c: u32) {
     }
 }
 
-/// Put a typed character into the visible buffer.
-fn type_char(c: u8) {
-    unsafe {
-        match c {
-            b'\n' | 13 => newline(),
-            8 | 127 => {
-                if CUR_COL > 0 {
-                    CUR_COL -= 1;
-                    TEXT[CUR_ROW][CUR_COL] = b' ';
-                }
-            }
-            c if c >= 0x20 && c < 0x7F => {
-                TEXT[CUR_ROW][CUR_COL] = c;
-                CUR_COL += 1;
-                if CUR_COL == COLS {
-                    newline();
-                }
-            }
-            _ => {}
-        }
-    }
-}
-
-fn newline() {
-    unsafe {
-        CUR_COL = 0;
-        if CUR_ROW + 1 < ROWS {
-            CUR_ROW += 1;
-        } else {
-            for r in 1..ROWS {
-                TEXT[r - 1] = TEXT[r];
-            }
-            TEXT[ROWS - 1] = [b' '; COLS];
-        }
-    }
-}
-
-fn draw(name: &[u8], focused: bool, frame: u32) {
-    // A background that moves, so it stays obvious that the window is being
-    // redrawn rather than left where it was — and dimmer when this window is
-    // not the one being typed into.
-    let dim: u8 = if focused { 1 } else { 3 };
-    for y in 0..H {
-        for x in 0..W {
-            let r = ((x * 120 / W) as u32 + frame * 2) as u8 / (2 * dim) + 0x10;
-            let g = ((y * 100 / H) as u32 + frame) as u8 / (2 * dim) + 0x14;
-            pixel(x, y, colour(r, g, 0x30 / dim));
-        }
-    }
-
-    // A band across the top that says, unmistakably, whether keys land here.
-    let band = if focused { colour(0x30, 0xA0, 0x50) } else { colour(0x40, 0x40, 0x48) };
-    fill(0, 0, W, GLYPH_H + 8, band);
-    let label: &[u8] = if focused { b"TYPING HERE" } else { b"not focused" };
-    text(8, 4, name, colour(0xFF, 0xFF, 0xFF));
-    text(W - 8 - label.len() * GLYPH_W, 4, label, colour(0xFF, 0xFF, 0xFF));
-
-    // What has been typed into this window, and only this window.
-    let ink = colour(0xFF, 0xFF, 0xFF);
-    unsafe {
-        for r in 0..ROWS {
-            text(8, GLYPH_H + 20 + r * GLYPH_H, &TEXT[r], ink);
-        }
-        // A block cursor, drawn only when this window would receive the next
-        // key. Two of these side by side is the whole demonstration.
-        if focused {
-            fill(
-                8 + CUR_COL * GLYPH_W,
-                GLYPH_H + 20 + CUR_ROW * GLYPH_H,
-                GLYPH_W,
-                GLYPH_H,
-                colour(0xFF, 0xFF, 0x80),
-            );
-        }
-    }
-
-    let hint = colour(0xC0, 0xC0, 0xC8);
-    text(8, H - GLYPH_H - 6, b"Tab: switch  Esc: end session  ^D: close", hint);
-}
-
 #[unsafe(no_mangle)]
 #[link_section = ".text.entry"]
 pub extern "C" fn _start() -> ! {
-    let Some(wm) = nameserver::lookup_retry(b"wm", 20) else {
+    let Some(server) = wm::connect() else {
         println!("wmdemo: no display server");
         syscall::sys_exit_code(1);
     };
 
-    // Which of the session's windows this is, from the compositor. Two copies
-    // of this program are otherwise the same picture twice.
-    let mut name = [0u8; 9];
-    name[..8].copy_from_slice(b"wmdemo #");
-    name[8] = args::argv(1).and_then(|a| a.first().copied()).unwrap_or(b'1');
-    let title: &[u8] = &name;
+    // Which of the session's windows this is, from the display server. Two
+    // copies of this program are otherwise the same picture twice.
+    let mut title = [0u8; 9];
+    title[..8].copy_from_slice(b"wmdemo #");
+    title[8] = args::argv(1).and_then(|a| a.first().copied()).unwrap_or(b'1');
 
-    let mut data = [0u64; 6];
-    data[0] = ((W as u64) << 32) | (H as u64);
-    for (i, chunk) in title.chunks(8).take(5).enumerate() {
-        let mut word = [0u8; 8];
-        word[..chunk.len()].copy_from_slice(chunk);
-        data[1 + i] = u64::from_le_bytes(word);
-    }
-
-    let mut reply = Message::empty();
-    let create = Message { sender: 0, tag: TAG_WM_CREATE, data };
-    if syscall::sys_call(wm, &create, &mut reply).is_err() || reply.tag == TAG_ERROR {
-        println!("wmdemo: no window (error {})", reply.data[0]);
+    let Some(window) = wm::Window::create(server, W, H, &title, BUF) else {
+        println!("wmdemo: no window");
         syscall::sys_exit_code(1);
+    };
+    unsafe { WIN = Some(window) };
+    println!("wmdemo: window {} ({}x{})", win().id, W, H);
+
+    // The red channel varies along a row and the green down the page, so a
+    // frame is one value per column plus one per row — worked out once here
+    // rather than a divide per pixel, sixty times a second.
+    let mut col = [0u8; W];
+    for (x, c) in col.iter_mut().enumerate() {
+        *c = (x * 255 / W) as u8;
     }
-    let id = reply.data[0] as usize;
-    let shmem = reply.data[1] as usize;
-    unsafe { STRIDE = (reply.data[2] >> 32) as usize };
 
-    if syscall::sys_shmem_map(shmem, BUF).is_err() {
-        println!("wmdemo: could not map the window");
-        syscall::sys_exit_code(1);
+    let white = win().colour(0xFF, 0xFF, 0xFF);
+    let black = win().colour(0x00, 0x00, 0x00);
+    let blue = win().colour(0x00, 0x00, 0x60);
+
+    for frame in 0..FRAMES {
+        // A gradient that moves, so it is obvious the window is being redrawn
+        // rather than left where it was. Written a row at a time: the display
+        // server reads this buffer only after the round trip a commit makes,
+        // so there is nothing a per-pixel volatile store would order against
+        // and plenty it would stop the compiler doing.
+        let w = win();
+        let r_pos = w.r_pos;
+        let g_pos = w.g_pos;
+        for y in 0..H {
+            let g = ((y * 255 / H) as u32 + frame * 2) as u8;
+            let g_bits = (g as u32) << g_pos;
+            let row = w.row(y);
+            for x in 0..W {
+                let r = (col[x] as u32 + frame * 4) as u8;
+                row[x] = ((r as u32) << r_pos) | g_bits | blue;
+            }
+        }
+
+        text(16, 24, b"A second window.", white);
+        text(16, 48, b"Its pixels live in memory", white);
+        text(16, 66, b"the display server reads.", white);
+        text(16, 100, b"frame", black);
+        let mut n = [b' '; 4];
+        let mut v = frame;
+        for i in (0..4).rev() {
+            n[i] = b'0' + (v % 10) as u8;
+            v /= 10;
+        }
+        text(16 + 6 * GLYPH_W, 100, &n, black);
+
+        win().commit();
+
+        // Paced against the clock, not against the scheduler. Asleep rather
+        // than yielding in a loop: a yield loop is a delay that costs a whole
+        // core to wait out, and on a machine where two of these and a
+        // compositor are all doing it, the time goes to spinning instead of to
+        // whoever is drawing.
+        syscall::sleep_ticks(TICKS_PER_FRAME);
     }
 
-    println!("wmdemo: window {} ({}x{})", id, W, H);
-
-    let mut frame: u32 = 0;
-    let mut focused = false;
-    let mut next_frame = syscall::sys_ticks();
-    loop {
-        // Everything that has happened since the last look. Draining rather
-        // than taking one means a burst of typing arrives whole, at the cost
-        // of nothing: the queue is empty almost every time.
-        let mut dirty = false;
-        loop {
-            let poll = Message { sender: 0, tag: TAG_WM_POLL_EVENT, data: [id as u64, 0, 0, 0, 0, 0] };
-            if syscall::sys_call(wm, &poll, &mut reply).is_err() || reply.tag == TAG_ERROR {
-                // The compositor has gone. So has the window.
-                syscall::sys_exit_code(0);
-            }
-            let now_focused = reply.data[5] != 0;
-            if now_focused != focused {
-                focused = now_focused;
-                dirty = true;
-            }
-            if reply.data[0] == 0 {
-                break;
-            }
-            let ascii = reply.data[1] as u8;
-            let press = reply.data[4] != 0;
-            if !press {
-                continue; // releases are delivered; nothing here wants them
-            }
-            if ascii == 0x04 {
-                // Ctrl-D: close this window and stop. The session ends when
-                // the last of these does.
-                let destroy =
-                    Message { sender: 0, tag: TAG_WM_DESTROY, data: [id as u64, 0, 0, 0, 0, 0] };
-                let _ = syscall::sys_call(wm, &destroy, &mut reply);
-                syscall::sys_exit_code(0);
-            }
-            type_char(ascii);
-            dirty = true;
-        }
-
-        // Redraw when something was typed, and otherwise only as fast as the
-        // background moves: a full window is a hundred thousand pixels, and
-        // there is no reason to pay for it a hundred times a second.
-        let now = syscall::sys_ticks();
-        if now >= next_frame {
-            next_frame = now + TICKS_PER_FRAME;
-            frame = frame.wrapping_add(1);
-            dirty = true;
-        }
-        if dirty {
-            draw(title, focused, frame);
-            let commit =
-                Message { sender: 0, tag: TAG_WM_COMMIT, data: [id as u64, 0, 0, 0, 0, 0] };
-            let _ = syscall::sys_call(wm, &commit, &mut reply);
-        }
-
-        // Paced against the clock, not against the scheduler. A bare yield
-        // loop polls the compositor as fast as the machine will go, which
-        // taxes it for latency it cannot use: a tick is ten milliseconds, and
-        // nobody types faster than that.
-        let tick = syscall::sys_ticks();
-        while syscall::sys_ticks() == tick {
-            syscall::sys_yield();
-        }
-    }
+    // Saying so is the polite way. A client that simply exits is handled too —
+    // the display server is told when a task dies and takes its windows with
+    // it — but that is the safety net, not the protocol.
+    win().destroy();
+    syscall::sys_exit_code(0);
 }
 
 #[panic_handler]

@@ -20,6 +20,7 @@ pub mod net;
 pub mod socket;
 pub mod passwd;
 pub mod vfs;
+pub mod wm;
 
 pub mod allocator;
 
