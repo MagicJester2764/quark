@@ -7,6 +7,7 @@ pub mod ext2;
 pub mod ext2_alloc;
 pub mod ext2_dir;
 pub mod ext4;
+pub mod csum;
 
 use quark_rt::ipc::{Message, TID_ANY};
 use quark_rt::nameserver;
@@ -2175,11 +2176,17 @@ fn handle_create_ext2(sender: usize, msg: &Message) {
         return;
     }
 
-    // Allocate new inode
+    // Allocate new inode. The number comes back but the bytes are still the
+    // last file's, and write_inode overlays rather than overwrites, so wipe it
+    // before anything reads a generation or a checksum out of it.
     let new_ino = match ext2_alloc::alloc_inode(e2) {
         Ok(ino) => ino,
         Err(code) => { error_reply(sender, code); return; }
     };
+    if let Err(code) = ext2::zero_inode(e2, new_ino) {
+        error_reply(sender, code);
+        return;
+    }
 
     // Initialize the inode
     let mode = if is_dir {
@@ -2219,7 +2226,9 @@ fn handle_create_ext2(sender: usize, msg: &Message) {
         new_inode.i_size = e2.block_size;
         new_inode.i_blocks = e2.block_size / 512;
 
-        if ext2_dir::init_dir_block(e2, block, new_ino, parent_ino).is_err() {
+        if ext2_dir::init_dir_block(e2, block, new_ino, parent_ino, new_inode.i_generation)
+            .is_err()
+        {
             error_reply(sender, ERR_IO);
             return;
         }

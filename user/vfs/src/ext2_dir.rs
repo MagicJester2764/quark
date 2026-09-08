@@ -222,6 +222,10 @@ pub fn create_dir_entry(
     file_type: u8,
 ) -> Result<(), u64> {
     let bs = ext2.block_size;
+    // The last twelve bytes of every block may be a checksum tail. It is
+    // disguised as an unused entry, so a scan that treats it as free space
+    // will happily allocate over it — and the block's checksum with it.
+    let usable = crate::csum::dir_usable_len(ext2, bs);
     let needed = align4(8 + name.len() as u32);
     let total_blocks = (dir_inode.i_size + bs - 1) / bs;
 
@@ -237,7 +241,7 @@ pub fn create_dir_entry(
         let block_buf = unsafe { &mut DIR_BLOCK_BUF };
 
         let mut pos = 0u32;
-        while pos < bs {
+        while pos < usable {
             let off = pos as usize;
             let entry_inode = read_u32(block_buf, off);
             let rec_len = read_u16(block_buf, off + 4) as u32;
@@ -253,7 +257,10 @@ pub fn create_dir_entry(
                 align4(8 + entry_name_len)
             };
 
-            let free_space = rec_len - actual_size;
+            // An entry may claim the tail's bytes if the block has none, but
+            // never past it if it has.
+            let entry_end = (pos + rec_len).min(usable);
+            let free_space = entry_end.saturating_sub(pos + actual_size);
 
             if free_space >= needed {
                 if entry_inode != 0 {
@@ -263,15 +270,14 @@ pub fn create_dir_entry(
 
                 // Write new entry at pos + actual_size
                 let new_off = (pos + actual_size) as usize;
-                let new_rec_len = rec_len - actual_size;
+                let new_rec_len = entry_end - (pos + actual_size);
                 write_u32(block_buf, new_off, new_inode);
                 write_u16(block_buf, new_off + 4, new_rec_len as u16);
                 block_buf[new_off + 6] = name.len() as u8;
                 block_buf[new_off + 7] = file_type;
                 block_buf[new_off + 8..new_off + 8 + name.len()].copy_from_slice(name);
 
-                // Write block back to disk
-                write_block_buf(ext2, phys_block, block_buf)?;
+                write_dir_block(ext2, phys_block, dir_inode_num, dir_inode, block_buf)?;
                 return Ok(());
             }
 
@@ -292,12 +298,15 @@ pub fn create_dir_entry(
     let block_buf = unsafe { &mut DIR_BLOCK_BUF };
     block_buf.fill(0);
     write_u32(block_buf, 0, new_inode);
-    write_u16(block_buf, 4, bs as u16);
+    write_u16(block_buf, 4, usable as u16);
     block_buf[6] = name.len() as u8;
     block_buf[7] = file_type;
     block_buf[8..8 + name.len()].copy_from_slice(name);
+    if usable != bs {
+        crate::csum::init_dirent_tail(&mut block_buf[..bs as usize]);
+    }
 
-    write_block_buf(ext2, new_block, block_buf)?;
+    write_dir_block(ext2, new_block, dir_inode_num, dir_inode, block_buf)?;
 
     // Update directory inode on disk
     write_inode(ext2, dir_inode_num, dir_inode)?;
@@ -311,8 +320,10 @@ pub fn init_dir_block(
     block: u32,
     self_ino: u32,
     parent_ino: u32,
+    generation: u32,
 ) -> Result<(), u64> {
     let bs = ext2.block_size;
+    let usable = crate::csum::dir_usable_len(ext2, bs);
     let buf = unsafe { &mut DIR_BLOCK_BUF };
     buf.fill(0);
 
@@ -324,8 +335,8 @@ pub fn init_dir_block(
     buf[7] = FT_DIR;
     buf[8] = b'.';
 
-    // ".." entry — takes remaining space in block
-    let dotdot_rec_len = bs - dot_rec_len;
+    // ".." entry — takes the rest, short of the checksum tail if there is one.
+    let dotdot_rec_len = usable - dot_rec_len;
     let off = dot_rec_len as usize;
     write_u32(buf, off, parent_ino);
     write_u16(buf, off + 4, dotdot_rec_len as u16);
@@ -334,7 +345,23 @@ pub fn init_dir_block(
     buf[off + 8] = b'.';
     buf[off + 9] = b'.';
 
-    write_block_buf(ext2, block, buf)
+    if usable != bs {
+        crate::csum::init_dirent_tail(&mut buf[..bs as usize]);
+    }
+
+    // The block belongs to the directory it describes, so its checksum is
+    // seeded by that inode — which is `self_ino`, not the parent.
+    let seed = crate::csum::inode_seed(ext2, self_ino, generation);
+    crate::csum::set_dirblock(ext2, seed, &mut buf[..bs as usize]);
+
+    for s in 0..ext2.sectors_per_block {
+        let abs_lba = ext2.block_to_lba(block) + s;
+        let o = (s * 512) as usize;
+        let disk_buf = unsafe { core::slice::from_raw_parts_mut(DISK_IO_BUF as *mut u8, 512) };
+        disk_buf.copy_from_slice(&buf[o..o + 512]);
+        ext2.write_sector_abs(abs_lba).map_err(|_| ERR_IO)?;
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -370,7 +397,22 @@ fn read_block_buf_mut(ext2: &Ext2State, phys_block: u32) -> Result<(), u64> {
 }
 
 /// Write a block buffer back to disk, sector by sector.
-fn write_block_buf(ext2: &Ext2State, block: u32, buf: &[u8]) -> Result<(), u64> {
+/// Write a directory block back, checksumming it first.
+///
+/// The checksum is seeded by the directory's own inode, so a block cannot be
+/// moved into another directory and still verify — which is why this needs to
+/// know whose block it is rather than just where it goes.
+fn write_dir_block(
+    ext2: &Ext2State,
+    block: u32,
+    dir_inode_num: u32,
+    dir_inode: &Ext2Inode,
+    buf: &mut [u8],
+) -> Result<(), u64> {
+    let bs = ext2.block_size as usize;
+    let seed = crate::csum::inode_seed(ext2, dir_inode_num, dir_inode.i_generation);
+    crate::csum::set_dirblock(ext2, seed, &mut buf[..bs]);
+
     for s in 0..ext2.sectors_per_block {
         let abs_lba = ext2.block_to_lba(block) + s;
         let off = (s * 512) as usize;

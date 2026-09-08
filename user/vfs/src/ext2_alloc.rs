@@ -16,6 +16,16 @@ pub fn alloc_block(ext2: &mut Ext2State) -> Result<u32, u64> {
         if bgd.bg_free_blocks_count == 0 {
             continue;
         }
+        // An uninitialised bitmap says nothing about which of its blocks are
+        // free: mkfs never wrote one, and the kernel derives it from where the
+        // group's metadata lands rather than reading it. Deriving it here means
+        // knowing every group's metadata that falls in this one — flex_bg puts
+        // sixteen groups' bitmaps and inode tables together — so for now these
+        // groups are left alone. See the roadmap: it costs capacity, not
+        // correctness.
+        if bgd.bg_flags & crate::ext4::BG_BLOCK_UNINIT != 0 {
+            continue;
+        }
 
         let bitmap_block = ext2.block32(bgd.bg_block_bitmap)?;
 
@@ -106,6 +116,10 @@ pub fn alloc_inode(ext2: &mut Ext2State) -> Result<u32, u64> {
             continue;
         }
 
+        if bgd.bg_flags & crate::ext4::BG_INODE_UNINIT != 0 {
+            continue; // as above, for inodes
+        }
+
         let bitmap_block = ext2.block32(bgd.bg_inode_bitmap)?;
 
         for s in 0..ext2.sectors_per_block {
@@ -133,6 +147,18 @@ pub fn alloc_inode(ext2: &mut Ext2State) -> Result<u32, u64> {
                         // Update counts
                         ext2.bgd_table[group as usize].bg_free_inodes_count -= 1;
                         ext2.free_inodes_count -= 1;
+
+                        // bg_itable_unused counts inodes at the *end* of the
+                        // table that have never been used, so fsck can stop
+                        // reading there. Taking one inside that range without
+                        // shrinking it tells fsck the inode does not exist —
+                        // and it then reports the directory entry pointing at
+                        // it as a reference to a deleted inode.
+                        let used_through = ext2.inodes_per_group - (inode_in_group + 1);
+                        let unused = &mut ext2.bgd_table[group as usize].bg_itable_unused;
+                        if *unused > used_through {
+                            *unused = used_through;
+                        }
 
                         flush_bgd(ext2, group)?;
                         flush_superblock(ext2)?;

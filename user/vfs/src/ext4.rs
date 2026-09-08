@@ -92,7 +92,14 @@ pub const RO_COMPAT_WRITE_SUPPORTED: u32 = RO_COMPAT_SPARSE_SUPER
     | RO_COMPAT_LARGE_FILE
     | RO_COMPAT_HUGE_FILE
     | RO_COMPAT_DIR_NLINK
-    | RO_COMPAT_EXTRA_ISIZE;
+    | RO_COMPAT_EXTRA_ISIZE
+    | RO_COMPAT_METADATA_CSUM;
+
+/// This group's inode bitmap has never been written, so what is on disk for it
+/// says nothing about which inodes are free.
+pub const BG_INODE_UNINIT: u16 = 0x0001;
+/// The same for its block bitmap.
+pub const BG_BLOCK_UNINIT: u16 = 0x0002;
 
 /// Set in `i_flags` when an inode's `i_block` is an extent tree.
 pub const EXT4_EXTENTS_FL: u32 = 0x0008_0000;
