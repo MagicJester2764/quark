@@ -19,8 +19,11 @@ and the bootloader, never the reverse.
 
 ## Toolchain
 
-Pinned to `nightly-2026-03-01` in `rust-toolchain.toml`, in both this repo and
-`../bang` — the same `make sync-quark` run builds both, so they must agree.
+Pinned to `nightly-2026-03-01` in `rust-toolchain.toml`. `../bang` pins the
+same nightly, but for its own reasons rather than to match this tree: it does
+not depend on the fork at all, and pins because newer toolchains rewrite the
+uefi crate's UCS-2 loops into a `wcslen` libcall it has to supply. Keeping the
+two equal only saves rustup a second download.
 
 **The pin must equal the commit the fork is based on.** `../rust`'s `library/`
 is a checkout of upstream at one commit and only compiles with the rustc built
@@ -50,9 +53,13 @@ git -C ../rust submodule update --init --depth 1 library/backtrace
 ```
 
 That submodule is the easy one to miss. Without it `std` fails with
-`couldn't read .../backtrace/src/lib.rs`, which stops `make sync-quark` before
-it copies `kernel.bin` — so the image silently keeps booting a stale kernel and
-you debug the wrong binary.
+`couldn't read .../backtrace/src/lib.rs`, which stops the build before
+`../explosion` can stage a kernel — so the image keeps whatever it had and you
+debug the wrong binary.
+
+The fork is needed only for the hosted `hello`. Without it on disk, `make`
+skips that one program and says so; the kernel and every other program still
+build, because a kernel should not need a patched rustc checkout to compile.
 
 ## Build and run
 

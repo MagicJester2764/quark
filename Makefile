@@ -5,6 +5,16 @@ BINARY := target/$(TARGET)/release/quark
 # Hosted target (requires std fork at QUARK_RUST_STD_PATH)
 HOSTED_TARGET := x86_64-unknown-quark
 QUARK_RUST_STD_PATH ?= $(CURDIR)/../rust/library
+
+# `hello` is the only program that needs the std fork next door. Build it when
+# the fork is present and skip it when it is not, so this tree stands alone:
+# a kernel should not require a patched rustc checkout to compile at all.
+HAVE_STD_FORK := $(wildcard $(QUARK_RUST_STD_PATH)/std/Cargo.toml)
+ifeq ($(HAVE_STD_FORK),)
+HOSTED_ELF :=
+else
+HOSTED_ELF := $(HELLO_ELF)
+endif
 GRUB_MKRESCUE := $(shell command -v grub-mkrescue 2>/dev/null || command -v grub2-mkrescue 2>/dev/null)
 
 VGA_DRV_DIR := drivers/vga
@@ -82,6 +92,9 @@ check-abi:
 	@./tools/check-abi.sh
 
 all: check-abi $(KERNEL) drivers user rootfs
+ifeq ($(HAVE_STD_FORK),)
+	@echo "note: no std fork at $(QUARK_RUST_STD_PATH); skipped the hosted 'hello'"
+endif
 
 $(KERNEL): FORCE
 	cargo build --release
@@ -97,7 +110,7 @@ $(FAT32_DRV_BIN): FORCE
 	cd $(FAT32_DRV_DIR) && cargo build --release
 	objcopy -O binary $(FAT32_DRV_ELF) $(FAT32_DRV_BIN)
 
-user: $(INIT_ELF) $(HELLO_ELF) $(NS_ELF) $(KBD_ELF) $(CON_ELF) $(INP_ELF) $(DISK_ELF) $(DISKTEST_ELF) $(VFS_ELF) $(NET_ELF) $(SHELL_ELF) $(ECHO_ELF) $(LS_ELF) $(CAT_ELF) $(LOGIN_ELF) $(PS_ELF) $(IPCPING_ELF) $(PING_ELF) $(HTTPGET_ELF) $(SHUTDOWN_ELF)
+user: $(INIT_ELF) $(HOSTED_ELF) $(NS_ELF) $(KBD_ELF) $(CON_ELF) $(INP_ELF) $(DISK_ELF) $(DISKTEST_ELF) $(VFS_ELF) $(NET_ELF) $(SHELL_ELF) $(ECHO_ELF) $(LS_ELF) $(CAT_ELF) $(LOGIN_ELF) $(PS_ELF) $(IPCPING_ELF) $(PING_ELF) $(HTTPGET_ELF) $(SHUTDOWN_ELF)
 
 $(INIT_ELF): FORCE
 	cd $(INIT_DIR) && cargo build --release
@@ -232,7 +245,14 @@ install: all
 		src=$${p%%:*}; dst=$${p##*:}; \
 		cp user/$$src/target/$(TARGET)/release/$$src $(DESTDIR)/usr/bin/$$dst.ELF; \
 	done
+	@# Gate on the fork, not on the file: a hello left over from an earlier
+	@# build cannot be shown to match the current tree, and shipping a stale
+	@# one is how it ended up calling pre-Phase-0 syscall numbers.
+ifeq ($(HAVE_STD_FORK),)
+	@echo "  (no std fork - HELLO.ELF omitted rather than shipped stale)"
+else
 	@cp $(HELLO_ELF) $(DESTDIR)/usr/bin/HELLO.ELF
+endif
 	@cp rootfs/etc/passwd $(DESTDIR)/etc/PASSWD
 	@echo "installed to $(DESTDIR)"
 
