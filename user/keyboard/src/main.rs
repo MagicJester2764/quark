@@ -246,6 +246,15 @@ pub extern "C" fn _start() -> ! {
                     };
                     let _ = syscall::sys_reply(msg.sender, &reply);
                 }
+                quark_rt::ipc::TAG_PING => {
+                    // Liveness probe: reply immediately, do nothing else.
+                    let reply = Message {
+                        sender: 0,
+                        tag: quark_rt::ipc::TAG_PING,
+                        data: [0; 6],
+                    };
+                    let _ = syscall::sys_reply(msg.sender, &reply);
+                }
                 _ => {
                     let reply = Message {
                         sender: 0,

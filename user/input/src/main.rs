@@ -129,6 +129,17 @@ pub extern "C" fn _start() -> ! {
                     }
                 }
             }
+            quark_rt::ipc::TAG_PING => {
+                // Liveness probe: reply immediately, do nothing else. Without
+                // this arm the default drops the message and the caller waits
+                // out its timeout against a perfectly healthy service.
+                let reply = Message {
+                    sender: 0,
+                    tag: quark_rt::ipc::TAG_PING,
+                    data: [0; 6],
+                };
+                let _ = syscall::sys_reply(msg.sender, &reply);
+            }
             _ => {}
         }
     }

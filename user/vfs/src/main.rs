@@ -1507,6 +1507,15 @@ pub extern "C" fn _start() -> ! {
             TAG_WRITE => handle_write(&disk, sender, &msg),
             TAG_CREATE => handle_create(&disk, sender, &msg),
             TAG_READDIR_BULK => handle_readdir_bulk(&disk, sender, &msg),
+            quark_rt::ipc::TAG_PING => {
+                // Liveness probe: reply immediately, touching no disk state.
+                let reply = Message {
+                    sender: 0,
+                    tag: quark_rt::ipc::TAG_PING,
+                    data: [0; 6],
+                };
+                let _ = syscall::sys_reply(sender, &reply);
+            }
             _ => error_reply(sender, 0xFF),
         }
     }
