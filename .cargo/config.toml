@@ -2,4 +2,9 @@
 target = "x86_64-unknown-none"
 
 [target.x86_64-unknown-none]
-rustflags = ["-C", "link-arg=-Tlinker.ld", "-C", "relocation-model=static"]
+# The kernel's linker script is passed by the Makefile, not here. This config
+# is inherited by every crate under the repo, so a script named here was
+# applied twice to user programs — once from this file and once from their own.
+# Harmless while the script only placed sections; once it defined symbols, the
+# second pass created a duplicate empty .tdata and bound them all to that.
+rustflags = ["-C", "relocation-model=static"]

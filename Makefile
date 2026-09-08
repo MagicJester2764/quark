@@ -101,7 +101,7 @@ ifeq ($(HAVE_STD_FORK),)
 endif
 
 $(KERNEL): FORCE
-	cargo build --release
+	cargo rustc --release -- -C link-arg=-Tlinker.ld
 	cp $(BINARY) $(KERNEL)
 
 drivers: $(VGA_DRV_BIN) $(FAT32_DRV_BIN)

@@ -113,6 +113,17 @@ pub fn load(elf: &[u8], scratch: &Scratch) -> Result<Spawned, ()> {
     let cr3 = syscall::sys_addrspace_create()?;
     let tid = syscall::sys_task_create()?;
 
+    // Adjacent segments can share a page: a read-only one ending part way
+    // through it and the next beginning in the same one. Allocating a fresh
+    // frame per page per segment then maps the second over the first, losing
+    // whatever the first had written — the GOT, in the case that found this,
+    // leaving every call through it going to zero.
+    //
+    // Only neighbours can overlap, since segments are laid out in address
+    // order, so remembering the last page of the previous one is enough.
+    let mut prev_page: usize = usize::MAX;
+    let mut prev_frame: usize = 0;
+
     for i in 0..phnum {
         let offset = match phoff.checked_add(i * phentsize) {
             Some(o) => o,
@@ -142,13 +153,21 @@ pub fn load(elf: &[u8], scratch: &Scratch) -> Result<Spawned, ()> {
         for p in 0..pages {
             let page_vaddr = vaddr_page_start + p * PAGE_SIZE;
 
-            let frame = syscall::sys_phys_alloc(1)?;
+            let reused = page_vaddr == prev_page;
+            let frame = if reused {
+                prev_frame
+            } else {
+                syscall::sys_phys_alloc(1)?
+            };
             let temp_page = scratch.elf + p * PAGE_SIZE;
             syscall::sys_map_phys(frame, temp_page, 1)?;
 
             // Zero first: the tail of the last page of a segment is .bss, and
-            // a fresh frame is not guaranteed to be clear.
-            unsafe { core::ptr::write_bytes(temp_page as *mut u8, 0, PAGE_SIZE) };
+            // a fresh frame is not guaranteed to be clear. A reused page
+            // already holds the previous segment's bytes, which must survive.
+            if !reused {
+                unsafe { core::ptr::write_bytes(temp_page as *mut u8, 0, PAGE_SIZE) };
+            }
 
             let page_end = page_vaddr + PAGE_SIZE;
             if file_start < page_end && file_end > page_vaddr {
@@ -171,6 +190,9 @@ pub fn load(elf: &[u8], scratch: &Scratch) -> Result<Spawned, ()> {
 
             let flags: u64 = if writable { 1 } else { 0 };
             syscall::sys_addrspace_map(cr3, page_vaddr, frame, 1, flags)?;
+
+            prev_page = page_vaddr;
+            prev_frame = frame;
         }
     }
 

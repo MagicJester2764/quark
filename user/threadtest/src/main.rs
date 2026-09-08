@@ -1,5 +1,6 @@
 #![no_std]
 #![no_main]
+#![feature(thread_local)]
 
 //! Two tasks in one address space.
 //!
@@ -21,6 +22,16 @@ quark_rt::manifest!([
 static COUNTER: AtomicU32 = AtomicU32::new(0);
 static DONE: AtomicU32 = AtomicU32::new(0);
 
+/// A real thread-local: the compiler resolves this as an offset from FS, so
+/// each thread reads its own copy without anything at the use site saying so.
+#[thread_local]
+static mut COLOUR: u32 = 0xDEAD;
+
+/// Storage for each thread's copy. Static rather than allocated because there
+/// is no allocator here; one region per thread, never shared.
+static mut TLS_MAIN: [u8; 512] = [0; 512];
+static mut TLS_WORKER: [u8; 512] = [0; 512];
+
 /// Reads the FS-relative word the thread set up, which is what a thread-local
 /// compiles down to. Two threads with different FS bases see different values
 /// from the identical instruction.
@@ -35,13 +46,14 @@ static mut MAIN_TLS: u64 = 0;
 static mut WORKER_TLS: u64 = 0;
 
 extern "C" fn arg_worker(arg: usize) -> ! {
-    // FS base of our own, so fs:[0] reads WORKER_TLS rather than MAIN_TLS.
+    // Proper thread-local storage of our own, laid out from the PT_TLS image.
     unsafe {
-        WORKER_TLS = 0xBBBB_BBBB;
-        let _ = syscall::sys_set_fs_base(core::ptr::addr_of!(WORKER_TLS) as usize);
+        let r = core::ptr::addr_of_mut!(TLS_WORKER) as *mut u8;
+        let _ = quark_rt::tls::init_in(r, 512);
+        COLOUR = 0xBBBB;          // writes this thread's copy
+        TLS_SEEN.store(COLOUR, Ordering::SeqCst);
     }
     ARG_SEEN.store(arg as u32, Ordering::SeqCst);
-    TLS_SEEN.store(read_fs_word() as u32, Ordering::SeqCst);
     syscall::sys_exit_code(0);
 }
 
@@ -85,20 +97,24 @@ pub extern "C" fn _start() -> ! {
     // would already have faulted rather than printed.
     println!("threadtest: address space survived the thread");
 
-    // A thread's entry argument, and a per-thread FS base.
+    // A thread's entry argument, and a genuine #[thread_local].
     unsafe {
-        MAIN_TLS = 0xAAAA_AAAA;
-        let _ = syscall::sys_set_fs_base(core::ptr::addr_of!(MAIN_TLS) as usize);
+        let r = core::ptr::addr_of_mut!(TLS_MAIN) as *mut u8;
+        if quark_rt::tls::init_in(r, 512).is_err() {
+            println!("  tls init -> FAILED");
+        }
+        COLOUR = 0xAAAA;
+        println!("  tls template     = {} bytes", quark_rt::tls::template_size());
     }
     match thread::spawn_with_arg(arg_worker, 0x1234_5678, 4) {
         Ok(t) => {
             t.join();
             println!("  entry argument   = 0x{:x} (expected 0x12345678)",
                      ARG_SEEN.load(Ordering::SeqCst));
-            println!("  worker fs:[0]    = 0x{:x} (its own)",
+            println!("  worker COLOUR    = 0x{:x} (its own copy)",
                      TLS_SEEN.load(Ordering::SeqCst));
-            println!("  main   fs:[0]    = 0x{:x} (unchanged by the thread)",
-                     read_fs_word());
+            println!("  main   COLOUR    = 0x{:x} (unchanged by the thread)",
+                     unsafe { COLOUR });
         }
         Err(()) => println!("  spawn_with_arg -> FAILED"),
     }
