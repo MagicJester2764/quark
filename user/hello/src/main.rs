@@ -84,6 +84,56 @@ fn main() {
 
     println!("Heap test passed!");
 
+    // Timed waits. The kernel blocks for these now; it used to have no timed
+    // futex, so std's wait_timeout was polling and yielding until the deadline.
+    {
+        use std::sync::{Arc, Condvar, Mutex};
+        let pair = Arc::new((Mutex::new(false), Condvar::new()));
+
+        // Nobody signals: this must come back as a timeout, near the deadline.
+        let t0 = std::time::Instant::now();
+        let (lock, cv) = &*pair;
+        let guard = lock.lock().unwrap();
+        let (_g, r) = cv
+            .wait_timeout(guard, std::time::Duration::from_millis(300))
+            .unwrap();
+        println!(
+            "condvar timeout: {} after {}ms",
+            r.timed_out(),
+            t0.elapsed().as_millis()
+        );
+    }
+    {
+        use std::sync::{Arc, Condvar, Mutex};
+        let pair = Arc::new((Mutex::new(false), Condvar::new()));
+        let signaller = Arc::clone(&pair);
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            let (lock, cv) = &*signaller;
+            *lock.lock().unwrap() = true;
+            cv.notify_one();
+        });
+
+        // Signalled well inside the deadline: this must return early.
+        let t0 = std::time::Instant::now();
+        let (lock, cv) = &*pair;
+        let mut guard = lock.lock().unwrap();
+        while !*guard {
+            let (g, r) = cv
+                .wait_timeout(guard, std::time::Duration::from_millis(2000))
+                .unwrap();
+            guard = g;
+            if r.timed_out() {
+                break;
+            }
+        }
+        println!(
+            "condvar notify: signalled={} after {}ms",
+            *guard,
+            t0.elapsed().as_millis()
+        );
+    }
+
     // Test sleep
     let t0 = std::time::Instant::now();
     println!("Sleeping 500ms...");

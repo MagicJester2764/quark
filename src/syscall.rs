@@ -126,6 +126,7 @@ pub const SYS_IOPORT_REP: u64 = 115;
 // --- 0x80  synchronisation ---
 pub const SYS_FUTEX_WAIT: u64 = 128;
 pub const SYS_FUTEX_WAKE: u64 = 129;
+pub const SYS_FUTEX_WAIT_TIMEOUT: u64 = 130;
 
 // --- 0x90  time ---
 pub const SYS_TICKS: u64 = 144;
@@ -143,7 +144,7 @@ pub const SYS_ABI_VERSION: u64 = 240;
 /// minor when calls are added. User space can refuse to run against a major it
 /// does not know, which is the point of exposing it at all.
 pub const ABI_VERSION_MAJOR: u64 = 1;
-pub const ABI_VERSION_MINOR: u64 = 1;
+pub const ABI_VERSION_MINOR: u64 = 2;
 
 
 
@@ -1015,6 +1016,10 @@ extern "C" fn syscall_dispatch(
         SYS_FUTEX_WAKE => {
             // arg0 = addr, arg1 = max_wake
             crate::futex::futex_wake(arg0, arg1)
+        }
+        SYS_FUTEX_WAIT_TIMEOUT => {
+            // arg0 = addr, arg1 = expected value, arg2 = timeout in ticks
+            crate::futex::futex_wait_timeout(arg0, arg1 as u32, arg2)
         }
         SYS_MMAP => {
             // arg0 = vaddr, arg1 = pages

@@ -85,6 +85,7 @@ pub const SYS_IOPORT_REP: u64 = 115;
 // --- 0x80  synchronisation ---
 pub const SYS_FUTEX_WAIT: u64 = 128;
 pub const SYS_FUTEX_WAKE: u64 = 129;
+pub const SYS_FUTEX_WAIT_TIMEOUT: u64 = 130;
 
 // --- 0x90  time ---
 pub const SYS_TICKS: u64 = 144;
@@ -491,6 +492,17 @@ pub fn sys_futex_wait(addr: *const u32, expected: u32) -> u64 {
 
 pub fn sys_futex_wake(addr: *const u32, max_wake: usize) -> u64 {
     unsafe { syscall2(SYS_FUTEX_WAKE, addr as u64, max_wake as u64) }
+}
+
+/// Returned by [`sys_futex_wait_timeout`] when the deadline passed.
+pub const FUTEX_TIMED_OUT: u64 = 2;
+
+/// Wait, giving up after `timeout_ticks` (100 Hz, so 10 ms each).
+///
+/// Returns 0 if woken, 1 if the word already differed, [`FUTEX_TIMED_OUT`] if
+/// the deadline passed. A timeout of 0 checks the word without blocking.
+pub fn sys_futex_wait_timeout(addr: *const u32, expected: u32, timeout_ticks: u64) -> u64 {
+    unsafe { syscall3(SYS_FUTEX_WAIT_TIMEOUT, addr as u64, expected as u64, timeout_ticks) }
 }
 
 /// Receive with timeout.

@@ -129,21 +129,18 @@ pub mod futex {
             return true;
         };
 
-        // The kernel futex has no timeout form, so bound the wait here: poll
-        // the word against the PIT tick counter (100 Hz, 10 ms per tick) and
-        // yield in between.
-        let deadline = syscall::sys_ticks() + ticks_for(timeout);
-        loop {
-            if futex.load(Ordering::Relaxed) != expected {
-                return true;
-            }
-            if syscall::sys_ticks() >= deadline {
-                // One last check to close the race between the load above and
-                // the deadline expiring.
-                return futex.load(Ordering::Relaxed) != expected;
-            }
-            syscall::sys_yield();
+        // This used to poll the word against the tick counter and yield, for
+        // want of a timed wait in the kernel — which burned a core for the
+        // length of the wait and could not see a wake before the next poll.
+        let r = syscall::sys_futex_wait_timeout(ptr, expected, ticks_for(timeout));
+        if r != syscall::FUTEX_TIMED_OUT {
+            return true;
         }
+
+        // Timed out. Report a wake anyway if the word moved in the meantime:
+        // std reads `false` as "the deadline passed and nothing happened", and
+        // a change that landed either side of the deadline did happen.
+        futex.load(Ordering::Relaxed) != expected
     }
 
     /// Convert a duration to PIT ticks (100 Hz), rounding up so a sub-tick

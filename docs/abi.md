@@ -1,6 +1,6 @@
 # Quark syscall ABI
 
-**Version 1.0.** Query the running kernel with `SYS_ABI_VERSION` (240), which
+**Version 1.2.** Query the running kernel with `SYS_ABI_VERSION` (240), which
 returns `(major << 16) | minor`.
 
 This document is the contract between the Quark kernel and everything above it.
@@ -78,6 +78,14 @@ threads are the two expected to claim one.
 - **Deprecation is a three-step process**: mark the call deprecated in this
   document with its replacement; keep it working for at least one major
   version; then withdraw it and leave the slot empty.
+
+### What each minor added
+
+| Version | Added |
+|---|---|
+| 1.0 | The ABI as first frozen. |
+| 1.1 | `SYS_ADDRSPACE_SELF` (41), `SYS_SET_FS_BASE` (102), `SYS_TASK_START_ARG` (103) — what a thread needs: the caller's own address space to share, a per-task FS base for thread-local storage, and an argument to hand the new thread. |
+| 1.2 | `SYS_FUTEX_WAIT_TIMEOUT` (130). |
 
 Five calls are **deprecated as of 1.0** — the `CAP_*` object-capability calls
 (80–85) replace them:
@@ -285,16 +293,21 @@ per-IRQ ring buffer, polled in `SYS_RECV`.
 |---|---|---|---|---|
 | 128 | `SYS_FUTEX_WAIT` | arg0 = addr (4-byte aligned), arg1 = expected | 0 = woken, 1 = value already differed, `u64::MAX` = bad address or no wait slot. **Blocks.** | — |
 | 129 | `SYS_FUTEX_WAKE` | arg0 = addr, arg1 = max to wake | number woken | — |
+| 130 | `SYS_FUTEX_WAIT_TIMEOUT` | arg0 = addr, arg1 = expected, arg2 = ticks | 0 = woken, 1 = value already differed, 2 = timed out, `u64::MAX` = bad address or no wait slot. **Blocks.** | — |
 
 Futexes are keyed on **physical** address, so a word in shared memory is one
 futex to every task that maps it, whatever virtual address each uses.
 
-**There is no timed futex wait.** `SYS_FUTEX_WAIT` blocks until woken, full
-stop. `quark-rt` emulates a deadline for `Condvar::wait_timeout` by polling the
-word against `SYS_TICKS` and yielding, which burns CPU for the duration of the
-wait. A `SYS_FUTEX_WAIT_TIMEOUT` in slot 130 is the obvious fix and the reason
-that slot is reserved; it should land before threads do, since that is when
-timed waits start to matter.
+A timeout of 0 ticks makes `SYS_FUTEX_WAIT_TIMEOUT` a check rather than a wait:
+it returns 1 if the value already differs and 2 if it does not, without
+blocking. There is no way to ask for an unbounded wait through this call; that
+is what `SYS_FUTEX_WAIT` is.
+
+A timed wait that expires leaves its wait slot claimed until the woken task
+returns through the kernel and reads why it woke, so a task blocked on a futex
+holds its slot from the moment it waits to the moment it runs again. With
+`MAX_FUTEX_WAITERS` slots in total, a caller that gets `u64::MAX` should treat
+it as a resource limit rather than as a bad argument.
 
 ### Time (0x90)
 
