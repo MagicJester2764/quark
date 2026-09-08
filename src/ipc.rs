@@ -586,6 +586,9 @@ fn call_inner(dest: usize, msg: &Message, timeout_ticks: u64) -> Result<Message,
     }
     let caller = scheduler::current_tid();
 
+    // Set when the receiver was waiting for this and can take over directly.
+    let mut hand_over_to: Option<usize> = None;
+
     let flags = irq_save();
     unsafe {
         let mut to_send = *msg;
@@ -600,8 +603,12 @@ fn call_inner(dest: usize, msg: &Message, timeout_ticks: u64) -> Result<Message,
                 TASK_IPC[caller].pending_msg = None;
                 TASK_IPC[dest].pending_msg = Some(to_send);
                 TASK_IPC[dest].state = IpcState::None;
-                scheduler::unblock_task_next(dest);
+                // Runnable, but deliberately not queued: it is about to be
+                // switched to, and an entry left behind is a turn it has
+                // already had.
+                scheduler::make_ready(dest);
                 scheduler::block_task(caller);
+                hand_over_to = Some(dest);
             }
             _ => {
                 // Slow path: receiver not ready, block as CallSendBlocked.
@@ -619,7 +626,13 @@ fn call_inner(dest: usize, msg: &Message, timeout_ticks: u64) -> Result<Message,
         };
     }
     irq_restore(flags);
-    scheduler::yield_now();
+    match hand_over_to {
+        // Straight across, on what is left of this task's slice.
+        Some(dest) => scheduler::donate_to(dest),
+        // Nobody was waiting; the message is queued and somebody will come
+        // for it. Ordinary scheduling.
+        None => scheduler::yield_now(),
+    }
 
     // Reply arrived
     let flags = irq_save();

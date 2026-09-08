@@ -36,6 +36,21 @@ static mut WAIT_CODE: [i32; MAX_TASKS] = [0; MAX_TASKS];
 /// Per-task "reaped" flag. If true, parent has collected the exit via sys_wait (or has no parent).
 static mut REAPED: [bool; MAX_TASKS] = [false; MAX_TASKS];
 
+/// How long a task may run before it is preempted, in PIT ticks.
+///
+/// The scheduler used to reschedule on every timer interrupt, which is a
+/// quantum of one tick and a context switch a hundred times a second whether
+/// or not anything else wanted the CPU. It also meant a task could never
+/// finish a short burst of work without being interrupted partway through it.
+///
+/// Three ticks is thirty milliseconds. Anything interactive blocks long before
+/// that — a server blocks on its next receive, a client on its next call — so
+/// this only ever bounds work that is genuinely CPU-bound.
+const QUANTUM_TICKS: u32 = 3;
+
+/// Ticks left in each task's slice.
+static mut SLICE_LEFT: [u32; MAX_TASKS] = [0; MAX_TASKS];
+
 /// Initialize the scheduler. Creates the idle task (TID 0) which represents
 /// the current execution context (kernel_main's continuation).
 pub fn init() {
@@ -187,12 +202,21 @@ pub fn exit_with(code: i32) -> ! {
     }
 }
 
-/// Called from the PIT IRQ handler to preempt the current task.
+/// Called from the PIT IRQ handler to charge the running task for the tick,
+/// and to preempt it once its slice is spent.
 pub fn timer_tick() {
     if !INITIALIZED.load(Ordering::SeqCst) {
         return;
     }
-    unsafe { schedule_inner(true) };
+    unsafe {
+        let current = CURRENT_TID.load(Ordering::SeqCst);
+        if SLICE_LEFT[current] > 1 {
+            SLICE_LEFT[current] -= 1;
+            return; // still has time to run
+        }
+        SLICE_LEFT[current] = 0;
+        schedule_inner(true);
+    }
 }
 
 /// Core scheduling logic.
@@ -234,6 +258,20 @@ unsafe fn schedule_inner(from_irq: bool) { unsafe {
         }
     };
 
+    // A slice of its own, since this is the scheduler choosing it rather than
+    // a task handing over what it had left.
+    SLICE_LEFT[next_tid] = QUANTUM_TICKS;
+    switch_to(current_tid, next_tid, flags);
+}}
+
+/// Switch from `current_tid` to `next_tid`.
+///
+/// Interrupts are already off; `flags` is what they were. Whoever calls this
+/// has already decided who runs next and how long they get.
+///
+/// # Safety
+/// Interrupts must be disabled and both tasks must exist.
+unsafe fn switch_to(current_tid: usize, next_tid: usize, flags: u64) { unsafe {
     if next_tid == current_tid {
         // Same task, just mark running again
         if let Some(ref mut task) = TASKS[current_tid] {
@@ -283,6 +321,60 @@ unsafe fn schedule_inner(from_irq: bool) { unsafe {
     // Perform the context switch (restores RFLAGS from new context)
     context::context_switch(old_ctx, new_ctx);
 }}
+
+/// Make a blocked task runnable without putting it in the ready queue.
+///
+/// For the task that is about to be switched to directly. Queueing it as well
+/// would leave an entry behind for a task that is already running.
+pub fn make_ready(tid: usize) {
+    if tid >= MAX_TASKS {
+        return;
+    }
+    unsafe {
+        if let Some(ref mut task) = TASKS[tid] {
+            if task.state == TaskState::Blocked {
+                task.state = TaskState::Ready;
+            }
+        }
+    }
+}
+
+/// Give the rest of this task's slice to `tid` and switch to it now.
+///
+/// The caller has already blocked itself on `tid` — it is waiting for a reply
+/// and has nothing to contribute until it arrives, so a synchronous call is
+/// one line of control moving between address spaces rather than two tasks
+/// taking turns. Running the callee on the caller's own slice is what makes
+/// that true of the accounting as well: a server does not earn a fresh
+/// quantum every time somebody calls it, which for a chain of servers polled
+/// a hundred times a second is most of a CPU handed out for free.
+///
+/// Falls back to ordinary scheduling if the target cannot take over.
+pub fn donate_to(tid: usize) {
+    if !INITIALIZED.load(Ordering::SeqCst) {
+        return;
+    }
+    unsafe {
+        let flags: u64;
+        core::arch::asm!("pushfq; pop {}; cli", out(reg) flags, options(nostack));
+        let current_tid = CURRENT_TID.load(Ordering::SeqCst);
+
+        let takeable = tid < MAX_TASKS
+            && tid != current_tid
+            && TASKS[tid].as_ref().map(|t| t.state == TaskState::Ready).unwrap_or(false);
+        if !takeable {
+            restore_flags(flags);
+            yield_now();
+            return;
+        }
+
+        // At least one tick, so a caller whose slice was already spent still
+        // makes progress rather than handing over a turn that ends at once.
+        SLICE_LEFT[tid] = SLICE_LEFT[current_tid].max(1);
+        SLICE_LEFT[current_tid] = 0;
+        switch_to(current_tid, tid, flags);
+    }
+}
 
 /// Dequeue the next ready task from the ready queue.
 unsafe fn dequeue_ready() -> Option<usize> { unsafe {
