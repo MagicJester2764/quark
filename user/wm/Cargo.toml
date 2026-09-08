@@ -1,0 +1,13 @@
+[package]
+name = "wm"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+quark-rt = { path = "../quark-rt" }
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"

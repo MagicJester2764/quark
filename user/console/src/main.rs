@@ -2,8 +2,6 @@
 #![no_main]
 #![allow(static_mut_refs)]
 
-mod font8x16;
-
 use quark_rt::ipc::{Message, TID_ANY};
 use quark_rt::nameserver;
 use quark_rt::{println, syscall};
@@ -27,6 +25,25 @@ static mut R_POS: u8 = 16;
 static mut G_POS: u8 = 8;
 static mut B_POS: u8 = 0;
 static mut INITIALIZED: bool = false;
+
+/// The display server, and the window it gave us. 0 means we are drawing
+/// straight at the framebuffer, which happens only when there is no display
+/// server to ask.
+static mut WM_TID: usize = 0;
+static mut WINDOW_ID: usize = 0;
+
+/// Where the window's pixels are mapped.
+const WINDOW_VADDR: usize = 0x83_0000_0000;
+/// Space left around the window so the display server's frame has somewhere
+/// to go and a second window is visible behind it.
+const WINDOW_MARGIN: usize = 24;
+/// Room for the title bar the display server draws above the contents.
+const TITLE_ALLOWANCE: usize = 32;
+
+const TAG_WM_CREATE: u64 = 1;
+const TAG_WM_COMMIT: u64 = 2;
+const TAG_WM_SCREEN: u64 = 5;
+const TAG_WM_ERROR: u64 = u64::MAX;
 
 // ANSI escape sequence state machine
 static mut ESC_STATE: u8 = 0;       // 0=normal, 1=got ESC, 2=got CSI
@@ -62,25 +79,32 @@ unsafe fn mark_dirty(row: usize) {
 #[unsafe(no_mangle)]
 #[link_section = ".text.entry"]
 pub extern "C" fn _start() -> ! {
-    println!("[console] Started, waiting for FB init.");
+    println!("[console] Started.");
 
-    // Wait for framebuffer init message from init
-    let mut msg = Message::empty();
-    if syscall::sys_recv(TID_ANY, &mut msg).is_err() {
-        println!("[console] Failed to receive FB init.");
-        syscall::sys_exit();
+    // A display server, if there is one. Then this is a window like any other
+    // program's; without one, the framebuffer arrives from init instead and
+    // this draws on it directly, as it always did.
+    if let Some(wm) = nameserver::lookup_retry(b"wm", 20) {
+        if !init_window(wm) {
+            println!("[console] Falling back to the framebuffer.");
+        }
     }
 
-    if msg.tag != TAG_FB_INIT {
-        println!("[console] Unexpected first message.");
-        syscall::sys_exit();
+    if !unsafe { INITIALIZED } {
+        let mut msg = Message::empty();
+        if syscall::sys_recv(TID_ANY, &mut msg).is_err() {
+            println!("[console] Failed to receive FB init.");
+            syscall::sys_exit();
+        }
+        if msg.tag != TAG_FB_INIT {
+            println!("[console] Unexpected first message.");
+            syscall::sys_exit();
+        }
+        init_framebuffer(&msg);
+        // Reply to init so it knows we're ready
+        let reply = Message { sender: 0, tag: 0, data: [0; 6] };
+        let _ = syscall::sys_reply(msg.sender, &reply);
     }
-
-    init_framebuffer(&msg);
-
-    // Reply to init so it knows we're ready
-    let reply = Message { sender: 0, tag: 0, data: [0; 6] };
-    let _ = syscall::sys_reply(msg.sender, &reply);
 
     // Register with nameserver
     if nameserver::register(b"console").is_ok() {
@@ -121,6 +145,100 @@ pub extern "C" fn _start() -> ! {
     }
 
     syscall::sys_exit();
+}
+
+/// Ask the display server for a window, and draw into that.
+///
+/// The console used to map the framebuffer itself, which is why nothing else
+/// could be on the screen: it held the only copy. Now it is a client like any
+/// other — the drawing code is unchanged, because all it ever needed was
+/// somewhere to put pixels and a stride to step by.
+fn init_window(wm: usize) -> bool {
+    // How big is the screen? A terminal wants most of it, with room for the
+    // frame the display server draws around it.
+    let mut reply = Message::empty();
+    let ask = Message { sender: 0, tag: TAG_WM_SCREEN, data: [0; 6] };
+    if syscall::sys_call(wm, &ask, &mut reply).is_err() || reply.tag == TAG_WM_ERROR {
+        println!("[console] display server would not say how big the screen is");
+        return false;
+    }
+    let sw = (reply.data[0] >> 32) as usize;
+    let sh = (reply.data[0] & 0xFFFF_FFFF) as usize;
+    // A window buffer is copied to the screen verbatim, so it has to be in the
+    // screen's pixel format. Without this the text was drawn with a colour of
+    // zero: black glyphs on a black window.
+    unsafe {
+        R_POS = ((reply.data[1] >> 16) & 0xFF) as u8;
+        G_POS = ((reply.data[1] >> 8) & 0xFF) as u8;
+        B_POS = (reply.data[1] & 0xFF) as u8;
+    }
+
+    let w = sw.saturating_sub(WINDOW_MARGIN * 2);
+    let h = sh.saturating_sub(WINDOW_MARGIN * 2 + TITLE_ALLOWANCE);
+    if w == 0 || h == 0 {
+        return false;
+    }
+
+    let mut data = [0u64; 6];
+    data[0] = ((w as u64) << 32) | (h as u64);
+    let title = b"Terminal";
+    for (i, chunk) in title.chunks(8).enumerate() {
+        let mut word = [0u8; 8];
+        word[..chunk.len()].copy_from_slice(chunk);
+        data[1 + i] = u64::from_le_bytes(word);
+    }
+    let create = Message { sender: 0, tag: TAG_WM_CREATE, data };
+    if syscall::sys_call(wm, &create, &mut reply).is_err() || reply.tag == TAG_WM_ERROR {
+        println!("[console] display server would not give us a window");
+        return false;
+    }
+
+    let id = reply.data[0] as usize;
+    let shmem = reply.data[1] as usize;
+    let stride = (reply.data[2] >> 32) as usize;
+    let bpp = (reply.data[2] & 0xFF) as usize;
+
+    if syscall::sys_shmem_map(shmem, WINDOW_VADDR).is_err() {
+        println!("[console] could not map the window");
+        return false;
+    }
+
+    unsafe {
+        // The same globals as before; they simply point at a window now.
+        FB = WINDOW_VADDR;
+        PITCH = stride;
+        WIDTH = w;
+        HEIGHT = h;
+        BPP = bpp;
+        COLS = w / GLYPH_W;
+        ROWS = h / GLYPH_H;
+        if COLS > MAX_CELL_COLS { COLS = MAX_CELL_COLS; }
+        if ROWS > MAX_CELL_ROWS { ROWS = MAX_CELL_ROWS; }
+        COL = 0;
+        ROW = 0;
+        WM_TID = wm;
+        WINDOW_ID = id;
+        INITIALIZED = true;
+        FG_COLOR = encode_color(0xCC, 0xCC, 0xCC);
+        core::ptr::write_bytes(FB as *mut u8, 0, stride * h);
+    }
+    present();
+    true
+}
+
+/// Tell the display server the window has changed.
+fn present() {
+    let wm = unsafe { WM_TID };
+    if wm == 0 {
+        return;
+    }
+    let msg = Message {
+        sender: 0,
+        tag: TAG_WM_COMMIT,
+        data: [unsafe { WINDOW_ID } as u64, 0, 0, 0, 0, 0],
+    };
+    let mut reply = Message::empty();
+    let _ = syscall::sys_call(wm, &msg, &mut reply);
 }
 
 fn init_framebuffer(msg: &Message) {
@@ -238,7 +356,7 @@ fn putc(c: u8) {
 }
 
 fn draw_glyph(col: usize, row: usize, ch: u8, fg: u32) {
-    let glyph = &font8x16::FONT[ch as usize];
+    let glyph = &quark_rt::font::FONT[ch as usize];
 
     let pixel_x = col * GLYPH_W;
     let pixel_y = row * GLYPH_H;
@@ -407,11 +525,22 @@ fn flush_dirty() {
         DIRTY_MIN = usize::MAX;
         DIRTY_MAX = 0;
     }
+    // Nothing appears until the display server is told to look. Here rather
+    // than per glyph: a commit is a round trip, and this is already the point
+    // at which a batch of drawing is finished.
+    present();
 }
 
 /// Draw cursor block at current position.
 unsafe fn draw_cursor() {
     if !INITIALIZED { return; }
+    draw_cursor_cell();
+    // The blink is the only thing that changes the screen without anything
+    // being written, so it has to ask for a redraw itself.
+    present();
+}
+
+unsafe fn draw_cursor_cell() {
     if CURSOR_VISIBLE {
         // Draw a solid block at (COL, ROW) using FG_COLOR
         draw_cursor_block(FG_COLOR);

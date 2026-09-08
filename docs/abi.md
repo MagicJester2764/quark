@@ -201,11 +201,16 @@ Physical addresses are page aligned; a request that is not is rejected.
 
 | # | Name | Arguments | Returns | Cap |
 |---|---|---|---|---|
-| 48 | `SYS_SHMEM_CREATE` | arg0 = pages | handle / `u64::MAX` | — (charged to creator's quota) |
+| 48 | `SYS_SHMEM_CREATE` | arg0 = pages (1–1024) | handle / `u64::MAX` | — (charged to creator's quota) |
 | 49 | `SYS_SHMEM_MAP` | arg0 = handle, arg1 = vaddr | 0 / `u64::MAX` | must have been granted |
 | 50 | `SYS_SHMEM_UNMAP` | arg0 = handle, arg1 = vaddr | 0 / `u64::MAX` | — |
 | 51 | `SYS_SHMEM_GRANT` | arg0 = handle, arg1 = target tid | 0 / `u64::MAX` | must be the creator |
 | 52 | `SYS_SHMEM_DESTROY` | arg0 = handle | 0 / `u64::MAX` | must be the creator |
+
+A region is one contiguous run of physical frames, which is what makes a
+window-sized one possible: 1024 pages is four megabytes, the same ceiling
+`SYS_PHYS_ALLOC` has. It was sixteen pages until the display server needed to
+share a screenful with a client.
 
 Destruction is deferred while any mapping remains. Futexes are keyed on physical
 address, so a futex word inside a shared region is one object to every task that

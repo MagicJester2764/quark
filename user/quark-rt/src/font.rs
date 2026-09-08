@@ -1,3 +1,9 @@
+//! An 8x16 bitmap font.
+//!
+//! Shared because more than one thing draws text on a framebuffer now: the
+//! console renders a terminal, and the display server renders window titles.
+//! One copy of the glyphs, one place to change them.
+
 /// Classic VGA 8x16 bitmap font (CP437).
 /// Each character is 16 bytes — one byte per row, MSB-left.
 /// 256 glyphs × 16 bytes = 4096 bytes total.

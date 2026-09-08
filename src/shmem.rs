@@ -14,14 +14,24 @@ use crate::{paging, pmm, scheduler};
 use crate::task::MAX_TASKS;
 
 const MAX_SHMEM: usize = 32;
-const MAX_PAGES_PER_REGION: usize = 16;
+/// Pages one region may hold.
+///
+/// Sixteen once, which was fine for passing a buffer between two services and
+/// useless for the thing shared memory is most obviously for: a window. A
+/// 1280x800 window is four megabytes, so this matches what `SYS_PHYS_ALLOC`
+/// already allows a task to take in one go.
+const MAX_PAGES_PER_REGION: usize = 1024;
 
 /// `access`/`mapped` are TID bitmasks, one bit per task.
 const _: () = assert!(MAX_TASKS <= u64::BITS as usize);
 
 struct ShmemRegion {
     in_use: bool,
-    pages: [usize; MAX_PAGES_PER_REGION], // physical addresses
+    /// Physical address of the first frame. A region is one contiguous run
+    /// rather than a list of frames: an array of a thousand addresses per
+    /// region is eight kilobytes of kernel memory each, and the contiguous
+    /// allocator was already there.
+    base: usize,
     page_count: usize,
     creator: usize,
     /// Bitmask of TIDs with access (bit N = TID N can map).
@@ -37,7 +47,7 @@ impl ShmemRegion {
     const fn empty() -> Self {
         ShmemRegion {
             in_use: false,
-            pages: [0; MAX_PAGES_PER_REGION],
+            base: 0,
             page_count: 0,
             creator: 0,
             access: 0,
@@ -79,9 +89,9 @@ unsafe fn regions() -> &'static mut [ShmemRegion; MAX_SHMEM] { unsafe {
 /// Release a region's frames and reset the slot. Interrupts must be off.
 unsafe fn release(region: &mut ShmemRegion) {
     let mut freed = 0;
-    for j in 0..region.page_count {
-        if region.pages[j] != 0 {
-            pmm::free(pmm::PhysFrame::from_address(region.pages[j]));
+    if region.base != 0 {
+        for j in 0..region.page_count {
+            pmm::free(pmm::PhysFrame::from_address(region.base + j * 4096));
             freed += 1;
         }
     }
@@ -129,26 +139,22 @@ pub fn create(pages: usize) -> u64 {
     }
     irq_restore(flags);
 
-    // Allocate backing frames. On failure, roll the whole region back.
-    for i in 0..pages {
-        match pmm::alloc() {
-            Some(frame) => {
-                let phys = frame.address();
-                // Zero the frame (identity-mapped) so it cannot leak whatever
-                // the previous owner left behind.
-                unsafe { core::ptr::write_bytes(phys as *mut u8, 0, 4096) };
-                let flags = irq_save();
-                unsafe { regions()[handle].pages[i] = phys };
-                irq_restore(flags);
-            }
-            None => {
-                let flags = irq_save();
-                unsafe { release(&mut regions()[handle]) };
-                irq_restore(flags);
-                return u64::MAX;
-            }
+    // One contiguous run for the whole region. On failure, roll it back.
+    let base = match pmm::alloc_contiguous(pages) {
+        Some(frame) => frame.address(),
+        None => {
+            let flags = irq_save();
+            unsafe { release(&mut regions()[handle]) };
+            irq_restore(flags);
+            return u64::MAX;
         }
-    }
+    };
+    // Zero it (identity-mapped) so it cannot leak whatever the previous owner
+    // left behind.
+    unsafe { core::ptr::write_bytes(base as *mut u8, 0, pages * 4096) };
+    let flags = irq_save();
+    unsafe { regions()[handle].base = base };
+    irq_restore(flags);
 
     scheduler::current_task_charge_mem(pages);
     handle as u64
@@ -192,7 +198,7 @@ pub fn map(handle: usize, vaddr: usize) -> u64 {
         let pte_flags = paging::PRESENT | paging::WRITABLE | paging::USER;
         for i in 0..page_count {
             let v = vaddr + i * 4096;
-            if paging::map_page(cr3, v, region.pages[i], pte_flags).is_err() {
+            if paging::map_page(cr3, v, region.base + i * 4096, pte_flags).is_err() {
                 for j in 0..i {
                     let _ = paging::unmap_page(cr3, vaddr + j * 4096);
                 }

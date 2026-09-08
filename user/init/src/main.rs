@@ -498,7 +498,47 @@ fn load_essentials_from_boot_image(rootfs_phys: usize, rootfs_size: usize) -> Bo
         }
     }
 
-    // Pass 2: spawn CONSOLE.ELF (needs framebuffer info from boot info)
+    // Whether a display server took the framebuffer. The console asks it for
+    // a window when there is one, and is handed the framebuffer when there is
+    // not — and must not be sent both, since it only ever waits for the one it
+    // is going to get.
+    let mut have_wm = false;
+
+    // Pass 1b: spawn WM.ELF, the display server.
+    //
+    // Before the console, because the console asks it for a window: the
+    // framebuffer belongs to one program, and making that the display server
+    // is what lets there be more than one thing on the screen. The console
+    // falls back to the framebuffer if this is missing, so an image without a
+    // display server still boots to a terminal.
+    for i in 0..count {
+        let e = &entries[i];
+        if &e.name[0..8] == b"WM      " && &e.name[8..11] == b"ELF" {
+            if let Ok(data) = read_file_to_buffer(rootfs, &bpb, e.first_cluster, e.file_size) {
+                match spawn::load(data, &SPAWN_SCRATCH) {
+                    Ok(info) => {
+                        // The framebuffer, and nothing else. Its address comes
+                        // from whatever mode the bootloader set, so this is the
+                        // one grant a manifest cannot express.
+                        let (fb_base, fb_end) = framebuffer_range();
+                        mint_and_grant(info.tid, 0, syscall::CAP_TYPE_PHYS_RANGE, fb_base, fb_end);
+                        grant_caps_from_manifest(data, info.tid);
+                        add_service(info.tid);
+                        grant_endpoints(info.tid, syscall::SLOT_ENDPOINT);
+                        let _ = spawn::set_args(&info, &[b"wm"], &SPAWN_SCRATCH);
+                        let _ = info.start();
+                        send_fb_info(info.tid);
+                        have_wm = true;
+                        println!("[init] Spawned wm (TID {})", info.tid);
+                    }
+                    Err(()) => println!("[init] FAILED to spawn wm"),
+                }
+            }
+            break;
+        }
+    }
+
+    // Pass 2: spawn CONSOLE.ELF
     let mut console_pipe: usize = 0;
     for i in 0..count {
         let e = &entries[i];
@@ -506,15 +546,12 @@ fn load_essentials_from_boot_image(rootfs_phys: usize, rootfs_size: usize) -> Bo
             if let Ok(data) = read_file_to_buffer(rootfs, &bpb, e.first_cluster, e.file_size) {
                 match spawn::load(data, &SPAWN_SCRATCH) {
                     Ok(info) => {
-                        // Console maps the framebuffer and nothing else, so
-                        // grant precisely that. CAP_MAP_PHYS is deliberately
-                        // withheld: sys_grant_cap runs populate_from_bitmask,
-                        // which mints a second, full-range PhysRange that would
-                        // make this one moot.
-                        // The framebuffer is the one grant a manifest cannot
-                        // express: its address comes from the bootloader at
-                        // runtime, not from anything knowable when the console
-                        // was built. Everything else console needs, it asks for.
+                        // The framebuffer still, but only so the console can
+                        // fall back to drawing on it when there is no display
+                        // server to give it a window. With one, it never maps
+                        // this and the grant goes unused — which is the right
+                        // shape to leave it in: it is the display server that
+                        // owns the screen now.
                         let (fb_base, fb_end) = framebuffer_range();
                         mint_and_grant(info.tid, 0, syscall::CAP_TYPE_PHYS_RANGE, fb_base, fb_end);
                         grant_caps_from_manifest(data, info.tid);
@@ -531,7 +568,13 @@ fn load_essentials_from_boot_image(rootfs_phys: usize, rootfs_size: usize) -> Bo
                             let _ = syscall::sys_pipe_fd_set(my_tid, 2, pipe, true);
                         }
                         let _ = info.start();
-                        send_fb_info(info.tid);
+                        // Only when the console is going to draw on the
+                        // framebuffer itself. With a display server it never
+                        // waits for this message, and sending it would block
+                        // init here for good.
+                        if !have_wm {
+                            send_fb_info(info.tid);
+                        }
                         println!("[init] Spawned console (TID {})", info.tid);
                     }
                     Err(()) => println!("[init] FAILED to spawn console"),

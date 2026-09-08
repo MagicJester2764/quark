@@ -5,6 +5,7 @@ extern crate alloc;
 
 pub mod args;
 pub mod console;
+pub mod font;
 pub mod ipc;
 pub mod manifest;
 pub mod signal;

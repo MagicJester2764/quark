@@ -37,7 +37,11 @@ KBD_DIR := user/keyboard
 KBD_ELF := $(KBD_DIR)/target/$(TARGET)/release/keyboard
 
 CON_DIR := user/console
+WM_DIR := user/wm
+WMDEMO_DIR := user/wmdemo
 CON_ELF := $(CON_DIR)/target/$(TARGET)/release/console
+WM_ELF := $(WM_DIR)/target/$(TARGET)/release/wm
+WMDEMO_ELF := $(WMDEMO_DIR)/target/$(TARGET)/release/wmdemo
 
 INP_DIR := user/input
 INP_ELF := $(INP_DIR)/target/$(TARGET)/release/input
@@ -119,7 +123,7 @@ $(FAT32_DRV_BIN): FORCE
 	cd $(FAT32_DRV_DIR) && cargo build --release
 	objcopy -O binary $(FAT32_DRV_ELF) $(FAT32_DRV_BIN)
 
-user: $(INIT_ELF) $(HOSTED_ELFS) $(NS_ELF) $(KBD_ELF) $(CON_ELF) $(INP_ELF) $(DISK_ELF) $(DISKTEST_ELF) $(VFS_ELF) $(NET_ELF) $(SHELL_ELF) $(ECHO_ELF) $(LS_ELF) $(CAT_ELF) $(LOGIN_ELF) $(PS_ELF) $(IPCPING_ELF) $(PING_ELF) $(SHUTDOWN_ELF) $(CAPDEMO_ELF) $(THREADTEST_ELF) $(SOCKTEST_ELF) $(FSTEST_ELF) $(CWC_ELF)
+user: $(INIT_ELF) $(HOSTED_ELFS) $(NS_ELF) $(KBD_ELF) $(CON_ELF) $(WM_ELF) $(INP_ELF) $(DISK_ELF) $(DISKTEST_ELF) $(VFS_ELF) $(NET_ELF) $(SHELL_ELF) $(ECHO_ELF) $(LS_ELF) $(CAT_ELF) $(LOGIN_ELF) $(PS_ELF) $(IPCPING_ELF) $(PING_ELF) $(SHUTDOWN_ELF) $(CAPDEMO_ELF) $(THREADTEST_ELF) $(SOCKTEST_ELF) $(FSTEST_ELF) $(WMDEMO_ELF) $(CWC_ELF)
 
 $(INIT_ELF): FORCE
 	cd $(INIT_DIR) && cargo build --release
@@ -169,6 +173,12 @@ $(KBD_ELF): FORCE
 
 $(CON_ELF): FORCE
 	cd $(CON_DIR) && cargo build --release
+
+$(WM_ELF): FORCE
+	cd $(WM_DIR) && cargo build --release
+
+$(WMDEMO_ELF): FORCE
+	cd $(WMDEMO_DIR) && cargo build --release
 
 $(INP_ELF): FORCE
 	cd $(INP_DIR) && cargo build --release
@@ -267,10 +277,10 @@ run-uefi: iso
 DESTDIR ?= dist
 
 BOOT_SERVICES := nameserver:NAMESRVR keyboard:KEYBOARD console:CONSOLE \
-                 input:INPUT disk:DISK vfs:VFS net:NET
+                 input:INPUT disk:DISK vfs:VFS net:NET wm:WM
 USR_PROGRAMS  := disktest:DISKTEST shell:SHELL echo:ECHO ls:LS cat:CAT \
                  login:LOGIN ps:PS ipcping:IPCPING ping:PING \
-                 shutdown:SHUTDOWN capdemo:CAPDEMO threadtest:THREADTEST socktest:SOCKTEST fstest:FSTEST
+                 shutdown:SHUTDOWN capdemo:CAPDEMO threadtest:THREADTEST socktest:SOCKTEST fstest:FSTEST wmdemo:WMDEMO
 
 # Programs written in C, built against user/libc.
 C_PROGRAMS    := cwc:CWC
