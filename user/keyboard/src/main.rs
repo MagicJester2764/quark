@@ -2,6 +2,7 @@
 #![no_main]
 
 use quark_rt::ipc::{Message, TID_ANY};
+use quark_rt::nameserver;
 use quark_rt::{println, syscall};
 
 // PS/2 controller data and status ports, and the keyboard interrupt line.
@@ -9,12 +10,6 @@ quark_rt::manifest!([
     quark_rt::manifest::CapReq::ioport(0x60, 0x64),
     quark_rt::manifest::CapReq::irq(1),
 ]);
-
-// Nameserver well-known TID (init spawns nameserver first to guarantee this)
-const NAMESERVER_TID: usize = 2;
-
-// Nameserver protocol tags
-const TAG_NS_REGISTER: u64 = 1;
 
 // Keyboard IPC tags
 const TAG_GET_KEY: u64 = 1;
@@ -132,7 +127,11 @@ pub extern "C" fn _start() -> ! {
     }
 
     // Register with nameserver as "keyboard"
-    register_with_nameserver();
+    if nameserver::register(b"keyboard").is_ok() {
+        println!("[keyboard] Registered with nameserver.");
+    } else {
+        println!("[keyboard] Failed to register with nameserver.");
+    }
 
     let mut keybuf = KeyBuffer::new();
     let mut modifiers: u8 = 0;
@@ -286,29 +285,6 @@ fn make_key_reply(ev: &KeyEvent) -> Message {
             0,
             0,
         ],
-    }
-}
-
-fn register_with_nameserver() {
-    // Encode "keyboard" as 3 x u64 (zero-padded)
-    let name = b"keyboard";
-    let mut buf = [0u8; 24];
-    buf[..name.len()].copy_from_slice(name);
-    let w0 = u64::from_le_bytes([buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7]]);
-    let w1 = u64::from_le_bytes([buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15]]);
-    let w2 = u64::from_le_bytes([buf[16], buf[17], buf[18], buf[19], buf[20], buf[21], buf[22], buf[23]]);
-
-    let msg = Message {
-        sender: 0,
-        tag: TAG_NS_REGISTER,
-        data: [w0, w1, w2, 0, 0, 0],
-    };
-
-    let mut reply = Message::empty();
-    if syscall::sys_call(NAMESERVER_TID, &msg, &mut reply).is_ok() {
-        println!("[keyboard] Registered with nameserver.");
-    } else {
-        println!("[keyboard] Failed to register with nameserver.");
     }
 }
 

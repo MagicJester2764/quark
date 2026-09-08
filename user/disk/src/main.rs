@@ -3,6 +3,7 @@
 #![allow(dead_code)]
 
 use quark_rt::ipc::{Message, TID_ANY};
+use quark_rt::nameserver;
 use quark_rt::{println, syscall};
 
 use quark_rt::manifest::CapReq;
@@ -16,11 +17,6 @@ quark_rt::manifest!([
     CapReq::irq(14),
     CapReq::phys_range(0, 0x1_0000_0000),
 ]);
-
-const NAMESERVER_TID: usize = 2;
-
-// Nameserver protocol
-const TAG_NS_REGISTER: u64 = 1;
 
 // Disk IPC tags
 const TAG_READ_SECTOR: u64 = 1;
@@ -282,28 +278,6 @@ fn ata_write_sector(lba: u32, buf: *const u8) -> bool {
     true
 }
 
-fn register_with_nameserver() {
-    let name = b"disk";
-    let mut buf = [0u8; 24];
-    buf[..name.len()].copy_from_slice(name);
-    let w0 = u64::from_le_bytes([buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7]]);
-    let w1 = u64::from_le_bytes([buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15]]);
-    let w2 = u64::from_le_bytes([buf[16], buf[17], buf[18], buf[19], buf[20], buf[21], buf[22], buf[23]]);
-
-    let msg = Message {
-        sender: 0,
-        tag: TAG_NS_REGISTER,
-        data: [w0, w1, w2, 0, 0, 0],
-    };
-
-    let mut reply = Message::empty();
-    if syscall::sys_call(NAMESERVER_TID, &msg, &mut reply).is_ok() {
-        println!("[disk] Registered with nameserver.");
-    } else {
-        println!("[disk] Failed to register with nameserver.");
-    }
-}
-
 #[unsafe(no_mangle)]
 #[link_section = ".text.entry"]
 pub extern "C" fn _start() -> ! {
@@ -316,7 +290,11 @@ pub extern "C" fn _start() -> ! {
     }
 
     // Register with nameserver
-    register_with_nameserver();
+    if nameserver::register(b"disk").is_ok() {
+        println!("[disk] Registered with nameserver.");
+    } else {
+        println!("[disk] Failed to register with nameserver.");
+    }
 
     // Service loop
     loop {

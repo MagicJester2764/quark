@@ -14,7 +14,9 @@ pub mod tls;
 pub mod stdio;
 pub mod sync;
 pub mod syscall;
+pub mod nameserver;
 pub mod net;
+pub mod socket;
 pub mod passwd;
 pub mod vfs;
 

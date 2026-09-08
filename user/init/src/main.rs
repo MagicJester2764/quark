@@ -2,6 +2,7 @@
 #![no_main]
 
 use quark_rt::ipc::Message;
+use quark_rt::nameserver;
 use quark_rt::spawn::{self, Scratch, Spawned};
 use quark_rt::{println, syscall, vfs};
 
@@ -10,7 +11,6 @@ const BOOT_INFO_ADDR: usize = 0x80_4000_0000;
 const FILE_BUF_BASE: usize = 0x82_0000_0000;
 const BOOT_IMG_BASE: usize = 0x85_0000_0000;
 const NAMESERVER_TID: usize = 2;
-const TAG_NS_LOOKUP: u64 = 2;
 
 // ---------------------------------------------------------------------------
 // Boot info structures (matches kernel's BootInfo)
@@ -42,9 +42,6 @@ struct BootModuleDesc {
 // ---------------------------------------------------------------------------
 // ELF64 structures
 // ---------------------------------------------------------------------------
-
-
-
 
 // ---------------------------------------------------------------------------
 // Minimal FAT32 reader (read-only, root directory only)
@@ -217,8 +214,6 @@ fn read_file_to_buffer<'a>(
 // ELF spawning (takes pre-mapped byte slice)
 // ---------------------------------------------------------------------------
 
-
-
 /// Load an ELF into a new task but do NOT start it.
 /// Call info.start() after wiring fds / granting caps.
 
@@ -304,8 +299,6 @@ fn name_matches_entry(entry: &vfs::DirEntry, base: &[u8], ext: &[u8]) -> bool {
     }
     false
 }
-
-
 
 fn fat_name_to_buf(name: &[u8; 11], buf: &mut [u8; 16]) -> usize {
     let base_len = name[0..8]
@@ -409,42 +402,6 @@ fn grant_caps_from_manifest(image: &[u8], tid: usize) {
 /// Slot in init's own CSpace used to hold a capability while handing it over.
 /// Below SLOT_ENDPOINT_EXTRA (13) so it cannot tread on the endpoint sets.
 const MANIFEST_SCRATCH_SLOT: usize = 12;
-
-/// Look up a named service via the nameserver.
-fn lookup_service(name: &[u8]) -> Option<usize> {
-    let mut buf = [0u8; 24];
-    let len = name.len().min(24);
-    buf[..len].copy_from_slice(&name[..len]);
-    let w0 = u64::from_le_bytes(buf[0..8].try_into().unwrap());
-    let w1 = u64::from_le_bytes(buf[8..16].try_into().unwrap());
-    let w2 = u64::from_le_bytes(buf[16..24].try_into().unwrap());
-
-    let msg = Message {
-        sender: 0,
-        tag: TAG_NS_LOOKUP,
-        data: [w0, w1, w2, 0, 0, 0],
-    };
-
-    let mut reply = Message::empty();
-    if syscall::sys_call(NAMESERVER_TID, &msg, &mut reply).is_ok() && reply.tag != u64::MAX {
-        Some(reply.tag as usize)
-    } else {
-        None
-    }
-}
-
-/// Look up a service, retrying with yields between attempts.
-fn lookup_service_with_retry(name: &[u8], max_attempts: usize) -> Option<usize> {
-    for _ in 0..max_attempts {
-        if let Some(tid) = lookup_service(name) {
-            return Some(tid);
-        }
-        for _ in 0..100 {
-            syscall::sys_yield();
-        }
-    }
-    None
-}
 
 // (Disk-based FAT32 reader removed — init now uses VFS for disk files)
 
@@ -885,7 +842,7 @@ pub extern "C" fn _start() -> ! {
             let vfs_tid = if let Some(vfs) = ctx.vfs_spawn {
                 println!("[init] Starting VFS (TID {})", vfs.tid);
                 let _ = vfs.start();
-                match lookup_service_with_retry(b"vfs", 50) {
+                match nameserver::lookup_retry(b"vfs", 50) {
                     Some(tid) => {
                         println!("[init] VFS ready.");
                         Some(tid)

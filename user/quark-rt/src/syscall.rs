@@ -90,6 +90,10 @@ pub const SYS_FUTEX_WAIT_TIMEOUT: u64 = 130;
 // --- 0x90  time ---
 pub const SYS_TICKS: u64 = 144;
 
+// --- 0xB0  sockets ---
+pub const SYS_SOCK_FD: u64 = 176;
+pub const SYS_SOCK_INFO: u64 = 177;
+
 // --- 0xA0  kernel debug console ---
 pub const SYS_WRITE: u64 = 160;
 pub const SYS_CONSOLE_POS: u64 = 161;
@@ -484,6 +488,25 @@ pub const WOULD_BLOCK: u64 = 0xFFFF_FFFE;
 pub fn sys_fd_set(tid: usize, fd: usize, service_tid: usize, tag: u64) -> Result<(), ()> {
     let ret = unsafe { syscall4(SYS_FD_SET, tid as u64, fd as u64, service_tid as u64, tag) };
     if ret == u64::MAX { Err(()) } else { Ok(()) }
+}
+
+/// Bind a net-server connection handle to a file descriptor.
+///
+/// Returns the descriptor, which then reads and writes with the ordinary
+/// `sys_fd_read` and `sys_fd_write` — the point of the exercise.
+pub fn sys_sock_fd(net_tid: usize, handle: usize) -> Result<usize, ()> {
+    let r = unsafe { syscall2(SYS_SOCK_FD, net_tid as u64, handle as u64) };
+    if r == u64::MAX { Err(()) } else { Ok(r as usize) }
+}
+
+/// The `(net_tid, handle)` behind a socket fd, for closing the connection.
+pub fn sys_sock_info(fd: usize) -> Result<(usize, usize), ()> {
+    let r = unsafe { syscall1(SYS_SOCK_INFO, fd as u64) };
+    if r == u64::MAX {
+        Err(())
+    } else {
+        Ok(((r >> 32) as usize, (r & 0xFFFF_FFFF) as usize))
+    }
 }
 
 pub fn sys_futex_wait(addr: *const u32, expected: u32) -> u64 {

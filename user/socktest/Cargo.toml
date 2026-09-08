@@ -1,9 +1,10 @@
 [package]
-name = "httpget"
+name = "socktest"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+quark-rt = { path = "../quark-rt" }
 
 [profile.dev]
 panic = "abort"

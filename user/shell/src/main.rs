@@ -2,6 +2,7 @@
 #![no_main]
 
 use quark_rt::ipc::Message;
+use quark_rt::nameserver;
 use quark_rt::spawn::{self, Scratch, Spawned};
 use quark_rt::{args, print, println, syscall, vfs};
 use quark_rt::stdio::read_line;
@@ -19,8 +20,6 @@ quark_rt::manifest!([
 ]);
 
 const PAGE_SIZE: usize = 4096;
-const NAMESERVER_TID: usize = 2;
-const TAG_NS_LOOKUP: u64 = 2;
 const TAG_SET_FOREGROUND: u64 = 2;
 
 // Shell temp address ranges (non-overlapping with init's 0x82-0x88)
@@ -38,60 +37,12 @@ const SPAWN_SCRATCH: Scratch = Scratch {
 };
 
 // ---------------------------------------------------------------------------
-// ELF64 structures (copied from init)
-// ---------------------------------------------------------------------------
-
-
-
-
-// ---------------------------------------------------------------------------
-// Service discovery
-// ---------------------------------------------------------------------------
-
-fn lookup_service(name: &[u8]) -> Option<usize> {
-    let mut buf = [0u8; 24];
-    let len = name.len().min(24);
-    buf[..len].copy_from_slice(&name[..len]);
-    let w0 = u64::from_le_bytes(buf[0..8].try_into().unwrap());
-    let w1 = u64::from_le_bytes(buf[8..16].try_into().unwrap());
-    let w2 = u64::from_le_bytes(buf[16..24].try_into().unwrap());
-
-    let msg = Message {
-        sender: 0,
-        tag: TAG_NS_LOOKUP,
-        data: [w0, w1, w2, 0, 0, 0],
-    };
-
-    let mut reply = Message::empty();
-    if syscall::sys_call(NAMESERVER_TID, &msg, &mut reply).is_ok() && reply.tag != u64::MAX {
-        Some(reply.tag as usize)
-    } else {
-        None
-    }
-}
-
-fn lookup_service_with_retry(name: &[u8], max_attempts: usize) -> Option<usize> {
-    for _ in 0..max_attempts {
-        if let Some(tid) = lookup_service(name) {
-            return Some(tid);
-        }
-        for _ in 0..100 {
-            syscall::sys_yield();
-        }
-    }
-    None
-}
-
-// ---------------------------------------------------------------------------
 // ELF loader (mirrors init's load_elf using shell temp addresses)
 // ---------------------------------------------------------------------------
-
-
 
 // ---------------------------------------------------------------------------
 // Program arguments
 // ---------------------------------------------------------------------------
-
 
 // ---------------------------------------------------------------------------
 // Capability granting for child tasks
@@ -654,7 +605,7 @@ pub extern "C" fn _start() -> ! {
     cwd_init();
 
     // Discover services
-    let vfs_tid = match lookup_service_with_retry(b"vfs", 50) {
+    let vfs_tid = match nameserver::lookup_retry(b"vfs", 50) {
         Some(tid) => tid,
         None => {
             println!("shell: vfs not found");
@@ -662,7 +613,7 @@ pub extern "C" fn _start() -> ! {
         }
     };
 
-    let input_tid = lookup_service(b"input").unwrap_or(0);
+    let input_tid = nameserver::lookup(b"input").unwrap_or(0);
 
     // Main loop
     let mut line_buf = [0u8; 256];

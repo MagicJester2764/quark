@@ -2,10 +2,10 @@
 #![no_main]
 
 use quark_rt::ipc::Message;
+use quark_rt::nameserver;
 use quark_rt::{args, println, syscall};
 
 const NAMESERVER_TID: usize = 2;
-const TAG_NS_LOOKUP: u64 = 2;
 const DEFAULT_COUNT: usize = 4;
 const NAME_LEN: usize = 24; // 3 x u64, as the nameserver stores it
 
@@ -21,28 +21,6 @@ fn parse_usize(s: &[u8]) -> Option<usize> {
         n = n.checked_mul(10)?.checked_add((b - b'0') as usize)?;
     }
     Some(n)
-}
-
-fn lookup_service(name: &[u8]) -> Option<usize> {
-    let mut buf = [0u8; 24];
-    let len = name.len().min(24);
-    buf[..len].copy_from_slice(&name[..len]);
-    let w0 = u64::from_le_bytes(buf[0..8].try_into().unwrap());
-    let w1 = u64::from_le_bytes(buf[8..16].try_into().unwrap());
-    let w2 = u64::from_le_bytes(buf[16..24].try_into().unwrap());
-
-    let msg = Message {
-        sender: 0,
-        tag: TAG_NS_LOOKUP,
-        data: [w0, w1, w2, 0, 0, 0],
-    };
-
-    let mut reply = Message::empty();
-    if syscall::sys_call(NAMESERVER_TID, &msg, &mut reply).is_ok() && reply.tag != u64::MAX {
-        Some(reply.tag as usize)
-    } else {
-        None
-    }
 }
 
 /// Nameserver reverse lookup: what name did this TID register under?
@@ -164,7 +142,7 @@ pub extern "C" fn _start() -> ! {
         syscall::sys_exit();
     }
 
-    match lookup_service(service_name) {
+    match nameserver::lookup(service_name) {
         Some(tid) => ping(tid, core::str::from_utf8(service_name).ok(), count),
         None => {
             if let Ok(s) = core::str::from_utf8(service_name) {

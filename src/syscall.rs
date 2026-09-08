@@ -131,6 +131,23 @@ pub const SYS_FUTEX_WAIT_TIMEOUT: u64 = 130;
 // --- 0x90  time ---
 pub const SYS_TICKS: u64 = 144;
 
+// --- 0xB0  sockets ---
+/// Bind a net-server connection handle to a file descriptor.
+pub const SYS_SOCK_FD: u64 = 176;
+/// Recover the (net_tid, handle) behind a socket fd.
+pub const SYS_SOCK_INFO: u64 = 177;
+
+/// Operation tags a socket fd sends to the net server. The connection handle
+/// rides in the tag's upper 32 bits, because the payload fills every data word
+/// and the tag is the only field left to carry it.
+pub const TAG_SOCK_WRITE: u64 = 16;
+pub const TAG_SOCK_READ: u64 = 17;
+const SOCK_HANDLE_SHIFT: u32 = 32;
+
+const fn sock_tag(op: u64, handle: usize) -> u64 {
+    op | ((handle as u64) << SOCK_HANDLE_SHIFT)
+}
+
 // --- 0xA0  kernel debug console ---
 pub const SYS_WRITE: u64 = 160;
 pub const SYS_CONSOLE_POS: u64 = 161;
@@ -144,7 +161,7 @@ pub const SYS_ABI_VERSION: u64 = 240;
 /// minor when calls are added. User space can refuse to run against a major it
 /// does not know, which is the point of exposing it at all.
 pub const ABI_VERSION_MAJOR: u64 = 1;
-pub const ABI_VERSION_MINOR: u64 = 2;
+pub const ABI_VERSION_MINOR: u64 = 3;
 
 
 
@@ -879,6 +896,9 @@ extern "C" fn syscall_dispatch(
                     crate::pipe::write(handle, ptr, len)
                 }
                 crate::task::FdKind::PipeRead(_) => u64::MAX,
+                crate::task::FdKind::Socket { net_tid, handle } => {
+                    fd_write_ipc(net_tid, sock_tag(TAG_SOCK_WRITE, handle), ptr, len)
+                }
                 crate::task::FdKind::Empty => {
                     // fd not connected — fall back to kernel console for fd 1/2
                     if (fd == 1 || fd == 2) && len > 0 {
@@ -908,6 +928,9 @@ extern "C" fn syscall_dispatch(
                     crate::pipe::read(handle, ptr, max_len)
                 }
                 crate::task::FdKind::PipeWrite(_) => u64::MAX,
+                crate::task::FdKind::Socket { net_tid, handle } => {
+                    fd_read_ipc(net_tid, sock_tag(TAG_SOCK_READ, handle), ptr, max_len)
+                }
                 crate::task::FdKind::Empty => u64::MAX,
             }
         }
@@ -973,6 +996,34 @@ extern "C" fn syscall_dispatch(
             match scheduler::set_fd(tid, fd, kind) {
                 Ok(()) => 0,
                 Err(()) => u64::MAX,
+            }
+        }
+        SYS_SOCK_FD => {
+            // arg0 = net server tid, arg1 = connection handle
+            //
+            // The handle is not checked here: the net server owns connections
+            // and refuses one that does not belong to the sender, which the
+            // kernel stamps on every message. What is checked is the right to
+            // talk to that server at all, once, here, rather than on every
+            // read and write through the descriptor.
+            let net_tid = arg0 as usize;
+            let handle = arg1 as usize;
+            if !crate::cap::task_has_endpoint(scheduler::current_tid(), net_tid) {
+                return u64::MAX;
+            }
+            match scheduler::current_alloc_fd(crate::task::FdKind::Socket { net_tid, handle }) {
+                Ok(fd) => fd as u64,
+                Err(()) => u64::MAX,
+            }
+        }
+        SYS_SOCK_INFO => {
+            // arg0 = fd. Returns (net_tid << 32) | handle, so a program can
+            // close the connection it is about to drop the descriptor for.
+            match scheduler::current_fd(arg0 as usize) {
+                crate::task::FdKind::Socket { net_tid, handle } => {
+                    ((net_tid as u64) << 32) | (handle as u64)
+                }
+                _ => u64::MAX,
             }
         }
         SYS_FD_DUP => {

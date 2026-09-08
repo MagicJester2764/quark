@@ -8,6 +8,7 @@ pub mod ext2_alloc;
 pub mod ext2_dir;
 
 use quark_rt::ipc::{Message, TID_ANY};
+use quark_rt::nameserver;
 use quark_rt::{println, syscall};
 
 use quark_rt::manifest::CapReq;
@@ -20,11 +21,6 @@ quark_rt::manifest!([
 ]);
 
 pub const PAGE_SIZE: usize = 4096;
-const NAMESERVER_TID: usize = 2;
-
-// Nameserver protocol
-const TAG_NS_REGISTER: u64 = 1;
-const TAG_NS_LOOKUP: u64 = 2;
 
 // Disk driver protocol
 pub const TAG_READ_SECTOR: u64 = 1;
@@ -1273,66 +1269,6 @@ fn write_file_data(
     Ok(written)
 }
 
-// ---------------------------------------------------------------------------
-// IPC helpers
-// ---------------------------------------------------------------------------
-
-fn register_with_nameserver() {
-    let name = b"vfs";
-    let mut buf = [0u8; 24];
-    buf[..name.len()].copy_from_slice(name);
-    let w0 = u64::from_le_bytes([buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7]]);
-    let w1 = u64::from_le_bytes([buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15]]);
-    let w2 = u64::from_le_bytes([buf[16], buf[17], buf[18], buf[19], buf[20], buf[21], buf[22], buf[23]]);
-
-    let msg = Message {
-        sender: 0,
-        tag: TAG_NS_REGISTER,
-        data: [w0, w1, w2, 0, 0, 0],
-    };
-
-    let mut reply = Message::empty();
-    if syscall::sys_call(NAMESERVER_TID, &msg, &mut reply).is_ok() {
-        println!("[vfs] Registered with nameserver.");
-    } else {
-        println!("[vfs] Failed to register with nameserver.");
-    }
-}
-
-fn lookup_service(name: &[u8]) -> Option<usize> {
-    let mut buf = [0u8; 24];
-    let len = name.len().min(24);
-    buf[..len].copy_from_slice(&name[..len]);
-    let w0 = u64::from_le_bytes(buf[0..8].try_into().unwrap());
-    let w1 = u64::from_le_bytes(buf[8..16].try_into().unwrap());
-    let w2 = u64::from_le_bytes(buf[16..24].try_into().unwrap());
-
-    let msg = Message {
-        sender: 0,
-        tag: TAG_NS_LOOKUP,
-        data: [w0, w1, w2, 0, 0, 0],
-    };
-
-    let mut reply = Message::empty();
-    if syscall::sys_call(NAMESERVER_TID, &msg, &mut reply).is_ok() && reply.tag != u64::MAX {
-        Some(reply.tag as usize)
-    } else {
-        None
-    }
-}
-
-fn lookup_service_with_retry(name: &[u8], max_attempts: usize) -> Option<usize> {
-    for _ in 0..max_attempts {
-        if let Some(tid) = lookup_service(name) {
-            return Some(tid);
-        }
-        for _ in 0..100 {
-            syscall::sys_yield();
-        }
-    }
-    None
-}
-
 fn error_reply(sender: usize, err_code: u64) {
     let reply = Message {
         sender: 0,
@@ -1384,7 +1320,7 @@ pub extern "C" fn _start() -> ! {
     println!("[vfs] Started.");
 
     // Discover disk service
-    let disk_tid = match lookup_service_with_retry(b"disk", 20) {
+    let disk_tid = match nameserver::lookup_retry(b"disk", 20) {
         Some(tid) => tid,
         None => {
             println!("[vfs] Disk service not found. Exiting.");
@@ -1496,7 +1432,11 @@ pub extern "C" fn _start() -> ! {
     };
 
     // Register with nameserver
-    register_with_nameserver();
+    if nameserver::register(b"vfs").is_ok() {
+        println!("[vfs] Registered with nameserver.");
+    } else {
+        println!("[vfs] Failed to register with nameserver.");
+    }
 
     // Service loop
     loop {

@@ -1,7 +1,7 @@
 #![no_std]
 #![no_main]
 
-use quark_rt::ipc::Message;
+use quark_rt::nameserver;
 use quark_rt::{args, print, println, syscall, vfs};
 
 use quark_rt::manifest::CapReq;
@@ -9,31 +9,7 @@ use quark_rt::manifest::CapReq;
 quark_rt::manifest!([CapReq::phys_alloc(64)]);
 
 const PAGE_SIZE: usize = 4096;
-const NAMESERVER_TID: usize = 2;
-const TAG_NS_LOOKUP: u64 = 2;
 const BUF_VADDR: usize = 0x90_0000_0000;
-
-fn lookup_service(name: &[u8]) -> Option<usize> {
-    let mut buf = [0u8; 24];
-    let len = name.len().min(24);
-    buf[..len].copy_from_slice(&name[..len]);
-    let w0 = u64::from_le_bytes(buf[0..8].try_into().unwrap());
-    let w1 = u64::from_le_bytes(buf[8..16].try_into().unwrap());
-    let w2 = u64::from_le_bytes(buf[16..24].try_into().unwrap());
-
-    let msg = Message {
-        sender: 0,
-        tag: TAG_NS_LOOKUP,
-        data: [w0, w1, w2, 0, 0, 0],
-    };
-
-    let mut reply = Message::empty();
-    if syscall::sys_call(NAMESERVER_TID, &msg, &mut reply).is_ok() && reply.tag != u64::MAX {
-        Some(reply.tag as usize)
-    } else {
-        None
-    }
-}
 
 #[unsafe(no_mangle)]
 #[link_section = ".text.entry"]
@@ -60,7 +36,7 @@ pub extern "C" fn _start() -> ! {
     // Discover VFS
     let mut attempts = 0;
     let vfs_tid = loop {
-        if let Some(tid) = lookup_service(b"vfs") {
+        if let Some(tid) = nameserver::lookup(b"vfs") {
             break tid;
         }
         attempts += 1;

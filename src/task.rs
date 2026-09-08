@@ -18,6 +18,12 @@ pub enum FdKind {
     Ipc { target_tid: usize, tag: u64 },
     PipeRead(usize),   // pipe handle index
     PipeWrite(usize),  // pipe handle index
+    /// A network connection, held by the net server as `handle`.
+    ///
+    /// Unlike `Ipc`, which is one-directional and carries a fixed tag, a
+    /// socket is read and written through the same descriptor, so the tag is
+    /// chosen per direction and the handle travels in its upper bits.
+    Socket { net_tid: usize, handle: usize },
 }
 
 impl FdKind {

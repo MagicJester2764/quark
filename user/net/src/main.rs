@@ -3,6 +3,7 @@
 #![allow(dead_code)]
 
 use quark_rt::ipc::{Message, TID_ANY};
+use quark_rt::nameserver;
 use quark_rt::{println, syscall};
 
 use quark_rt::manifest::CapReq;
@@ -20,9 +21,6 @@ quark_rt::manifest!([
 // IPC protocol
 // ---------------------------------------------------------------------------
 
-const NAMESERVER_TID: usize = 2;
-const TAG_NS_REGISTER: u64 = 1;
-
 const TAG_UDP_SEND: u64 = 1;
 const TAG_UDP_RECV: u64 = 2;
 const TAG_NET_CONFIG: u64 = 3;
@@ -35,6 +33,18 @@ const TAG_TCP_LISTEN: u64 = 11;
 const TAG_TCP_SEND: u64 = 13;
 const TAG_TCP_RECV: u64 = 14;
 const TAG_TCP_CLOSE: u64 = 15;
+
+/// Read and write for a connection reached through a file descriptor.
+///
+/// The kernel's fd path already chunks a user buffer into IPC messages and
+/// unpacks a reply the same way; these carry the payload in exactly that
+/// layout so a socket fd needs no special case in it. The connection handle
+/// travels in the tag's upper 32 bits, because the payload uses every data
+/// word and the tag is the only field left.
+const TAG_SOCK_WRITE: u64 = 16;
+const TAG_SOCK_READ: u64 = 17;
+const SOCK_TAG_MASK: u64 = 0xFFFF_FFFF;
+const SOCK_HANDLE_SHIFT: u32 = 32;
 const TAG_OK: u64 = 0;
 const TAG_ERROR: u64 = u64::MAX;
 
@@ -247,6 +257,13 @@ const TCP_PENDING_NONE: u8 = 0;
 const TCP_PENDING_CONNECT: u8 = 1;
 const TCP_PENDING_ACCEPT: u8 = 2;
 const TCP_PENDING_RECV: u8 = 3;
+/// A write that did not fit in the send buffer. Held until ACKs free space,
+/// so a socket write blocks rather than silently losing its tail.
+const TCP_PENDING_SEND: u8 = 4;
+
+/// Bytes the kernel's fd path carries in one message: five data words, with
+/// the sixth holding the count.
+const SOCK_CHUNK: usize = 40;
 
 struct TcpConn {
     state: TcpState,
@@ -267,6 +284,16 @@ struct TcpConn {
     pending_max: usize,
     in_use: bool,
     fin_received: bool,
+    /// The task this connection belongs to. Handles are indices into one
+    /// array shared by every client, so without this any task could name any
+    /// other task's connection and read or write it.
+    owner_tid: usize,
+    /// Set when the fd path is in use, so the reply carries data inline
+    /// instead of through a page the client mapped.
+    pending_inline: bool,
+    /// Bytes a deferred write is still trying to queue.
+    pending_data: [u8; SOCK_CHUNK],
+    pending_len: usize,
 }
 
 struct DnsCacheEntry {
@@ -334,6 +361,8 @@ static mut NET: NetState = NetState {
             recv_len: 0, send_len: 0, retransmit_tick: 0, timewait_tick: 0,
             pending_tid: 0, pending_op: TCP_PENDING_NONE,
             pending_phys: 0, pending_max: 0, in_use: false, fin_received: false,
+            owner_tid: 0, pending_inline: false,
+            pending_data: [0; SOCK_CHUNK], pending_len: 0,
         };
         [EMPTY; MAX_TCP_CONNS]
     },
@@ -940,9 +969,145 @@ fn free_tcp_conn(idx: usize) {
         NET.tcp_conns[idx].send_len = 0;
         NET.tcp_conns[idx].pending_op = TCP_PENDING_NONE;
         NET.tcp_conns[idx].fin_received = false;
+        NET.tcp_conns[idx].owner_tid = 0;
+        NET.tcp_conns[idx].pending_inline = false;
+        NET.tcp_conns[idx].pending_len = 0;
     }
     let _ = syscall::sys_munmap(tcp_recv_buf_vaddr(idx), 1);
     let _ = syscall::sys_munmap(tcp_send_buf_vaddr(idx), 1);
+}
+
+/// Does `tid` own connection `handle`?
+///
+/// Handles are indices into one array shared by every client, so a client that
+/// names a handle it was never given would otherwise be reading and writing
+/// someone else's connection. Checked on every operation that names one.
+fn conn_owned_by(handle: usize, tid: usize) -> bool {
+    if handle >= MAX_TCP_CONNS {
+        return false;
+    }
+    let c = unsafe { &NET.tcp_conns[handle] };
+    c.in_use && c.owner_tid == tid
+}
+
+/// Pack up to [`SOCK_CHUNK`] bytes into the six data words of a reply, in the
+/// layout the kernel's fd path unpacks: count first, then the bytes.
+fn sock_pack(src: &[u8]) -> [u64; 6] {
+    let n = src.len().min(SOCK_CHUNK);
+    let mut data = [0u64; 6];
+    data[0] = n as u64;
+    for i in 0..5 {
+        let mut w = [0u8; 8];
+        for j in 0..8 {
+            let k = i * 8 + j;
+            if k < n {
+                w[j] = src[k];
+            }
+        }
+        data[i + 1] = u64::from_le_bytes(w);
+    }
+    data
+}
+
+/// The inverse: bytes out of a request's data words.
+fn sock_unpack(data: &[u64; 6], out: &mut [u8; SOCK_CHUNK]) -> usize {
+    let n = (data[0] as usize).min(SOCK_CHUNK);
+    for i in 0..5 {
+        let bytes = data[i + 1].to_le_bytes();
+        for j in 0..8 {
+            let k = i * 8 + j;
+            if k < n {
+                out[k] = bytes[j];
+            }
+        }
+    }
+    n
+}
+
+/// Copy `src` into the connection's send buffer and put it on the wire.
+///
+/// Returns how much was queued, which is less than `src.len()` when the send
+/// buffer is full — the caller decides whether to wait for space or report a
+/// short write.
+fn tcp_queue_send(handle: usize, src: &[u8]) -> usize {
+    let sv = tcp_send_buf_vaddr(handle);
+    let cur_len = unsafe { NET.tcp_conns[handle].send_len };
+    let to_queue = src.len().min(TCP_BUF_SIZE - cur_len);
+    if to_queue == 0 {
+        return 0;
+    }
+
+    unsafe {
+        core::ptr::copy_nonoverlapping(src.as_ptr(), (sv + cur_len) as *mut u8, to_queue);
+        NET.tcp_conns[handle].send_len += to_queue;
+    }
+
+    let mut offset = 0;
+    while offset < to_queue {
+        let chunk = (to_queue - offset).min(TCP_MSS);
+        let payload =
+            unsafe { core::slice::from_raw_parts((sv + cur_len + offset) as *const u8, chunk) };
+        let snd_nxt = unsafe { NET.tcp_conns[handle].snd_nxt };
+        let c = unsafe { &NET.tcp_conns[handle] };
+        send_tcp_segment(
+            &c.remote_ip,
+            c.local_port,
+            c.remote_port,
+            snd_nxt,
+            c.rcv_nxt,
+            TCP_ACK | TCP_PSH,
+            (TCP_BUF_SIZE - c.recv_len) as u16,
+            payload,
+        );
+        unsafe {
+            NET.tcp_conns[handle].snd_nxt = snd_nxt.wrapping_add(chunk as u32);
+            NET.tcp_conns[handle].retransmit_tick = syscall::sys_ticks();
+        }
+        offset += chunk;
+    }
+    to_queue
+}
+
+/// Can this connection accept data right now?
+fn tcp_can_send(handle: usize) -> bool {
+    let state = unsafe { NET.tcp_conns[handle].state };
+    state == TcpState::Established || state == TcpState::CloseWait
+}
+
+/// Complete a write that was waiting for send-buffer space.
+///
+/// Called when ACKs free space. A write is held whole: it is queued only when
+/// all of it fits, so the client never sees a torn chunk.
+fn tcp_deliver_send(idx: usize) {
+    unsafe {
+        let c = &NET.tcp_conns[idx];
+        if c.pending_op != TCP_PENDING_SEND {
+            return;
+        }
+        let want = c.pending_len;
+        let pending_tid = c.pending_tid;
+
+        if !tcp_can_send(idx) {
+            // The connection went away underneath the write.
+            NET.tcp_conns[idx].pending_op = TCP_PENDING_NONE;
+            NET.tcp_conns[idx].pending_len = 0;
+            let reply = Message { sender: 0, tag: TAG_ERROR, data: [2, 0, 0, 0, 0, 0] };
+            let _ = syscall::sys_reply(pending_tid, &reply);
+            return;
+        }
+
+        if TCP_BUF_SIZE - NET.tcp_conns[idx].send_len < want {
+            return; // still no room
+        }
+
+        let staged = NET.tcp_conns[idx].pending_data;
+        let n = tcp_queue_send(idx, &staged[..want]);
+        NET.tcp_conns[idx].pending_op = TCP_PENDING_NONE;
+        NET.tcp_conns[idx].pending_len = 0;
+
+        let reply = Message { sender: 0, tag: TAG_OK, data: [n as u64, 0, 0, 0, 0, 0] };
+        let _ = syscall::sys_reply(pending_tid, &reply);
+    }
 }
 
 fn alloc_ephemeral_port() -> u16 {
@@ -1059,23 +1224,36 @@ fn tcp_deliver_recv(idx: usize) {
 
         let n = c.recv_len.min(c.pending_max);
         let old_recv_len = c.recv_len;
-        if n > 0 && syscall::sys_map_phys(c.pending_phys, CLIENT_BUF, 1).is_ok() {
-            let rv = tcp_recv_buf_vaddr(idx);
-            core::ptr::copy_nonoverlapping(rv as *const u8, CLIENT_BUF as *mut u8, n);
-            // Compact
+        let rv = tcp_recv_buf_vaddr(idx);
+
+        // Two ways out: inline in the reply for a socket fd, or through the
+        // page the client mapped for the older phys-address protocol.
+        let data = if c.pending_inline {
+            let out = sock_pack(core::slice::from_raw_parts(rv as *const u8, n));
             if n < c.recv_len {
                 core::ptr::copy((rv + n) as *const u8, rv as *mut u8, c.recv_len - n);
             }
-        }
+            out
+        } else {
+            if n > 0 && syscall::sys_map_phys(c.pending_phys, CLIENT_BUF, 1).is_ok() {
+                core::ptr::copy_nonoverlapping(rv as *const u8, CLIENT_BUF as *mut u8, n);
+                // Compact
+                if n < c.recv_len {
+                    core::ptr::copy((rv + n) as *const u8, rv as *mut u8, c.recv_len - n);
+                }
+            }
+            [n as u64, 0, 0, 0, 0, 0]
+        };
 
         let reply = Message {
             sender: 0,
             tag: TAG_OK,
-            data: [n as u64, 0, 0, 0, 0, 0],
+            data,
         };
         let _ = syscall::sys_reply(c.pending_tid, &reply);
         NET.tcp_conns[idx].recv_len -= n;
         NET.tcp_conns[idx].pending_op = TCP_PENDING_NONE;
+        NET.tcp_conns[idx].pending_inline = false;
 
         // Send a window update if consuming data opened significant buffer space.
         // Without this, the remote peer stalls on a zero (or small) window that
@@ -1159,6 +1337,9 @@ fn accept_tcp_syn(listener_idx: usize, remote_ip: &[u8; 4], remote_port: u16, se
     let local_port = listener.local_port;
     let pending_tid = listener.pending_tid;
     let pending_op = listener.pending_op;
+    // The accepted connection belongs to whoever was listening.
+    let owner_tid = listener.owner_tid;
+    let pending_inline = listener.pending_inline;
 
     unsafe {
         NET.tcp_conns[idx] = TcpConn {
@@ -1180,6 +1361,10 @@ fn accept_tcp_syn(listener_idx: usize, remote_ip: &[u8; 4], remote_port: u16, se
             pending_max: 0,
             in_use: true,
             fin_received: false,
+            owner_tid,
+            pending_inline,
+            pending_data: [0; SOCK_CHUNK],
+            pending_len: 0,
         };
         // Clear the listener's pending (it's been moved to the new conn)
         NET.tcp_conns[listener_idx].pending_op = TCP_PENDING_NONE;
@@ -1378,6 +1563,10 @@ fn process_tcp_ack(idx: usize, ack: u32, window: u16) {
         } else {
             c.retransmit_tick = syscall::sys_ticks();
         }
+
+        // Acking is the only thing that frees send-buffer space, so it is also
+        // the only thing that can let a held write through.
+        tcp_deliver_send(idx);
     }
 }
 
@@ -1921,32 +2110,6 @@ fn handle_packet(pkt: &[u8]) {
 }
 
 // ---------------------------------------------------------------------------
-// Nameserver registration
-// ---------------------------------------------------------------------------
-
-fn register_with_nameserver() {
-    let name = b"net";
-    let mut buf = [0u8; 24];
-    buf[..name.len()].copy_from_slice(name);
-    let w0 = u64::from_le_bytes([buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7]]);
-    let w1 = u64::from_le_bytes([buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15]]);
-    let w2 = u64::from_le_bytes([buf[16], buf[17], buf[18], buf[19], buf[20], buf[21], buf[22], buf[23]]);
-
-    let msg = Message {
-        sender: 0,
-        tag: TAG_NS_REGISTER,
-        data: [w0, w1, w2, 0, 0, 0],
-    };
-
-    let mut reply = Message::empty();
-    if syscall::sys_call(NAMESERVER_TID, &msg, &mut reply).is_ok() {
-        println!("[net] Registered with nameserver.");
-    } else {
-        println!("[net] Failed to register with nameserver.");
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
 
@@ -1978,7 +2141,11 @@ pub extern "C" fn _start() -> ! {
         syscall::sys_yield();
     }
 
-    register_with_nameserver();
+    if nameserver::register(b"net").is_ok() {
+        println!("[net] Registered with nameserver.");
+    } else {
+        println!("[net] Failed to register with nameserver.");
+    }
 
     let ip = unsafe { NET.ip };
     println!("[net] IP {}.{}.{}.{} — ready.", ip[0], ip[1], ip[2], ip[3]);
@@ -2045,8 +2212,13 @@ pub extern "C" fn _start() -> ! {
             continue;
         }
 
-        // IPC request from client
-        match msg.tag {
+        // IPC request from client.
+        //
+        // A socket-fd request carries its connection handle in the tag's upper
+        // bits, so dispatch on the operation alone and read the handle back
+        // out in the arm that needs it.
+        let sock_handle = (msg.tag >> SOCK_HANDLE_SHIFT) as usize;
+        match msg.tag & SOCK_TAG_MASK {
             TAG_UDP_SEND => {
                 let phys_addr = msg.data[0] as usize;
                 let len = msg.data[1] as usize;
@@ -2257,6 +2429,10 @@ pub extern "C" fn _start() -> ! {
                         pending_max: 0,
                         in_use: true,
                         fin_received: false,
+                        owner_tid: msg.sender,
+                        pending_inline: false,
+                        pending_data: [0; SOCK_CHUNK],
+                        pending_len: 0,
                     };
                 }
 
@@ -2318,6 +2494,10 @@ pub extern "C" fn _start() -> ! {
                         pending_op: TCP_PENDING_ACCEPT,
                         pending_phys: 0, pending_max: 0,
                         in_use: true, fin_received: false,
+                        owner_tid: msg.sender,
+                        pending_inline: false,
+                        pending_data: [0; SOCK_CHUNK],
+                        pending_len: 0,
                     };
                 }
                 // Deferred reply — will reply when connection established
@@ -2327,7 +2507,7 @@ pub extern "C" fn _start() -> ! {
                 let phys_addr = msg.data[1] as usize;
                 let len = msg.data[2] as usize;
 
-                if handle >= MAX_TCP_CONNS {
+                if !conn_owned_by(handle, msg.sender) {
                     let reply = Message { sender: 0, tag: TAG_ERROR, data: [1, 0, 0, 0, 0, 0] };
                     let _ = syscall::sys_reply(msg.sender, &reply);
                     continue;
@@ -2401,7 +2581,7 @@ pub extern "C" fn _start() -> ! {
                 let phys_addr = msg.data[1] as usize;
                 let max_len = msg.data[2] as usize;
 
-                if handle >= MAX_TCP_CONNS {
+                if !conn_owned_by(handle, msg.sender) {
                     let reply = Message { sender: 0, tag: TAG_ERROR, data: [1, 0, 0, 0, 0, 0] };
                     let _ = syscall::sys_reply(msg.sender, &reply);
                     continue;
@@ -2463,10 +2643,68 @@ pub extern "C" fn _start() -> ! {
                     }
                 }
             }
+            TAG_SOCK_WRITE => {
+                // Payload inline, in the layout the kernel's fd path packs.
+                let mut buf = [0u8; SOCK_CHUNK];
+                let n = sock_unpack(&msg.data, &mut buf);
+
+                if !conn_owned_by(sock_handle, msg.sender) {
+                    let reply = Message { sender: 0, tag: TAG_ERROR, data: [1, 0, 0, 0, 0, 0] };
+                    let _ = syscall::sys_reply(msg.sender, &reply);
+                    continue;
+                }
+                if !tcp_can_send(sock_handle) {
+                    let reply = Message { sender: 0, tag: TAG_ERROR, data: [2, 0, 0, 0, 0, 0] };
+                    let _ = syscall::sys_reply(msg.sender, &reply);
+                    continue;
+                }
+
+                // Queue it whole or not at all. A partial write here would be
+                // invisible to the caller: the kernel's fd path reports what
+                // it handed over, not what was taken.
+                let free = TCP_BUF_SIZE - unsafe { NET.tcp_conns[sock_handle].send_len };
+                if free >= n {
+                    let queued = tcp_queue_send(sock_handle, &buf[..n]);
+                    let reply =
+                        Message { sender: 0, tag: TAG_OK, data: [queued as u64, 0, 0, 0, 0, 0] };
+                    let _ = syscall::sys_reply(msg.sender, &reply);
+                } else {
+                    // No room. Hold the bytes and the reply until ACKs make
+                    // some, which is what makes a socket write block.
+                    unsafe {
+                        NET.tcp_conns[sock_handle].pending_data = buf;
+                        NET.tcp_conns[sock_handle].pending_len = n;
+                        NET.tcp_conns[sock_handle].pending_tid = msg.sender;
+                        NET.tcp_conns[sock_handle].pending_op = TCP_PENDING_SEND;
+                    }
+                }
+            }
+            TAG_SOCK_READ => {
+                if !conn_owned_by(sock_handle, msg.sender) {
+                    let reply = Message { sender: 0, tag: TAG_ERROR, data: [1, 0, 0, 0, 0, 0] };
+                    let _ = syscall::sys_reply(msg.sender, &reply);
+                    continue;
+                }
+
+                let max_len = (msg.data[0] as usize).min(SOCK_CHUNK);
+                unsafe {
+                    NET.tcp_conns[sock_handle].pending_tid = msg.sender;
+                    NET.tcp_conns[sock_handle].pending_op = TCP_PENDING_RECV;
+                    NET.tcp_conns[sock_handle].pending_inline = true;
+                    NET.tcp_conns[sock_handle].pending_phys = 0;
+                    NET.tcp_conns[sock_handle].pending_max = max_len;
+                }
+                // Replies now if there is data or a FIN, and otherwise leaves
+                // the request pending for whenever one arrives.
+                tcp_deliver_recv(sock_handle);
+            }
             TAG_TCP_CLOSE => {
                 let handle = msg.data[0] as usize;
 
-                if handle >= MAX_TCP_CONNS || !unsafe { NET.tcp_conns[handle].in_use } {
+                // A close from a task that does not own it is not an error to
+                // report, just nothing to do: the caller learns nothing about
+                // whether the handle exists.
+                if !conn_owned_by(handle, msg.sender) {
                     let reply = Message { sender: 0, tag: TAG_OK, data: [0; 6] };
                     let _ = syscall::sys_reply(msg.sender, &reply);
                     continue;

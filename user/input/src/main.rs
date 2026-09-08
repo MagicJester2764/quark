@@ -2,6 +2,7 @@
 #![no_main]
 
 use quark_rt::ipc::{Message, TID_ANY};
+use quark_rt::nameserver;
 use quark_rt::{print, println, syscall};
 
 use quark_rt::manifest::CapReq;
@@ -10,12 +11,6 @@ use quark_rt::manifest::CapReq;
 quark_rt::manifest!([
     CapReq::task_mgmt(0),
 ]);
-
-const NAMESERVER_TID: usize = 2;
-
-// Nameserver protocol
-const TAG_NS_REGISTER: u64 = 1;
-const TAG_NS_LOOKUP: u64 = 2;
 
 // Keyboard protocol (client side)
 const TAG_GET_KEY: u64 = 1;
@@ -41,15 +36,19 @@ pub extern "C" fn _start() -> ! {
     println!("[input] Started.");
 
     // Discover keyboard service
-    let kbd_tid = lookup_service(b"keyboard");
-    if kbd_tid == 0 {
-        println!("[input] Keyboard service not found!");
-        syscall::sys_exit();
-    }
+    let kbd_tid = match nameserver::lookup(b"keyboard") {
+        Some(tid) => tid,
+        None => {
+            println!("[input] Keyboard service not found!");
+            syscall::sys_exit();
+        }
+    };
     println!("[input] Found keyboard at TID {}", kbd_tid);
 
     // Register as "input" with nameserver
-    register_with_nameserver();
+    if nameserver::register(b"input").is_ok() {
+        println!("[input] Registered with nameserver.");
+    }
 
     // Register with keyboard driver for Ctrl+C notifications
     register_sigint(kbd_tid);
@@ -211,48 +210,6 @@ fn handle_ctrl_c(foreground_tid: &mut usize, line_len: &mut usize) {
     if *foreground_tid != 0 {
         let _ = syscall::sys_signal(*foreground_tid, syscall::SIG_INT);
         *foreground_tid = 0;
-    }
-}
-
-fn lookup_service(name: &[u8]) -> usize {
-    let mut buf = [0u8; 24];
-    let copy_len = name.len().min(24);
-    buf[..copy_len].copy_from_slice(&name[..copy_len]);
-    let w0 = u64::from_le_bytes(buf[0..8].try_into().unwrap());
-    let w1 = u64::from_le_bytes(buf[8..16].try_into().unwrap());
-    let w2 = u64::from_le_bytes(buf[16..24].try_into().unwrap());
-
-    let msg = Message {
-        sender: 0,
-        tag: TAG_NS_LOOKUP,
-        data: [w0, w1, w2, 0, 0, 0],
-    };
-
-    let mut reply = Message::empty();
-    if syscall::sys_call(NAMESERVER_TID, &msg, &mut reply).is_ok() && reply.tag != u64::MAX {
-        reply.tag as usize
-    } else {
-        0
-    }
-}
-
-fn register_with_nameserver() {
-    let name = b"input";
-    let mut buf = [0u8; 24];
-    buf[..name.len()].copy_from_slice(name);
-    let w0 = u64::from_le_bytes(buf[0..8].try_into().unwrap());
-    let w1 = u64::from_le_bytes(buf[8..16].try_into().unwrap());
-    let w2 = u64::from_le_bytes(buf[16..24].try_into().unwrap());
-
-    let msg = Message {
-        sender: 0,
-        tag: TAG_NS_REGISTER,
-        data: [w0, w1, w2, 0, 0, 0],
-    };
-
-    let mut reply = Message::empty();
-    if syscall::sys_call(NAMESERVER_TID, &msg, &mut reply).is_ok() {
-        println!("[input] Registered with nameserver.");
     }
 }
 

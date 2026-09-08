@@ -2,46 +2,11 @@
 #![no_main]
 
 use quark_rt::ipc::Message;
+use quark_rt::nameserver;
 use quark_rt::{args, println, signal, syscall};
 use quark_rt::net;
 
-const NAMESERVER_TID: usize = 2;
-const TAG_NS_LOOKUP: u64 = 2;
 const DEFAULT_COUNT: usize = 4;
-
-fn lookup_service(name: &[u8]) -> Option<usize> {
-    let mut buf = [0u8; 24];
-    let len = name.len().min(24);
-    buf[..len].copy_from_slice(&name[..len]);
-    let w0 = u64::from_le_bytes(buf[0..8].try_into().unwrap());
-    let w1 = u64::from_le_bytes(buf[8..16].try_into().unwrap());
-    let w2 = u64::from_le_bytes(buf[16..24].try_into().unwrap());
-
-    let msg = Message {
-        sender: 0,
-        tag: TAG_NS_LOOKUP,
-        data: [w0, w1, w2, 0, 0, 0],
-    };
-
-    let mut reply = Message::empty();
-    if syscall::sys_call(NAMESERVER_TID, &msg, &mut reply).is_ok() && reply.tag != u64::MAX {
-        Some(reply.tag as usize)
-    } else {
-        None
-    }
-}
-
-fn lookup_service_retry(name: &[u8], max_attempts: usize) -> Option<usize> {
-    for _ in 0..max_attempts {
-        if let Some(tid) = lookup_service(name) {
-            return Some(tid);
-        }
-        for _ in 0..100 {
-            syscall::sys_yield();
-        }
-    }
-    None
-}
 
 fn parse_usize(s: &[u8]) -> Option<usize> {
     let mut n: usize = 0;
@@ -113,7 +78,7 @@ pub extern "C" fn _start() -> ! {
         DEFAULT_COUNT
     };
 
-    let net_tid = match lookup_service_retry(b"net", 50) {
+    let net_tid = match nameserver::lookup_retry(b"net", 50) {
         Some(tid) => tid,
         None => {
             println!("ping: net service not found");

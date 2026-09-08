@@ -6,17 +6,15 @@ BINARY := target/$(TARGET)/release/quark
 HOSTED_TARGET := x86_64-unknown-quark
 QUARK_RUST_STD_PATH ?= $(CURDIR)/../rust/library
 
-# `hello` is the only program that needs the std fork next door. Build it when
-# the fork is present and skip it when it is not, so this tree stands alone:
-# a kernel should not require a patched rustc checkout to compile at all.
+# Programs that need the std fork next door. Built when the fork is present and
+# skipped when it is not, so this tree stands alone: a kernel should not require
+# a patched rustc checkout to compile at all.
+HOSTED_PROGRAMS := hello httpget
 HAVE_STD_FORK := $(wildcard $(QUARK_RUST_STD_PATH)/std/Cargo.toml)
 ifeq ($(HAVE_STD_FORK),)
-HOSTED_ELF :=
+HOSTED_ELFS :=
 else
-# Deferred, not immediate: HELLO_ELF is defined further down, so `:=` here
-# expanded to nothing and quietly dropped the hosted program from `make all`.
-# It kept building only because it was also invoked directly.
-HOSTED_ELF = $(HELLO_ELF)
+HOSTED_ELFS := $(foreach p,$(HOSTED_PROGRAMS),user/$(p)/target/$(HOSTED_TARGET)/release/$(p))
 endif
 GRUB_MKRESCUE := $(shell command -v grub-mkrescue 2>/dev/null || command -v grub2-mkrescue 2>/dev/null)
 
@@ -31,9 +29,6 @@ FAT32_DRV_BIN := $(FAT32_DRV_DIR)/fat32.drv
 # User-space programs (ELF binaries, not flat)
 INIT_DIR := user/init
 INIT_ELF := $(INIT_DIR)/target/$(TARGET)/release/init
-
-HELLO_DIR := user/hello
-HELLO_ELF := $(HELLO_DIR)/target/$(HOSTED_TARGET)/release/hello
 
 NS_DIR := user/nameserver
 NS_ELF := $(NS_DIR)/target/$(TARGET)/release/nameserver
@@ -71,9 +66,11 @@ LS_ELF := $(LS_DIR)/target/$(TARGET)/release/ls
 CAT_DIR := user/cat
 CAPDEMO_DIR := user/capdemo
 THREADTEST_DIR := user/threadtest
+SOCKTEST_DIR := user/socktest
 CAT_ELF := $(CAT_DIR)/target/$(TARGET)/release/cat
 CAPDEMO_ELF := $(CAPDEMO_DIR)/target/$(TARGET)/release/capdemo
 THREADTEST_ELF := $(THREADTEST_DIR)/target/$(TARGET)/release/threadtest
+SOCKTEST_ELF := $(SOCKTEST_DIR)/target/$(TARGET)/release/socktest
 
 LOGIN_DIR := user/login
 LOGIN_ELF := $(LOGIN_DIR)/target/$(TARGET)/release/login
@@ -87,9 +84,6 @@ IPCPING_ELF := $(IPCPING_DIR)/target/$(TARGET)/release/ipcping
 PING_DIR := user/ping
 PING_ELF := $(PING_DIR)/target/$(TARGET)/release/ping
 
-HTTPGET_DIR := user/httpget
-HTTPGET_ELF := $(HTTPGET_DIR)/target/$(TARGET)/release/httpget
-
 SHUTDOWN_DIR := user/shutdown
 SHUTDOWN_ELF := $(SHUTDOWN_DIR)/target/$(TARGET)/release/shutdown
 
@@ -100,7 +94,7 @@ check-abi:
 
 all: check-abi $(KERNEL) drivers user rootfs
 ifeq ($(HAVE_STD_FORK),)
-	@echo "note: no std fork at $(QUARK_RUST_STD_PATH); skipped the hosted 'hello'"
+	@echo "note: no std fork at $(QUARK_RUST_STD_PATH); skipped $(HOSTED_PROGRAMS)"
 endif
 
 $(KERNEL): FORCE
@@ -117,38 +111,47 @@ $(FAT32_DRV_BIN): FORCE
 	cd $(FAT32_DRV_DIR) && cargo build --release
 	objcopy -O binary $(FAT32_DRV_ELF) $(FAT32_DRV_BIN)
 
-user: $(INIT_ELF) $(HOSTED_ELF) $(NS_ELF) $(KBD_ELF) $(CON_ELF) $(INP_ELF) $(DISK_ELF) $(DISKTEST_ELF) $(VFS_ELF) $(NET_ELF) $(SHELL_ELF) $(ECHO_ELF) $(LS_ELF) $(CAT_ELF) $(LOGIN_ELF) $(PS_ELF) $(IPCPING_ELF) $(PING_ELF) $(HTTPGET_ELF) $(SHUTDOWN_ELF) $(CAPDEMO_ELF) $(THREADTEST_ELF)
+user: $(INIT_ELF) $(HOSTED_ELFS) $(NS_ELF) $(KBD_ELF) $(CON_ELF) $(INP_ELF) $(DISK_ELF) $(DISKTEST_ELF) $(VFS_ELF) $(NET_ELF) $(SHELL_ELF) $(ECHO_ELF) $(LS_ELF) $(CAT_ELF) $(LOGIN_ELF) $(PS_ELF) $(IPCPING_ELF) $(PING_ELF) $(SHUTDOWN_ELF) $(CAPDEMO_ELF) $(THREADTEST_ELF) $(SOCKTEST_ELF)
 
 $(INIT_ELF): FORCE
 	cd $(INIT_DIR) && cargo build --release
 
-# quark-rt reaches the hosted binary only through the fork's library/Cargo.toml
+# quark-rt reaches a hosted binary only through the fork's library/Cargo.toml
 # patch, and `cargo -Z build-std` does not propagate that dependency into its
-# fingerprints: editing quark-rt leaves hello linked against the previous copy,
-# and cargo reports "Finished" without rebuilding. That silently produced a
-# hello carrying the pre-Phase-0 syscall numbers while the kernel had moved to
+# fingerprints: editing quark-rt leaves the program linked against the previous
+# copy, and cargo reports "Finished" without rebuilding. That silently produced
+# a hello carrying the pre-Phase-0 syscall numbers while the kernel had moved to
 # the new ones, which faulted as #UD out of the alloc error handler.
 #
 # Hash the quark-rt sources and clean the hosted build when they change. std
 # genuinely has to be recompiled in that case — it links quark-rt — so the cost
 # is inherent, not overhead. The stamp is written only after a successful
 # build, so an interrupted one does not mark itself current.
+# The whole of the fork's `sys` tree, not just its quark-named files. Listing
+# those by hand missed sys/net/connection/mod.rs, which is where a platform is
+# routed to its own module: adding Quark there changed nothing, cargo reported
+# "Finished", and httpget went on linking std's `unsupported` socket stubs —
+# compiling perfectly and failing at run time.
 QUARK_RT_SRCS := $(wildcard user/quark-rt/src/*.rs) user/quark-rt/Cargo.toml \
-                 $(wildcard $(QUARK_RUST_STD_PATH)/std/src/sys/pal/quark/*.rs) \
-                 $(wildcard $(QUARK_RUST_STD_PATH)/std/src/sys/*/quark.rs) \
-                 $(wildcard $(QUARK_RUST_STD_PATH)/std/src/sys/io/*/quark.rs) \
-                 $(wildcard $(QUARK_RUST_STD_PATH)/std/src/sys/net/connection/quark.rs)
-HELLO_STAMP := $(HELLO_DIR)/target/.quark-rt-stamp
+                 $(shell find $(QUARK_RUST_STD_PATH)/std/src/sys -name '*.rs' 2>/dev/null | sort)
 
-$(HELLO_ELF): FORCE
-	@new=`cat $(QUARK_RT_SRCS) | md5sum | cut -d' ' -f1`; \
-	 old=`cat $(HELLO_STAMP) 2>/dev/null || echo none`; \
-	 if [ "$$new" != "$$old" ]; then \
-	   echo "  quark-rt changed since the last hosted build - cleaning std"; \
-	   (cd $(HELLO_DIR) && cargo clean); \
+# One recipe, instantiated per hosted program. A pattern rule cannot do this:
+# the program name appears twice in the path, and make allows a single % in a
+# target. The program name is also its directory and its binary, so $(1) is the
+# only thing that varies.
+define HOSTED_BUILD_RULE
+user/$(1)/target/$$(HOSTED_TARGET)/release/$(1): FORCE
+	@new=`cat $$(QUARK_RT_SRCS) | md5sum | cut -d' ' -f1`; \
+	 old=`cat user/$(1)/target/.quark-rt-stamp 2>/dev/null || echo none`; \
+	 if [ "$$$$new" != "$$$$old" ]; then \
+	   echo "  quark-rt changed since the last hosted build - cleaning std for $(1)"; \
+	   (cd user/$(1) && cargo clean); \
 	 fi
-	cd $(HELLO_DIR) && __CARGO_TESTS_ONLY_SRC_ROOT=$(realpath $(QUARK_RUST_STD_PATH)) cargo build --release --target ../../x86_64-unknown-quark.json -Z build-std=std,panic_abort -Z build-std-features=compiler-builtins-mem -Z json-target-spec
-	@mkdir -p $(dir $(HELLO_STAMP)) && cat $(QUARK_RT_SRCS) | md5sum | cut -d' ' -f1 > $(HELLO_STAMP)
+	cd user/$(1) && __CARGO_TESTS_ONLY_SRC_ROOT=$$(realpath $$(QUARK_RUST_STD_PATH)) cargo build --release --target ../../x86_64-unknown-quark.json -Z build-std=std,panic_abort -Z build-std-features=compiler-builtins-mem -Z json-target-spec
+	@cat $$(QUARK_RT_SRCS) | md5sum | cut -d' ' -f1 > user/$(1)/target/.quark-rt-stamp
+endef
+
+$(foreach p,$(HOSTED_PROGRAMS),$(eval $(call HOSTED_BUILD_RULE,$(p))))
 
 $(NS_ELF): FORCE
 	cd $(NS_DIR) && cargo build --release
@@ -192,6 +195,9 @@ $(CAPDEMO_ELF): FORCE
 $(THREADTEST_ELF): FORCE
 	cd $(THREADTEST_DIR) && cargo build --release
 
+$(SOCKTEST_ELF): FORCE
+	cd $(SOCKTEST_DIR) && cargo build --release
+
 $(LOGIN_ELF): FORCE
 	cd $(LOGIN_DIR) && cargo build --release
 
@@ -203,9 +209,6 @@ $(IPCPING_ELF): FORCE
 
 $(PING_ELF): FORCE
 	cd $(PING_DIR) && cargo build --release
-
-$(HTTPGET_ELF): FORCE
-	cd $(HTTPGET_DIR) && cargo build --release
 
 $(SHUTDOWN_ELF): FORCE
 	cd $(SHUTDOWN_DIR) && cargo build --release
@@ -247,7 +250,7 @@ BOOT_SERVICES := nameserver:NAMESRVR keyboard:KEYBOARD console:CONSOLE \
                  input:INPUT disk:DISK vfs:VFS net:NET
 USR_PROGRAMS  := disktest:DISKTEST shell:SHELL echo:ECHO ls:LS cat:CAT \
                  login:LOGIN ps:PS ipcping:IPCPING ping:PING \
-                 httpget:HTTPGET shutdown:SHUTDOWN capdemo:CAPDEMO threadtest:THREADTEST
+                 shutdown:SHUTDOWN capdemo:CAPDEMO threadtest:THREADTEST socktest:SOCKTEST
 
 install: all
 	@mkdir -p $(DESTDIR)/drivers $(DESTDIR)/boot $(DESTDIR)/usr/bin $(DESTDIR)/etc
@@ -262,13 +265,16 @@ install: all
 		src=$${p%%:*}; dst=$${p##*:}; \
 		cp user/$$src/target/$(TARGET)/release/$$src $(DESTDIR)/usr/bin/$$dst.ELF; \
 	done
-	@# Gate on the fork, not on the file: a hello left over from an earlier
-	@# build cannot be shown to match the current tree, and shipping a stale
-	@# one is how it ended up calling pre-Phase-0 syscall numbers.
+	@# Gate on the fork, not on the files: a hosted binary left over from an
+	@# earlier build cannot be shown to match the current tree, and shipping a
+	@# stale one is how hello ended up calling pre-Phase-0 syscall numbers.
 ifeq ($(HAVE_STD_FORK),)
-	@echo "  (no std fork - HELLO.ELF omitted rather than shipped stale)"
+	@echo "  (no std fork - $(HOSTED_PROGRAMS) omitted rather than shipped stale)"
 else
-	@cp $(HELLO_ELF) $(DESTDIR)/usr/bin/HELLO.ELF
+	@for p in $(HOSTED_PROGRAMS); do \
+	   cp user/$$p/target/$(HOSTED_TARGET)/release/$$p \
+	      $(DESTDIR)/usr/bin/`echo $$p | tr a-z A-Z`.ELF; \
+	 done
 endif
 	@cp rootfs/etc/passwd $(DESTDIR)/etc/PASSWD
 	@echo "installed to $(DESTDIR)"
@@ -278,7 +284,6 @@ clean:
 	cd $(VGA_DRV_DIR) && cargo clean
 	cd $(FAT32_DRV_DIR) && cargo clean
 	cd $(INIT_DIR) && cargo clean
-	cd $(HELLO_DIR) && cargo clean
 	cd $(NS_DIR) && cargo clean
 	cd $(KBD_DIR) && cargo clean
 	cd $(CON_DIR) && cargo clean
@@ -295,8 +300,8 @@ clean:
 	cd $(PS_DIR) && cargo clean
 	cd $(IPCPING_DIR) && cargo clean
 	cd $(PING_DIR) && cargo clean
-	cd $(HTTPGET_DIR) && cargo clean
 	cd $(SHUTDOWN_DIR) && cargo clean
+	@for p in $(HOSTED_PROGRAMS); do (cd user/$$p && cargo clean); done
 	rm -rf $(KERNEL) $(VGA_DRV_BIN) $(FAT32_DRV_BIN) quark.iso isodir
 
 FORCE:

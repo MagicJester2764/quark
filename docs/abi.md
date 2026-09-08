@@ -1,6 +1,6 @@
 # Quark syscall ABI
 
-**Version 1.2.** Query the running kernel with `SYS_ABI_VERSION` (240), which
+**Version 1.3.** Query the running kernel with `SYS_ABI_VERSION` (240), which
 returns `(major << 16) | minor`.
 
 This document is the contract between the Quark kernel and everything above it.
@@ -60,10 +60,12 @@ unused slots in a block are reserved for that subsystem.
 | 0x80  | 128–143   | Synchronisation               |
 | 0x90  | 144–159   | Time                          |
 | 0xA0  | 160–175   | Kernel debug console          |
+| 0xB0  | 176–191   | Sockets                       |
 | 0xF0  | 240–255   | ABI introspection             |
 
-Blocks 0xB0–0xE0 are unassigned and available for new subsystems — sockets and
-threads are the two expected to claim one.
+Blocks 0xC0–0xE0 are unassigned and available for new subsystems. Threads
+never needed one: a thread is a task started with its creator's address space,
+so it is built from calls that already existed.
 
 ## Stability and deprecation
 
@@ -86,6 +88,7 @@ threads are the two expected to claim one.
 | 1.0 | The ABI as first frozen. |
 | 1.1 | `SYS_ADDRSPACE_SELF` (41), `SYS_SET_FS_BASE` (102), `SYS_TASK_START_ARG` (103) — what a thread needs: the caller's own address space to share, a per-task FS base for thread-local storage, and an argument to hand the new thread. |
 | 1.2 | `SYS_FUTEX_WAIT_TIMEOUT` (130). |
+| 1.3 | `SYS_SOCK_FD` (176), `SYS_SOCK_INFO` (177) — a network connection as a file descriptor. |
 
 Five calls are **deprecated as of 1.0** — the `CAP_*` object-capability calls
 (80–85) replace them:
@@ -317,6 +320,39 @@ it as a resource limit rather than as a bad argument.
 
 The PIT runs at 100 Hz, so one tick is 10 ms. Every timeout argument in this
 ABI is in ticks.
+
+### Sockets (0xB0)
+
+| # | Name | Arguments | Returns | Cap |
+|---|---|---|---|---|
+| 176 | `SYS_SOCK_FD` | arg0 = net server tid, arg1 = connection handle | the new fd / `u64::MAX` | Endpoint to the net server |
+| 177 | `SYS_SOCK_INFO` | arg0 = fd | `(net_tid << 32) \| handle` / `u64::MAX` | — |
+
+A socket is a connection the net server already holds, bound to a descriptor in
+the calling task's fd table. `SYS_FD_READ` and `SYS_FD_WRITE` on that descriptor
+carry data to and from the server, in the same chunked-IPC form they use for a
+service — so a socket is read and written by code that has no idea it is one.
+
+The handle is **not** checked here. Connections belong to the task that opened
+them, and the net server refuses one named by anybody else; the kernel stamps
+the sender on every message, so it cannot be forged. What is checked is the
+right to talk to that server at all, once, at bind time, rather than on every
+read and write.
+
+The lowest free descriptor from 3 upwards is used. 0, 1 and 2 are stdio by
+convention even when unset, and handing one out would silently redirect a
+program's output into a socket.
+
+Closing is not a kernel operation: the connection is the net server's, and
+`quark_rt::socket` closes it through `TAG_TCP_CLOSE` when the stream is
+dropped. `SYS_SOCK_INFO` exists so a program holding only a descriptor can
+recover what to close.
+
+**Throughput.** The fd path carries 40 bytes per message, so a socket does a
+round trip per 40 bytes rather than per page. That is the cost of going through
+the same path as every other descriptor. It is a data-path change to fix and
+not an interface one; the page-based calls the net server has always had remain
+for a caller that needs the bandwidth.
 
 ### Kernel debug console (0xA0)
 

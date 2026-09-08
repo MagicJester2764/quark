@@ -753,6 +753,31 @@ pub fn set_fd(tid: usize, fd: usize, entry: crate::task::FdKind) -> Result<(), (
     }
 }
 
+/// Claim the lowest free descriptor on the current task.
+///
+/// Sockets are created by the task that will use them, rather than wired up by
+/// a parent the way stdio and pipes are, so there is nobody to say which fd
+/// number to use.
+pub fn current_alloc_fd(entry: crate::task::FdKind) -> Result<usize, ()> {
+    unsafe {
+        let tid = CURRENT_TID.load(Ordering::SeqCst);
+        match TASKS[tid].as_mut() {
+            Some(task) => {
+                // 0, 1 and 2 are stdio by convention even when unset, and
+                // handing one out would silently redirect a program's output.
+                for fd in 3..crate::task::MAX_FDS {
+                    if task.fds[fd].is_empty() {
+                        task.fds[fd] = entry;
+                        return Ok(fd);
+                    }
+                }
+                Err(())
+            }
+            None => Err(()),
+        }
+    }
+}
+
 /// Set the pager task for a given task.
 pub fn set_pager(tid: usize, pager_tid: usize) -> Result<(), ()> {
     // pager_tid is used to index TASK_IPC in ipc::fault_call, so it has to be

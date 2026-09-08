@@ -5,12 +5,8 @@
 mod font8x16;
 
 use quark_rt::ipc::{Message, TID_ANY};
+use quark_rt::nameserver;
 use quark_rt::{println, syscall};
-
-const NAMESERVER_TID: usize = 2;
-
-// Nameserver protocol
-const TAG_NS_REGISTER: u64 = 1;
 
 // Init -> console: framebuffer initialization
 const TAG_FB_INIT: u64 = 100;
@@ -87,7 +83,9 @@ pub extern "C" fn _start() -> ! {
     let _ = syscall::sys_reply(msg.sender, &reply);
 
     // Register with nameserver
-    register_with_nameserver();
+    if nameserver::register(b"console").is_ok() {
+        println!("[console] Registered with nameserver.");
+    }
 
     println!("[console] Ready.");
 
@@ -454,26 +452,6 @@ unsafe fn draw_cursor_block(color: u32) {
                 ptr.add(2).write_volatile((color >> 16) as u8);
             }
         }
-    }
-}
-
-fn register_with_nameserver() {
-    let name = b"console";
-    let mut buf = [0u8; 24];
-    buf[..name.len()].copy_from_slice(name);
-    let w0 = u64::from_le_bytes(buf[0..8].try_into().unwrap());
-    let w1 = u64::from_le_bytes(buf[8..16].try_into().unwrap());
-    let w2 = u64::from_le_bytes(buf[16..24].try_into().unwrap());
-
-    let msg = Message {
-        sender: 0,
-        tag: TAG_NS_REGISTER,
-        data: [w0, w1, w2, 0, 0, 0],
-    };
-
-    let mut reply = Message::empty();
-    if syscall::sys_call(NAMESERVER_TID, &msg, &mut reply).is_ok() {
-        println!("[console] Registered with nameserver.");
     }
 }
 
