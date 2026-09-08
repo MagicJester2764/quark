@@ -227,13 +227,14 @@ pub unsafe extern "C" fn enter_user_trampoline() {
         "mov rdi, r12",  // entry
         "mov rsi, r13",  // stack
         "mov rdx, r14",  // pml4
+        "mov rcx, r15",  // value handed to the entry point
         "call {inner}",
         inner = sym enter_user_inner,
     );
 }
 
 /// Inner function called by the trampoline with proper C ABI args.
-fn enter_user_inner(entry: u64, stack: u64, pml4: u64) {
+fn enter_user_inner(entry: u64, stack: u64, pml4: u64, arg: u64) {
     // Switch to the user's address space
     unsafe {
         paging::write_cr3(pml4 as usize);
@@ -250,7 +251,7 @@ fn enter_user_inner(entry: u64, stack: u64, pml4: u64) {
 
     // Enter user mode
     unsafe {
-        syscall::enter_usermode(entry, stack);
+        syscall::enter_usermode(entry, stack, arg);
     }
 }
 
@@ -303,6 +304,7 @@ pub fn spawn_init(elf_data: &[u8], fb: Option<crate::multiboot2::FramebufferInfo
         task.context.r12 = entry;
         task.context.r13 = stack_top;
         task.context.r14 = pml4 as u64;
+        task.context.r15 = 0;
     }
 
     // Map boot info page at BOOT_INFO_ADDR

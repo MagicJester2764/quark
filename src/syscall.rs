@@ -106,6 +106,16 @@ pub const SYS_GET_UID: u64 = 98;
 pub const SYS_SET_UID: u64 = 99;
 pub const SYS_SET_GID: u64 = 100;
 pub const SYS_GET_TUID: u64 = 101;
+/// Set the calling task's FS base, where its thread-locals live. Per task and
+/// self-directed, so it needs no capability: a task can already write any of
+/// its own memory.
+pub const SYS_SET_FS_BASE: u64 = 102;
+/// As SYS_TASK_START, but also places a value in the new task's RDI.
+///
+/// A thread entry needs its closure, and SYS_TASK_START has nowhere to put
+/// one. Added rather than extending SYS_TASK_START, whose callers pass four
+/// arguments and would leave the fifth register undefined.
+pub const SYS_TASK_START_ARG: u64 = 103;
 
 // --- 0x70  hardware and drivers ---
 pub const SYS_IRQ_REGISTER: u64 = 112;
@@ -384,6 +394,25 @@ extern "C" fn syscall_dispatch(
         }
         SYS_EXIT_CODE => {
             scheduler::exit_with(arg0 as i32)
+        }
+        SYS_SET_FS_BASE => {
+            let base = arg0;
+            // Must be a user address: FS is used by user code, and a kernel
+            // base would let a task read through it with SMAP inactive.
+            if base >= USER_ADDR_LIMIT {
+                return u64::MAX;
+            }
+            let tid = scheduler::current_tid();
+            match unsafe { scheduler::get_task_mut(tid) } {
+                Some(t) => {
+                    t.fs_base = base;
+                    // Effective now, not at the next switch: the caller is
+                    // running and will use it before it is scheduled again.
+                    crate::cpu::set_fs_base(base);
+                    0
+                }
+                None => u64::MAX,
+            }
         }
         SYS_ADDRSPACE_SELF => {
             match unsafe { scheduler::get_task_mut(scheduler::current_tid()) } {
@@ -675,7 +704,7 @@ extern "C" fn syscall_dispatch(
             }
             0
         }
-        SYS_TASK_START => {
+        SYS_TASK_START | SYS_TASK_START_ARG => {
             // arg0=tid, arg1=rip, arg2=rsp, arg3=cr3
             if !crate::cap::task_has_task_mgmt(scheduler::current_tid(), 0) {
                 return u64::MAX;
@@ -697,7 +726,10 @@ extern "C" fn syscall_dispatch(
             if !crate::userspace::may_use_address_space(scheduler::current_tid(), cr3) {
                 return u64::MAX;
             }
-            match scheduler::start_task(tid, rip, rsp, cr3) {
+            // arg4 carries the value for RDI; SYS_TASK_START leaves it zero
+            // because syscall4 never sets that register.
+            let entry_arg = if nr == SYS_TASK_START_ARG { arg4 } else { 0 };
+            match scheduler::start_task(tid, rip, rsp, cr3, entry_arg) {
                 Ok(()) => 0,
                 Err(()) => u64::MAX,
             }
@@ -1529,7 +1561,7 @@ pub fn update_kernel_rsp(rsp: u64) {
 ///
 /// # Safety
 /// `rip` must point to valid user code, `rsp` to a valid user stack.
-pub unsafe fn enter_usermode(rip: u64, rsp: u64) -> ! { unsafe {
+pub unsafe fn enter_usermode(rip: u64, rsp: u64, arg: u64) -> ! { unsafe {
     core::arch::asm!(
         "pushq {user_ss}",             // SS
         "pushq {user_rsp}",            // RSP
@@ -1545,6 +1577,9 @@ pub unsafe fn enter_usermode(rip: u64, rsp: u64) -> ! { unsafe {
         user_rsp = in(reg) rsp,
         user_cs = in(reg) 0x33u64,      // 0x30 | 3
         user_rip = in(reg) rip,
+        // The entry point's first argument. A thread needs its closure, and
+        // iretq leaves the general registers alone, so RDI simply survives.
+        in("rdi") arg,
         options(att_syntax, nostack, noreturn)
     );
 }}

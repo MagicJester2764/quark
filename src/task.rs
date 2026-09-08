@@ -81,6 +81,12 @@ pub struct Task {
     /// Exit status reported to a parent waiting in sys_wait.
     /// Negative values indicate abnormal termination (killed/signalled).
     pub exit_code: i32,
+    /// FS segment base, restored on every switch into this task.
+    ///
+    /// Threads share an address space, so a thread-local needs a per-task
+    /// register to distinguish one thread's copy from another's. FS is that
+    /// register: `thread_local!` compiles to an offset from it.
+    pub fs_base: u64,
     /// User ID. 0 = root.
     pub uid: u32,
     /// Group ID. 0 = root.
@@ -145,6 +151,7 @@ impl Task {
             mem_pages: 0,
             mem_limit: 0,
             exit_code: 0,
+            fs_base: 0,
             uid: 0,
             gid: 0,
         }

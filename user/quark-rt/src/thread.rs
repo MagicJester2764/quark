@@ -50,6 +50,19 @@ impl Thread {
     }
 }
 
+/// Start `entry` on a new thread, handing it `arg`.
+///
+/// This is what a runtime needs: `entry` is a trampoline and `arg` the boxed
+/// closure it should run. [`spawn`] is the same thing with no argument.
+pub fn spawn_with_arg(
+    entry: extern "C" fn(usize) -> !,
+    arg: usize,
+    slot: usize,
+    stack_pages: usize,
+) -> Result<Thread, ()> {
+    start(entry as usize as u64, arg as u64, slot, stack_pages)
+}
+
 /// Start `entry` on a new thread in this address space.
 ///
 /// `slot` distinguishes this thread's stack from other threads' — pass a
@@ -69,6 +82,10 @@ pub fn spawn_with_stack(
     slot: usize,
     stack_pages: usize,
 ) -> Result<Thread, ()> {
+    start(entry as usize as u64, 0, slot, stack_pages)
+}
+
+fn start(entry: u64, arg: u64, slot: usize, stack_pages: usize) -> Result<Thread, ()> {
     if stack_pages == 0 {
         return Err(());
     }
@@ -86,6 +103,6 @@ pub fn spawn_with_stack(
         syscall::sys_map_phys(frame, bottom + p * crate::spawn::PAGE_SIZE, 1)?;
     }
 
-    syscall::sys_task_start(tid, entry as usize as u64, top as u64, cr3)?;
+    syscall::sys_task_start_arg(tid, entry, top as u64, cr3, arg)?;
     Ok(Thread { tid })
 }

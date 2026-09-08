@@ -64,6 +64,7 @@ pub fn init() {
             mem_pages: 0,
             mem_limit: 0,
             exit_code: 0,
+            fs_base: 0,
             uid: 0,
             gid: 0,
         });
@@ -259,6 +260,12 @@ unsafe fn schedule_inner(from_irq: bool) { unsafe {
         crate::syscall::update_kernel_rsp(kernel_stack_top);
         crate::idt::update_tss_rsp0(kernel_stack_top);
     }
+
+    // Threads share an address space, so FS is what tells one thread's
+    // thread-locals from another's. Written unconditionally: comparing against
+    // the outgoing value first would need per-CPU state for no measurable gain
+    // at this scheduler's switch rate.
+    crate::cpu::set_fs_base(new_task.fs_base);
 
     // Get raw pointers to contexts
     let old_ctx = &raw mut TASKS[current_tid].as_mut().unwrap().context;
@@ -654,6 +661,7 @@ pub fn create_empty_task() -> Option<usize> {
             mem_pages: 0,
             mem_limit: 0,
             exit_code: 0,
+            fs_base: 0,
             uid: parent_uid,
             gid: parent_gid,
         });
@@ -664,7 +672,10 @@ pub fn create_empty_task() -> Option<usize> {
 }
 
 /// Configure and start a previously created empty task for userspace entry.
-pub fn start_task(tid: usize, rip: u64, rsp: u64, cr3: usize) -> Result<(), ()> {
+/// Start `tid` in `cr3` at `rip`, with `arg` in RDI.
+///
+/// `arg` is how a thread receives its closure; ordinary spawns pass 0.
+pub fn start_task(tid: usize, rip: u64, rsp: u64, cr3: usize, arg: u64) -> Result<(), ()> {
     if tid >= MAX_TASKS {
         return Err(());
     }
@@ -700,6 +711,7 @@ pub fn start_task(tid: usize, rip: u64, rsp: u64, cr3: usize) -> Result<(), ()> 
         task.context.r12 = rip;
         task.context.r13 = rsp;
         task.context.r14 = cr3 as u64;
+        task.context.r15 = arg;
 
         task.state = TaskState::Ready;
         enqueue(tid);

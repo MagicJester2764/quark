@@ -73,6 +73,8 @@ pub const SYS_GET_UID: u64 = 98;
 pub const SYS_SET_UID: u64 = 99;
 pub const SYS_SET_GID: u64 = 100;
 pub const SYS_GET_TUID: u64 = 101;
+pub const SYS_SET_FS_BASE: u64 = 102;
+pub const SYS_TASK_START_ARG: u64 = 103;
 
 // --- 0x70  hardware and drivers ---
 pub const SYS_IRQ_REGISTER: u64 = 112;
@@ -763,4 +765,28 @@ pub fn sys_abi_version() -> (u32, u32) {
 pub fn sys_addrspace_self() -> Result<usize, ()> {
     let ret = unsafe { syscall0(SYS_ADDRSPACE_SELF) };
     if ret == u64::MAX { Err(()) } else { Ok(ret as usize) }
+}
+
+/// Set this task's FS base, where its thread-locals live.
+///
+/// Per task and self-directed, so it needs no capability: a task can already
+/// write any of its own memory. Takes effect immediately, not at the next
+/// context switch.
+pub fn sys_set_fs_base(base: usize) -> Result<(), ()> {
+    let ret = unsafe { syscall1(SYS_SET_FS_BASE, base as u64) };
+    if ret == u64::MAX { Err(()) } else { Ok(()) }
+}
+
+/// As [`sys_task_start`], but hands `arg` to the entry point in RDI.
+pub fn sys_task_start_arg(
+    tid: usize,
+    rip: u64,
+    rsp: u64,
+    cr3: usize,
+    arg: u64,
+) -> Result<(), ()> {
+    let ret = unsafe {
+        syscall5(SYS_TASK_START_ARG, tid as u64, rip, rsp, cr3 as u64, arg)
+    };
+    if ret == u64::MAX { Err(()) } else { Ok(()) }
 }

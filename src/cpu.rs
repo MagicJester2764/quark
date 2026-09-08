@@ -118,3 +118,24 @@ impl Drop for UserAccess {
         }
     }
 }
+
+/// IA32_FS_BASE. The base FS-relative addressing resolves against, which is
+/// where a thread's thread-locals live.
+const MSR_FS_BASE: u32 = 0xC000_0100;
+
+/// Set the FS segment base for the task about to run.
+///
+/// Called on every switch. Writing an MSR is not free, but a thread-local read
+/// has to be a plain FS-relative load with no test in it, so the cost belongs
+/// here rather than in every access.
+pub fn set_fs_base(base: u64) {
+    unsafe {
+        core::arch::asm!(
+            "wrmsr",
+            in("ecx") MSR_FS_BASE,
+            in("eax") base as u32,
+            in("edx") (base >> 32) as u32,
+            options(nostack, preserves_flags),
+        );
+    }
+}
