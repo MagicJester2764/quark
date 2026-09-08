@@ -218,11 +218,22 @@ pub unsafe fn init() {
     let efer = read_msr(MSR_EFER);
     write_msr(MSR_EFER, efer | 1); // SCE
 
-    // STAR[47:32] = kernel CS for syscall, STAR[63:48] = base for sysret
-    // sysret 64-bit: CS = (base+16)|3, SS = (base+8)|3
-    // base=0x20 → CS=0x33 (selector 0x30), SS=0x2B (selector 0x28)
-    // GDT: [0x28]=user data, [0x30]=user code ✓
-    let star = (0x0020_u64 << 48) | (KERNEL_CS << 32);
+    // STAR[47:32] = kernel CS for syscall, STAR[63:48] = the base sysret does
+    // arithmetic on: CS = base + 16, SS = base + 8.
+    //
+    // The base carries RPL 3 itself rather than relying on the CPU to add it.
+    // Intel's SYSRET ORs 3 into both selectors; **AMD's does not do so for
+    // SS**, so a base of 0x20 gives CS = 0x33 and SS = 0x28 — a stack selector
+    // with RPL 0 while running at CPL 3. Nothing complains until a hardware
+    // interrupt arrives in user mode: the CPU pushes that SS, and the `iretq`
+    // returning to ring 3 faults because the return SS and CS disagree about
+    // privilege. #GP inside the kernel, on an AMD machine only, at whatever
+    // moment a timer tick happened to land after a system call.
+    //
+    // 0x23 is not a selector anything loads — only the number sysret adds to.
+    // GDT: [0x28] = user data, [0x30] = user code, so 0x23 + 8 = 0x2B and
+    // 0x23 + 16 = 0x33, both already RPL 3, on either vendor.
+    let star = (0x0023_u64 << 48) | (KERNEL_CS << 32);
     write_msr(MSR_STAR, star);
 
     write_msr(MSR_LSTAR, syscall_entry as *const () as u64);

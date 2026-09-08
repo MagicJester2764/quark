@@ -422,6 +422,13 @@ extern "C" fn exception_handler(frame: &InterruptFrame) {
     }
     crate::serial::puts(b" tid=");
     crate::serial::put_usize(crate::scheduler::current_tid());
+    // Where the kernel stack actually is, because an rsp on its own does not
+    // say whether it had run out.
+    let (kbase, ktop) = crate::scheduler::current_kernel_stack();
+    crate::serial::puts(b" kstack=0x");
+    crate::serial::put_hex_usize(kbase);
+    crate::serial::puts(b"..0x");
+    crate::serial::put_hex_usize(ktop);
     crate::serial::puts(b"]\n");
     console::puts(b"\n!!! EXCEPTION: ");
     if vec < 32 {
