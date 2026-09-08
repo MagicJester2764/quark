@@ -5,14 +5,17 @@ and must be checked out as siblings:
 
 ```
 repos/
-  quark/   this repo — kernel, drivers, user space
-  bang/    UEFI bootloader; also owns the disk image and QEMU targets
-  rust/    fork of rust-lang/rust carrying the x86_64-unknown-quark std PAL
+  quark/       this repo — kernel, drivers, user space
+  bang/        UEFI bootloader, and nothing else
+  explosion/   the distro: stages the other two and assembles the image
+  rust/        fork of rust-lang/rust carrying the x86_64-unknown-quark std PAL
 ```
 
-`bang` refers to `../quark`, and the fork's `library/Cargo.toml` patches
-`quark-rt` through the relative path `../../quark/user/quark-rt`. Anything
-other than a flat sibling layout breaks the build.
+`explosion` refers to `../quark` and `../bang`, and the fork's
+`library/Cargo.toml` patches `quark-rt` through the relative path
+`../../quark/user/quark-rt`. Anything other than a flat sibling layout breaks
+the build. The dependency runs one way — the distro reaches down to the kernel
+and the bootloader, never the reverse.
 
 ## Toolchain
 
@@ -54,16 +57,26 @@ you debug the wrong binary.
 ## Build and run
 
 ```bash
-cd ../bang
-make sync-quark   # builds the kernel + all user programs, copies artifacts here
-make hd           # assembles hdimage.bin
-make run          # QEMU
+make            # kernel, drivers and every user program
+make install DESTDIR=<dir>   # stage the artifacts for a distro to consume
+
+cd ../explosion
+make run        # stage both trees, assemble the image, boot it in QEMU
 ```
 
-`make sync-quark` compiles `std` from source and is the memory-hungriest step;
-an unexplained build death is usually the OOM killer.
+Quark builds a kernel and the programs that run on it. It does not know what an
+image looks like, and nothing here reaches into a sibling repo — `make install`
+lays artifacts out and ExplOSion collects them.
 
-`make run` passes `-cpu max` deliberately. QEMU's default CPU models expose
+The hosted `hello` compiles `std` from source and is the memory-hungriest step;
+an unexplained build death is usually the OOM killer. Note that
+`cargo -Z build-std` does not track `quark-rt`, which reaches `hello` only
+through the fork's `library/Cargo.toml` patch, so the Makefile hashes the
+quark-rt sources and cleans the hosted build when they change. Without that,
+editing quark-rt leaves a stale `hello` linked against the previous copy —
+which is how it ended up calling pre-Phase-0 syscall numbers and faulting.
+
+ExplOSion's QEMU targets pass `-cpu max` deliberately. Default CPU models expose
 neither SMEP nor SMAP, so the kernel's supervisor-mode protections are silently
 inactive without it — a boot test on the default CPU proves nothing about them.
 The kernel prints which it enabled to serial at boot.

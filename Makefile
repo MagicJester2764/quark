@@ -76,7 +76,7 @@ HTTPGET_ELF := $(HTTPGET_DIR)/target/$(TARGET)/release/httpget
 SHUTDOWN_DIR := user/shutdown
 SHUTDOWN_ELF := $(SHUTDOWN_DIR)/target/$(TARGET)/release/shutdown
 
-.PHONY: check-abi all clean iso run run-uefi drivers user rootfs FORCE
+.PHONY: check-abi install all clean iso run run-uefi drivers user rootfs FORCE
 
 check-abi:
 	@./tools/check-abi.sh
@@ -198,6 +198,43 @@ run: iso
 run-uefi: iso
 	qemu-system-x86_64 -cdrom quark.iso \
 		-drive if=pflash,format=raw,readonly=on,file=/usr/share/edk2/ovmf/OVMF_CODE.fd
+
+# Stage build artifacts for whoever assembles an image out of them.
+#
+# Quark builds a kernel and the programs that run on it; it does not know what
+# an image looks like or where one is mounted. `make install DESTDIR=<dir>`
+# lays the artifacts out in the shape a distro consumes, and nothing here
+# reaches into a sibling repo to put them somewhere.
+#
+#   $(DESTDIR)/kernel.bin
+#   $(DESTDIR)/drivers/      loaded by the bootloader from the ESP
+#   $(DESTDIR)/boot/         essential services, staged into boot.img
+#   $(DESTDIR)/usr/bin/      everything else, staged into the root filesystem
+#   $(DESTDIR)/etc/
+DESTDIR ?= dist
+
+BOOT_SERVICES := nameserver:NAMESRVR keyboard:KEYBOARD console:CONSOLE \
+                 input:INPUT disk:DISK vfs:VFS net:NET
+USR_PROGRAMS  := disktest:DISKTEST shell:SHELL echo:ECHO ls:LS cat:CAT \
+                 login:LOGIN ps:PS ipcping:IPCPING ping:PING \
+                 httpget:HTTPGET shutdown:SHUTDOWN
+
+install: all
+	@mkdir -p $(DESTDIR)/drivers $(DESTDIR)/boot $(DESTDIR)/usr/bin $(DESTDIR)/etc
+	@cp $(KERNEL) $(DESTDIR)/kernel.bin
+	@cp $(VGA_DRV_BIN) $(FAT32_DRV_BIN) $(DESTDIR)/drivers/
+	@cp $(INIT_ELF) $(DESTDIR)/drivers/init.elf
+	@for p in $(BOOT_SERVICES); do \
+		src=$${p%%:*}; dst=$${p##*:}; \
+		cp user/$$src/target/$(TARGET)/release/$$src $(DESTDIR)/boot/$$dst.ELF; \
+	done
+	@for p in $(USR_PROGRAMS); do \
+		src=$${p%%:*}; dst=$${p##*:}; \
+		cp user/$$src/target/$(TARGET)/release/$$src $(DESTDIR)/usr/bin/$$dst.ELF; \
+	done
+	@cp $(HELLO_ELF) $(DESTDIR)/usr/bin/HELLO.ELF
+	@cp rootfs/etc/passwd $(DESTDIR)/etc/PASSWD
+	@echo "installed to $(DESTDIR)"
 
 clean:
 	cargo clean
