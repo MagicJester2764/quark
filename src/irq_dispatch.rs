@@ -94,10 +94,25 @@ pub fn dispatch_irq(irq: u8) -> bool {
         data: [0; 6],
     };
 
-    state.rings[idx].push(msg);
+    let queued = state.rings[idx].push(msg);
     // Drop lock before calling scheduler (avoids potential ordering issues)
     drop(state);
     scheduler::unblock_task(tid);
+
+    if !queued {
+        // The ring was full, so this notification is gone — and with it the
+        // `sys_irq_ack` that would have acknowledged this interrupt. Lines
+        // delegated to user space are acknowledged by the driver, so an
+        // interrupt nobody is told about is one the PIC never hears the end
+        // of: its in-service bit stays set and the line delivers nothing
+        // again, ever. A keyboard that stops mid-sentence and never comes
+        // back is what that looks like.
+        //
+        // Losing the notification is survivable — a driver that drains its
+        // device collects the work on the next one. Losing the EOI is not,
+        // so it is sent here.
+        unsafe { crate::pic::send_eoi(irq) };
+    }
 
     true
 }

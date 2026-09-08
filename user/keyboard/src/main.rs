@@ -158,90 +158,38 @@ pub extern "C" fn _start() -> ! {
         }
 
         if msg.sender == 0 {
-            // IRQ notification from kernel — read scancode
-            let raw = syscall::sys_ioport_read(0x60) as u8;
+            // Take everything the controller has, not one byte per
+            // notification. The kernel's per-IRQ queue is eight deep and drops
+            // silently when it is full, so a burst of typing on a busy machine
+            // loses notifications — and with one byte each, that lost every
+            // keystroke behind them. Draining means a lost notification costs
+            // nothing: the next wake-up collects what the last one left.
+            //
+            // Bit 0 of the status port says there is a byte waiting. The bound
+            // is in case a controller lies about that, so a wedged keyboard
+            // cannot become a wedged system.
+            let mut budget = 64;
+            loop {
+                let raw = syscall::sys_ioport_read(0x60) as u8;
+                handle_scancode(
+                    raw,
+                    &mut extended,
+                    &mut modifiers,
+                    &mut keybuf,
+                    sigint_tid,
+                    &mut waiting_client,
+                );
+                budget -= 1;
+                // Bit 0 of the status port says another byte is already
+                // waiting. Asked after the read rather than before it: the
+                // byte this notification is about is there whether or not the
+                // controller admits it, and reading unconditionally is what
+                // the driver always did.
+                if budget == 0 || syscall::sys_ioport_read(0x64) & 1 == 0 {
+                    break;
+                }
+            }
             syscall::sys_irq_ack(1);
-
-            if raw == 0xE0 {
-                extended = true;
-                continue;
-            }
-
-            if extended {
-                // Ignore extended scancodes for now
-                extended = false;
-                continue;
-            }
-
-            let press = raw & 0x80 == 0;
-            let scancode = raw & 0x7F;
-
-            // Update modifier state
-            match scancode {
-                SC_LSHIFT | SC_RSHIFT => {
-                    if press {
-                        modifiers |= MOD_SHIFT;
-                    } else {
-                        modifiers &= !MOD_SHIFT;
-                    }
-                }
-                SC_LCTRL => {
-                    if press {
-                        modifiers |= MOD_CTRL;
-                    } else {
-                        modifiers &= !MOD_CTRL;
-                    }
-                }
-                SC_LALT => {
-                    if press {
-                        modifiers |= MOD_ALT;
-                    } else {
-                        modifiers &= !MOD_ALT;
-                    }
-                }
-                SC_CAPSLOCK => {
-                    if press {
-                        modifiers ^= MOD_CAPSLOCK;
-                    }
-                }
-                _ => {}
-            }
-
-            // Translate to ASCII
-            let use_shifted = (modifiers & MOD_SHIFT != 0) ^ (modifiers & MOD_CAPSLOCK != 0);
-            let mut ascii = if use_shifted {
-                SCANCODE_SHIFTED[scancode as usize]
-            } else {
-                SCANCODE_UNSHIFTED[scancode as usize]
-            };
-
-            // Ctrl transformation: Ctrl+letter produces 0x01-0x1A
-            if modifiers & MOD_CTRL != 0 && ascii >= b'a' && ascii <= b'z' {
-                ascii &= 0x1F;
-            }
-
-            // Notify input server on Ctrl+C key press
-            if press && ascii == 0x03 && sigint_tid != 0 {
-                let _ = syscall::sys_notify(sigint_tid, 1);
-            }
-
-            let ev = KeyEvent {
-                press,
-                ascii,
-                scancode,
-                modifiers,
-            };
-
-            // If a client is blocked waiting, reply immediately
-            if press {
-                if let Some(client_tid) = waiting_client.take() {
-                    let reply = make_key_reply(&ev);
-                    let _ = syscall::sys_reply(client_tid, &reply);
-                    continue;
-                }
-            }
-
-            keybuf.push(ev);
         } else {
             // Client IPC request
             match msg.tag {
@@ -290,6 +238,91 @@ pub extern "C" fn _start() -> ! {
             }
         }
     }
+}
+
+/// Translate one scancode and deliver or buffer the event it makes.
+fn handle_scancode(
+    raw: u8,
+    extended: &mut bool,
+    modifiers: &mut u8,
+    keybuf: &mut KeyBuffer,
+    sigint_tid: usize,
+    waiting_client: &mut Option<usize>,
+) {
+    if raw == 0xE0 {
+        *extended = true;
+        return;
+    }
+    if *extended {
+        // Ignore extended scancodes for now
+        *extended = false;
+        return;
+    }
+
+    let press = raw & 0x80 == 0;
+    let scancode = raw & 0x7F;
+
+    // Update modifier state
+    match scancode {
+        SC_LSHIFT | SC_RSHIFT => {
+            if press {
+                *modifiers |= MOD_SHIFT;
+            } else {
+                *modifiers &= !MOD_SHIFT;
+            }
+        }
+        SC_LCTRL => {
+            if press {
+                *modifiers |= MOD_CTRL;
+            } else {
+                *modifiers &= !MOD_CTRL;
+            }
+        }
+        SC_LALT => {
+            if press {
+                *modifiers |= MOD_ALT;
+            } else {
+                *modifiers &= !MOD_ALT;
+            }
+        }
+        SC_CAPSLOCK => {
+            if press {
+                *modifiers ^= MOD_CAPSLOCK;
+            }
+        }
+        _ => {}
+    }
+
+    // Translate to ASCII
+    let use_shifted = (*modifiers & MOD_SHIFT != 0) ^ (*modifiers & MOD_CAPSLOCK != 0);
+    let mut ascii = if use_shifted {
+        SCANCODE_SHIFTED[scancode as usize]
+    } else {
+        SCANCODE_UNSHIFTED[scancode as usize]
+    };
+
+    // Ctrl transformation: Ctrl+letter produces 0x01-0x1A
+    if *modifiers & MOD_CTRL != 0 && ascii.is_ascii_lowercase() {
+        ascii &= 0x1F;
+    }
+
+    // Notify input server on Ctrl+C key press
+    if press && ascii == 0x03 && sigint_tid != 0 {
+        let _ = syscall::sys_notify(sigint_tid, 1);
+    }
+
+    let ev = KeyEvent { press, ascii, scancode, modifiers: *modifiers };
+
+    // If a client is blocked waiting, reply immediately
+    if press {
+        if let Some(client_tid) = waiting_client.take() {
+            let reply = make_key_reply(&ev);
+            let _ = syscall::sys_reply(client_tid, &reply);
+            return;
+        }
+    }
+
+    keybuf.push(ev);
 }
 
 fn make_key_reply(ev: &KeyEvent) -> Message {
