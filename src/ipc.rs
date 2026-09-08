@@ -76,6 +76,19 @@ static mut TASK_TIMEOUT: [u64; MAX_TASKS] = [0; MAX_TASKS];
 /// caller can tell "nobody answered in time" from "the target died".
 static mut TASK_TIMED_OUT: [bool; MAX_TASKS] = [false; MAX_TASKS];
 
+/// Where each receiver's next scan for a waiting sender begins.
+///
+/// The scan used to start at TID 0 every time, which is not a queue but a
+/// priority order: the lowest-numbered sender blocked on a service is served,
+/// and if it blocks again before that service scans once more, it is served
+/// again. A higher-numbered sender behind it never runs. Two clients polling
+/// one server is enough to reproduce it — a compositor with two windows had
+/// the second one wait forever for a reply to its first message.
+///
+/// Starting one past whoever was served last makes it a round robin: every
+/// waiting sender is reached within one turn of the table.
+static mut RECV_ROTOR: [usize; MAX_TASKS] = [0; MAX_TASKS];
+
 /// Per-task notification word (seL4-style). Bits are OR'd in by sys_notify().
 /// Atomically read-and-cleared when consumed by sys_recv/sys_recv_timeout.
 static mut TASK_NOTIFY: [u64; MAX_TASKS] = [0; MAX_TASKS];
@@ -314,8 +327,10 @@ pub fn sys_recv(from: usize) -> Result<Message, IpcError> {
 
     let flags = irq_save();
     unsafe {
-        // Check if any sender is blocked waiting to send to us
-        for tid in 0..MAX_TASKS {
+        // Check if any sender is blocked waiting to send to us, starting one
+        // past the last one served so that no sender can monopolise us.
+        for step in 0..MAX_TASKS {
+            let tid = (RECV_ROTOR[receiver] + step) % MAX_TASKS;
             if tid == receiver {
                 continue;
             }
@@ -325,6 +340,7 @@ pub fn sys_recv(from: usize) -> Result<Message, IpcError> {
                 _ => continue,
             };
             if dest == receiver && (from == TID_ANY || from == tid) {
+                RECV_ROTOR[receiver] = (tid + 1) % MAX_TASKS;
                 let was_call = matches!(TASK_IPC[tid].state, IpcState::CallSendBlocked(_));
                 let msg = match TASK_IPC[tid].pending_msg.take() {
                     Some(m) => m,
@@ -546,8 +562,10 @@ pub fn sys_recv_timeout(from: usize, timeout_ticks: u64) -> Result<Message, IpcE
 
     let flags = irq_save();
     unsafe {
-        // Check if any sender is blocked waiting to send to us (same as sys_recv)
-        for tid in 0..MAX_TASKS {
+        // Check if any sender is blocked waiting to send to us (same as
+        // sys_recv, round robin included).
+        for step in 0..MAX_TASKS {
+            let tid = (RECV_ROTOR[receiver] + step) % MAX_TASKS;
             if tid == receiver {
                 continue;
             }
@@ -557,6 +575,7 @@ pub fn sys_recv_timeout(from: usize, timeout_ticks: u64) -> Result<Message, IpcE
                 _ => continue,
             };
             if dest == receiver && (from == TID_ANY || from == tid) {
+                RECV_ROTOR[receiver] = (tid + 1) % MAX_TASKS;
                 let was_call = matches!(TASK_IPC[tid].state, IpcState::CallSendBlocked(_));
                 let msg = match TASK_IPC[tid].pending_msg.take() {
                     Some(m) => m,
