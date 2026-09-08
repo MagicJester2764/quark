@@ -7,6 +7,7 @@ pub mod args;
 pub mod console;
 pub mod ipc;
 pub mod signal;
+pub mod spawn;
 pub mod stdio;
 pub mod sync;
 pub mod syscall;

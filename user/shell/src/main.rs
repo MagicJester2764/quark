@@ -2,6 +2,7 @@
 #![no_main]
 
 use quark_rt::ipc::Message;
+use quark_rt::spawn::{self, Scratch, Spawned};
 use quark_rt::{args, print, println, syscall, vfs};
 use quark_rt::stdio::read_line;
 
@@ -12,44 +13,24 @@ const TAG_SET_FOREGROUND: u64 = 2;
 
 // Shell temp address ranges (non-overlapping with init's 0x82-0x88)
 const FILE_BUF_BASE: usize = 0x90_0000_0000;
+// Staging areas for quark_rt::spawn, in this task's own address space.
 const ELF_TEMP: usize = 0x91_0000_0000;
 const STACK_TEMP: usize = 0x92_0000_0000;
 const ARGS_TEMP_PAGE: usize = 0x93_0000_0000;
-const ARGS_PAGE_ADDR: usize = 0x80_8000_0000;
+
+/// Staging areas quark_rt::spawn maps through while building a child.
+const SPAWN_SCRATCH: Scratch = Scratch {
+    elf: ELF_TEMP,
+    stack: STACK_TEMP,
+    args: ARGS_TEMP_PAGE,
+};
 
 // ---------------------------------------------------------------------------
 // ELF64 structures (copied from init)
 // ---------------------------------------------------------------------------
 
-#[repr(C, packed)]
-struct Elf64Header {
-    e_ident: [u8; 16],
-    e_type: u16,
-    e_machine: u16,
-    e_version: u32,
-    e_entry: u64,
-    e_phoff: u64,
-    e_shoff: u64,
-    e_flags: u32,
-    e_ehsize: u16,
-    e_phentsize: u16,
-    e_phnum: u16,
-}
 
-#[repr(C, packed)]
-struct Elf64Phdr {
-    p_type: u32,
-    p_flags: u32,
-    p_offset: u64,
-    p_vaddr: u64,
-    p_paddr: u64,
-    p_filesz: u64,
-    p_memsz: u64,
-    p_align: u64,
-}
 
-const PT_LOAD: u32 = 1;
-const ELF_MAGIC: [u8; 4] = [0x7F, b'E', b'L', b'F'];
 
 // ---------------------------------------------------------------------------
 // Service discovery
@@ -93,139 +74,12 @@ fn lookup_service_with_retry(name: &[u8], max_attempts: usize) -> Option<usize> 
 // ELF loader (mirrors init's load_elf using shell temp addresses)
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Copy)]
-struct SpawnInfo {
-    tid: usize,
-    entry: u64,
-    stack_top: u64,
-    cr3: usize,
-}
 
-impl SpawnInfo {
-    fn start(&self) -> Result<(), ()> {
-        syscall::sys_task_start(self.tid, self.entry, self.stack_top, self.cr3)
-    }
-}
-
-fn load_elf(elf_data: &[u8]) -> Result<SpawnInfo, ()> {
-    if elf_data.len() < 64 || elf_data[0..4] != ELF_MAGIC {
-        return Err(());
-    }
-
-    let hdr = unsafe { &*(elf_data.as_ptr() as *const Elf64Header) };
-    let entry = hdr.e_entry;
-    let phoff = hdr.e_phoff as usize;
-    let phentsize = hdr.e_phentsize as usize;
-    let phnum = hdr.e_phnum as usize;
-
-    let cr3 = syscall::sys_addrspace_create()?;
-    let tid = syscall::sys_task_create()?;
-
-    for i in 0..phnum {
-        let offset = phoff + i * phentsize;
-        if offset + phentsize > elf_data.len() {
-            break;
-        }
-        let phdr = unsafe { &*(elf_data.as_ptr().add(offset) as *const Elf64Phdr) };
-
-        if phdr.p_type != PT_LOAD {
-            continue;
-        }
-
-        let vaddr = phdr.p_vaddr as usize;
-        let filesz = phdr.p_filesz as usize;
-        let memsz = phdr.p_memsz as usize;
-        let file_offset = phdr.p_offset as usize;
-        let writable = phdr.p_flags & 2 != 0;
-
-        let vaddr_page_start = vaddr & !0xFFF;
-        let vaddr_end = vaddr + memsz;
-        let pages = (vaddr_end - vaddr_page_start + PAGE_SIZE - 1) / PAGE_SIZE;
-
-        let file_start = vaddr;
-        let file_end = vaddr + filesz;
-
-        for p in 0..pages {
-            let page_vaddr = vaddr_page_start + p * PAGE_SIZE;
-
-            let frame = syscall::sys_phys_alloc(1)?;
-
-            let temp_page = ELF_TEMP + p * PAGE_SIZE;
-            syscall::sys_map_phys(frame, temp_page, 1)?;
-
-            unsafe {
-                core::ptr::write_bytes(temp_page as *mut u8, 0, PAGE_SIZE);
-            }
-
-            let page_end = page_vaddr + PAGE_SIZE;
-            if file_start < page_end && file_end > page_vaddr {
-                let copy_vstart = file_start.max(page_vaddr);
-                let copy_vend = file_end.min(page_end);
-                let copy_len = copy_vend - copy_vstart;
-                let dst_offset = copy_vstart - page_vaddr;
-                let src_offset = file_offset + (copy_vstart - vaddr);
-
-                if src_offset + copy_len <= elf_data.len() {
-                    unsafe {
-                        core::ptr::copy_nonoverlapping(
-                            elf_data.as_ptr().add(src_offset),
-                            (temp_page + dst_offset) as *mut u8,
-                            copy_len,
-                        );
-                    }
-                }
-            }
-
-            let flags: u64 = if writable { 1 } else { 0 };
-            syscall::sys_addrspace_map(cr3, page_vaddr, frame, 1, flags)?;
-        }
-    }
-
-    // Set up user stack (4 pages)
-    let stack_top: usize = 0x7FFF_FFFF_F000;
-    let stack_pages: usize = 4;
-    let stack_bottom = stack_top - stack_pages * PAGE_SIZE;
-    for p in 0..stack_pages {
-        let frame = syscall::sys_phys_alloc(1)?;
-        let temp_page = STACK_TEMP + p * PAGE_SIZE;
-        syscall::sys_map_phys(frame, temp_page, 1)?;
-        unsafe {
-            core::ptr::write_bytes(temp_page as *mut u8, 0, PAGE_SIZE);
-        }
-        syscall::sys_addrspace_map(cr3, stack_bottom + p * PAGE_SIZE, frame, 1, 1)?;
-    }
-
-    Ok(SpawnInfo { tid, entry, stack_top: stack_top as u64, cr3 })
-}
 
 // ---------------------------------------------------------------------------
 // Program arguments
 // ---------------------------------------------------------------------------
 
-fn set_args(info: &SpawnInfo, args: &[&[u8]]) -> Result<(), ()> {
-    let frame = syscall::sys_phys_alloc(1)?;
-    syscall::sys_map_phys(frame, ARGS_TEMP_PAGE, 1)?;
-
-    let base = ARGS_TEMP_PAGE as *mut u8;
-    unsafe {
-        core::ptr::write_bytes(base, 0, PAGE_SIZE);
-        *(base as *mut u64) = args.len() as u64;
-
-        let mut offset = 8usize;
-        for arg in args {
-            if offset + 8 + arg.len() > PAGE_SIZE {
-                break;
-            }
-            *(base.add(offset) as *mut u64) = arg.len() as u64;
-            offset += 8;
-            core::ptr::copy_nonoverlapping(arg.as_ptr(), base.add(offset), arg.len());
-            offset += arg.len();
-        }
-    }
-
-    syscall::sys_addrspace_map(info.cr3, ARGS_PAGE_ADDR, frame, 1, 0)?;
-    Ok(())
-}
 
 // ---------------------------------------------------------------------------
 // Capability granting for child tasks
@@ -334,7 +188,7 @@ fn cmd_spawn(
     vfs_tid: usize,
     inherit_stdin: bool,
     inherit_stdout: bool,
-) -> Option<SpawnInfo> {
+) -> Option<Spawned> {
     let mut path = [0u8; 64];
     let pos = build_path(cmd, &mut path);
     let has_slash = cmd.iter().any(|&b| b == b'/');
@@ -421,7 +275,7 @@ fn cmd_spawn(
     let elf_data = unsafe { core::slice::from_raw_parts(FILE_BUF_BASE as *const u8, size) };
 
     // Load ELF
-    let info = match load_elf(elf_data) {
+    let info = match spawn::load(elf_data, &SPAWN_SCRATCH) {
         Ok(i) => i,
         Err(()) => {
             println!("shell: failed to load ELF");
@@ -485,7 +339,7 @@ fn cmd_spawn(
         }
     }
 
-    let _ = set_args(&info, &argv_bufs[..argc]);
+    let _ = spawn::set_args(&info, &argv_bufs[..argc], &SPAWN_SCRATCH);
 
     Some(info)
 }
@@ -560,7 +414,7 @@ fn cmd_pipeline(stages: &[&[u8]], vfs_tid: usize, input_tid: usize) -> i32 {
     }
     let _ = npipes;
 
-    let mut infos = [SpawnInfo { tid: 0, entry: 0, stack_top: 0, cr3: 0 }; MAX_STAGES];
+    let mut infos = [Spawned { tid: 0, entry: 0, stack_top: 0, cr3: 0 }; MAX_STAGES];
     let mut spawned = 0;
 
     for i in 0..n {
