@@ -89,6 +89,7 @@ so it is built from calls that already existed.
 | 1.1 | `SYS_ADDRSPACE_SELF` (41), `SYS_SET_FS_BASE` (102), `SYS_TASK_START_ARG` (103) — what a thread needs: the caller's own address space to share, a per-task FS base for thread-local storage, and an argument to hand the new thread. |
 | 1.2 | `SYS_FUTEX_WAIT_TIMEOUT` (130). |
 | 1.3 | `SYS_SOCK_FD` (176), `SYS_SOCK_INFO` (177) — a network connection as a file descriptor. |
+| 1.4 | `SYS_TASK_WATCH` (104) — be told when a task dies, so what it was lent can be taken back. |
 
 A capability may only be minted from one the caller already holds, and only
 narrowed — with one exception. **An `Endpoint` naming only the caller may
@@ -279,6 +280,7 @@ cannot resurrect a revoked capability in practice.
 | 99 | `SYS_SET_UID` | arg0 = tid, arg1 = uid | 0 / `u64::MAX` | `SetUid` |
 | 100 | `SYS_SET_GID` | arg0 = tid, arg1 = gid | 0 / `u64::MAX` | `SetUid` |
 | 101 | `SYS_GET_TUID` | arg0 = tid | that task's UID | — |
+| 104 | `SYS_TASK_WATCH` | arg0 = tid | 0, or `u64::MAX` if that task is already gone | — |
 
 There is no fork or exec. A parent creates a task, builds its address space,
 loads its image, sets its arguments and capabilities, then starts it. TIDs are
@@ -287,6 +289,23 @@ that task lives — see the note on `Endpoint` revocation below.
 
 `SYS_GET_TUID` exists for servers doing permission checks on behalf of a
 caller: the VFS uses it to evaluate file modes against the requester.
+
+`SYS_TASK_WATCH` asks to be told when a task dies. The notification arrives at
+the watcher's next `SYS_RECV` as a message from the kernel — sender 0, tag
+`0xFFFF_0003`, `data[0]` the TID that died — and is delivered when the task is
+marked dead rather than when it is reaped, since reaping waits on a parent that
+may never call `SYS_WAIT`.
+
+It takes no capability. `SYS_TASK_INFO` already tells anybody whether a given
+task is alive, so a watch discloses nothing new; what it removes is the polling,
+and the window between polls in which a server still believes a dead task holds
+what it lent out. Failure means the task was already gone, which is an answer:
+the caller may reclaim immediately.
+
+Registrations are dropped when either task dies, so a watcher is never told
+about the next occupant of a recycled TID. A watcher that lets eight
+notifications go uncollected loses the ninth; a server whose whole job is to
+reclaim on death should not be one of them.
 
 ### Hardware and drivers (0x70)
 

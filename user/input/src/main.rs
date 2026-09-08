@@ -25,7 +25,7 @@
 //! caller needs no capability at all, which is what makes the pull the shape
 //! that works.
 
-use quark_rt::ipc::{Message, TID_ANY};
+use quark_rt::ipc::{Message, TAG_NOTIFICATION, TAG_TASK_DIED, TID_ANY};
 use quark_rt::nameserver;
 use quark_rt::{print, println, syscall};
 
@@ -66,9 +66,6 @@ const TAG_INPUT_NONE: u64 = 0x204;
 
 const TAG_OK: u64 = 0;
 const TAG_ERROR: u64 = u64::MAX;
-
-// Notification tag from kernel
-const TAG_NOTIFICATION: u64 = 0xFFFF_0002;
 
 const KEY_PRESS: u64 = 1;
 
@@ -152,6 +149,10 @@ pub extern "C" fn _start() -> ! {
                     let _ = syscall::sys_reply(sender, &error());
                 } else {
                     raw_owner = sender;
+                    // A claimant that dies without releasing would otherwise
+                    // leave every reader here waiting for a release that never
+                    // comes, which is a console nobody can type at.
+                    let _ = syscall::sys_task_watch(sender);
                     // Whatever was typed before the claim was typed at
                     // something else. Throw it away rather than delivering a
                     // shell command's tail to a compositor.
@@ -173,6 +174,27 @@ pub extern "C" fn _start() -> ! {
                     let _ = syscall::sys_reply(sender, &ok());
                     println!("[input] keyboard released by tid {}", sender);
 
+                    for i in 0..deferred_len {
+                        let (tid, max) = deferred[i];
+                        serve_read(
+                            kbd_tid,
+                            tid,
+                            max,
+                            &mut line_buf,
+                            &mut line_len,
+                            &mut foreground_tid,
+                        );
+                    }
+                    deferred_len = 0;
+                }
+            }
+
+            // Whoever held the keyboard has died. Take it back, and serve
+            // whoever was waiting on a line.
+            TAG_TASK_DIED => {
+                if raw_owner != 0 && msg.data[0] as usize == raw_owner {
+                    println!("[input] tid {} died holding the keyboard", raw_owner);
+                    raw_owner = 0;
                     for i in 0..deferred_len {
                         let (tid, max) = deferred[i];
                         serve_read(
@@ -213,15 +235,6 @@ pub extern "C" fn _start() -> ! {
 
             TAG_READ => {
                 let max_bytes = (msg.data[0] as usize).min(40);
-                // A claimant that died still holding the keyboard would leave
-                // every reader here waiting for a release that is never
-                // coming, which is a console nobody can type at. Nothing tells
-                // this server when a task ends, so the question is asked at
-                // the one moment the answer matters.
-                if raw_owner != 0 && !alive(raw_owner) {
-                    println!("[input] tid {} died holding the keyboard", raw_owner);
-                    raw_owner = 0;
-                }
                 if raw_owner != 0 {
                     // Someone else has the keyboard. Hold the reader instead
                     // of answering it: reading here would take keys out of the
@@ -263,17 +276,6 @@ pub extern "C" fn _start() -> ! {
 
 fn ok() -> Message {
     Message { sender: 0, tag: TAG_OK, data: [0; 6] }
-}
-
-/// Is `tid` still a running task?
-///
-/// A task that exited but has not been waited for stays in the table as Dead,
-/// so this answers the same either way.
-fn alive(tid: usize) -> bool {
-    match syscall::sys_task_info(tid) {
-        Ok((state, _, _)) => state != 3, // 3 is Dead
-        Err(()) => false,
-    }
 }
 
 fn error() -> Message {

@@ -503,6 +503,11 @@ fn load_essentials_from_boot_image(rootfs_phys: usize, rootfs_size: usize) -> Bo
     // Before the console, because the console asks it for the display. The
     // framebuffer is a device with one owner at a time, and this is what
     // decides who: the text console at boot, a compositor when one is run.
+    //
+    // Being first means there is nowhere for it to write yet — the pipe every
+    // other service prints to is the console's, and the console does not
+    // exist. Its descriptors are wired below, once there is one.
+    let mut fb_tid: usize = 0;
     for i in 0..count {
         let e = &entries[i];
         if &e.name[0..8] == b"FB      " && &e.name[8..11] == b"ELF" {
@@ -520,6 +525,7 @@ fn load_essentials_from_boot_image(rootfs_phys: usize, rootfs_size: usize) -> Bo
                         add_service(info.tid);
                         grant_endpoints(info.tid, syscall::SLOT_ENDPOINT);
                         let _ = spawn::set_args(&info, &[b"fb"], &SPAWN_SCRATCH);
+                        fb_tid = info.tid;
                         let _ = info.start();
                         send_fb_info(info.tid);
                         println!("[init] Spawned fb (TID {})", info.tid);
@@ -557,6 +563,16 @@ fn load_essentials_from_boot_image(rootfs_phys: usize, rootfs_size: usize) -> Bo
                         }
                         let _ = info.start();
                         println!("[init] Spawned console (TID {})", info.tid);
+                        // The framebuffer device could not be given a stdout
+                        // when it started, because this pipe is what a stdout
+                        // is and the console owns the other end of it. It is
+                        // the one service whose diagnostics you want when the
+                        // display misbehaves, so it should not be the one
+                        // service that cannot speak.
+                        if console_pipe != 0 && fb_tid != 0 {
+                            let _ = syscall::sys_pipe_fd_set(fb_tid, 1, console_pipe, true);
+                            let _ = syscall::sys_pipe_fd_set(fb_tid, 2, console_pipe, true);
+                        }
                     }
                     Err(()) => println!("[init] FAILED to spawn console"),
                 }

@@ -165,6 +165,10 @@ pub fn exit_with(code: i32) -> ! {
             task.state = TaskState::Dead;
             task.exit_code = code;
             crate::ipc::clear_signal_deadline(current);
+            // Told now rather than at reaping: reaping waits on a parent that
+            // may never call sys_wait, and whatever this task was holding
+            // needs reclaiming when it stops, not when it is tidied away.
+            crate::ipc::notify_watchers(current);
             let parent = task.parent_tid;
             // If parent is blocked in sys_wait, wake it with our TID
             if parent != 0 && WAIT_BLOCKED[parent] {
@@ -435,6 +439,7 @@ pub fn kill_task(tid: usize) -> Result<(), ()> {
                 task.state = TaskState::Dead;
                 task.exit_code = -1; // killed
                 crate::ipc::clear_signal_deadline(tid);
+                crate::ipc::notify_watchers(tid);
                 let parent = task.parent_tid;
                 if parent != 0 && WAIT_BLOCKED[parent] {
                     WAIT_BLOCKED[parent] = false;

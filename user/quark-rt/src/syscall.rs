@@ -75,6 +75,7 @@ pub const SYS_SET_GID: u64 = 100;
 pub const SYS_GET_TUID: u64 = 101;
 pub const SYS_SET_FS_BASE: u64 = 102;
 pub const SYS_TASK_START_ARG: u64 = 103;
+pub const SYS_TASK_WATCH: u64 = 104;
 
 // --- 0x70  hardware and drivers ---
 pub const SYS_IRQ_REGISTER: u64 = 112;
@@ -292,6 +293,20 @@ pub fn sys_task_kill(tid: usize) -> Result<(), ()> {
 
 /// Returns (state, parent_tid, uid) or Err if no task at that TID.
 /// state: 0=Ready, 1=Running, 2=Blocked, 3=Dead
+/// Ask to be told when `tid` dies.
+///
+/// The notification arrives at the caller's next receive as a message from the
+/// kernel: sender 0, tag [`crate::ipc::TAG_TASK_DIED`], `data[0]` the task
+/// that died. It is the answer to "who still holds this?" for anything lent
+/// out — a display, a window, the keyboard — without polling for it.
+///
+/// Fails if `tid` is already dead, which is an answer rather than a problem:
+/// there is nothing to wait for and the caller may reclaim at once.
+pub fn sys_task_watch(tid: usize) -> Result<(), ()> {
+    let ret = unsafe { syscall1(SYS_TASK_WATCH, tid as u64) };
+    if ret == u64::MAX { Err(()) } else { Ok(()) }
+}
+
 pub fn sys_task_info(tid: usize) -> Result<(u8, usize, u32), ()> {
     let ret = unsafe { syscall1(SYS_TASK_INFO, tid as u64) };
     if ret == u64::MAX { return Err(()); }

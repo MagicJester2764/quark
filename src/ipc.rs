@@ -93,12 +93,32 @@ static mut RECV_ROTOR: [usize; MAX_TASKS] = [0; MAX_TASKS];
 /// Atomically read-and-cleared when consumed by sys_recv/sys_recv_timeout.
 static mut TASK_NOTIFY: [u64; MAX_TASKS] = [0; MAX_TASKS];
 
+/// Who has asked to be told when each task dies.
+///
+/// `WATCHERS[t]` is a bitmask of tasks wanting to hear about `t`, the same
+/// shape as an `Endpoint` set and for the same reason: TIDs are small and
+/// there are only 64 of them.
+static mut WATCHERS: [u64; MAX_TASKS] = [0; MAX_TASKS];
+
+/// Deaths a watcher has been told about and has not yet collected.
+///
+/// Shallow on purpose. A watcher exists to reclaim something the dead task
+/// held — a display, a window, a keyboard — and one that has let eight deaths
+/// pile up unread is not doing that. Dropping the ninth loses a reclaim; a
+/// deeper queue would only lose the twenty-fifth.
+const DEATH_QUEUE: usize = 8;
+static mut DEATHS: [[u8; DEATH_QUEUE]; MAX_TASKS] = [[0; DEATH_QUEUE]; MAX_TASKS];
+static mut DEATHS_LEN: [usize; MAX_TASKS] = [0; MAX_TASKS];
+
 /// Per-task signal kill deadline (PIT tick). 0 = no pending signal deadline.
 /// When nonzero, the task will be force-killed after the deadline expires.
 static mut SIGNAL_DEADLINE: [u64; MAX_TASKS] = [0; MAX_TASKS];
 
 /// Tag for notification messages delivered to user space.
 pub const TAG_NOTIFICATION: u64 = 0xFFFF_0002;
+
+/// Tag for a death notification: `data[0]` is the task that died.
+pub const TAG_TASK_DIED: u64 = 0xFFFF_0003;
 
 // Signal badge bits (use high bits to avoid collision with app badges)
 pub const SIG_INT: u64 = 1 << 16;
@@ -129,6 +149,84 @@ fn irq_restore(flags: u64) {
 
 /// Asynchronous notification: OR `badge` into dest's notification word.
 /// Non-blocking. Wakes the dest task if it is RecvBlocked(0) or RecvBlocked(TID_ANY).
+/// Ask to be told when `target` dies.
+///
+/// No capability is required, and deliberately: `SYS_TASK_INFO` already tells
+/// anyone whether a given task is alive, so a watch reveals nothing that was
+/// not already there for the asking. What it removes is the polling — and the
+/// window between polls, which is where a display stays claimed by a task that
+/// no longer exists.
+///
+/// The registration is dropped when either task dies, so a watcher is never
+/// told about the next occupant of a recycled TID.
+pub fn sys_task_watch(watcher: usize, target: usize) -> Result<(), IpcError> {
+    if target >= MAX_TASKS || watcher >= MAX_TASKS || target == watcher {
+        return Err(IpcError::InvalidTid);
+    }
+    if !scheduler::task_is_live(target) {
+        // Already gone. Say so now rather than promising news that will never
+        // come: a caller told "no such task" can reclaim immediately, and one
+        // left waiting for a notification cannot.
+        return Err(IpcError::DeadTask);
+    }
+    let flags = irq_save();
+    unsafe { WATCHERS[target] |= 1u64 << watcher };
+    irq_restore(flags);
+    Ok(())
+}
+
+/// Tell everyone watching `dead` that it has gone.
+///
+/// Called when the task is marked Dead, not when it is reaped: reaping waits
+/// on a parent that may never call `sys_wait`, and a compositor holding the
+/// screen for a program that exited ten minutes ago is the thing this exists
+/// to prevent.
+pub fn notify_watchers(dead: usize) {
+    if dead >= MAX_TASKS {
+        return;
+    }
+    let flags = irq_save();
+    unsafe {
+        let mut mask = WATCHERS[dead];
+        WATCHERS[dead] = 0;
+        while mask != 0 {
+            let w = mask.trailing_zeros() as usize;
+            mask &= mask - 1;
+            if DEATHS_LEN[w] < DEATH_QUEUE {
+                DEATHS[w][DEATHS_LEN[w]] = dead as u8;
+                DEATHS_LEN[w] += 1;
+            }
+            // Wake it if it is sitting in a receive that would take this.
+            match TASK_IPC[w].state {
+                IpcState::RecvBlocked(from) if from == 0 || from == TID_ANY => {
+                    TASK_IPC[w].state = IpcState::None;
+                    scheduler::unblock_task(w);
+                }
+                _ => {}
+            }
+        }
+    }
+    irq_restore(flags);
+}
+
+/// Take one pending death notification, if there is one.
+///
+/// # Safety
+/// The caller holds interrupts off.
+unsafe fn take_death(receiver: usize) -> Option<Message> {
+    unsafe {
+        if DEATHS_LEN[receiver] == 0 {
+            return None;
+        }
+        let dead = DEATHS[receiver][0] as u64;
+        for i in 1..DEATHS_LEN[receiver] {
+            DEATHS[receiver][i - 1] = DEATHS[receiver][i];
+        }
+        DEATHS_LEN[receiver] -= 1;
+        Some(Message { sender: 0, tag: TAG_TASK_DIED, data: [dead, 0, 0, 0, 0, 0] })
+    }
+}
+
 pub fn sys_notify(dest: usize, badge: u64) -> Result<(), IpcError> {
     if dest >= MAX_TASKS || badge == 0 {
         return Err(IpcError::InvalidTid);
@@ -373,6 +471,14 @@ pub fn sys_recv(from: usize) -> Result<Message, IpcError> {
             }
         }
 
+        // A task this one was watching has died.
+        if from == 0 || from == TID_ANY {
+            if let Some(msg) = take_death(receiver) {
+                irq_restore(flags);
+                return Ok(msg);
+            }
+        }
+
         // Check for pending notifications (from=0 or TID_ANY)
         if from == 0 || from == TID_ANY {
             let word = TASK_NOTIFY[receiver];
@@ -409,6 +515,15 @@ pub fn sys_recv(from: usize) -> Result<Message, IpcError> {
         // No IPC message — check IRQ
         if from == 0 || from == TID_ANY {
             if let Some(msg) = crate::irq_dispatch::poll_irq_message(receiver) {
+                TASK_IPC[receiver].state = IpcState::None;
+                irq_restore(flags);
+                return Ok(msg);
+            }
+        }
+
+        // A task this one was watching has died.
+        if from == 0 || from == TID_ANY {
+            if let Some(msg) = take_death(receiver) {
                 TASK_IPC[receiver].state = IpcState::None;
                 irq_restore(flags);
                 return Ok(msg);
@@ -604,6 +719,14 @@ pub fn sys_recv_timeout(from: usize, timeout_ticks: u64) -> Result<Message, IpcE
             }
         }
 
+        // A task this one was watching has died.
+        if from == 0 || from == TID_ANY {
+            if let Some(msg) = take_death(receiver) {
+                irq_restore(flags);
+                return Ok(msg);
+            }
+        }
+
         // Check for pending notifications
         if from == 0 || from == TID_ANY {
             let word = TASK_NOTIFY[receiver];
@@ -647,6 +770,15 @@ pub fn sys_recv_timeout(from: usize, timeout_ticks: u64) -> Result<Message, IpcE
         // Check IRQ messages
         if from == 0 || from == TID_ANY {
             if let Some(msg) = crate::irq_dispatch::poll_irq_message(receiver) {
+                TASK_IPC[receiver].state = IpcState::None;
+                irq_restore(flags);
+                return Ok(msg);
+            }
+        }
+
+        // A task this one was watching has died.
+        if from == 0 || from == TID_ANY {
+            if let Some(msg) = take_death(receiver) {
                 TASK_IPC[receiver].state = IpcState::None;
                 irq_restore(flags);
                 return Ok(msg);
@@ -761,6 +893,15 @@ pub fn cleanup_task_ipc(dead_tid: usize) {
 
     let flags = irq_save();
     unsafe {
+        // Withdraw its watches and drop what it never collected. TIDs are
+        // recycled, so a registration left behind would fire for whoever
+        // lands in the slot next.
+        WATCHERS[dead_tid] = 0;
+        DEATHS_LEN[dead_tid] = 0;
+        let bit = !(1u64 << dead_tid);
+        for t in 0..MAX_TASKS {
+            WATCHERS[t] &= bit;
+        }
         // Clear the dead task's own IPC state, timeout, notifications, and signal deadline
         TASK_IPC[dead_tid].state = IpcState::None;
         TASK_IPC[dead_tid].pending_msg = None;

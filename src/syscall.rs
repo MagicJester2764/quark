@@ -116,6 +116,10 @@ pub const SYS_SET_FS_BASE: u64 = 102;
 /// one. Added rather than extending SYS_TASK_START, whose callers pass four
 /// arguments and would leave the fifth register undefined.
 pub const SYS_TASK_START_ARG: u64 = 103;
+/// Be told when a task dies, so that whatever it was lent can be taken back.
+/// Takes no capability: SYS_TASK_INFO already answers the same question by
+/// polling, so this only removes the polling.
+pub const SYS_TASK_WATCH: u64 = 104;
 
 // --- 0x70  hardware and drivers ---
 pub const SYS_IRQ_REGISTER: u64 = 112;
@@ -161,7 +165,7 @@ pub const SYS_ABI_VERSION: u64 = 240;
 /// minor when calls are added. User space can refuse to run against a major it
 /// does not know, which is the point of exposing it at all.
 pub const ABI_VERSION_MAJOR: u64 = 1;
-pub const ABI_VERSION_MINOR: u64 = 3;
+pub const ABI_VERSION_MINOR: u64 = 4;
 
 
 
@@ -436,6 +440,14 @@ extern "C" fn syscall_dispatch(
             match unsafe { scheduler::get_task_mut(scheduler::current_tid()) } {
                 Some(t) => t.cr3 as u64,
                 None => u64::MAX,
+            }
+        }
+        SYS_TASK_WATCH => {
+            // No capability: SYS_TASK_INFO already answers "is that task
+            // alive" for anybody, so this only spares the asking.
+            match crate::ipc::sys_task_watch(scheduler::current_tid(), arg0 as usize) {
+                Ok(()) => 0,
+                Err(_) => u64::MAX,
             }
         }
         SYS_ABI_VERSION => (ABI_VERSION_MAJOR << 16) | ABI_VERSION_MINOR,

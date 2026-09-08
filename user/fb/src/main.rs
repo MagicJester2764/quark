@@ -28,7 +28,7 @@
 //!     wm <--- mode -------
 //! ```
 
-use quark_rt::ipc::{Message, TID_ANY};
+use quark_rt::ipc::{Message, TAG_TASK_DIED, TID_ANY};
 use quark_rt::{nameserver, println, syscall};
 
 // No manifest. The framebuffer's address is whatever mode the bootloader set,
@@ -126,6 +126,20 @@ fn ok() -> Message {
     Message { sender: 0, tag: TAG_OK, data: [0; 6] }
 }
 
+/// Give the display to `back`, which had it before, and tell it the mode.
+fn hand_back(back: usize) {
+    if back == 0 || !lease_to(back) {
+        return;
+    }
+    unsafe { OWNER = back };
+    let _ = syscall::sys_task_watch(back);
+    println!("[fb] display returned to tid {}", back);
+    let msg = mode_reply();
+    let handover = Message { sender: 0, tag: TAG_FB_GAINED, data: msg.data };
+    let mut ack = Message::empty();
+    let _ = syscall::sys_call(back, &handover, &mut ack);
+}
+
 /// Hand the right to map the framebuffer to `tid`.
 ///
 /// Revoke first, always: the previous lease is derived from this slot, so
@@ -219,6 +233,11 @@ pub extern "C" fn _start() -> ! {
                     }
                     if lease_to(sender) {
                         unsafe { OWNER = sender };
+                        // A program that dies still holding the display would
+                        // otherwise keep it for good: revocation stops it
+                        // mapping the framebuffer again, but nothing gives the
+                        // screen back, and there is no console to return to.
+                        let _ = syscall::sys_task_watch(sender);
                         println!("[fb] display claimed by tid {}", sender);
                         mode_reply()
                     } else {
@@ -243,16 +262,33 @@ pub extern "C" fn _start() -> ! {
                     // is a call of its own.
                     let _ = syscall::sys_reply(sender, &ok());
 
-                    if back != 0 && lease_to(back) {
-                        unsafe { OWNER = back };
-                        println!("[fb] display returned to tid {}", back);
-                        let msg = mode_reply();
-                        let handover = Message { sender: 0, tag: TAG_FB_GAINED, data: msg.data };
-                        let mut ack = Message::empty();
-                        let _ = syscall::sys_call(back, &handover, &mut ack);
-                    }
+                    hand_back(back);
                     continue; // already replied
                 }
+            }
+
+            // Whoever had the display has died. Nobody is waiting on an
+            // answer to this, so take it back and give it to whoever was
+            // displaced — the text console, on the path that matters.
+            TAG_TASK_DIED => {
+                let dead = msg.data[0] as usize;
+                unsafe {
+                    if PREVIOUS == dead {
+                        PREVIOUS = 0;
+                    }
+                    if OWNER != dead {
+                        continue;
+                    }
+                }
+                println!("[fb] tid {} died holding the display", dead);
+                let _ = syscall::sys_cap_revoke(LEASE_SLOT);
+                let back = unsafe { PREVIOUS };
+                unsafe {
+                    OWNER = 0;
+                    PREVIOUS = 0;
+                }
+                hand_back(back);
+                continue; // the kernel is not waiting for a reply
             }
 
             _ => error(),

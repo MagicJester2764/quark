@@ -31,3 +31,12 @@ impl Message {
 /// Note that not every service is an IPC server: the console is driven by a
 /// pipe on fd 0 and has no dispatch to answer from, so it never replies.
 pub const TAG_PING: u64 = 0xFFFF_FFFF_FFFF_FF01;
+
+/// Kernel notification word, delivered with sender 0.
+pub const TAG_NOTIFICATION: u64 = 0xFFFF_0002;
+
+/// A task registered with [`crate::syscall::sys_task_watch`] has died;
+/// `data[0]` is its TID. Sender is 0, as for every message the kernel makes
+/// up — a receive loop that reads sender 0 as "an IRQ" needs to check the tag
+/// before it believes that.
+pub const TAG_TASK_DIED: u64 = 0xFFFF_0003;
