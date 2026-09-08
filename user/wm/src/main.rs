@@ -22,6 +22,16 @@
 //!     COMMIT(id) ------------->  composite ---------->  framebuffer
 //! ```
 //!
+//! Keys come the other way. The compositor claims the keyboard from the input
+//! server when it claims the display — whoever owns the screen owns the
+//! keyboard, which is how switching between a graphical session and a text
+//! console has always worked — and hands each key to the focused window's
+//! queue. A client reads its own queue, because a compositor cannot send to a
+//! program it spawned: originating IPC needs an Endpoint capability naming the
+//! destination, and a task ID that did not exist at spawn time is not
+//! something this can mint. Answering a caller needs no capability, so the
+//! client asks.
+//!
 //! Shared memory rather than messages because a window is a megabyte and a
 //! message is forty bytes: the point of a compositor is that a client's
 //! drawing does not travel anywhere. The client writes pixels, the server
@@ -80,6 +90,13 @@ const TAG_FB_RELEASE: u64 = 3;
 /// same `sys_recv`, and 4 was already `TAG_WM_FOCUS`.
 const TAG_FB_LOST: u64 = 0x100;
 
+/// Talking to the input server, which arbitrates the keyboard the same way the
+/// framebuffer device arbitrates the screen.
+const TAG_INPUT_CLAIM: u64 = 0x200;
+const TAG_INPUT_RELEASE: u64 = 0x201;
+const TAG_INPUT_POLL: u64 = 0x202;
+const TAG_INPUT_KEY: u64 = 0x203;
+
 /// Ask for a window. `data[0] = (width << 32) | height`, `data[1..]` the title.
 ///
 /// Replies with `data[0] = window id`, `data[1] = shared memory handle`,
@@ -98,6 +115,14 @@ const TAG_WM_FOCUS: u64 = 4;
 /// needs the slot — which is a thing to fix with a death notification, not
 /// with guesswork here.
 const TAG_WM_DESTROY: u64 = 6;
+/// Anything happened to this window? `data[0] = id`. Answers now, either way.
+///
+/// Replies `data[0] = 1` when there was an event and 0 when there was not,
+/// then `data[1] = ascii`, `data[2] = scancode`, `data[3] = modifiers`,
+/// `data[4] = 1` for a press and 0 for a release. `data[5]` says whether this
+/// window currently has focus, which the client would otherwise have to ask
+/// for separately and which changes underneath it without warning.
+const TAG_WM_POLL_EVENT: u64 = 7;
 
 /// How big is the screen, and how are its pixels laid out?
 ///
@@ -120,6 +145,12 @@ const BORDER: usize = 2;
 
 const MAX_WINDOWS: usize = 8;
 const MAX_TITLE: usize = 32;
+/// Keys held for a window that has not asked for them yet.
+///
+/// Deep enough for a burst of typing between two of a client's frames. When it
+/// fills, the oldest goes: a client that has stopped reading should not be able
+/// to make the newest keystroke the one that is lost.
+const EVENT_QUEUE: usize = 16;
 
 /// Where the framebuffer is mapped.
 const FB_VADDR: usize = 0x81_0000_0000;
@@ -173,6 +204,10 @@ struct Window {
     stride: usize,
     title: [u8; MAX_TITLE],
     title_len: usize,
+    /// Keys waiting to be collected, packed by [`pack_event`].
+    events: [u32; EVENT_QUEUE],
+    ev_head: usize,
+    ev_len: usize,
 }
 
 const NO_WINDOW: Window = Window {
@@ -187,6 +222,9 @@ const NO_WINDOW: Window = Window {
     stride: 0,
     title: [0; MAX_TITLE],
     title_len: 0,
+    events: [0; EVENT_QUEUE],
+    ev_head: 0,
+    ev_len: 0,
 };
 
 static mut WINDOWS: [Window; MAX_WINDOWS] = [NO_WINDOW; MAX_WINDOWS];
@@ -197,8 +235,16 @@ static mut STACK_LEN: usize = 0;
 static mut FOCUS: usize = usize::MAX;
 /// The framebuffer device that lent us the display.
 static mut FB_TID: usize = 0;
-/// The program this session is for. When it stops, so does this.
-static mut SESSION: usize = 0;
+/// The input server that lent us the keyboard. Zero if it would not.
+static mut INPUT_TID: usize = 0;
+
+/// How many programs one session may be. More than one so that focus is a
+/// thing that can be observed: with a single window there is nowhere for a key
+/// to go wrong.
+const MAX_SESSION: usize = 4;
+/// The programs this session is for. When the last of them stops, so does this.
+static mut SESSION: [usize; MAX_SESSION] = [0; MAX_SESSION];
+static mut SESSION_LEN: usize = 0;
 
 fn pack_colour(r: u8, g: u8, b: u8) -> u32 {
     let s = unsafe { &SCREEN };
@@ -368,6 +414,151 @@ fn raise(idx: usize) {
     }
 }
 
+/// End the session.
+const KEY_ESCAPE: u8 = 0x1B;
+/// Move focus to the next window.
+const KEY_TAB: u8 = b'\t';
+
+/// Move focus to the next window round.
+///
+/// Raising the bottom one is the whole of it: the stack is bottom to top, so
+/// promoting the bottom rotates the order and lands focus somewhere new every
+/// time until it comes back round.
+fn cycle_focus() {
+    unsafe {
+        if STACK_LEN < 2 {
+            return;
+        }
+        raise(STACK[0]);
+    }
+}
+
+fn pack_event(press: bool, ascii: u8, scancode: u8, modifiers: u8) -> u32 {
+    (if press { 1u32 << 24 } else { 0 })
+        | ((modifiers as u32) << 16)
+        | ((scancode as u32) << 8)
+        | ascii as u32
+}
+
+/// Give a key to a window, dropping the oldest one it has not read if it is
+/// behind.
+fn push_event(idx: usize, ev: u32) {
+    unsafe {
+        let w = &mut WINDOWS[idx];
+        if !w.used {
+            return;
+        }
+        if w.ev_len == EVENT_QUEUE {
+            w.ev_head = (w.ev_head + 1) % EVENT_QUEUE;
+            w.ev_len -= 1;
+        }
+        let at = (w.ev_head + w.ev_len) % EVENT_QUEUE;
+        w.events[at] = ev;
+        w.ev_len += 1;
+    }
+}
+
+fn pop_event(idx: usize) -> Option<u32> {
+    unsafe {
+        let w = &mut WINDOWS[idx];
+        if w.ev_len == 0 {
+            return None;
+        }
+        let ev = w.events[w.ev_head];
+        w.ev_head = (w.ev_head + 1) % EVENT_QUEUE;
+        w.ev_len -= 1;
+        Some(ev)
+    }
+}
+
+/// Take the keyboard, so that keys come here rather than to the shell that
+/// launched this. Not fatal if it fails: a session with a screen and no
+/// keyboard is still worth more than no session.
+fn claim_input() {
+    let Some(input) = nameserver::lookup_retry(b"input", 20) else {
+        println!("wm: no input server; running without a keyboard");
+        return;
+    };
+    let msg = Message { sender: 0, tag: TAG_INPUT_CLAIM, data: [0; 6] };
+    let mut reply = Message::empty();
+    if syscall::sys_call(input, &msg, &mut reply).is_err() || reply.tag == TAG_ERROR {
+        println!("wm: could not claim the keyboard");
+        return;
+    }
+    unsafe { INPUT_TID = input };
+}
+
+fn release_input() {
+    let input = unsafe { INPUT_TID };
+    if input == 0 {
+        return;
+    }
+    unsafe { INPUT_TID = 0 };
+    let msg = Message { sender: 0, tag: TAG_INPUT_RELEASE, data: [0; 6] };
+    let mut reply = Message::empty();
+    let _ = syscall::sys_call(input, &msg, &mut reply);
+}
+
+/// Collect whatever has been typed since the last look and route it.
+///
+/// Bounded so that holding a key down cannot keep this from ever getting back
+/// to compositing: what is left stays in the driver's ring and arrives next
+/// time round.
+fn pump_input() {
+    let input = unsafe { INPUT_TID };
+    if input == 0 {
+        return;
+    }
+    for _ in 0..EVENT_QUEUE {
+        let msg = Message { sender: 0, tag: TAG_INPUT_POLL, data: [0; 6] };
+        let mut reply = Message::empty();
+        if syscall::sys_call(input, &msg, &mut reply).is_err() {
+            return;
+        }
+        if reply.tag != TAG_INPUT_KEY {
+            return;
+        }
+        dispatch_key(
+            reply.data[0] != 0,
+            reply.data[1] as u8,
+            reply.data[2] as u8,
+            reply.data[3] as u8,
+        );
+    }
+}
+
+/// Decide where a key goes.
+///
+/// The compositor's own bindings come first and are never passed on — a client
+/// cannot be allowed to swallow the way out of the session. Their releases are
+/// held back too: a client shown the release of a key it was never told was
+/// pressed would be tracking a phantom. Everything else, releases included,
+/// goes to the focused window and nowhere else.
+fn dispatch_key(press: bool, ascii: u8, scancode: u8, modifiers: u8) {
+    match ascii {
+        KEY_ESCAPE => {
+            if press {
+                quit();
+            }
+            return;
+        }
+        KEY_TAB => {
+            if press {
+                cycle_focus();
+                composite();
+            }
+            return;
+        }
+        _ => {}
+    }
+
+    let focus = unsafe { FOCUS };
+    if focus == usize::MAX {
+        return;
+    }
+    push_event(focus, pack_event(press, ascii, scancode, modifiers));
+}
+
 /// Lay a new window out.
 ///
 /// Cascaded from the top left, which is the least surprising thing to do with
@@ -410,6 +601,7 @@ fn handle_create(sender: usize, msg: &Message) -> Message {
     let s = unsafe { &SCREEN };
 
     if w == 0 || h == 0 || w > s.width || h > s.height {
+        println!("[wm] refused a window for tid {}: bad size", sender);
         return error(1);
     }
 
@@ -421,6 +613,7 @@ fn handle_create(sender: usize, msg: &Message) -> Message {
         }
     }
     if idx == MAX_WINDOWS {
+        println!("[wm] refused a window for tid {}: no free window", sender);
         return error(2);
     }
 
@@ -428,15 +621,18 @@ fn handle_create(sender: usize, msg: &Message) -> Message {
     let bytes = stride * h;
     let pages = (bytes + 4095) / 4096;
     if pages * 4096 > WIN_STRIDE {
+        println!("[wm] refused a window for tid {}: too big", sender);
         return error(3);
     }
 
     let Ok(shmem) = syscall::sys_shmem_create(pages) else {
+        println!("[wm] refused a window for tid {}: no shared memory", sender);
         return error(4);
     };
     let buf = WIN_BASE + idx * WIN_STRIDE;
     if syscall::sys_shmem_map(shmem, buf).is_err() {
         let _ = syscall::sys_shmem_destroy(shmem);
+        println!("[wm] refused a window for tid {}: could not map it", sender);
         return error(5);
     }
     // The client cannot map what it has not been granted, and it is the whole
@@ -444,6 +640,7 @@ fn handle_create(sender: usize, msg: &Message) -> Message {
     if syscall::sys_shmem_grant(shmem, sender).is_err() {
         let _ = syscall::sys_shmem_unmap(shmem, buf);
         let _ = syscall::sys_shmem_destroy(shmem);
+        println!("[wm] refused a window for tid {}: could not share it", sender);
         return error(6);
     }
     unsafe { core::ptr::write_bytes(buf as *mut u8, 0, bytes) };
@@ -474,6 +671,7 @@ fn handle_create(sender: usize, msg: &Message) -> Message {
             stride,
             title,
             title_len,
+            ..NO_WINDOW
         };
         STACK[STACK_LEN] = idx;
         STACK_LEN += 1;
@@ -553,29 +751,60 @@ pub extern "C" fn _start() -> ! {
     }
 
     let _ = nameserver::register(b"wm");
+    // The keyboard follows the screen. Claimed after the display, so that a
+    // failure here leaves a compositor that draws rather than one that has
+    // taken the keyboard away from a console it never displaced.
+    claim_input();
     composite();
 
     // What this session is for. Without one there is nothing to composite and
     // nothing to wait for, so say so rather than sit on the display.
-    let Some(program) = args::argv(1) else {
-        println!("usage: wm <program>");
+    if args::argv(1).is_none() {
+        println!("usage: wm <program> [program...]");
         quit();
-    };
-    let Some(session) = start_session(program) else {
-        quit();
-    };
-    unsafe { SESSION = session };
+    }
+    let mut n = 0;
+    while n < MAX_SESSION {
+        let Some(program) = args::argv(1 + n) else { break };
+        let Some(tid) = start_session(program, n) else {
+            quit();
+        };
+        unsafe {
+            SESSION[n] = tid;
+            SESSION_LEN += 1;
+        }
+        n += 1;
+    }
 
+    let mut last_pump: u64 = 0;
+    let mut last_check: u64 = 0;
     loop {
-        // A timed receive rather than a blocking one, so the session ending is
-        // noticed. Nothing else would wake this: a program that exits sends no
-        // message, and a compositor sitting on the display for a session that
-        // finished is a machine with no way back to its console.
-        let mut msg = Message::empty();
-        if syscall::sys_recv_timeout(TID_ANY, &mut msg, SESSION_POLL_TICKS).is_err() {
+        // Two things happen that nobody sends a message about. Keys are one:
+        // the input server cannot send here uninvited, so the keyboard has to
+        // be asked. The session ending is the other — a program that exits
+        // says nothing, and a compositor sitting on the display for a session
+        // that finished is a machine with no way back to its console.
+        //
+        // Both are done on the clock rather than off the receive timing out.
+        // A session whose clients poll for their own events keeps this loop
+        // busy, and hanging the keyboard off an idle moment would mean it went
+        // unread for exactly as long as anything was happening.
+        let now = syscall::sys_ticks();
+        if now != last_pump {
+            last_pump = now;
+            pump_input();
+        }
+        if now.wrapping_sub(last_check) >= SESSION_CHECK_TICKS {
+            last_check = now;
             if session_finished() {
                 quit();
             }
+        }
+
+        // A timed receive rather than a blocking one, so that the two above
+        // still happen on a screen nothing is drawing to.
+        let mut msg = Message::empty();
+        if syscall::sys_recv_timeout(TID_ANY, &mut msg, POLL_TICKS).is_err() {
             continue;
         }
         let sender = msg.sender;
@@ -610,6 +839,31 @@ pub extern "C" fn _start() -> ! {
                 }
                 None => error(1),
             },
+            TAG_WM_POLL_EVENT => match window_of(msg.data[0] as usize, sender) {
+                Some(i) => {
+                    let focused = if unsafe { FOCUS } == i { 1 } else { 0 };
+                    match pop_event(i) {
+                        Some(ev) => Message {
+                            sender: 0,
+                            tag: TAG_OK,
+                            data: [
+                                1,
+                                (ev & 0xFF) as u64,
+                                ((ev >> 8) & 0xFF) as u64,
+                                ((ev >> 16) & 0xFF) as u64,
+                                ((ev >> 24) & 1) as u64,
+                                focused,
+                            ],
+                        },
+                        None => Message {
+                            sender: 0,
+                            tag: TAG_OK,
+                            data: [0, 0, 0, 0, 0, focused],
+                        },
+                    }
+                }
+                None => error(1),
+            },
             TAG_WM_DESTROY => match window_of(msg.data[0] as usize, sender) {
                 Some(i) => {
                     destroy_window(i);
@@ -627,6 +881,8 @@ pub extern "C" fn _start() -> ! {
                     SCREEN.fb = 0;
                     SCREEN.back = 0;
                 }
+                // The keyboard came with the screen and goes back with it.
+                release_input();
                 println!("wm: display taken; exiting");
                 syscall::sys_exit_code(0);
             }
@@ -695,33 +951,50 @@ fn init_screen(reply: &Message) -> bool {
     true
 }
 
-/// How often to look at whether the session is still running, in PIT ticks.
-/// A tenth of a second: unnoticeable to a person, and nothing to a machine
-/// that is otherwise idle waiting for a client.
-const SESSION_POLL_TICKS: u64 = 10;
-
-/// Has the session program stopped?
+/// How long to wait for a message before looking around, in PIT ticks.
 ///
-/// Reaps it if so. A task that has exited but not been waited for stays in the
-/// table as Dead, so asking about its state is the same question either way.
+/// One, which is ten milliseconds, because this is also how often the keyboard
+/// is asked and typing at a tenth of a second is typing through treacle.
+const POLL_TICKS: u64 = 1;
+/// How long between checks on whether the session is over, in the same ticks.
+///
+/// The keyboard wants asking every one of them — ten milliseconds is below
+/// what a typist notices and a hundred is not — but whether a program has
+/// exited does not change on that scale, and asking costs a system call per
+/// task in the session.
+const SESSION_CHECK_TICKS: u64 = 25;
+
+/// Have all the session's programs stopped?
+///
+/// A task that has exited but not been waited for stays in the table as Dead,
+/// so asking about its state is the same question either way. The session
+/// lasts as long as its last program: closing one window of two is not a
+/// reason to take the screen away from the other.
 fn session_finished() -> bool {
-    let session = unsafe { SESSION };
-    if session == 0 {
-        return false;
-    }
-    match syscall::sys_task_info(session) {
-        Ok((state, _, _)) => state == 3, // Dead
-        Err(()) => true,                 // gone entirely
+    unsafe {
+        if SESSION_LEN == 0 {
+            return false;
+        }
+        for i in 0..SESSION_LEN {
+            let alive = match syscall::sys_task_info(SESSION[i]) {
+                Ok((state, _, _)) => state != 3, // 3 is Dead
+                Err(()) => false,                // gone entirely
+            };
+            if alive {
+                return false;
+            }
+        }
+        true
     }
 }
 
-/// Start the program this session is for.
+/// Start one of the programs this session is for.
 ///
-/// The compositor holds the display for as long as that program runs, and
-/// gives it back when it stops — which is what `startx` does, and for the same
-/// reason: something has to decide when the graphical session is over, and the
-/// thing the user asked to run is the obvious candidate.
-fn start_session(name: &[u8]) -> Option<usize> {
+/// The compositor holds the display for as long as those programs run, and
+/// gives it back when the last of them stops — which is what `startx` does,
+/// and for the same reason: something has to decide when the graphical session
+/// is over, and the thing the user asked to run is the obvious candidate.
+fn start_session(name: &[u8], index: usize) -> Option<usize> {
     let vfs_tid = nameserver::lookup_retry(b"vfs", 20)?;
 
     // The same two spellings the shell tries: lowercase for ext2, uppercase
@@ -794,7 +1067,17 @@ fn start_session(name: &[u8]) -> Option<usize> {
         let _ = syscall::sys_cap_delete(slot);
     }
 
-    let _ = spawn::set_args(&info, &[name], &SPAWN_SCRATCH);
+    // Where a client's diagnostics go. Not stdin: a session program takes its
+    // keys from this compositor, and a read on the input server would only
+    // block until the display went back to the console anyway.
+    let _ = syscall::sys_fd_dup(info.tid, 1, 1);
+    let _ = syscall::sys_fd_dup(info.tid, 2, 2);
+
+    // argv[1] is which of the session's programs this one is. Two copies of
+    // the same program are otherwise indistinguishable on screen, and telling
+    // which window has focus is the entire point of having two.
+    let tag = [b'1' + (index % 9) as u8];
+    let _ = spawn::set_args(&info, &[name, &tag], &SPAWN_SCRATCH);
     if info.start().is_err() {
         println!("wm: could not start that program");
         return None;
@@ -805,11 +1088,23 @@ fn start_session(name: &[u8]) -> Option<usize> {
 /// Give the display back and stop.
 fn quit() -> ! {
     let fb = unsafe { FB_TID };
+
+    // Take the session down first. A client outliving its compositor is a task
+    // calling a dead TID for windows it can no longer draw, and — because TIDs
+    // are recycled — eventually calling whatever lands in that slot next.
+    unsafe {
+        for i in 0..SESSION_LEN {
+            let _ = syscall::sys_task_kill(SESSION[i]);
+        }
+        SESSION_LEN = 0;
+    }
+
     for i in 0..MAX_WINDOWS {
         if unsafe { WINDOWS[i].used } {
             destroy_window(i);
         }
     }
+    release_input();
     if fb != 0 {
         // Hand the capability back with the display: a slot must be empty to
         // be granted into, so leaving it filled would stop the next claimant

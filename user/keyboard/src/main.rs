@@ -16,6 +16,18 @@ const TAG_GET_KEY: u64 = 1;
 const TAG_KEY_EVENT: u64 = 2;
 const TAG_NO_KEY: u64 = 3;
 const TAG_REGISTER_SIGINT: u64 = 4;
+/// Take a key if one is waiting, but do not wait for one.
+///
+/// [`TAG_GET_KEY`] parks the caller until something is typed, which is right
+/// for a line discipline and wrong for anything with a screen to redraw. A
+/// server that has to stay answerable — the input server while a compositor
+/// holds the keyboard — asks this instead and gets [`TAG_NO_KEY`] when there
+/// is nothing.
+///
+/// A keyboard driver that predates this answers `TAG_NO_KEY` through its
+/// default arm, so the failure is "no keys ever" rather than a caller that
+/// hangs on an unrecognised tag.
+const TAG_GET_KEY_NB: u64 = 5;
 
 // Key event types
 const KEY_PRESS: u64 = 1;
@@ -241,6 +253,13 @@ pub extern "C" fn _start() -> ! {
                         // No key available — save client to reply later
                         waiting_client = Some(msg.sender);
                     }
+                }
+                TAG_GET_KEY_NB => {
+                    let reply = match keybuf.pop() {
+                        Some(ev) => make_key_reply(&ev),
+                        None => Message { sender: 0, tag: TAG_NO_KEY, data: [0; 6] },
+                    };
+                    let _ = syscall::sys_reply(msg.sender, &reply);
                 }
                 TAG_REGISTER_SIGINT => {
                     sigint_tid = msg.sender;
