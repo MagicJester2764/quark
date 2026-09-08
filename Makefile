@@ -68,11 +68,17 @@ CAPDEMO_DIR := user/capdemo
 THREADTEST_DIR := user/threadtest
 SOCKTEST_DIR := user/socktest
 FSTEST_DIR := user/fstest
+
+# C programs, built against the C library rather than quark-rt.
+LIBC_DIR := user/libc
+CWC_DIR := user/cwc
 CAT_ELF := $(CAT_DIR)/target/$(TARGET)/release/cat
 CAPDEMO_ELF := $(CAPDEMO_DIR)/target/$(TARGET)/release/capdemo
 THREADTEST_ELF := $(THREADTEST_DIR)/target/$(TARGET)/release/threadtest
 SOCKTEST_ELF := $(SOCKTEST_DIR)/target/$(TARGET)/release/socktest
 FSTEST_ELF := $(FSTEST_DIR)/target/$(TARGET)/release/fstest
+LIBC_A := $(LIBC_DIR)/libquark.a
+CWC_ELF := $(CWC_DIR)/cwc
 
 LOGIN_DIR := user/login
 LOGIN_ELF := $(LOGIN_DIR)/target/$(TARGET)/release/login
@@ -113,7 +119,7 @@ $(FAT32_DRV_BIN): FORCE
 	cd $(FAT32_DRV_DIR) && cargo build --release
 	objcopy -O binary $(FAT32_DRV_ELF) $(FAT32_DRV_BIN)
 
-user: $(INIT_ELF) $(HOSTED_ELFS) $(NS_ELF) $(KBD_ELF) $(CON_ELF) $(INP_ELF) $(DISK_ELF) $(DISKTEST_ELF) $(VFS_ELF) $(NET_ELF) $(SHELL_ELF) $(ECHO_ELF) $(LS_ELF) $(CAT_ELF) $(LOGIN_ELF) $(PS_ELF) $(IPCPING_ELF) $(PING_ELF) $(SHUTDOWN_ELF) $(CAPDEMO_ELF) $(THREADTEST_ELF) $(SOCKTEST_ELF) $(FSTEST_ELF)
+user: $(INIT_ELF) $(HOSTED_ELFS) $(NS_ELF) $(KBD_ELF) $(CON_ELF) $(INP_ELF) $(DISK_ELF) $(DISKTEST_ELF) $(VFS_ELF) $(NET_ELF) $(SHELL_ELF) $(ECHO_ELF) $(LS_ELF) $(CAT_ELF) $(LOGIN_ELF) $(PS_ELF) $(IPCPING_ELF) $(PING_ELF) $(SHUTDOWN_ELF) $(CAPDEMO_ELF) $(THREADTEST_ELF) $(SOCKTEST_ELF) $(FSTEST_ELF) $(CWC_ELF)
 
 $(INIT_ELF): FORCE
 	cd $(INIT_DIR) && cargo build --release
@@ -203,6 +209,15 @@ $(SOCKTEST_ELF): FORCE
 $(FSTEST_ELF): FORCE
 	cd $(FSTEST_DIR) && cargo build --release
 
+# The C library, and a C program built against it. A libc is a consumer of the
+# Quark ABI exactly as the Rust runtime is; neither is privileged over the
+# other, and both are built here.
+$(LIBC_A): FORCE
+	$(MAKE) -C $(LIBC_DIR)
+
+$(CWC_ELF): $(LIBC_A) FORCE
+	$(MAKE) -C $(CWC_DIR)
+
 $(LOGIN_ELF): FORCE
 	cd $(LOGIN_DIR) && cargo build --release
 
@@ -257,6 +272,9 @@ USR_PROGRAMS  := disktest:DISKTEST shell:SHELL echo:ECHO ls:LS cat:CAT \
                  login:LOGIN ps:PS ipcping:IPCPING ping:PING \
                  shutdown:SHUTDOWN capdemo:CAPDEMO threadtest:THREADTEST socktest:SOCKTEST fstest:FSTEST
 
+# Programs written in C, built against user/libc.
+C_PROGRAMS    := cwc:CWC
+
 install: all
 	@mkdir -p $(DESTDIR)/drivers $(DESTDIR)/boot $(DESTDIR)/usr/bin $(DESTDIR)/etc
 	@cp $(KERNEL) $(DESTDIR)/kernel.bin
@@ -269,6 +287,12 @@ install: all
 	@for p in $(USR_PROGRAMS); do \
 		src=$${p%%:*}; dst=$${p##*:}; \
 		cp user/$$src/target/$(TARGET)/release/$$src $(DESTDIR)/usr/bin/$$dst.ELF; \
+	done
+	@# C programs are not cargo crates, so their binaries sit beside their
+	@# sources rather than under a target directory.
+	@for p in $(C_PROGRAMS); do \
+		src=$${p%%:*}; dst=$${p##*:}; \
+		cp user/$$src/$$src $(DESTDIR)/usr/bin/$$dst.ELF; \
 	done
 	@# Gate on the fork, not on the files: a hosted binary left over from an
 	@# earlier build cannot be shown to match the current tree, and shipping a
@@ -307,6 +331,8 @@ clean:
 	cd $(PING_DIR) && cargo clean
 	cd $(SHUTDOWN_DIR) && cargo clean
 	@for p in $(HOSTED_PROGRAMS); do (cd user/$$p && cargo clean); done
+	$(MAKE) -C $(LIBC_DIR) clean
+	$(MAKE) -C $(CWC_DIR) clean
 	rm -rf $(KERNEL) $(VGA_DRV_BIN) $(FAT32_DRV_BIN) quark.iso isodir
 
 FORCE:
