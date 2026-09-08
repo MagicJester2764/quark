@@ -338,7 +338,27 @@ impl Ext2State {
     }
 
     /// Write a sector (from DISK_IO_BUF) at an absolute LBA.
+    ///
+    /// Diverted into the open transaction if there is one, so that nothing
+    /// reaches the disk until the journal says it may. The journal's own
+    /// writes go through [`Ext2State::write_sector_raw`], or committing would
+    /// capture itself.
     pub fn write_sector_abs(&self, abs_lba: u32) -> Result<(), ()> {
+        if crate::journal::capture_write(crate::journal_mut(), self, abs_lba) {
+            // Drop the cached copy rather than replacing it. Caching the new
+            // contents here would mean reading DISK_IO_BUF, which capture_write
+            // has just used to read the rest of the block off the disk — so the
+            // cache would get some other sector's bytes under this sector's
+            // number. A miss falls through to raw_read_sector, which serves the
+            // transaction anyway.
+            unsafe { SECTOR_CACHE.invalidate(abs_lba) };
+            return Ok(());
+        }
+        self.write_sector_raw(abs_lba)
+    }
+
+    /// Write a sector straight to the disk, transaction or not.
+    pub fn write_sector_raw(&self, abs_lba: u32) -> Result<(), ()> {
         let msg = Message {
             sender: 0,
             tag: TAG_WRITE_SECTOR,
@@ -407,6 +427,24 @@ impl Ext2State {
 // ---------------------------------------------------------------------------
 
 pub fn raw_read_sector(disk_tid: usize, buf_phys: usize, lba: u32) -> Result<(), ()> {
+    // A read-modify-write inside a transaction must see the transaction's own
+    // earlier writes. Going to the disk would read what is deliberately not
+    // written yet and put back a block missing every change made so far.
+    {
+        let buf = unsafe { core::slice::from_raw_parts_mut(DISK_IO_BUF as *mut u8, 512) };
+        if crate::journal::peek_read(crate::journal_ref(), crate::ext2_state(), lba, buf) {
+            return Ok(());
+        }
+    }
+    read_sector_bypass(disk_tid, buf_phys, lba)
+}
+
+/// Read a sector from the disk, ignoring any open transaction.
+///
+/// The journal's own bookkeeping needs what is actually on the disk: writing
+/// the transaction's version of a block out from under it would put half a
+/// transaction where the journal had promised none.
+pub fn read_sector_bypass(disk_tid: usize, buf_phys: usize, lba: u32) -> Result<(), ()> {
     let msg = Message {
         sender: 0,
         tag: TAG_READ_SECTOR,
@@ -535,15 +573,11 @@ pub fn init_ext2(
         return Err(());
     }
 
-    // The journal is the filesystem's record of writes it has committed but
-    // not yet placed. Mounting over one without replaying it reads superseded
-    // data as though it were current.
-    if feature_incompat & ext4::INCOMPAT_RECOVER != 0 {
-        println!("[vfs] journal needs recovery; mounting read-only");
-    }
-
+    // Whether the journal makes this read-only is decided after it has been
+    // looked at: a dirty journal that can be replayed leaves the filesystem
+    // writable, and one that cannot does not.
     let unknown_ro = feature_ro_compat & !ext4::RO_COMPAT_WRITE_SUPPORTED;
-    let read_only = unknown_ro != 0 || feature_incompat & ext4::INCOMPAT_RECOVER != 0;
+    let read_only = unknown_ro != 0;
     if unknown_ro != 0 {
         println!(
             "[vfs] read-only: features 0x{:x} need maintaining on write",
@@ -1210,6 +1244,43 @@ pub fn check_permission(inode: &Ext2Inode, uid: u32, gid: u32, required: u16) ->
 // ---------------------------------------------------------------------------
 
 /// Write back the superblock's free block/inode counts.
+/// Say whether the filesystem needs its journal replayed.
+///
+/// Set while a committed transaction has not yet been written where it
+/// belongs, and cleared once it has. `e2fsck` looks at this to decide whether
+/// to replay: without it, a crash in that window leaves a filesystem it
+/// declares inconsistent instead of one it can put right.
+pub fn set_needs_recovery(ext2: &Ext2State, on: bool) -> Result<(), u64> {
+    let abs_lba = ext2.part_lba + 2;
+    let sb = unsafe { &mut *core::ptr::addr_of_mut!(SB_BUF) };
+    for s in 0..2usize {
+        read_sector_bypass(ext2.disk_tid, ext2.buf_phys, abs_lba + s as u32)
+            .map_err(|_| ERR_IO)?;
+        let disk = unsafe { core::slice::from_raw_parts(DISK_IO_BUF as *const u8, 512) };
+        sb[s * 512..(s + 1) * 512].copy_from_slice(disk);
+    }
+
+    let mut incompat = read_u32(sb, 96);
+    let want = if on {
+        incompat | ext4::INCOMPAT_RECOVER
+    } else {
+        incompat & !ext4::INCOMPAT_RECOVER
+    };
+    if want == incompat {
+        return Ok(());
+    }
+    incompat = want;
+    write_u32(sb, 96, incompat);
+    csum::set_superblock(sb);
+
+    for s in 0..2usize {
+        let disk = unsafe { core::slice::from_raw_parts_mut(DISK_IO_BUF as *mut u8, 512) };
+        disk.copy_from_slice(&sb[s * 512..(s + 1) * 512]);
+        ext2.write_sector_raw(abs_lba + s as u32).map_err(|_| ERR_IO)?;
+    }
+    Ok(())
+}
+
 /// Largest inode this handles. ext4 allows more, but nothing makes one.
 pub const INODE_BUF_LEN: usize = 1024;
 static mut INODE_BUF: [u8; INODE_BUF_LEN] = [0; INODE_BUF_LEN];

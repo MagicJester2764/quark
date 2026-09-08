@@ -58,6 +58,37 @@ pub extern "C" fn _start() -> ! {
         syscall::sys_exit_code(1);
     }
 
+    // `fstest loop` writes files until it is killed, which is how the journal
+    // gets tested: stop the machine at an arbitrary moment and see whether
+    // what comes back up is consistent.
+    if quark_rt::args::argv(1) == Some(b"loop") {
+        let mut n = 0u32;
+        loop {
+            let mut path = *b"/home/root/loop00.txt";
+            path[15] = b'0' + ((n / 10) % 10) as u8;
+            path[16] = b'0' + (n % 10) as u8;
+            match vfs::create(vfs_tid, &path, false) {
+                Ok((h, _, _)) => {
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(
+                            CONTENT.as_ptr(),
+                            BUF as *mut u8,
+                            CONTENT.len(),
+                        );
+                    }
+                    let _ = vfs::write(vfs_tid, h, phys, 0, CONTENT.len() as u32);
+                    let _ = vfs::close(vfs_tid, h);
+                    println!("wrote {}", Str(&path));
+                }
+                Err(e) => {
+                    println!("create {} failed: {}", Str(&path), e);
+                    syscall::sys_exit_code(1);
+                }
+            }
+            n = (n + 1) % 100;
+        }
+    }
+
     let path = b"/home/root/fstest.txt";
     println!("fstest: {}", Str(path));
 

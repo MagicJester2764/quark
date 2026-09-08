@@ -8,6 +8,7 @@ pub mod ext2_alloc;
 pub mod ext2_dir;
 pub mod ext4;
 pub mod csum;
+pub mod journal;
 
 use quark_rt::ipc::{Message, TID_ANY};
 use quark_rt::nameserver;
@@ -66,6 +67,21 @@ enum FsType {
 }
 
 static mut FS_TYPE: FsType = FsType::Fat32;
+/// The journal, if the mounted filesystem has one.
+///
+/// A global for the same reason as the filesystem state: the sector read and
+/// write paths that have to consult it are free functions several layers below
+/// anything holding a reference.
+static mut JOURNAL: journal::Journal = journal::Journal::empty();
+
+pub fn journal_ref() -> &'static journal::Journal {
+    unsafe { &*core::ptr::addr_of!(JOURNAL) }
+}
+
+pub fn journal_mut() -> &'static mut journal::Journal {
+    unsafe { &mut *core::ptr::addr_of_mut!(JOURNAL) }
+}
+
 /// The mounted filesystem's state.
 ///
 /// A flat static rather than an `Option`, and never assigned as a whole: it
@@ -207,6 +223,16 @@ impl SectorCache {
             }
         }
         self.entries[idx].hash_next = NONE;
+    }
+
+    /// Drop everything. Used when an abandoned transaction means the cache
+    /// may hold writes that are never going to reach the disk.
+    pub fn flush_all(&mut self) {
+        for i in 0..CACHE_ENTRIES {
+            if self.entries[i].valid {
+                self.invalidate(self.entries[i].lba);
+            }
+        }
     }
 
     /// Invalidate any cached copy of a given LBA.
@@ -1395,6 +1421,42 @@ pub extern "C" fn _start() -> ! {
                         if state.read_only { " (read-only)" } else { "" }
                     );
                     unsafe { FS_TYPE = FsType::Ext2 };
+
+                    // The journal, and whatever it says did not finish.
+                    if journal::map_buffers().is_err() {
+                        println!("[vfs] could not map journal buffers; mounting read-only");
+                        ext2_state_mut().read_only = true;
+                    } else {
+                        match journal::load(journal_mut(), ext2_state()) {
+                            Ok(true) => {
+                                if let Err(e) = journal::recover(journal_mut(), ext2_state()) {
+                                    println!("[vfs] journal recovery failed ({}); read-only", e);
+                                    ext2_state_mut().read_only = true;
+                                } else if let Err(e) =
+                                    journal::checkpoint_done(journal_mut(), ext2_state())
+                                {
+                                    println!("[vfs] could not clear the journal ({}); read-only", e);
+                                    ext2_state_mut().read_only = true;
+                                } else {
+                                    println!("[vfs] journal ready");
+                                }
+                            }
+                            Ok(false) => {
+                                // No journal. If the filesystem says it needs
+                                // recovering, nothing here can do it.
+                                if ext2_state().feature_incompat & ext4::INCOMPAT_RECOVER != 0 {
+                                    println!(
+                                        "[vfs] needs recovery but has no journal; read-only"
+                                    );
+                                    ext2_state_mut().read_only = true;
+                                }
+                            }
+                            Err(e) => {
+                                println!("[vfs] journal unusable ({}); mounting read-only", e);
+                                ext2_state_mut().read_only = true;
+                            }
+                        }
+                    }
                 }
                 Err(()) => {
                     println!("[vfs] mount failed, falling back to FAT32.");
@@ -1462,8 +1524,8 @@ pub extern "C" fn _start() -> ! {
             TAG_CLOSE => handle_close(sender, &msg),
             TAG_READDIR => handle_readdir(&disk, sender, &msg),
             TAG_STAT => handle_stat(sender, &msg),
-            TAG_WRITE => handle_write(&disk, sender, &msg),
-            TAG_CREATE => handle_create(&disk, sender, &msg),
+            TAG_WRITE => transacted(|| handle_write(&disk, sender, &msg)),
+            TAG_CREATE => transacted(|| handle_create(&disk, sender, &msg)),
             TAG_READDIR_BULK => handle_readdir_bulk(&disk, sender, &msg),
             quark_rt::ipc::TAG_PING => {
                 // Liveness probe: reply immediately, touching no disk state.
@@ -1949,6 +2011,27 @@ fn handle_read_ext2(sender: usize, msg: &Message) {
             }
         }
         None => error_reply(sender, ERR_INVALID_HANDLE),
+    }
+}
+
+/// Run one filesystem-modifying operation as a single transaction.
+///
+/// Everything it writes is held in the journal until it is complete, so a
+/// machine that stops half way through leaves the filesystem as it was rather
+/// than as neither one thing nor the other.
+fn transacted<F: FnOnce()>(body: F) {
+    journal::begin(journal_mut());
+    body();
+    match journal::commit(journal_mut(), ext2_state()) {
+        Ok(_) => {
+            if let Err(e) = journal::checkpoint(journal_mut(), ext2_state()) {
+                println!("[vfs] checkpoint failed ({}); the journal will replay it", e);
+            }
+        }
+        Err(e) => {
+            println!("[vfs] commit failed ({}); the change was abandoned", e);
+            journal::abort(journal_mut());
+        }
     }
 }
 

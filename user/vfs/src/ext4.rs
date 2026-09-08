@@ -44,6 +44,11 @@ pub const COMPAT_DIR_INDEX: u32 = 0x0020;
 
 pub const INCOMPAT_FILETYPE: u32 = 0x0002;
 /// The journal holds committed data the filesystem does not yet reflect.
+///
+/// Listed as supported because supporting it *is* replaying the journal, which
+/// happens at mount. A filesystem that says this and has no journal to replay
+/// it with is mounted read-only instead: it is describing work nothing can
+/// finish, and writing over it would bury whatever was interrupted.
 pub const INCOMPAT_RECOVER: u32 = 0x0004;
 pub const INCOMPAT_META_BG: u32 = 0x0010;
 pub const INCOMPAT_EXTENTS: u32 = 0x0040;
@@ -81,7 +86,8 @@ pub const INCOMPAT_SUPPORTED: u32 = INCOMPAT_FILETYPE
     | INCOMPAT_EXTENTS
     | INCOMPAT_64BIT
     | INCOMPAT_FLEX_BG
-    | INCOMPAT_CSUM_SEED;
+    | INCOMPAT_CSUM_SEED
+    | INCOMPAT_RECOVER;
 
 /// Read-only-compatible features that also do not stop us *writing*.
 ///
