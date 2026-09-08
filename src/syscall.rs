@@ -13,30 +13,115 @@ const MSR_EFER: u32 = 0xC000_0080;
 
 const KERNEL_CS: u64 = 0x08;
 
-/// Syscall numbers are assigned in 16-slot blocks, one subsystem per block, so
-/// a new call lands beside its relatives instead of in whatever gap is free.
-/// The unused slots in each block are reserved for that subsystem.
-///
-///   0x00  0-15     process lifecycle
-///   0x10  16-31    IPC
-///   0x20  32-47    memory
-///   0x30  48-63    shared memory
-///   0x40  64-79    file descriptors and pipes
-///   0x50  80-95    capabilities
-///   0x60  96-111   task lifecycle and identity
-///   0x70  112-127  hardware and drivers
-///   0x80  128-143  synchronisation
-///   0x90  144-159  time
-///   0xA0  160-175  kernel debug console
-///   0xF0  240-255  ABI introspection
-///
-/// Numbers are stable within an ABI version: they are never reused, and a
-/// withdrawn call leaves its slot empty rather than being backfilled. See
-/// `docs/abi.md` for the full contract.
+// Syscall numbers are assigned in 16-slot blocks, one subsystem per block, so
+// a new call lands beside its relatives instead of in whatever gap is free.
+// The unused slots in each block are reserved for that subsystem.
+//
+//   0x00  0-15     process lifecycle
+//   0x10  16-31    IPC
+//   0x20  32-47    memory
+//   0x30  48-63    shared memory
+//   0x40  64-79    file descriptors and pipes
+//   0x50  80-95    capabilities
+//   0x60  96-111   task lifecycle and identity
+//   0x70  112-127  hardware and drivers
+//   0x80  128-143  synchronisation
+//   0x90  144-159  time
+//   0xA0  160-175  kernel debug console
+//   0xF0  240-255  ABI introspection
+//
+// Numbers are stable within an ABI version: they are never reused, and a
+// withdrawn call leaves its slot empty rather than being backfilled. See
+// `docs/abi.md` for the full contract.
+
+// --- 0x00  process lifecycle ---
 pub const SYS_EXIT: u64 = 0;
+/// Exit with a status. Separate from SYS_EXIT because `syscall0` leaves RDI
+/// undefined, so the existing zero-argument SYS_EXIT cannot grow an argument.
+pub const SYS_EXIT_CODE: u64 = 1;
 pub const SYS_YIELD: u64 = 2;
+pub const SYS_GETPID: u64 = 3;
+pub const SYS_WAIT: u64 = 4;
+pub const SYS_TASK_KILL: u64 = 5;
+pub const SYS_SIGNAL: u64 = 6;
+pub const SYS_TASK_INFO: u64 = 7;
+
+// --- 0x10  IPC ---
+pub const SYS_SEND: u64 = 16;
+pub const SYS_RECV: u64 = 17;
+pub const SYS_CALL: u64 = 18;
+pub const SYS_REPLY: u64 = 19;
+pub const SYS_CALL_TIMEOUT: u64 = 20;
+pub const SYS_RECV_TIMEOUT: u64 = 21;
+pub const SYS_NOTIFY: u64 = 22;
+
+// --- 0x20  memory ---
+pub const SYS_MMAP: u64 = 32;
+pub const SYS_MUNMAP: u64 = 33;
+pub const SYS_PHYS_ALLOC: u64 = 34;
+pub const SYS_PHYS_FREE: u64 = 35;
+pub const SYS_ADDRSPACE_CREATE: u64 = 36;
+pub const SYS_ADDRSPACE_MAP: u64 = 37;
+pub const SYS_MAP_PHYS: u64 = 38;
+pub const SYS_SET_MEM_LIMIT: u64 = 39;
+pub const SYS_SET_PAGER: u64 = 40;
+
+// --- 0x30  shared memory ---
+pub const SYS_SHMEM_CREATE: u64 = 48;
+pub const SYS_SHMEM_MAP: u64 = 49;
+pub const SYS_SHMEM_UNMAP: u64 = 50;
+pub const SYS_SHMEM_GRANT: u64 = 51;
+pub const SYS_SHMEM_DESTROY: u64 = 52;
+
+// --- 0x40  file descriptors and pipes ---
+pub const SYS_FD_READ: u64 = 64;
+pub const SYS_FD_WRITE: u64 = 65;
+pub const SYS_FD_READ_NB: u64 = 66;
+pub const SYS_FD_SET: u64 = 67;
+pub const SYS_FD_DUP: u64 = 68;
+pub const SYS_PIPE_CREATE: u64 = 69;
+pub const SYS_PIPE_FD_SET: u64 = 70;
+
+// --- 0x50  capabilities ---
+pub const SYS_CAP_MINT: u64 = 80;
+pub const SYS_CAP_GRANT: u64 = 81;
+pub const SYS_CAP_REVOKE: u64 = 82;
+pub const SYS_CAP_INSPECT: u64 = 83;
+pub const SYS_CAP_DELETE: u64 = 84;
+pub const SYS_CAP_TRANSFER: u64 = 85;
+pub const SYS_GRANT_CAP: u64 = 86;
+pub const SYS_GRANT_IOPORT: u64 = 87;
+pub const SYS_GRANT_IRQ: u64 = 88;
+pub const SYS_SET_USER_CAPS: u64 = 89;
+pub const SYS_GET_USER_CAPS: u64 = 90;
+
+// --- 0x60  task lifecycle and identity ---
+pub const SYS_TASK_CREATE: u64 = 96;
+pub const SYS_TASK_START: u64 = 97;
+pub const SYS_GET_UID: u64 = 98;
+pub const SYS_SET_UID: u64 = 99;
+pub const SYS_SET_GID: u64 = 100;
+pub const SYS_GET_TUID: u64 = 101;
+
+// --- 0x70  hardware and drivers ---
+pub const SYS_IRQ_REGISTER: u64 = 112;
+pub const SYS_IRQ_ACK: u64 = 113;
+pub const SYS_IOPORT: u64 = 114;
+pub const SYS_IOPORT_REP: u64 = 115;
+
+// --- 0x80  synchronisation ---
+pub const SYS_FUTEX_WAIT: u64 = 128;
+pub const SYS_FUTEX_WAKE: u64 = 129;
+
+// --- 0x90  time ---
+pub const SYS_TICKS: u64 = 144;
+
+// --- 0xA0  kernel debug console ---
 pub const SYS_WRITE: u64 = 160;
 pub const SYS_CONSOLE_POS: u64 = 161;
+
+// --- 0xF0  ABI introspection ---
+pub const SYS_ABI_VERSION: u64 = 240;
 
 /// Current syscall ABI version, as (major << 16) | minor.
 ///
@@ -45,75 +130,14 @@ pub const SYS_CONSOLE_POS: u64 = 161;
 /// does not know, which is the point of exposing it at all.
 pub const ABI_VERSION_MAJOR: u64 = 1;
 pub const ABI_VERSION_MINOR: u64 = 0;
-pub const SYS_ABI_VERSION: u64 = 240;
-/// Exit with a status. Separate from SYS_EXIT because `syscall0` leaves RDI
-/// undefined, so the existing zero-argument SYS_EXIT cannot grow an argument.
-pub const SYS_EXIT_CODE: u64 = 1;
-pub const SYS_SEND: u64 = 16;
-pub const SYS_RECV: u64 = 17;
-pub const SYS_CALL: u64 = 18;
-pub const SYS_REPLY: u64 = 19;
-pub const SYS_CALL_TIMEOUT: u64 = 20;
-pub const SYS_GETPID: u64 = 3;
-pub const SYS_IRQ_REGISTER: u64 = 112;
-pub const SYS_IRQ_ACK: u64 = 113;
-pub const SYS_IOPORT: u64 = 114;
-pub const SYS_MAP_PHYS: u64 = 38;
-pub const SYS_IOPORT_REP: u64 = 115;
 
-pub const SYS_TASK_CREATE: u64 = 96;
-pub const SYS_ADDRSPACE_CREATE: u64 = 36;
-pub const SYS_ADDRSPACE_MAP: u64 = 37;
-pub const SYS_TASK_START: u64 = 97;
-pub const SYS_PHYS_ALLOC: u64 = 34;
-pub const SYS_PHYS_FREE: u64 = 35;
-pub const SYS_GRANT_IOPORT: u64 = 87;
-pub const SYS_GRANT_IRQ: u64 = 88;
-pub const SYS_GRANT_CAP: u64 = 86;
 
-pub const SYS_FD_WRITE: u64 = 65;
-pub const SYS_FD_READ: u64 = 64;
-pub const SYS_FD_SET: u64 = 67;
-pub const SYS_PIPE_CREATE: u64 = 69;
-pub const SYS_PIPE_FD_SET: u64 = 70;
-pub const SYS_FD_DUP: u64 = 68;
-pub const SYS_FD_READ_NB: u64 = 66;
 
-pub const SYS_FUTEX_WAIT: u64 = 128;
-pub const SYS_FUTEX_WAKE: u64 = 129;
 
-pub const SYS_GET_UID: u64 = 98;
-pub const SYS_SET_UID: u64 = 99;
-pub const SYS_SET_GID: u64 = 100;
-pub const SYS_GET_TUID: u64 = 101;
-pub const SYS_TASK_KILL: u64 = 5;
-pub const SYS_TASK_INFO: u64 = 7;
-pub const SYS_SIGNAL: u64 = 6;
 
-pub const SYS_MMAP: u64 = 32;
-pub const SYS_MUNMAP: u64 = 33;
 
-pub const SYS_RECV_TIMEOUT: u64 = 21;
-pub const SYS_TICKS: u64 = 144;
-pub const SYS_SET_PAGER: u64 = 40;
-pub const SYS_WAIT: u64 = 4;
-pub const SYS_SET_MEM_LIMIT: u64 = 39;
-pub const SYS_NOTIFY: u64 = 22;
 
-pub const SYS_SHMEM_CREATE: u64 = 48;
-pub const SYS_SHMEM_MAP: u64 = 49;
-pub const SYS_SHMEM_GRANT: u64 = 51;
-pub const SYS_CAP_TRANSFER: u64 = 85;
 
-pub const SYS_CAP_MINT: u64 = 80;
-pub const SYS_CAP_GRANT: u64 = 81;
-pub const SYS_CAP_REVOKE: u64 = 82;
-pub const SYS_CAP_INSPECT: u64 = 83;
-pub const SYS_CAP_DELETE: u64 = 84;
-pub const SYS_SET_USER_CAPS: u64 = 89;
-pub const SYS_GET_USER_CAPS: u64 = 90;
-pub const SYS_SHMEM_UNMAP: u64 = 50;
-pub const SYS_SHMEM_DESTROY: u64 = 52;
 
 const SFMASK_VALUE: u64 = (1 << 9) | (1 << 10) | (1 << 18); // clear IF | DF | AC
 

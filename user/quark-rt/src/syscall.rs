@@ -6,68 +6,98 @@
 use core::arch::asm;
 
 // Syscall numbers
+// --- 0x00  process lifecycle ---
 pub const SYS_EXIT: u64 = 0;
-pub const SYS_YIELD: u64 = 2;
-pub const SYS_WRITE: u64 = 160;
-pub const SYS_CONSOLE_POS: u64 = 161;
-pub const SYS_ABI_VERSION: u64 = 240;
 pub const SYS_EXIT_CODE: u64 = 1;
+pub const SYS_YIELD: u64 = 2;
+pub const SYS_GETPID: u64 = 3;
+pub const SYS_WAIT: u64 = 4;
+pub const SYS_TASK_KILL: u64 = 5;
+pub const SYS_SIGNAL: u64 = 6;
+pub const SYS_TASK_INFO: u64 = 7;
+
+// --- 0x10  IPC ---
 pub const SYS_SEND: u64 = 16;
 pub const SYS_RECV: u64 = 17;
 pub const SYS_CALL: u64 = 18;
 pub const SYS_REPLY: u64 = 19;
 pub const SYS_CALL_TIMEOUT: u64 = 20;
-pub const SYS_GETPID: u64 = 3;
-pub const SYS_IRQ_REGISTER: u64 = 112;
-pub const SYS_IRQ_ACK: u64 = 113;
-pub const SYS_IOPORT: u64 = 114;
-pub const SYS_MAP_PHYS: u64 = 38;
-pub const SYS_IOPORT_REP: u64 = 115;
-pub const SYS_TASK_CREATE: u64 = 96;
-pub const SYS_ADDRSPACE_CREATE: u64 = 36;
-pub const SYS_ADDRSPACE_MAP: u64 = 37;
-pub const SYS_TASK_START: u64 = 97;
-pub const SYS_PHYS_ALLOC: u64 = 34;
-pub const SYS_PHYS_FREE: u64 = 35;
-pub const SYS_GRANT_IOPORT: u64 = 87;
-pub const SYS_GRANT_IRQ: u64 = 88;
-pub const SYS_GRANT_CAP: u64 = 86;
+pub const SYS_RECV_TIMEOUT: u64 = 21;
+pub const SYS_NOTIFY: u64 = 22;
 
-pub const SYS_FD_WRITE: u64 = 65;
-pub const SYS_FD_READ: u64 = 64;
-pub const SYS_FD_SET: u64 = 67;
-pub const SYS_PIPE_CREATE: u64 = 69;
-pub const SYS_PIPE_FD_SET: u64 = 70;
-pub const SYS_FD_DUP: u64 = 68;
-pub const SYS_FD_READ_NB: u64 = 66;
-
-pub const SYS_FUTEX_WAIT: u64 = 128;
-pub const SYS_FUTEX_WAKE: u64 = 129;
-
+// --- 0x20  memory ---
 pub const SYS_MMAP: u64 = 32;
 pub const SYS_MUNMAP: u64 = 33;
+pub const SYS_PHYS_ALLOC: u64 = 34;
+pub const SYS_PHYS_FREE: u64 = 35;
+pub const SYS_ADDRSPACE_CREATE: u64 = 36;
+pub const SYS_ADDRSPACE_MAP: u64 = 37;
+pub const SYS_MAP_PHYS: u64 = 38;
+pub const SYS_SET_MEM_LIMIT: u64 = 39;
+pub const SYS_SET_PAGER: u64 = 40;
 
+// --- 0x30  shared memory ---
+pub const SYS_SHMEM_CREATE: u64 = 48;
+pub const SYS_SHMEM_MAP: u64 = 49;
+pub const SYS_SHMEM_UNMAP: u64 = 50;
+pub const SYS_SHMEM_GRANT: u64 = 51;
+pub const SYS_SHMEM_DESTROY: u64 = 52;
+
+// --- 0x40  file descriptors and pipes ---
+pub const SYS_FD_READ: u64 = 64;
+pub const SYS_FD_WRITE: u64 = 65;
+pub const SYS_FD_READ_NB: u64 = 66;
+pub const SYS_FD_SET: u64 = 67;
+pub const SYS_FD_DUP: u64 = 68;
+pub const SYS_PIPE_CREATE: u64 = 69;
+pub const SYS_PIPE_FD_SET: u64 = 70;
+
+// --- 0x50  capabilities ---
+pub const SYS_CAP_MINT: u64 = 80;
+pub const SYS_CAP_GRANT: u64 = 81;
+pub const SYS_CAP_REVOKE: u64 = 82;
+pub const SYS_CAP_INSPECT: u64 = 83;
+pub const SYS_CAP_DELETE: u64 = 84;
+pub const SYS_CAP_TRANSFER: u64 = 85;
+pub const SYS_GRANT_CAP: u64 = 86;
+pub const SYS_GRANT_IOPORT: u64 = 87;
+pub const SYS_GRANT_IRQ: u64 = 88;
+pub const SYS_SET_USER_CAPS: u64 = 89;
+pub const SYS_GET_USER_CAPS: u64 = 90;
+
+// --- 0x60  task lifecycle and identity ---
+pub const SYS_TASK_CREATE: u64 = 96;
+pub const SYS_TASK_START: u64 = 97;
 pub const SYS_GET_UID: u64 = 98;
 pub const SYS_SET_UID: u64 = 99;
 pub const SYS_SET_GID: u64 = 100;
 pub const SYS_GET_TUID: u64 = 101;
-pub const SYS_TASK_KILL: u64 = 5;
-pub const SYS_TASK_INFO: u64 = 7;
-pub const SYS_SIGNAL: u64 = 6;
 
-pub const SYS_RECV_TIMEOUT: u64 = 21;
+// --- 0x70  hardware and drivers ---
+pub const SYS_IRQ_REGISTER: u64 = 112;
+pub const SYS_IRQ_ACK: u64 = 113;
+pub const SYS_IOPORT: u64 = 114;
+pub const SYS_IOPORT_REP: u64 = 115;
+
+// --- 0x80  synchronisation ---
+pub const SYS_FUTEX_WAIT: u64 = 128;
+pub const SYS_FUTEX_WAKE: u64 = 129;
+
+// --- 0x90  time ---
 pub const SYS_TICKS: u64 = 144;
-pub const SYS_SET_PAGER: u64 = 40;
-pub const SYS_WAIT: u64 = 4;
-pub const SYS_SET_MEM_LIMIT: u64 = 39;
-pub const SYS_NOTIFY: u64 = 22;
 
-pub const SYS_SHMEM_CREATE: u64 = 48;
-pub const SYS_SHMEM_MAP: u64 = 49;
-pub const SYS_SHMEM_GRANT: u64 = 51;
-pub const SYS_CAP_TRANSFER: u64 = 85;
-pub const SYS_SHMEM_UNMAP: u64 = 50;
-pub const SYS_SHMEM_DESTROY: u64 = 52;
+// --- 0xA0  kernel debug console ---
+pub const SYS_WRITE: u64 = 160;
+pub const SYS_CONSOLE_POS: u64 = 161;
+
+// --- 0xF0  ABI introspection ---
+pub const SYS_ABI_VERSION: u64 = 240;
+
+
+
+
+
+
 
 #[inline(always)]
 pub unsafe fn syscall0(nr: u64) -> u64 {
@@ -634,13 +664,6 @@ pub fn sys_signal(tid: usize, sig: u64) -> Result<(), ()> {
 }
 
 // Object capability syscalls
-pub const SYS_CAP_MINT: u64 = 80;
-pub const SYS_SET_USER_CAPS: u64 = 89;
-pub const SYS_GET_USER_CAPS: u64 = 90;
-pub const SYS_CAP_GRANT: u64 = 81;
-pub const SYS_CAP_REVOKE: u64 = 82;
-pub const SYS_CAP_INSPECT: u64 = 83;
-pub const SYS_CAP_DELETE: u64 = 84;
 
 // Object capability types
 pub const CAP_TYPE_IOPORT: u64 = 1;
