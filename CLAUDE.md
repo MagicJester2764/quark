@@ -138,14 +138,31 @@ These were established deliberately. Breaking one silently re-opens a hole.
   every CSpace, because TIDs are recycled and a stale bit would otherwise
   transfer to the slot's next occupant.
 
-`init` spawns `CONSOLE`, `INPUT` and `VFS` in passes of their own. If a program
-misbehaves for lack of a capability, check that its pass actually calls
+`init` spawns `WM`, `CONSOLE`, `INPUT` and `VFS` in passes of their own. If a
+program misbehaves for lack of a capability, check that its pass actually calls
 `grant_caps_from_manifest` — there is no shared path that does it for them, and
 INPUT's pass once granted nothing at all, which the UID bypass hid.
 
+## The screen
+
+`user/wm` owns the framebuffer. Everything that draws asks it for a window,
+gets shared memory back, writes pixels into it and sends a commit; the display
+server composites. The console is a client like any other, so the shell and
+everything it runs live inside a window.
+
+Two consequences worth knowing before changing any of it:
+
+- **Only one program may map the framebuffer.** `init` grants the `PhysRange`
+  to `wm`, and to the console only so it can fall back to drawing directly when
+  there is no display server. If both drew, they would overwrite each other.
+- **`init` sends framebuffer geometry to exactly one of them.** The console
+  waits for that message only when it is going to use it; `send_fb_info` is a
+  blocking call, so sending it to a console that is waiting for a window
+  instead stops `init` part way through starting the system.
+
 ## Known gaps
 
-- `PhysRange` is narrow where it can be: console holds exactly the framebuffer,
+- `PhysRange` is narrow where it can be: `wm` holds exactly the framebuffer,
   and login, the shell and everything they spawn hold none at all. DISK, VFS and
   NET still hold `PhysRange(0, 4 GiB)`, because each maps a DMA page the
   *client* allocated and named over IPC, which has no static extent to grant.
@@ -153,6 +170,10 @@ INPUT's pass once granted nothing at all, which the UID bypass hid.
   ownership transfer on the IPC — rather than a range grant.
 - Endpoint sets are TID bitmasks, not true endpoint objects. A service and its
   clients are named by slot number, not identity.
+- Input goes to the input server and out to the shell. The display server
+  tracks which window has focus and shows it, but nothing routes events by it,
+  and a window whose owner exits without saying so stays on the screen. Both
+  want a task-death notification the kernel does not send.
 - The rust fork is one commit on `upstream/main`. Rebasing it means re-checking
   the PAL against std's internals, which move: the allocator PAL shape, the
   futex module location, `RawOsError`'s home and `BorrowedCursor`'s parameters
