@@ -65,6 +65,10 @@ pub const SYS_ADDRSPACE_MAP: u64 = 37;
 pub const SYS_MAP_PHYS: u64 = 38;
 pub const SYS_SET_MEM_LIMIT: u64 = 39;
 pub const SYS_SET_PAGER: u64 = 40;
+/// The caller's own address space. Threads need it to start a task in the
+/// address space they are already running in; it grants nothing, since the
+/// caller is executing there either way.
+pub const SYS_ADDRSPACE_SELF: u64 = 41;
 
 // --- 0x30  shared memory ---
 pub const SYS_SHMEM_CREATE: u64 = 48;
@@ -129,7 +133,7 @@ pub const SYS_ABI_VERSION: u64 = 240;
 /// minor when calls are added. User space can refuse to run against a major it
 /// does not know, which is the point of exposing it at all.
 pub const ABI_VERSION_MAJOR: u64 = 1;
-pub const ABI_VERSION_MINOR: u64 = 0;
+pub const ABI_VERSION_MINOR: u64 = 1;
 
 
 
@@ -380,6 +384,12 @@ extern "C" fn syscall_dispatch(
         }
         SYS_EXIT_CODE => {
             scheduler::exit_with(arg0 as i32)
+        }
+        SYS_ADDRSPACE_SELF => {
+            match unsafe { scheduler::get_task_mut(scheduler::current_tid()) } {
+                Some(t) => t.cr3 as u64,
+                None => u64::MAX,
+            }
         }
         SYS_ABI_VERSION => (ABI_VERSION_MAJOR << 16) | ABI_VERSION_MINOR,
         SYS_YIELD => {
@@ -646,7 +656,7 @@ extern "C" fn syscall_dispatch(
             }
             // cr3 must be an address space this task created, not an arbitrary
             // physical address reinterpreted as a PML4.
-            if !crate::userspace::is_owned_address_space(scheduler::current_tid(), cr3) {
+            if !crate::userspace::may_use_address_space(scheduler::current_tid(), cr3) {
                 return u64::MAX;
             }
             // No OWNED bit: the frames came from the caller (via sys_phys_alloc),
@@ -684,7 +694,7 @@ extern "C" fn syscall_dispatch(
                 return u64::MAX;
             }
             let cr3 = arg3 as usize;
-            if !crate::userspace::is_owned_address_space(scheduler::current_tid(), cr3) {
+            if !crate::userspace::may_use_address_space(scheduler::current_tid(), cr3) {
                 return u64::MAX;
             }
             match scheduler::start_task(tid, rip, rsp, cr3) {

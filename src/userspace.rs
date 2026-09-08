@@ -19,9 +19,13 @@ pub const USER_ADDR_LIMIT: u64 = paging::USER_ADDR_LIMIT;
 /// `sys_addrspace_map` and `sys_task_start` take a CR3 straight from user
 /// space. Without this, CAP_TASK_MGMT let a task reinterpret *any* physical
 /// address as a PML4 and have the kernel walk and write to it.
+///
+/// The third field counts the tasks currently running in the address space.
+/// Threads are tasks that share one, so it cannot be destroyed when the first
+/// of them exits — only when the last does.
 const MAX_ADDRESS_SPACES: usize = crate::task::MAX_TASKS * 2;
-static mut ADDRESS_SPACES: [(usize, usize); MAX_ADDRESS_SPACES] =
-    [(0, 0); MAX_ADDRESS_SPACES];
+static mut ADDRESS_SPACES: [(usize, usize, u32); MAX_ADDRESS_SPACES] =
+    [(0, 0, 0); MAX_ADDRESS_SPACES];
 
 /// Record `cr3` as an address space created by `owner`.
 /// Returns false if the registry is full.
@@ -30,7 +34,7 @@ fn register_address_space(cr3: usize, owner: usize) -> bool {
         let table = &mut *core::ptr::addr_of_mut!(ADDRESS_SPACES);
         for slot in table.iter_mut() {
             if slot.0 == 0 {
-                *slot = (cr3, owner);
+                *slot = (cr3, owner, 0);
                 return true;
             }
         }
@@ -44,7 +48,7 @@ pub fn unregister_address_space(cr3: usize) {
         let table = &mut *core::ptr::addr_of_mut!(ADDRESS_SPACES);
         for slot in table.iter_mut() {
             if slot.0 == cr3 {
-                *slot = (0, 0);
+                *slot = (0, 0, 0);
             }
         }
     }
@@ -57,8 +61,54 @@ pub fn is_owned_address_space(tid: usize, cr3: usize) -> bool {
     }
     unsafe {
         let table = &*core::ptr::addr_of!(ADDRESS_SPACES);
-        table.iter().any(|&(c, owner)| c == cr3 && owner == tid)
+        table.iter().any(|&(c, owner, _)| c == cr3 && owner == tid)
     }
+}
+
+/// Whether `tid` may direct a task into `cr3`.
+///
+/// The creator may, which is the ordinary case of spawning a child. So may a
+/// task already executing there: that is how a thread starts another thread in
+/// the address space they share, without being the one that created it.
+pub fn may_use_address_space(tid: usize, cr3: usize) -> bool {
+    if cr3 == 0 {
+        return false;
+    }
+    if is_owned_address_space(tid, cr3) {
+        return true;
+    }
+    unsafe { crate::scheduler::get_task_mut(tid).map(|t| t.cr3) == Some(cr3) }
+}
+
+/// Note that another task is now running in `cr3`.
+pub fn addrspace_ref(cr3: usize) {
+    unsafe {
+        let table = &mut *core::ptr::addr_of_mut!(ADDRESS_SPACES);
+        for slot in table.iter_mut() {
+            if slot.0 == cr3 {
+                slot.2 = slot.2.saturating_add(1);
+                return;
+            }
+        }
+    }
+}
+
+/// Note that a task has stopped running in `cr3`.
+///
+/// Returns true when that was the last one, meaning the caller should destroy
+/// it. An address space the registry does not know about — the kernel's own —
+/// reports false, so nothing tries to tear it down.
+pub fn addrspace_unref(cr3: usize) -> bool {
+    unsafe {
+        let table = &mut *core::ptr::addr_of_mut!(ADDRESS_SPACES);
+        for slot in table.iter_mut() {
+            if slot.0 == cr3 {
+                slot.2 = slot.2.saturating_sub(1);
+                return slot.2 == 0;
+            }
+        }
+    }
+    false
 }
 
 /// Create a new user address space.

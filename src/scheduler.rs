@@ -499,9 +499,13 @@ pub fn reap_dead() {
                     // Withdraw everyone's permission to send to this TID before
                     // the slot can be handed to a different task.
                     crate::cap::revoke_endpoints_to(i);
-                    // Destroy user address space
+                    // Destroy the address space only once the last task using
+                    // it is gone. Threads share one; tearing it down when the
+                    // first exits would pull it out from under the others.
                     let cr3 = task.cr3;
-                    if cr3 != 0 && cr3 != crate::paging::kernel_cr3() {
+                    if cr3 != 0 && cr3 != crate::paging::kernel_cr3()
+                        && crate::userspace::addrspace_unref(cr3)
+                    {
                         crate::paging::destroy_address_space(cr3);
                         crate::userspace::unregister_address_space(cr3);
                     }
@@ -673,7 +677,10 @@ pub fn start_task(tid: usize, rip: u64, rsp: u64, cr3: usize) -> Result<(), ()> 
             return Err(());
         }
 
+        // Another task is now running here. Threads share an address space, so
+        // this is what stops the first one to exit destroying it.
         task.cr3 = cr3;
+        crate::userspace::addrspace_ref(cr3);
 
         // Set up context so context_switch enters enter_user_trampoline
         // with r12=rip, r13=rsp, r14=cr3

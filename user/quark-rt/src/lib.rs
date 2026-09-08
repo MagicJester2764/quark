@@ -9,6 +9,7 @@ pub mod ipc;
 pub mod manifest;
 pub mod signal;
 pub mod spawn;
+pub mod thread;
 pub mod stdio;
 pub mod sync;
 pub mod syscall;

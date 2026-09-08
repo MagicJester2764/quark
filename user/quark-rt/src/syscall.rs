@@ -35,6 +35,7 @@ pub const SYS_ADDRSPACE_MAP: u64 = 37;
 pub const SYS_MAP_PHYS: u64 = 38;
 pub const SYS_SET_MEM_LIMIT: u64 = 39;
 pub const SYS_SET_PAGER: u64 = 40;
+pub const SYS_ADDRSPACE_SELF: u64 = 41;
 
 // --- 0x30  shared memory ---
 pub const SYS_SHMEM_CREATE: u64 = 48;
@@ -753,4 +754,13 @@ pub const CAP_ENDPOINT: u32 = 1 << 6;
 pub fn sys_abi_version() -> (u32, u32) {
     let v = unsafe { syscall0(SYS_ABI_VERSION) };
     ((v >> 16) as u32, (v & 0xFFFF) as u32)
+}
+
+/// The address space this task is running in.
+///
+/// Needed to start a thread, which is a task started with the same cr3. It
+/// conveys no authority: the caller is already executing there.
+pub fn sys_addrspace_self() -> Result<usize, ()> {
+    let ret = unsafe { syscall0(SYS_ADDRSPACE_SELF) };
+    if ret == u64::MAX { Err(()) } else { Ok(ret as usize) }
 }
