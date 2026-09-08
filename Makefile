@@ -102,8 +102,29 @@ user: $(INIT_ELF) $(HELLO_ELF) $(NS_ELF) $(KBD_ELF) $(CON_ELF) $(INP_ELF) $(DISK
 $(INIT_ELF): FORCE
 	cd $(INIT_DIR) && cargo build --release
 
+# quark-rt reaches the hosted binary only through the fork's library/Cargo.toml
+# patch, and `cargo -Z build-std` does not propagate that dependency into its
+# fingerprints: editing quark-rt leaves hello linked against the previous copy,
+# and cargo reports "Finished" without rebuilding. That silently produced a
+# hello carrying the pre-Phase-0 syscall numbers while the kernel had moved to
+# the new ones, which faulted as #UD out of the alloc error handler.
+#
+# Hash the quark-rt sources and clean the hosted build when they change. std
+# genuinely has to be recompiled in that case — it links quark-rt — so the cost
+# is inherent, not overhead. The stamp is written only after a successful
+# build, so an interrupted one does not mark itself current.
+QUARK_RT_SRCS := $(wildcard user/quark-rt/src/*.rs) user/quark-rt/Cargo.toml
+HELLO_STAMP := $(HELLO_DIR)/target/.quark-rt-stamp
+
 $(HELLO_ELF): FORCE
+	@new=`cat $(QUARK_RT_SRCS) | md5sum | cut -d' ' -f1`; \
+	 old=`cat $(HELLO_STAMP) 2>/dev/null || echo none`; \
+	 if [ "$$new" != "$$old" ]; then \
+	   echo "  quark-rt changed since the last hosted build - cleaning std"; \
+	   (cd $(HELLO_DIR) && cargo clean); \
+	 fi
 	cd $(HELLO_DIR) && __CARGO_TESTS_ONLY_SRC_ROOT=$(realpath $(QUARK_RUST_STD_PATH)) cargo build --release --target ../../x86_64-unknown-quark.json -Z build-std=std,panic_abort -Z build-std-features=compiler-builtins-mem -Z json-target-spec
+	@mkdir -p $(dir $(HELLO_STAMP)) && cat $(QUARK_RT_SRCS) | md5sum | cut -d' ' -f1 > $(HELLO_STAMP)
 
 $(NS_ELF): FORCE
 	cd $(NS_DIR) && cargo build --release
