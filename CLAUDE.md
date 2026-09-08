@@ -184,6 +184,32 @@ Three things to know before changing any of it:
   and a TID that did not exist at spawn time cannot be minted into one. A reply
   needs no capability, so every hop here is the client asking.
 
+## Scheduling
+
+Four bands, best first: drivers, servers, ordinary programs, idle. A task runs
+only when nothing better is waiting and takes turns within its own band. A
+program asks for a band in its `manifest!` block alongside its capabilities,
+and a spawner applies it under the same narrowing rule — it can never grant a
+better band than it is in, so only `init` can put a driver in the driver band.
+
+Three things follow from that, and breaking any of them is quiet:
+
+- **Waiting means blocking.** A task in a better band that spins on
+  `sys_yield` is immediately runnable again, so nothing below it ever runs.
+  This is fatal rather than merely wasteful now: `nameserver::lookup_retry`
+  yielded a hundred times between tries and starved the VFS out of ever
+  registering. Use `sleep_ticks`, or `sys_recv_timeout` if there is also
+  something to hear.
+- **A synchronous call hands over the CPU.** The caller has blocked and has
+  nothing to contribute until the reply, so the callee is switched to directly
+  and runs on what is left of the caller's slice rather than a fresh one. A
+  server does not earn a quantum every time it is called.
+- **A task runs at the band of whoever is waiting on it**, for as long as that
+  is true. Without it a server called by something urgent is preempted by
+  anything in between. It is also what lets the direct switch stay safe: the
+  callee already carries the caller's band when the scheduler decides whether
+  handing straight over would run something ahead of its betters.
+
 ## Known gaps
 
 - `PhysRange` is narrow where it can be: `fb` holds exactly the framebuffer,
