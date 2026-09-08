@@ -15,6 +15,7 @@
 #include <fcntl.h>
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 #include <quark/layout.h>
 #include <quark/syscall.h>
@@ -323,4 +324,33 @@ long readfile(const char *path, char *buf, long size) {
     ssize_t n = read(fd, buf, (size_t)size);
     close(fd);
     return n;
+}
+
+time_t time(time_t *t) {
+    time_t now = (time_t)(__syscall0(SYS_TICKS) / 100);
+    if (t) {
+        *t = now;
+    }
+    return now;
+}
+
+clock_t clock(void) {
+    return (clock_t)__syscall0(SYS_TICKS);
+}
+
+int nanosleep(const struct timespec *req, struct timespec *rem) {
+    (void)rem;
+    if (!req) {
+        errno = EINVAL;
+        return -1;
+    }
+    /* Rounded up: a sleep that returns early is a bug, one that returns a
+       tick late is a 100 Hz timer. */
+    unsigned long ticks = (unsigned long)req->tv_sec * 100
+                        + (unsigned long)((req->tv_nsec + 9999999) / 10000000);
+    unsigned long until = __syscall0(SYS_TICKS) + ticks;
+    while (__syscall0(SYS_TICKS) < until) {
+        __syscall0(SYS_YIELD);
+    }
+    return 0;
 }

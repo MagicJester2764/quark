@@ -9,6 +9,7 @@
 #include <errno.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 #include <quark/layout.h>
 #include <quark/syscall.h>
 
@@ -23,6 +24,10 @@ struct header {
     size_t size; /* the whole block, this header included */
     struct header *next;
 };
+
+/* Every function that fails sets this, so it lives with the library rather
+   than with the entry point. */
+int errno;
 
 static struct header *free_list;
 static unsigned long heap_top = HEAP_START;
@@ -141,6 +146,17 @@ void *realloc(void *p, size_t n) {
         free(p);
     }
     return q;
+}
+
+void exit(int status) {
+    __syscall1(SYS_EXIT_CODE, (unsigned long)(long)status);
+    __builtin_unreachable();
+}
+
+void abort(void) {
+    static const char msg[] = "abort\n";
+    write(STDERR_FILENO, msg, sizeof(msg) - 1);
+    exit(127);
 }
 
 long strtol(const char *s, char **end, int base) {

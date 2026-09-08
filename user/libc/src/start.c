@@ -28,7 +28,6 @@
 static char *argv_slots[MAX_ARGS + 1];
 static char argv_bytes[ARGS_BYTES];
 
-int errno;
 
 extern int main(int argc, char **argv);
 
@@ -72,15 +71,4 @@ static int build_argv(void) {
 __attribute__((noreturn, used)) void _start(void) {
     int argc = build_argv();
     exit(main(argc, argv_slots));
-}
-
-void exit(int status) {
-    __syscall1(SYS_EXIT_CODE, (unsigned long)(long)status);
-    __builtin_unreachable();
-}
-
-void abort(void) {
-    static const char msg[] = "abort\n";
-    write(STDERR_FILENO, msg, sizeof(msg) - 1);
-    exit(127);
 }

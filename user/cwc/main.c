@@ -84,7 +84,7 @@ static long slurp(const char *path, char **out) {
 
 int main(int argc, char **argv) {
     if (argc < 2) {
-        fprintf(2, "usage: %s <file> [file ...]\n", argv[0]);
+        fprintf(stderr, "usage: %s <file> [file ...]\n", argv[0]);
         return 2;
     }
 
@@ -95,7 +95,7 @@ int main(int argc, char **argv) {
         char *data = 0;
         long n = slurp(argv[i], &data);
         if (n < 0) {
-            fprintf(2, "%s: cannot read %s\n", argv[0], argv[i]);
+            fprintf(stderr, "%s: cannot read %s\n", argv[0], argv[i]);
             failures++;
             continue;
         }
