@@ -600,7 +600,7 @@ fn call_inner(dest: usize, msg: &Message, timeout_ticks: u64) -> Result<Message,
                 TASK_IPC[caller].pending_msg = None;
                 TASK_IPC[dest].pending_msg = Some(to_send);
                 TASK_IPC[dest].state = IpcState::None;
-                scheduler::unblock_task(dest);
+                scheduler::unblock_task_next(dest);
                 scheduler::block_task(caller);
             }
             _ => {
@@ -657,7 +657,10 @@ pub fn sys_reply(dest: usize, msg: &Message) -> Result<(), IpcError> {
                 reply.sender = replier;
                 TASK_IPC[dest].pending_msg = Some(reply);
                 TASK_IPC[dest].state = IpcState::None;
-                scheduler::unblock_task(dest);
+                // The caller has been stopped waiting for exactly this. It
+                // runs as soon as this server blocks again, rather than after
+                // everything else that became ready in the meantime.
+                scheduler::unblock_task_next(dest);
                 Ok(())
             }
             _ => {

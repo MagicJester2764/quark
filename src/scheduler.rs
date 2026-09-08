@@ -312,6 +312,17 @@ unsafe fn enqueue(tid: usize) { unsafe {
     READY_COUNT += 1;
 }}
 
+/// Put a task at the *front* of the ready queue, so it runs next.
+unsafe fn enqueue_front(tid: usize) { unsafe {
+    if READY_COUNT >= MAX_TASKS {
+        crate::console::puts(b"scheduler: ready queue full, dropping task\n");
+        return;
+    }
+    READY_HEAD = (READY_HEAD + MAX_TASKS - 1) % MAX_TASKS;
+    READY_QUEUE[READY_HEAD] = tid;
+    READY_COUNT += 1;
+}}
+
 /// Restore interrupt flag from saved RFLAGS.
 unsafe fn restore_flags(flags: u64) { unsafe {
     if flags & (1 << 9) != 0 {
@@ -346,6 +357,32 @@ pub fn unblock_task(tid: usize) {
             if task.state == TaskState::Blocked {
                 task.state = TaskState::Ready;
                 enqueue(tid);
+            }
+        }
+    }
+}
+
+/// Unblock a task and run it *next*, ahead of everything already waiting.
+///
+/// For the two halves of a synchronous IPC: the caller has just blocked on the
+/// callee, and the reply is the only thing that will wake it again. Queueing
+/// the callee behind everything else makes a round trip cost a lap of the
+/// whole table — measured at 84 milliseconds for one poll of the input server
+/// through the keyboard driver, which is what "typing is slow" turned out to
+/// mean. The caller has stopped to wait, so this is its remaining time being
+/// handed to the task it is waiting for, not a queue-jump for free.
+///
+/// Fairness is unaffected: the woken task still yields at the end of its
+/// timeslice, and a task that never blocks is never overtaken by this.
+pub fn unblock_task_next(tid: usize) {
+    if tid >= MAX_TASKS {
+        return;
+    }
+    unsafe {
+        if let Some(ref mut task) = TASKS[tid] {
+            if task.state == TaskState::Blocked {
+                task.state = TaskState::Ready;
+                enqueue_front(tid);
             }
         }
     }
@@ -481,6 +518,24 @@ pub fn task_info(tid: usize) -> Option<(TaskState, u32, u32, usize)> {
 /// Reap dead tasks (clean up IPC, IRQs, address space, and free stacks).
 /// Only reaps tasks that have been collected by sys_wait, have no parent,
 /// or whose parent is already gone.
+/// The current task's kernel stack, as (base, top). Both zero for the boot
+/// task, which runs on the stack the bootloader left.
+///
+/// For working out whether a fault is a stack overflow, which from the rsp
+/// alone is unknowable: the same address is "nearly empty" or "just ran out"
+/// depending on where the allocation starts.
+pub fn current_kernel_stack() -> (usize, usize) {
+    unsafe {
+        let tid = CURRENT_TID.load(Ordering::SeqCst);
+        match TASKS[tid] {
+            Some(ref t) if !t.kernel_stack_base.is_null() => {
+                (t.kernel_stack_base as usize, t.kernel_stack_base as usize + t.kernel_stack_size)
+            }
+            _ => (0, 0),
+        }
+    }
+}
+
 pub fn reap_dead() {
     unsafe {
         for i in 1..MAX_TASKS {
