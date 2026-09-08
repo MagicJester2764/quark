@@ -118,10 +118,12 @@ const MAX_WINDOWS: usize = 8;
 const MAX_TITLE: usize = 32;
 /// Keys held for a window that has not asked for them yet.
 ///
-/// Deep enough for a burst of typing between two of a client's frames. When it
-/// fills, the oldest goes: a client that has stopped reading should not be able
-/// to make the newest keystroke the one that is lost.
-const EVENT_QUEUE: usize = 16;
+/// Deep enough for a burst of typing between two of a client's frames — every
+/// key is two of these, since a release is an event too, and a client redrawing
+/// itself can be a frame behind. When it fills, the oldest goes: a client that
+/// has stopped reading should not be able to make the newest keystroke the one
+/// that is lost.
+const EVENT_QUEUE: usize = 64;
 
 /// Where the framebuffer is mapped.
 const FB_VADDR: usize = 0x81_0000_0000;
@@ -577,8 +579,17 @@ fn pump_input() {
     for _ in 0..EVENT_QUEUE {
         let msg = Message { sender: 0, tag: TAG_INPUT_POLL, data: [0; 6] };
         let mut reply = Message::empty();
-        if syscall::sys_call(input, &msg, &mut reply).is_err() {
-            return;
+        // Timed, because asking the keyboard must not be able to stop the
+        // screen. A plain call to a service that has stopped answering hangs
+        // the compositor, and with it every client waiting on it — one wedged
+        // server should cost the keyboard, not the display.
+        match syscall::sys_call_timeout(input, &msg, &mut reply, INPUT_CALL_TICKS) {
+            syscall::CallOutcome::Replied => {}
+            syscall::CallOutcome::TimedOut => {
+                println!("[wm] input server did not answer");
+                return;
+            }
+            syscall::CallOutcome::Failed => return,
         }
         if reply.tag != TAG_INPUT_KEY {
             return;
@@ -1055,6 +1066,8 @@ fn init_screen(reply: &Message) -> bool {
 /// One, which is ten milliseconds, because this is also how often the keyboard
 /// is asked and typing at a tenth of a second is typing through treacle.
 const POLL_TICKS: u64 = 1;
+/// How long to wait for the input server before giving up on this round.
+const INPUT_CALL_TICKS: u64 = 20;
 /// How long between checks on whether the session is over, in the same ticks.
 ///
 /// A backstop, not the mechanism: the kernel says when a session program dies

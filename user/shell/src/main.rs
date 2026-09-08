@@ -5,7 +5,7 @@ use quark_rt::ipc::Message;
 use quark_rt::nameserver;
 use quark_rt::spawn::{self, Scratch, Spawned};
 use quark_rt::{args, print, println, syscall, vfs};
-use quark_rt::stdio::read_line;
+use quark_rt::stdio::read_line_result;
 
 use quark_rt::manifest::CapReq;
 
@@ -638,7 +638,17 @@ pub extern "C" fn _start() -> ! {
         }
         print!("$ ");
 
-        let n = read_line(&mut line_buf);
+        let n = match read_line_result(&mut line_buf) {
+            Ok(n) => n,
+            // No descriptor on stdin. Nothing is ever going to be typed here,
+            // so asking again is a spin — which is what running a shell under
+            // a compositor used to be, a prompt printed as fast as the machine
+            // could manage into a terminal that was not on the screen.
+            Err(()) => {
+                println!("shell: no input available; exiting");
+                syscall::sys_exit_code(0);
+            }
+        };
         if n == 0 {
             continue;
         }

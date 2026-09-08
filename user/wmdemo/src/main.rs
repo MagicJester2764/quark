@@ -31,25 +31,23 @@ const TICKS_PER_FRAME: u64 = 8;
 /// at, short enough that the shell comes back on its own.
 const FRAMES: u32 = 150;
 
-static mut WIN: Option<wm::Window> = None;
-
-fn win() -> &'static mut wm::Window {
-    unsafe { (&mut *core::ptr::addr_of_mut!(WIN)).as_mut().unwrap() }
-}
-
-fn pixel(x: usize, y: usize, c: u32) {
+// The window is passed to whatever draws rather than kept in a static and
+// handed out again per call: two live `&mut` to one place is undefined
+// behaviour, and the compiler is entitled to assume they cannot be the same
+// memory.
+fn pixel(win: &wm::Window, x: usize, y: usize, c: u32) {
     if x >= W || y >= H {
         return;
     }
-    win().row(y)[x] = c;
+    win.row(y)[x] = c;
 }
 
-fn text(x: usize, y: usize, s: &[u8], c: u32) {
+fn text(win: &wm::Window, x: usize, y: usize, s: &[u8], c: u32) {
     for (i, &ch) in s.iter().enumerate() {
         for (gy, &bits) in FONT[ch as usize].iter().enumerate() {
             for gx in 0..GLYPH_W {
                 if (bits >> (7 - gx)) & 1 != 0 {
-                    pixel(x + i * GLYPH_W + gx, y + gy, c);
+                    pixel(win, x + i * GLYPH_W + gx, y + gy, c);
                 }
             }
         }
@@ -70,12 +68,11 @@ pub extern "C" fn _start() -> ! {
     title[..8].copy_from_slice(b"wmdemo #");
     title[8] = args::argv(1).and_then(|a| a.first().copied()).unwrap_or(b'1');
 
-    let Some(window) = wm::Window::create(server, W, H, &title, BUF) else {
+    let Some(win) = wm::Window::create(server, W, H, &title, BUF) else {
         println!("wmdemo: no window");
         syscall::sys_exit_code(1);
     };
-    unsafe { WIN = Some(window) };
-    println!("wmdemo: window {} ({}x{})", win().id, W, H);
+    println!("wmdemo: window {} ({}x{})", win.id, W, H);
 
     // The red channel varies along a row and the green down the page, so a
     // frame is one value per column plus one per row — worked out once here
@@ -85,9 +82,9 @@ pub extern "C" fn _start() -> ! {
         *c = (x * 255 / W) as u8;
     }
 
-    let white = win().colour(0xFF, 0xFF, 0xFF);
-    let black = win().colour(0x00, 0x00, 0x00);
-    let blue = win().colour(0x00, 0x00, 0x60);
+    let white = win.colour(0xFF, 0xFF, 0xFF);
+    let black = win.colour(0x00, 0x00, 0x00);
+    let blue = win.colour(0x00, 0x00, 0x60);
 
     for frame in 0..FRAMES {
         // A gradient that moves, so it is obvious the window is being redrawn
@@ -95,32 +92,31 @@ pub extern "C" fn _start() -> ! {
         // server reads this buffer only after the round trip a commit makes,
         // so there is nothing a per-pixel volatile store would order against
         // and plenty it would stop the compiler doing.
-        let w = win();
-        let r_pos = w.r_pos;
-        let g_pos = w.g_pos;
+        let r_pos = win.r_pos;
+        let g_pos = win.g_pos;
         for y in 0..H {
             let g = ((y * 255 / H) as u32 + frame * 2) as u8;
             let g_bits = (g as u32) << g_pos;
-            let row = w.row(y);
+            let row = win.row(y);
             for x in 0..W {
                 let r = (col[x] as u32 + frame * 4) as u8;
                 row[x] = ((r as u32) << r_pos) | g_bits | blue;
             }
         }
 
-        text(16, 24, b"A second window.", white);
-        text(16, 48, b"Its pixels live in memory", white);
-        text(16, 66, b"the display server reads.", white);
-        text(16, 100, b"frame", black);
+        text(&win, 16, 24, b"A second window.", white);
+        text(&win, 16, 48, b"Its pixels live in memory", white);
+        text(&win, 16, 66, b"the display server reads.", white);
+        text(&win, 16, 100, b"frame", black);
         let mut n = [b' '; 4];
         let mut v = frame;
         for i in (0..4).rev() {
             n[i] = b'0' + (v % 10) as u8;
             v /= 10;
         }
-        text(16 + 6 * GLYPH_W, 100, &n, black);
+        text(&win, 16 + 6 * GLYPH_W, 100, &n, black);
 
-        win().commit();
+        win.commit();
 
         // Paced against the clock, not against the scheduler. Asleep rather
         // than yielding in a loop: a yield loop is a delay that costs a whole
@@ -133,7 +129,7 @@ pub extern "C" fn _start() -> ! {
     // Saying so is the polite way. A client that simply exits is handled too —
     // the display server is told when a task dies and takes its windows with
     // it — but that is the safety net, not the protocol.
-    win().destroy();
+    win.destroy();
     syscall::sys_exit_code(0);
 }
 

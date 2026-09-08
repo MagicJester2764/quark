@@ -35,41 +35,43 @@ const TICKS_PER_FRAME: u64 = 8;
 
 /// How much typing is kept on screen.
 const COLS: usize = 46;
-const ROWS: usize = 6;
+const ROWS: usize = 8;
+/// Where it starts, in the window.
+const TEXT_X: usize = 12;
+const TEXT_Y: usize = 12;
 
-static mut WIN: Option<wm::Window> = None;
 static mut TEXT: [[u8; COLS]; ROWS] = [[b' '; COLS]; ROWS];
 static mut CUR_ROW: usize = 0;
 static mut CUR_COL: usize = 0;
 
-fn win() -> &'static mut wm::Window {
-    unsafe { (&mut *core::ptr::addr_of_mut!(WIN)).as_mut().unwrap() }
-}
-
-fn pixel(x: usize, y: usize, c: u32) {
+// The window is passed to whatever draws rather than kept in a static and
+// handed out again per call. Two live `&mut` to one place is undefined
+// behaviour whatever the machine does with it, and what this machine did was
+// keep the background and drop the text drawn over it.
+fn pixel(win: &wm::Window, x: usize, y: usize, c: u32) {
     if x >= W || y >= H {
         return;
     }
-    win().row(y)[x] = c;
+    win.row(y)[x] = c;
 }
 
-fn fill(x: usize, y: usize, w: usize, h: usize, c: u32) {
+fn fill(win: &wm::Window, x: usize, y: usize, w: usize, h: usize, c: u32) {
     let x1 = (x + w).min(W);
     let y1 = (y + h).min(H);
     if x >= x1 {
         return;
     }
-    for row in y..y1 {
-        win().row(row)[x..x1].fill(c);
+    for row in y..y1.min(H) {
+        win.row(row)[x..x1].fill(c);
     }
 }
 
-fn text(x: usize, y: usize, s: &[u8], c: u32) {
+fn text(win: &wm::Window, x: usize, y: usize, s: &[u8], c: u32) {
     for (i, &ch) in s.iter().enumerate() {
         for (gy, &bits) in FONT[ch as usize].iter().enumerate() {
             for gx in 0..GLYPH_W {
                 if (bits >> (7 - gx)) & 1 != 0 {
-                    pixel(x + i * GLYPH_W + gx, y + gy, c);
+                    pixel(win, x + i * GLYPH_W + gx, y + gy, c);
                 }
             }
         }
@@ -113,53 +115,60 @@ fn newline() {
     }
 }
 
-fn draw(name: &[u8], frame: u32, col: &[u8; W]) {
-    let w = win();
-    let focused = w.focused;
+fn draw(win: &wm::Window, frame: u32, col: &[u8; W]) {
+    let focused = win.focused;
     // A background that moves, so it stays obvious the window is being
     // redrawn — and dimmer when this window is not the one being typed into.
     let dim: u8 = if focused { 1 } else { 3 };
-    let r_pos = w.r_pos;
-    let g_pos = w.g_pos;
-    let blue = w.colour(0, 0, 0x30 / dim);
+    let r_pos = win.r_pos;
+    let g_pos = win.g_pos;
+    let blue = win.colour(0, 0, 0x30 / dim);
+
+    // The red channel already shifted into place, one entry per column. The
+    // divide is what makes the dimming, and doing it per pixel is a hundred
+    // thousand divisions a frame — enough that a keystroke waited for the
+    // background to be recomputed before it could be drawn on top of it.
+    let mut red = [0u32; W];
+    for (x, r) in red.iter_mut().enumerate() {
+        *r = (((col[x] as u32 + frame * 2) as u8 / (2 * dim) + 0x10) as u32) << r_pos;
+    }
+
     for y in 0..H {
         let g = (((y * 100 / H) as u32 + frame) as u8) / (2 * dim) + 0x14;
-        let g_bits = (g as u32) << g_pos;
-        let row = w.row(y);
+        let g_bits = ((g as u32) << g_pos) | blue;
+        let row = win.row(y);
         for x in 0..W {
-            let r = (col[x] as u32 + frame * 2) as u8 / (2 * dim) + 0x10;
-            row[x] = ((r as u32) << r_pos) | g_bits | blue;
+            row[x] = red[x] | g_bits;
         }
     }
 
-    // A band across the top that says, unmistakably, whether keys land here.
-    let band = if focused { win().colour(0x30, 0xA0, 0x50) } else { win().colour(0x40, 0x40, 0x48) };
-    let white = win().colour(0xFF, 0xFF, 0xFF);
-    fill(0, 0, W, GLYPH_H + 8, band);
-    let label: &[u8] = if focused { b"TYPING HERE" } else { b"not focused" };
-    text(8, 4, name, white);
-    text(W - 8 - label.len() * GLYPH_W, 4, label, white);
-
-    // What has been typed into this window, and only this window.
+    // No title of its own. The display server already draws one, lit when this
+    // window has focus, and a second bar underneath it saying the same thing
+    // twice is a window with two title bars.
+    //
+    // Focus shows in what this draws rather than in what it labels: the
+    // background is dimmer without it, and the cursor is only there when the
+    // next key would land here. Two of these side by side is the whole
+    // demonstration.
+    let white = win.colour(0xFF, 0xFF, 0xFF);
     unsafe {
         for r in 0..ROWS {
-            text(8, GLYPH_H + 20 + r * GLYPH_H, &TEXT[r], white);
+            text(win, TEXT_X, TEXT_Y + r * GLYPH_H, &TEXT[r], white);
         }
-        // A block cursor, drawn only when this window would receive the next
-        // key. Two of these side by side is the whole demonstration.
         if focused {
             fill(
-                8 + CUR_COL * GLYPH_W,
-                GLYPH_H + 20 + CUR_ROW * GLYPH_H,
+                win,
+                TEXT_X + CUR_COL * GLYPH_W,
+                TEXT_Y + CUR_ROW * GLYPH_H,
                 GLYPH_W,
                 GLYPH_H,
-                win().colour(0xFF, 0xFF, 0x80),
+                win.colour(0xFF, 0xFF, 0x80),
             );
         }
     }
 
-    let hint = win().colour(0xC0, 0xC0, 0xC8);
-    text(8, H - GLYPH_H - 6, b"Tab: switch  Esc: end session  ^D: close", hint);
+    let hint = win.colour(0xC0, 0xC0, 0xC8);
+    text(win, TEXT_X, H - GLYPH_H - 6, b"Tab: switch  Esc: end session  ^D: close", hint);
 }
 
 #[unsafe(no_mangle)]
@@ -176,12 +185,11 @@ pub extern "C" fn _start() -> ! {
     title[..8].copy_from_slice(b"wmtype #");
     title[8] = args::argv(1).and_then(|a| a.first().copied()).unwrap_or(b'1');
 
-    let Some(window) = wm::Window::create(server, W, H, &title, BUF) else {
+    let Some(mut win) = wm::Window::create(server, W, H, &title, BUF) else {
         println!("wmtype: no window");
         syscall::sys_exit_code(1);
     };
-    unsafe { WIN = Some(window) };
-    println!("wmtype: window {} ({}x{})", win().id, W, H);
+    println!("wmtype: window {} ({}x{})", win.id, W, H);
 
     let mut col = [0u8; W];
     for (x, c) in col.iter_mut().enumerate() {
@@ -197,13 +205,13 @@ pub extern "C" fn _start() -> ! {
         // of nothing: the queue is empty almost every time.
         let mut dirty = false;
         loop {
-            let event = match win().poll() {
+            let event = match win.poll() {
                 Ok(e) => e,
                 // The display server has gone. So has the window.
                 Err(()) => syscall::sys_exit_code(0),
             };
-            if win().focused != was_focused {
-                was_focused = win().focused;
+            if win.focused != was_focused {
+                was_focused = win.focused;
                 dirty = true;
             }
             let Some(event) = event else { break };
@@ -230,8 +238,8 @@ pub extern "C" fn _start() -> ! {
             dirty = true;
         }
         if dirty {
-            draw(&title, frame, &col);
-            win().commit();
+            draw(&win, frame, &col);
+            win.commit();
         }
 
         // Asleep until the next tick, rather than spinning until it arrives.

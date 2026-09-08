@@ -383,8 +383,16 @@ fn get_key_blocking(kbd_tid: usize) -> u8 {
 fn get_key_nb(kbd_tid: usize) -> Option<KeyEvent> {
     let msg = Message { sender: 0, tag: TAG_GET_KEY_NB, data: [0; 6] };
     let mut reply = Message::empty();
-    if syscall::sys_call(kbd_tid, &msg, &mut reply).is_err() {
-        return None;
+    // Timed for the same reason the compositor times this server: a driver
+    // that stops answering should cost the keyboard, not everything holding
+    // still behind it.
+    match syscall::sys_call_timeout(kbd_tid, &msg, &mut reply, 20) {
+        syscall::CallOutcome::Replied => {}
+        syscall::CallOutcome::TimedOut => {
+            println!("[input] keyboard driver did not answer");
+            return None;
+        }
+        syscall::CallOutcome::Failed => return None,
     }
     if reply.tag != TAG_KEY_EVENT {
         return None;

@@ -102,7 +102,15 @@ pub extern "C" fn _start() -> ! {
         } else if n == syscall::WOULD_BLOCK || n == u64::MAX {
             // Nothing to print. A good moment to notice the display changing
             // hands, and to blink.
-            poll_display_handover();
+            //
+            // Waiting a tick rather than yielding in a loop. There is no way
+            // to block on the pipe and on IPC at once, so idling here means
+            // asking the pipe again shortly — but a yield loop asks it as fast
+            // as the machine will go, four system calls at a time, forever.
+            // That is a whole core spent on an idle terminal, and it was
+            // enough to keep the keyboard driver from being scheduled while
+            // somebody typed.
+            poll_display_handover(1);
             let now = syscall::sys_ticks();
             unsafe {
                 if now.wrapping_sub(CURSOR_LAST_TOGGLE) >= CURSOR_BLINK_TICKS {
@@ -111,7 +119,6 @@ pub extern "C" fn _start() -> ! {
                     draw_cursor();
                 }
             }
-            syscall::sys_yield();
         } else {
             // Got data — hide cursor, write, show cursor
             unsafe { hide_cursor(); }
@@ -218,9 +225,12 @@ fn redraw_all() {
 ///
 /// Polled rather than waited for, since the main loop's real job is draining
 /// the pipe. A zero timeout is a poll: nothing to collect, nothing lost.
-fn poll_display_handover() {
+/// Notice the display changing hands, waiting up to `ticks` for word of it.
+///
+/// Zero polls and returns; anything else is how this server idles.
+fn poll_display_handover(ticks: u64) {
     let mut msg = Message::empty();
-    if syscall::sys_recv_timeout(TID_ANY, &mut msg, 0).is_err() {
+    if syscall::sys_recv_timeout(TID_ANY, &mut msg, ticks).is_err() {
         return;
     }
     match msg.tag {

@@ -58,8 +58,20 @@ pub fn _eprint(args: fmt::Arguments) {
 /// Read a line from stdin (fd 0) into `buf`. Returns the number of bytes read.
 /// Blocks until a line is available. Returns 0 if stdin is not connected.
 pub fn read_line(buf: &mut [u8]) -> usize {
+    read_line_result(buf).unwrap_or(0)
+}
+
+/// Read a line, distinguishing "nothing was typed" from "there is nowhere to
+/// read from".
+///
+/// [`read_line`] answers 0 to both, which is fine for a program that will ask
+/// again and wrong for one that will ask again *immediately*: a shell with no
+/// descriptor on stdin spins printing prompts at a pipe nobody is reading.
+/// `Err` means the descriptor is not connected, which is not a pause — it is
+/// the end.
+pub fn read_line_result(buf: &mut [u8]) -> Result<usize, ()> {
     let ret = syscall::sys_fd_read(0, buf);
-    if ret == u64::MAX { 0 } else { ret as usize }
+    if ret == u64::MAX { Err(()) } else { Ok(ret as usize) }
 }
 
 #[macro_export]
