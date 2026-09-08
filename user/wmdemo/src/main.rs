@@ -26,7 +26,12 @@ const H: usize = 260;
 const BUF: usize = 0x84_0000_0000;
 
 const GLYPH_W: usize = 8;
-const GLYPH_H: usize = 16;
+
+/// PIT ticks between frames — 100 Hz, so this is about twelve frames a second.
+const TICKS_PER_FRAME: u64 = 8;
+/// How long the demo runs before giving its window back: long enough to look
+/// at, short enough that the shell comes back on its own.
+const FRAMES: u32 = 150;
 
 static mut STRIDE: usize = 0;
 static mut R_POS: u8 = 16;
@@ -94,7 +99,7 @@ pub extern "C" fn _start() -> ! {
     // exited would leave the display server holding a window nothing owns:
     // there is no notification when a task dies, so saying so is the client's
     // job for now.
-    for frame in 0..60u32 {
+    for frame in 0..FRAMES {
         for y in 0..H {
             for x in 0..W {
                 // A gradient that moves, so it is obvious the window is being
@@ -119,7 +124,11 @@ pub extern "C" fn _start() -> ! {
         let commit = Message { sender: 0, tag: TAG_WM_COMMIT, data: [id as u64, 0, 0, 0, 0, 0] };
         let _ = syscall::sys_call(wm, &commit, &mut reply);
 
-        for _ in 0..5 {
+        // Paced against the clock, not against the scheduler. Yielding a few
+        // times is not a delay: the first version drew all its frames inside a
+        // few milliseconds and exited before anyone could see it.
+        let until = syscall::sys_ticks() + TICKS_PER_FRAME;
+        while syscall::sys_ticks() < until {
             syscall::sys_yield();
         }
     }

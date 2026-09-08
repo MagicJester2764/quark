@@ -502,7 +502,30 @@ pub fn revoke(tid: usize, slot: usize) {
 
 /// Mint a new cap: find a source cap of the same type in the caller's CSpace
 /// that is a superset of the requested params.
-pub fn can_mint(cspace: &CSpace, cap_type: CapType, param0: u64, param1: u64) -> bool {
+pub fn can_mint(
+    cspace: &CSpace,
+    self_tid: usize,
+    cap_type: CapType,
+    param0: u64,
+    param1: u64,
+) -> bool {
+    // A task may always authorise others to call *it*. That is not an
+    // escalation: it confers no authority over any third party, and the only
+    // task it exposes is the one granting it, which could ignore the messages
+    // anyway.
+    //
+    // Without this rule an Endpoint can only ever be narrowed, and a server
+    // started at run time can never admit a client it spawned itself — its own
+    // TID is in nobody's destination set, because it did not exist when those
+    // sets were made. A compositor launching its session is exactly that case.
+    let param0 = if matches!(cap_type, CapType::Endpoint) && self_tid < MAX_TASKS {
+        param0 & !(1u64 << self_tid)
+    } else {
+        param0
+    };
+    if matches!(cap_type, CapType::Endpoint) && param0 == 0 {
+        return true; // nothing left but the self bit
+    }
     cspace.iter().any(|cap| validate_attenuation(cap, cap_type, param0, param1))
 }
 

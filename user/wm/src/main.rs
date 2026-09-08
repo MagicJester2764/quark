@@ -2,17 +2,16 @@
 #![no_main]
 #![allow(static_mut_refs)]
 
-//! A display server.
+//! A compositor.
 //!
-//! Before this, the console mapped the framebuffer and drew straight into it.
-//! That works for exactly one program, which is why there was only ever one
-//! thing on the screen: the console had the framebuffer, so nothing else could
-//! have it.
+//! Run it and it takes the display; quit and it gives the display back, and
+//! the text console picks up where it left off. It is a *client* of the
+//! framebuffer device the same way anything else is — it does not own the
+//! screen, it borrows it — which is what makes it something a user installs
+//! rather than something the system is built around.
 //!
-//! A display server is the answer to that. It is the only thing that maps the
-//! framebuffer; everything else asks it for a window, gets a slab of shared
-//! memory back, draws into that, and says when it has finished. The server
-//! composites the results.
+//! Its own clients ask it for a window, get a slab of shared memory back, draw
+//! into that, and say when they have finished. It composites the results.
 //!
 //! ```text
 //!     client                     wm                    screen
@@ -28,23 +27,58 @@
 //! drawing does not travel anywhere. The client writes pixels, the server
 //! reads them, and the only thing that moves is a word saying "look now".
 //!
+//! Compositing happens into a buffer of its own, and only the finished frame
+//! reaches the screen. That is not an optimisation — it is what stops the
+//! flicker. Painting the backdrop and then the windows *onto the framebuffer*
+//! means the cleared screen is briefly the visible one, once per frame; at a
+//! cursor blink's two frames a second that reads as a steady flash rather than
+//! as motion.
+//!
 //! Windows are composited in stacking order on every commit, whole. That is
 //! more work than tracking damage, and at these sizes it is a memcpy per
 //! window per update — worth revisiting when a client updates faster than it
-//! can be redrawn, and not before.
+//! can be redrawn, and not before. Damage tracking would make the blink cheap;
+//! the back buffer is what makes it invisible.
 
 use quark_rt::font::FONT;
 use quark_rt::ipc::{Message, TID_ANY};
-use quark_rt::{nameserver, println, syscall};
+use quark_rt::spawn::{self, Scratch};
+use quark_rt::{args, nameserver, println, syscall, vfs};
 
-// No manifest. The display server maps the framebuffer and nothing else, and
-// that grant cannot come from here: the address is whatever mode the
-// bootloader set, which nothing knowable at build time can name. `init` mints
-// it and sends the geometry along with TAG_FB_INIT. Shared memory needs no
-// capability — it is charged to whoever creates it.
+// The back buffer is ordinary memory, so this needs to allocate pages. The
+// right to map the framebuffer is not asked for here: it is lent by the
+// framebuffer device when the display is claimed, and taken away again when it
+// is released.
+// The back buffer is ordinary memory, and running a session means creating a
+// task for it and giving that task pages. The right to map the framebuffer is
+// not asked for here: it is lent by the framebuffer device when the display is
+// claimed, and taken away again when it is released.
+// 64 pages, not "unlimited": a capability may only be narrowed, and the shell
+// that launches this holds 64. Asking for more than the spawner has is not
+// refused loudly — the mint simply fails and the capability is absent, which
+// then looks like an unrelated failure much later.
+quark_rt::manifest!([
+    quark_rt::manifest::CapReq::phys_alloc(64),
+    quark_rt::manifest::CapReq::task_mgmt(0),
+]);
 
-/// From `init`: where the framebuffer is and what shape it has.
-const TAG_FB_INIT: u64 = 100;
+/// Scratch addresses for staging a session program's pages into its new
+/// address space. Each spawner needs its own; these are the compositor's.
+static SPAWN_SCRATCH: Scratch =
+    Scratch { elf: 0x8A_0000_0000, stack: 0x8B_0000_0000, args: 0x8C_0000_0000 };
+/// Where a session program's image is read before it is loaded.
+const FILE_BUF: usize = 0x8D_0000_0000;
+
+const PAGE_SIZE: usize = 4096;
+
+/// Talking to the framebuffer device.
+const TAG_FB_CLAIM: u64 = 2;
+const TAG_FB_RELEASE: u64 = 3;
+/// Somebody else wants the display. Stop drawing and answer.
+///
+/// Well clear of this compositor's own protocol numbers: both arrive at the
+/// same `sys_recv`, and 4 was already `TAG_WM_FOCUS`.
+const TAG_FB_LOST: u64 = 0x100;
 
 /// Ask for a window. `data[0] = (width << 32) | height`, `data[1..]` the title.
 ///
@@ -89,6 +123,10 @@ const MAX_TITLE: usize = 32;
 
 /// Where the framebuffer is mapped.
 const FB_VADDR: usize = 0x81_0000_0000;
+/// Where the frame is assembled before any of it is shown.
+const BACK_VADDR: usize = 0x85_0000_0000;
+/// The slot the framebuffer device grants the display into.
+const FB_LEASE_SLOT: usize = 2;
 /// Where window buffers are mapped, one region each.
 const WIN_BASE: usize = 0x82_0000_0000;
 /// Room per window: 1280x800x4 is 4 MiB, so eight of them is the ceiling on
@@ -96,7 +134,10 @@ const WIN_BASE: usize = 0x82_0000_0000;
 const WIN_STRIDE: usize = 0x40_0000;
 
 struct Screen {
+    /// Where the finished frame is copied to: the framebuffer itself.
     fb: usize,
+    /// Where it is drawn: memory nobody is looking at.
+    back: usize,
     pitch: usize,
     width: usize,
     height: usize,
@@ -108,6 +149,7 @@ struct Screen {
 
 static mut SCREEN: Screen = Screen {
     fb: 0,
+    back: 0,
     pitch: 0,
     width: 0,
     height: 0,
@@ -153,6 +195,10 @@ static mut STACK: [usize; MAX_WINDOWS] = [usize::MAX; MAX_WINDOWS];
 static mut STACK_LEN: usize = 0;
 /// Which window input would go to, and which gets the lit title bar.
 static mut FOCUS: usize = usize::MAX;
+/// The framebuffer device that lent us the display.
+static mut FB_TID: usize = 0;
+/// The program this session is for. When it stops, so does this.
+static mut SESSION: usize = 0;
 
 fn pack_colour(r: u8, g: u8, b: u8) -> u32 {
     let s = unsafe { &SCREEN };
@@ -165,7 +211,7 @@ fn put_pixel(x: usize, y: usize, colour: u32) {
         return;
     }
     let bpp = s.bpp / 8;
-    let at = s.fb + y * s.pitch + x * bpp;
+    let at = s.back + y * s.pitch + x * bpp;
     unsafe {
         if bpp == 4 {
             (at as *mut u32).write_volatile(colour);
@@ -178,11 +224,34 @@ fn put_pixel(x: usize, y: usize, colour: u32) {
     }
 }
 
+/// Fill a rectangle in the back buffer.
+///
+/// Clipped once and then written a row at a time. Going through `put_pixel`
+/// meant a bounds check and a volatile store per pixel, and the backdrop alone
+/// is a million of them per frame — enough that a client animating at a dozen
+/// frames a second could not keep up with itself.
 fn fill_rect(x: usize, y: usize, w: usize, h: usize, colour: u32) {
-    for dy in 0..h {
-        for dx in 0..w {
-            put_pixel(x + dx, y + dy, colour);
+    let s = unsafe { &SCREEN };
+    if s.back == 0 || s.bpp != 32 {
+        // Anything but 32-bit goes the slow way; nothing here produces it.
+        for dy in 0..h {
+            for dx in 0..w {
+                put_pixel(x + dx, y + dy, colour);
+            }
         }
+        return;
+    }
+
+    let x1 = (x + w).min(s.width);
+    let y1 = (y + h).min(s.height);
+    if x >= x1 || y >= y1 {
+        return;
+    }
+
+    for row in y..y1 {
+        let start = s.back + row * s.pitch + x * 4;
+        let pixels = unsafe { core::slice::from_raw_parts_mut(start as *mut u32, x1 - x) };
+        pixels.fill(colour);
     }
 }
 
@@ -235,7 +304,7 @@ fn draw_window(idx: usize) {
         if dst_y >= s.height {
             break;
         }
-        let dst = s.fb + dst_y * s.pitch + ox * bpp;
+        let dst = s.back + dst_y * s.pitch + ox * bpp;
         let bytes = (win.w * bpp).min(s.pitch.saturating_sub(ox * bpp));
         unsafe {
             core::ptr::copy_nonoverlapping(src as *const u8, dst as *mut u8, bytes);
@@ -250,14 +319,34 @@ fn draw_window(idx: usize) {
 /// whenever it likes needs the client to say what changed. Worth doing when a
 /// client updates faster than this can keep up.
 fn composite() {
-    let backdrop = pack_colour(0x10, 0x14, 0x1C);
     let s = unsafe { &SCREEN };
+    if s.fb == 0 || s.back == 0 {
+        return; // the display is somebody else's at the moment
+    }
+
+    let backdrop = pack_colour(0x10, 0x14, 0x1C);
     fill_rect(0, 0, s.width, s.height, backdrop);
 
     unsafe {
         for i in 0..STACK_LEN {
             draw_window(STACK[i]);
         }
+    }
+    present();
+}
+
+/// Put the finished frame on the screen, in one pass.
+///
+/// Everything above drew into the back buffer. This is the only write to the
+/// framebuffer, which is why the cleared backdrop is never what anybody sees.
+fn present() {
+    let s = unsafe { &SCREEN };
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            s.back as *const u8,
+            s.fb as *mut u8,
+            s.pitch * s.height,
+        );
     }
 }
 
@@ -445,31 +534,48 @@ fn ok() -> Message {
 #[unsafe(no_mangle)]
 #[link_section = ".text.entry"]
 pub extern "C" fn _start() -> ! {
-    println!("[wm] Started.");
+    let Some(fb) = nameserver::lookup_retry(b"fb", 20) else {
+        println!("wm: no framebuffer device");
+        syscall::sys_exit_code(1);
+    };
+    unsafe { FB_TID = fb };
 
-    // The framebuffer, from init. Nothing can be drawn before it arrives, so
-    // this is a blocking wait rather than part of the main loop.
-    let mut msg = Message::empty();
-    loop {
-        if syscall::sys_recv(TID_ANY, &mut msg).is_err() {
-            continue;
-        }
-        if msg.tag == TAG_FB_INIT {
-            break;
-        }
-        let _ = syscall::sys_reply(msg.sender, &error(0));
+    // Take the display. Whoever had it — the text console, on a fresh boot —
+    // is told to stop before this returns.
+    let claim = Message { sender: 0, tag: TAG_FB_CLAIM, data: [0; 6] };
+    let mut reply = Message::empty();
+    if syscall::sys_call(fb, &claim, &mut reply).is_err() || reply.tag == TAG_ERROR {
+        println!("wm: could not claim the display");
+        syscall::sys_exit_code(1);
     }
-    init_screen(&msg);
-    let _ = syscall::sys_reply(msg.sender, &ok());
+    if !init_screen(&reply) {
+        syscall::sys_exit_code(1);
+    }
 
-    if nameserver::register(b"wm").is_ok() {
-        println!("[wm] Registered with nameserver.");
-    }
+    let _ = nameserver::register(b"wm");
     composite();
 
+    // What this session is for. Without one there is nothing to composite and
+    // nothing to wait for, so say so rather than sit on the display.
+    let Some(program) = args::argv(1) else {
+        println!("usage: wm <program>");
+        quit();
+    };
+    let Some(session) = start_session(program) else {
+        quit();
+    };
+    unsafe { SESSION = session };
+
     loop {
+        // A timed receive rather than a blocking one, so the session ending is
+        // noticed. Nothing else would wake this: a program that exits sends no
+        // message, and a compositor sitting on the display for a session that
+        // finished is a machine with no way back to its console.
         let mut msg = Message::empty();
-        if syscall::sys_recv(TID_ANY, &mut msg).is_err() {
+        if syscall::sys_recv_timeout(TID_ANY, &mut msg, SESSION_POLL_TICKS).is_err() {
+            if session_finished() {
+                quit();
+            }
             continue;
         }
         let sender = msg.sender;
@@ -512,6 +618,18 @@ pub extern "C" fn _start() -> ! {
                 }
                 None => error(1),
             },
+            // The framebuffer device wants the display back for somebody
+            // else. There is nowhere for a compositor to go without a screen,
+            // so acknowledge and quit rather than linger invisibly.
+            TAG_FB_LOST => {
+                let _ = syscall::sys_reply(sender, &ok());
+                unsafe {
+                    SCREEN.fb = 0;
+                    SCREEN.back = 0;
+                }
+                println!("wm: display taken; exiting");
+                syscall::sys_exit_code(0);
+            }
             TAG_WM_SCREEN => {
                 let s = unsafe { &SCREEN };
                 Message {
@@ -534,33 +652,174 @@ pub extern "C" fn _start() -> ! {
     }
 }
 
-fn init_screen(msg: &Message) {
-    // Same packing init sends the console, because it is the same message.
-    let phys = msg.data[0] as usize;
-    let w = (msg.data[1] >> 32) as usize;
-    let h = (msg.data[1] & 0xFFFF_FFFF) as usize;
-    let pitch = (msg.data[2] >> 32) as usize;
-    let bpp = (msg.data[2] & 0xFF) as usize;
+/// Map the framebuffer the device just lent us, and a back buffer beside it.
+fn init_screen(reply: &Message) -> bool {
+    let w = (reply.data[0] >> 32) as usize;
+    let h = (reply.data[0] & 0xFFFF_FFFF) as usize;
+    let pitch = (reply.data[1] >> 32) as usize;
+    let bpp = (reply.data[1] & 0xFF) as usize;
+    let phys = reply.data[3] as usize;
 
     let pages = (pitch * h + 4095) / 4096;
     if syscall::sys_map_phys(phys, FB_VADDR, pages).is_err() {
-        println!("[wm] Could not map the framebuffer.");
-        syscall::sys_exit_code(1);
+        println!("wm: could not map the framebuffer");
+        return false;
+    }
+    // Ordinary memory, the same shape as the screen. sys_mmap needs no
+    // capability — a task may always grow its own address space — but it maps
+    // at most 256 pages a call, and a screenful is four times that.
+    const MMAP_MAX: usize = 256;
+    let mut done = 0;
+    while done < pages {
+        let chunk = (pages - done).min(MMAP_MAX);
+        if syscall::sys_mmap(BACK_VADDR + done * 4096, chunk).is_err() {
+            println!("wm: could not allocate a back buffer");
+            return false;
+        }
+        done += chunk;
     }
 
     unsafe {
         SCREEN = Screen {
             fb: FB_VADDR,
+            back: BACK_VADDR,
             pitch,
             width: w,
             height: h,
             bpp,
-            r_pos: ((msg.data[3] >> 16) & 0xFF) as u8,
-            g_pos: ((msg.data[3] >> 8) & 0xFF) as u8,
-            b_pos: (msg.data[3] & 0xFF) as u8,
+            r_pos: ((reply.data[2] >> 16) & 0xFF) as u8,
+            g_pos: ((reply.data[2] >> 8) & 0xFF) as u8,
+            b_pos: (reply.data[2] & 0xFF) as u8,
         };
     }
-    println!("[wm] {}x{} at {} bpp.", w, h, bpp);
+    true
+}
+
+/// How often to look at whether the session is still running, in PIT ticks.
+/// A tenth of a second: unnoticeable to a person, and nothing to a machine
+/// that is otherwise idle waiting for a client.
+const SESSION_POLL_TICKS: u64 = 10;
+
+/// Has the session program stopped?
+///
+/// Reaps it if so. A task that has exited but not been waited for stays in the
+/// table as Dead, so asking about its state is the same question either way.
+fn session_finished() -> bool {
+    let session = unsafe { SESSION };
+    if session == 0 {
+        return false;
+    }
+    match syscall::sys_task_info(session) {
+        Ok((state, _, _)) => state == 3, // Dead
+        Err(()) => true,                 // gone entirely
+    }
+}
+
+/// Start the program this session is for.
+///
+/// The compositor holds the display for as long as that program runs, and
+/// gives it back when it stops — which is what `startx` does, and for the same
+/// reason: something has to decide when the graphical session is over, and the
+/// thing the user asked to run is the obvious candidate.
+fn start_session(name: &[u8]) -> Option<usize> {
+    let vfs_tid = nameserver::lookup_retry(b"vfs", 20)?;
+
+    // The same two spellings the shell tries: lowercase for ext2, uppercase
+    // with .ELF for FAT32.
+    let mut lower = [0u8; 64];
+    let mut upper = [0u8; 64];
+    let prefix = b"/usr/bin/";
+    let n = name.len().min(48);
+    lower[..prefix.len()].copy_from_slice(prefix);
+    upper[..prefix.len()].copy_from_slice(prefix);
+    let mut lp = prefix.len();
+    let mut up = prefix.len();
+    for i in 0..n {
+        let c = name[i];
+        lower[lp] = if c.is_ascii_uppercase() { c + 32 } else { c };
+        upper[up] = if c.is_ascii_lowercase() { c - 32 } else { c };
+        lp += 1;
+        up += 1;
+    }
+    upper[up..up + 4].copy_from_slice(b".ELF");
+    up += 4;
+
+    let (handle, size, _) = match vfs::open(vfs_tid, &lower[..lp]) {
+        Ok(h) => h,
+        Err(_) => match vfs::open(vfs_tid, &upper[..up]) {
+            Ok(h) => h,
+            Err(_) => {
+                println!("wm: cannot find that program");
+                return None;
+            }
+        },
+    };
+
+    let size = size as usize;
+    let pages = (size + PAGE_SIZE - 1) / PAGE_SIZE;
+    let mut ok = true;
+    for p in 0..pages {
+        let Ok(frame) = syscall::sys_phys_alloc(1) else { ok = false; break };
+        if syscall::sys_map_phys(frame, FILE_BUF + p * PAGE_SIZE, 1).is_err() {
+            ok = false;
+            break;
+        }
+        let want = PAGE_SIZE.min(size - p * PAGE_SIZE) as u32;
+        if vfs::read(vfs_tid, handle, frame, (p * PAGE_SIZE) as u32, want).is_err() {
+            ok = false;
+            break;
+        }
+    }
+    let _ = vfs::close(vfs_tid, handle);
+    if !ok {
+        println!("wm: could not read that program");
+        return None;
+    }
+
+    let image = unsafe { core::slice::from_raw_parts(FILE_BUF as *const u8, size) };
+    let Ok(info) = spawn::load(image, &SPAWN_SCRATCH) else {
+        println!("wm: could not load that program");
+        return None;
+    };
+    // A client needs no authority over anything — the memory it draws into is
+    // memory this hands it — but it does need to be able to *ask*. Two grants:
+    // this compositor's own IPC reach, so it can find the nameserver, and
+    // permission to call this compositor, which nothing else can give it.
+    // A task's own destination bit is the one an Endpoint may always add.
+    let _ = syscall::sys_cap_grant(info.tid, syscall::SLOT_ENDPOINT, syscall::SLOT_ENDPOINT);
+    let me = syscall::sys_getpid() as u64;
+    let slot = syscall::SLOT_ENDPOINT_EXTRA;
+    if syscall::sys_cap_mint(slot, syscall::CAP_TYPE_ENDPOINT, 1u64 << me, 0).is_ok() {
+        let _ = syscall::sys_cap_grant(info.tid, slot, slot);
+        let _ = syscall::sys_cap_delete(slot);
+    }
+
+    let _ = spawn::set_args(&info, &[name], &SPAWN_SCRATCH);
+    if info.start().is_err() {
+        println!("wm: could not start that program");
+        return None;
+    }
+    Some(info.tid)
+}
+
+/// Give the display back and stop.
+fn quit() -> ! {
+    let fb = unsafe { FB_TID };
+    for i in 0..MAX_WINDOWS {
+        if unsafe { WINDOWS[i].used } {
+            destroy_window(i);
+        }
+    }
+    if fb != 0 {
+        // Hand the capability back with the display: a slot must be empty to
+        // be granted into, so leaving it filled would stop the next claimant
+        // ever being given it.
+        let _ = syscall::sys_cap_delete(FB_LEASE_SLOT);
+        let msg = Message { sender: 0, tag: TAG_FB_RELEASE, data: [0; 6] };
+        let mut reply = Message::empty();
+        let _ = syscall::sys_call(fb, &msg, &mut reply);
+    }
+    syscall::sys_exit_code(0);
 }
 
 #[panic_handler]

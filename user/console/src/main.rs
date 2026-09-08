@@ -6,8 +6,6 @@ use quark_rt::ipc::{Message, TID_ANY};
 use quark_rt::nameserver;
 use quark_rt::{println, syscall};
 
-// Init -> console: framebuffer initialization
-const TAG_FB_INIT: u64 = 100;
 
 const GLYPH_W: usize = 8;
 const GLYPH_H: usize = 16;
@@ -26,24 +24,24 @@ static mut G_POS: u8 = 8;
 static mut B_POS: u8 = 0;
 static mut INITIALIZED: bool = false;
 
-/// The display server, and the window it gave us. 0 means we are drawing
-/// straight at the framebuffer, which happens only when there is no display
-/// server to ask.
-static mut WM_TID: usize = 0;
-static mut WINDOW_ID: usize = 0;
+/// The framebuffer device server, and whether the display is ours right now.
+///
+/// A compositor can take the screen while this keeps running: the text carries
+/// on accumulating in the cell buffer, and is redrawn from it when the display
+/// comes back.
+static mut FB_TID: usize = 0;
+static mut HAVE_DISPLAY: bool = false;
 
-/// Where the window's pixels are mapped.
-const WINDOW_VADDR: usize = 0x83_0000_0000;
-/// Space left around the window so the display server's frame has somewhere
-/// to go and a second window is visible behind it.
-const WINDOW_MARGIN: usize = 24;
-/// Room for the title bar the display server draws above the contents.
-const TITLE_ALLOWANCE: usize = 32;
+/// Where the framebuffer is mapped.
+const FB_VADDR: usize = 0x81_0000_0000;
+/// The slot the framebuffer device grants the display into. Fixed by that
+/// device, and emptied again when the display goes back.
+const FB_LEASE_SLOT: usize = 2;
 
-const TAG_WM_CREATE: u64 = 1;
-const TAG_WM_COMMIT: u64 = 2;
-const TAG_WM_SCREEN: u64 = 5;
-const TAG_WM_ERROR: u64 = u64::MAX;
+const TAG_FB_CLAIM: u64 = 2;
+const TAG_FB_LOST: u64 = 0x100;
+const TAG_FB_GAINED: u64 = 0x101;
+const TAG_FB_ERROR: u64 = u64::MAX;
 
 // ANSI escape sequence state machine
 static mut ESC_STATE: u8 = 0;       // 0=normal, 1=got ESC, 2=got CSI
@@ -81,29 +79,9 @@ unsafe fn mark_dirty(row: usize) {
 pub extern "C" fn _start() -> ! {
     println!("[console] Started.");
 
-    // A display server, if there is one. Then this is a window like any other
-    // program's; without one, the framebuffer arrives from init instead and
-    // this draws on it directly, as it always did.
-    if let Some(wm) = nameserver::lookup_retry(b"wm", 20) {
-        if !init_window(wm) {
-            println!("[console] Falling back to the framebuffer.");
-        }
-    }
-
-    if !unsafe { INITIALIZED } {
-        let mut msg = Message::empty();
-        if syscall::sys_recv(TID_ANY, &mut msg).is_err() {
-            println!("[console] Failed to receive FB init.");
-            syscall::sys_exit();
-        }
-        if msg.tag != TAG_FB_INIT {
-            println!("[console] Unexpected first message.");
-            syscall::sys_exit();
-        }
-        init_framebuffer(&msg);
-        // Reply to init so it knows we're ready
-        let reply = Message { sender: 0, tag: 0, data: [0; 6] };
-        let _ = syscall::sys_reply(msg.sender, &reply);
+    if !claim_display() {
+        println!("[console] No display; nothing to draw on.");
+        syscall::sys_exit_code(1);
     }
 
     // Register with nameserver
@@ -122,7 +100,9 @@ pub extern "C" fn _start() -> ! {
         if n == 0 {
             break; // EOF
         } else if n == syscall::WOULD_BLOCK || n == u64::MAX {
-            // No data — check cursor blink
+            // Nothing to print. A good moment to notice the display changing
+            // hands, and to blink.
+            poll_display_handover();
             let now = syscall::sys_ticks();
             unsafe {
                 if now.wrapping_sub(CURSOR_LAST_TOGGLE) >= CURSOR_BLINK_TICKS {
@@ -147,147 +127,130 @@ pub extern "C" fn _start() -> ! {
     syscall::sys_exit();
 }
 
-/// Ask the display server for a window, and draw into that.
+/// Take the display and start drawing on it.
 ///
-/// The console used to map the framebuffer itself, which is why nothing else
-/// could be on the screen: it held the only copy. Now it is a client like any
-/// other — the drawing code is unchanged, because all it ever needed was
-/// somewhere to put pixels and a stride to step by.
-fn init_window(wm: usize) -> bool {
-    // How big is the screen? A terminal wants most of it, with room for the
-    // frame the display server draws around it.
-    let mut reply = Message::empty();
-    let ask = Message { sender: 0, tag: TAG_WM_SCREEN, data: [0; 6] };
-    if syscall::sys_call(wm, &ask, &mut reply).is_err() || reply.tag == TAG_WM_ERROR {
-        println!("[console] display server would not say how big the screen is");
+/// The console is an ordinary client of the framebuffer device: it asks for
+/// the screen, is given the right to map it, and draws text across the whole
+/// of it. No frame, no title bar — this is the text console the machine boots
+/// into, and it is the only thing on the screen until something else asks for
+/// it.
+fn claim_display() -> bool {
+    let Some(fb) = nameserver::lookup_retry(b"fb", 30) else {
         return false;
-    }
-    let sw = (reply.data[0] >> 32) as usize;
-    let sh = (reply.data[0] & 0xFFFF_FFFF) as usize;
-    // A window buffer is copied to the screen verbatim, so it has to be in the
-    // screen's pixel format. Without this the text was drawn with a colour of
-    // zero: black glyphs on a black window.
-    unsafe {
-        R_POS = ((reply.data[1] >> 16) & 0xFF) as u8;
-        G_POS = ((reply.data[1] >> 8) & 0xFF) as u8;
-        B_POS = (reply.data[1] & 0xFF) as u8;
-    }
-
-    let w = sw.saturating_sub(WINDOW_MARGIN * 2);
-    let h = sh.saturating_sub(WINDOW_MARGIN * 2 + TITLE_ALLOWANCE);
-    if w == 0 || h == 0 {
-        return false;
-    }
-
-    let mut data = [0u64; 6];
-    data[0] = ((w as u64) << 32) | (h as u64);
-    let title = b"Terminal";
-    for (i, chunk) in title.chunks(8).enumerate() {
-        let mut word = [0u8; 8];
-        word[..chunk.len()].copy_from_slice(chunk);
-        data[1 + i] = u64::from_le_bytes(word);
-    }
-    let create = Message { sender: 0, tag: TAG_WM_CREATE, data };
-    if syscall::sys_call(wm, &create, &mut reply).is_err() || reply.tag == TAG_WM_ERROR {
-        println!("[console] display server would not give us a window");
-        return false;
-    }
-
-    let id = reply.data[0] as usize;
-    let shmem = reply.data[1] as usize;
-    let stride = (reply.data[2] >> 32) as usize;
-    let bpp = (reply.data[2] & 0xFF) as usize;
-
-    if syscall::sys_shmem_map(shmem, WINDOW_VADDR).is_err() {
-        println!("[console] could not map the window");
-        return false;
-    }
-
-    unsafe {
-        // The same globals as before; they simply point at a window now.
-        FB = WINDOW_VADDR;
-        PITCH = stride;
-        WIDTH = w;
-        HEIGHT = h;
-        BPP = bpp;
-        COLS = w / GLYPH_W;
-        ROWS = h / GLYPH_H;
-        if COLS > MAX_CELL_COLS { COLS = MAX_CELL_COLS; }
-        if ROWS > MAX_CELL_ROWS { ROWS = MAX_CELL_ROWS; }
-        COL = 0;
-        ROW = 0;
-        WM_TID = wm;
-        WINDOW_ID = id;
-        INITIALIZED = true;
-        FG_COLOR = encode_color(0xCC, 0xCC, 0xCC);
-        core::ptr::write_bytes(FB as *mut u8, 0, stride * h);
-    }
-    present();
-    true
-}
-
-/// Tell the display server the window has changed.
-fn present() {
-    let wm = unsafe { WM_TID };
-    if wm == 0 {
-        return;
-    }
-    let msg = Message {
-        sender: 0,
-        tag: TAG_WM_COMMIT,
-        data: [unsafe { WINDOW_ID } as u64, 0, 0, 0, 0, 0],
     };
+    unsafe { FB_TID = fb };
+
+    let msg = Message { sender: 0, tag: TAG_FB_CLAIM, data: [0; 6] };
     let mut reply = Message::empty();
-    let _ = syscall::sys_call(wm, &msg, &mut reply);
+    if syscall::sys_call(fb, &msg, &mut reply).is_err() || reply.tag == TAG_FB_ERROR {
+        println!("[console] the framebuffer would not give up the display");
+        return false;
+    }
+    adopt_mode(&reply)
 }
 
-fn init_framebuffer(msg: &Message) {
-    // data[0] = physical address
-    // data[1] = (width << 32) | height
-    // data[2] = (pitch << 32) | bpp
-    // data[3] = (red_pos << 16) | (green_pos << 8) | blue_pos
-    // data[4] = (cursor_row << 32) | cursor_col
-    let phys_addr = msg.data[0] as usize;
-    let w = (msg.data[1] >> 32) as usize;
-    let h = (msg.data[1] & 0xFFFF_FFFF) as usize;
-    let pitch = (msg.data[2] >> 32) as usize;
-    let bpp = (msg.data[2] & 0xFF) as usize;
-    let rp = ((msg.data[3] >> 16) & 0xFF) as u8;
-    let gp = ((msg.data[3] >> 8) & 0xFF) as u8;
-    let bp = (msg.data[3] & 0xFF) as u8;
-    // Kernel passes cursor as pixel coordinates (font-independent)
-    let cursor_pixel_y = (msg.data[4] >> 32) as usize;
-    let cursor_pixel_x = (msg.data[4] & 0xFFFF_FFFF) as usize;
+/// Map the framebuffer and lay the text grid out on it.
+fn adopt_mode(reply: &Message) -> bool {
+    let w = (reply.data[0] >> 32) as usize;
+    let h = (reply.data[0] & 0xFFFF_FFFF) as usize;
+    let pitch = (reply.data[1] >> 32) as usize;
+    let bpp = (reply.data[1] & 0xFF) as usize;
+    let phys = reply.data[3] as usize;
 
-    // Map the framebuffer into our address space
-    let fb_size = pitch * h;
-    let pages = (fb_size + 4095) / 4096;
-    let fb_vaddr: usize = 0x81_0000_0000;
-
-    if syscall::sys_map_phys(phys_addr, fb_vaddr, pages).is_err() {
-        println!("[console] Failed to map framebuffer!");
-        return;
+    let pages = (pitch * h + 4095) / 4096;
+    if syscall::sys_map_phys(phys, FB_VADDR, pages).is_err() {
+        println!("[console] could not map the framebuffer");
+        return false;
     }
 
-    let rows = h / GLYPH_H;
-    let cols = w / GLYPH_W;
-
     unsafe {
-        FB = fb_vaddr;
+        FB = FB_VADDR;
         PITCH = pitch;
         WIDTH = w;
         HEIGHT = h;
         BPP = bpp;
-        COLS = cols;
-        ROWS = rows;
-        // Continue where the kernel console left off (convert pixels to our glyph grid)
-        COL = (cursor_pixel_x / GLYPH_W).min(cols.saturating_sub(1));
-        ROW = (cursor_pixel_y / GLYPH_H).min(rows.saturating_sub(1));
-        R_POS = rp;
-        G_POS = gp;
-        B_POS = bp;
+        R_POS = ((reply.data[2] >> 16) & 0xFF) as u8;
+        G_POS = ((reply.data[2] >> 8) & 0xFF) as u8;
+        B_POS = (reply.data[2] & 0xFF) as u8;
+        COLS = (w / GLYPH_W).min(MAX_CELL_COLS);
+        ROWS = (h / GLYPH_H).min(MAX_CELL_ROWS);
+        if FG_COLOR == 0 {
+            FG_COLOR = encode_color(0xCC, 0xCC, 0xCC);
+        }
+        HAVE_DISPLAY = true;
         INITIALIZED = true;
-        FG_COLOR = encode_color(0xCC, 0xCC, 0xCC);
+    }
+    true
+}
+
+/// Unmap the framebuffer, however many pages that is.
+///
+/// `sys_munmap` takes at most 256 pages a call and a screenful is four times
+/// that, so this loops. Leaving it mapped would mean holding a window onto the
+/// screen after the right to do so had been revoked — revocation governs the
+/// right to map, not mappings that already exist.
+unsafe fn unmap_framebuffer(bytes: usize) {
+    const MUNMAP_MAX: usize = 256;
+    let pages = (bytes + 4095) / 4096;
+    let mut done = 0;
+    while done < pages {
+        let chunk = (pages - done).min(MUNMAP_MAX);
+        let _ = syscall::sys_munmap(FB_VADDR + done * 4096, chunk);
+        done += chunk;
+    }
+}
+
+/// Redraw every cell. Used when the display comes back from a compositor:
+/// what is on the screen is whatever that left there.
+fn redraw_all() {
+    if !unsafe { HAVE_DISPLAY } {
+        return;
+    }
+    unsafe {
+        core::ptr::write_bytes(FB as *mut u8, 0, PITCH * HEIGHT);
+        DIRTY_MIN = 0;
+        DIRTY_MAX = ROWS.saturating_sub(1);
+    }
+    flush_dirty();
+}
+
+/// Answer the framebuffer device when the display changes hands.
+///
+/// Polled rather than waited for, since the main loop's real job is draining
+/// the pipe. A zero timeout is a poll: nothing to collect, nothing lost.
+fn poll_display_handover() {
+    let mut msg = Message::empty();
+    if syscall::sys_recv_timeout(TID_ANY, &mut msg, 0).is_err() {
+        return;
+    }
+    match msg.tag {
+        TAG_FB_LOST => {
+            // Stop drawing before answering: the reply is what lets the new
+            // owner start, and two programs writing the same pixels is the
+            // thing this protocol exists to prevent.
+            unsafe {
+                HAVE_DISPLAY = false;
+                unmap_framebuffer(PITCH * HEIGHT);
+            }
+            // Drop the capability along with the mapping. A granted slot must
+            // be empty to be granted into again, so keeping a revoked one
+            // means the display can never be handed back.
+            let _ = syscall::sys_cap_delete(FB_LEASE_SLOT);
+            let ack = Message { sender: 0, tag: 0, data: [0; 6] };
+            let _ = syscall::sys_reply(msg.sender, &ack);
+        }
+        TAG_FB_GAINED => {
+            let ok = adopt_mode(&msg);
+            let ack = Message { sender: 0, tag: 0, data: [0; 6] };
+            let _ = syscall::sys_reply(msg.sender, &ack);
+            if ok {
+                redraw_all();
+            }
+        }
+        _ => {
+            let ack = Message { sender: 0, tag: u64::MAX, data: [0; 6] };
+            let _ = syscall::sys_reply(msg.sender, &ack);
+        }
     }
 }
 
@@ -356,6 +319,9 @@ fn putc(c: u8) {
 }
 
 fn draw_glyph(col: usize, row: usize, ch: u8, fg: u32) {
+    if !unsafe { HAVE_DISPLAY } {
+        return;
+    }
     let glyph = &quark_rt::font::FONT[ch as usize];
 
     let pixel_x = col * GLYPH_W;
@@ -460,6 +426,11 @@ fn apply_sgr(code: u16) {
     }
 }
 
+/// Move everything up one line.
+///
+/// The pixel half is skipped when the display belongs to somebody else, but
+/// the cell buffer is not: that is the text, and it is what the screen is
+/// redrawn from when the display comes back.
 fn scroll() {
     unsafe {
         // Flush any pending dirty rows to the framebuffer BEFORE scrolling pixels,
@@ -488,22 +459,24 @@ fn scroll() {
             CELL_FG[i] = 0;
         }
 
-        // Scroll framebuffer pixels up by one text row instead of full redraw,
-        // so pre-existing content (e.g. kernel boot text) is preserved.
-        let shift = GLYPH_H * PITCH;
-        let total = ROWS * GLYPH_H * PITCH;
-        core::ptr::copy(
-            (FB + shift) as *const u8,
-            FB as *mut u8,
-            total - shift,
-        );
+        // Scroll framebuffer pixels up by one text row instead of a full
+        // redraw, so pre-existing content (e.g. kernel boot text) is preserved.
+        if HAVE_DISPLAY {
+            let shift = GLYPH_H * PITCH;
+            let total = ROWS * GLYPH_H * PITCH;
+            core::ptr::copy(
+                (FB + shift) as *const u8,
+                FB as *mut u8,
+                total - shift,
+            );
 
-        // Clear the last text row in the framebuffer
-        core::ptr::write_bytes(
-            (FB + (ROWS - 1) * GLYPH_H * PITCH) as *mut u8,
-            0,
-            GLYPH_H * PITCH,
-        );
+            // Clear the last text row in the framebuffer
+            core::ptr::write_bytes(
+                (FB + (ROWS - 1) * GLYPH_H * PITCH) as *mut u8,
+                0,
+                GLYPH_H * PITCH,
+            );
+        }
 
         ROW = ROWS - 1;
     }
@@ -511,7 +484,7 @@ fn scroll() {
 
 fn flush_dirty() {
     unsafe {
-        if !INITIALIZED || DIRTY_MIN > DIRTY_MAX {
+        if !INITIALIZED || !HAVE_DISPLAY || DIRTY_MIN > DIRTY_MAX {
             return;
         }
         let min = DIRTY_MIN;
@@ -525,22 +498,11 @@ fn flush_dirty() {
         DIRTY_MIN = usize::MAX;
         DIRTY_MAX = 0;
     }
-    // Nothing appears until the display server is told to look. Here rather
-    // than per glyph: a commit is a round trip, and this is already the point
-    // at which a batch of drawing is finished.
-    present();
 }
 
 /// Draw cursor block at current position.
 unsafe fn draw_cursor() {
-    if !INITIALIZED { return; }
-    draw_cursor_cell();
-    // The blink is the only thing that changes the screen without anything
-    // being written, so it has to ask for a redraw itself.
-    present();
-}
-
-unsafe fn draw_cursor_cell() {
+    if !INITIALIZED || !HAVE_DISPLAY { return; }
     if CURSOR_VISIBLE {
         // Draw a solid block at (COL, ROW) using FG_COLOR
         draw_cursor_block(FG_COLOR);
@@ -552,6 +514,9 @@ unsafe fn draw_cursor_cell() {
 
 /// Erase cursor by redrawing the cell content at cursor position.
 unsafe fn hide_cursor() {
+    if !HAVE_DISPLAY {
+        return;
+    }
     if !INITIALIZED { return; }
     if COL < COLS && ROW < ROWS {
         let idx = cell_idx(COL, ROW);
@@ -561,6 +526,9 @@ unsafe fn hide_cursor() {
 
 /// Draw a solid underline cursor (bottom 2 rows of the glyph cell).
 unsafe fn draw_cursor_block(color: u32) {
+    if !HAVE_DISPLAY {
+        return;
+    }
     if COL >= COLS || ROW >= ROWS { return; }
     let pixel_x = COL * GLYPH_W;
     let pixel_y = ROW * GLYPH_H;

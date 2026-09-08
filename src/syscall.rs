@@ -1372,7 +1372,7 @@ extern "C" fn syscall_dispatch(
                 };
                 // The caller must already hold a capability that covers what
                 // it is minting. This used to be skipped for UID 0.
-                if !crate::cap::can_mint(&task.cspace, cap_type, param0, param1) {
+                if !crate::cap::can_mint(&task.cspace, tid, cap_type, param0, param1) {
                     return u64::MAX;
                 }
                 // Target slot must be empty

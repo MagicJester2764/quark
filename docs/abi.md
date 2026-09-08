@@ -90,6 +90,14 @@ so it is built from calls that already existed.
 | 1.2 | `SYS_FUTEX_WAIT_TIMEOUT` (130). |
 | 1.3 | `SYS_SOCK_FD` (176), `SYS_SOCK_INFO` (177) — a network connection as a file descriptor. |
 
+A capability may only be minted from one the caller already holds, and only
+narrowed — with one exception. **An `Endpoint` naming only the caller may
+always be minted**, whoever they are. Admitting others to call you confers no
+authority over anybody else, and without it an `Endpoint` can only ever shrink:
+a server started at run time could never admit a client it spawned, because its
+own task ID is in nobody's destination set. It did not exist when those sets
+were made.
+
 Five calls are **deprecated as of 1.0** — the `CAP_*` object-capability calls
 (80–85) replace them:
 
