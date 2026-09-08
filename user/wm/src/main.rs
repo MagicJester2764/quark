@@ -965,10 +965,13 @@ pub extern "C" fn _start() -> ! {
                         destroy_window(i);
                     }
                 }
+                let mut was_session = false;
                 unsafe {
                     let mut out = 0;
                     for i in 0..SESSION_LEN {
-                        if SESSION[i] != dead {
+                        if SESSION[i] == dead {
+                            was_session = true;
+                        } else {
                             SESSION[out] = SESSION[i];
                             out += 1;
                         }
@@ -977,6 +980,13 @@ pub extern "C" fn _start() -> ! {
                     if SESSION_LEN == 0 {
                         quit();
                     }
+                }
+                if was_session {
+                    // Collect it. A task this one started keeps its slot and
+                    // its address space until its parent asks, and there is a
+                    // dead child waiting right now — so this answers at once
+                    // rather than blocking.
+                    let _ = syscall::sys_wait();
                 }
                 composite();
                 continue; // the kernel is not waiting for a reply

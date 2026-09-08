@@ -944,12 +944,20 @@ pub extern "C" fn _start() -> ! {
     let me = syscall::sys_getpid() as usize;
     let _ = syscall::sys_task_priority(me, syscall::PRIO_NORMAL);
 
-    // Asleep rather than spinning. init has nothing left to do, and a yield
-    // loop is a task asking to be run again as fast as the machine can manage
-    // in order to ask once more.
-    let mut msg = Message::empty();
+    // Collect the dead. A task that has exited keeps its slot, its kernel
+    // stack and its address space until a parent collects it, and init is the
+    // parent of everything the system starts — so an init that never waits is
+    // a steady leak of the table that decides how many tasks can exist at all.
+    //
+    // Blocking here rather than spinning: this is the same wait a shell does
+    // for a foreground command, and it is what init has to do for the rest of
+    // the machine's life.
     loop {
-        let _ = syscall::sys_recv(quark_rt::ipc::TID_ANY, &mut msg);
+        if syscall::sys_wait().is_err() {
+            // No children at all, which should not happen while the servers
+            // are up. Wait rather than ask again as fast as the machine can.
+            syscall::sleep_ticks(100);
+        }
     }
 }
 
