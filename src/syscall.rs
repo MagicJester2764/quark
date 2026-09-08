@@ -1030,14 +1030,29 @@ extern "C" fn syscall_dispatch(
             if !paging::user_range_ok(vaddr, pages) {
                 return u64::MAX;
             }
+
+            let cr3 = paging::read_cr3();
+
+            // Refuse to map over anything already there. map_page would
+            // overwrite the entry, which loses the old frame — leaked, since
+            // nothing tracks it any more — and silently replaces whatever the
+            // owner had in it with zeroes. That is invisible to both parties:
+            // the previous owner keeps using addresses whose contents have
+            // been swapped out from under it. Failing here means a caller that
+            // guessed at a base address finds out, rather than corrupting the
+            // task it collided with.
+            for i in 0..pages {
+                if unsafe { paging::translate(cr3, vaddr + i * 4096) }.is_some() {
+                    return u64::MAX;
+                }
+            }
+
             // Charge up front so a partial failure can't leave pages mapped
             // but unaccounted; the rollback path refunds.
             if !scheduler::current_task_check_mem(pages) {
                 return u64::MAX;
             }
             scheduler::current_task_charge_mem(pages);
-
-            let cr3 = paging::read_cr3();
             // OWNED: anonymous memory this address space must free on teardown.
             let flags =
                 paging::PRESENT | paging::WRITABLE | paging::USER | paging::OWNED;

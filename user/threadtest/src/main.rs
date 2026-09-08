@@ -32,19 +32,6 @@ static mut COLOUR: u32 = 0xDEAD;
 static mut TLS_MAIN: [u8; 512] = [0; 512];
 static mut TLS_WORKER: [u8; 512] = [0; 512];
 
-/// Reads the FS-relative word the thread set up, which is what a thread-local
-/// compiles down to. Two threads with different FS bases see different values
-/// from the identical instruction.
-fn read_fs_word() -> u64 {
-    let v: u64;
-    unsafe { core::arch::asm!("mov {}, fs:[0]", out(reg) v, options(nostack, readonly)) };
-    v
-}
-
-/// Per-thread storage. Same address in both threads; FS is what separates them.
-static mut MAIN_TLS: u64 = 0;
-static mut WORKER_TLS: u64 = 0;
-
 extern "C" fn arg_worker(arg: usize) -> ! {
     // Proper thread-local storage of our own, laid out from the PT_TLS image.
     unsafe {

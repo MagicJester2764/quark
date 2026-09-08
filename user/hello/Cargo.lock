@@ -5,3 +5,10 @@ version = 4
 [[package]]
 name = "hello"
 version = "0.1.0"
+dependencies = [
+ "quark-rt",
+]
+
+[[package]]
+name = "quark-rt"
+version = "0.1.0"

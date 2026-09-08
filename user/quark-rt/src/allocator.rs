@@ -8,14 +8,32 @@ use core::ptr;
 
 use crate::sync::Mutex;
 
-/// Heap starts at 0x90_0000_0000 — above all existing user mappings.
+/// Where the heap starts looking for space — above all existing user
+/// mappings. A starting point, not a reservation: see [`AllocInner::grow`].
 const HEAP_START: usize = 0x90_0000_0000;
+
+/// One past the last address the heap will probe.
+const HEAP_LIMIT: usize = 0x98_0000_0000;
+
+/// How many occupied regions a single grow will step over before giving up.
+/// Collisions come from a second allocator instance in the same program, so
+/// the realistic count is one or two; the cap only stops a pathological loop
+/// from making syscalls forever.
+const MAX_PROBES: usize = 64;
+
 const PAGE_SIZE: usize = 4096;
 
-/// Two-word header stored just before every returned pointer.
-/// [0] = block base address (where the free block started)
-/// [1] = block total size (entire block including header + padding)
-const HEADER_WORDS: usize = 2;
+/// Three-word header stored just before every returned pointer.
+/// [0] = a magic, so a write that lands here is noticed rather than silently
+///       redirecting the next free into arbitrary memory
+/// [1] = block base address (where the free block started)
+/// [2] = block total size (entire block including header + padding)
+///
+/// The magic exists because the header sits immediately below the pointer
+/// handed out, so an underflow of one allocation destroys the bookkeeping for
+/// it and the damage only surfaces later, somewhere else, as a wild write.
+const HEADER_MAGIC: usize = 0x5152_4B48_4452_0001; // "QRKHDR" + version
+const HEADER_WORDS: usize = 3;
 const HEADER_SIZE: usize = HEADER_WORDS * core::mem::size_of::<usize>();
 
 /// Minimum block size (must fit a FreeBlock header).
@@ -43,14 +61,35 @@ impl AllocInner {
     }
 
     /// Grow the heap by at least `min_bytes`, mapping new pages via sys_mmap.
+    ///
+    /// `heap_top` is where to *look* next, not memory this allocator holds. A
+    /// program can contain more than one instance of this allocator, each with
+    /// its own `heap_top` starting at `HEAP_START`: the hosted target links
+    /// quark-rt twice, once inside std and once for the program itself, and
+    /// std allocates a thread's control block through `System` rather than
+    /// through the global allocator — so spawning a thread is enough to bring
+    /// the second instance to life. Both would then hand out the same
+    /// addresses.
+    ///
+    /// The kernel refuses to map over a live mapping, so a collision surfaces
+    /// as a failed mmap rather than as one allocator's pages being replaced by
+    /// another's. Step past the occupied region and ask again.
     fn grow(&mut self, min_bytes: usize) -> bool {
         let pages = (min_bytes + PAGE_SIZE - 1) / PAGE_SIZE;
-        let vaddr = self.heap_top;
-        if crate::syscall::sys_mmap(vaddr, pages).is_err() {
-            return false;
-        }
         let size = pages * PAGE_SIZE;
-        self.heap_top += size;
+
+        let mut vaddr = self.heap_top;
+        let mut probes = 0;
+        while crate::syscall::sys_mmap(vaddr, pages).is_err() {
+            probes += 1;
+            // Every step advances by at least a page, so this terminates.
+            match vaddr.checked_add(size) {
+                Some(next) if probes <= MAX_PROBES && next + size <= HEAP_LIMIT => vaddr = next,
+                _ => return false,
+            }
+        }
+
+        self.heap_top = vaddr + size;
 
         let block = vaddr as *mut FreeBlock;
         unsafe {
@@ -160,6 +199,24 @@ impl AllocInner {
         let data_addr = ptr as usize;
         let (block_base, block_size) = read_header(data_addr);
 
+        // A base outside the heap, or a size that runs past its top, means the
+        // header survived but holds nonsense. Freeing on that basis puts a
+        // pointer to arbitrary memory into the free list.
+        if block_base < HEAP_START
+            || block_base >= self.heap_top
+            || block_size < MIN_BLOCK_SIZE
+            || block_base + block_size > self.heap_top
+        {
+            crate::syscall::sys_write(b"\nheap: implausible header on free of 0x");
+            write_hex(data_addr);
+            crate::syscall::sys_write(b"\n      base 0x");
+            write_hex(block_base);
+            crate::syscall::sys_write(b" size 0x");
+            write_hex(block_size);
+            crate::syscall::sys_write(b"\n");
+            crate::syscall::sys_exit_code(101);
+        }
+
         let block = block_base as *mut FreeBlock;
         unsafe {
             (*block).size = block_size;
@@ -169,21 +226,52 @@ impl AllocInner {
     }
 }
 
-/// Write the 2-word header just before `data_start`.
+/// Write the header just before `data_start`.
 fn write_header(data_start: usize, block_base: usize, block_size: usize) {
     unsafe {
         let header = (data_start - HEADER_SIZE) as *mut usize;
-        *header = block_base;
-        *header.add(1) = block_size;
+        *header = HEADER_MAGIC;
+        *header.add(1) = block_base;
+        *header.add(2) = block_size;
     }
 }
 
-/// Read the 2-word header just before `data_addr`.
+/// Read the header just before `data_addr`, checking it first.
+///
+/// A wrong magic means something wrote below this allocation, and there is no
+/// sensible value to return: reporting it here names the moment of use, where
+/// the free list would otherwise be corrupted silently and fault somewhere
+/// unrelated. So this either returns a good header or does not return.
 fn read_header(data_addr: usize) -> (usize, usize) {
     unsafe {
         let header = (data_addr - HEADER_SIZE) as *const usize;
-        (*header, *header.add(1))
+        if *header != HEADER_MAGIC {
+            report_corruption(data_addr, *header);
+        }
+        (*header.add(1), *header.add(2))
     }
+}
+
+/// Say what happened, as loudly as possible, and stop.
+///
+/// Continuing past a corrupt header means threading a bad pointer into the
+/// free list, and the eventual fault says nothing about the cause.
+fn report_corruption(data_addr: usize, found: usize) -> ! {
+    crate::syscall::sys_write(b"\nheap: header corrupted below allocation 0x");
+    write_hex(data_addr);
+    crate::syscall::sys_write(b"\n      expected magic, found 0x");
+    write_hex(found);
+    crate::syscall::sys_write(b"\n      something wrote to the 24 bytes below that pointer\n");
+    crate::syscall::sys_exit_code(101);
+}
+
+fn write_hex(mut v: usize) {
+    let mut buf = [b'0'; 16];
+    for i in (0..16).rev() {
+        buf[i] = b"0123456789abcdef"[v & 0xF];
+        v >>= 4;
+    }
+    crate::syscall::sys_write(&buf);
 }
 
 fn align_up(addr: usize, align: usize) -> usize {

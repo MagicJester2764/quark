@@ -136,3 +136,30 @@ pub fn thread_pointer() -> usize {
     }
     tp
 }
+
+/// Where per-thread TLS blocks are mapped, one page each.
+///
+/// Deliberately not the heap. A thread sets its storage up before it is fully
+/// running, and taking the allocator's lock there means a thread-startup path
+/// entangled with every other allocation — and a mistake in the layout
+/// arithmetic lands on someone else's bookkeeping rather than on unmapped
+/// memory. Pages from the kernel fail visibly instead.
+const TLS_AREA_BASE: usize = 0x7FF0_0000_0000;
+const TLS_AREA_STRIDE: usize = 0x1000 * 4;
+
+static NEXT_TLS: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// Map a region for one thread's storage. Never freed: it must stay valid as
+/// long as anything might read a thread-local through it, and there is no hook
+/// that runs after the last such read.
+pub fn map_region() -> Result<(*mut u8, usize), ()> {
+    let need = required_bytes();
+    let pages = (need + 4095) / 4096;
+    let slot = NEXT_TLS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    let base = TLS_AREA_BASE + slot * TLS_AREA_STRIDE;
+    if pages * 4096 > TLS_AREA_STRIDE {
+        return Err(());
+    }
+    syscall::sys_mmap(base, pages)?;
+    Ok((base as *mut u8, pages * 4096))
+}
