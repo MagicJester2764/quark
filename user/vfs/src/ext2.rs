@@ -1,13 +1,19 @@
-/// ext2 filesystem structures and core operations.
+/// ext2 and ext4 filesystem structures and core operations.
 ///
-/// Supports revision 0 ext2 with 1024-byte blocks, 128-byte inodes.
+/// The two share this code: same superblock, same block groups, same inode
+/// table, same directory entries. What ext4 changes is how an inode names its
+/// blocks, which is [`crate::ext4`], and how wide some fields are, which is
+/// the `desc_size` and 64-bit handling here.
+///
 /// All on-disk structures are parsed from byte slices (no repr(C) transmute).
 
+use crate::ext4;
 use crate::{
     read_u16, read_u32, CACHE_BUF_BASE, CLIENT_BUF, DISK_IO_BUF, ERR_IO, ERR_IS_DIR,
     ERR_NOT_FOUND, PAGE_SIZE, SECTOR_CACHE, TAG_DISK_OK, TAG_READ_SECTOR,
     TAG_READ_SECTORS, TAG_WRITE_SECTOR,
 };
+use quark_rt::println;
 use quark_rt::ipc::Message;
 use quark_rt::syscall;
 
@@ -45,6 +51,9 @@ pub struct Ext2Inode {
     pub i_blocks: u32, // in 512-byte units
     pub i_flags: u32,
     pub i_block: [u32; 15], // 0-11 direct, 12 indirect, 13 double, 14 triple
+    /// High 32 bits of the size, for a regular file. Directories use this
+    /// field for something else and are never large enough to need it.
+    pub i_size_high: u32,
 }
 
 impl Ext2Inode {
@@ -62,6 +71,7 @@ impl Ext2Inode {
             i_blocks: 0,
             i_flags: 0,
             i_block: [0; 15],
+            i_size_high: 0,
         }
     }
 
@@ -92,10 +102,26 @@ impl Ext2Inode {
             i_blocks: read_u32(data, 28),
             i_flags: read_u32(data, 32),
             i_block,
+            i_size_high: read_u32(data, 108),
         }
     }
 
-    /// Serialize to 128 bytes for writing back to disk.
+    /// The file's size, as the two halves make it.
+    pub fn size64(&self) -> u64 {
+        if self.is_regular() {
+            ((self.i_size_high as u64) << 32) | self.i_size as u64
+        } else {
+            self.i_size as u64
+        }
+    }
+
+    /// Overlay the modelled fields onto an existing on-disk inode.
+    ///
+    /// `out` must hold the inode as it currently is on disk, not zeros. Only
+    /// the fields above are written; everything else is left exactly as found.
+    /// This used to zero bytes 100..128, which threw away `i_generation` and
+    /// `i_file_acl` on ext2, and on ext4 also the high half of the size and the
+    /// inode checksum — a checksum this does not compute but must not destroy.
     pub fn to_bytes(&self, out: &mut [u8]) {
         write_u16(out, 0, self.i_mode);
         write_u16(out, 2, self.i_uid);
@@ -108,25 +134,27 @@ impl Ext2Inode {
         write_u16(out, 26, self.i_links_count);
         write_u32(out, 28, self.i_blocks);
         write_u32(out, 32, self.i_flags);
-        // i_osd1 at bytes 36-39 (OS-dependent, zero for us)
-        write_u32(out, 36, 0);
         for j in 0..15 {
             write_u32(out, 40 + j * 4, self.i_block[j]);
         }
-        // Zero remaining bytes (100..128)
-        for i in 100..128 {
-            if i < out.len() {
-                out[i] = 0;
-            }
+        if self.is_regular() {
+            write_u32(out, 108, self.i_size_high);
         }
     }
 }
 
+/// One block group's metadata locations and free counts.
+///
+/// 32 bytes on ext2. With `INCOMPAT_64BIT` the descriptor grows to 64 and each
+/// of the three block numbers gains a high half at the far end of it, which is
+/// why `from_bytes` needs to be told the size — reading a 64-byte table with a
+/// 32-byte stride lands halfway into the previous entry and yields addresses
+/// that are plausible but wrong.
 #[derive(Clone, Copy)]
 pub struct BlockGroupDesc {
-    pub bg_block_bitmap: u32,
-    pub bg_inode_bitmap: u32,
-    pub bg_inode_table: u32,
+    pub bg_block_bitmap: u64,
+    pub bg_inode_bitmap: u64,
+    pub bg_inode_table: u64,
     pub bg_free_blocks_count: u16,
     pub bg_free_inodes_count: u16,
     pub bg_used_dirs_count: u16,
@@ -144,24 +172,35 @@ impl BlockGroupDesc {
         }
     }
 
-    pub fn from_bytes(data: &[u8], off: usize) -> Self {
+    /// Parse one descriptor. `desc_size` is 32 for ext2, 64 with 64BIT.
+    pub fn from_bytes(data: &[u8], off: usize, desc_size: usize) -> Self {
+        let hi = |o: usize| -> u64 {
+            if desc_size >= 64 { (read_u32(data, off + o) as u64) << 32 } else { 0 }
+        };
         Self {
-            bg_block_bitmap: read_u32(data, off),
-            bg_inode_bitmap: read_u32(data, off + 4),
-            bg_inode_table: read_u32(data, off + 8),
+            bg_block_bitmap: read_u32(data, off) as u64 | hi(32),
+            bg_inode_bitmap: read_u32(data, off + 4) as u64 | hi(36),
+            bg_inode_table: read_u32(data, off + 8) as u64 | hi(40),
             bg_free_blocks_count: read_u16(data, off + 12),
             bg_free_inodes_count: read_u16(data, off + 14),
             bg_used_dirs_count: read_u16(data, off + 16),
         }
     }
 
-    pub fn write_to_bytes(&self, data: &mut [u8], off: usize) {
-        write_u32(data, off, self.bg_block_bitmap);
-        write_u32(data, off + 4, self.bg_inode_bitmap);
-        write_u32(data, off + 8, self.bg_inode_table);
+    /// Write the fields back, leaving everything else in the descriptor —
+    /// checksums and unused-count hints among them — exactly as it was.
+    pub fn write_to_bytes(&self, data: &mut [u8], off: usize, desc_size: usize) {
+        write_u32(data, off, self.bg_block_bitmap as u32);
+        write_u32(data, off + 4, self.bg_inode_bitmap as u32);
+        write_u32(data, off + 8, self.bg_inode_table as u32);
         write_u16(data, off + 12, self.bg_free_blocks_count);
         write_u16(data, off + 14, self.bg_free_inodes_count);
         write_u16(data, off + 16, self.bg_used_dirs_count);
+        if desc_size >= 64 {
+            write_u32(data, off + 32, (self.bg_block_bitmap >> 32) as u32);
+            write_u32(data, off + 36, (self.bg_inode_bitmap >> 32) as u32);
+            write_u32(data, off + 40, (self.bg_inode_table >> 32) as u32);
+        }
     }
 }
 
@@ -186,7 +225,22 @@ pub struct Ext2State {
     pub total_inodes: u32,
     pub free_blocks_count: u32,
     pub free_inodes_count: u32,
+    /// Size of one block group descriptor: 32, or 64 with `INCOMPAT_64BIT`.
+    pub desc_size: usize,
+    pub feature_compat: u32,
+    pub feature_incompat: u32,
+    pub feature_ro_compat: u32,
+    /// Set when a feature is present that a writer would have to maintain and
+    /// this does not. Reading is still correct; writing would corrupt.
+    pub read_only: bool,
     pub bgd_table: [BlockGroupDesc; MAX_BLOCK_GROUPS],
+}
+
+impl Ext2State {
+    /// Does this filesystem use extents rather than the block pointer array?
+    pub fn is_ext4(&self) -> bool {
+        self.feature_incompat & crate::ext4::INCOMPAT_EXTENTS != 0
+    }
 }
 
 impl Ext2State {
@@ -206,8 +260,28 @@ impl Ext2State {
             total_inodes: 0,
             free_blocks_count: 0,
             free_inodes_count: 0,
+            desc_size: 32,
+            feature_compat: 0,
+            feature_incompat: 0,
+            feature_ro_compat: 0,
+            read_only: false,
             bgd_table: [BlockGroupDesc::empty(); MAX_BLOCK_GROUPS],
         }
+    }
+
+    /// Narrow a 64-bit block number for use as an LBA.
+    ///
+    /// The descriptors are read as 64-bit because that is the on-disk format
+    /// with `INCOMPAT_64BIT`, not because this can address that far: the disk
+    /// driver is LBA28, so the ceiling is 128 GiB whatever the format allows.
+    /// Failing here says so, where truncating would read a wrong sector and
+    /// report whatever it found.
+    pub fn block32(&self, block: u64) -> Result<u32, u64> {
+        let sectors = block.saturating_mul(self.sectors_per_block as u64);
+        if sectors + self.part_lba as u64 > u32::MAX as u64 {
+            return Err(ERR_IO);
+        }
+        Ok(block as u32)
     }
 
     /// Convert a block number to an absolute LBA.
@@ -362,7 +436,19 @@ pub fn write_u32(data: &mut [u8], off: usize, val: u32) {
 
 /// Initialize ext2 state from the superblock at the given partition.
 /// Superblock is at byte offset 1024 from partition start = sector 2 for 512-byte sectors.
-pub fn init_ext2(disk_tid: usize, buf_phys: usize, part_lba: u32) -> Result<Ext2State, ()> {
+/// Read the superblock and descriptor table into `ext2`.
+///
+/// Fills a caller-provided state rather than returning one: `Ext2State` holds
+/// the whole descriptor table and is several kilobytes, and building it on the
+/// stack to copy it out overflowed the server's four-page stack the moment
+/// 64-bit descriptors made each entry wider. It lives in .bss now and is
+/// filled where it sits.
+pub fn init_ext2(
+    ext2: &mut Ext2State,
+    disk_tid: usize,
+    buf_phys: usize,
+    part_lba: u32,
+) -> Result<(), ()> {
     // Read superblock — it's at byte offset 1024, which is sector 2 (512*2=1024).
     raw_read_sector(disk_tid, buf_phys, part_lba + 2)?;
     let sb0 = unsafe { core::slice::from_raw_parts(DISK_IO_BUF as *const u8, 512) };
@@ -394,58 +480,112 @@ pub fn init_ext2(disk_tid: usize, buf_phys: usize, part_lba: u32) -> Result<Ext2
         128
     };
 
+    // Feature flags. The three sets differ in what not knowing one costs:
+    // a compat feature can be ignored, a ro_compat feature means a writer must
+    // maintain something, and an incompat feature changes the format — so an
+    // implementation that does not know one must not touch the filesystem,
+    // because reading it would silently return the wrong bytes.
+    let (feature_compat, feature_incompat, feature_ro_compat) = if s_rev_level >= 1 {
+        (
+            read_u32(&sb_buf, 92),
+            read_u32(&sb_buf, 96),
+            read_u32(&sb_buf, 100),
+        )
+    } else {
+        (0, 0, 0)
+    };
+
+    let unknown_incompat = feature_incompat & !ext4::INCOMPAT_SUPPORTED;
+    if unknown_incompat != 0 {
+        println!(
+            "[vfs] refusing to mount: unsupported incompatible features 0x{:x}",
+            unknown_incompat
+        );
+        return Err(());
+    }
+
+    // The journal is the filesystem's record of writes it has committed but
+    // not yet placed. Mounting over one without replaying it reads superseded
+    // data as though it were current.
+    if feature_incompat & ext4::INCOMPAT_RECOVER != 0 {
+        println!("[vfs] journal needs recovery; mounting read-only");
+    }
+
+    let unknown_ro = feature_ro_compat & !ext4::RO_COMPAT_WRITE_SUPPORTED;
+    let read_only = unknown_ro != 0 || feature_incompat & ext4::INCOMPAT_RECOVER != 0;
+    if unknown_ro != 0 {
+        println!(
+            "[vfs] read-only: features 0x{:x} need maintaining on write",
+            unknown_ro
+        );
+    }
+
+    // With 64BIT the descriptor grows and every entry moves; reading the table
+    // with the wrong stride gives addresses that look plausible and are not.
+    let desc_size = if feature_incompat & ext4::INCOMPAT_64BIT != 0 {
+        let d = read_u16(&sb_buf, 254) as usize;
+        if d < 32 || d > 1024 || !d.is_power_of_two() {
+            println!("[vfs] refusing to mount: bad descriptor size {}", d);
+            return Err(());
+        }
+        d
+    } else {
+        32
+    };
+
     let block_size = 1024u32 << s_log_block_size;
     let sectors_per_block = block_size / 512;
 
     let num_block_groups =
         (s_blocks_count + s_blocks_per_group - 1) / s_blocks_per_group;
 
-    let mut ext2 = Ext2State {
-        disk_tid,
-        buf_phys,
-        part_lba,
-        block_size,
-        sectors_per_block,
-        inodes_per_group: s_inodes_per_group,
-        blocks_per_group: s_blocks_per_group,
-        inode_size: s_inode_size,
-        first_data_block: s_first_data_block,
-        num_block_groups,
-        total_blocks: s_blocks_count,
-        total_inodes: s_inodes_count,
-        free_blocks_count: s_free_blocks_count,
-        free_inodes_count: s_free_inodes_count,
-        bgd_table: [BlockGroupDesc::empty(); MAX_BLOCK_GROUPS],
-    };
+    ext2.disk_tid = disk_tid;
+    ext2.buf_phys = buf_phys;
+    ext2.part_lba = part_lba;
+    ext2.block_size = block_size;
+    ext2.sectors_per_block = sectors_per_block;
+    ext2.inodes_per_group = s_inodes_per_group;
+    ext2.blocks_per_group = s_blocks_per_group;
+    ext2.inode_size = s_inode_size;
+    ext2.first_data_block = s_first_data_block;
+    ext2.num_block_groups = num_block_groups;
+    ext2.total_blocks = s_blocks_count;
+    ext2.total_inodes = s_inodes_count;
+    ext2.free_blocks_count = s_free_blocks_count;
+    ext2.free_inodes_count = s_free_inodes_count;
+    ext2.desc_size = desc_size;
+    ext2.feature_compat = feature_compat;
+    ext2.feature_incompat = feature_incompat;
+    ext2.feature_ro_compat = feature_ro_compat;
+    ext2.read_only = read_only;
 
     // Read block group descriptor table (starts at block after superblock).
     // For 1K blocks: superblock is block 1, BGD table starts at block 2.
     // For 4K blocks: superblock is in block 0 (bytes 1024-2047), BGD table at block 1.
     let bgd_block = if block_size == 1024 { 2 } else { 1 };
-    let bgd_abs_lba = ext2.block_to_lba(bgd_block);
 
-    // Each BGD is 32 bytes. With 512-byte sectors, 16 BGDs per sector.
-    let bgd_sectors = ((num_block_groups * 32) + 511) / 512;
-    let bgd_sectors = bgd_sectors.min(ext2.sectors_per_block * 4); // reasonable limit
-
-    // Read BGD sectors
-    let mut bgd_idx = 0u32;
-    for s in 0..bgd_sectors {
-        let data = ext2.cached_read_sector(bgd_abs_lba + s)?;
-        let mut sec_buf = [0u8; 512];
-        sec_buf.copy_from_slice(data);
-
-        let entries_in_sector = (512 / 32).min((num_block_groups - bgd_idx) as usize);
-        for e in 0..entries_in_sector {
-            if (bgd_idx as usize) < MAX_BLOCK_GROUPS {
-                ext2.bgd_table[bgd_idx as usize] =
-                    BlockGroupDesc::from_bytes(&sec_buf, e * 32);
-            }
-            bgd_idx += 1;
-        }
+    // Descriptors are read one at a time through read_block_bytes rather than
+    // a sector at a time: a 64-byte descriptor divides 512, but the loop that
+    // assumed it also assumed the 32-byte stride, and the two assumptions are
+    // easy to get out of step. This has one.
+    let groups = (num_block_groups as usize).min(MAX_BLOCK_GROUPS);
+    let mut desc = [0u8; 64];
+    for g in 0..groups {
+        let off = g * desc_size;
+        let block = bgd_block + (off / block_size as usize) as u32;
+        let in_block = off % block_size as usize;
+        read_block_bytes(ext2, block, in_block, &mut desc[..desc_size]).map_err(|_| ())?;
+        ext2.bgd_table[g] = BlockGroupDesc::from_bytes(&desc, 0, desc_size);
     }
 
-    Ok(ext2)
+    if num_block_groups as usize > MAX_BLOCK_GROUPS {
+        println!(
+            "[vfs] filesystem has {} block groups; only the first {} are usable",
+            num_block_groups, MAX_BLOCK_GROUPS
+        );
+    }
+
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -465,7 +605,7 @@ pub fn read_inode(ext2: &Ext2State, inode_num: u32) -> Result<Ext2Inode, u64> {
         return Err(ERR_IO);
     }
 
-    let inode_table_block = ext2.bgd_table[group as usize].bg_inode_table;
+    let inode_table_block = ext2.block32(ext2.bgd_table[group as usize].bg_inode_table)?;
     let byte_offset = index * ext2.inode_size as u32;
     let block_offset = byte_offset / ext2.block_size;
     let offset_in_block = byte_offset % ext2.block_size;
@@ -506,7 +646,7 @@ pub fn write_inode(ext2: &Ext2State, inode_num: u32, inode: &Ext2Inode) -> Resul
     let group = (inode_num - 1) / ext2.inodes_per_group;
     let index = (inode_num - 1) % ext2.inodes_per_group;
 
-    let inode_table_block = ext2.bgd_table[group as usize].bg_inode_table;
+    let inode_table_block = ext2.block32(ext2.bgd_table[group as usize].bg_inode_table)?;
     let byte_offset = index * ext2.inode_size as u32;
     let block_offset = byte_offset / ext2.block_size;
     let offset_in_block = byte_offset % ext2.block_size;
@@ -517,29 +657,40 @@ pub fn write_inode(ext2: &Ext2State, inode_num: u32, inode: &Ext2Inode) -> Resul
 
     let abs_lba = ext2.block_to_lba(block) + sector_in_block;
 
-    let mut inode_bytes = [0u8; 128];
-    inode.to_bytes(&mut inode_bytes);
-
+    // Read what is there, overlay the modelled fields, write it back. Seeding
+    // from disk rather than from zeros is what keeps the fields this does not
+    // model — generation, extended attributes, checksums — intact.
     if offset_in_sector + 128 > 512 {
-        // Spans sector boundary
+        // Spans a sector boundary.
         let first_part = 512 - offset_in_sector;
+        let mut inode_bytes = [0u8; 128];
 
-        // Read-modify-write first sector
+        raw_read_sector(ext2.disk_tid, ext2.buf_phys, abs_lba).map_err(|_| ERR_IO)?;
+        {
+            let buf = unsafe { core::slice::from_raw_parts(DISK_IO_BUF as *const u8, 512) };
+            inode_bytes[..first_part].copy_from_slice(&buf[offset_in_sector..]);
+        }
+        raw_read_sector(ext2.disk_tid, ext2.buf_phys, abs_lba + 1).map_err(|_| ERR_IO)?;
+        {
+            let buf = unsafe { core::slice::from_raw_parts(DISK_IO_BUF as *const u8, 512) };
+            inode_bytes[first_part..].copy_from_slice(&buf[..128 - first_part]);
+        }
+
+        inode.to_bytes(&mut inode_bytes);
+
         raw_read_sector(ext2.disk_tid, ext2.buf_phys, abs_lba).map_err(|_| ERR_IO)?;
         let buf = unsafe { core::slice::from_raw_parts_mut(DISK_IO_BUF as *mut u8, 512) };
         buf[offset_in_sector..].copy_from_slice(&inode_bytes[..first_part]);
         ext2.write_sector_abs(abs_lba).map_err(|_| ERR_IO)?;
 
-        // Read-modify-write second sector
         raw_read_sector(ext2.disk_tid, ext2.buf_phys, abs_lba + 1).map_err(|_| ERR_IO)?;
         let buf = unsafe { core::slice::from_raw_parts_mut(DISK_IO_BUF as *mut u8, 512) };
         buf[..128 - first_part].copy_from_slice(&inode_bytes[first_part..]);
         ext2.write_sector_abs(abs_lba + 1).map_err(|_| ERR_IO)?;
     } else {
-        // Read-modify-write single sector
         raw_read_sector(ext2.disk_tid, ext2.buf_phys, abs_lba).map_err(|_| ERR_IO)?;
         let buf = unsafe { core::slice::from_raw_parts_mut(DISK_IO_BUF as *mut u8, 512) };
-        buf[offset_in_sector..offset_in_sector + 128].copy_from_slice(&inode_bytes);
+        inode.to_bytes(&mut buf[offset_in_sector..offset_in_sector + 128]);
         ext2.write_sector_abs(abs_lba).map_err(|_| ERR_IO)?;
     }
 
@@ -553,6 +704,13 @@ pub fn write_inode(ext2: &Ext2State, inode_num: u32, inode: &Ext2Inode) -> Resul
 /// Map a logical file block number to a physical disk block number.
 /// Returns 0 if the block is not allocated (sparse file).
 pub fn block_map(ext2: &Ext2State, inode: &Ext2Inode, logical: u32) -> Result<u32, u64> {
+    // An ext4 inode reuses the same sixty bytes for the root of an extent
+    // tree, so which of the two this is depends on the inode, not the
+    // filesystem: an ext4 volume converted from ext2 holds both kinds.
+    if ext4::uses_extents(inode) {
+        return ext4::extent_lookup(ext2, inode, logical);
+    }
+
     let ppb = ext2.ptrs_per_block(); // pointers per indirect block (256 for 1K, 1024 for 4K)
 
     if logical < 12 {
@@ -604,6 +762,35 @@ pub fn block_map(ext2: &Ext2State, inode: &Ext2Inode, logical: u32) -> Result<u3
         return Ok(0);
     }
     read_block_ptr(ext2, ind, idx3)
+}
+
+/// Read `out.len()` bytes from `block` starting at `byte_off` within it.
+///
+/// Sectors are the unit the cache and the disk driver deal in, and a structure
+/// need not sit inside one: an extent entry is twelve bytes, which does not
+/// divide 512, so entries straddle sector boundaries as a matter of course.
+pub fn read_block_bytes(
+    ext2: &Ext2State,
+    block: u32,
+    byte_off: usize,
+    out: &mut [u8],
+) -> Result<(), u64> {
+    if byte_off + out.len() > ext2.block_size as usize {
+        return Err(ERR_IO);
+    }
+    let base_lba = ext2.block_to_lba(block);
+    let mut done = 0;
+    while done < out.len() {
+        let pos = byte_off + done;
+        let sector = (pos / 512) as u32;
+        let in_sector = pos % 512;
+        let take = (512 - in_sector).min(out.len() - done);
+
+        let data = ext2.cached_read_sector(base_lba + sector).map_err(|_| ERR_IO)?;
+        out[done..done + take].copy_from_slice(&data[in_sector..in_sector + take]);
+        done += take;
+    }
+    Ok(())
 }
 
 /// Read a u32 block pointer from an indirect block at the given index.
@@ -827,6 +1014,10 @@ pub fn set_block_ptr(
     logical: u32,
     phys_block: u32,
 ) -> Result<(), u64> {
+    if ext4::uses_extents(inode) {
+        return ext4::extent_insert(inode, logical, phys_block);
+    }
+
     let ppb = ext2.ptrs_per_block();
 
     if logical < 12 {
@@ -936,17 +1127,27 @@ pub fn flush_superblock(ext2: &Ext2State) -> Result<(), u64> {
 
 /// Write back a block group descriptor.
 pub fn flush_bgd(ext2: &Ext2State, group: u32) -> Result<(), u64> {
-    let bgd_block = if ext2.block_size == 1024 { 2 } else { 1 };
-    let bgd_byte_offset = group * 32;
-    let bgd_sector = bgd_byte_offset / 512;
-    let bgd_offset_in_sector = (bgd_byte_offset % 512) as usize;
+    let bgd_block_base = if ext2.block_size == 1024 { 2 } else { 1 };
+    // The stride is the descriptor size, not 32: with 64BIT every entry past
+    // the first sits somewhere a 32-byte stride does not point at.
+    let bgd_byte_offset = group as usize * ext2.desc_size;
+    let bgd_block = bgd_block_base + (bgd_byte_offset / ext2.block_size as usize) as u32;
+    let in_block = bgd_byte_offset % ext2.block_size as usize;
+    let bgd_sector = (in_block / 512) as u32;
+    let bgd_offset_in_sector = in_block % 512;
+
+    // A descriptor must not straddle a sector, or this read-modify-write would
+    // rewrite half of it. Both 32 and 64 divide 512, so it never does.
+    if bgd_offset_in_sector + ext2.desc_size > 512 {
+        return Err(ERR_IO);
+    }
 
     let abs_lba = ext2.block_to_lba(bgd_block) + bgd_sector;
 
     // Read-modify-write
     raw_read_sector(ext2.disk_tid, ext2.buf_phys, abs_lba).map_err(|_| ERR_IO)?;
     let buf = unsafe { core::slice::from_raw_parts_mut(DISK_IO_BUF as *mut u8, 512) };
-    ext2.bgd_table[group as usize].write_to_bytes(buf, bgd_offset_in_sector);
+    ext2.bgd_table[group as usize].write_to_bytes(buf, bgd_offset_in_sector, ext2.desc_size);
     ext2.write_sector_abs(abs_lba).map_err(|_| ERR_IO)?;
 
     Ok(())

@@ -17,7 +17,7 @@ pub fn alloc_block(ext2: &mut Ext2State) -> Result<u32, u64> {
             continue;
         }
 
-        let bitmap_block = bgd.bg_block_bitmap;
+        let bitmap_block = ext2.block32(bgd.bg_block_bitmap)?;
 
         // Scan bitmap sectors
         for s in 0..ext2.sectors_per_block {
@@ -74,7 +74,7 @@ pub fn free_block(ext2: &mut Ext2State, block: u32) -> Result<(), u64> {
     let byte_idx = (block_in_group / 8) as usize;
     let bit = block_in_group % 8;
 
-    let bitmap_block = ext2.bgd_table[group as usize].bg_block_bitmap;
+    let bitmap_block = ext2.block32(ext2.bgd_table[group as usize].bg_block_bitmap)?;
     let sector_in_bitmap = (byte_idx / 512) as u32;
     let byte_in_sector = byte_idx % 512;
 
@@ -106,7 +106,7 @@ pub fn alloc_inode(ext2: &mut Ext2State) -> Result<u32, u64> {
             continue;
         }
 
-        let bitmap_block = bgd.bg_inode_bitmap;
+        let bitmap_block = ext2.block32(bgd.bg_inode_bitmap)?;
 
         for s in 0..ext2.sectors_per_block {
             let abs_lba = ext2.block_to_lba(bitmap_block) + s;
@@ -159,7 +159,7 @@ pub fn free_inode(ext2: &mut Ext2State, inode_num: u32) -> Result<(), u64> {
     let byte_idx = (inode_in_group / 8) as usize;
     let bit = inode_in_group % 8;
 
-    let bitmap_block = ext2.bgd_table[group as usize].bg_inode_bitmap;
+    let bitmap_block = ext2.block32(ext2.bgd_table[group as usize].bg_inode_bitmap)?;
     let sector_in_bitmap = (byte_idx / 512) as u32;
     let byte_in_sector = byte_idx % 512;
 

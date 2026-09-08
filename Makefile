@@ -67,10 +67,12 @@ CAT_DIR := user/cat
 CAPDEMO_DIR := user/capdemo
 THREADTEST_DIR := user/threadtest
 SOCKTEST_DIR := user/socktest
+FSTEST_DIR := user/fstest
 CAT_ELF := $(CAT_DIR)/target/$(TARGET)/release/cat
 CAPDEMO_ELF := $(CAPDEMO_DIR)/target/$(TARGET)/release/capdemo
 THREADTEST_ELF := $(THREADTEST_DIR)/target/$(TARGET)/release/threadtest
 SOCKTEST_ELF := $(SOCKTEST_DIR)/target/$(TARGET)/release/socktest
+FSTEST_ELF := $(FSTEST_DIR)/target/$(TARGET)/release/fstest
 
 LOGIN_DIR := user/login
 LOGIN_ELF := $(LOGIN_DIR)/target/$(TARGET)/release/login
@@ -111,7 +113,7 @@ $(FAT32_DRV_BIN): FORCE
 	cd $(FAT32_DRV_DIR) && cargo build --release
 	objcopy -O binary $(FAT32_DRV_ELF) $(FAT32_DRV_BIN)
 
-user: $(INIT_ELF) $(HOSTED_ELFS) $(NS_ELF) $(KBD_ELF) $(CON_ELF) $(INP_ELF) $(DISK_ELF) $(DISKTEST_ELF) $(VFS_ELF) $(NET_ELF) $(SHELL_ELF) $(ECHO_ELF) $(LS_ELF) $(CAT_ELF) $(LOGIN_ELF) $(PS_ELF) $(IPCPING_ELF) $(PING_ELF) $(SHUTDOWN_ELF) $(CAPDEMO_ELF) $(THREADTEST_ELF) $(SOCKTEST_ELF)
+user: $(INIT_ELF) $(HOSTED_ELFS) $(NS_ELF) $(KBD_ELF) $(CON_ELF) $(INP_ELF) $(DISK_ELF) $(DISKTEST_ELF) $(VFS_ELF) $(NET_ELF) $(SHELL_ELF) $(ECHO_ELF) $(LS_ELF) $(CAT_ELF) $(LOGIN_ELF) $(PS_ELF) $(IPCPING_ELF) $(PING_ELF) $(SHUTDOWN_ELF) $(CAPDEMO_ELF) $(THREADTEST_ELF) $(SOCKTEST_ELF) $(FSTEST_ELF)
 
 $(INIT_ELF): FORCE
 	cd $(INIT_DIR) && cargo build --release
@@ -198,6 +200,9 @@ $(THREADTEST_ELF): FORCE
 $(SOCKTEST_ELF): FORCE
 	cd $(SOCKTEST_DIR) && cargo build --release
 
+$(FSTEST_ELF): FORCE
+	cd $(FSTEST_DIR) && cargo build --release
+
 $(LOGIN_ELF): FORCE
 	cd $(LOGIN_DIR) && cargo build --release
 
@@ -250,7 +255,7 @@ BOOT_SERVICES := nameserver:NAMESRVR keyboard:KEYBOARD console:CONSOLE \
                  input:INPUT disk:DISK vfs:VFS net:NET
 USR_PROGRAMS  := disktest:DISKTEST shell:SHELL echo:ECHO ls:LS cat:CAT \
                  login:LOGIN ps:PS ipcping:IPCPING ping:PING \
-                 shutdown:SHUTDOWN capdemo:CAPDEMO threadtest:THREADTEST socktest:SOCKTEST
+                 shutdown:SHUTDOWN capdemo:CAPDEMO threadtest:THREADTEST socktest:SOCKTEST fstest:FSTEST
 
 install: all
 	@mkdir -p $(DESTDIR)/drivers $(DESTDIR)/boot $(DESTDIR)/usr/bin $(DESTDIR)/etc

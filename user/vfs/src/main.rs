@@ -6,6 +6,7 @@
 pub mod ext2;
 pub mod ext2_alloc;
 pub mod ext2_dir;
+pub mod ext4;
 
 use quark_rt::ipc::{Message, TID_ANY};
 use quark_rt::nameserver;
@@ -49,6 +50,9 @@ pub const ERR_INVALID_PATH: u64 = 5;
 pub const ERR_NOT_DIR: u64 = 6;
 pub const ERR_IS_DIR: u64 = 7;
 pub const ERR_PERMISSION: u64 = 8;
+/// The filesystem was mounted read-only, because it uses something a writer
+/// would have to maintain and this does not.
+pub const ERR_READ_ONLY: u64 = 9;
 
 // ---------------------------------------------------------------------------
 // Filesystem type detection
@@ -61,14 +65,19 @@ enum FsType {
 }
 
 static mut FS_TYPE: FsType = FsType::Fat32;
-static mut EXT2_STATE: Option<ext2::Ext2State> = None;
+/// The mounted filesystem's state.
+///
+/// A flat static rather than an `Option`, and never assigned as a whole: it
+/// holds the entire block group descriptor table, so moving one through a
+/// local overflows this server's stack. `FS_TYPE` says whether it is mounted.
+static mut EXT2_STATE: ext2::Ext2State = ext2::Ext2State::empty();
 
 fn ext2_state() -> &'static ext2::Ext2State {
-    unsafe { EXT2_STATE.as_ref().unwrap() }
+    unsafe { &*core::ptr::addr_of!(EXT2_STATE) }
 }
 
 fn ext2_state_mut() -> &'static mut ext2::Ext2State {
-    unsafe { EXT2_STATE.as_mut().unwrap() }
+    unsafe { &mut *core::ptr::addr_of_mut!(EXT2_STATE) }
 }
 
 // Virtual addresses for temp mappings
@@ -1374,21 +1383,20 @@ pub extern "C" fn _start() -> ! {
         let sb_data = unsafe { core::slice::from_raw_parts(DISK_IO_BUF as *const u8, 512) };
         let magic = read_u16(sb_data, 56);
         if magic == ext2::EXT2_MAGIC {
-            println!("[vfs] ext2 detected.");
-            match ext2::init_ext2(disk_tid, buf_phys, part_lba) {
-                Ok(state) => {
+            match ext2::init_ext2(ext2_state_mut(), disk_tid, buf_phys, part_lba) {
+                Ok(()) => {
+                    let state = ext2_state();
                     println!(
-                        "[vfs] ext2: blocks={} inodes={} block_size={} groups={}",
+                        "[vfs] {} detected: blocks={} inodes={} block_size={} groups={}{}",
+                        if state.is_ext4() { "ext4" } else { "ext2" },
                         state.total_blocks, state.total_inodes,
-                        state.block_size, state.num_block_groups
+                        state.block_size, state.num_block_groups,
+                        if state.read_only { " (read-only)" } else { "" }
                     );
-                    unsafe {
-                        FS_TYPE = FsType::Ext2;
-                        EXT2_STATE = Some(state);
-                    }
+                    unsafe { FS_TYPE = FsType::Ext2 };
                 }
                 Err(()) => {
-                    println!("[vfs] ext2 init failed, falling back to FAT32.");
+                    println!("[vfs] mount failed, falling back to FAT32.");
                 }
             }
         }
@@ -1944,6 +1952,10 @@ fn handle_read_ext2(sender: usize, msg: &Message) {
 }
 
 fn handle_write_ext2(sender: usize, msg: &Message) {
+    if ext2_state().read_only {
+        error_reply(sender, ERR_READ_ONLY);
+        return;
+    }
     let handle = msg.data[0] as usize;
     let phys_addr = msg.data[1] as usize;
     let offset = msg.data[2] as u32;
@@ -2104,6 +2116,10 @@ fn handle_readdir_bulk_ext2(sender: usize, msg: &Message) {
 }
 
 fn handle_create_ext2(sender: usize, msg: &Message) {
+    if ext2_state().read_only {
+        error_reply(sender, ERR_READ_ONLY);
+        return;
+    }
     let flags = msg.data[5];
     let is_dir = flags & 1 != 0;
 
@@ -2178,13 +2194,28 @@ fn handle_create_ext2(sender: usize, msg: &Message) {
     new_inode.i_gid = gid as u16;
     new_inode.i_links_count = if is_dir { 2 } else { 1 };
 
+    // On a volume with INCOMPAT_EXTENTS the pointer array is not an
+    // alternative: a reader takes i_block as an extent header whatever we put
+    // there, so a file created without one is unreadable rather than merely
+    // old-fashioned.
+    if e2.is_ext4() {
+        ext4::init_extent_root(&mut new_inode);
+    }
+
     if is_dir {
         // Allocate a block for the directory and write . and .. entries
         let block = match ext2_alloc::alloc_block(e2) {
             Ok(b) => b,
             Err(code) => { error_reply(sender, code); return; }
         };
-        new_inode.i_block[0] = block;
+        if e2.is_ext4() {
+            if ext4::extent_insert(&mut new_inode, 0, block).is_err() {
+                error_reply(sender, ERR_IO);
+                return;
+            }
+        } else {
+            new_inode.i_block[0] = block;
+        }
         new_inode.i_size = e2.block_size;
         new_inode.i_blocks = e2.block_size / 512;
 
