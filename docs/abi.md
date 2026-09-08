@@ -315,6 +315,15 @@ band is waiting, and takes turns within its own; a task woken into a better band
 than the running one preempts it at the next tick rather than waiting out its
 slice.
 
+A task also runs in the better of its own band and the band of anything blocked
+waiting on it, for as long as that is true. Bands otherwise introduce the
+problem they are famous for: a server in an ordinary band, called by something
+in a better one, is preempted by any middling task that comes along, and the
+caller — which outranks that task — waits behind it. The work is being done on
+the caller's behalf, so it is done at the caller's urgency, and the loan is
+returned when the caller stops waiting, whether that is a reply, a timeout, or
+the caller dying.
+
 It follows the same narrowing rule as capabilities — a caller cannot grant a
 better band than it is in itself — so a shell running as an ordinary program
 cannot promote what it starts. Programs ask for a band in their manifest, and

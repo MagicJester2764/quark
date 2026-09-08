@@ -83,6 +83,7 @@ pub fn init() {
             kernel_stack_base: core::ptr::null_mut(), // uses boot stack
             kernel_stack_size: 0,
             priority: PRIO_IDLE,
+            base_priority: PRIO_IDLE,
             cr3: crate::paging::read_cr3(),
             caps: crate::task::CAP_ALL,
             // Mirror the bitmask into real capabilities: with the UID 0 bypass
@@ -367,10 +368,59 @@ pub fn set_priority(tid: usize, band: u8) -> Result<(), ()> {
     unsafe {
         match TASKS[tid] {
             Some(ref mut task) => {
-                task.priority = band;
+                task.base_priority = band;
                 Ok(())
             }
             None => Err(()),
+        }
+    }
+    .map(|()| refresh_priority(tid))
+}
+
+/// Work out what band `tid` should actually run in, and follow the chain if it
+/// changes.
+///
+/// A task runs in the better of its own band and the band of anything blocked
+/// waiting on it. Without that, bands introduce the problem they are famous
+/// for: a server in an ordinary band, called by something in a better one, is
+/// preempted by any middling task that comes along — and the caller, which
+/// outranks that task, waits behind it. The work is being done on the caller's
+/// behalf, so it should be done at the caller's urgency.
+///
+/// Called whenever the set of tasks waiting on `tid` changes.
+pub fn refresh_priority(tid: usize) {
+    let mut cur = tid;
+    // Chains of one server calling another are short. The bound is so that a
+    // cycle — which should not exist, and would mean a deadlock if it did —
+    // cannot turn into a hang here.
+    for _ in 0..8 {
+        if cur >= MAX_TASKS {
+            return;
+        }
+        unsafe {
+            let base = match TASKS[cur] {
+                Some(ref t) => t.base_priority,
+                None => return,
+            };
+            let mut best = base;
+            for t in 0..MAX_TASKS {
+                if crate::ipc::blocked_on(t) == Some(cur) {
+                    if let Some(ref waiter) = TASKS[t] {
+                        if waiter.priority < best {
+                            best = waiter.priority;
+                        }
+                    }
+                }
+            }
+            match TASKS[cur] {
+                Some(ref mut t) if t.priority != best => t.priority = best,
+                _ => return, // unchanged, so nothing downstream changes either
+            }
+        }
+        // Whatever `cur` is itself waiting on inherits this too.
+        match crate::ipc::blocked_on(cur) {
+            Some(next) => cur = next,
+            None => return,
         }
     }
 }
@@ -894,6 +944,7 @@ pub fn create_empty_task() -> Option<usize> {
             kernel_stack_base: stack_base,
             kernel_stack_size: KERNEL_STACK_SIZE,
             priority: crate::scheduler::PRIO_NORMAL,
+            base_priority: crate::scheduler::PRIO_NORMAL,
             cr3: 0,
             caps: 0,
             cspace: crate::cap::empty_cspace(),

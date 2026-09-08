@@ -149,6 +149,24 @@ fn irq_restore(flags: u64) {
 
 /// Asynchronous notification: OR `badge` into dest's notification word.
 /// Non-blocking. Wakes the dest task if it is RecvBlocked(0) or RecvBlocked(TID_ANY).
+/// Who is `tid` waiting on, if anyone.
+///
+/// The scheduler asks this to work out who is doing work on whose behalf: a
+/// task blocked on another is not competing with it, it is waiting for it.
+pub fn blocked_on(tid: usize) -> Option<usize> {
+    if tid >= MAX_TASKS {
+        return None;
+    }
+    unsafe {
+        match TASK_IPC[tid].state {
+            IpcState::SendBlocked(d) | IpcState::CallSendBlocked(d) | IpcState::CallBlocked(d) => {
+                Some(d)
+            }
+            _ => None,
+        }
+    }
+}
+
 /// Ask to be told when `target` dies.
 ///
 /// No capability is required, and deliberately: `SYS_TASK_INFO` already tells
@@ -618,6 +636,12 @@ fn call_inner(dest: usize, msg: &Message, timeout_ticks: u64) -> Result<Message,
             }
         };
 
+        // The caller is now waiting on `dest`, so `dest` is working on its
+        // behalf and runs at its urgency until it answers. Done before
+        // anything decides who runs next, so the decision sees the raised
+        // band rather than the one it will have a moment later.
+        scheduler::refresh_priority(dest);
+
         TASK_TIMED_OUT[caller] = false;
         TASK_TIMEOUT[caller] = if timeout_ticks == 0 {
             0
@@ -674,6 +698,9 @@ pub fn sys_reply(dest: usize, msg: &Message) -> Result<(), IpcError> {
                 // runs as soon as this server blocks again, rather than after
                 // everything else that became ready in the meantime.
                 scheduler::unblock_task_next(dest);
+                // It is no longer waiting on us, so whatever urgency it lent
+                // goes back with it.
+                scheduler::refresh_priority(replier);
                 Ok(())
             }
             _ => {
@@ -885,13 +912,16 @@ pub fn check_timeouts() {
                         TASK_IPC[tid].state = IpcState::None;
                         scheduler::unblock_task(tid);
                     }
-                    IpcState::CallSendBlocked(_) | IpcState::CallBlocked(_) => {
+                    IpcState::CallSendBlocked(dest) | IpcState::CallBlocked(dest) => {
                         // Drop the undelivered message so no receiver can pick
                         // it up after we have stopped waiting for the reply.
                         TASK_IPC[tid].pending_msg = None;
                         TASK_IPC[tid].state = IpcState::None;
                         TASK_TIMED_OUT[tid] = true;
                         scheduler::unblock_task(tid);
+                        // Giving up on the reply takes back the urgency lent
+                        // to whoever was going to send it.
+                        scheduler::refresh_priority(dest);
                     }
                     _ => {}
                 }
@@ -906,6 +936,9 @@ pub fn cleanup_task_ipc(dead_tid: usize) {
     if dead_tid >= MAX_TASKS {
         return;
     }
+
+    // Whatever it was waiting on is no longer working on its behalf.
+    let waiting_on = blocked_on(dead_tid);
 
     let flags = irq_save();
     unsafe {
@@ -962,4 +995,7 @@ pub fn cleanup_task_ipc(dead_tid: usize) {
         }
     }
     irq_restore(flags);
+    if let Some(target) = waiting_on {
+        scheduler::refresh_priority(target);
+    }
 }

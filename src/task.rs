@@ -69,7 +69,11 @@ pub struct Task {
     pub context: CpuContext,
     pub kernel_stack_base: *mut u8,
     pub kernel_stack_size: usize,
+    /// The band the scheduler actually uses. Normally `base_priority`, but
+    /// raised while a task in a better band is blocked waiting on this one.
     pub priority: u8,
+    /// The band this task was given, and the one it returns to.
+    pub base_priority: u8,
     pub cr3: usize,
     pub caps: u32,
     /// Object capability space (16 slots).
@@ -148,6 +152,7 @@ impl Task {
             kernel_stack_base: stack_base,
             kernel_stack_size: KERNEL_STACK_SIZE,
             priority: crate::scheduler::PRIO_NORMAL,
+            base_priority: crate::scheduler::PRIO_NORMAL,
             cr3: crate::paging::read_cr3(),
             caps: 0,
             cspace: cap::empty_cspace(),
