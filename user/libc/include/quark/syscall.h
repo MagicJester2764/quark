@@ -32,6 +32,13 @@
 #define SYS_FD_READ         64
 #define SYS_FD_WRITE        65
 
+/* 0x60  task */
+#define SYS_SET_FS_BASE     102
+
+/* 0x80  futex */
+#define SYS_FUTEX_WAIT      128
+#define SYS_FUTEX_WAKE      129
+
 /* 0x90  time */
 #define SYS_TICKS           144
 
