@@ -26,7 +26,11 @@ pub const ARGS_PAGE_ADDR: usize = 0x80_8000_0000;
 
 /// Top of the user stack, in the child. Stacks grow down from here.
 pub const STACK_TOP: usize = 0x7FFF_FFFF_F000;
-pub const STACK_PAGES: usize = 4;
+/// 1 MiB, matching the kernel's own `USER_STACK_PAGES`. A spawner maps this
+/// eagerly, so it is memory spent per task rather than reserved address
+/// space — see the note there for why it is this size and not eight
+/// megabytes.
+pub const STACK_PAGES: usize = 256;
 
 /// Scratch virtual addresses in the caller's own address space, used to stage
 /// pages before they are mapped into the child.

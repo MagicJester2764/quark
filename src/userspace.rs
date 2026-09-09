@@ -10,7 +10,13 @@ const PAGE_SIZE: usize = 4096;
 /// User-space address constants.
 /// User code/data lives in the lower half (below 0x0000_8000_0000_0000).
 pub const USER_STACK_TOP: u64 = 0x0000_7FFF_FFFF_F000;
-pub const USER_STACK_PAGES: usize = 4; // 16 KiB user stack
+/// 1 MiB. Sixteen kilobytes was enough for the programs in this tree and
+/// nothing else: GNU `wc` puts a quarter of a megabyte on its stack in one
+/// frame and faulted on the first write to it. There is no demand paging, so
+/// this is mapped up front and every task pays for it — which is the reason
+/// not to make it Linux's eight megabytes, and no reason at all to keep it at
+/// a size real software cannot run in.
+pub const USER_STACK_PAGES: usize = 256;
 /// Highest address a user segment may occupy (exclusive).
 pub const USER_ADDR_LIMIT: u64 = paging::USER_ADDR_LIMIT;
 
