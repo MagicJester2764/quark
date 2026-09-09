@@ -9,7 +9,10 @@ AR      ?= ar
 CFLAGS  := -ffreestanding -nostdlib -fno-builtin -fno-stack-protector \
            -fno-pic -no-pie -mcmodel=large -mno-red-zone \
            -std=c11 -O2 -Wall -Wextra -I../libc/include
-OBJS    := src/syscall.o src/start.o
+# The VFS client is shared with Quark's own C library rather than written
+# twice: it is the same wire protocol either way, and two copies of a wire
+# protocol drift.
+OBJS    := src/syscall.o src/start.o src/files.o ../libc/src/quark.o
 
 all: liblinux-abi.a
 

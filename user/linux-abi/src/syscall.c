@@ -21,6 +21,8 @@
 #include <quark/layout.h>
 #include <quark/syscall.h>
 
+#include "abi.h"
+
 typedef long ssize_t;
 typedef unsigned long size_t;
 
@@ -32,7 +34,9 @@ typedef unsigned long size_t;
 #define LX_write             1
 #define LX_open              2
 #define LX_close             3
+#define LX_stat              4
 #define LX_fstat             5
+#define LX_lstat             6
 #define LX_lseek             8
 #define LX_mmap              9
 #define LX_mprotect         10
@@ -45,6 +49,7 @@ typedef unsigned long size_t;
 #define LX_writev           20
 #define LX_madvise          28
 #define LX_getpid           39
+#define LX_fcntl            72
 #define LX_exit             60
 #define LX_uname            63
 #define LX_getcwd           79
@@ -61,19 +66,9 @@ typedef unsigned long size_t;
 #define LX_set_robust_list 273
 #define LX_prlimit64       302
 #define LX_getrandom       318
+#define LX_newfstatat      262
 #define LX_statx           332
 #define LX_rseq            334
-
-/* Errors, in the values Linux uses — they are what musl compares against. */
-#define LX_EPERM     1
-#define LX_ENOENT    2
-#define LX_EBADF     9
-#define LX_ENOMEM   12
-#define LX_EFAULT   14
-#define LX_EINVAL   22
-#define LX_ENOSYS   38
-#define LX_ENOTTY   25
-#define LX_ESPIPE   29
 
 #define ARCH_SET_FS 0x1002
 #define ARCH_GET_FS 0x1003
@@ -144,15 +139,10 @@ struct iovec {
     size_t iov_len;
 };
 
-static long do_write(long fd, const void *buf, unsigned long n) {
-    unsigned long r = __syscall3(SYS_FD_WRITE, (unsigned long)fd, (unsigned long)buf, n);
-    return r == QUARK_ERR ? -LX_EBADF : (long)r;
-}
-
-static long do_read(long fd, void *buf, unsigned long n) {
-    unsigned long r = __syscall3(SYS_FD_READ, (unsigned long)fd, (unsigned long)buf, n);
-    return r == QUARK_ERR ? -LX_EBADF : (long)r;
-}
+/* Descriptors 0, 1 and 2 go to the kernel and anything above them to the VFS;
+   `files.c` decides which, so that `write` and `writev` agree about it. */
+#define do_write __quark_write
+#define do_read  __quark_read
 
 /* Linux's struct timespec, which is what clock_gettime fills in. */
 struct lx_timespec {
@@ -326,15 +316,38 @@ long __quark_syscall(long n, long a1, long a2, long a3, long a4, long a5, long a
     case LX_getcwd:
         return -LX_ENOSYS;
 
-    /* Files are the VFS's, and reaching it needs the IPC client that the C
-       library already has. Not yet wired through here, which is why this says
-       so plainly instead of returning a descriptor that does not work. */
+    /* Files. The VFS answers all of these; `files.c` is where a handle and an
+       offset become a descriptor. */
     case LX_open:
+        return __quark_open((const char *)a1, a2);
     case LX_openat:
+        return __quark_openat(a1, (const char *)a2, a3);
     case LX_close:
-    case LX_fstat:
-    case LX_statx:
+        return __quark_close(a1);
     case LX_lseek:
+        return __quark_lseek(a1, a2, a3);
+    case LX_fstat:
+        return __quark_fstat(a1, (void *)a2);
+    case LX_stat:
+    case LX_lstat:
+        /* No symbolic links on either filesystem here, so following one and
+           not following it are the same question. */
+        return __quark_stat((const char *)a1, (void *)a2);
+    case LX_newfstatat:
+        if (!a2 || !*(const char *)a2) {
+            return __quark_fstat(a1, (void *)a3);
+        }
+        return __quark_stat((const char *)a2, (void *)a3);
+
+    /* musl probes this when fstat says EBADF, to tell a closed descriptor
+       from one the kernel will not stat. Answering keeps it on the path that
+       works rather than sending it to /proc, which does not exist. */
+    case LX_fcntl:
+        return 0;
+
+    /* statx carries more than the VFS knows, and musl falls back to the plain
+       stat calls when it is refused. */
+    case LX_statx:
         return -LX_ENOSYS;
 
     default:

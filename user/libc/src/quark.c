@@ -7,8 +7,33 @@
  * that translation lives.
  */
 
-#include <string.h>
 #include <quark/syscall.h>
+#include <quark/vfs.h>
+
+/* No <string.h>: this file is compiled into the Linux translation layer as
+   well, which sits *underneath* a C library and so cannot use one. */
+static void zero(void *p, unsigned long n) {
+    unsigned char *b = p;
+    while (n--) {
+        *b++ = 0;
+    }
+}
+
+static void copy(void *dst, const void *src, unsigned long n) {
+    unsigned char *d = dst;
+    const unsigned char *s = src;
+    while (n--) {
+        *d++ = *s++;
+    }
+}
+
+static unsigned long length(const char *s) {
+    unsigned long n = 0;
+    while (s[n]) {
+        n++;
+    }
+    return n;
+}
 
 /* The nameserver, started first by init so this number is stable. Everything
    else is found by asking it. */
@@ -26,15 +51,15 @@ size_t quark_lookup(const char *name) {
     struct quark_msg reply;
     unsigned char packed[24];
 
-    memset(&msg, 0, sizeof msg);
-    memset(packed, 0, sizeof packed);
+    zero(&msg, sizeof msg);
+    zero(packed, sizeof packed);
 
-    size_t len = strlen(name);
+    size_t len = length(name);
     if (len > sizeof packed) {
         len = sizeof packed;
     }
-    memcpy(packed, name, len);
-    memcpy(msg.data, packed, sizeof packed);
+    copy(packed, name, len);
+    copy(msg.data, packed, sizeof packed);
     msg.tag = TAG_NS_LOOKUP;
 
     if (quark_call(NAMESERVER_TID, &msg, &reply) != 0) {
@@ -59,4 +84,131 @@ size_t quark_vfs(void) {
         looked = 1;
     }
     return tid;
+}
+
+/* ------------------------------------------------------------------------ */
+/* The VFS, as a client.                                                     */
+/* ------------------------------------------------------------------------ */
+
+/* Ask the VFS one question and get its answer, translating "the call did not
+   happen" and "the server said no" into the same small integers. */
+static int vfs_call(struct quark_msg *msg, struct quark_msg *reply) {
+    size_t vfs = quark_vfs();
+    if (vfs == 0) {
+        return QUARK_VFS_UNREACHABLE;
+    }
+    if (quark_call(vfs, msg, reply) != 0) {
+        return QUARK_VFS_UNREACHABLE;
+    }
+    if (reply->tag == QUARK_ERR) {
+        /* The server puts its code in the first word. A zero there would be
+           "no error", which it would not have sent, so treat it as I/O. */
+        unsigned long code = reply->data[0];
+        return code ? (int)code : QUARK_VFS_IO;
+    }
+    return 0;
+}
+
+int quark_vfs_open(const char *path, int create, struct quark_vfs_file *out) {
+    struct quark_msg msg;
+    struct quark_msg reply;
+
+    unsigned long len = length(path);
+    if (len == 0 || len > QUARK_VFS_MAX_PATH) {
+        return QUARK_VFS_INVALID_PATH;
+    }
+
+    zero(&msg, sizeof msg);
+    msg.tag = create ? QUARK_VFS_TAG_CREATE : QUARK_VFS_TAG_OPEN;
+    copy(msg.data, path, len);
+    if (create) {
+        /* A file rather than a directory. The path can never reach this word:
+           one longer than the protocol carries is refused above. */
+        msg.data[5] = 0;
+    }
+
+    int err = vfs_call(&msg, &reply);
+    if (err) {
+        return err;
+    }
+    if (out) {
+        out->handle = reply.data[0];
+        out->size = reply.data[1];
+        out->is_dir = reply.data[2] != 0;
+    }
+    return 0;
+}
+
+int quark_vfs_stat(unsigned long handle, struct quark_vfs_file *out) {
+    struct quark_msg msg;
+    struct quark_msg reply;
+
+    zero(&msg, sizeof msg);
+    msg.tag = QUARK_VFS_TAG_STAT;
+    msg.data[0] = handle;
+
+    int err = vfs_call(&msg, &reply);
+    if (err) {
+        return err;
+    }
+    if (out) {
+        out->handle = handle;
+        out->size = reply.data[0];
+        out->is_dir = reply.data[1] != 0;
+    }
+    return 0;
+}
+
+int quark_vfs_read(unsigned long handle, unsigned long phys, unsigned long offset,
+                   unsigned long len, unsigned long *got) {
+    struct quark_msg msg;
+    struct quark_msg reply;
+
+    zero(&msg, sizeof msg);
+    msg.tag = QUARK_VFS_TAG_READ;
+    msg.data[0] = handle;
+    msg.data[1] = phys;
+    msg.data[2] = offset;
+    msg.data[3] = len;
+
+    int err = vfs_call(&msg, &reply);
+    if (err) {
+        return err;
+    }
+    if (got) {
+        *got = reply.data[0];
+    }
+    return 0;
+}
+
+int quark_vfs_write(unsigned long handle, unsigned long phys, unsigned long offset,
+                    unsigned long len, unsigned long *put) {
+    struct quark_msg msg;
+    struct quark_msg reply;
+
+    zero(&msg, sizeof msg);
+    msg.tag = QUARK_VFS_TAG_WRITE;
+    msg.data[0] = handle;
+    msg.data[1] = phys;
+    msg.data[2] = offset;
+    msg.data[3] = len;
+
+    int err = vfs_call(&msg, &reply);
+    if (err) {
+        return err;
+    }
+    if (put) {
+        *put = reply.data[0];
+    }
+    return 0;
+}
+
+int quark_vfs_close(unsigned long handle) {
+    struct quark_msg msg;
+    struct quark_msg reply;
+
+    zero(&msg, sizeof msg);
+    msg.tag = QUARK_VFS_TAG_CLOSE;
+    msg.data[0] = handle;
+    return vfs_call(&msg, &reply);
 }

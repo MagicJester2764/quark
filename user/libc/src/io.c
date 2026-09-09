@@ -19,34 +19,12 @@
 #include <unistd.h>
 #include <quark/layout.h>
 #include <quark/syscall.h>
-
-#define TAG_OPEN   1
-#define TAG_READ   2
-#define TAG_CLOSE  3
-#define TAG_WRITE  6
-#define TAG_CREATE 7
-#define TAG_ERROR  ((unsigned long)-1)
-
-/* Errors the VFS reports, which are its own small integers rather than
-   anybody's errno. */
-#define VFS_NOT_FOUND      1
-#define VFS_INVALID_HANDLE 2
-#define VFS_IO             3
-#define VFS_TOO_MANY_OPEN  4
-#define VFS_INVALID_PATH   5
-#define VFS_NOT_DIR        6
-#define VFS_IS_DIR         7
-#define VFS_PERMISSION     8
-#define VFS_READ_ONLY      9
+#include <quark/vfs.h>
 
 #define PAGE_SIZE 4096
 /* The shared transfer page: above everything the loader places, and clear of
    the stack and the heap. */
 #define XFER_VADDR QUARK_XFER_PAGE
-
-/* Longest path the VFS protocol carries: it travels in the six data words of
-   one message, with room for a terminator. */
-#define MAX_PATH 47
 
 #define FIRST_FD 3
 #define MAX_FILES 16
@@ -83,18 +61,19 @@ static int xfer_page(void) {
     return 0;
 }
 
-static int vfs_errno(unsigned long code) {
+/* The server's codes are its own; this is where they become ours. */
+static int vfs_errno(int code) {
     switch (code) {
-    case VFS_NOT_FOUND:      return ENOENT;
-    case VFS_INVALID_HANDLE: return EBADF;
-    case VFS_IO:             return EIO;
-    case VFS_TOO_MANY_OPEN:  return EMFILE;
-    case VFS_INVALID_PATH:   return EINVAL;
-    case VFS_NOT_DIR:        return ENOTDIR;
-    case VFS_IS_DIR:         return EISDIR;
-    case VFS_PERMISSION:     return EACCES;
-    case VFS_READ_ONLY:      return EROFS;
-    default:                 return EIO;
+    case QUARK_VFS_NOT_FOUND:      return ENOENT;
+    case QUARK_VFS_INVALID_HANDLE: return EBADF;
+    case QUARK_VFS_IO:             return EIO;
+    case QUARK_VFS_TOO_MANY_OPEN:  return EMFILE;
+    case QUARK_VFS_INVALID_PATH:   return EINVAL;
+    case QUARK_VFS_NOT_DIR:        return ENOTDIR;
+    case QUARK_VFS_IS_DIR:         return EISDIR;
+    case QUARK_VFS_PERMISSION:     return EACCES;
+    case QUARK_VFS_READ_ONLY:      return EROFS;
+    default:                       return EIO;
     }
 }
 
@@ -106,26 +85,7 @@ static struct openfile *slot(int fd) {
     return f->used ? f : 0;
 }
 
-/* Pack a path into a message's data words, as the VFS expects it. */
-static int path_msg(struct quark_msg *msg, unsigned long tag, const char *path) {
-    size_t len = strlen(path);
-    if (len > MAX_PATH) {
-        errno = EINVAL;
-        return -1;
-    }
-    memset(msg, 0, sizeof *msg);
-    msg->tag = tag;
-    memcpy(msg->data, path, len);
-    return 0;
-}
-
 int open(const char *path, int flags, ...) {
-    size_t vfs = quark_vfs();
-    if (vfs == 0) {
-        errno = EIO;
-        return -1;
-    }
-
     int fd = -1;
     for (int i = 0; i < MAX_FILES; i++) {
         if (!files[i].used) {
@@ -138,30 +98,17 @@ int open(const char *path, int flags, ...) {
         return -1;
     }
 
-    struct quark_msg msg, reply;
-    unsigned long tag = (flags & O_CREAT) ? TAG_CREATE : TAG_OPEN;
-    if (path_msg(&msg, tag, path) != 0) {
-        return -1;
-    }
-    /* TAG_CREATE reads its flags from the last data word, which the path
-       never reaches: a path that long is refused above. */
-    if (tag == TAG_CREATE) {
-        msg.data[5] = 0; /* a file, not a directory */
-    }
-
-    if (quark_call(vfs, &msg, &reply) != 0) {
-        errno = EIO;
-        return -1;
-    }
-    if (reply.tag == TAG_ERROR) {
-        errno = vfs_errno(reply.data[0]);
+    struct quark_vfs_file info;
+    int err = quark_vfs_open(path, (flags & O_CREAT) != 0, &info);
+    if (err) {
+        errno = vfs_errno(err);
         return -1;
     }
 
     struct openfile *f = &files[fd - FIRST_FD];
     f->used = 1;
-    f->handle = reply.data[0];
-    f->size = reply.data[1];
+    f->handle = info.handle;
+    f->size = info.size;
     f->offset = 0;
     return fd;
 }
@@ -172,11 +119,7 @@ int close(int fd) {
         errno = EBADF;
         return -1;
     }
-    struct quark_msg msg, reply;
-    memset(&msg, 0, sizeof msg);
-    msg.tag = TAG_CLOSE;
-    msg.data[0] = f->handle;
-    quark_call(quark_vfs(), &msg, &reply);
+    quark_vfs_close(f->handle);
     f->used = 0;
     return 0;
 }
@@ -209,23 +152,12 @@ ssize_t read(int fd, void *buf, size_t n) {
         if (want > PAGE_SIZE) {
             want = PAGE_SIZE;
         }
-        struct quark_msg msg, reply;
-        memset(&msg, 0, sizeof msg);
-        msg.tag = TAG_READ;
-        msg.data[0] = f->handle;
-        msg.data[1] = xfer_phys;
-        msg.data[2] = f->offset;
-        msg.data[3] = want;
-
-        if (quark_call(quark_vfs(), &msg, &reply) != 0) {
-            errno = EIO;
+        unsigned long got = 0;
+        int err = quark_vfs_read(f->handle, xfer_phys, f->offset, want, &got);
+        if (err) {
+            errno = vfs_errno(err);
             return done ? (ssize_t)done : -1;
         }
-        if (reply.tag == TAG_ERROR) {
-            errno = vfs_errno(reply.data[0]);
-            return done ? (ssize_t)done : -1;
-        }
-        unsigned long got = reply.data[0];
         if (got == 0) {
             break; /* end of file */
         }
@@ -269,23 +201,12 @@ ssize_t write(int fd, const void *buf, size_t n) {
         }
         memcpy((void *)XFER_VADDR, in + done, want);
 
-        struct quark_msg msg, reply;
-        memset(&msg, 0, sizeof msg);
-        msg.tag = TAG_WRITE;
-        msg.data[0] = f->handle;
-        msg.data[1] = xfer_phys;
-        msg.data[2] = f->offset;
-        msg.data[3] = want;
-
-        if (quark_call(quark_vfs(), &msg, &reply) != 0) {
-            errno = EIO;
+        unsigned long put = 0;
+        int err = quark_vfs_write(f->handle, xfer_phys, f->offset, want, &put);
+        if (err) {
+            errno = vfs_errno(err);
             return done ? (ssize_t)done : -1;
         }
-        if (reply.tag == TAG_ERROR) {
-            errno = vfs_errno(reply.data[0]);
-            return done ? (ssize_t)done : -1;
-        }
-        unsigned long put = reply.data[0];
         done += put;
         f->offset += put;
         if (put < want) {
