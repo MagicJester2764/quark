@@ -105,6 +105,11 @@ SHUTDOWN_ELF := $(SHUTDOWN_DIR)/target/$(TARGET)/release/shutdown
 
 .PHONY: check-abi install all clean iso run run-uefi drivers user rootfs FORCE
 
+# `all` is not the first target in this file, so say which one is: plain `make`
+# otherwise builds nothing but the ABI check, which passes and looks like a
+# successful build of a tree that was never compiled.
+.DEFAULT_GOAL := all
+
 check-abi:
 	@./tools/check-abi.sh
 
