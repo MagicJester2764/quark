@@ -135,6 +135,8 @@ int quark_vfs_open(const char *path, int create, struct quark_vfs_file *out) {
         out->handle = reply.data[0];
         out->size = reply.data[1];
         out->is_dir = reply.data[2] != 0;
+        out->mode = (unsigned int)reply.data[3];
+        out->access = (unsigned int)reply.data[4];
     }
     return 0;
 }
@@ -155,6 +157,8 @@ int quark_vfs_stat(unsigned long handle, struct quark_vfs_file *out) {
         out->handle = handle;
         out->size = reply.data[0];
         out->is_dir = reply.data[1] != 0;
+        out->mode = (unsigned int)reply.data[3];
+        out->access = (unsigned int)reply.data[4];
     }
     return 0;
 }

@@ -35,6 +35,7 @@ typedef unsigned long size_t;
 #define LX_open              2
 #define LX_close             3
 #define LX_stat              4
+#define LX_access           21
 #define LX_fstat             5
 #define LX_lstat             6
 #define LX_lseek             8
@@ -48,6 +49,7 @@ typedef unsigned long size_t;
 #define LX_readv            19
 #define LX_writev           20
 #define LX_madvise          28
+#define LX_fadvise64       221
 #define LX_getpid           39
 #define LX_fcntl            72
 #define LX_exit             60
@@ -58,17 +60,20 @@ typedef unsigned long size_t;
 #define LX_geteuid         107
 #define LX_getegid         108
 #define LX_arch_prctl      158
+#define LX_sched_getaffinity 204
 #define LX_futex           202
 #define LX_set_tid_address 218
 #define LX_clock_gettime   228
 #define LX_exit_group      231
 #define LX_openat          257
+#define LX_faccessat       269
 #define LX_set_robust_list 273
 #define LX_prlimit64       302
 #define LX_getrandom       318
 #define LX_newfstatat      262
 #define LX_statx           332
 #define LX_rseq            334
+#define LX_faccessat2      439
 
 #define ARCH_SET_FS 0x1002
 #define ARCH_GET_FS 0x1003
@@ -104,6 +109,32 @@ static long map_pages(unsigned long at, unsigned long pages) {
     return 0;
 }
 
+#ifdef QUARK_ABI_TRACE
+/* A porting aid, off unless asked for: an unimplemented call otherwise reaches
+   the program as a bare errno and is reported as whatever it was doing at the
+   time ("sort: cannot read"), with nothing saying which call was missing. */
+long __quark_write(long fd, const void *buf, unsigned long n);
+static void trace(const char *what, long n) {
+    char buf[64];
+    int i = 0;
+    buf[i++] = '[';
+    while (*what && i < 40) {
+        buf[i++] = *what++;
+    }
+    buf[i++] = ' ';
+    if (n < 0) { buf[i++] = '-'; n = -n; }
+    char d[24];
+    int j = 0;
+    do { d[j++] = (char)('0' + n % 10); n /= 10; } while (n && j < 20);
+    while (j) { buf[i++] = d[--j]; }
+    buf[i++] = ']';
+    buf[i++] = '\n';
+    __quark_write(2, buf, (unsigned long)i);
+}
+#else
+#define trace(what, n) ((void)0)
+#endif
+
 static long do_mmap(unsigned long len) {
     if (len == 0) {
         return -LX_EINVAL;
@@ -111,9 +142,11 @@ static long do_mmap(unsigned long len) {
     unsigned long pages = (len + PAGE_SIZE - 1) / PAGE_SIZE;
     unsigned long at = mmap_next;
     if (at + pages * PAGE_SIZE > MMAP_LIMIT) {
+        trace("mmap-arena-full", (long)pages);
         return -LX_ENOMEM;
     }
     if (map_pages(at, pages) != 0) {
+        trace("mmap-failed-pages", (long)pages);
         return -LX_ENOMEM;
     }
     mmap_next = at + pages * PAGE_SIZE;
@@ -226,9 +259,12 @@ long __quark_syscall(long n, long a1, long a2, long a3, long a4, long a5, long a
         return do_munmap((unsigned long)a1, (unsigned long)a2);
 
     /* Nothing here has page permissions to change after the fact, and the
-       mapping already allows what was asked for. */
+       mapping already allows what was asked for. Advice about how a file will
+       be read is the same kind of thing: nothing here acts on it, and having
+       done nothing is a complete implementation of it rather than a refusal. */
     case LX_mprotect:
     case LX_madvise:
+    case LX_fadvise64:
         return 0;
 
     /* There is no brk. Saying so is what makes musl use mmap instead, which
@@ -242,6 +278,22 @@ long __quark_syscall(long n, long a1, long a2, long a3, long a4, long a5, long a
             return 0;
         }
         return -LX_EINVAL;
+
+    /* Quark is uniprocessor, and deliberately: several kernel invariants
+       depend on it. One CPU, which is a fact rather than a placeholder, and
+       reporting it is what makes `nproc` right. */
+    case LX_sched_getaffinity: {
+        unsigned long size = (unsigned long)a2;
+        unsigned char *mask = (unsigned char *)a3;
+        if (!mask || size < sizeof(unsigned long)) {
+            return -LX_EINVAL;
+        }
+        for (unsigned long i = 0; i < size; i++) {
+            mask[i] = 0;
+        }
+        mask[0] = 1;
+        return (long)sizeof(unsigned long);
+    }
 
     case LX_set_tid_address:
         return (long)__syscall0(SYS_GETPID);
@@ -339,6 +391,20 @@ long __quark_syscall(long n, long a1, long a2, long a3, long a4, long a5, long a
         }
         return __quark_stat((const char *)a2, (void *)a3);
 
+    /* access(2). gnulib's euidaccess tries faccessat2 first, then faccessat,
+       and reports whatever the last one said — so refusing these is not a
+       missing convenience: `sort /etc/passwd` says "cannot read" about a file
+       it can read perfectly well. All three ask the same question, and only
+       the directory this system does not have separates them. */
+    case LX_access:
+        return __quark_access((const char *)a1, a2);
+    case LX_faccessat:
+    case LX_faccessat2:
+        if (a1 != LX_AT_FDCWD) {
+            return -LX_ENOSYS;
+        }
+        return __quark_access((const char *)a2, a3);
+
     /* musl probes this when fstat says EBADF, to tell a closed descriptor
        from one the kernel will not stat. Answering keeps it on the path that
        works rather than sending it to /proc, which does not exist. */
@@ -351,6 +417,7 @@ long __quark_syscall(long n, long a1, long a2, long a3, long a4, long a5, long a
         return -LX_ENOSYS;
 
     default:
+        trace("nosys", n);
         return -LX_ENOSYS;
     }
 }

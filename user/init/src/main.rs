@@ -394,9 +394,7 @@ fn grant_caps_from_manifest(image: &[u8], tid: usize) {
     // IPC destination.
     grant_endpoints(tid, syscall::SLOT_ENDPOINT);
 
-    if let Some(reqs) = quark_rt::manifest::find(image) {
-        quark_rt::manifest::grant(tid, reqs, MANIFEST_SCRATCH_SLOT);
-    }
+    quark_rt::manifest::grant_image(tid, image, MANIFEST_SCRATCH_SLOT);
 }
 
 /// Slot in init's own CSpace used to hold a capability while handing it over.

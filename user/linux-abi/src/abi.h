@@ -20,6 +20,10 @@
 #define LX_ENOTDIR  20
 #define LX_EISDIR   21
 
+/* There is no working directory anywhere in this system, so this is the only
+   value the *at calls accept for one. */
+#define LX_AT_FDCWD (-100)
+
 /* Files, implemented in files.c. Each returns a Linux-style result: a count
    or a value on success, and a negated errno on failure. */
 long __quark_open(const char *path, long flags);
@@ -30,5 +34,6 @@ long __quark_write(long fd, const void *buf, unsigned long n);
 long __quark_lseek(long fd, long offset, long whence);
 long __quark_fstat(long fd, void *statbuf);
 long __quark_stat(const char *path, void *statbuf);
+long __quark_access(const char *path, long mode);
 
 #endif

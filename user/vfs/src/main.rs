@@ -600,6 +600,29 @@ static mut FILE_TABLE: [OpenFile; MAX_OPEN_FILES] = {
     [EMPTY; MAX_OPEN_FILES]
 };
 
+/// What this caller may do with an inode, as the rwx bits `access(2)` asks
+/// about: 4 read, 2 write, 1 execute.
+///
+/// The client asks the server rather than working it out from a mode, because
+/// the answer depends on the file's owner and the caller's identity and the
+/// server is the only party that knows both. A client that recomputed it would
+/// be keeping a second copy of this system's permission policy.
+fn access_bits(inode: &ext2::Ext2Inode, uid: u32, gid: u32) -> u64 {
+    let mut bits = 0;
+    for probe in [4u16, 2, 1] {
+        if ext2::check_permission(inode, uid, gid, probe) {
+            bits |= probe as u64;
+        }
+    }
+    bits
+}
+
+/// FAT has no owners and no mode bits, and this server checks nothing on it.
+/// Saying "anyone may do anything" is a description of what will actually
+/// happen rather than a default standing in for information we lost.
+const FAT_MODE: u64 = 0o777;
+const FAT_ACCESS: u64 = 7;
+
 fn alloc_handle_fat32(
     tid: usize,
     cluster: u32,
@@ -1547,7 +1570,9 @@ pub extern "C" fn _start() -> ! {
 // ---------------------------------------------------------------------------
 
 /// TAG_OPEN: data[0..6] = path (up to 48 bytes, null-terminated)
-/// Reply: tag=TAG_OK, data[0]=handle  OR  tag=TAG_ERROR, data[0]=error_code
+/// Reply: tag=TAG_OK, data[0]=handle, data[1]=size, data[2]=is_dir,
+///         data[3]=mode bits, data[4]=what this caller may do (rwx)
+///   OR  tag=TAG_ERROR, data[0]=error_code
 fn handle_open(disk: &DiskState, sender: usize, msg: &Message) {
     if unsafe { FS_TYPE } == FsType::Ext2 {
         handle_open_ext2(sender, msg);
@@ -1574,7 +1599,14 @@ fn handle_open(disk: &DiskState, sender: usize, msg: &Message) {
                     let reply = Message {
                         sender: 0,
                         tag: TAG_OK,
-                        data: [handle as u64, size as u64, is_dir as u64, 0, 0, 0],
+                        data: [
+                            handle as u64,
+                            size as u64,
+                            is_dir as u64,
+                            FAT_MODE,
+                            FAT_ACCESS,
+                            0,
+                        ],
                     };
                     let _ = syscall::sys_reply(sender, &reply);
                 }
@@ -1687,15 +1719,23 @@ fn handle_readdir(disk: &DiskState, sender: usize, msg: &Message) {
 }
 
 /// TAG_STAT: data[0]=handle
-/// Reply: tag=TAG_OK, data[0]=size, data[1]=is_dir
+/// Reply: tag=TAG_OK, data[0]=size, data[1]=is_dir, data[2]=id,
+///         data[3]=mode bits, data[4]=what this caller may do (rwx)
 fn handle_stat(sender: usize, msg: &Message) {
     let handle = msg.data[0] as usize;
+    let (uid, gid) = get_sender_uid_gid(sender);
     match get_handle(handle, sender) {
         Some(file) => {
-            let id = match &file.fs {
-                FsFileData::Fat32 { first_cluster, .. } => *first_cluster as u64,
-                FsFileData::Ext2 { inode_num, .. } => *inode_num as u64,
-                FsFileData::None => 0,
+            let (id, mode, access) = match &file.fs {
+                FsFileData::Fat32 { first_cluster, .. } => {
+                    (*first_cluster as u64, FAT_MODE, FAT_ACCESS)
+                }
+                FsFileData::Ext2 { inode_num, inode, .. } => (
+                    *inode_num as u64,
+                    (inode.i_mode & 0o7777) as u64,
+                    access_bits(inode, uid, gid),
+                ),
+                FsFileData::None => (0, 0, 0),
             };
             let reply = Message {
                 sender: 0,
@@ -1704,7 +1744,9 @@ fn handle_stat(sender: usize, msg: &Message) {
                     file.file_size as u64,
                     file.is_dir as u64,
                     id,
-                    0, 0, 0,
+                    mode,
+                    access,
+                    0,
                 ],
             };
             let _ = syscall::sys_reply(sender, &reply);
@@ -1816,7 +1858,7 @@ fn handle_create(disk: &DiskState, sender: usize, msg: &Message) {
                     let reply = Message {
                         sender: 0,
                         tag: TAG_OK,
-                        data: [handle as u64, 0, is_dir as u64, 0, 0, 0],
+                        data: [handle as u64, 0, is_dir as u64, FAT_MODE, FAT_ACCESS, 0],
                     };
                     let _ = syscall::sys_reply(sender, &reply);
                 }
@@ -1974,7 +2016,9 @@ fn handle_open_ext2(sender: usize, msg: &Message) {
                             handle as u64,
                             inode.i_size as u64,
                             inode.is_dir() as u64,
-                            0, 0, 0,
+                            (inode.i_mode & 0o7777) as u64,
+                            access_bits(&inode, uid, gid),
+                            0,
                         ],
                     };
                     let _ = syscall::sys_reply(sender, &reply);
@@ -2348,7 +2392,14 @@ fn handle_create_ext2(sender: usize, msg: &Message) {
             let reply = Message {
                 sender: 0,
                 tag: TAG_OK,
-                data: [handle as u64, 0, is_dir as u64, 0, 0, 0],
+                data: [
+                    handle as u64,
+                    0,
+                    is_dir as u64,
+                    (new_inode.i_mode & 0o7777) as u64,
+                    access_bits(&new_inode, uid, gid),
+                    0,
+                ],
             };
             let _ = syscall::sys_reply(sender, &reply);
         }

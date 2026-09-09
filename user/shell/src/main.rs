@@ -77,9 +77,7 @@ fn grant_caps_from_manifest(image: &[u8], tid: usize) {
     // 64-bit destination set to re-mint it.
     let _ = syscall::sys_cap_grant(tid, syscall::SLOT_ENDPOINT, syscall::SLOT_ENDPOINT);
 
-    if let Some(reqs) = quark_rt::manifest::find(image) {
-        quark_rt::manifest::grant(tid, reqs, 12);
-    }
+    quark_rt::manifest::grant_image(tid, image, 12);
 }
 
 fn build_path(cmd: &[u8], path_buf: &mut [u8; 64]) -> usize {

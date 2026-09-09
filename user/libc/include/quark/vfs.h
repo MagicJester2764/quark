@@ -42,10 +42,21 @@
    did not go. Distinct from every code the server reports. */
 #define QUARK_VFS_UNREACHABLE 255
 
+/* `access` is what *this* caller may do with the file — the rwx bits
+   `access(2)` asks about, 4 read, 2 write, 1 execute — answered by the server
+   rather than worked out here. It depends on the file's owner and on who is
+   asking, and the server is the only party that knows both; a client deriving
+   it from `mode` would be keeping a second copy of the permission policy. */
+#define QUARK_VFS_R_OK 4
+#define QUARK_VFS_W_OK 2
+#define QUARK_VFS_X_OK 1
+
 struct quark_vfs_file {
     unsigned long handle;
     unsigned long size;
     int is_dir;
+    unsigned int mode;   /* permission bits, without the file type */
+    unsigned int access; /* QUARK_VFS_{R,W,X}_OK, for the caller */
 };
 
 /* Every one of these returns 0, or a positive error code from the list

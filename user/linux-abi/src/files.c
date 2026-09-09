@@ -33,6 +33,7 @@ struct openfile {
     unsigned long offset; /* the VFS has no seek, so the position is ours */
     unsigned long size;
     int is_dir;
+    unsigned int mode;    /* permission bits, as the server reports them */
 };
 
 static struct openfile files[MAX_FILES];
@@ -45,8 +46,6 @@ static int xfer_ready;
 #define LX_O_CREAT  0100
 #define LX_O_TRUNC  01000
 #define LX_O_APPEND 02000
-
-#define LX_AT_FDCWD (-100)
 
 #define LX_SEEK_SET 0
 #define LX_SEEK_CUR 1
@@ -143,6 +142,7 @@ long __quark_open(const char *path, long flags) {
     f->handle = info.handle;
     f->size = info.size;
     f->is_dir = info.is_dir;
+    f->mode = info.mode;
     /* Appending starts at the end; everything else starts at the beginning.
        There is no O_TRUNC here because the VFS has no truncate — a caller
        asking for one gets a file it can overwrite but not shorten, which is
@@ -154,6 +154,13 @@ long __quark_open(const char *path, long flags) {
 long __quark_close(long fd) {
     struct openfile *f = slot(fd);
     if (!f) {
+        /* 0, 1 and 2 belong to whoever spawned this task, and go when the
+           task does. A program closing them is finished with them, which is
+           the same outcome — and reporting EBADF instead makes every tool
+           that tidies up after itself print an error it cannot act on. */
+        if (fd >= 0 && fd < FIRST_FD) {
+            return 0;
+        }
         return -LX_EBADF;
     }
     quark_vfs_close(f->handle);
@@ -246,6 +253,12 @@ long __quark_file_write(long fd, const void *buf, unsigned long n) {
 long __quark_lseek(long fd, long offset, long whence) {
     struct openfile *f = slot(fd);
     if (!f) {
+        /* A standard descriptor is a pipe or a service, and seeking one is
+           the error Linux calls ESPIPE — which is what stdio checks for when
+           it decides whether a stream is seekable. */
+        if (fd >= 0 && fd < FIRST_FD) {
+            return -LX_ESPIPE;
+        }
         return -LX_EBADF;
     }
     long base;
@@ -284,15 +297,12 @@ struct lx_kstat {
 };
 
 static void fill_stat(struct lx_kstat *st, unsigned long size, int is_dir,
-                      unsigned long ino) {
+                      unsigned long ino, unsigned int mode) {
     bytes_zero(st, sizeof *st);
     st->st_dev = 1;
     st->st_ino = ino;
     st->st_nlink = 1;
-    /* Readable and writable by everyone: the VFS enforces permissions against
-       the caller's UID and does not report the mode bits, so reporting a
-       guess with the type bit right is the most that is true here. */
-    st->st_mode = (is_dir ? LX_S_IFDIR : LX_S_IFREG) | 0666;
+    st->st_mode = (is_dir ? LX_S_IFDIR : LX_S_IFREG) | (mode & 07777);
     st->st_size = (long)size;
     st->st_blksize = (long)PAGE_SIZE;
     st->st_blocks = (long)((size + 511) / 512);
@@ -316,7 +326,7 @@ long __quark_fstat(long fd, void *statbuf) {
         }
         return -LX_EBADF;
     }
-    fill_stat(statbuf, f->size, f->is_dir, f->handle);
+    fill_stat(statbuf, f->size, f->is_dir, f->handle, f->mode);
     return 0;
 }
 
@@ -326,9 +336,34 @@ long __quark_stat(const char *path, void *statbuf) {
     if (err) {
         return vfs_errno(err);
     }
-    fill_stat(statbuf, info.size, info.is_dir, info.handle);
+    fill_stat(statbuf, info.size, info.is_dir, info.handle, info.mode);
     quark_vfs_close(info.handle);
     return 0;
+}
+
+/* access(2), and the *at forms of it that gnulib reaches for first.
+ *
+ * The question is "may I", and the only way to ask it is to open the file:
+ * that runs the server's own permission check, and the reply says what this
+ * caller may do with what it found. Working it out from the mode bits here
+ * would need the file's owner as well, and would be this program's opinion
+ * about a policy the VFS enforces — which is the one that decides.
+ *
+ * The one thing to know is that Quark checks nothing on execute: init and the
+ * shell load a program by reading it. So a file the server calls executable is
+ * one a program is allowed to try, which is what a caller asks X_OK for. */
+long __quark_access(const char *path, long mode) {
+    struct quark_vfs_file info;
+    int err = quark_vfs_open(path, 0, &info);
+    if (err) {
+        return vfs_errno(err);
+    }
+    unsigned int have = info.access;
+    quark_vfs_close(info.handle);
+
+    /* F_OK is 0 — asking only whether it is there, which the open answered. */
+    unsigned int want = (unsigned int)mode & 7;
+    return (want & ~have) ? -LX_EACCES : 0;
 }
 
 /* Reads and writes on 0, 1 and 2 go to the kernel; anything else is a file. */

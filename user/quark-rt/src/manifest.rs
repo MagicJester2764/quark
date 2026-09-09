@@ -117,73 +117,121 @@ macro_rules! manifest {
     };
 }
 
-/// Find a manifest in a program image.
+/// Every manifest block in a program image, in the order they appear.
 ///
-/// Located by scanning for the magic rather than by section name, so it does
-/// not depend on section headers surviving, on a particular linker script, or
-/// on the manifest landing in a predictable segment.
+/// Blocks are found by scanning for the magic rather than by section name, so
+/// this does not depend on section headers surviving, on a particular linker
+/// script, or on the manifest landing in a predictable segment. An image with
+/// no manifest yields nothing, which is not an error: a program that needs no
+/// capabilities declares nothing.
 ///
-/// Returns the requests, or `None` if the image has no manifest — which is not
-/// an error: a program that needs no capabilities declares nothing.
-pub fn find(image: &[u8]) -> Option<&[CapReq]> {
-    const HDR: usize = 24; // magic + version + count
-    let magic = MANIFEST_MAGIC.to_le_bytes();
+/// An image is linked from several objects and any of them may declare what it
+/// needs. That is not a corner case: a C library asks for the page file data
+/// moves through, because the library is what knows a page is needed and the
+/// program only knows it called `fopen`. So an image's manifest is the sum of
+/// the blocks in it rather than whichever one the linker happened to put
+/// first — a program that declared nothing still gets what its library asked
+/// for, and one that declared something gets both.
+pub struct Blocks<'a> {
+    image: &'a [u8],
+    off: usize,
+}
 
-    let mut off = 0;
-    while off + HDR <= image.len() {
-        if image[off..off + 8] == magic {
-            let version = u64::from_le_bytes(image[off + 8..off + 16].try_into().ok()?);
-            let count = u64::from_le_bytes(image[off + 16..off + 24].try_into().ok()?) as usize;
+impl<'a> Iterator for Blocks<'a> {
+    type Item = &'a [CapReq];
+
+    fn next(&mut self) -> Option<&'a [CapReq]> {
+        const HDR: usize = 24; // magic + version + count
+        let magic = MANIFEST_MAGIC.to_le_bytes();
+
+        while self.off + HDR <= self.image.len() {
+            let off = self.off;
+            if self.image[off..off + 8] != magic {
+                // The manifest is a static, so it is at least 8-byte aligned.
+                self.off += 8;
+                continue;
+            }
+            let version =
+                u64::from_le_bytes(self.image[off + 8..off + 16].try_into().ok()?);
+            let count =
+                u64::from_le_bytes(self.image[off + 16..off + 24].try_into().ok()?) as usize;
             if version != MANIFEST_VERSION {
-                off += 8;
+                self.off += 8;
                 continue;
             }
             // A count that does not fit is a corrupt or mis-detected header,
             // not a reason to read past the end of the image.
-            let bytes = count.checked_mul(core::mem::size_of::<CapReq>())?;
-            if off + HDR + bytes > image.len() {
-                off += 8;
+            let bytes = match count.checked_mul(core::mem::size_of::<CapReq>()) {
+                Some(b) => b,
+                None => {
+                    self.off += 8;
+                    continue;
+                }
+            };
+            if off + HDR + bytes > self.image.len() {
+                self.off += 8;
                 continue;
             }
-            let ptr = unsafe { image.as_ptr().add(off + HDR) as *const CapReq };
+            self.off = off + HDR + bytes;
+            let ptr = unsafe { self.image.as_ptr().add(off + HDR) as *const CapReq };
             return Some(unsafe { core::slice::from_raw_parts(ptr, count) });
         }
-        // The manifest is a static, so it is at least 8-byte aligned.
-        off += 8;
+        None
     }
-    None
 }
 
-/// Mint each requested capability and grant it to `child`.
+pub fn blocks(image: &[u8]) -> Blocks<'_> {
+    Blocks { image, off: 0 }
+}
+
+/// Mint everything an image asks for, across every block in it, and grant it
+/// to `child`.
 ///
 /// `scratch_slot` is a slot in *our* CSpace used to hold each capability while
-/// it is handed over; it is emptied afterwards. Requests we cannot satisfy are
+/// it is handed over; it is emptied afterwards, and it also bounds how far into
+/// the child's CSpace a manifest can reach. Requests we cannot satisfy are
 /// skipped rather than failing the whole spawn — a spawner is allowed to hold
-/// less than a program asks for, and the program finds out when it tries to act.
+/// less than a program asks for, and the program finds out when it tries to
+/// act.
+///
+/// Slots are handed out in order as capabilities are actually minted, so a
+/// request that is only a scheduling band does not leave a hole and two blocks
+/// do not land on top of each other.
 ///
 /// Returns how many were granted.
-pub fn grant(child: usize, reqs: &[CapReq], scratch_slot: usize) -> usize {
-    let mut granted = 0;
-    for (i, req) in reqs.iter().enumerate() {
-        if req.cap_type == 0 {
-            continue;
-        }
-        if req.cap_type == PRIORITY_REQ {
-            // Nothing to mint: this asks to be scheduled differently, not to
-            // be allowed to do something. Refused rather than granted if the
-            // spawner is not in a good enough band itself.
-            if syscall::sys_task_priority(child, req.param0 as u8).is_ok() {
+pub fn grant_image(child: usize, image: &[u8], scratch_slot: usize) -> usize {
+    let mut slot = 0usize;
+    let mut granted = 0usize;
+    for reqs in blocks(image) {
+        for req in reqs {
+            if req.cap_type == 0 {
+                continue;
+            }
+            if req.cap_type == PRIORITY_REQ {
+                // Nothing to mint: this asks to be scheduled differently, not
+                // to be allowed to do something.
+                if syscall::sys_task_priority(child, req.param0 as u8).is_ok() {
+                    granted += 1;
+                }
+                continue;
+            }
+            // Slots at and above the scratch one are the spawner's own
+            // working space and the endpoint sets; a manifest cannot reach
+            // into them.
+            if slot >= scratch_slot {
+                break;
+            }
+            if syscall::sys_cap_mint(scratch_slot, req.cap_type, req.param0, req.param1).is_err()
+            {
+                slot += 1;
+                continue;
+            }
+            if syscall::sys_cap_grant(child, scratch_slot, slot).is_ok() {
                 granted += 1;
             }
-            continue;
+            let _ = syscall::sys_cap_delete(scratch_slot);
+            slot += 1;
         }
-        if syscall::sys_cap_mint(scratch_slot, req.cap_type, req.param0, req.param1).is_err() {
-            continue;
-        }
-        if syscall::sys_cap_grant(child, scratch_slot, i).is_ok() {
-            granted += 1;
-        }
-        let _ = syscall::sys_cap_delete(scratch_slot);
     }
     granted
 }
