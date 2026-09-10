@@ -295,6 +295,29 @@ pub fn release_fd(kind: &FdKind) {
 }
 ```
 
+Add its mirror in the same commit, because `SYS_FD_DUP` already has a per-kind
+refcount bump written inline (`src/syscall.rs:1093`) and every kind this plan
+adds has to appear there too. One function means one place:
+
+```rust
+/// Take a reference on whatever a descriptor names, for a copy of it.
+///
+/// The mirror of `release_fd`, and deliberately beside it: `SYS_FD_DUP` and
+/// `SYS_PIPE_FD_SET` both make a second descriptor for one object, and a kind
+/// added to one of these and not the other leaks or double-frees.
+pub fn retain_fd(kind: &FdKind) -> Result<(), ()> {
+    match kind {
+        FdKind::PipeRead(h) => add_ref(*h, false),
+        FdKind::PipeWrite(h) => add_ref(*h, true),
+        _ => Ok(()),
+    }
+}
+```
+
+and replace the inline `match kind { FdKind::PipeRead(..) => ... }` in
+`SYS_FD_DUP` with
+`if crate::pipe::retain_fd(&kind).is_err() { return u64::MAX; }`.
+
 `drop_ref` is currently private (`fn drop_ref`, line 346). Make it `pub fn` —
 `src/stream.rs` calls it in Task 5.
 
@@ -361,6 +384,11 @@ Let a task close a descriptor
 There was no way to. A descriptor could be installed and never released, which
 means the last writer of a pipe could never go away and a reader could never
 see end-of-file — the one thing a pipe is for.
+
+`retain_fd` arrives with `release_fd` as its mirror. sys_fd_dup had the
+per-kind refcount bump written inline, so every new kind of descriptor had two
+places to be remembered in — and one of them was easy to miss, which leaks or
+double-frees depending which.
 
 Brings `user/dtest` with it, which is this repo's nearest thing to a test
 framework: a program that asserts and exits non-zero. Phase 10 adds a section
@@ -937,10 +965,27 @@ pub fn install_fd(tid: usize, kind: crate::task::FdKind) -> Option<usize> {
 }
 ```
 
-`src/pipe.rs`, extend `release_fd`:
+`src/pipe.rs`, extend both halves — a duplicated memory descriptor is a second
+reference to the region:
 
 ```rust
+    // in release_fd
         FdKind::MemFd { handle } => crate::shmem::close_ref(*handle),
+
+    // in retain_fd
+        FdKind::MemFd { handle } => {
+            crate::shmem::add_access(*handle, scheduler::current_tid());
+            Ok(())
+        }
+```
+
+and in `SYS_FD_DUP`, admit the *target* rather than the caller, since that is
+who ends up holding the copy:
+
+```rust
+            if let crate::task::FdKind::MemFd { handle } = kind {
+                crate::shmem::add_access(handle, target_tid);
+            }
 ```
 
 `user/quark-rt/src/syscall.rs`, numbers and wrappers:
@@ -1087,8 +1132,13 @@ struct Stream {
     /// Descriptors travelling towards end 1, then towards end 0.
     q: [[FdKind; FD_QUEUE]; 2],
     q_len: [usize; 2],
-    /// Whether each end still has a descriptor referring to it.
-    open: [bool; 2],
+    /// How many descriptors name each end.
+    ///
+    /// A count and not a flag, because `SYS_FD_DUP` makes a second descriptor
+    /// for one end — which is exactly how a parent hands a child its side of a
+    /// connection. With a flag, the parent closing its copy would tell the peer
+    /// the end had gone while the child was still holding it.
+    refs: [usize; 2],
 }
 
 impl Stream {
@@ -1100,7 +1150,7 @@ impl Stream {
             one_to_zero: 0,
             q: [[FdKind::Empty; FD_QUEUE]; 2],
             q_len: [0; 2],
-            open: [false; 2],
+            refs: [0; 2],
         }
     }
 }
@@ -1185,13 +1235,32 @@ pub fn create(tid: usize) -> Option<usize> {
         s.creator = tid;
         s.zero_to_one = a;
         s.one_to_zero = b;
-        s.open = [true, true];
+        s.refs = [1, 1];
     }
     irq_restore(flags);
     Some(idx)
 }
 
-/// One end's descriptor has gone.
+/// Take a reference on an end, for a second descriptor naming it.
+pub fn retain_end(stream: usize, end: u8) -> Result<(), ()> {
+    if stream >= MAX_STREAMS || end > 1 {
+        return Err(());
+    }
+    let flags = irq_save();
+    let ok = unsafe {
+        let s = &mut streams()[stream];
+        if s.in_use && s.refs[end as usize] > 0 {
+            s.refs[end as usize] += 1;
+            true
+        } else {
+            false
+        }
+    };
+    irq_restore(flags);
+    if ok { Ok(()) } else { Err(()) }
+}
+
+/// One descriptor naming this end has gone. The end goes with the last of them.
 pub fn close_end(stream: usize, end: u8) {
     if stream >= MAX_STREAMS || end > 1 {
         return;
@@ -1199,18 +1268,23 @@ pub fn close_end(stream: usize, end: u8) {
     let flags = irq_save();
     let (drop_pipes, orphans) = unsafe {
         let s = &mut streams()[stream];
-        if !s.in_use || !s.open[end as usize] {
+        if !s.in_use || s.refs[end as usize] == 0 {
             irq_restore(flags);
             return;
         }
-        s.open[end as usize] = false;
+        s.refs[end as usize] -= 1;
+        if s.refs[end as usize] > 0 {
+            // Somebody else still holds this end; nothing observable happens.
+            irq_restore(flags);
+            return;
+        }
         // Anything still in flight towards the peer is released with the end
         // that would have delivered it.
         let mut orphans = [FdKind::Empty; FD_QUEUE];
         let n = s.q_len[1 - end as usize];
         orphans[..n].copy_from_slice(&s.q[1 - end as usize][..n]);
         s.q_len[1 - end as usize] = 0;
-        let both_gone = !s.open[0] && !s.open[1];
+        let both_gone = s.refs[0] == 0 && s.refs[1] == 0;
         let ab = (s.zero_to_one, s.one_to_zero);
         if both_gone {
             *s = Stream::empty();
@@ -1316,12 +1390,21 @@ pub fn drop_unreferenced(handle: usize) {
 }
 ```
 
-Make `drop_ref` and `add_ref` `pub` if they are not already, and extend
-`release_fd`:
+Make `drop_ref` and `add_ref` `pub` if they are not already, and extend both
+halves:
 
 ```rust
+    // in release_fd
         FdKind::StreamEnd { stream, end } => crate::stream::close_end(*stream, *end),
+
+    // in retain_fd
+        FdKind::StreamEnd { stream, end } => crate::stream::retain_end(*stream, *end),
 ```
+
+This is the case that makes the reference count necessary rather than tidy:
+handing a child one side of a connection is `SYS_FD_DUP` followed by the parent
+closing its own copy, and with a flag the peer would be told the end had gone
+while the child still held it.
 
 `src/syscall.rs` — the number, the arm, and routing read/write:
 
@@ -1411,7 +1494,10 @@ ring with readers, writers and blocked tasks. What a stream adds is the pairing
 and, next, a queue of descriptors in flight.
 
 Both ends land in the caller's own table, the way socketpair(2) works; moving
-one into a child is what sys_fd_dup already does.
+one into a child is sys_fd_dup followed by closing our copy. That is why an end
+is reference counted rather than flagged — with a flag, the parent closing its
+copy would tell the peer the end had gone while the child was still holding
+it.
 
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
 EOF
@@ -1508,7 +1594,7 @@ pub fn push_fd(stream: usize, end: u8, kind: FdKind) -> bool {
     let flags = irq_save();
     let ok = unsafe {
         let s = &mut streams()[stream];
-        if !s.in_use || !s.open[to] || s.q_len[to] == FD_QUEUE {
+        if !s.in_use || s.refs[to] == 0 || s.q_len[to] == FD_QUEUE {
             false
         } else {
             s.q[to][s.q_len[to]] = kind;
@@ -2037,7 +2123,7 @@ pub fn peer_gone(stream: usize, end: u8) -> bool {
     let flags = irq_save();
     let out = unsafe {
         let s = &streams()[stream];
-        !s.in_use || !s.open[1 - end as usize]
+        !s.in_use || s.refs[1 - end as usize] == 0
     };
     irq_restore(flags);
     out
@@ -3385,6 +3471,249 @@ EOF
 
 ---
 
+### Task 13: All of it, between two address spaces
+
+**Files:**
+- Create: `user/dchild/Cargo.toml`, `user/dchild/src/main.rs`
+- Modify: `user/dtest/src/main.rs`, `Makefile`
+
+**Interfaces:**
+- Consumes: every earlier task.
+- Produces: nothing later depends on this; it is the acceptance criterion.
+
+Tasks 1–12 exercise all of this inside one process, where a descriptor is a
+number in one table and a region is mapped once. Every one of these primitives
+exists to be used between two tasks, and the bugs that only appear there — a
+reference not taken across `SYS_FD_DUP`, a region the receiver was never
+admitted to, a wake that goes to the wrong task — are exactly the ones this
+plan would otherwise ship. So this is a task and not a note.
+
+- [ ] **Step 1: Write the failing test**
+
+Create `user/dchild/Cargo.toml`, the same shape as `user/dtest`'s with
+`name = "dchild"`.
+
+Create `user/dchild/src/main.rs`:
+
+```rust
+#![no_std]
+#![no_main]
+
+//! The other half of `dtest`'s cross-process check.
+//!
+//! Started by `dtest` with one end of a socketpair already at descriptor 3.
+//! Allocates memory, writes a witness into it, and sends the descriptor back —
+//! which is the whole of what a Wayland client does with `wl_shm`, minus the
+//! drawing.
+
+use quark_rt::manifest::CapReq;
+use quark_rt::{println, syscall};
+
+quark_rt::manifest!([CapReq::phys_alloc(16)]);
+
+const CONN: usize = 3;
+const MINE: usize = 0x97_0000_0000;
+pub const WITNESS: u64 = 0x0D15_EA5E_D15C_0DE5;
+
+#[unsafe(no_mangle)]
+#[link_section = ".text.entry"]
+pub extern "C" fn _start() -> ! {
+    // Wait for the parent's byte before answering, so the test proves the
+    // stream carries data in both directions between address spaces.
+    let mut buf = [0u8; 8];
+    let n = syscall::sys_fd_read(CONN, &mut buf);
+    if n != 4 || &buf[..4] != b"go!\n" {
+        println!("[dchild] bad greeting: {} bytes", n);
+        syscall::sys_exit_code(2);
+    }
+
+    let Ok(mem) = syscall::sys_memfd_create(2) else {
+        println!("[dchild] no memory");
+        syscall::sys_exit_code(3);
+    };
+    if syscall::sys_mmap_fd(mem, MINE).is_err() {
+        println!("[dchild] cannot map my own memory");
+        syscall::sys_exit_code(4);
+    }
+    unsafe { core::ptr::write_volatile(MINE as *mut u64, WITNESS) };
+
+    if syscall::sys_fd_send(CONN, b"here", Some(mem)) != Ok(4) {
+        println!("[dchild] send failed");
+        syscall::sys_exit_code(5);
+    }
+    println!("[dchild] sent");
+    syscall::sys_exit_code(0);
+}
+
+#[panic_handler]
+fn panic(info: &core::panic::PanicInfo) -> ! {
+    println!("[dchild] PANIC: {}", info);
+    syscall::sys_exit_code(255);
+}
+```
+
+Register it in `Makefile` the way Task 1 registered `dtest`: `DCHILD_DIR`,
+`DCHILD_ELF`, a `FORCE` rule, an entry in `user:`, and `dchild:DCHILD` in
+`USR_PROGRAMS`.
+
+Add to `user/dtest/src/main.rs`. The spawn is modelled on `user/wm`'s
+`start_session` — read the image through the VFS, `spawn::load`, grant, start:
+
+```rust
+use quark_rt::{nameserver, spawn, vfs};
+
+const CHILD_IMAGE: usize = 0x98_0000_0000;
+const THEIR_MEM: usize = 0x99_0000_0000;
+const WITNESS: u64 = 0x0D15_EA5E_D15C_0DE5;
+
+static SPAWN_SCRATCH: spawn::Scratch = spawn::Scratch {
+    elf: 0x9A_0000_0000,
+    stack: 0x9B_0000_0000,
+    args: 0x9C_0000_0000,
+};
+
+/// Read `/usr/bin/dchild` and start it. Returns its TID.
+fn start_child() -> Option<spawn::Spawned> {
+    let vfs_tid = nameserver::lookup_retry(b"vfs", 20)?;
+    // Lowercase for ext2, uppercase with .ELF for FAT32 — the two spellings
+    // the shell already tries.
+    let (handle, size, _) = match vfs::open(vfs_tid, b"/usr/bin/dchild") {
+        Ok(h) => h,
+        Err(_) => vfs::open(vfs_tid, b"/usr/bin/DCHILD.ELF").ok()?,
+    };
+    let size = size as usize;
+    let pages = (size + 4095) / 4096;
+    for p in 0..pages {
+        let frame = syscall::sys_phys_alloc(1).ok()?;
+        syscall::sys_map_phys(frame, CHILD_IMAGE + p * 4096, 1).ok()?;
+        let want = 4096.min(size - p * 4096) as u32;
+        vfs::read(vfs_tid, handle, frame, (p * 4096) as u32, want).ok()?;
+    }
+    let _ = vfs::close(vfs_tid, handle);
+
+    let image = unsafe { core::slice::from_raw_parts(CHILD_IMAGE as *const u8, size) };
+    let info = spawn::load(image, &SPAWN_SCRATCH).ok()?;
+    quark_rt::manifest::grant_image(info.tid, image, 12);
+    // It needs to be able to answer us and to reach the nameserver.
+    let _ = syscall::sys_cap_grant(info.tid, syscall::SLOT_ENDPOINT, syscall::SLOT_ENDPOINT);
+    // And somewhere for its println to go.
+    let _ = syscall::sys_fd_dup(info.tid, 1, 1);
+    let _ = syscall::sys_fd_dup(info.tid, 2, 2);
+    Some(info)
+}
+
+fn test_across_address_spaces() {
+    println!("across address spaces:");
+    let (mine, theirs) = match syscall::sys_socketpair() {
+        Ok(p) => p,
+        Err(()) => { check("a pair", false); return; }
+    };
+    let Some(info) = start_child() else {
+        check("start /usr/bin/dchild", false);
+        return;
+    };
+    check("start /usr/bin/dchild", true);
+
+    // Hand the child its end, then drop ours. If an end were a flag rather
+    // than a count, this would tell the child's peer the end had gone.
+    check("give the child descriptor 3", syscall::sys_fd_dup(info.tid, 3, theirs).is_ok());
+    check("drop our copy of it", syscall::sys_fd_close(theirs).is_ok());
+    check("the stream is still alive", syscall::sys_fd_write(mine, b"go!\n") == 4);
+
+    if info.start().is_err() {
+        check("the child runs", false);
+        return;
+    }
+    check("the child runs", true);
+
+    // Wait for its answer with the set, which is what makes this the whole
+    // phase and not three quarters of it.
+    let set = match syscall::sys_pollset_create() {
+        Ok(s) => s,
+        Err(()) => { check("a set to wait on", false); return; }
+    };
+    let _ = syscall::sys_pollset_add(set, mine, syscall::POLL_READABLE, 7);
+    let mut ready = [syscall::Ready::empty(); 2];
+    check(
+        "the set wakes for the child's reply",
+        syscall::sys_pollset_wait(set, &mut ready, 500) == Ok(1) && ready[0].token == 7,
+    );
+
+    let mut buf = [0u8; 8];
+    let got = syscall::sys_fd_recv(mine, &mut buf, Some(25));
+    check("bytes and a descriptor arrived", got == Ok((4, true)));
+    check("map memory the other task allocated", syscall::sys_mmap_fd(25, THEIR_MEM).is_ok());
+    check(
+        "and read what it wrote there",
+        unsafe { core::ptr::read_volatile(THEIR_MEM as *const u64) } == WITNESS,
+    );
+
+    let _ = syscall::sys_fd_close(25);
+    let _ = syscall::sys_fd_close(set);
+    let _ = syscall::sys_fd_close(mine);
+}
+```
+
+Call it last from `_start`, before the summary.
+
+- [ ] **Step 2: Run it to verify it fails**
+
+Build, boot, run `dtest`.
+Expected: FAIL at `start /usr/bin/dchild`, because `dchild` is not in the image
+until the Makefile registration and `make hd` have both happened. Once it is,
+the first real failure to expect is `map memory the other task allocated` —
+that is the one that needs `add_access` on receive, which Task 6 wired.
+
+- [ ] **Step 3: Write the minimal implementation**
+
+There should be nothing to write. Every mechanism this exercises was built in
+Tasks 1–12; the work here is finding what does not survive contact with a
+second address space. The likely three, in the order they will bite:
+
+1. **A reference not taken.** `SYS_FD_DUP` must call `pipe::retain_fd`, which
+   for a `StreamEnd` is `stream::retain_end` — otherwise `sys_fd_close(theirs)`
+   in the parent takes the end away from the child.
+2. **A region the receiver cannot map.** `SYS_FD_RECV` must call
+   `shmem::add_access(handle, tid)` for a `MemFd`, or the child's memory is
+   refused to the parent that was just handed it.
+3. **A wake to the wrong task.** `pollset::note_pipe` looks up watches by the
+   *set owner's* descriptor table. A set owned by the parent watching a stream
+   the child writes to must resolve through the parent's table, not the
+   writer's.
+
+Fix what fails, in the file that owns it, and add nothing new.
+
+- [ ] **Step 4: Run it to verify it passes**
+
+Build, `make hd`, boot, run `dtest`.
+Expected: ten more `ok` lines, `[dchild] sent` on the console before them, and
+`0 failed` for every section.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add user/dchild user/dtest/src/main.rs Makefile
+git commit -m "$(cat <<'EOF'
+Prove it between two address spaces
+
+Everything up to here was tested inside one process, where a descriptor is a
+number in one table and a region is mapped once. All of it exists to be used
+between two tasks, and the bugs that only appear there are the ones this would
+otherwise have shipped: a reference not taken across sys_fd_dup, a region the
+receiver was never admitted to, a wake resolved through the wrong task's
+descriptor table.
+
+dchild is handed one end of a socketpair at descriptor 3, allocates memory,
+writes a witness into it and sends the descriptor back. That is what a Wayland
+client does with wl_shm, minus the drawing.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+EOF
+)"
+```
+
+---
+
 ## Acceptance
 
 Phase 10 is done when `dtest` reports `0 failed` on a booted machine and the
@@ -3396,14 +3725,8 @@ roadmap's own criterion holds:
 > that became ready, and a program started with `FOO=bar` in its environment
 > can read it back with `getenv`.
 
-Tasks 1–9 cover the first three clauses within one process. **The
-cross-process form is the last check and it is not optional** — everything in
-this phase exists to be used between two tasks, and a bug that only appears
-when the sender and receiver are different address spaces is exactly the bug
-this plan would otherwise ship. Add to `dtest`: spawn a child with
-`quark_rt::spawn`, hand it one end of a socketpair with `sys_fd_dup`, have the
-child send a memfd back with a witness word written into it, and assert the
-parent maps it and reads that word.
+Tasks 1–12 cover every clause within one process; **Task 13 is the same thing
+between two**, and it is where a bug in any of this would actually hide.
 
 ## Notes for whoever executes this
 
