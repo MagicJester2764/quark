@@ -64,6 +64,12 @@ pub struct Buffer {
     /// The compositor is reading these pixels right now. Releasing a buffer it
     /// is still reading is what tears a frame in half.
     pub in_use: bool,
+    /// The client destroyed it while the compositor was still showing it.
+    ///
+    /// Wayland allows that, and a compositor that took it literally would
+    /// unmap the pool underneath a window it is about to composite. The buffer
+    /// stays until the surface stops showing it.
+    pub zombie: bool,
 }
 
 const NO_POOL: Pool =
@@ -77,6 +83,7 @@ const NO_BUFFER: Buffer = Buffer {
     stride: 0,
     format: 0,
     in_use: false,
+    zombie: false,
 };
 
 static mut POOLS: [Pool; MAX_POOLS] = [NO_POOL; MAX_POOLS];
@@ -168,6 +175,7 @@ pub fn create_buffer(
             stride,
             format,
             in_use: false,
+            zombie: false,
         };
         POOLS[pool_idx].buffers += 1;
     }
@@ -181,21 +189,37 @@ pub fn pixels(idx: usize) -> Option<(*const u8, usize, usize, usize)> {
     Some(((p.vaddr + b.offset) as *const u8, b.width, b.height, b.stride))
 }
 
+/// Say whether the compositor is currently showing a buffer.
+///
+/// Stopping is what lets a buffer the client already destroyed finally go: it
+/// is the moment the pool underneath it is no longer being read.
 pub fn set_in_use(idx: usize, yes: bool) {
-    unsafe {
-        if let Some(b) = BUFFERS.get_mut(idx) {
-            if b.used {
-                b.in_use = yes;
-            }
-        }
+    let finished = unsafe {
+        let Some(b) = BUFFERS.get_mut(idx).filter(|b| b.used) else {
+            return;
+        };
+        b.in_use = yes;
+        !yes && b.zombie
+    };
+    if finished {
+        destroy_buffer(idx);
     }
 }
 
 /// A client is finished with a buffer.
+///
+/// If the compositor is still showing it, the destruction is remembered and
+/// happens when it stops. A client is allowed to destroy an attached buffer,
+/// and a compositor that unmapped the pool there and then would fault on its
+/// own next composite — which is a client crashing the compositor.
 pub fn destroy_buffer(idx: usize) {
     unsafe {
         let Some(b) = BUFFERS.get_mut(idx) else { return };
         if !b.used {
+            return;
+        }
+        if b.in_use {
+            b.zombie = true;
             return;
         }
         let pool_idx = b.pool;
@@ -256,6 +280,9 @@ pub fn forget_client(owner: usize) {
     unsafe {
         for i in 0..MAX_BUFFERS {
             if BUFFERS[i].used && POOLS[BUFFERS[i].pool].owner == owner {
+                // No zombie handling here: the client's surfaces went first, so
+                // nothing is showing any of this, and the ordering is the whole
+                // reason `close` drops surfaces before pools.
                 BUFFERS[i] = NO_BUFFER;
             }
         }

@@ -35,6 +35,10 @@ const MAX_PENDING_FDS: usize = 4;
 /// surface may commit between passes, and each may have asked for a frame.
 const MAX_DUE: usize = 16;
 
+/// Room to leave before starting an event. Comfortably larger than the biggest
+/// this compositor sends, which is `wl_output.geometry` with two strings.
+const EVENT_SLACK: usize = 256;
+
 pub struct Client {
     pub used: bool,
     /// Which entry of the compositor's client table this is. Surfaces are kept
@@ -63,6 +67,14 @@ pub struct Client {
     due: [u32; MAX_DUE],
     ndue: usize,
     fired_at: u64,
+    /// An argument did not fit in the write buffer, so the event being built
+    /// is not the event it claims to be.
+    ///
+    /// A half-written event is worse than a missing one: its header says a
+    /// size, the arguments after it are somebody else's, and the client parses
+    /// the rest of the connection out of step. `end` rolls the whole event back
+    /// when this is set, so the stream stays valid whatever else is lost.
+    wfail: bool,
 }
 
 pub const NO_CLIENT: Client = Client {
@@ -80,6 +92,7 @@ pub const NO_CLIENT: Client = Client {
     due: [0; MAX_DUE],
     ndue: 0,
     fired_at: 0,
+    wfail: false,
 };
 
 impl Client {
@@ -143,9 +156,16 @@ impl Client {
     /// Start an event. Returns where its arguments go, or `None` if the write
     /// buffer is full.
     fn begin(&mut self, object: u32, opcode: u16) -> Option<usize> {
+        // Make room before starting rather than discovering halfway through.
+        // The send is non-blocking, so this may not free anything — but when it
+        // does, an event that would have been rolled back goes out instead.
+        if WRITE_BUF - self.wlen < EVENT_SLACK {
+            self.flush();
+        }
         if self.wlen + wire::HEADER > WRITE_BUF {
             return None;
         }
+        self.wfail = false;
         let at = self.wlen;
         wire::put_header(
             &mut self.wbuf[at..],
@@ -164,6 +184,11 @@ impl Client {
     /// zero. Every event went out with opcode 0, which for `delete_id` is
     /// `wl_display.error` and reads to a client as the compositor giving up.
     fn end(&mut self, at: usize) {
+        if self.wfail {
+            self.wlen = at;
+            self.wfail = false;
+            return;
+        }
         let size = (self.wlen - at) as u16;
         let lo = self.wbuf[at + 4];
         let hi = self.wbuf[at + 5];
@@ -174,6 +199,7 @@ impl Client {
 
     fn arg_u32(&mut self, v: u32) -> bool {
         if self.wlen + 4 > WRITE_BUF {
+            self.wfail = true;
             return false;
         }
         wire::put_u32(&mut self.wbuf, self.wlen, v);
@@ -188,6 +214,7 @@ impl Client {
     fn arg_array(&mut self, bytes: &[u8]) -> bool {
         let need = 4 + wire::pad4(bytes.len());
         if self.wlen + need > WRITE_BUF {
+            self.wfail = true;
             return false;
         }
         wire::put_u32(&mut self.wbuf, self.wlen, bytes.len() as u32);
@@ -202,6 +229,7 @@ impl Client {
     fn arg_str(&mut self, s: &[u8]) -> bool {
         let need = 4 + wire::pad4(s.len() + 1);
         if self.wlen + need > WRITE_BUF {
+            self.wfail = true;
             return false;
         }
         let n = wire::put_str(&mut self.wbuf, self.wlen, s);
