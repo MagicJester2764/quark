@@ -179,7 +179,7 @@ pub const SYS_ABI_VERSION: u64 = 240;
 /// minor when calls are added. User space can refuse to run against a major it
 /// does not know, which is the point of exposing it at all.
 pub const ABI_VERSION_MAJOR: u64 = 1;
-pub const ABI_VERSION_MINOR: u64 = 5;
+pub const ABI_VERSION_MINOR: u64 = 6;
 
 
 
@@ -1440,7 +1440,18 @@ extern "C" fn syscall_dispatch(
             let mut got = 0u64;
             if at != u64::MAX {
                 let slot = at as usize;
-                if slot < crate::task::MAX_FDS {
+                // Check the slot *before* taking the descriptor off the queue.
+                // Popping first and failing to install destroys something the
+                // sender handed over and the receiver asked for, and neither
+                // of them is told.
+                let free = slot < crate::task::MAX_FDS
+                    && unsafe {
+                        match scheduler::get_task_mut(tid) {
+                            Some(t) => t.fds[slot].is_empty(),
+                            None => false,
+                        }
+                    };
+                if free {
                     if let Some(kind) = crate::stream::pop_fd(stream, end) {
                         // Turn the queue's anonymous reference into one owned
                         // by this task. Memory arriving this way admits the

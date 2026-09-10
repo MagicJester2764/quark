@@ -34,6 +34,7 @@ typedef unsigned long size_t;
 #define LX_write             1
 #define LX_open              2
 #define LX_close             3
+#define LX_poll              7
 #define LX_stat              4
 #define LX_access           21
 #define LX_fstat             5
@@ -49,6 +50,9 @@ typedef unsigned long size_t;
 #define LX_readv            19
 #define LX_writev           20
 #define LX_madvise          28
+#define LX_sendmsg          46
+#define LX_recvmsg          47
+#define LX_socketpair       53
 #define LX_fadvise64       221
 #define LX_getpid           39
 #define LX_fcntl            72
@@ -73,6 +77,11 @@ typedef unsigned long size_t;
 #define LX_newfstatat      262
 #define LX_statx           332
 #define LX_rseq            334
+#define LX_epoll_wait      232
+#define LX_epoll_ctl       233
+#define LX_ppoll           271
+#define LX_epoll_create1   291
+#define LX_memfd_create    319
 #define LX_faccessat2      439
 
 #define ARCH_SET_FS 0x1002
@@ -148,6 +157,23 @@ static long do_mmap(unsigned long len) {
     if (map_pages(at, pages) != 0) {
         trace("mmap-failed-pages", (long)pages);
         return -LX_ENOMEM;
+    }
+    mmap_next = at + pages * PAGE_SIZE;
+    return (long)at;
+}
+
+/* Map memory named by a descriptor, at an address of our choosing. */
+static long do_mmap_fd(long fd, unsigned long len) {
+    if (len == 0) {
+        return -LX_EINVAL;
+    }
+    unsigned long pages = (len + PAGE_SIZE - 1) / PAGE_SIZE;
+    unsigned long at = mmap_next;
+    if (at + pages * PAGE_SIZE > MMAP_LIMIT) {
+        return -LX_ENOMEM;
+    }
+    if (__syscall2(SYS_MMAP_FD, (unsigned long)fd, at) == QUARK_ERR) {
+        return -LX_ENODEV;
     }
     mmap_next = at + pages * PAGE_SIZE;
     return (long)at;
@@ -247,11 +273,15 @@ long __quark_syscall(long n, long a1, long a2, long a3, long a4, long a5, long a
     }
 
     case LX_mmap:
-        /* Only anonymous mappings. A file mapping would have to be read
-           through the VFS into pages, which is a different thing wearing the
-           same name, and musl does not need it to start. */
+        /* A mapping backed by a descriptor is `wl_shm`: the caller made memory
+           with memfd_create and wants it visible. Quark maps at an address you
+           name, so the address is chosen here from the same arena anonymous
+           mappings come out of.
+           A mapping backed by a *file* is still refused — that would have to
+           be read through the VFS into pages, which is a different thing
+           wearing the same name. */
         if (a5 != -1L) {
-            return -LX_ENOSYS;
+            return do_mmap_fd(a5, (unsigned long)a2);
         }
         return do_mmap((unsigned long)a2);
 
@@ -410,6 +440,34 @@ long __quark_syscall(long n, long a1, long a2, long a3, long a4, long a5, long a
        works rather than sending it to /proc, which does not exist. */
     case LX_fcntl:
         return 0;
+
+    /* Streams, descriptors in flight, and waiting. Each is the same operation
+       Quark has with Linux's packaging around it. */
+    case LX_memfd_create:
+        return __quark_memfd((const char *)a1, a2);
+    case LX_socketpair:
+        return __quark_socketpair(a1, a2, a3, (int *)a4);
+    case LX_sendmsg:
+        return __quark_sendmsg(a1, (const void *)a2, a3);
+    case LX_recvmsg:
+        return __quark_recvmsg(a1, (void *)a2, a3);
+    case LX_poll:
+        return __quark_poll((void *)a1, a2, a3);
+    case LX_ppoll:
+        /* The signal mask is the only difference and there are no handlers
+           here, so the timeout is the whole of it: a timespec rather than
+           milliseconds. */
+        if (a3) {
+            const long *ts = (const long *)a3;
+            return __quark_poll((void *)a1, a2, ts[0] * 1000 + ts[1] / 1000000);
+        }
+        return __quark_poll((void *)a1, a2, -1);
+    case LX_epoll_create1:
+        return __quark_epoll_create();
+    case LX_epoll_ctl:
+        return __quark_epoll_ctl(a1, a2, a3, (void *)a4);
+    case LX_epoll_wait:
+        return __quark_epoll_wait(a1, (void *)a2, a3, a4);
 
     /* statx carries more than the VFS knows, and musl falls back to the plain
        stat calls when it is refused. */
