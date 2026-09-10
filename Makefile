@@ -79,6 +79,13 @@ FSTEST_DIR := user/fstest
 
 # C programs, built against the C library rather than quark-rt.
 LIBC_DIR := user/libc
+# The Linux system call surface, which musl programs are linked against by the
+# cross toolchain's specs file. Built here even though nothing in this tree
+# links it: the specs file names the archive by path, so a stale one is linked
+# into every musl program silently, and the symptom is a bug you already fixed
+# still happening.
+LINUX_ABI_DIR := user/linux-abi
+LINUX_ABI_A := $(LINUX_ABI_DIR)/liblinux-abi.a
 CWC_DIR := user/cwc
 CAT_ELF := $(CAT_DIR)/target/$(TARGET)/release/cat
 CAPDEMO_ELF := $(CAPDEMO_DIR)/target/$(TARGET)/release/capdemo
@@ -120,7 +127,7 @@ SHUTDOWN_ELF := $(SHUTDOWN_DIR)/target/$(TARGET)/release/shutdown
 check-abi:
 	@./tools/check-abi.sh
 
-all: check-abi $(KERNEL) drivers user rootfs
+all: check-abi $(KERNEL) drivers user $(LINUX_ABI_A) rootfs
 ifeq ($(HAVE_STD_FORK),)
 	@echo "note: no std fork at $(QUARK_RUST_STD_PATH); skipped $(HOSTED_PROGRAMS)"
 endif
@@ -252,6 +259,9 @@ $(FSTEST_ELF): FORCE
 # other, and both are built here.
 $(LIBC_A): FORCE
 	$(MAKE) -C $(LIBC_DIR)
+
+$(LINUX_ABI_A): FORCE
+	$(MAKE) -C $(LINUX_ABI_DIR)
 
 $(CWC_ELF): $(LIBC_A) FORCE
 	$(MAKE) -C $(CWC_DIR)

@@ -716,6 +716,14 @@ pub fn install_fd(tid: usize, kind: crate::task::FdKind) -> Option<usize> {
     None
 }
 
+/// The lowest free descriptor at or above 3.
+pub fn lowest_free_fd(tid: usize) -> Option<usize> {
+    unsafe {
+        let task = TASKS[tid].as_ref()?;
+        (3..crate::task::MAX_FDS).find(|&fd| task.fds[fd].is_empty())
+    }
+}
+
 /// Empty one descriptor without releasing what it named.
 ///
 /// For unwinding a partial install, where the caller releases the object.

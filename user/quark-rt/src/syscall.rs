@@ -721,9 +721,67 @@ pub fn sys_fd_send(fd: usize, buf: &[u8], pass: Option<usize>) -> Result<usize, 
     if ret == u64::MAX { Err(()) } else { Ok((ret & 0xFFFF_FFFF) as usize) }
 }
 
+/// `at` for [`sys_fd_recv`] when any free descriptor will do.
+pub const ANY_FD: usize = usize::MAX - 1;
+
+/// Ask the kernel not to park: `MSG_DONTWAIT`.
+const FD_DONTWAIT: u64 = 1;
+
+/// Send without parking. `Ok(None)` means the stream is full and nothing was
+/// written — the peer is not reading, which is its problem and not a reason
+/// for this task to stop.
+pub fn sys_fd_send_nb(fd: usize, buf: &[u8], pass: Option<usize>) -> Result<Option<usize>, ()> {
+    let p = match pass { Some(f) => f as u64, None => u64::MAX };
+    let ret = unsafe {
+        syscall5(
+            SYS_FD_SEND, fd as u64, buf.as_ptr() as u64, buf.len() as u64, p, FD_DONTWAIT,
+        )
+    };
+    match ret {
+        u64::MAX => Err(()),
+        WOULD_BLOCK => Ok(None),
+        n => Ok(Some((n & 0xFFFF_FFFF) as usize)),
+    }
+}
+
+/// Receive without parking. `Ok(None)` means nothing had arrived.
+///
+/// A reader that loops until there is nothing left — which is what libwayland
+/// does — needs this: the last call of every such loop is the one that finds
+/// the stream empty, and if it parks there the loop never ends.
+pub fn sys_fd_recv_nb(
+    fd: usize,
+    buf: &mut [u8],
+    at: Option<usize>,
+) -> Result<Option<(usize, Option<usize>)>, ()> {
+    let a = match at { Some(f) => f as u64, None => u64::MAX };
+    let ret = unsafe {
+        syscall5(
+            SYS_FD_RECV, fd as u64, buf.as_mut_ptr() as u64, buf.len() as u64, a, FD_DONTWAIT,
+        )
+    };
+    match ret {
+        u64::MAX => Err(()),
+        WOULD_BLOCK => Ok(None),
+        r => {
+            let got = (r >> 32) as usize;
+            Ok(Some((
+                (r & 0xFFFF_FFFF) as usize,
+                if got == 0 { None } else { Some(got - 1) },
+            )))
+        }
+    }
+}
+
 /// Read from a stream. If `at` is given and a descriptor was attached, it is
-/// installed there. Returns the byte count and whether one arrived.
-pub fn sys_fd_recv(fd: usize, buf: &mut [u8], at: Option<usize>) -> Result<(usize, bool), ()> {
+/// installed there — or at any free slot if `at` is [`ANY_FD`].
+///
+/// Returns the byte count, and which descriptor arrived if one did.
+pub fn sys_fd_recv(
+    fd: usize,
+    buf: &mut [u8],
+    at: Option<usize>,
+) -> Result<(usize, Option<usize>), ()> {
     let a = match at { Some(f) => f as u64, None => u64::MAX };
     let ret = unsafe {
         syscall4(SYS_FD_RECV, fd as u64, buf.as_mut_ptr() as u64, buf.len() as u64, a)
@@ -731,7 +789,11 @@ pub fn sys_fd_recv(fd: usize, buf: &mut [u8], at: Option<usize>) -> Result<(usiz
     if ret == u64::MAX {
         Err(())
     } else {
-        Ok(((ret & 0xFFFF_FFFF) as usize, (ret >> 32) != 0))
+        let got = (ret >> 32) as usize;
+        Ok((
+            (ret & 0xFFFF_FFFF) as usize,
+            if got == 0 { None } else { Some(got - 1) },
+        ))
     }
 }
 

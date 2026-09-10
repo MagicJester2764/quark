@@ -37,7 +37,6 @@ long __quark_lseek(long fd, long offset, long whence);
 long __quark_fstat(long fd, void *statbuf);
 long __quark_stat(const char *path, void *statbuf);
 long __quark_access(const char *path, long mode);
-long __quark_kernel_fd_candidate(int nth);
 
 /* Streams, descriptor passing and waiting, in net.c. */
 long __quark_memfd(const char *name, long flags);

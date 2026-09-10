@@ -68,6 +68,16 @@
    means, and the wrappers here translate. */
 #define QUARK_ERR ((unsigned long)-1)
 
+/* SYS_FD_RECV's `at` when any free descriptor will do. The kernel picks the
+   number and returns it, which is what a caller translating `recvmsg` needs:
+   it cannot see the kernel's half of the table to pick one itself. */
+#define QUARK_ANY_FD ((unsigned long)-2)
+
+/* SYS_FD_SEND and SYS_FD_RECV flags. QUARK_DONTWAIT is MSG_DONTWAIT: return
+   QUARK_WOULD_BLOCK rather than parking. */
+#define QUARK_DONTWAIT      1UL
+#define QUARK_WOULD_BLOCK   ((unsigned long)0xFFFFFFFEUL)
+
 /* The system call wrappers.
  *
  * The kernel's entry path does not preserve the argument registers: it

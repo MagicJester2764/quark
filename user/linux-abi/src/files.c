@@ -33,11 +33,12 @@
  * `open` had two different things called descriptor 4, and neither could see
  * the other's.
  *
- * So this layer takes the top of the table and the kernel keeps the bottom.
- * They meet only when a program holds twenty-nine descriptors at once, and a
- * received descriptor is placed by asking the kernel for a slot and checking
- * that it took it. */
-#define FIRST_FD  16
+ * So this layer takes the numbers above the kernel's table and the kernel
+ * keeps the ones inside it. The split has to sit exactly at the kernel's
+ * MAX_FDS: any lower and a descriptor the kernel installs on our behalf --
+ * `recvmsg` asks it to choose one -- can land on a number this layer has
+ * already given to an open file, and the two are invisible to each other. */
+#define FIRST_FD  32 /* == the kernel's MAX_FDS */
 #define MAX_FILES 16
 
 struct openfile {
@@ -403,19 +404,6 @@ long __quark_write(long fd, const void *buf, unsigned long n) {
    directory here — no server keeps one, and inventing one in this layer would
    make every program disagree with every other — so only AT_FDCWD is
    accepted, and paths are what the VFS is given. */
-/* The lowest descriptor this side is not using, for a passed descriptor to
-   land in. Linux's recvmsg chooses the number and reports it; Quark installs
-   at a slot we name, so somebody has to choose, and it is us. */
-/* A slot in the kernel's half of the table for a passed descriptor to land in.
- *
- * The kernel's half is 3 up to FIRST_FD, and this layer cannot see what is in
- * it — so the caller tries each in turn and believes the kernel when it says
- * whether the descriptor was installed. */
-long __quark_kernel_fd_candidate(int nth) {
-    long fd = 3 + nth;
-    return fd < FIRST_FD ? fd : -1;
-}
-
 long __quark_openat(long dirfd, const char *path, long flags) {
     if (dirfd != LX_AT_FDCWD) {
         return -LX_ENOSYS;

@@ -44,6 +44,12 @@ struct cmsghdr {
 #define SOL_SOCKET  1
 #define SCM_RIGHTS  1
 
+/* The only message flags that change what a call does here. MSG_NOSIGNAL is
+ * ignored on purpose: there are no signals, so a broken stream is already an
+ * error return rather than a death. */
+#define MSG_DONTWAIT 0x40
+
+
 #define AF_UNIX      1
 #define SOCK_STREAM  1
 
@@ -128,7 +134,7 @@ static long control_fd(const struct msghdr *m, int *too_many) {
 }
 
 long __quark_sendmsg(long fd, const void *msg, long flags) {
-    (void)flags;
+    unsigned long fl = (flags & MSG_DONTWAIT) ? QUARK_DONTWAIT : 0;
     const struct msghdr *m = msg;
     if (!m) {
         return -LX_EFAULT;
@@ -150,10 +156,13 @@ long __quark_sendmsg(long fd, const void *msg, long flags) {
         /* The descriptor rides with the first piece that carries bytes, so it
            is queued before anything the peer can read. */
         unsigned long attach = (total == 0 && pass >= 0) ? (unsigned long)pass : QUARK_ERR;
-        unsigned long w = __syscall4(SYS_FD_SEND, (unsigned long)fd,
-                                     (unsigned long)v->iov_base, v->iov_len, attach);
+        unsigned long w = __syscall5(SYS_FD_SEND, (unsigned long)fd,
+                                     (unsigned long)v->iov_base, v->iov_len, attach, fl);
         if (w == QUARK_ERR) {
             return total ? total : -LX_EIO;
+        }
+        if (w == QUARK_WOULD_BLOCK) {
+            return total ? total : -LX_EAGAIN;
         }
         total += (long)(w & 0xFFFFFFFF);
         if ((unsigned long)(w & 0xFFFFFFFF) < v->iov_len) {
@@ -162,8 +171,8 @@ long __quark_sendmsg(long fd, const void *msg, long flags) {
     }
     /* A control message with no data still has to hand the descriptor over. */
     if (total == 0 && pass >= 0) {
-        unsigned long w = __syscall4(SYS_FD_SEND, (unsigned long)fd, 0, 0,
-                                     (unsigned long)pass);
+        unsigned long w = __syscall5(SYS_FD_SEND, (unsigned long)fd, 0, 0,
+                                     (unsigned long)pass, fl);
         if (w == QUARK_ERR) {
             return -LX_EIO;
         }
@@ -172,16 +181,17 @@ long __quark_sendmsg(long fd, const void *msg, long flags) {
 }
 
 long __quark_recvmsg(long fd, void *msg, long flags) {
-    (void)flags;
+    unsigned long fl = (flags & MSG_DONTWAIT) ? QUARK_DONTWAIT : 0;
     struct msghdr *m = msg;
     if (!m) {
         return -LX_EFAULT;
     }
 
     /* Where a received descriptor should land. Linux hands back a number it
-       chose; Quark installs at a slot we name. This layer cannot see the
-       kernel's half of the table, so it offers slots in turn and believes the
-       kernel's answer about whether one took. */
+       chose, and so does Quark when asked with QUARK_ANY_FD — which is the
+       only workable answer, because this layer cannot see the kernel's half
+       of the table and probing for a free slot would mean reading, and
+       reading is the thing recvmsg must do exactly once. */
     int room = m->msg_control && m->msg_controllen >= sizeof(struct cmsghdr) + sizeof(int);
 
     long total = 0;
@@ -191,33 +201,29 @@ long __quark_recvmsg(long fd, void *msg, long flags) {
         if (v->iov_len == 0) {
             continue;
         }
-        unsigned long r;
-        if (total == 0 && room && landed_at < 0) {
-            /* Only the first piece carries the descriptor, and only a read
-               that consumes no bytes may be retried — so probe with a
-               zero-length read until a slot takes, then read for real. */
-            for (int nth = 0;; nth++) {
-                long cand = __quark_kernel_fd_candidate(nth);
-                if (cand < 0) {
-                    break;
-                }
-                r = __syscall4(SYS_FD_RECV, (unsigned long)fd, 0, 0, (unsigned long)cand);
-                if (r == QUARK_ERR) {
-                    return -LX_EIO;
-                }
-                if (r >> 32) {
-                    landed_at = cand;
-                    break;
-                }
-                /* A refusal means either that nothing was queued or that this
-                   slot was taken, and the two look the same from here — so
-                   try the next one rather than deciding which it was. */
-            }
-        }
-        r = __syscall4(SYS_FD_RECV, (unsigned long)fd,
-                       (unsigned long)v->iov_base, v->iov_len, QUARK_ERR);
+        /* Only the first read may collect a descriptor: one control message
+           carries one, and a later piece asking for another would take the
+           next sender's. */
+        unsigned long at = (total == 0 && room && landed_at < 0)
+                               ? QUARK_ANY_FD
+                               : QUARK_ERR;
+        unsigned long r = __syscall5(SYS_FD_RECV, (unsigned long)fd,
+                                     (unsigned long)v->iov_base, v->iov_len, at, fl);
         if (r == QUARK_ERR) {
             return total ? total : -LX_EIO;
+        }
+        if (r == QUARK_WOULD_BLOCK) {
+            /* Nothing there. A caller that loops until this happens -- which
+               is what libwayland does -- is the reason MSG_DONTWAIT cannot be
+               ignored: the last turn of the loop is always this one. */
+            if (total) {
+                break;
+            }
+            m->msg_controllen = 0;
+            return -LX_EAGAIN;
+        }
+        if (r >> 32) {
+            landed_at = (long)(r >> 32) - 1;
         }
         unsigned long n = r & 0xFFFFFFFF;
         total += (long)n;

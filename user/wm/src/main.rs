@@ -67,7 +67,10 @@ use quark_rt::{args, nameserver, println, syscall, vfs};
 // that launches this holds 64. Asking for more than the spawner has is not
 // refused loudly — the mint simply fails and the capability is absent, which
 // then looks like an unrelated failure much later.
+mod client;
 mod draw;
+mod objects;
+mod protocol;
 
 use draw::{draw_text, fill_rect, pack_colour, present, Rect, Screen, CLIP, GLYPH_H, SCREEN};
 
@@ -194,6 +197,16 @@ static mut INPUT_TID: usize = 0;
 const MAX_SESSION: usize = 4;
 /// The programs this session is for. When the last of them stops, so does this.
 static mut SESSION: [usize; MAX_SESSION] = [0; MAX_SESSION];
+
+/// The clients connected to this compositor.
+///
+/// One per session program: `wm` makes a socketpair, keeps this end and hands
+/// the other to the child as descriptor 3, then tells it where to look with
+/// `WAYLAND_SOCKET`. That is the whole reason libwayland needs no patch — its
+/// `wl_display_connect` checks that variable before it looks for a socket in a
+/// filesystem this system does not have.
+static mut CLIENTS: [client::Client; client::MAX_CLIENTS] =
+    [client::NO_CLIENT; client::MAX_CLIENTS];
 static mut SESSION_LEN: usize = 0;
 
 
@@ -715,6 +728,12 @@ pub extern "C" fn _start() -> ! {
             last_pump = now;
             pump_input();
         }
+
+        // A client's requests arrive on a stream rather than as IPC, and the
+        // kernel has no single wait that covers both. Until it does, this asks
+        // each connection whether it has anything, which costs one system call
+        // per client per tick and is the same shape the keyboard already has.
+        serve_clients();
         if now.wrapping_sub(last_check) >= SESSION_CHECK_TICKS {
             last_check = now;
             if session_finished() {
@@ -1038,12 +1057,60 @@ fn start_session(name: &[u8], index: usize) -> Option<usize> {
     // the same program are otherwise indistinguishable on screen, and telling
     // which window has focus is the entire point of having two.
     let tag = [b'1' + (index % 9) as u8];
-    let _ = spawn::set_args(&info, &[name, &tag], &SPAWN_SCRATCH);
+
+    // A Wayland connection, if there is room for one. The child gets its end
+    // at descriptor 3 and is told so; we keep ours and close our copy of its,
+    // which is safe because an end is reference counted — the peer is not told
+    // the connection has gone just because we let go of its half.
+    let mut env: [&[u8]; 1] = [b""];
+    let mut env_len = 0;
+    if let Some(slot) = unsafe { CLIENTS.iter().position(|c| !c.used) } {
+        if let Ok((mine, theirs)) = syscall::sys_socketpair() {
+            if syscall::sys_fd_dup(info.tid, WAYLAND_FD, theirs).is_ok() {
+                let _ = syscall::sys_fd_close(theirs);
+                unsafe { CLIENTS[slot].open(mine, info.tid) };
+                env[0] = b"WAYLAND_SOCKET=3";
+                env_len = 1;
+            } else {
+                let _ = syscall::sys_fd_close(mine);
+                let _ = syscall::sys_fd_close(theirs);
+            }
+        }
+    }
+
+    let _ = spawn::set_args_env(&info, &[name, &tag], &env[..env_len], &SPAWN_SCRATCH);
     if info.start().is_err() {
         println!("wm: could not start that program");
         return None;
     }
     Some(info.tid)
+}
+
+/// Where a client finds its end of the connection.
+const WAYLAND_FD: usize = 3;
+
+/// Let every connected client speak, and drop the ones that have stopped.
+fn serve_clients() {
+    unsafe {
+        for i in 0..client::MAX_CLIENTS {
+            if !CLIENTS[i].used {
+                continue;
+            }
+            let mut fds = [syscall::PollFd::new(CLIENTS[i].fd, syscall::POLL_READABLE)];
+            // Zero timeout: this is a question, not a wait. The waiting is
+            // done by the main loop's timed receive, which also hears about
+            // windows and input; a wait here would stop it hearing either.
+            if syscall::sys_poll(&mut fds, 0) != Ok(1) {
+                continue;
+            }
+            if fds[0].revents & (syscall::POLL_READABLE | syscall::POLL_HANGUP) == 0 {
+                continue;
+            }
+            if !CLIENTS[i].dispatch() {
+                CLIENTS[i].close();
+            }
+        }
+    }
 }
 
 /// Give the display back and stop.
@@ -1060,6 +1127,11 @@ fn quit() -> ! {
         SESSION_LEN = 0;
     }
 
+    unsafe {
+        for i in 0..client::MAX_CLIENTS {
+            CLIENTS[i].close();
+        }
+    }
     for i in 0..MAX_WINDOWS {
         if unsafe { WINDOWS[i].used } {
             destroy_window(i);

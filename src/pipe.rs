@@ -311,11 +311,26 @@ fn read_inner(handle: usize, buf: *mut u8, max_len: usize) -> u64 {
     }
 }
 
-/// Non-blocking pipe read. Returns bytes read, 0 if empty (with writers), u64::MAX on error.
-/// Returns 0 with a special marker: if no writers remain, returns 0 (EOF).
-/// To distinguish empty-with-writers from EOF, we use a convention:
-/// 0 = EOF (no writers), 0xFFFF_FFFE = would block (empty but writers exist).
+/// What a non-blocking pipe call returns instead of parking.
+///
+/// Distinct from both 0 and `u64::MAX`, because all three are different
+/// answers: 0 is end of file, `u64::MAX` is a broken pipe, and this is "ask
+/// again later". A caller that folded the last two together would report a
+/// closed connection every time a buffer happened to be empty.
+pub const WOULD_BLOCK: u64 = 0xFFFF_FFFE;
+
+/// Read without parking. Returns bytes read, 0 at end of file,
+/// [`WOULD_BLOCK`] if the buffer is empty but a writer still holds the pipe,
+/// and `u64::MAX` on error.
 pub fn read_nonblock(handle: usize, buf: *mut u8, max_len: usize) -> u64 {
+    let n = read_nonblock_inner(handle, buf, max_len);
+    if n != WOULD_BLOCK && n != u64::MAX {
+        crate::pollset::note_pipe(handle);
+    }
+    n
+}
+
+fn read_nonblock_inner(handle: usize, buf: *mut u8, max_len: usize) -> u64 {
     let flags = irq_save();
     let result = unsafe {
         if handle >= MAX_PIPES || !PIPES[handle].in_use {
@@ -348,11 +363,62 @@ pub fn read_nonblock(handle: usize, buf: *mut u8, max_len: usize) -> u64 {
             } else if pipe.writers == 0 {
                 0 // EOF
             } else {
-                0xFFFF_FFFE // would block
+                WOULD_BLOCK
             }
         }
     };
     irq_restore(flags);
+    result
+}
+
+/// Write without parking. Returns what fitted, [`WOULD_BLOCK`] if nothing did,
+/// and `u64::MAX` on a broken pipe.
+///
+/// A short write is not a failure here: the caller asked not to wait, and the
+/// bytes that fitted are as much progress as waiting would have made in the
+/// same instant.
+pub fn write_nonblock(handle: usize, buf: *const u8, len: usize) -> u64 {
+    let flags = irq_save();
+    let result = unsafe {
+        if handle >= MAX_PIPES || !PIPES[handle].in_use {
+            u64::MAX
+        } else {
+            let pipe = &mut PIPES[handle];
+            if pipe.readers == 0 {
+                u64::MAX
+            } else {
+                let space = PIPE_BUF_SIZE - pipe.len;
+                let to_copy = space.min(len);
+                if to_copy == 0 {
+                    WOULD_BLOCK
+                } else {
+                    {
+                        let _ua = crate::cpu::UserAccess::begin();
+                        for i in 0..to_copy {
+                            let pos = (pipe.write_pos + i) % PIPE_BUF_SIZE;
+                            pipe.buf[pos] = buf.add(i).read();
+                        }
+                    }
+                    pipe.write_pos = (pipe.write_pos + to_copy) % PIPE_BUF_SIZE;
+                    pipe.len += to_copy;
+
+                    if pipe.read_waiter_count > 0 {
+                        let tid = pipe.read_waiters[0];
+                        pipe.read_waiter_count -= 1;
+                        for j in 0..pipe.read_waiter_count {
+                            pipe.read_waiters[j] = pipe.read_waiters[j + 1];
+                        }
+                        scheduler::unblock_task(tid);
+                    }
+                    to_copy as u64
+                }
+            }
+        }
+    };
+    irq_restore(flags);
+    if result != WOULD_BLOCK && result != u64::MAX {
+        crate::pollset::note_pipe(handle);
+    }
     result
 }
 

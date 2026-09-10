@@ -180,7 +180,7 @@ pub const SYS_ABI_VERSION: u64 = 240;
 /// minor when calls are added. User space can refuse to run against a major it
 /// does not know, which is the point of exposing it at all.
 pub const ABI_VERSION_MAJOR: u64 = 1;
-pub const ABI_VERSION_MINOR: u64 = 7;
+pub const ABI_VERSION_MINOR: u64 = 8;
 
 /// Threads a task may make with no capability at all.
 ///
@@ -290,6 +290,18 @@ fn validate_user_range(addr: u64, len: u64, write: bool) -> bool {
 }
 
 /// Read-only user buffer check.
+/// `SYS_FD_RECV`'s `at` when the caller wants any free descriptor rather than
+/// a particular one.
+pub const ANY_FD: u64 = u64::MAX - 1;
+
+/// `SYS_FD_SEND` and `SYS_FD_RECV` flag: return rather than park.
+///
+/// This is `MSG_DONTWAIT`, and it is not an optimisation. libwayland reads in
+/// a loop until a read says there is nothing left, so a receive that parks on
+/// an empty stream never returns and the client hangs holding data it has
+/// already been given.
+pub const FD_DONTWAIT: u64 = 1;
+
 /// The set a descriptor names, or `None` if it names something else.
 fn pollset_of(tid: usize, fd: usize) -> Option<usize> {
     if fd >= crate::task::MAX_FDS {
@@ -1415,7 +1427,7 @@ extern "C" fn syscall_dispatch(
         }
         SYS_FD_SEND => {
             // arg0 = stream fd, arg1 = buf, arg2 = len, arg3 = fd to pass or
-            // u64::MAX. This needs no authority over the peer: it takes
+            // u64::MAX, arg4 = flags. This needs no authority over the peer: it takes
             // delivery by calling recv. That is the difference from
             // SYS_FD_DUP, which puts a descriptor into a task that never asked
             // and therefore requires TaskMgmt over it.
@@ -1462,11 +1474,16 @@ extern "C" fn syscall_dispatch(
                 Some(p) => p,
                 None => return u64::MAX,
             };
-            crate::pipe::write(wr, arg1 as *const u8, len)
+            if arg4 & FD_DONTWAIT != 0 {
+                crate::pipe::write_nonblock(wr, arg1 as *const u8, len)
+            } else {
+                crate::pipe::write(wr, arg1 as *const u8, len)
+            }
         }
         SYS_FD_RECV => {
             // arg0 = stream fd, arg1 = buf, arg2 = len, arg3 = where to
-            // install any attached descriptor, or u64::MAX to leave it queued.
+            // install any attached descriptor, or u64::MAX to leave it queued,
+            // arg4 = flags.
             let fd = arg0 as usize;
             let len = arg2 as usize;
             let at = arg3;
@@ -1485,14 +1502,38 @@ extern "C" fn syscall_dispatch(
                 Some(p) => p,
                 None => return u64::MAX,
             };
-            let n = crate::pipe::read(rd, arg1 as *mut u8, len);
+            let n = if arg4 & FD_DONTWAIT != 0 {
+                crate::pipe::read_nonblock(rd, arg1 as *mut u8, len)
+            } else {
+                crate::pipe::read(rd, arg1 as *mut u8, len)
+            };
             if n == u64::MAX {
                 return u64::MAX;
             }
+            // Nothing arrived and the caller asked not to wait. Report that
+            // before touching the descriptor queue: a queued descriptor
+            // belongs with the bytes it was sent alongside, and taking it now
+            // would deliver it on a call the caller is about to treat as
+            // having delivered nothing.
+            if n == crate::pipe::WOULD_BLOCK {
+                return crate::pipe::WOULD_BLOCK;
+            }
 
+            // `at` names a slot, or asks for any free one. Asking is what a
+            // caller wants when it is translating `recvmsg`: Linux chooses the
+            // number and reports it, and a caller that had to guess would have
+            // to probe — which cannot be done without reading, and reading is
+            // the thing it is trying to do exactly once.
             let mut got = 0u64;
             if at != u64::MAX {
-                let slot = at as usize;
+                let slot = if at == ANY_FD {
+                    match scheduler::lowest_free_fd(tid) {
+                        Some(s) => s,
+                        None => crate::task::MAX_FDS,
+                    }
+                } else {
+                    at as usize
+                };
                 // Check the slot *before* taking the descriptor off the queue.
                 // Popping first and failing to install destroys something the
                 // sender handed over and the receiver asked for, and neither
@@ -1506,6 +1547,7 @@ extern "C" fn syscall_dispatch(
                     };
                 if free {
                     if let Some(kind) = crate::stream::pop_fd(stream, end) {
+                        let landed = slot;
                         // Turn the queue's anonymous reference into one owned
                         // by this task. Memory arriving this way admits the
                         // receiver to the region: the sender chose to send and
@@ -1525,7 +1567,9 @@ extern "C" fn syscall_dispatch(
                         };
                         crate::pipe::release_in_flight(&kind);
                         if installed {
-                            got = 1;
+                            // The number, not merely the fact: a caller that
+                            // asked for any slot has no other way to learn it.
+                            got = landed as u64 + 1;
                         }
                     }
                 }

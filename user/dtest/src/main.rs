@@ -213,7 +213,7 @@ fn test_fd_passing() {
     let mut buf = [0u8; 4];
     check(
         "receive says a descriptor came",
-        syscall::sys_fd_recv(b, &mut buf, Some(20)) == Ok((1, true)),
+        syscall::sys_fd_recv(b, &mut buf, Some(20)) == Ok((1, Some(20))),
     );
 
     // The received descriptor is a different number naming the same memory.
@@ -230,7 +230,7 @@ fn test_fd_passing() {
     check("send with no descriptor", syscall::sys_fd_send(a, b"x", None) == Ok(1));
     check(
         "receive says none came",
-        syscall::sys_fd_recv(b, &mut buf, Some(21)) == Ok((1, false)),
+        syscall::sys_fd_recv(b, &mut buf, Some(21)) == Ok((1, None)),
     );
 
     let _ = syscall::sys_fd_close(20);
@@ -249,7 +249,7 @@ fn test_fd_passing() {
     check("close the only other copy", syscall::sys_fd_close(orphan).is_ok());
     check(
         "receive it anyway",
-        syscall::sys_fd_recv(b, &mut buf, Some(22)) == Ok((1, true)),
+        syscall::sys_fd_recv(b, &mut buf, Some(22)) == Ok((1, Some(22))),
     );
     check("map what arrived", syscall::sys_mmap_fd(22, PASSED_AT + 0x28000).is_ok());
     check(
@@ -258,6 +258,24 @@ fn test_fd_passing() {
     );
 
     let _ = syscall::sys_fd_close(22);
+
+    // Asking for any slot rather than naming one. A caller translating
+    // `recvmsg` has no way to name one: Linux chooses the number, and the
+    // alternative -- probing -- means reading, which is the one thing a
+    // receive must do exactly once.
+    let any = match syscall::sys_memfd_create(1) {
+        Ok(f) => f,
+        Err(()) => { check("memory to send anywhere", false); return; }
+    };
+    check("send it", syscall::sys_fd_send(a, b"x", Some(any)) == Ok(1));
+    let landed = syscall::sys_fd_recv(b, &mut buf, Some(syscall::ANY_FD));
+    check("receive into a slot of the kernel's choosing", matches!(landed, Ok((1, Some(_)))));
+    let slot = match landed { Ok((_, Some(s))) => s, _ => 0 };
+    check("the slot it named is above the standard three", slot >= 3);
+    check("and it holds memory", syscall::sys_mmap_fd(slot, PASSED_AT + 0x30000).is_ok());
+    let _ = syscall::sys_fd_close(slot);
+    let _ = syscall::sys_fd_close(any);
+
     let _ = syscall::sys_fd_close(a);
     let _ = syscall::sys_fd_close(b);
 }
@@ -599,7 +617,7 @@ fn test_across_address_spaces() {
     let mut buf = [0u8; 8];
     check(
         "bytes and a descriptor arrived",
-        syscall::sys_fd_recv(mine, &mut buf, Some(25)) == Ok((4, true)),
+        syscall::sys_fd_recv(mine, &mut buf, Some(25)) == Ok((4, Some(25))),
     );
     check(
         "map memory the other task allocated",
