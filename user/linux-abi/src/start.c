@@ -18,11 +18,18 @@
 
 #define MAX_ARGS   32
 #define ARGS_BYTES 1024
+#define MAX_ENV    32
+#define ENV_BYTES  1024
 
-/* argc, the argv pointers, argv's terminator, an empty environment, and one
-   auxiliary entry. */
-static unsigned long start_block[1 + MAX_ARGS + 1 + 1 + 4];
+/* argc, the argv pointers and their terminator, the environment pointers and
+   theirs, and two auxiliary entries.
+ *
+ * A static, which is what makes it writable — and musl needs that. Its
+ * `unsetenv` shuffles this array in place. It never writes through the
+ * pointers, so the strings themselves may stay wherever they are. */
+static unsigned long start_block[1 + MAX_ARGS + 1 + MAX_ENV + 1 + 4];
 static char argv_bytes[ARGS_BYTES];
+static char env_bytes[ENV_BYTES];
 
 #define AT_NULL   0
 #define AT_PAGESZ 6
@@ -60,11 +67,43 @@ unsigned long *__quark_start_args(void) {
         off += len;
     }
 
+    /* The environment follows the arguments on the same page. A program built
+       before it existed reads the count as zero, which is why it is there and
+       not in front. */
+    unsigned long envc = 0;
+    unsigned long env_used = 0;
+    unsigned long env_ptrs[MAX_ENV];
+    if (off + sizeof(unsigned long) <= 4096) {
+        unsigned long declared = *(const unsigned long *)(page + off);
+        off += sizeof(unsigned long);
+        for (unsigned long e = 0; e < declared && envc < MAX_ENV; e++) {
+            if (off + sizeof(unsigned long) > 4096) {
+                break;
+            }
+            unsigned long len = *(const unsigned long *)(page + off);
+            off += sizeof(unsigned long);
+            if (off + len > 4096 || env_used + len + 1 > ENV_BYTES) {
+                break;
+            }
+            char *dst = &env_bytes[env_used];
+            for (unsigned long j = 0; j < len; j++) {
+                dst[j] = (char)page[off + j];
+            }
+            dst[len] = '\0';
+            env_ptrs[envc++] = (unsigned long)dst;
+            env_used += len + 1;
+            off += len;
+        }
+    }
+
     unsigned long i = 0;
     start_block[0] = argc;
     i = 1 + argc;
     start_block[i++] = 0;          /* end of argv */
-    start_block[i++] = 0;          /* end of an empty environment */
+    for (unsigned long e = 0; e < envc; e++) {
+        start_block[i++] = env_ptrs[e];
+    }
+    start_block[i++] = 0;          /* end of the environment */
     /* One auxiliary entry, because musl takes the page size from here and a
        zero page size makes its allocator do arithmetic on nothing. */
     start_block[i++] = AT_PAGESZ;

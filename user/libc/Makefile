@@ -15,7 +15,7 @@ CFLAGS  := -ffreestanding -nostdlib -fno-builtin -fno-stack-protector \
 # toolchain links crt0 first and pulls the rest out of the library only as it
 # is referenced, which is the difference between `_start` always being there
 # and it being there when something happens to mention it.
-OBJS    := src/string.o src/quark.o src/io.o src/stdio.o src/stdlib.o
+OBJS    := src/string.o src/quark.o src/io.o src/stdio.o src/stdlib.o src/env.o
 CRT0    := src/start.o
 
 all: libquark.a $(CRT0)
