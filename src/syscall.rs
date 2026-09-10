@@ -1230,33 +1230,49 @@ extern "C" fn syscall_dispatch(
 
             let deadline = crate::pit::ticks().saturating_add(arg3);
             let mut found = [(0u64, 0u32); 64];
-            loop {
+            let out = loop {
                 let n = crate::pollset::scan(set, tid, &mut found[..cap]);
                 if n > 0 {
-                    let _ua = crate::cpu::UserAccess::begin();
-                    for i in 0..n {
-                        unsafe {
-                            let p = (arg1 as *mut u8).add(i * 16);
-                            *(p as *mut u64) = found[i].0;
-                            *(p.add(8) as *mut u32) = found[i].1;
-                            *(p.add(12) as *mut u32) = 0;
-                        }
-                    }
-                    return n as u64;
+                    break n as u64;
                 }
                 let now = crate::pit::ticks();
                 if now >= deadline {
-                    return 0;
+                    break 0;
                 }
+
+                // Register as the waiter *before* the last look. Anything that
+                // becomes ready after this either happened before that scan,
+                // so the scan sees it and we never block, or after it — and
+                // then `note_pipe` finds us parked and wakes us. There is no
+                // window between looking and sleeping.
+                crate::pollset::park(set, tid);
+                if crate::pollset::scan(set, tid, &mut found[..cap]) > 0 {
+                    crate::pollset::unpark(set);
+                    continue;
+                }
+
                 // There is no `sleep` in this kernel. A task sleeps by
                 // receiving from its own TID with a timeout — nobody can send
-                // to that, so only the deadline ends it — and `sleep_ticks` in
-                // quark-rt is exactly this. Reusing it means the existing
-                // timeout sweep already knows how to abandon the block, and no
-                // second sweep has to be written. The next commit makes a pipe
-                // that becomes ready end this early.
+                // to that, so only the deadline or `wake_sleeper` ends it —
+                // and `sleep_ticks` in quark-rt is exactly this. Reusing it
+                // means the existing timeout sweep abandons the block and no
+                // second sweep had to be written.
                 let _ = crate::ipc::sys_recv_timeout(tid, deadline - now);
+                crate::pollset::unpark(set);
+            };
+            crate::pollset::unpark(set);
+            if out > 0 {
+                let _ua = crate::cpu::UserAccess::begin();
+                for i in 0..(out as usize) {
+                    unsafe {
+                        let p = (arg1 as *mut u8).add(i * 16);
+                        *(p as *mut u64) = found[i].0;
+                        *(p.add(8) as *mut u32) = found[i].1;
+                        *(p.add(12) as *mut u32) = 0;
+                    }
+                }
             }
+            out
         }
         SYS_FD_SEND => {
             // arg0 = stream fd, arg1 = buf, arg2 = len, arg3 = fd to pass or

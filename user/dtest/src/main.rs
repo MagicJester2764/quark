@@ -8,7 +8,7 @@
 //! line. Each section corresponds to one task of the Phase 10 plan.
 
 use quark_rt::manifest::CapReq;
-use quark_rt::{println, syscall};
+use quark_rt::{println, syscall, thread};
 
 quark_rt::manifest!([CapReq::task_mgmt(0), CapReq::phys_alloc(64)]);
 
@@ -377,6 +377,72 @@ fn test_pollset() {
     let _ = syscall::sys_fd_close(b);
 }
 
+/// The waking thread's end of the pair, handed to it as descriptor 3.
+const WAKER_FD: usize = 3;
+
+/// Sleep a little, then write. Run on a thread so that something can become
+/// ready while the main task is blocked in a wait — which is the whole of what
+/// Task 8 adds, and cannot be tested from one task.
+extern "C" fn waker() -> ! {
+    syscall::sleep_ticks(5);
+    let _ = syscall::sys_fd_write(WAKER_FD, b"wake");
+    syscall::sys_exit_code(0);
+}
+
+fn test_wake_latency() {
+    println!("waiting wakes promptly:");
+    let (a, b) = match syscall::sys_socketpair() {
+        Ok(p) => p,
+        Err(()) => { check("a pair", false); return; }
+    };
+    let set = match syscall::sys_pollset_create() {
+        Ok(s) => s,
+        Err(()) => { check("a set", false); return; }
+    };
+    let _ = syscall::sys_pollset_add(set, b, syscall::POLL_READABLE, 1);
+
+    // Data already waiting: a correct wait returns without sleeping at all.
+    let _ = syscall::sys_fd_write(a, b"now");
+    let before = syscall::sys_ticks();
+    let mut ready = [syscall::Ready::empty(); 2];
+    let n = syscall::sys_pollset_wait(set, &mut ready, 100);
+    let elapsed = syscall::sys_ticks() - before;
+    check("data already waiting returns at once", n == Ok(1) && elapsed <= 1);
+
+    let mut buf = [0u8; 8];
+    let _ = syscall::sys_fd_read(b, &mut buf);
+
+    // Nothing to read: this must run its full timeout and not return early.
+    let before = syscall::sys_ticks();
+    let n = syscall::sys_pollset_wait(set, &mut ready, 20);
+    let elapsed = syscall::sys_ticks() - before;
+    check("an empty wait runs its full timeout", n == Ok(0) && elapsed >= 20);
+
+    // And the one that matters: something becomes ready *while* we are
+    // blocked. Without a wake path the wait sleeps its whole timeout and only
+    // then notices, so the check is on the clock and not on the answer.
+    let Ok(t) = thread::spawn_with_stack(waker, 8) else {
+        check("start a thread to wake us", false);
+        return;
+    };
+    check("start a thread to wake us", true);
+    if syscall::sys_fd_dup(t.tid(), WAKER_FD, a).is_err() {
+        check("give it the other end", false);
+        return;
+    }
+    check("give it the other end", true);
+
+    let before = syscall::sys_ticks();
+    let n = syscall::sys_pollset_wait(set, &mut ready, 300);
+    let elapsed = syscall::sys_ticks() - before;
+    check("woken by the write, not by the deadline", n == Ok(1) && elapsed < 100);
+
+    let _ = syscall::sys_fd_read(b, &mut buf);
+    let _ = syscall::sys_fd_close(set);
+    let _ = syscall::sys_fd_close(a);
+    let _ = syscall::sys_fd_close(b);
+}
+
 #[unsafe(no_mangle)]
 #[link_section = ".text.entry"]
 pub extern "C" fn _start() -> ! {
@@ -389,6 +455,7 @@ pub extern "C" fn _start() -> ! {
     test_fd_passing();
     test_no_leak();
     test_pollset();
+    test_wake_latency();
 
     unsafe {
         println!("[dtest] {} passed, {} failed", PASSED, FAILED);

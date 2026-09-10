@@ -236,7 +236,18 @@ pub fn add_ref(handle: usize, is_write: bool) -> Result<(), ()> {
 }
 
 /// Read from a pipe. Blocks if empty and writers exist. Returns bytes read (0 = EOF).
+/// Read from a pipe, then say so.
+///
+/// The notification is outside the critical section deliberately: waking a set
+/// reaches into the task table and the stream table, and doing that with this
+/// module's interrupts-off window open would nest two of them.
 pub fn read(handle: usize, buf: *mut u8, max_len: usize) -> u64 {
+    let n = read_inner(handle, buf, max_len);
+    crate::pollset::note_pipe(handle);
+    n
+}
+
+fn read_inner(handle: usize, buf: *mut u8, max_len: usize) -> u64 {
     unsafe {
         loop {
             let flags = irq_save();
@@ -347,6 +358,12 @@ pub fn read_nonblock(handle: usize, buf: *mut u8, max_len: usize) -> u64 {
 
 /// Write to a pipe. Blocks if full and readers exist. Returns bytes written.
 pub fn write(handle: usize, buf: *const u8, len: usize) -> u64 {
+    let n = write_inner(handle, buf, len);
+    crate::pollset::note_pipe(handle);
+    n
+}
+
+fn write_inner(handle: usize, buf: *const u8, len: usize) -> u64 {
     unsafe {
         if len == 0 {
             return 0;
@@ -493,6 +510,13 @@ pub fn retain_fd(kind: &FdKind, owner: usize) -> Result<(), ()> {
 }
 
 pub fn drop_ref(handle: usize, is_write: bool) {
+    drop_ref_inner(handle, is_write);
+    // A departed writer is end-of-file and a departed reader is a hangup, both
+    // of which somebody may be waiting on.
+    crate::pollset::note_pipe(handle);
+}
+
+fn drop_ref_inner(handle: usize, is_write: bool) {
     let flags = irq_save();
     unsafe {
         if handle >= MAX_PIPES || !PIPES[handle].in_use {

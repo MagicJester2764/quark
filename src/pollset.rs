@@ -218,6 +218,105 @@ pub fn readiness_of(tid: usize, fd: usize) -> u32 {
     readiness(tid, fd)
 }
 
+/// The task blocked in a wait on this set, if any.
+///
+/// One waiter per set. Two tasks waiting on one set would each have to be told
+/// which of them takes an event, and nothing here shares a set.
+static mut WAITERS: [usize; MAX_SETS] = [usize::MAX; MAX_SETS];
+
+/// Register as the waiter on a set, before the last scan and the block.
+///
+/// The order matters and is the whole of why this is correct: anything that
+/// becomes ready after this either happened before the scan that follows — so
+/// the scan sees it and we never block — or after it, and then `note_pipe`
+/// finds us parked and wakes us. There is no window between looking and
+/// sleeping.
+pub fn park(set: usize, tid: usize) {
+    if set < MAX_SETS {
+        let flags = irq_save();
+        unsafe { (*core::ptr::addr_of_mut!(WAITERS))[set] = tid };
+        irq_restore(flags);
+    }
+}
+
+pub fn unpark(set: usize) {
+    if set < MAX_SETS {
+        let flags = irq_save();
+        unsafe { (*core::ptr::addr_of_mut!(WAITERS))[set] = usize::MAX };
+        irq_restore(flags);
+    }
+}
+
+/// Does this task's descriptor `fd` name pipe `handle`?
+fn names_pipe(tid: usize, fd: usize, handle: usize) -> bool {
+    if fd >= crate::task::MAX_FDS {
+        return false;
+    }
+    let kind = unsafe {
+        match scheduler::get_task_mut(tid) {
+            Some(t) => t.fds[fd],
+            None => return false,
+        }
+    };
+    match kind {
+        FdKind::PipeRead(h) | FdKind::PipeWrite(h) => h == handle,
+        FdKind::StreamEnd { stream: s, end } => match stream::pipes_for(s, end) {
+            Some((rd, wr)) => rd == handle || wr == handle,
+            None => false,
+        },
+        _ => false,
+    }
+}
+
+/// A pipe changed state. Wake any set watching a descriptor that names it.
+///
+/// Sets are scanned rather than pipes carrying a list of their watchers: there
+/// are sixty-four sets, and the alternative puts a back pointer in every pipe
+/// for the benefit of the rare one anybody watches. The parked check comes
+/// first, so a system with nobody waiting pays sixty-four comparisons.
+pub fn note_pipe(handle: usize) {
+    let mut wake = [usize::MAX; MAX_SETS];
+    let mut n = 0;
+
+    let flags = irq_save();
+    unsafe {
+        let waiters = &*core::ptr::addr_of!(WAITERS);
+        for i in 0..MAX_SETS {
+            let waiter = waiters[i];
+            if waiter == usize::MAX || !sets()[i].in_use {
+                continue;
+            }
+            wake[n] = waiter;
+            n += 1;
+        }
+    }
+    irq_restore(flags);
+
+    // Deciding *which* of them care is done outside the lock, because
+    // `names_pipe` reaches into the task table and the stream table.
+    for i in 0..n {
+        let tid = wake[i];
+        let watches = {
+            let flags = irq_save();
+            let w = unsafe {
+                match sets().iter().position(|s| s.in_use && s.owner == tid) {
+                    Some(idx) => Some(sets()[idx].watches),
+                    None => None,
+                }
+            };
+            irq_restore(flags);
+            w
+        };
+        let Some(watches) = watches else { continue };
+        if watches
+            .iter()
+            .any(|w| w.used && names_pipe(tid, w.fd, handle))
+        {
+            crate::ipc::wake_sleeper(tid);
+        }
+    }
+}
+
 /// Collect what is ready. Returns how many entries of `out` were filled.
 pub fn scan(set: usize, tid: usize, out: &mut [(u64, u32)]) -> usize {
     if set >= MAX_SETS {
