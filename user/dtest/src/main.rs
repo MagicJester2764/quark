@@ -93,12 +93,50 @@ fn test_fd_table() {
     }
 }
 
+const SHM_AT: usize = 0x94_0000_0000;
+
+fn test_big_region() {
+    println!("shared memory:");
+    // 2000 pages is two 1280x800 buffers: the case that could not be
+    // expressed when a region was capped at 1024 pages.
+    let handle = match syscall::sys_shmem_create(2000) {
+        Ok(h) => h,
+        Err(()) => {
+            check("create a 2000-page region", false);
+            return;
+        }
+    };
+    check("create a 2000-page region", true);
+    check("map it", syscall::sys_shmem_map(handle, SHM_AT).is_ok());
+
+    // Write the page number into the first word of every page and read it
+    // back. A run list that stitches its runs together wrongly shows up here
+    // and nowhere else.
+    let mut good = true;
+    for p in 0..2000usize {
+        let at = (SHM_AT + p * 4096) as *mut u64;
+        unsafe { core::ptr::write_volatile(at, p as u64 ^ 0x5A5A_0000) };
+    }
+    for p in 0..2000usize {
+        let at = (SHM_AT + p * 4096) as *const u64;
+        if unsafe { core::ptr::read_volatile(at) } != p as u64 ^ 0x5A5A_0000 {
+            good = false;
+            break;
+        }
+    }
+    check("every one of its 2000 pages is distinct and readable", good);
+
+    check("unmap", syscall::sys_shmem_unmap(handle, SHM_AT).is_ok());
+    check("destroy", syscall::sys_shmem_destroy(handle).is_ok());
+}
+
 #[unsafe(no_mangle)]
 #[link_section = ".text.entry"]
 pub extern "C" fn _start() -> ! {
     println!("[dtest] Phase 10 acceptance");
     test_close();
     test_fd_table();
+    test_big_region();
 
     unsafe {
         println!("[dtest] {} passed, {} failed", PASSED, FAILED);

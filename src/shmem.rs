@@ -13,25 +13,48 @@
 use crate::{paging, pmm, scheduler};
 use crate::task::MAX_TASKS;
 
-const MAX_SHMEM: usize = 32;
+/// Regions in the system.
+///
+/// Thirty-two was half a region per task. Linux's System V limit is 4096 and
+/// its POSIX shared memory has no count at all; macOS's 32 is a legacy knob
+/// nothing modern uses. This is a fixed array like everything else in this
+/// kernel, so the number is what it costs. With the run list below a region is
+/// about 304 bytes, so 256 of them is roughly seventy-six kilobytes — most of
+/// it the runs, which is the price of not needing one contiguous span.
+const MAX_SHMEM: usize = 256;
+
 /// Pages one region may hold.
 ///
 /// Sixteen once, which was fine for passing a buffer between two services and
-/// useless for the thing shared memory is most obviously for: a window. A
-/// 1280x800 window is four megabytes, so this matches what `SYS_PHYS_ALLOC`
-/// already allows a task to take in one go.
-const MAX_PAGES_PER_REGION: usize = 1024;
+/// useless for the thing shared memory is most obviously for: a window. Then
+/// 1024, which is exactly a 1280x800 window and therefore one buffer and not
+/// two. A 1920x1080 buffer is 2025 pages, so this is two of them with room.
+const MAX_PAGES_PER_REGION: usize = 4096;
+
+/// Contiguous runs one region may be assembled from.
+///
+/// A region used to be a single run, which made the page limit a promise the
+/// allocator could not keep: 4096 contiguous pages is sixteen megabytes in one
+/// piece, on a machine with a hundred and twenty-eight. Sixteen runs covers any
+/// real allocation and costs 256 bytes per region, against the eight kilobytes
+/// an array of frame addresses would have — which is why the original chose a
+/// single run.
+const MAX_RUNS: usize = 16;
+
+#[derive(Clone, Copy)]
+struct Run {
+    base: usize,
+    pages: usize,
+}
 
 /// `access`/`mapped` are TID bitmasks, one bit per task.
 const _: () = assert!(MAX_TASKS <= u64::BITS as usize);
 
 struct ShmemRegion {
     in_use: bool,
-    /// Physical address of the first frame. A region is one contiguous run
-    /// rather than a list of frames: an array of a thousand addresses per
-    /// region is eight kilobytes of kernel memory each, and the contiguous
-    /// allocator was already there.
-    base: usize,
+    /// The contiguous runs this region is assembled from, in order.
+    runs: [Run; MAX_RUNS],
+    run_count: usize,
     page_count: usize,
     creator: usize,
     /// Bitmask of TIDs with access (bit N = TID N can map).
@@ -47,7 +70,8 @@ impl ShmemRegion {
     const fn empty() -> Self {
         ShmemRegion {
             in_use: false,
-            base: 0,
+            runs: [Run { base: 0, pages: 0 }; MAX_RUNS],
+            run_count: 0,
             page_count: 0,
             creator: 0,
             access: 0,
@@ -86,12 +110,29 @@ unsafe fn regions() -> &'static mut [ShmemRegion; MAX_SHMEM] { unsafe {
     &mut *core::ptr::addr_of_mut!(REGIONS)
 }}
 
+impl ShmemRegion {
+    /// Physical address of the region's `index`-th page.
+    ///
+    /// Walks the runs rather than dividing, because they are unequal. Sixteen
+    /// at most, and every caller walks a region in order anyway.
+    fn frame_at(&self, index: usize) -> Option<usize> {
+        let mut seen = 0;
+        for r in &self.runs[..self.run_count] {
+            if index < seen + r.pages {
+                return Some(r.base + (index - seen) * 4096);
+            }
+            seen += r.pages;
+        }
+        None
+    }
+}
+
 /// Release a region's frames and reset the slot. Interrupts must be off.
 unsafe fn release(region: &mut ShmemRegion) {
     let mut freed = 0;
-    if region.base != 0 {
-        for j in 0..region.page_count {
-            pmm::free(pmm::PhysFrame::from_address(region.base + j * 4096));
+    for r in &region.runs[..region.run_count] {
+        for j in 0..r.pages {
+            pmm::free(pmm::PhysFrame::from_address(r.base + j * 4096));
             freed += 1;
         }
     }
@@ -139,21 +180,47 @@ pub fn create(pages: usize) -> u64 {
     }
     irq_restore(flags);
 
-    // One contiguous run for the whole region. On failure, roll it back.
-    let base = match pmm::alloc_contiguous(pages) {
-        Some(frame) => frame.address(),
-        None => {
-            let flags = irq_save();
-            unsafe { release(&mut regions()[handle]) };
-            irq_restore(flags);
-            return u64::MAX;
+    // Take the largest contiguous runs the allocator will give, halving the
+    // request whenever it refuses. A fresh machine satisfies this in one run;
+    // a fragmented one in several, which is the entire point of a run list.
+    let mut want = pages;
+    let mut got = 0usize;
+    let mut runs = [Run { base: 0, pages: 0 }; MAX_RUNS];
+    let mut run_count = 0usize;
+    while got < pages && run_count < MAX_RUNS && want > 0 {
+        let ask = want.min(pages - got);
+        match pmm::alloc_contiguous(ask) {
+            Some(frame) => {
+                runs[run_count] = Run { base: frame.address(), pages: ask };
+                run_count += 1;
+                got += ask;
+            }
+            None => want /= 2,
         }
-    };
-    // Zero it (identity-mapped) so it cannot leak whatever the previous owner
-    // left behind.
-    unsafe { core::ptr::write_bytes(base as *mut u8, 0, pages * 4096) };
+    }
+    if got < pages {
+        // Hand back what was taken. `release` frees by the run list, so give
+        // it the partial one rather than leaking it.
+        let flags = irq_save();
+        unsafe {
+            let region = &mut regions()[handle];
+            region.runs = runs;
+            region.run_count = run_count;
+            release(region);
+        }
+        irq_restore(flags);
+        return u64::MAX;
+    }
+    // Zero every run (identity-mapped) so nothing leaks from a previous owner.
+    for r in &runs[..run_count] {
+        unsafe { core::ptr::write_bytes(r.base as *mut u8, 0, r.pages * 4096) };
+    }
     let flags = irq_save();
-    unsafe { regions()[handle].base = base };
+    unsafe {
+        let region = &mut regions()[handle];
+        region.runs = runs;
+        region.run_count = run_count;
+    }
     irq_restore(flags);
 
     scheduler::current_task_charge_mem(pages);
@@ -198,7 +265,17 @@ pub fn map(handle: usize, vaddr: usize) -> u64 {
         let pte_flags = paging::PRESENT | paging::WRITABLE | paging::USER;
         for i in 0..page_count {
             let v = vaddr + i * 4096;
-            if paging::map_page(cr3, v, region.base + i * 4096, pte_flags).is_err() {
+            let phys = match region.frame_at(i) {
+                Some(p) => p,
+                None => {
+                    for j in 0..i {
+                        let _ = paging::unmap_page(cr3, vaddr + j * 4096);
+                    }
+                    irq_restore(flags);
+                    return u64::MAX;
+                }
+            };
+            if paging::map_page(cr3, v, phys, pte_flags).is_err() {
                 for j in 0..i {
                     let _ = paging::unmap_page(cr3, vaddr + j * 4096);
                 }
