@@ -46,7 +46,8 @@ for want of them.
 | `poll()` on the connection | nothing at all | **Phase 10** |
 | `pthread_mutex`, `pthread_cond` in `wl_display` | futex only | **Phase 9** |
 | libffi, for dispatching into listeners | — | port; still a hard dependency at libwayland 1.26.90 |
-| libwayland-client | — | port, patched — see below |
+| libwayland-client | — | port, **unpatched** — see below |
+| an environment (`getenv`/`setenv`) | nothing at all | new; what makes the above unpatched |
 
 The compositor is **our own code**. libwayland-server is not used, which is what
 keeps `epoll` off this list: it belongs to that library's event loop, not to the
@@ -175,21 +176,47 @@ it lives in one place.
 
 ## The Quark port of libwayland
 
-Patched, and kept in `explosion/toolchain/patches/` beside the musl and gcc
-patches. Two things need changing and the rest should compile.
+**There is no patch.** That was the plan until `wayland-client.c` was actually
+read, and the first thing `wl_display_connect` does is:
 
-**Finding the compositor.** `wl_display_connect` reads `$WAYLAND_DISPLAY` and
-opens a socket at `$XDG_RUNTIME_DIR/wayland-0`. Quark has no environment and no
-filesystem sockets. The Quark path is a nameserver lookup for `wm` and an IPC
-handshake in which the compositor creates a socketpair and installs one end in
-the caller's descriptor table; `wl_display_connect` returns that descriptor and
-everything above it is unmodified. `wl_display_connect_to_fd` already exists and
-does the rest, so the patch is small and confined to one function.
+```c
+connection = getenv("WAYLAND_SOCKET");
+if (connection) {
+        fd = strtol(connection, &end, 10);
+        ...
+        unsetenv("WAYLAND_SOCKET");
+} else {
+        fd = connect_to_socket(name);   /* $WAYLAND_DISPLAY, $XDG_RUNTIME_DIR */
+}
+return wl_display_connect_to_fd(fd);
+```
+
+`WAYLAND_SOCKET` holds a **descriptor number**, already connected. It is the
+supported path for socket-activated clients, and it is exactly the shape Quark
+already has: the compositor creates a socketpair, installs one end in the
+client's descriptor table with `SYS_FD_DUP`, and spawns it with
+`WAYLAND_SOCKET=3`. Upstream libwayland, unmodified.
+
+So no filesystem socket namespace is needed — no socket inodes in the VFS, no
+`bind`, `listen`, `accept` or `connect` by path. That is a large piece of work
+this does not have to do, and it can wait until something actually wants it.
+
+**What is needed instead is an environment,** which Quark has none of at all.
+That is much the smaller job and it is wanted regardless: `TERM`, `LANG`,
+`HOME` and `PATH` are asked for by essentially everything that will ever be
+ported here, and Phase 6 already records their absence as a gap. It means an
+`envp` block in what the spawner stages, inheritance across spawn, and `getenv`
+and `setenv`/`unsetenv` in both C libraries — `wl_display_connect` calls
+`unsetenv`, so the environment has to be mutable rather than a read-only image.
+
+One detail that happens to work in our favour: the code calls
+`fcntl(fd, F_GETFD)` and only gives up on `-1` with `EBADF`. The translation
+layer already answers `fcntl` with 0, so it proceeds.
 
 **`wl_shm` memory.** A client creates the pool with `memfd_create` or
-`shm_open` and mmaps it. Phase 10's memory-as-a-descriptor is exactly that
-shape, so this may need no patch at all beyond musl answering `memfd_create` —
-which belongs in the translation layer rather than in libwayland.
+`shm_open` and mmaps it. Phase 10's memory-as-a-descriptor is that shape, so
+the work is in the translation layer answering `memfd_create`, not in
+libwayland.
 
 Everything else — the connection buffer, the closure marshalling, the proxy and
 listener machinery, the object id allocator — is portable C over `sendmsg`,
@@ -232,18 +259,47 @@ may do to what it starts, which is the trade `startx` made by being setuid.
 
 | | Client | What it proves | What it needs beyond the compositor |
 |---|---|---|---|
-| **MVP** | `weston-simple-shm` | a real Wayland client, unmodified, draws on Quark | libffi, libwayland-client, xdg-shell |
+| **MVP** | `weston-simple-shm` | a real Wayland client, unmodified, draws on Quark | libffi, libwayland-client, xdg-shell, an environment |
 | **Near** | `weston-terminal` | text, input, clipboard, menus | cairo, pixman, freetype, fontconfig |
 | **Mid to long** | GTK and Qt applications | a desktop is possible | glib, gio, pango, harfbuzz, and further |
 
+The MVP deliberately has **no seat**. It answers one question — can an
+unmodified client somebody else wrote run here — and input does not move that
+answer, while the highest-risk single item in this phase is the i8042
+keyboard/mouse demultiplex, which can wedge the keyboard. Coupling the two
+makes one failure look like the other. Verification does not need input either:
+`weston-simple-shm` is checked by screendump.
+
+The usual argument against deferring input is rework — if the compositor's wait
+loop has to be restructured to wait on a second thing, building it around one
+is wasted. Choosing an epoll-like object removes that argument: the loop waits
+on a *set*, and adding input later adds a descriptor to it.
+
+So input follows immediately rather than eventually:
+
+- **8a** transport, buffers, `xdg-shell` — `weston-simple-shm` draws.
+- **8b** `wl_seat` and `wl_keyboard` — mostly re-plumbing input that already
+  works onto the new protocol.
+- **8c** `wl_pointer` — the genuinely new work: the i8042 demultiplex, the
+  cursor surface, click-to-focus and drag.
+
 ## Open questions
+
+**Answered since this was written:**
+
+- **Waiting is an epoll-like object**, decided 2026-09-10. It scales better
+  than an array-taking call and is the primitive worth having. But
+  libwayland-client calls `poll()`, so a one-shot `poll` taking an array ships
+  alongside it as a thin wrapper — otherwise every frame costs three system
+  calls to build and tear down a set for two descriptors.
+- **The text console stays a direct `user/fb` claimant**, and is renamed
+  `qtty`. Making it a Wayland client would mean a compositor must be running
+  for a machine to have a console, which is backwards for the thing it boots
+  into. `qterm` is Quark's own Wayland terminal, later; `weston-terminal` is
+  the ported client that proves the protocol first. The shell becomes `qsh`,
+  which is a different domain and can happen whenever.
+
+**Still open:**
 
 - **Which protocol versions the milestone clients actually demand.** Answerable
   by running them and reading the error, and not before.
-- **Whether `poll` is a syscall or a descriptor.** A syscall taking an array is
-  the obvious shape; an epoll-like object scales better and is more to build.
-  Phase 10's decision, not this one's.
-- **Whether the compositor keeps a Quark-native path at all.** The text console
-  is a framebuffer client that does not need Wayland, and making it speak the
-  protocol to draw a TTY may be worse than leaving it as a direct claimant of
-  `user/fb`. Decide once the compositor exists.
