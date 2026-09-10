@@ -94,6 +94,7 @@ pub const SYS_FD_RECV: u64 = 74;
 pub const SYS_POLLSET_CREATE: u64 = 75;
 pub const SYS_POLLSET_CTL: u64 = 76;
 pub const SYS_POLLSET_WAIT: u64 = 77;
+pub const SYS_POLL: u64 = 78;
 
 // --- 0x50  capabilities ---
 pub const SYS_CAP_MINT: u64 = 80;
@@ -1182,6 +1183,91 @@ extern "C" fn syscall_dispatch(
                     u64::MAX
                 }
             }
+        }
+        SYS_POLL => {
+            // arg0 = array of (u32 fd, u32 events, u32 revents, u32 pad),
+            // arg1 = count, arg2 = timeout in ticks.
+            //
+            // A set built inside the kernel and thrown away. The saving is in
+            // the syscall count, which is where it is actually spent:
+            // libwayland polls two descriptors once per dispatch, and making
+            // it create, fill and destroy a set from user space would be three
+            // calls where one will do. Waiting cannot be done without a set,
+            // because that is what a pipe becoming ready looks for.
+            let n = (arg1 as usize).min(32);
+            if n == 0 || !validate_user_ptr_mut(arg0, (n * 16) as u64) {
+                return u64::MAX;
+            }
+            let tid = scheduler::current_tid();
+
+            let mut want = [(0usize, 0u32); 32];
+            {
+                let _ua = crate::cpu::UserAccess::begin();
+                for i in 0..n {
+                    unsafe {
+                        let p = (arg0 as *const u8).add(i * 16);
+                        want[i] = (*(p as *const u32) as usize, *(p.add(4) as *const u32));
+                    }
+                }
+            }
+
+            let set = match crate::pollset::create(tid) {
+                Some(s) => s,
+                None => return u64::MAX,
+            };
+            let mut rev = [0u32; 32];
+            let mut invalid = 0;
+            for i in 0..n {
+                if crate::pollset::watchable(tid, want[i].0) {
+                    // The index is the token, so a hit names its own entry.
+                    crate::pollset::ctl(set, tid, 0, want[i].0, want[i].1, i as u64);
+                } else {
+                    rev[i] = crate::pollset::INVALID;
+                    invalid += 1;
+                }
+            }
+
+            let deadline = crate::pit::ticks().saturating_add(arg2);
+            let mut found = [(0u64, 0u32); 32];
+            let mut hits = 0usize;
+            loop {
+                let got = crate::pollset::scan(set, tid, &mut found[..n]);
+                if got > 0 {
+                    for i in 0..got {
+                        let idx = found[i].0 as usize;
+                        if idx < n {
+                            rev[idx] |= found[i].1;
+                        }
+                    }
+                    hits = got;
+                    break;
+                }
+                // An invalid entry is an answer, so do not sleep on top of it.
+                if invalid > 0 {
+                    break;
+                }
+                let now = crate::pit::ticks();
+                if now >= deadline {
+                    break;
+                }
+                crate::pollset::park(set, tid);
+                if crate::pollset::scan(set, tid, &mut found[..n]) > 0 {
+                    crate::pollset::unpark(set);
+                    continue;
+                }
+                let _ = crate::ipc::sys_recv_timeout(tid, deadline - now);
+                crate::pollset::unpark(set);
+            }
+            crate::pollset::unpark(set);
+            crate::pollset::destroy(set);
+
+            {
+                let _ua = crate::cpu::UserAccess::begin();
+                for i in 0..n {
+                    unsafe { *((arg0 as *mut u8).add(i * 16 + 8) as *mut u32) = rev[i] };
+                }
+            }
+            (hits + invalid) as u64
         }
         SYS_POLLSET_CREATE => {
             let tid = scheduler::current_tid();

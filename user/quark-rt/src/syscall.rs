@@ -61,10 +61,14 @@ pub const SYS_FD_RECV: u64 = 74;
 pub const SYS_POLLSET_CREATE: u64 = 75;
 pub const SYS_POLLSET_CTL: u64 = 76;
 pub const SYS_POLLSET_WAIT: u64 = 77;
+pub const SYS_POLL: u64 = 78;
 
 pub const POLL_READABLE: u32 = 1;
 pub const POLL_WRITABLE: u32 = 2;
 pub const POLL_HANGUP: u32 = 4;
+/// A descriptor that cannot be waited on. Reported by [`sys_poll`] in
+/// `revents`; [`sys_pollset_add`] refuses such a descriptor outright instead.
+pub const POLL_INVALID: u32 = 8;
 
 // --- 0x50  capabilities ---
 pub const SYS_CAP_MINT: u64 = 80;
@@ -608,6 +612,37 @@ pub fn sleep_ms(ms: u64) {
     // PIT runs at 100 Hz → 1 tick = 10 ms. Round up.
     let ticks = (ms + 9) / 10;
     sleep_ticks(ticks);
+}
+
+/// One descriptor to watch, and what it did.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct PollFd {
+    pub fd: u32,
+    pub events: u32,
+    pub revents: u32,
+    pub _pad: u32,
+}
+
+impl PollFd {
+    pub const fn new(fd: usize, events: u32) -> Self {
+        PollFd { fd: fd as u32, events, revents: 0, _pad: 0 }
+    }
+}
+
+/// Wait on several descriptors without building a set.
+///
+/// A set is the better primitive when it is waited on many times; this is for
+/// the caller that waits once, which is what `poll(2)` is and what libwayland
+/// calls every time it dispatches. The kernel builds a set internally, so the
+/// saving is the two system calls that would otherwise bracket every wait.
+///
+/// Returns how many entries have a non-zero `revents`.
+pub fn sys_poll(fds: &mut [PollFd], timeout_ticks: u64) -> Result<usize, ()> {
+    let ret = unsafe {
+        syscall3(SYS_POLL, fds.as_mut_ptr() as u64, fds.len() as u64, timeout_ticks)
+    };
+    if ret == u64::MAX { Err(()) } else { Ok(ret as usize) }
 }
 
 /// One ready descriptor, as the kernel writes it.

@@ -443,6 +443,57 @@ fn test_wake_latency() {
     let _ = syscall::sys_fd_close(b);
 }
 
+fn test_poll() {
+    println!("one-shot poll:");
+    let (a, b) = match syscall::sys_socketpair() {
+        Ok(p) => p,
+        Err(()) => { check("a pair", false); return; }
+    };
+
+    // `a` is writable and `b` is not readable, so exactly one fires — and it
+    // has to land in the right entry, which is what revents is for.
+    let mut fds = [
+        syscall::PollFd::new(b, syscall::POLL_READABLE),
+        syscall::PollFd::new(a, syscall::POLL_WRITABLE),
+    ];
+    check("the writable end fires", syscall::sys_poll(&mut fds, 50) == Ok(1));
+    check(
+        "and it is the second entry",
+        fds[1].revents & syscall::POLL_WRITABLE != 0,
+    );
+    check("the first reports nothing", fds[0].revents == 0);
+
+    // Nothing ready: run the timeout rather than returning early.
+    let mut fds = [syscall::PollFd::new(b, syscall::POLL_READABLE)];
+    let before = syscall::sys_ticks();
+    let n = syscall::sys_poll(&mut fds, 15);
+    let elapsed = syscall::sys_ticks() - before;
+    check("nothing ready times out", n == Ok(0) && elapsed >= 15);
+
+    let _ = syscall::sys_fd_write(a, b"z");
+    let mut fds = [syscall::PollFd::new(b, syscall::POLL_READABLE)];
+    check("after a write it is readable", syscall::sys_poll(&mut fds, 50) == Ok(1));
+
+    // A descriptor that cannot be waited on is reported as invalid rather than
+    // failing the whole call, which is what poll(2) does.
+    let mut fds = [
+        syscall::PollFd::new(30, syscall::POLL_READABLE),
+        syscall::PollFd::new(b, syscall::POLL_READABLE),
+    ];
+    let n = syscall::sys_poll(&mut fds, 50);
+    check("an unwaitable descriptor is reported, not fatal", n == Ok(2));
+    check(
+        "and it is marked invalid",
+        fds[0].revents & syscall::POLL_INVALID != 0,
+    );
+    check("while the good one still reports", fds[1].revents & syscall::POLL_READABLE != 0);
+
+    let mut buf = [0u8; 4];
+    let _ = syscall::sys_fd_read(b, &mut buf);
+    let _ = syscall::sys_fd_close(a);
+    let _ = syscall::sys_fd_close(b);
+}
+
 #[unsafe(no_mangle)]
 #[link_section = ".text.entry"]
 pub extern "C" fn _start() -> ! {
@@ -456,6 +507,7 @@ pub extern "C" fn _start() -> ! {
     test_no_leak();
     test_pollset();
     test_wake_latency();
+    test_poll();
 
     unsafe {
         println!("[dtest] {} passed, {} failed", PASSED, FAILED);

@@ -21,6 +21,14 @@ const MAX_WATCHED: usize = 32;
 pub const READABLE: u32 = 1;
 pub const WRITABLE: u32 = 2;
 pub const HANGUP: u32 = 4;
+/// A descriptor that cannot be waited on at all.
+///
+/// `poll(2)` reports this in `revents` rather than failing the call, because
+/// one bad entry should not deny the caller the answer about the others. The
+/// set-shaped interface refuses at `ctl` time instead: there the caller is
+/// building something to reuse, and a watch that can never fire is a mistake
+/// worth hearing about once rather than on every wait.
+pub const INVALID: u32 = 8;
 
 #[derive(Clone, Copy)]
 struct Watch {
