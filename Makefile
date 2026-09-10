@@ -104,6 +104,8 @@ PING_ELF := $(PING_DIR)/target/$(TARGET)/release/ping
 
 DTEST_DIR := user/dtest
 DTEST_ELF := $(DTEST_DIR)/target/$(TARGET)/release/dtest
+DCHILD_DIR := user/dchild
+DCHILD_ELF := $(DCHILD_DIR)/target/$(TARGET)/release/dchild
 
 SHUTDOWN_DIR := user/shutdown
 SHUTDOWN_ELF := $(SHUTDOWN_DIR)/target/$(TARGET)/release/shutdown
@@ -137,7 +139,7 @@ $(FAT32_DRV_BIN): FORCE
 	cd $(FAT32_DRV_DIR) && cargo build --release
 	objcopy -O binary $(FAT32_DRV_ELF) $(FAT32_DRV_BIN)
 
-user: $(INIT_ELF) $(HOSTED_ELFS) $(NS_ELF) $(KBD_ELF) $(CON_ELF) $(FB_ELF) $(WM_ELF) $(INP_ELF) $(DISK_ELF) $(DISKTEST_ELF) $(VFS_ELF) $(NET_ELF) $(SHELL_ELF) $(ECHO_ELF) $(LS_ELF) $(CAT_ELF) $(LOGIN_ELF) $(PS_ELF) $(IPCPING_ELF) $(PING_ELF) $(SHUTDOWN_ELF) $(CAPDEMO_ELF) $(THREADTEST_ELF) $(SOCKTEST_ELF) $(FSTEST_ELF) $(WMDEMO_ELF) $(WMTYPE_ELF) $(CWC_ELF) $(DTEST_ELF) $(ENVTEST_ELF)
+user: $(INIT_ELF) $(HOSTED_ELFS) $(NS_ELF) $(KBD_ELF) $(CON_ELF) $(FB_ELF) $(WM_ELF) $(INP_ELF) $(DISK_ELF) $(DISKTEST_ELF) $(VFS_ELF) $(NET_ELF) $(SHELL_ELF) $(ECHO_ELF) $(LS_ELF) $(CAT_ELF) $(LOGIN_ELF) $(PS_ELF) $(IPCPING_ELF) $(PING_ELF) $(SHUTDOWN_ELF) $(CAPDEMO_ELF) $(THREADTEST_ELF) $(SOCKTEST_ELF) $(FSTEST_ELF) $(WMDEMO_ELF) $(WMTYPE_ELF) $(CWC_ELF) $(DTEST_ELF) $(DCHILD_ELF) $(ENVTEST_ELF)
 
 $(INIT_ELF): FORCE
 	cd $(INIT_DIR) && cargo build --release
@@ -181,6 +183,9 @@ $(foreach p,$(HOSTED_PROGRAMS),$(eval $(call HOSTED_BUILD_RULE,$(p))))
 
 $(DTEST_ELF): FORCE
 	cd $(DTEST_DIR) && cargo build --release
+
+$(DCHILD_ELF): FORCE
+	cd $(DCHILD_DIR) && cargo build --release
 
 $(NS_ELF): FORCE
 	cd $(NS_DIR) && cargo build --release
@@ -306,7 +311,7 @@ BOOT_SERVICES := nameserver:NAMESRVR keyboard:KEYBOARD console:CONSOLE \
                  input:INPUT disk:DISK vfs:VFS net:NET fb:FB
 USR_PROGRAMS  := disktest:DISKTEST shell:SHELL echo:ECHO ls:LS cat:CAT \
                  login:LOGIN ps:PS ipcping:IPCPING ping:PING \
-                 shutdown:SHUTDOWN dtest:DTEST capdemo:CAPDEMO threadtest:THREADTEST socktest:SOCKTEST fstest:FSTEST wm:WM wmdemo:WMDEMO wmtype:WMTYPE
+                 shutdown:SHUTDOWN dtest:DTEST dchild:DCHILD capdemo:CAPDEMO threadtest:THREADTEST socktest:SOCKTEST fstest:FSTEST wm:WM wmdemo:WMDEMO wmtype:WMTYPE
 
 # Programs written in C, built against user/libc.
 C_PROGRAMS    := cwc:CWC envtest:ENVTEST

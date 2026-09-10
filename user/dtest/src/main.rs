@@ -8,7 +8,7 @@
 //! line. Each section corresponds to one task of the Phase 10 plan.
 
 use quark_rt::manifest::CapReq;
-use quark_rt::{println, syscall, thread};
+use quark_rt::{nameserver, println, spawn, syscall, thread, vfs};
 
 quark_rt::manifest!([CapReq::task_mgmt(0), CapReq::phys_alloc(64)]);
 
@@ -513,6 +513,107 @@ fn test_environment() {
     check("and argv[0] is this program", quark_rt::args::argv(0) == Some(&b"dtest"[..]));
 }
 
+const CHILD_IMAGE: usize = 0x98_0000_0000;
+const THEIR_MEM: usize = 0x99_0000_0000;
+const WITNESS: u64 = 0x0D15_EA5E_D15C_0DE5;
+
+static SPAWN_SCRATCH: spawn::Scratch = spawn::Scratch {
+    elf: 0x9A_0000_0000,
+    stack: 0x9B_0000_0000,
+    args: 0x9C_0000_0000,
+};
+
+/// Read `/usr/bin/dchild` and load it. Modelled on how `wm` starts a session
+/// program: the image comes through the VFS, `spawn::load` builds the address
+/// space, and the manifest decides what it is granted.
+fn load_child() -> Option<spawn::Spawned> {
+    let vfs_tid = nameserver::lookup_retry(b"vfs", 20)?;
+    // Lowercase for ext2, uppercase with .ELF for FAT32 — the two spellings
+    // the shell already tries.
+    let (handle, size, _) = match vfs::open(vfs_tid, b"/usr/bin/dchild") {
+        Ok(h) => h,
+        Err(_) => vfs::open(vfs_tid, b"/usr/bin/DCHILD.ELF").ok()?,
+    };
+    let size = size as usize;
+    let pages = (size + 4095) / 4096;
+    for p in 0..pages {
+        let frame = syscall::sys_phys_alloc(1).ok()?;
+        syscall::sys_map_phys(frame, CHILD_IMAGE + p * 4096, 1).ok()?;
+        let want = 4096.min(size - p * 4096) as u32;
+        vfs::read(vfs_tid, handle, frame, (p * 4096) as u32, want).ok()?;
+    }
+    let _ = vfs::close(vfs_tid, handle);
+
+    let image = unsafe { core::slice::from_raw_parts(CHILD_IMAGE as *const u8, size) };
+    let info = spawn::load(image, &SPAWN_SCRATCH).ok()?;
+    quark_rt::manifest::grant_image(info.tid, image, 12);
+    // It needs to be able to reach the nameserver, and somewhere to print.
+    let _ = syscall::sys_cap_grant(info.tid, syscall::SLOT_ENDPOINT, syscall::SLOT_ENDPOINT);
+    let _ = syscall::sys_fd_dup(info.tid, 1, 1);
+    let _ = syscall::sys_fd_dup(info.tid, 2, 2);
+    Some(info)
+}
+
+fn test_across_address_spaces() {
+    println!("across address spaces:");
+    let (mine, theirs) = match syscall::sys_socketpair() {
+        Ok(p) => p,
+        Err(()) => { check("a pair", false); return; }
+    };
+    let Some(info) = load_child() else {
+        check("load /usr/bin/dchild", false);
+        return;
+    };
+    check("load /usr/bin/dchild", true);
+
+    // Hand the child its end, then drop ours. If an end were a flag rather
+    // than a count, this would tell the child's peer the end had gone.
+    check(
+        "give the child descriptor 3",
+        syscall::sys_fd_dup(info.tid, 3, theirs).is_ok(),
+    );
+    check("drop our copy of it", syscall::sys_fd_close(theirs).is_ok());
+    check("the stream is still alive", syscall::sys_fd_write(mine, b"go!\n") == 4);
+
+    if info.start().is_err() {
+        check("the child runs", false);
+        return;
+    }
+    check("the child runs", true);
+
+    // Wait for its answer with the set, which is what makes this the whole
+    // phase rather than three quarters of it.
+    let set = match syscall::sys_pollset_create() {
+        Ok(s) => s,
+        Err(()) => { check("a set to wait on", false); return; }
+    };
+    let _ = syscall::sys_pollset_add(set, mine, syscall::POLL_READABLE, 7);
+    let mut ready = [syscall::Ready::empty(); 2];
+    let n = syscall::sys_pollset_wait(set, &mut ready, 500);
+    check(
+        "the set wakes for the child's reply",
+        n == Ok(1) && ready[0].token == 7,
+    );
+
+    let mut buf = [0u8; 8];
+    check(
+        "bytes and a descriptor arrived",
+        syscall::sys_fd_recv(mine, &mut buf, Some(25)) == Ok((4, true)),
+    );
+    check(
+        "map memory the other task allocated",
+        syscall::sys_mmap_fd(25, THEIR_MEM).is_ok(),
+    );
+    check(
+        "and read what it wrote there",
+        unsafe { core::ptr::read_volatile(THEIR_MEM as *const u64) } == WITNESS,
+    );
+
+    let _ = syscall::sys_fd_close(25);
+    let _ = syscall::sys_fd_close(set);
+    let _ = syscall::sys_fd_close(mine);
+}
+
 #[unsafe(no_mangle)]
 #[link_section = ".text.entry"]
 pub extern "C" fn _start() -> ! {
@@ -528,6 +629,7 @@ pub extern "C" fn _start() -> ! {
     test_wake_latency();
     test_poll();
     test_environment();
+    test_across_address_spaces();
 
     unsafe {
         println!("[dtest] {} passed, {} failed", PASSED, FAILED);
