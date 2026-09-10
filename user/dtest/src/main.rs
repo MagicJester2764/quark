@@ -8,6 +8,7 @@
 //! line. Each section corresponds to one task of the Phase 10 plan.
 
 use quark_rt::manifest::CapReq;
+use quark_rt::wl::wire;
 use quark_rt::{nameserver, println, spawn, sync, syscall, thread, vfs};
 
 quark_rt::manifest!([CapReq::task_mgmt(0), CapReq::phys_alloc(64)]);
@@ -722,6 +723,46 @@ fn test_sync() {
     check("and there is not a second one", !SEM.try_acquire());
 }
 
+fn test_wire() {
+    println!("wayland wire format:");
+    // wl_display.get_registry as libwayland actually sent it down a Quark
+    // socketpair: object 1, opcode 1, size 12, one new_id argument of 2.
+    // Twelve real bytes rather than twelve invented ones.
+    let msg: [u8; 12] = [
+        0x01, 0x00, 0x00, 0x00, // object 1
+        0x01, 0x00, 0x0C, 0x00, // opcode 1, size 12
+        0x02, 0x00, 0x00, 0x00, // new_id 2
+    ];
+    let h = wire::parse_header(&msg);
+    check("a header parses", h.is_some());
+    let Some(h) = h else { return };
+    check("object is 1", h.object == 1);
+    check("opcode is 1", h.opcode == 1);
+    check("size is 12", h.size == 12);
+    check("the argument is 2", wire::get_u32(&msg, 8) == Some(2));
+
+    let mut out = [0u8; 12];
+    wire::put_header(&mut out, wire::Header { object: 1, opcode: 1, size: 12 });
+    wire::put_u32(&mut out, 8, 2);
+    check("a header we write is the one libwayland wrote", out == msg);
+
+    check("a truncated header is refused", wire::parse_header(&msg[..7]).is_none());
+    // A size that does not cover its own header would advance a read cursor
+    // by less than nothing.
+    let bad: [u8; 8] = [1, 0, 0, 0, 1, 0, 4, 0];
+    check("a size smaller than a header is refused", wire::parse_header(&bad).is_none());
+
+    let mut sb = [0u8; 16];
+    let n = wire::put_str(&mut sb, 0, b"wl_shm");
+    check("a string is length, bytes, NUL, padding", n == 12);
+    check("its length includes the NUL", wire::get_u32(&sb, 0) == Some(7));
+    check(
+        "and it reads back",
+        wire::get_str(&sb, 0).map(|(s, _)| s) == Some(&b"wl_shm"[..]),
+    );
+    check("padding rounds up to four", wire::pad4(7) == 8 && wire::pad4(8) == 8);
+}
+
 #[unsafe(no_mangle)]
 #[link_section = ".text.entry"]
 pub extern "C" fn _start() -> ! {
@@ -739,6 +780,7 @@ pub extern "C" fn _start() -> ! {
     test_environment();
     test_across_address_spaces();
     test_sync();
+    test_wire();
 
     unsafe {
         println!("[dtest] {} passed, {} failed", PASSED, FAILED);
