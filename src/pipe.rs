@@ -10,7 +10,13 @@
 use crate::scheduler;
 use crate::task::{FdKind, MAX_FDS};
 
-const MAX_PIPES: usize = 32;
+/// Pipes in the system.
+///
+/// Every stream is two of these, so a compositor holding a connection per
+/// client spends them quickly: ninety-six is thirty-two ordinary pipes plus
+/// two apiece for the thirty-two streams. Each carries a 4 KiB buffer inline,
+/// so the number is 384 KiB of kernel memory and is spent up front.
+const MAX_PIPES: usize = 96;
 const PIPE_BUF_SIZE: usize = 4096;
 const MAX_WAITERS: usize = 8;
 
@@ -80,6 +86,70 @@ const MAX_PIPES_PER_TASK: usize = 8;
 
 /// Create a new pipe. Returns the pipe handle index.
 /// Handles start at 1 (slot 0 is reserved so that 0 can mean "no pipe").
+/// A pipe for a stream, exempt from the per-task cap.
+///
+/// That cap exists because `sys_pipe_create` needs no capability, so one task
+/// could otherwise drain the table. A stream is bounded by its own table
+/// instead, and charging its two pipes against a task's eight would have meant
+/// four connections per program.
+pub fn create_for_stream() -> Option<usize> {
+    let creator = scheduler::current_tid();
+    let flags = irq_save();
+    let result = unsafe {
+        let mut found = None;
+        for i in 1..MAX_PIPES {
+            if !PIPES[i].in_use {
+                PIPES[i] = Pipe::new();
+                PIPES[i].in_use = true;
+                PIPES[i].creator = creator;
+                found = Some(i);
+                break;
+            }
+        }
+        found
+    };
+    irq_restore(flags);
+    result
+}
+
+/// Is a read able to return now — with bytes, or with the end-of-file a
+/// departed writer means?
+pub fn readable(handle: usize) -> bool {
+    let flags = irq_save();
+    let out = unsafe {
+        handle < MAX_PIPES
+            && PIPES[handle].in_use
+            && (PIPES[handle].len > 0 || PIPES[handle].writers == 0)
+    };
+    irq_restore(flags);
+    out
+}
+
+/// Is there room to write?
+pub fn writable(handle: usize) -> bool {
+    let flags = irq_save();
+    let out = unsafe {
+        handle < MAX_PIPES && PIPES[handle].in_use && PIPES[handle].len < PIPE_BUF_SIZE
+    };
+    irq_restore(flags);
+    out
+}
+
+/// Free a pipe that was created and never wired to anything.
+pub fn drop_unreferenced(handle: usize) {
+    let flags = irq_save();
+    unsafe {
+        if handle < MAX_PIPES
+            && PIPES[handle].in_use
+            && PIPES[handle].readers == 0
+            && PIPES[handle].writers == 0
+        {
+            PIPES[handle].in_use = false;
+        }
+    }
+    irq_restore(flags);
+}
+
 pub fn create() -> Option<usize> {
     let creator = scheduler::current_tid();
     let flags = irq_save();
@@ -351,6 +421,7 @@ pub fn release_fd(kind: &FdKind, owner: usize) {
         FdKind::PipeRead(handle) => drop_ref(*handle, false),
         FdKind::PipeWrite(handle) => drop_ref(*handle, true),
         FdKind::MemFd { handle } => crate::shmem::close_ref(*handle, owner),
+        FdKind::StreamEnd { stream, end } => crate::stream::close_end(*stream, *end),
         _ => {}
     }
 }
@@ -370,6 +441,7 @@ pub fn retain_fd(kind: &FdKind, owner: usize) -> Result<(), ()> {
             // Whoever ends up holding the copy may map it.
             if crate::shmem::add_access(*handle, owner) { Ok(()) } else { Err(()) }
         }
+        FdKind::StreamEnd { stream, end } => crate::stream::retain_end(*stream, *end),
         _ => Ok(()),
     }
 }

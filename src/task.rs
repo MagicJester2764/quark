@@ -28,6 +28,8 @@ pub enum FdKind {
     /// Shared memory, named by a descriptor so that it can be passed across a
     /// stream, inherited, and closed like anything else a program holds.
     MemFd { handle: usize },
+    /// One end of a connected pair. `end` is 0 or 1.
+    StreamEnd { stream: usize, end: u8 },
     /// A network connection, held by the net server as `handle`.
     ///
     /// Unlike `Ipc`, which is one-directional and carries a fixed tag, a

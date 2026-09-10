@@ -55,6 +55,7 @@ pub const SYS_FD_DUP: u64 = 68;
 pub const SYS_PIPE_CREATE: u64 = 69;
 pub const SYS_PIPE_FD_SET: u64 = 70;
 pub const SYS_FD_CLOSE: u64 = 71;
+pub const SYS_SOCKETPAIR: u64 = 72;
 
 // --- 0x50  capabilities ---
 pub const SYS_CAP_MINT: u64 = 80;
@@ -598,6 +599,20 @@ pub fn sleep_ms(ms: u64) {
     // PIT runs at 100 Hz → 1 tick = 10 ms. Round up.
     let ticks = (ms + 9) / 10;
     sleep_ticks(ticks);
+}
+
+/// A connected pair of byte streams, both ends in this task's table.
+///
+/// Either end may be moved into another task with `sys_fd_dup`; an end is
+/// reference counted, so the mover closing its own copy afterwards does not
+/// tell the peer the connection has gone.
+pub fn sys_socketpair() -> Result<(usize, usize), ()> {
+    let ret = unsafe { syscall0(SYS_SOCKETPAIR) };
+    if ret == u64::MAX {
+        Err(())
+    } else {
+        Ok(((ret >> 32) as usize, (ret & 0xFFFF_FFFF) as usize))
+    }
 }
 
 /// Allocate `pages` of shareable memory and name it with a descriptor.

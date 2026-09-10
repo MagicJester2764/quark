@@ -88,6 +88,7 @@ pub const SYS_FD_DUP: u64 = 68;
 pub const SYS_PIPE_CREATE: u64 = 69;
 pub const SYS_PIPE_FD_SET: u64 = 70;
 pub const SYS_FD_CLOSE: u64 = 71;
+pub const SYS_SOCKETPAIR: u64 = 72;
 
 // --- 0x50  capabilities ---
 pub const SYS_CAP_MINT: u64 = 80;
@@ -947,6 +948,12 @@ extern "C" fn syscall_dispatch(
                     crate::pipe::write(handle, ptr, len)
                 }
                 crate::task::FdKind::PipeRead(_) => u64::MAX,
+                crate::task::FdKind::StreamEnd { stream, end } => {
+                    match crate::stream::pipes_for(stream, end) {
+                        Some((_, wr)) => crate::pipe::write(wr, ptr, len),
+                        None => u64::MAX,
+                    }
+                }
                 // Memory is mapped, not written through. A stream of bytes is
                 // the wrong shape for it, and answering as if it were would
                 // put the caller's data somewhere it will never look.
@@ -983,6 +990,12 @@ extern "C" fn syscall_dispatch(
                     crate::pipe::read(handle, ptr, max_len)
                 }
                 crate::task::FdKind::PipeWrite(_) => u64::MAX,
+                crate::task::FdKind::StreamEnd { stream, end } => {
+                    match crate::stream::pipes_for(stream, end) {
+                        Some((rd, _)) => crate::pipe::read(rd, ptr, max_len),
+                        None => u64::MAX,
+                    }
+                }
                 // As with write: it is mapped, not read.
                 crate::task::FdKind::MemFd { .. } => u64::MAX,
                 crate::task::FdKind::Socket { net_tid, handle } => {
@@ -1108,6 +1121,32 @@ extern "C" fn syscall_dispatch(
             match scheduler::set_fd(target_tid, target_fd, kind) {
                 Ok(()) => 0,
                 Err(()) => u64::MAX,
+            }
+        }
+        SYS_SOCKETPAIR => {
+            // Both ends land in the caller's own table, the way socketpair(2)
+            // works. Moving one into a child is sys_fd_dup followed by closing
+            // our copy, which is why an end is reference counted.
+            let tid = scheduler::current_tid();
+            let s = match crate::stream::create(tid) {
+                Some(s) => s,
+                None => return u64::MAX,
+            };
+            let a = scheduler::install_fd(tid, crate::task::FdKind::StreamEnd { stream: s, end: 0 });
+            let b = scheduler::install_fd(tid, crate::task::FdKind::StreamEnd { stream: s, end: 1 });
+            match (a, b) {
+                (Some(a), Some(b)) => ((a as u64) << 32) | b as u64,
+                _ => {
+                    if let Some(fd) = a {
+                        let _ = scheduler::clear_fd(tid, fd);
+                    }
+                    if let Some(fd) = b {
+                        let _ = scheduler::clear_fd(tid, fd);
+                    }
+                    crate::stream::close_end(s, 0);
+                    crate::stream::close_end(s, 1);
+                    u64::MAX
+                }
             }
         }
         SYS_MEMFD_CREATE => {

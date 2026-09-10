@@ -157,6 +157,35 @@ fn test_memfd() {
     );
 }
 
+fn test_socketpair() {
+    println!("socketpair:");
+    let (a, b) = match syscall::sys_socketpair() {
+        Ok(p) => p,
+        Err(()) => {
+            check("create a pair", false);
+            return;
+        }
+    };
+    check("create a pair", a >= 3 && b >= 3 && a != b);
+
+    let mut buf = [0u8; 16];
+    check("a writes", syscall::sys_fd_write(a, b"ping") == 4);
+    check(
+        "b reads what a wrote",
+        syscall::sys_fd_read(b, &mut buf) == 4 && &buf[..4] == b"ping",
+    );
+    // The direction a pipe cannot do.
+    check("b writes", syscall::sys_fd_write(b, b"pong") == 4);
+    check(
+        "a reads what b wrote",
+        syscall::sys_fd_read(a, &mut buf) == 4 && &buf[..4] == b"pong",
+    );
+
+    check("close a", syscall::sys_fd_close(a).is_ok());
+    check("b now reads EOF", syscall::sys_fd_read(b, &mut buf) == 0);
+    check("close b", syscall::sys_fd_close(b).is_ok());
+}
+
 #[unsafe(no_mangle)]
 #[link_section = ".text.entry"]
 pub extern "C" fn _start() -> ! {
@@ -165,6 +194,7 @@ pub extern "C" fn _start() -> ! {
     test_fd_table();
     test_big_region();
     test_memfd();
+    test_socketpair();
 
     unsafe {
         println!("[dtest] {} passed, {} failed", PASSED, FAILED);
