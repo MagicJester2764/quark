@@ -52,6 +52,7 @@ pub const SYS_FD_SET: u64 = 67;
 pub const SYS_FD_DUP: u64 = 68;
 pub const SYS_PIPE_CREATE: u64 = 69;
 pub const SYS_PIPE_FD_SET: u64 = 70;
+pub const SYS_FD_CLOSE: u64 = 71;
 
 // --- 0x50  capabilities ---
 pub const SYS_CAP_MINT: u64 = 80;
@@ -595,6 +596,16 @@ pub fn sleep_ms(ms: u64) {
     // PIT runs at 100 Hz → 1 tick = 10 ms. Round up.
     let ticks = (ms + 9) / 10;
     sleep_ticks(ticks);
+}
+
+/// Release a descriptor.
+///
+/// The last reader or writer of a pipe closing is what makes the other end see
+/// end-of-file, so this is not merely tidiness: without it a pipe's writer can
+/// never go away and its reader waits for ever.
+pub fn sys_fd_close(fd: usize) -> Result<(), ()> {
+    let ret = unsafe { syscall1(SYS_FD_CLOSE, fd as u64) };
+    if ret == u64::MAX { Err(()) } else { Ok(()) }
 }
 
 /// Set the memory limit (in pages) for a task. 0 = unlimited.

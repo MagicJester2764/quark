@@ -335,15 +335,36 @@ pub fn write(handle: usize, buf: *const u8, len: usize) -> u64 {
 /// Decrements refcounts and wakes blocked waiters.
 pub fn cleanup_task_fds(fds: &[FdKind; MAX_FDS]) {
     for fd in fds.iter() {
-        match fd {
-            FdKind::PipeRead(handle) => drop_ref(*handle, false),
-            FdKind::PipeWrite(handle) => drop_ref(*handle, true),
-            _ => {}
-        }
+        release_fd(fd);
     }
 }
 
-fn drop_ref(handle: usize, is_write: bool) {
+/// Drop one descriptor's reference to whatever it names.
+///
+/// `cleanup_task_fds` does this for a whole table when a task dies; a task
+/// closing one descriptor needs exactly the same work for one entry.
+pub fn release_fd(kind: &FdKind) {
+    match kind {
+        FdKind::PipeRead(handle) => drop_ref(*handle, false),
+        FdKind::PipeWrite(handle) => drop_ref(*handle, true),
+        _ => {}
+    }
+}
+
+/// Take a reference on whatever a descriptor names, for a copy of it.
+///
+/// The mirror of `release_fd`, and deliberately beside it: `SYS_FD_DUP` and
+/// `SYS_PIPE_FD_SET` both make a second descriptor for one object, and a kind
+/// added to one of these and not the other leaks or double-frees.
+pub fn retain_fd(kind: &FdKind) -> Result<(), ()> {
+    match kind {
+        FdKind::PipeRead(handle) => add_ref(*handle, false),
+        FdKind::PipeWrite(handle) => add_ref(*handle, true),
+        _ => Ok(()),
+    }
+}
+
+pub fn drop_ref(handle: usize, is_write: bool) {
     let flags = irq_save();
     unsafe {
         if handle >= MAX_PIPES || !PIPES[handle].in_use {

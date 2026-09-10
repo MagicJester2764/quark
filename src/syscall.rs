@@ -85,6 +85,7 @@ pub const SYS_FD_SET: u64 = 67;
 pub const SYS_FD_DUP: u64 = 68;
 pub const SYS_PIPE_CREATE: u64 = 69;
 pub const SYS_PIPE_FD_SET: u64 = 70;
+pub const SYS_FD_CLOSE: u64 = 71;
 
 // --- 0x50  capabilities ---
 pub const SYS_CAP_MINT: u64 = 80;
@@ -1089,24 +1090,41 @@ extern "C" fn syscall_dispatch(
             if kind.is_empty() {
                 return u64::MAX;
             }
-            // If it's a pipe, bump the refcount
-            match kind {
-                crate::task::FdKind::PipeRead(handle) => {
-                    if crate::pipe::add_ref(handle, false).is_err() {
-                        return u64::MAX;
-                    }
-                }
-                crate::task::FdKind::PipeWrite(handle) => {
-                    if crate::pipe::add_ref(handle, true).is_err() {
-                        return u64::MAX;
-                    }
-                }
-                _ => {}
+            // A second descriptor for one object is a second reference to it.
+            // `retain_fd` is `release_fd`'s mirror, and keeping the match in
+            // one place is what stops a new kind of descriptor being
+            // remembered in one of them and forgotten in the other.
+            if crate::pipe::retain_fd(&kind).is_err() {
+                return u64::MAX;
             }
             match scheduler::set_fd(target_tid, target_fd, kind) {
                 Ok(()) => 0,
                 Err(()) => u64::MAX,
             }
+        }
+        SYS_FD_CLOSE => {
+            // Releasing a descriptor is releasing whatever it refers to: a
+            // pipe loses a reader or a writer, and a reader reaching zero is
+            // what turns the peer's next read into end-of-file. Nothing here
+            // needs a capability — a task may always drop its own.
+            let fd = arg0 as usize;
+            if fd >= crate::task::MAX_FDS {
+                return u64::MAX;
+            }
+            let tid = scheduler::current_tid();
+            // `get_task_mut` is an unsafe fn: it hands out a `&'static mut`
+            // into the task table, so every use is inside an unsafe block.
+            let kind = unsafe {
+                match scheduler::get_task_mut(tid) {
+                    Some(t) => core::mem::replace(&mut t.fds[fd], crate::task::FdKind::Empty),
+                    None => return u64::MAX,
+                }
+            };
+            if kind.is_empty() {
+                return u64::MAX;
+            }
+            crate::pipe::release_fd(&kind);
+            0
         }
         SYS_FUTEX_WAIT => {
             // arg0 = addr, arg1 = expected value

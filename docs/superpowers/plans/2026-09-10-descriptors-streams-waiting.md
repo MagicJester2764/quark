@@ -113,6 +113,26 @@ comes first, and it brings the harness the rest of the plan tests through.
 
 - [ ] **Step 1: Write the failing test**
 
+A new user program needs **three** files before its source, not one. Miss the
+config and it links at its default base rather than Quark's, and the kernel
+refuses the image with "failed to load ELF"; miss the symlink and the linker
+cannot find the script the config names.
+
+```bash
+mkdir -p user/dtest/.cargo
+ln -s ../linker.ld user/dtest/linker.ld
+```
+
+Create `user/dtest/.cargo/config.toml`:
+
+```toml
+[build]
+target = "x86_64-unknown-none"
+
+[target.x86_64-unknown-none]
+rustflags = ["-C", "link-arg=-Tlinker.ld", "-C", "relocation-model=static", "-C", "code-model=large"]
+```
+
 Create `user/dtest/Cargo.toml`:
 
 ```toml
@@ -3490,8 +3510,11 @@ plan would otherwise ship. So this is a task and not a note.
 
 - [ ] **Step 1: Write the failing test**
 
-Create `user/dchild/Cargo.toml`, the same shape as `user/dtest`'s with
-`name = "dchild"`.
+Create `user/dchild/` with the same three files `user/dtest` has before its
+source: `Cargo.toml` (with `name = "dchild"`), `.cargo/config.toml`, and a
+`linker.ld` symlink to `../linker.ld`. None is optional — without the config it
+links below `USER_MIN_ADDR` and the kernel refuses it, and without the symlink
+it does not link at all.
 
 Create `user/dchild/src/main.rs`:
 
