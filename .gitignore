@@ -9,3 +9,8 @@
 /rootfs
 /rootfs/etc
 /rootfs/etc/passwd
+
+# Editor scratch files. One of these was committed once.
+*.swp
+*.swo
+*~
