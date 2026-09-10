@@ -8,7 +8,7 @@
 //! line. Each section corresponds to one task of the Phase 10 plan.
 
 use quark_rt::manifest::CapReq;
-use quark_rt::{nameserver, println, spawn, syscall, thread, vfs};
+use quark_rt::{nameserver, println, spawn, sync, syscall, thread, vfs};
 
 quark_rt::manifest!([CapReq::task_mgmt(0), CapReq::phys_alloc(64)]);
 
@@ -609,9 +609,117 @@ fn test_across_address_spaces() {
         unsafe { core::ptr::read_volatile(THEIR_MEM as *const u64) } == WITNESS,
     );
 
+    // A lock living in memory the two processes share. The child blocks on it
+    // in its own address space and is woken from this one, which works only
+    // because the kernel keys its futex queue on the physical address.
+    let shared = unsafe { &*((THEIR_MEM + 64) as *const sync::Mutex<u64>) };
+    let held = shared.lock();
+    // The child is now blocked on this. Give it long enough to get there.
+    syscall::sleep_ticks(10);
+    drop(held);
+
+    // Wait for the child to finish with it.
+    let mut waited = 0;
+    loop {
+        {
+            let v = shared.lock();
+            if *v == 1 {
+                break;
+            }
+        }
+        syscall::sleep_ticks(1);
+        waited += 1;
+        if waited > 300 {
+            break;
+        }
+    }
+    check("a lock in shared memory works between processes", waited <= 300 && *shared.lock() == 1);
+
     let _ = syscall::sys_fd_close(25);
     let _ = syscall::sys_fd_close(set);
     let _ = syscall::sys_fd_close(mine);
+}
+
+static LOCK: sync::Mutex<u32> = sync::Mutex::new(0);
+static COND: sync::Condvar = sync::Condvar::new();
+static ONCE: sync::Once = sync::Once::new();
+static ONCE_RAN: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static SEM: sync::Semaphore = sync::Semaphore::new(0);
+static RW: sync::RwLock<u32> = sync::RwLock::new(7);
+
+/// Take the lock, change the value, and say so — after a delay, so the main
+/// task is genuinely blocked rather than arriving second.
+extern "C" fn sync_worker() -> ! {
+    syscall::sleep_ticks(5);
+    {
+        let mut held = LOCK.lock();
+        *held = 99;
+        COND.notify_one();
+    }
+    SEM.release();
+    syscall::sys_exit_code(0);
+}
+
+fn test_sync() {
+    println!("locks:");
+    // Uncontended, which is the path that must cost no system call at all.
+    {
+        let mut held = LOCK.lock();
+        *held = 1;
+        check("lock and write through it", *held == 1);
+        check("try_lock fails while it is held", LOCK.try_lock().is_none());
+    }
+    check("try_lock succeeds once it is free", LOCK.try_lock().is_some());
+    {
+        let mut held = LOCK.lock();
+        *held = 0;
+    }
+
+    ONCE.call_once(|| {
+        ONCE_RAN.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    });
+    ONCE.call_once(|| {
+        ONCE_RAN.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    });
+    check(
+        "once runs exactly once",
+        ONCE_RAN.load(core::sync::atomic::Ordering::Relaxed) == 1 && ONCE.is_completed(),
+    );
+
+    {
+        let a = RW.read();
+        let b = RW.read();
+        check("two readers at once", *a == 7 && *b == 7);
+    }
+    {
+        let mut w = RW.write();
+        *w = 8;
+    }
+    check("a writer changed it", *RW.read() == 8);
+
+    // Contention, which needs a second task: one task cannot both hold a lock
+    // and wait for it.
+    let Ok(_t) = thread::spawn_with_stack(sync_worker, 8) else {
+        check("start a thread to contend with", false);
+        return;
+    };
+    check("start a thread to contend with", true);
+
+    let before = syscall::sys_ticks();
+    let mut held = LOCK.lock();
+    while *held != 99 {
+        held = COND.wait(held);
+    }
+    let elapsed = syscall::sys_ticks() - before;
+    check("condvar woke with the value the other task set", *held == 99);
+    // It has to have waited — arriving after the worker had already finished
+    // would prove nothing about waiting — but not spun for a whole timeout.
+    check("and it waited rather than spun", elapsed >= 3 && elapsed < 200);
+    drop(held);
+
+    SEM.acquire();
+    check("semaphore permit arrived", true);
+    check("and there is not a second one", !SEM.try_acquire());
 }
 
 #[unsafe(no_mangle)]
@@ -630,6 +738,7 @@ pub extern "C" fn _start() -> ! {
     test_poll();
     test_environment();
     test_across_address_spaces();
+    test_sync();
 
     unsafe {
         println!("[dtest] {} passed, {} failed", PASSED, FAILED);

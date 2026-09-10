@@ -8,7 +8,7 @@
 //! which is what a Wayland client does with `wl_shm`, minus the drawing.
 
 use quark_rt::manifest::CapReq;
-use quark_rt::{println, syscall};
+use quark_rt::{println, sync, syscall};
 
 quark_rt::manifest!([CapReq::phys_alloc(16)]);
 
@@ -42,7 +42,17 @@ pub extern "C" fn _start() -> ! {
         println!("[dchild] send failed");
         syscall::sys_exit_code(5);
     }
-    println!("[dchild] sent");
+
+    // A lock in memory the two of us share. The parent holds it when this
+    // arrives, so acquiring it means blocking in one address space and being
+    // woken from another — which works because the kernel keys its wait queue
+    // on the physical address of the word, not the virtual one.
+    let shared = unsafe { &*((MINE + 64) as *const sync::Mutex<u64>) };
+    {
+        let mut held = shared.lock();
+        *held += 1;
+    }
+    println!("[dchild] sent, and took the shared lock");
     syscall::sys_exit_code(0);
 }
 
