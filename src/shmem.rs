@@ -290,6 +290,60 @@ pub fn map(handle: usize, vaddr: usize) -> u64 {
     result
 }
 
+/// Admit `tid` to a region, with no check on the caller.
+///
+/// This is not `grant`: it is reachable only when a *descriptor* for the region
+/// changes hands — received over a stream, or duplicated into a task by
+/// somebody already holding `TaskMgmt` over it. In both cases the transfer was
+/// asked for by one side and chosen by the other, which is more than `grant`
+/// requires of anybody.
+pub fn add_access(handle: usize, tid: usize) -> bool {
+    if handle >= MAX_SHMEM || tid >= MAX_TASKS {
+        return false;
+    }
+    let flags = irq_save();
+    let ok = unsafe {
+        let r = &mut regions()[handle];
+        if r.in_use && !r.pending_destroy {
+            r.access |= 1u64 << tid;
+            true
+        } else {
+            false
+        }
+    };
+    irq_restore(flags);
+    ok
+}
+
+/// Drop one task's descriptor reference to a region.
+///
+/// `tid` is passed rather than taken from the current task because this is
+/// reached from the reaper as well as from a task closing its own descriptor,
+/// and the reaper is not the task whose descriptors it is releasing.
+pub fn close_ref(handle: usize, tid: usize) {
+    if handle >= MAX_SHMEM || tid >= MAX_TASKS {
+        return;
+    }
+    let flags = irq_save();
+    unsafe {
+        let r = &mut regions()[handle];
+        if r.in_use {
+            r.access &= !(1u64 << tid);
+            if r.access == 0 {
+                if r.mapped == 0 {
+                    release(r);
+                } else {
+                    // Somebody still has it mapped. Revocation governs the
+                    // right to map, not mappings that already exist, so the
+                    // frames go when the last mapper unmaps.
+                    r.pending_destroy = true;
+                }
+            }
+        }
+    }
+    irq_restore(flags);
+}
+
 /// Grant access to a shared memory region to another task.
 /// Must be the creator or have CAP_TASK_MGMT.
 pub fn grant(handle: usize, target_tid: usize) -> u64 {

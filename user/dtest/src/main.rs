@@ -130,6 +130,33 @@ fn test_big_region() {
     check("destroy", syscall::sys_shmem_destroy(handle).is_ok());
 }
 
+const MEMFD_AT: usize = 0x95_0000_0000;
+
+fn test_memfd() {
+    println!("memory as a descriptor:");
+    let fd = match syscall::sys_memfd_create(4) {
+        Ok(f) => f,
+        Err(()) => {
+            check("create a four-page memory descriptor", false);
+            return;
+        }
+    };
+    check("create a four-page memory descriptor", fd >= 3);
+    check("map it", syscall::sys_mmap_fd(fd, MEMFD_AT).is_ok());
+
+    unsafe { core::ptr::write_volatile(MEMFD_AT as *mut u64, 0xFEED_FACE) };
+    check(
+        "what was written is there",
+        unsafe { core::ptr::read_volatile(MEMFD_AT as *const u64) } == 0xFEED_FACE,
+    );
+
+    check("close it", syscall::sys_fd_close(fd).is_ok());
+    check(
+        "mapping a closed descriptor fails",
+        syscall::sys_mmap_fd(fd, MEMFD_AT + 0x10000).is_err(),
+    );
+}
+
 #[unsafe(no_mangle)]
 #[link_section = ".text.entry"]
 pub extern "C" fn _start() -> ! {
@@ -137,6 +164,7 @@ pub extern "C" fn _start() -> ! {
     test_close();
     test_fd_table();
     test_big_region();
+    test_memfd();
 
     unsafe {
         println!("[dtest] {} passed, {} failed", PASSED, FAILED);

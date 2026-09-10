@@ -25,6 +25,9 @@ pub enum FdKind {
     Ipc { target_tid: usize, tag: u64 },
     PipeRead(usize),   // pipe handle index
     PipeWrite(usize),  // pipe handle index
+    /// Shared memory, named by a descriptor so that it can be passed across a
+    /// stream, inherited, and closed like anything else a program holds.
+    MemFd { handle: usize },
     /// A network connection, held by the net server as `handle`.
     ///
     /// Unlike `Ipc`, which is one-directional and carries a fixed tag, a

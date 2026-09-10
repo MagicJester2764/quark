@@ -71,7 +71,9 @@ pub const SYS_SET_PAGER: u64 = 40;
 pub const SYS_ADDRSPACE_SELF: u64 = 41;
 
 // --- 0x30  shared memory ---
+pub const SYS_MMAP_FD: u64 = 42;
 pub const SYS_SHMEM_CREATE: u64 = 48;
+pub const SYS_MEMFD_CREATE: u64 = 53;
 pub const SYS_SHMEM_MAP: u64 = 49;
 pub const SYS_SHMEM_UNMAP: u64 = 50;
 pub const SYS_SHMEM_GRANT: u64 = 51;
@@ -945,6 +947,10 @@ extern "C" fn syscall_dispatch(
                     crate::pipe::write(handle, ptr, len)
                 }
                 crate::task::FdKind::PipeRead(_) => u64::MAX,
+                // Memory is mapped, not written through. A stream of bytes is
+                // the wrong shape for it, and answering as if it were would
+                // put the caller's data somewhere it will never look.
+                crate::task::FdKind::MemFd { .. } => u64::MAX,
                 crate::task::FdKind::Socket { net_tid, handle } => {
                     fd_write_ipc(net_tid, sock_tag(TAG_SOCK_WRITE, handle), ptr, len)
                 }
@@ -977,6 +983,8 @@ extern "C" fn syscall_dispatch(
                     crate::pipe::read(handle, ptr, max_len)
                 }
                 crate::task::FdKind::PipeWrite(_) => u64::MAX,
+                // As with write: it is mapped, not read.
+                crate::task::FdKind::MemFd { .. } => u64::MAX,
                 crate::task::FdKind::Socket { net_tid, handle } => {
                     fd_read_ipc(net_tid, sock_tag(TAG_SOCK_READ, handle), ptr, max_len)
                 }
@@ -1094,13 +1102,51 @@ extern "C" fn syscall_dispatch(
             // `retain_fd` is `release_fd`'s mirror, and keeping the match in
             // one place is what stops a new kind of descriptor being
             // remembered in one of them and forgotten in the other.
-            if crate::pipe::retain_fd(&kind).is_err() {
+            if crate::pipe::retain_fd(&kind, target_tid).is_err() {
                 return u64::MAX;
             }
             match scheduler::set_fd(target_tid, target_fd, kind) {
                 Ok(()) => 0,
                 Err(()) => u64::MAX,
             }
+        }
+        SYS_MEMFD_CREATE => {
+            // Memory a program can name and hand over. The region is exactly
+            // what SYS_SHMEM_CREATE makes; the descriptor is what lets it
+            // travel, be inherited, and be closed like anything else.
+            let pages = arg0 as usize;
+            let handle = crate::shmem::create(pages);
+            if handle == u64::MAX {
+                return u64::MAX;
+            }
+            let tid = scheduler::current_tid();
+            let kind = crate::task::FdKind::MemFd { handle: handle as usize };
+            match scheduler::install_fd(tid, kind) {
+                Some(fd) => fd as u64,
+                None => {
+                    crate::shmem::close_ref(handle as usize, tid);
+                    u64::MAX
+                }
+            }
+        }
+        SYS_MMAP_FD => {
+            // arg0 = descriptor naming memory, arg1 = where to map it
+            let fd = arg0 as usize;
+            let vaddr = arg1 as usize;
+            let tid = scheduler::current_tid();
+            if fd >= crate::task::MAX_FDS {
+                return u64::MAX;
+            }
+            let handle = unsafe {
+                match scheduler::get_task_mut(tid) {
+                    Some(t) => match t.fds[fd] {
+                        crate::task::FdKind::MemFd { handle } => handle,
+                        _ => return u64::MAX,
+                    },
+                    None => return u64::MAX,
+                }
+            };
+            crate::shmem::map(handle, vaddr)
         }
         SYS_FD_CLOSE => {
             // Releasing a descriptor is releasing whatever it refers to: a
@@ -1123,7 +1169,7 @@ extern "C" fn syscall_dispatch(
             if kind.is_empty() {
                 return u64::MAX;
             }
-            crate::pipe::release_fd(&kind);
+            crate::pipe::release_fd(&kind, tid);
             0
         }
         SYS_FUTEX_WAIT => {

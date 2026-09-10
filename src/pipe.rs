@@ -333,9 +333,9 @@ pub fn write(handle: usize, buf: *const u8, len: usize) -> u64 {
 
 /// Clean up pipe references when a task dies.
 /// Decrements refcounts and wakes blocked waiters.
-pub fn cleanup_task_fds(fds: &[FdKind; MAX_FDS]) {
+pub fn cleanup_task_fds(fds: &[FdKind; MAX_FDS], owner: usize) {
     for fd in fds.iter() {
-        release_fd(fd);
+        release_fd(fd, owner);
     }
 }
 
@@ -343,10 +343,14 @@ pub fn cleanup_task_fds(fds: &[FdKind; MAX_FDS]) {
 ///
 /// `cleanup_task_fds` does this for a whole table when a task dies; a task
 /// closing one descriptor needs exactly the same work for one entry.
-pub fn release_fd(kind: &FdKind) {
+///
+/// `owner` is passed rather than read from the current task: the reaper runs
+/// this over a *dead* task's table, and it is not that task.
+pub fn release_fd(kind: &FdKind, owner: usize) {
     match kind {
         FdKind::PipeRead(handle) => drop_ref(*handle, false),
         FdKind::PipeWrite(handle) => drop_ref(*handle, true),
+        FdKind::MemFd { handle } => crate::shmem::close_ref(*handle, owner),
         _ => {}
     }
 }
@@ -356,10 +360,16 @@ pub fn release_fd(kind: &FdKind) {
 /// The mirror of `release_fd`, and deliberately beside it: `SYS_FD_DUP` and
 /// `SYS_PIPE_FD_SET` both make a second descriptor for one object, and a kind
 /// added to one of these and not the other leaks or double-frees.
-pub fn retain_fd(kind: &FdKind) -> Result<(), ()> {
+/// `owner` is the task the *new* descriptor will belong to, which for
+/// `SYS_FD_DUP` is the target rather than the caller.
+pub fn retain_fd(kind: &FdKind, owner: usize) -> Result<(), ()> {
     match kind {
         FdKind::PipeRead(handle) => add_ref(*handle, false),
         FdKind::PipeWrite(handle) => add_ref(*handle, true),
+        FdKind::MemFd { handle } => {
+            // Whoever ends up holding the copy may map it.
+            if crate::shmem::add_access(*handle, owner) { Ok(()) } else { Err(()) }
+        }
         _ => Ok(()),
     }
 }

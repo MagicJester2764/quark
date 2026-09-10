@@ -38,7 +38,9 @@ pub const SYS_SET_PAGER: u64 = 40;
 pub const SYS_ADDRSPACE_SELF: u64 = 41;
 
 // --- 0x30  shared memory ---
+pub const SYS_MMAP_FD: u64 = 42;
 pub const SYS_SHMEM_CREATE: u64 = 48;
+pub const SYS_MEMFD_CREATE: u64 = 53;
 pub const SYS_SHMEM_MAP: u64 = 49;
 pub const SYS_SHMEM_UNMAP: u64 = 50;
 pub const SYS_SHMEM_GRANT: u64 = 51;
@@ -596,6 +598,23 @@ pub fn sleep_ms(ms: u64) {
     // PIT runs at 100 Hz → 1 tick = 10 ms. Round up.
     let ticks = (ms + 9) / 10;
     sleep_ticks(ticks);
+}
+
+/// Allocate `pages` of shareable memory and name it with a descriptor.
+///
+/// The same region `sys_shmem_create` makes, but reachable as a descriptor —
+/// which is what lets it be passed over a stream, inherited across a spawn, or
+/// closed. `wl_shm` is a client doing exactly this and handing the result to a
+/// compositor.
+pub fn sys_memfd_create(pages: usize) -> Result<usize, ()> {
+    let ret = unsafe { syscall1(SYS_MEMFD_CREATE, pages as u64) };
+    if ret == u64::MAX { Err(()) } else { Ok(ret as usize) }
+}
+
+/// Map memory named by a descriptor at `vaddr`.
+pub fn sys_mmap_fd(fd: usize, vaddr: usize) -> Result<(), ()> {
+    let ret = unsafe { syscall2(SYS_MMAP_FD, fd as u64, vaddr as u64) };
+    if ret == u64::MAX { Err(()) } else { Ok(()) }
 }
 
 /// Release a descriptor.
