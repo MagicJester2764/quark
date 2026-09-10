@@ -494,6 +494,25 @@ fn test_poll() {
     let _ = syscall::sys_fd_close(b);
 }
 
+fn test_environment() {
+    println!("environment:");
+    // What the shell puts in every program's environment.
+    check("HOME is set", quark_rt::args::getenv(b"HOME").is_some());
+    check(
+        "and it is a path",
+        quark_rt::args::getenv(b"HOME").map(|v| v.starts_with(b"/")) == Some(true),
+    );
+    check("PATH is set", quark_rt::args::getenv(b"PATH").is_some());
+    check("a name nobody set is absent", quark_rt::args::getenv(b"NOPE").is_none());
+    // A prefix of a real name must not match it: without checking the `=`,
+    // HOM matches HOME=/home/root and returns E=/home/root.
+    check("HOM does not match HOME", quark_rt::args::getenv(b"HOM").is_none());
+    // The environment sits after the arguments on the same page, so reading it
+    // must not have disturbed them.
+    check("arguments still readable", quark_rt::args::argv(0).is_some());
+    check("and argv[0] is this program", quark_rt::args::argv(0) == Some(&b"dtest"[..]));
+}
+
 #[unsafe(no_mangle)]
 #[link_section = ".text.entry"]
 pub extern "C" fn _start() -> ! {
@@ -508,6 +527,7 @@ pub extern "C" fn _start() -> ! {
     test_pollset();
     test_wake_latency();
     test_poll();
+    test_environment();
 
     unsafe {
         println!("[dtest] {} passed, {} failed", PASSED, FAILED);
