@@ -71,7 +71,9 @@ mod client;
 mod draw;
 mod objects;
 mod protocol;
+mod shell;
 mod shm;
+mod surface;
 
 use draw::{draw_text, fill_rect, pack_colour, present, Rect, Screen, CLIP, GLYPH_H, SCREEN};
 
@@ -151,6 +153,13 @@ struct Window {
     shmem: usize,
     /// Where the client's pixels are mapped in *our* address space.
     buf: usize,
+    /// Whether `shmem` is a region this compositor made and must give back.
+    ///
+    /// A Wayland surface's pixels live in a pool the *client* made and this
+    /// compositor merely mapped, and a window over one of those must not
+    /// destroy it when it closes — the client may still be drawing there, into
+    /// the buffer it is about to attach to a different surface.
+    owns_buf: bool,
     w: usize,
     h: usize,
     x: usize,
@@ -169,6 +178,7 @@ const NO_WINDOW: Window = Window {
     owner: 0,
     shmem: 0,
     buf: 0,
+    owns_buf: false,
     w: 0,
     h: 0,
     x: 0,
@@ -596,6 +606,7 @@ fn handle_create(sender: usize, msg: &Message) -> Message {
             owner: sender,
             shmem,
             buf,
+            owns_buf: true,
             w,
             h,
             x: 0,
@@ -628,6 +639,99 @@ fn handle_create(sender: usize, msg: &Message) -> Message {
     }
 }
 
+/// Put a window on the screen over memory this compositor does not own.
+///
+/// This is what a Wayland surface's first commit does. Everything after the
+/// buffer is the same as an ordinary window — a frame, a title bar, a place in
+/// the stack and the focus — because from the screen's point of view it is one.
+pub fn adopt_window(owner: usize, buf: usize, w: usize, h: usize, stride: usize) -> Option<usize> {
+    let s = unsafe { &SCREEN };
+    if w == 0 || h == 0 || w > s.width || h > s.height {
+        return None;
+    }
+    let idx = unsafe { WINDOWS.iter().position(|win| !win.used) }?;
+    // A window would otherwise outlive its owner: nothing else says the
+    // picture can come off the screen.
+    let _ = syscall::sys_task_watch(owner);
+    unsafe {
+        WINDOWS[idx] = Window {
+            used: true,
+            owner,
+            shmem: 0,
+            buf,
+            owns_buf: false,
+            w,
+            h,
+            stride,
+            ..NO_WINDOW
+        };
+        STACK[STACK_LEN] = idx;
+        STACK_LEN += 1;
+        FOCUS = idx;
+    }
+    place(idx);
+    composite();
+    Some(idx)
+}
+
+/// Show different pixels in a window that already exists.
+///
+/// A resize means the frame moved, so the whole screen is repainted; a buffer
+/// of the same size means only this window changed, which is the case a client
+/// hits sixty times a second.
+pub fn set_window_buffer(idx: usize, buf: usize, w: usize, h: usize, stride: usize) {
+    let resized = unsafe { WINDOWS[idx].w != w || WINDOWS[idx].h != h };
+    unsafe {
+        let win = &mut WINDOWS[idx];
+        if !win.used {
+            return;
+        }
+        win.buf = buf;
+        win.w = w;
+        win.h = h;
+        win.stride = stride;
+    }
+    if resized {
+        composite();
+    }
+}
+
+/// Give a window a title. A toplevel's title arrives after the window does.
+pub fn set_window_title(idx: usize, title: &[u8]) {
+    unsafe {
+        let win = &mut WINDOWS[idx];
+        if !win.used {
+            return;
+        }
+        win.title_len = title.len().min(MAX_TITLE);
+        win.title[..win.title_len].copy_from_slice(&title[..win.title_len]);
+    }
+    refresh_window(idx);
+}
+
+/// The screen, as a client is told about it.
+pub fn screen_size() -> (usize, usize) {
+    let s = unsafe { &SCREEN };
+    (s.width, s.height)
+}
+
+/// Milliseconds since boot, which is what a frame callback carries.
+///
+/// A client uses the difference between two of them to decide how far to move
+/// something, so what matters is that it advances at the right rate, not what
+/// it counts from. The PIT is 100 Hz, so this is accurate to ten milliseconds.
+pub fn now_ms() -> u32 {
+    (syscall::sys_ticks() * 10) as u32
+}
+
+/// What a client should be told to be: the size the frame leaves for it.
+pub fn suggested_size() -> (usize, usize) {
+    let s = unsafe { &SCREEN };
+    let w = s.width.saturating_sub(BORDER * 2 + 16).min(640);
+    let h = s.height.saturating_sub(TITLE_H + BORDER * 2 + 16).min(480);
+    (w, h)
+}
+
 /// Take a window off the screen and give its memory back.
 fn destroy_window(idx: usize) {
     unsafe {
@@ -635,8 +739,10 @@ fn destroy_window(idx: usize) {
         if !win.used {
             return;
         }
-        let _ = syscall::sys_shmem_unmap(win.shmem, win.buf);
-        let _ = syscall::sys_shmem_destroy(win.shmem);
+        if win.owns_buf {
+            let _ = syscall::sys_shmem_unmap(win.shmem, win.buf);
+            let _ = syscall::sys_shmem_destroy(win.shmem);
+        }
         WINDOWS[idx] = NO_WINDOW;
 
         let mut out = 0;
@@ -1069,7 +1175,7 @@ fn start_session(name: &[u8], index: usize) -> Option<usize> {
         if let Ok((mine, theirs)) = syscall::sys_socketpair() {
             if syscall::sys_fd_dup(info.tid, WAYLAND_FD, theirs).is_ok() {
                 let _ = syscall::sys_fd_close(theirs);
-                unsafe { CLIENTS[slot].open(mine, info.tid) };
+                unsafe { CLIENTS[slot].open(slot, mine, info.tid) };
                 env[0] = b"WAYLAND_SOCKET=3";
                 env_len = 1;
             } else {
@@ -1092,11 +1198,16 @@ const WAYLAND_FD: usize = 3;
 
 /// Let every connected client speak, and drop the ones that have stopped.
 fn serve_clients() {
+    let now = syscall::sys_ticks();
     unsafe {
         for i in 0..client::MAX_CLIENTS {
             if !CLIENTS[i].used {
                 continue;
             }
+            // Before reading: a client waiting on a frame has nothing to say
+            // until it gets one, so answering first is what gives it something
+            // to send on this pass rather than the next.
+            CLIENTS[i].fire_frames(now);
             let mut fds = [syscall::PollFd::new(CLIENTS[i].fd, syscall::POLL_READABLE)];
             // Zero timeout: this is a question, not a wait. The waiting is
             // done by the main loop's timed receive, which also hears about

@@ -22,6 +22,10 @@ pub enum Kind {
     ShmPool { pool: usize },
     Buffer { buffer: usize },
     Surface { surface: usize },
+    /// An opaque or input region. This compositor composites and routes the
+    /// same either way, so the object exists so that clients may name it and
+    /// its requests do nothing.
+    Region,
     Output,
     Callback,
     XdgWmBase,
@@ -66,6 +70,17 @@ impl Table {
             }
         }
         None
+    }
+
+    /// The id of the first object matching a predicate.
+    ///
+    /// Events go to objects, and the compositor's own tables are keyed by its
+    /// own indices — so telling a client that *its* buffer is free means
+    /// finding the name it knows that buffer by.
+    pub fn find(&self, pred: impl Fn(&Kind) -> bool) -> Option<u32> {
+        (0..MAX_OBJECTS)
+            .find(|&i| self.ids[i] != 0 && pred(&self.kinds[i]))
+            .map(|i| self.ids[i])
     }
 
     pub fn remove(&mut self, id: u32) {

@@ -14,7 +14,9 @@ use quark_rt::syscall;
 
 use crate::objects::{self, Kind, Table};
 use crate::protocol as proto;
+use crate::shell;
 use crate::shm;
+use crate::surface;
 
 pub const MAX_CLIENTS: usize = 4;
 const READ_BUF: usize = 4096;
@@ -29,8 +31,16 @@ const WRITE_BUF: usize = 4096;
 /// request that carries one is `wl_shm.create_pool`.
 const MAX_PENDING_FDS: usize = 4;
 
+/// Frame callbacks one client may have waiting to be answered. More than one
+/// surface may commit between passes, and each may have asked for a frame.
+const MAX_DUE: usize = 16;
+
 pub struct Client {
     pub used: bool,
+    /// Which entry of the compositor's client table this is. Surfaces are kept
+    /// in a table of their own and remember it, so that a disconnection can
+    /// take everything the client had with it.
+    pub slot: usize,
     /// Our end of the socketpair. The client holds the other.
     pub fd: usize,
     pub tid: usize,
@@ -41,10 +51,23 @@ pub struct Client {
     wlen: usize,
     fds: [usize; MAX_PENDING_FDS],
     nfds: usize,
+    /// Frame callbacks that have come due but not yet been sent, and the tick
+    /// the last batch went out on.
+    ///
+    /// A frame callback means "the frame you committed is on the screen; draw
+    /// the next one", so a client that gets one immediately draws again — and
+    /// answering inside `commit` means the compositor never gets back to its
+    /// own loop between frames. Holding them until the next pass is what turns
+    /// "as fast as the client can loop" into "as fast as this compositor
+    /// presents", which is what the callback is supposed to mean.
+    due: [u32; MAX_DUE],
+    ndue: usize,
+    fired_at: u64,
 }
 
 pub const NO_CLIENT: Client = Client {
     used: false,
+    slot: 0,
     fd: 0,
     tid: 0,
     objects: objects::EMPTY,
@@ -54,11 +77,15 @@ pub const NO_CLIENT: Client = Client {
     wlen: 0,
     fds: [0; MAX_PENDING_FDS],
     nfds: 0,
+    due: [0; MAX_DUE],
+    ndue: 0,
+    fired_at: 0,
 };
 
 impl Client {
-    pub fn open(&mut self, fd: usize, tid: usize) {
+    pub fn open(&mut self, slot: usize, fd: usize, tid: usize) {
         self.used = true;
+        self.slot = slot;
         self.fd = fd;
         self.tid = tid;
         self.objects.clear();
@@ -72,6 +99,7 @@ impl Client {
     pub fn close(&mut self) {
         if self.used {
             let _ = syscall::sys_fd_close(self.fd);
+            surface::forget_client(self.slot);
             shm::forget_client(self.tid);
         }
         // Descriptors that arrived and were never claimed by a request. The
@@ -150,6 +178,24 @@ impl Client {
         }
         wire::put_u32(&mut self.wbuf, self.wlen, v);
         self.wlen += 4;
+        true
+    }
+
+    /// An array argument: a length and that many bytes, padded to four.
+    ///
+    /// Unlike a string it carries no NUL, which is the whole difference between
+    /// the two on the wire and the reason they are separate functions.
+    fn arg_array(&mut self, bytes: &[u8]) -> bool {
+        let need = 4 + wire::pad4(bytes.len());
+        if self.wlen + need > WRITE_BUF {
+            return false;
+        }
+        wire::put_u32(&mut self.wbuf, self.wlen, bytes.len() as u32);
+        self.wbuf[self.wlen + 4..self.wlen + 4 + bytes.len()].copy_from_slice(bytes);
+        for i in bytes.len()..wire::pad4(bytes.len()) {
+            self.wbuf[self.wlen + 4 + i] = 0;
+        }
+        self.wlen += need;
         true
     }
 
@@ -257,7 +303,323 @@ impl Client {
             Kind::Shm => self.shm_request(h.object, h.opcode, body),
             Kind::ShmPool { pool } => self.pool_request(h.object, pool, h.opcode, body),
             Kind::Buffer { buffer } => self.buffer_request(h.object, buffer, h.opcode),
-            _ => true, // interfaces that arrive in later tasks
+            Kind::Compositor => self.compositor_request(h.opcode, body),
+            Kind::Surface { surface } => self.surface_request(h.object, surface, h.opcode, body),
+            Kind::Region => {
+                if h.opcode == proto::REGION_DESTROY {
+                    self.objects.remove(h.object);
+                }
+                true
+            }
+            Kind::XdgWmBase => self.wm_base_request(h.object, h.opcode, body),
+            Kind::XdgSurface { surface } => {
+                self.xdg_surface_request(h.object, surface, h.opcode, body)
+            }
+            Kind::XdgToplevel { surface } => {
+                self.toplevel_request(h.object, surface, h.opcode, body)
+            }
+            Kind::Output | Kind::Callback | Kind::None => true,
+        }
+    }
+
+    fn compositor_request(&mut self, opcode: u16, body: usize) -> bool {
+        let Some(id) = wire::get_u32(&self.rbuf, body) else {
+            return false;
+        };
+        match opcode {
+            proto::COMPOSITOR_CREATE_SURFACE => {
+                let Some(idx) = surface::create(self.slot, self.tid) else {
+                    return self.protocol_error(id, proto::ERR_NO_MEMORY, b"too many surfaces");
+                };
+                if !self.objects.insert(id, Kind::Surface { surface: idx }) {
+                    surface::destroy(idx);
+                    return false;
+                }
+                true
+            }
+            proto::COMPOSITOR_CREATE_REGION => self.objects.insert(id, Kind::Region),
+            _ => true,
+        }
+    }
+
+    fn surface_request(&mut self, object: u32, idx: usize, opcode: u16, body: usize) -> bool {
+        match opcode {
+            proto::SURFACE_DESTROY => {
+                surface::destroy(idx);
+                self.objects.remove(object);
+                true
+            }
+            proto::SURFACE_ATTACH => {
+                // attach(buffer, x, y). A null buffer is a real request: it
+                // says there is nothing to show, which is not the same as
+                // saying nothing about the buffer at all.
+                let Some(buffer_id) = wire::get_u32(&self.rbuf, body) else {
+                    return false;
+                };
+                if buffer_id == 0 {
+                    surface::attach(idx, surface::NONE);
+                    return true;
+                }
+                let Some(Kind::Buffer { buffer }) = self.objects.get(buffer_id) else {
+                    return self.protocol_error(
+                        object,
+                        proto::ERR_INVALID_OBJECT,
+                        b"attach: not a buffer",
+                    );
+                };
+                surface::attach(idx, buffer);
+                true
+            }
+            proto::SURFACE_DAMAGE | proto::SURFACE_DAMAGE_BUFFER => {
+                // Which pixels changed is not tracked. This compositor repaints
+                // a whole window when it commits, so the only thing damage
+                // decides here is whether to repaint at all — and the rectangle
+                // would have to be believed to be worth more than that.
+                surface::damage(idx);
+                true
+            }
+            proto::SURFACE_FRAME => {
+                let Some(id) = wire::get_u32(&self.rbuf, body) else {
+                    return false;
+                };
+                if !self.objects.insert(id, Kind::Callback) {
+                    return false;
+                }
+                if !surface::want_frame(idx, id) {
+                    return self.protocol_error(
+                        object,
+                        proto::ERR_NO_MEMORY,
+                        b"too many frame callbacks outstanding",
+                    );
+                }
+                true
+            }
+            proto::SURFACE_COMMIT => self.commit(object, idx),
+            // Regions, transforms, scales and offsets: accepted and not acted
+            // on. Each is a hint or a transform this compositor does not apply,
+            // and refusing them would stop clients that set them by habit.
+            proto::SURFACE_SET_OPAQUE_REGION
+            | proto::SURFACE_SET_INPUT_REGION
+            | proto::SURFACE_SET_BUFFER_TRANSFORM
+            | proto::SURFACE_SET_BUFFER_SCALE
+            | proto::SURFACE_OFFSET => true,
+            _ => true,
+        }
+    }
+
+    /// Apply everything the client has been accumulating, then tell it what
+    /// that cost it: the buffer it may draw into again, and the callbacks that
+    /// came due.
+    fn commit(&mut self, object: u32, idx: usize) -> bool {
+        let Some(s) = surface::get(idx) else {
+            return false;
+        };
+        // A buffer attached to a surface that has not agreed to a size is the
+        // one thing xdg_shell makes an error rather than a no-op: the client is
+        // showing pixels it has not been told the shape of. A surface with no
+        // role at all is exempt — it is not a window yet, so there is nothing
+        // it could have agreed to.
+        if s.role != surface::Role::None
+            && !s.configured
+            && s.pending.attached
+            && s.pending.buffer != surface::NONE
+        {
+            return self.protocol_error(
+                object,
+                proto::XDG_ERR_UNCONFIGURED_BUFFER,
+                b"buffer attached before ack_configure",
+            );
+        }
+        let Some(applied) = surface::commit(idx) else {
+            return false;
+        };
+        if applied.repaint {
+            if let Some(w) = surface::window_of(idx) {
+                crate::refresh_window(w);
+            }
+        }
+        if applied.release != surface::NONE {
+            if let Some(id) = self.id_of_buffer(applied.release) {
+                if let Some(a) = self.begin(id, proto::BUFFER_RELEASE) {
+                    self.end(a);
+                }
+            }
+        }
+        // The frame callbacks come due here and go out on the next pass. See
+        // `due` for why the delay is the point rather than an omission.
+        for i in 0..applied.nframes {
+            if self.ndue < MAX_DUE {
+                self.due[self.ndue] = applied.frames[i];
+                self.ndue += 1;
+            } else {
+                // Answer immediately rather than lose it: a frame callback
+                // that is never sent is a client that never draws again.
+                self.send_frame(applied.frames[i]);
+            }
+        }
+        true
+    }
+
+    fn send_frame(&mut self, id: u32) {
+        if let Some(a) = self.begin(id, proto::CALLBACK_DONE) {
+            self.arg_u32(crate::now_ms());
+            self.end(a);
+        }
+        self.delete_id(id);
+        self.objects.remove(id);
+    }
+
+    /// Answer the frame callbacks that came due, at most one batch per tick.
+    ///
+    /// The tick is the clock this compositor has: there is no vertical blank to
+    /// wait for, so "presented" means "drawn, and the compositor has been round
+    /// its loop since". A client is thereby held to a hundred frames a second
+    /// rather than to however fast it can fill a buffer, and the compositor
+    /// keeps the time in between for the keyboard.
+    pub fn fire_frames(&mut self, now: u64) {
+        if self.ndue == 0 || now == self.fired_at {
+            return;
+        }
+        self.fired_at = now;
+        let n = self.ndue;
+        self.ndue = 0;
+        let due = self.due;
+        for i in 0..n {
+            self.send_frame(due[i]);
+        }
+        self.flush();
+    }
+
+    /// The object id a client knows a buffer by.
+    fn id_of_buffer(&self, buffer: usize) -> Option<u32> {
+        self.objects.find(|k| matches!(k, Kind::Buffer { buffer: b } if *b == buffer))
+    }
+
+    /// Tell the client an id it allocated is free again.
+    fn delete_id(&mut self, id: u32) {
+        if let Some(a) = self.begin(proto::DISPLAY_ID, proto::DISPLAY_DELETE_ID) {
+            self.arg_u32(id);
+            self.end(a);
+        }
+    }
+
+    fn wm_base_request(&mut self, object: u32, opcode: u16, body: usize) -> bool {
+        match opcode {
+            proto::WM_BASE_GET_XDG_SURFACE => {
+                let (Some(id), Some(surface_id)) = (
+                    wire::get_u32(&self.rbuf, body),
+                    wire::get_u32(&self.rbuf, body + 4),
+                ) else {
+                    return false;
+                };
+                let Some(Kind::Surface { surface: idx }) = self.objects.get(surface_id) else {
+                    return self.protocol_error(
+                        object,
+                        proto::ERR_INVALID_OBJECT,
+                        b"get_xdg_surface: not a surface",
+                    );
+                };
+                self.objects.insert(id, Kind::XdgSurface { surface: idx })
+            }
+            proto::WM_BASE_DESTROY => {
+                self.objects.remove(object);
+                true
+            }
+            // A pong answers a ping this compositor does not send, and a
+            // positioner belongs to popups, which it does not place.
+            proto::WM_BASE_PONG => true,
+            proto::WM_BASE_CREATE_POSITIONER => {
+                self.protocol_error(object, proto::ERR_INVALID_METHOD, b"no popups")
+            }
+            _ => true,
+        }
+    }
+
+    fn xdg_surface_request(
+        &mut self,
+        object: u32,
+        idx: usize,
+        opcode: u16,
+        body: usize,
+    ) -> bool {
+        match opcode {
+            proto::XDG_SURFACE_GET_TOPLEVEL => {
+                let Some(id) = wire::get_u32(&self.rbuf, body) else {
+                    return false;
+                };
+                let Some(top) = shell::make_toplevel(idx) else {
+                    return self.protocol_error(
+                        object,
+                        proto::XDG_ERR_ROLE,
+                        b"that surface already has a role",
+                    );
+                };
+                if !self.objects.insert(id, Kind::XdgToplevel { surface: idx }) {
+                    return false;
+                }
+                // The size, then the state (none of them), then the configure
+                // that says "answer this". A client waits for all three before
+                // it draws anything at all.
+                if let Some(a) = self.begin(id, proto::TOPLEVEL_CONFIGURE) {
+                    self.arg_u32(top.width);
+                    self.arg_u32(top.height);
+                    self.arg_array(&[]);
+                    self.end(a);
+                }
+                let serial = shell::begin_configure(idx);
+                if let Some(a) = self.begin(object, proto::XDG_SURFACE_CONFIGURE) {
+                    self.arg_u32(serial);
+                    self.end(a);
+                }
+                self.flush();
+                true
+            }
+            proto::XDG_SURFACE_ACK_CONFIGURE => {
+                let Some(serial) = wire::get_u32(&self.rbuf, body) else {
+                    return false;
+                };
+                if !surface::ack(idx, serial) {
+                    return self.protocol_error(
+                        object,
+                        proto::ERR_INVALID_METHOD,
+                        b"ack_configure: no such serial",
+                    );
+                }
+                true
+            }
+            proto::XDG_SURFACE_DESTROY => {
+                self.objects.remove(object);
+                true
+            }
+            // Window geometry says which part of the surface is the window
+            // proper, excluding its own shadows. Nothing here draws client-side
+            // decorations, so the whole surface is the window.
+            proto::XDG_SURFACE_SET_GEOMETRY => true,
+            proto::XDG_SURFACE_GET_POPUP => {
+                self.protocol_error(object, proto::ERR_INVALID_METHOD, b"no popups")
+            }
+            _ => true,
+        }
+    }
+
+    fn toplevel_request(&mut self, object: u32, idx: usize, opcode: u16, body: usize) -> bool {
+        match opcode {
+            proto::TOPLEVEL_SET_TITLE => {
+                let Some((title, _)) = wire::get_str(&self.rbuf, body) else {
+                    return false;
+                };
+                surface::set_title(idx, title);
+                true
+            }
+            proto::TOPLEVEL_DESTROY => {
+                surface::destroy(idx);
+                self.objects.remove(object);
+                true
+            }
+            // Maximise, fullscreen, minimise, move, resize: this compositor
+            // decides where windows go and how big they are, and says so by
+            // never sending a configure that offers the client a choice.
+            _ => true,
         }
     }
 
@@ -461,6 +823,36 @@ impl Client {
         };
         if !self.objects.insert(id, kind) {
             return false;
+        }
+        if kind == Kind::Output {
+            // A client that binds an output waits for `done` before it
+            // believes any of it, so all four go out together.
+            let (w, h) = crate::screen_size();
+            if let Some(a) = self.begin(id, proto::OUTPUT_GEOMETRY) {
+                self.arg_u32(0); // x
+                self.arg_u32(0); // y
+                self.arg_u32(0); // physical width, unknown
+                self.arg_u32(0); // physical height, unknown
+                self.arg_u32(0); // subpixel: unknown
+                self.arg_str(b"Quark");
+                self.arg_str(b"framebuffer");
+                self.arg_u32(0); // transform: normal
+                self.end(a);
+            }
+            if let Some(a) = self.begin(id, proto::OUTPUT_MODE) {
+                self.arg_u32(proto::OUTPUT_MODE_CURRENT | proto::OUTPUT_MODE_PREFERRED);
+                self.arg_u32(w as u32);
+                self.arg_u32(h as u32);
+                self.arg_u32(0); // refresh in mHz: the framebuffer does not say
+                self.end(a);
+            }
+            if let Some(a) = self.begin(id, proto::OUTPUT_SCALE) {
+                self.arg_u32(1);
+                self.end(a);
+            }
+            if let Some(a) = self.begin(id, proto::OUTPUT_DONE) {
+                self.end(a);
+            }
         }
         if kind == Kind::Shm {
             // wl_shm announces its formats the moment it is bound, and a client

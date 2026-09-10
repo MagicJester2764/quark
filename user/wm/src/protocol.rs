@@ -62,5 +62,79 @@ pub const SHM_ERR_INVALID_FORMAT: u32 = 0;
 pub const SHM_ERR_INVALID_STRIDE: u32 = 1;
 pub const SHM_ERR_INVALID_FD: u32 = 2;
 
+// wl_compositor requests.
+pub const COMPOSITOR_CREATE_SURFACE: u16 = 0;
+pub const COMPOSITOR_CREATE_REGION: u16 = 1;
+
+// wl_surface requests. Everything between `attach` and `commit` accumulates:
+// none of them changes what is on screen, which is what makes `commit` atomic.
+pub const SURFACE_DESTROY: u16 = 0;
+pub const SURFACE_ATTACH: u16 = 1;
+pub const SURFACE_DAMAGE: u16 = 2;
+pub const SURFACE_FRAME: u16 = 3;
+pub const SURFACE_SET_OPAQUE_REGION: u16 = 4;
+pub const SURFACE_SET_INPUT_REGION: u16 = 5;
+pub const SURFACE_COMMIT: u16 = 6;
+pub const SURFACE_SET_BUFFER_TRANSFORM: u16 = 7;
+pub const SURFACE_SET_BUFFER_SCALE: u16 = 8;
+pub const SURFACE_DAMAGE_BUFFER: u16 = 9;
+pub const SURFACE_OFFSET: u16 = 10;
+// wl_surface events.
+pub const SURFACE_ENTER: u16 = 0;
+
+// wl_region requests. A region is an optimisation hint about which pixels are
+// opaque or want input; this compositor composites and routes the same either
+// way, so the object exists and its requests do nothing.
+pub const REGION_DESTROY: u16 = 0;
+
+// wl_output events. Advertised at version 2, which is the version that has
+// `done` — a client binding an output waits for it before believing anything.
+pub const OUTPUT_GEOMETRY: u16 = 0;
+pub const OUTPUT_MODE: u16 = 1;
+pub const OUTPUT_DONE: u16 = 2;
+pub const OUTPUT_SCALE: u16 = 3;
+/// `wl_output.mode` flags: this is the current mode, and the only one.
+pub const OUTPUT_MODE_CURRENT: u32 = 1;
+pub const OUTPUT_MODE_PREFERRED: u32 = 2;
+
+// xdg_wm_base requests and events.
+pub const WM_BASE_DESTROY: u16 = 0;
+pub const WM_BASE_CREATE_POSITIONER: u16 = 1;
+pub const WM_BASE_GET_XDG_SURFACE: u16 = 2;
+pub const WM_BASE_PONG: u16 = 3;
+
+// xdg_surface requests and events.
+pub const XDG_SURFACE_DESTROY: u16 = 0;
+pub const XDG_SURFACE_GET_TOPLEVEL: u16 = 1;
+pub const XDG_SURFACE_GET_POPUP: u16 = 2;
+pub const XDG_SURFACE_SET_GEOMETRY: u16 = 3;
+pub const XDG_SURFACE_ACK_CONFIGURE: u16 = 4;
+pub const XDG_SURFACE_CONFIGURE: u16 = 0;
+
+// xdg_toplevel requests and events.
+pub const TOPLEVEL_DESTROY: u16 = 0;
+pub const TOPLEVEL_SET_TITLE: u16 = 2;
+pub const TOPLEVEL_CONFIGURE: u16 = 0;
+pub const TOPLEVEL_CLOSE: u16 = 1;
+
+/// `xdg_wm_base.error`: a surface was given a second role, or shown before it
+/// acknowledged the configure that told it how big to be.
+pub const XDG_ERR_ROLE: u32 = 0;
+pub const XDG_ERR_UNCONFIGURED_BUFFER: u32 = 3;
+
 /// The object id of `wl_display`, which exists before anything is asked for.
 pub const DISPLAY_ID: u32 = 1;
+
+/// The next serial.
+///
+/// A serial is how a client says *which* event it is answering. The compositor
+/// sends a configure carrying one and will not show the surface until the same
+/// number comes back, which is what makes "the client agreed to this size"
+/// something that can be checked rather than assumed.
+pub fn next_serial() -> u32 {
+    static mut SERIAL: u32 = 0;
+    unsafe {
+        SERIAL = SERIAL.wrapping_add(1);
+        SERIAL
+    }
+}
