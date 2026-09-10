@@ -19,6 +19,7 @@
 #define LX_EIO       5
 #define LX_ENOTDIR  20
 #define LX_EISDIR   21
+#define LX_ENODEV   19
 
 /* There is no working directory anywhere in this system, so this is the only
    value the *at calls accept for one. */
@@ -35,5 +36,16 @@ long __quark_lseek(long fd, long offset, long whence);
 long __quark_fstat(long fd, void *statbuf);
 long __quark_stat(const char *path, void *statbuf);
 long __quark_access(const char *path, long mode);
+long __quark_kernel_fd_candidate(int nth);
+
+/* Streams, descriptor passing and waiting, in net.c. */
+long __quark_memfd(const char *name, long flags);
+long __quark_socketpair(long domain, long type, long protocol, int *sv);
+long __quark_sendmsg(long fd, const void *msg, long flags);
+long __quark_recvmsg(long fd, void *msg, long flags);
+long __quark_poll(void *fds, long nfds, long timeout_ms);
+long __quark_epoll_create(void);
+long __quark_epoll_ctl(long epfd, long op, long fd, void *event);
+long __quark_epoll_wait(long epfd, void *events, long maxevents, long timeout_ms);
 
 #endif

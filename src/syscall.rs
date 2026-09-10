@@ -71,7 +71,9 @@ pub const SYS_SET_PAGER: u64 = 40;
 pub const SYS_ADDRSPACE_SELF: u64 = 41;
 
 // --- 0x30  shared memory ---
+pub const SYS_MMAP_FD: u64 = 42;
 pub const SYS_SHMEM_CREATE: u64 = 48;
+pub const SYS_MEMFD_CREATE: u64 = 53;
 pub const SYS_SHMEM_MAP: u64 = 49;
 pub const SYS_SHMEM_UNMAP: u64 = 50;
 pub const SYS_SHMEM_GRANT: u64 = 51;
@@ -85,6 +87,14 @@ pub const SYS_FD_SET: u64 = 67;
 pub const SYS_FD_DUP: u64 = 68;
 pub const SYS_PIPE_CREATE: u64 = 69;
 pub const SYS_PIPE_FD_SET: u64 = 70;
+pub const SYS_FD_CLOSE: u64 = 71;
+pub const SYS_SOCKETPAIR: u64 = 72;
+pub const SYS_FD_SEND: u64 = 73;
+pub const SYS_FD_RECV: u64 = 74;
+pub const SYS_POLLSET_CREATE: u64 = 75;
+pub const SYS_POLLSET_CTL: u64 = 76;
+pub const SYS_POLLSET_WAIT: u64 = 77;
+pub const SYS_POLL: u64 = 78;
 
 // --- 0x50  capabilities ---
 pub const SYS_CAP_MINT: u64 = 80;
@@ -169,7 +179,7 @@ pub const SYS_ABI_VERSION: u64 = 240;
 /// minor when calls are added. User space can refuse to run against a major it
 /// does not know, which is the point of exposing it at all.
 pub const ABI_VERSION_MAJOR: u64 = 1;
-pub const ABI_VERSION_MINOR: u64 = 5;
+pub const ABI_VERSION_MINOR: u64 = 6;
 
 
 
@@ -273,6 +283,32 @@ fn validate_user_range(addr: u64, len: u64, write: bool) -> bool {
 }
 
 /// Read-only user buffer check.
+/// The set a descriptor names, or `None` if it names something else.
+fn pollset_of(tid: usize, fd: usize) -> Option<usize> {
+    if fd >= crate::task::MAX_FDS {
+        return None;
+    }
+    unsafe {
+        match scheduler::get_task_mut(tid)?.fds[fd] {
+            crate::task::FdKind::PollSet { set } => Some(set),
+            _ => None,
+        }
+    }
+}
+
+/// The stream and end a descriptor names, or `None` if it names something else.
+fn stream_end_of(tid: usize, fd: usize) -> Option<(usize, u8)> {
+    if fd >= crate::task::MAX_FDS {
+        return None;
+    }
+    unsafe {
+        match scheduler::get_task_mut(tid)?.fds[fd] {
+            crate::task::FdKind::StreamEnd { stream, end } => Some((stream, end)),
+            _ => None,
+        }
+    }
+}
+
 fn validate_user_ptr(addr: u64, len: u64) -> bool {
     validate_user_range(addr, len, false)
 }
@@ -944,6 +980,18 @@ extern "C" fn syscall_dispatch(
                     crate::pipe::write(handle, ptr, len)
                 }
                 crate::task::FdKind::PipeRead(_) => u64::MAX,
+                crate::task::FdKind::StreamEnd { stream, end } => {
+                    match crate::stream::pipes_for(stream, end) {
+                        Some((_, wr)) => crate::pipe::write(wr, ptr, len),
+                        None => u64::MAX,
+                    }
+                }
+                // A set is waited on, not written to.
+                crate::task::FdKind::PollSet { .. } => u64::MAX,
+                // Memory is mapped, not written through. A stream of bytes is
+                // the wrong shape for it, and answering as if it were would
+                // put the caller's data somewhere it will never look.
+                crate::task::FdKind::MemFd { .. } => u64::MAX,
                 crate::task::FdKind::Socket { net_tid, handle } => {
                     fd_write_ipc(net_tid, sock_tag(TAG_SOCK_WRITE, handle), ptr, len)
                 }
@@ -976,6 +1024,15 @@ extern "C" fn syscall_dispatch(
                     crate::pipe::read(handle, ptr, max_len)
                 }
                 crate::task::FdKind::PipeWrite(_) => u64::MAX,
+                crate::task::FdKind::StreamEnd { stream, end } => {
+                    match crate::stream::pipes_for(stream, end) {
+                        Some((rd, _)) => crate::pipe::read(rd, ptr, max_len),
+                        None => u64::MAX,
+                    }
+                }
+                crate::task::FdKind::PollSet { .. } => u64::MAX,
+                // As with write: it is mapped, not read.
+                crate::task::FdKind::MemFd { .. } => u64::MAX,
                 crate::task::FdKind::Socket { net_tid, handle } => {
                     fd_read_ipc(net_tid, sock_tag(TAG_SOCK_READ, handle), ptr, max_len)
                 }
@@ -1089,24 +1146,400 @@ extern "C" fn syscall_dispatch(
             if kind.is_empty() {
                 return u64::MAX;
             }
-            // If it's a pipe, bump the refcount
-            match kind {
-                crate::task::FdKind::PipeRead(handle) => {
-                    if crate::pipe::add_ref(handle, false).is_err() {
-                        return u64::MAX;
-                    }
-                }
-                crate::task::FdKind::PipeWrite(handle) => {
-                    if crate::pipe::add_ref(handle, true).is_err() {
-                        return u64::MAX;
-                    }
-                }
-                _ => {}
+            // A second descriptor for one object is a second reference to it.
+            // `retain_fd` is `release_fd`'s mirror, and keeping the match in
+            // one place is what stops a new kind of descriptor being
+            // remembered in one of them and forgotten in the other.
+            if crate::pipe::retain_fd(&kind, target_tid).is_err() {
+                return u64::MAX;
             }
             match scheduler::set_fd(target_tid, target_fd, kind) {
                 Ok(()) => 0,
                 Err(()) => u64::MAX,
             }
+        }
+        SYS_SOCKETPAIR => {
+            // Both ends land in the caller's own table, the way socketpair(2)
+            // works. Moving one into a child is sys_fd_dup followed by closing
+            // our copy, which is why an end is reference counted.
+            let tid = scheduler::current_tid();
+            let s = match crate::stream::create(tid) {
+                Some(s) => s,
+                None => return u64::MAX,
+            };
+            let a = scheduler::install_fd(tid, crate::task::FdKind::StreamEnd { stream: s, end: 0 });
+            let b = scheduler::install_fd(tid, crate::task::FdKind::StreamEnd { stream: s, end: 1 });
+            match (a, b) {
+                (Some(a), Some(b)) => ((a as u64) << 32) | b as u64,
+                _ => {
+                    if let Some(fd) = a {
+                        let _ = scheduler::clear_fd(tid, fd);
+                    }
+                    if let Some(fd) = b {
+                        let _ = scheduler::clear_fd(tid, fd);
+                    }
+                    crate::stream::close_end(s, 0);
+                    crate::stream::close_end(s, 1);
+                    u64::MAX
+                }
+            }
+        }
+        SYS_POLL => {
+            // arg0 = array of (u32 fd, u32 events, u32 revents, u32 pad),
+            // arg1 = count, arg2 = timeout in ticks.
+            //
+            // A set built inside the kernel and thrown away. The saving is in
+            // the syscall count, which is where it is actually spent:
+            // libwayland polls two descriptors once per dispatch, and making
+            // it create, fill and destroy a set from user space would be three
+            // calls where one will do. Waiting cannot be done without a set,
+            // because that is what a pipe becoming ready looks for.
+            let n = (arg1 as usize).min(32);
+            if n == 0 || !validate_user_ptr_mut(arg0, (n * 16) as u64) {
+                return u64::MAX;
+            }
+            let tid = scheduler::current_tid();
+
+            let mut want = [(0usize, 0u32); 32];
+            {
+                let _ua = crate::cpu::UserAccess::begin();
+                for i in 0..n {
+                    unsafe {
+                        let p = (arg0 as *const u8).add(i * 16);
+                        want[i] = (*(p as *const u32) as usize, *(p.add(4) as *const u32));
+                    }
+                }
+            }
+
+            let set = match crate::pollset::create(tid) {
+                Some(s) => s,
+                None => return u64::MAX,
+            };
+            let mut rev = [0u32; 32];
+            let mut invalid = 0;
+            for i in 0..n {
+                if crate::pollset::watchable(tid, want[i].0) {
+                    // The index is the token, so a hit names its own entry.
+                    crate::pollset::ctl(set, tid, 0, want[i].0, want[i].1, i as u64);
+                } else {
+                    rev[i] = crate::pollset::INVALID;
+                    invalid += 1;
+                }
+            }
+
+            let deadline = crate::pit::ticks().saturating_add(arg2);
+            let mut found = [(0u64, 0u32); 32];
+            let mut hits = 0usize;
+            loop {
+                let got = crate::pollset::scan(set, tid, &mut found[..n]);
+                if got > 0 {
+                    for i in 0..got {
+                        let idx = found[i].0 as usize;
+                        if idx < n {
+                            rev[idx] |= found[i].1;
+                        }
+                    }
+                    hits = got;
+                    break;
+                }
+                // An invalid entry is an answer, so do not sleep on top of it.
+                if invalid > 0 {
+                    break;
+                }
+                let now = crate::pit::ticks();
+                if now >= deadline {
+                    break;
+                }
+                crate::pollset::park(set, tid);
+                if crate::pollset::scan(set, tid, &mut found[..n]) > 0 {
+                    crate::pollset::unpark(set);
+                    continue;
+                }
+                let _ = crate::ipc::sys_recv_timeout(tid, deadline - now);
+                crate::pollset::unpark(set);
+            }
+            crate::pollset::unpark(set);
+            crate::pollset::destroy(set);
+
+            {
+                let _ua = crate::cpu::UserAccess::begin();
+                for i in 0..n {
+                    unsafe { *((arg0 as *mut u8).add(i * 16 + 8) as *mut u32) = rev[i] };
+                }
+            }
+            (hits + invalid) as u64
+        }
+        SYS_POLLSET_CREATE => {
+            let tid = scheduler::current_tid();
+            match crate::pollset::create(tid) {
+                Some(set) => match scheduler::install_fd(tid, crate::task::FdKind::PollSet { set }) {
+                    Some(fd) => fd as u64,
+                    None => {
+                        crate::pollset::destroy(set);
+                        u64::MAX
+                    }
+                },
+                None => u64::MAX,
+            }
+        }
+        SYS_POLLSET_CTL => {
+            // arg0 = set fd, arg1 = op, arg2 = fd, arg3 = events, arg4 = token
+            let tid = scheduler::current_tid();
+            let set = match pollset_of(tid, arg0 as usize) {
+                Some(s) => s,
+                None => return u64::MAX,
+            };
+            let target = arg2 as usize;
+            // Refuse what can never become ready rather than accept it and go
+            // quiet.
+            if arg1 != 2 && !crate::pollset::watchable(tid, target) {
+                return u64::MAX;
+            }
+            if crate::pollset::ctl(set, tid, arg1, target, arg3 as u32, arg4) {
+                0
+            } else {
+                u64::MAX
+            }
+        }
+        SYS_POLLSET_WAIT => {
+            // arg0 = set fd, arg1 = out array of (u64 token, u32 events,
+            // u32 pad), arg2 = capacity, arg3 = timeout in ticks.
+            let tid = scheduler::current_tid();
+            let set = match pollset_of(tid, arg0 as usize) {
+                Some(s) => s,
+                None => return u64::MAX,
+            };
+            let cap = (arg2 as usize).min(64);
+            if cap == 0 || !validate_user_ptr_mut(arg1, (cap * 16) as u64) {
+                return u64::MAX;
+            }
+
+            let deadline = crate::pit::ticks().saturating_add(arg3);
+            let mut found = [(0u64, 0u32); 64];
+            let out = loop {
+                let n = crate::pollset::scan(set, tid, &mut found[..cap]);
+                if n > 0 {
+                    break n as u64;
+                }
+                let now = crate::pit::ticks();
+                if now >= deadline {
+                    break 0;
+                }
+
+                // Register as the waiter *before* the last look. Anything that
+                // becomes ready after this either happened before that scan,
+                // so the scan sees it and we never block, or after it — and
+                // then `note_pipe` finds us parked and wakes us. There is no
+                // window between looking and sleeping.
+                crate::pollset::park(set, tid);
+                if crate::pollset::scan(set, tid, &mut found[..cap]) > 0 {
+                    crate::pollset::unpark(set);
+                    continue;
+                }
+
+                // There is no `sleep` in this kernel. A task sleeps by
+                // receiving from its own TID with a timeout — nobody can send
+                // to that, so only the deadline or `wake_sleeper` ends it —
+                // and `sleep_ticks` in quark-rt is exactly this. Reusing it
+                // means the existing timeout sweep abandons the block and no
+                // second sweep had to be written.
+                let _ = crate::ipc::sys_recv_timeout(tid, deadline - now);
+                crate::pollset::unpark(set);
+            };
+            crate::pollset::unpark(set);
+            if out > 0 {
+                let _ua = crate::cpu::UserAccess::begin();
+                for i in 0..(out as usize) {
+                    unsafe {
+                        let p = (arg1 as *mut u8).add(i * 16);
+                        *(p as *mut u64) = found[i].0;
+                        *(p.add(8) as *mut u32) = found[i].1;
+                        *(p.add(12) as *mut u32) = 0;
+                    }
+                }
+            }
+            out
+        }
+        SYS_FD_SEND => {
+            // arg0 = stream fd, arg1 = buf, arg2 = len, arg3 = fd to pass or
+            // u64::MAX. This needs no authority over the peer: it takes
+            // delivery by calling recv. That is the difference from
+            // SYS_FD_DUP, which puts a descriptor into a task that never asked
+            // and therefore requires TaskMgmt over it.
+            let fd = arg0 as usize;
+            let len = arg2 as usize;
+            let pass = arg3;
+            let tid = scheduler::current_tid();
+            if fd >= crate::task::MAX_FDS {
+                return u64::MAX;
+            }
+            if len > 0 && !validate_user_ptr(arg1, arg2) {
+                return u64::MAX;
+            }
+            let (stream, end) = match stream_end_of(tid, fd) {
+                Some(p) => p,
+                None => return u64::MAX,
+            };
+
+            // The descriptor goes on the queue before the bytes, so a peer
+            // that reads the bytes never has to wonder whether the handle is
+            // still coming.
+            if pass != u64::MAX {
+                let pfd = pass as usize;
+                if pfd >= crate::task::MAX_FDS {
+                    return u64::MAX;
+                }
+                let kind = scheduler::current_fd(pfd);
+                if kind.is_empty() {
+                    return u64::MAX;
+                }
+                // Hold it on the queue's behalf. Without this the sender
+                // closing its own copy frees the object underneath a
+                // descriptor still travelling.
+                if crate::pipe::retain_in_flight(&kind).is_err() {
+                    return u64::MAX;
+                }
+                if !crate::stream::push_fd(stream, end, kind) {
+                    crate::pipe::release_in_flight(&kind);
+                    return u64::MAX;
+                }
+            }
+
+            let (_, wr) = match crate::stream::pipes_for(stream, end) {
+                Some(p) => p,
+                None => return u64::MAX,
+            };
+            crate::pipe::write(wr, arg1 as *const u8, len)
+        }
+        SYS_FD_RECV => {
+            // arg0 = stream fd, arg1 = buf, arg2 = len, arg3 = where to
+            // install any attached descriptor, or u64::MAX to leave it queued.
+            let fd = arg0 as usize;
+            let len = arg2 as usize;
+            let at = arg3;
+            let tid = scheduler::current_tid();
+            if fd >= crate::task::MAX_FDS {
+                return u64::MAX;
+            }
+            if len > 0 && !validate_user_ptr_mut(arg1, arg2) {
+                return u64::MAX;
+            }
+            let (stream, end) = match stream_end_of(tid, fd) {
+                Some(p) => p,
+                None => return u64::MAX,
+            };
+            let (rd, _) = match crate::stream::pipes_for(stream, end) {
+                Some(p) => p,
+                None => return u64::MAX,
+            };
+            let n = crate::pipe::read(rd, arg1 as *mut u8, len);
+            if n == u64::MAX {
+                return u64::MAX;
+            }
+
+            let mut got = 0u64;
+            if at != u64::MAX {
+                let slot = at as usize;
+                // Check the slot *before* taking the descriptor off the queue.
+                // Popping first and failing to install destroys something the
+                // sender handed over and the receiver asked for, and neither
+                // of them is told.
+                let free = slot < crate::task::MAX_FDS
+                    && unsafe {
+                        match scheduler::get_task_mut(tid) {
+                            Some(t) => t.fds[slot].is_empty(),
+                            None => false,
+                        }
+                    };
+                if free {
+                    if let Some(kind) = crate::stream::pop_fd(stream, end) {
+                        // Turn the queue's anonymous reference into one owned
+                        // by this task. Memory arriving this way admits the
+                        // receiver to the region: the sender chose to send and
+                        // the receiver asked to take.
+                        let installed = unsafe {
+                            match scheduler::get_task_mut(tid) {
+                                Some(t) if t.fds[slot].is_empty() => {
+                                    if crate::pipe::retain_fd(&kind, tid).is_ok() {
+                                        t.fds[slot] = kind;
+                                        true
+                                    } else {
+                                        false
+                                    }
+                                }
+                                _ => false,
+                            }
+                        };
+                        crate::pipe::release_in_flight(&kind);
+                        if installed {
+                            got = 1;
+                        }
+                    }
+                }
+            }
+            (got << 32) | n
+        }
+        SYS_MEMFD_CREATE => {
+            // Memory a program can name and hand over. The region is exactly
+            // what SYS_SHMEM_CREATE makes; the descriptor is what lets it
+            // travel, be inherited, and be closed like anything else.
+            let pages = arg0 as usize;
+            let handle = crate::shmem::create(pages);
+            if handle == u64::MAX {
+                return u64::MAX;
+            }
+            let tid = scheduler::current_tid();
+            let kind = crate::task::FdKind::MemFd { handle: handle as usize };
+            match scheduler::install_fd(tid, kind) {
+                Some(fd) => fd as u64,
+                None => {
+                    crate::shmem::close_ref(handle as usize, tid);
+                    u64::MAX
+                }
+            }
+        }
+        SYS_MMAP_FD => {
+            // arg0 = descriptor naming memory, arg1 = where to map it
+            let fd = arg0 as usize;
+            let vaddr = arg1 as usize;
+            let tid = scheduler::current_tid();
+            if fd >= crate::task::MAX_FDS {
+                return u64::MAX;
+            }
+            let handle = unsafe {
+                match scheduler::get_task_mut(tid) {
+                    Some(t) => match t.fds[fd] {
+                        crate::task::FdKind::MemFd { handle } => handle,
+                        _ => return u64::MAX,
+                    },
+                    None => return u64::MAX,
+                }
+            };
+            crate::shmem::map(handle, vaddr)
+        }
+        SYS_FD_CLOSE => {
+            // Releasing a descriptor is releasing whatever it refers to: a
+            // pipe loses a reader or a writer, and a reader reaching zero is
+            // what turns the peer's next read into end-of-file. Nothing here
+            // needs a capability — a task may always drop its own.
+            let fd = arg0 as usize;
+            if fd >= crate::task::MAX_FDS {
+                return u64::MAX;
+            }
+            let tid = scheduler::current_tid();
+            // `get_task_mut` is an unsafe fn: it hands out a `&'static mut`
+            // into the task table, so every use is inside an unsafe block.
+            let kind = unsafe {
+                match scheduler::get_task_mut(tid) {
+                    Some(t) => core::mem::replace(&mut t.fds[fd], crate::task::FdKind::Empty),
+                    None => return u64::MAX,
+                }
+            };
+            if kind.is_empty() {
+                return u64::MAX;
+            }
+            crate::pipe::release_fd(&kind, tid);
+            0
         }
         SYS_FUTEX_WAIT => {
             // arg0 = addr, arg1 = expected value

@@ -27,10 +27,22 @@
 #define SYS_MUNMAP          33
 #define SYS_PHYS_ALLOC      34
 #define SYS_MAP_PHYS        38
+#define SYS_MMAP_FD         42
 
 /* 0x40  file descriptors */
 #define SYS_FD_READ         64
 #define SYS_FD_WRITE        65
+#define SYS_FD_CLOSE        71
+#define SYS_SOCKETPAIR      72
+#define SYS_FD_SEND         73
+#define SYS_FD_RECV         74
+#define SYS_POLLSET_CREATE  75
+#define SYS_POLLSET_CTL     76
+#define SYS_POLLSET_WAIT    77
+#define SYS_POLL            78
+
+/* 0x30  shared memory */
+#define SYS_MEMFD_CREATE    53
 
 /* 0x60  task */
 #define SYS_SET_FS_BASE     102
@@ -110,6 +122,19 @@ static inline unsigned long __syscall4(unsigned long n, unsigned long a, unsigne
                      : "=a"(r), "+D"(a), "+S"(b), "+d"(c), "+r"(r10)
                      : "a"(n)
                      : "r8", "r9", __SYSCALL_CLOBBERS);
+    return r;
+}
+
+/* arg4 travels in r8. */
+static inline unsigned long __syscall5(unsigned long n, unsigned long a, unsigned long b,
+                                       unsigned long c, unsigned long d, unsigned long e) {
+    unsigned long r;
+    register unsigned long r10 __asm__("r10") = d;
+    register unsigned long r8 __asm__("r8") = e;
+    __asm__ volatile("syscall"
+                     : "=a"(r), "+D"(a), "+S"(b), "+d"(c), "+r"(r10), "+r"(r8)
+                     : "a"(n)
+                     : "r9", __SYSCALL_CLOBBERS);
     return r;
 }
 

@@ -681,6 +681,37 @@ pub fn sys_wait() -> u64 {
 ///
 /// # Safety
 /// Caller must ensure no aliasing.
+/// Put `kind` in the lowest free descriptor at or above 3, and say which.
+///
+/// At or above 3 because 0, 1 and 2 are whatever a spawner wired them to, and a
+/// program allocating a descriptor never means to take stdin's place.
+pub fn install_fd(tid: usize, kind: crate::task::FdKind) -> Option<usize> {
+    unsafe {
+        let task = TASKS[tid].as_mut()?;
+        for fd in 3..crate::task::MAX_FDS {
+            if task.fds[fd].is_empty() {
+                task.fds[fd] = kind;
+                return Some(fd);
+            }
+        }
+    }
+    None
+}
+
+/// Empty one descriptor without releasing what it named.
+///
+/// For unwinding a partial install, where the caller releases the object.
+pub fn clear_fd(tid: usize, fd: usize) -> Result<(), ()> {
+    unsafe {
+        let task = TASKS[tid].as_mut().ok_or(())?;
+        if fd >= crate::task::MAX_FDS {
+            return Err(());
+        }
+        task.fds[fd] = crate::task::FdKind::Empty;
+        Ok(())
+    }
+}
+
 pub unsafe fn get_task_mut(tid: usize) -> Option<&'static mut Task> { unsafe {
     if tid < MAX_TASKS {
         TASKS[tid].as_mut()
@@ -782,7 +813,7 @@ pub fn reap_dead() {
                         continue;
                     }
                     // Clean up pipe refcounts and wake blocked tasks
-                    crate::pipe::cleanup_task_fds(&task.fds);
+                    crate::pipe::cleanup_task_fds(&task.fds, i);
                     // Reclaim pipes it created but never attached to an fd
                     crate::pipe::cleanup_orphans(i);
                     // Clean up IPC state and unblock tasks waiting on this one

@@ -10,7 +10,13 @@
 use crate::scheduler;
 use crate::task::{FdKind, MAX_FDS};
 
-const MAX_PIPES: usize = 32;
+/// Pipes in the system.
+///
+/// Every stream is two of these, so a compositor holding a connection per
+/// client spends them quickly: ninety-six is thirty-two ordinary pipes plus
+/// two apiece for the thirty-two streams. Each carries a 4 KiB buffer inline,
+/// so the number is 384 KiB of kernel memory and is spent up front.
+const MAX_PIPES: usize = 96;
 const PIPE_BUF_SIZE: usize = 4096;
 const MAX_WAITERS: usize = 8;
 
@@ -80,6 +86,86 @@ const MAX_PIPES_PER_TASK: usize = 8;
 
 /// Create a new pipe. Returns the pipe handle index.
 /// Handles start at 1 (slot 0 is reserved so that 0 can mean "no pipe").
+/// A pipe for a stream, exempt from the per-task cap.
+///
+/// That cap exists because `sys_pipe_create` needs no capability, so one task
+/// could otherwise drain the table. A stream is bounded by its own table
+/// instead, and charging its two pipes against a task's eight would have meant
+/// four connections per program.
+pub fn create_for_stream() -> Option<usize> {
+    let creator = scheduler::current_tid();
+    let flags = irq_save();
+    let result = unsafe {
+        let mut found = None;
+        for i in 1..MAX_PIPES {
+            if !PIPES[i].in_use {
+                PIPES[i] = Pipe::new();
+                PIPES[i].in_use = true;
+                PIPES[i].creator = creator;
+                found = Some(i);
+                break;
+            }
+        }
+        found
+    };
+    irq_restore(flags);
+    result
+}
+
+/// No writer remains, so a read will never block again.
+pub fn no_writers(handle: usize) -> bool {
+    let flags = irq_save();
+    let out = unsafe { handle < MAX_PIPES && PIPES[handle].in_use && PIPES[handle].writers == 0 };
+    irq_restore(flags);
+    out
+}
+
+/// No reader remains, so a write has nowhere to go.
+pub fn no_readers(handle: usize) -> bool {
+    let flags = irq_save();
+    let out = unsafe { handle < MAX_PIPES && PIPES[handle].in_use && PIPES[handle].readers == 0 };
+    irq_restore(flags);
+    out
+}
+
+/// Is a read able to return now — with bytes, or with the end-of-file a
+/// departed writer means?
+pub fn readable(handle: usize) -> bool {
+    let flags = irq_save();
+    let out = unsafe {
+        handle < MAX_PIPES
+            && PIPES[handle].in_use
+            && (PIPES[handle].len > 0 || PIPES[handle].writers == 0)
+    };
+    irq_restore(flags);
+    out
+}
+
+/// Is there room to write?
+pub fn writable(handle: usize) -> bool {
+    let flags = irq_save();
+    let out = unsafe {
+        handle < MAX_PIPES && PIPES[handle].in_use && PIPES[handle].len < PIPE_BUF_SIZE
+    };
+    irq_restore(flags);
+    out
+}
+
+/// Free a pipe that was created and never wired to anything.
+pub fn drop_unreferenced(handle: usize) {
+    let flags = irq_save();
+    unsafe {
+        if handle < MAX_PIPES
+            && PIPES[handle].in_use
+            && PIPES[handle].readers == 0
+            && PIPES[handle].writers == 0
+        {
+            PIPES[handle].in_use = false;
+        }
+    }
+    irq_restore(flags);
+}
+
 pub fn create() -> Option<usize> {
     let creator = scheduler::current_tid();
     let flags = irq_save();
@@ -150,7 +236,18 @@ pub fn add_ref(handle: usize, is_write: bool) -> Result<(), ()> {
 }
 
 /// Read from a pipe. Blocks if empty and writers exist. Returns bytes read (0 = EOF).
+/// Read from a pipe, then say so.
+///
+/// The notification is outside the critical section deliberately: waking a set
+/// reaches into the task table and the stream table, and doing that with this
+/// module's interrupts-off window open would nest two of them.
 pub fn read(handle: usize, buf: *mut u8, max_len: usize) -> u64 {
+    let n = read_inner(handle, buf, max_len);
+    crate::pollset::note_pipe(handle);
+    n
+}
+
+fn read_inner(handle: usize, buf: *mut u8, max_len: usize) -> u64 {
     unsafe {
         loop {
             let flags = irq_save();
@@ -261,6 +358,12 @@ pub fn read_nonblock(handle: usize, buf: *mut u8, max_len: usize) -> u64 {
 
 /// Write to a pipe. Blocks if full and readers exist. Returns bytes written.
 pub fn write(handle: usize, buf: *const u8, len: usize) -> u64 {
+    let n = write_inner(handle, buf, len);
+    crate::pollset::note_pipe(handle);
+    n
+}
+
+fn write_inner(handle: usize, buf: *const u8, len: usize) -> u64 {
     unsafe {
         if len == 0 {
             return 0;
@@ -333,17 +436,87 @@ pub fn write(handle: usize, buf: *const u8, len: usize) -> u64 {
 
 /// Clean up pipe references when a task dies.
 /// Decrements refcounts and wakes blocked waiters.
-pub fn cleanup_task_fds(fds: &[FdKind; MAX_FDS]) {
+pub fn cleanup_task_fds(fds: &[FdKind; MAX_FDS], owner: usize) {
     for fd in fds.iter() {
-        match fd {
-            FdKind::PipeRead(handle) => drop_ref(*handle, false),
-            FdKind::PipeWrite(handle) => drop_ref(*handle, true),
-            _ => {}
-        }
+        release_fd(fd, owner);
     }
 }
 
-fn drop_ref(handle: usize, is_write: bool) {
+/// Drop one descriptor's reference to whatever it names.
+///
+/// `cleanup_task_fds` does this for a whole table when a task dies; a task
+/// closing one descriptor needs exactly the same work for one entry.
+///
+/// `owner` is passed rather than read from the current task: the reaper runs
+/// this over a *dead* task's table, and it is not that task.
+pub fn release_fd(kind: &FdKind, owner: usize) {
+    match kind {
+        FdKind::PipeRead(handle) => drop_ref(*handle, false),
+        FdKind::PipeWrite(handle) => drop_ref(*handle, true),
+        FdKind::MemFd { handle } => crate::shmem::close_ref(*handle, owner),
+        FdKind::StreamEnd { stream, end } => crate::stream::close_end(*stream, *end),
+        FdKind::PollSet { set } => crate::pollset::destroy(*set),
+        _ => {}
+    }
+}
+
+/// Take a reference on whatever a descriptor names, for a copy of it.
+///
+/// The mirror of `release_fd`, and deliberately beside it: `SYS_FD_DUP` and
+/// `SYS_PIPE_FD_SET` both make a second descriptor for one object, and a kind
+/// added to one of these and not the other leaks or double-frees.
+/// Take a reference for a descriptor in flight, belonging to no task yet.
+///
+/// A queued descriptor has no owner — the receiver is not decided until it
+/// calls recv — so this is the tid-free counterpart of `retain_fd`, and its
+/// reference is released by `release_in_flight` whether the descriptor
+/// arrives or is dropped with the stream carrying it.
+pub fn retain_in_flight(kind: &FdKind) -> Result<(), ()> {
+    match kind {
+        FdKind::PipeRead(handle) => add_ref(*handle, false),
+        FdKind::PipeWrite(handle) => add_ref(*handle, true),
+        FdKind::MemFd { handle } => {
+            if crate::shmem::hold_in_flight(*handle) { Ok(()) } else { Err(()) }
+        }
+        FdKind::StreamEnd { stream, end } => crate::stream::retain_end(*stream, *end),
+        _ => Ok(()),
+    }
+}
+
+/// Give back what `retain_in_flight` took.
+pub fn release_in_flight(kind: &FdKind) {
+    match kind {
+        FdKind::PipeRead(handle) => drop_ref(*handle, false),
+        FdKind::PipeWrite(handle) => drop_ref(*handle, true),
+        FdKind::MemFd { handle } => crate::shmem::drop_in_flight(*handle),
+        FdKind::StreamEnd { stream, end } => crate::stream::close_end(*stream, *end),
+        _ => {}
+    }
+}
+
+/// `owner` is the task the *new* descriptor will belong to, which for
+/// `SYS_FD_DUP` is the target rather than the caller.
+pub fn retain_fd(kind: &FdKind, owner: usize) -> Result<(), ()> {
+    match kind {
+        FdKind::PipeRead(handle) => add_ref(*handle, false),
+        FdKind::PipeWrite(handle) => add_ref(*handle, true),
+        FdKind::MemFd { handle } => {
+            // Whoever ends up holding the copy may map it.
+            if crate::shmem::add_access(*handle, owner) { Ok(()) } else { Err(()) }
+        }
+        FdKind::StreamEnd { stream, end } => crate::stream::retain_end(*stream, *end),
+        _ => Ok(()),
+    }
+}
+
+pub fn drop_ref(handle: usize, is_write: bool) {
+    drop_ref_inner(handle, is_write);
+    // A departed writer is end-of-file and a departed reader is a hangup, both
+    // of which somebody may be waiting on.
+    crate::pollset::note_pipe(handle);
+}
+
+fn drop_ref_inner(handle: usize, is_write: bool) {
     let flags = irq_save();
     unsafe {
         if handle >= MAX_PIPES || !PIPES[handle].in_use {

@@ -71,6 +71,19 @@ fn eq_ignore_case(a: &[u8], b: &[u8]) -> bool {
 /// It deliberately holds no PhysRange, so a child asking for one is refused:
 /// the shell runs arbitrary user code and cannot hand out authority it was
 /// never given. That refusal is the kernel's, not a check here.
+/// What every program the shell starts is told about the world.
+///
+/// Fixed, because there is no `export` and nothing sets a variable at run time.
+/// It exists because software ported here expects these to be answerable — and
+/// because a Wayland client is handed its connection through this, in
+/// `WAYLAND_SOCKET`.
+const BASE_ENV: [&[u8]; 4] = [
+    b"HOME=/home/root",
+    b"PATH=/usr/bin",
+    b"TERM=quark",
+    b"USER=root",
+];
+
 fn grant_caps_from_manifest(image: &[u8], tid: usize) {
     // Every child inherits the shell's IPC reach, so it can find and call the
     // services. Delegated rather than minted: the shell cannot read back the
@@ -276,7 +289,7 @@ fn cmd_spawn(
         }
     }
 
-    let _ = spawn::set_args(&info, &argv_bufs[..argc], &SPAWN_SCRATCH);
+    let _ = spawn::set_args_env(&info, &argv_bufs[..argc], &BASE_ENV, &SPAWN_SCRATCH);
 
     Some(info)
 }

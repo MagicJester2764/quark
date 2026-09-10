@@ -245,6 +245,28 @@ unsafe fn take_death(receiver: usize) -> Option<Message> {
     }
 }
 
+/// Wake a task sleeping in `sys_recv_timeout` on its own TID.
+///
+/// That is how a task sleeps here — nobody can send to your own TID, so only
+/// the deadline ends the block. `sys_notify` deliberately wakes only a task
+/// waiting on `TID_ANY`, because a notification is a message and that task
+/// asked for one. This is not a message: it is a sleeper being told that its
+/// deadline no longer matters.
+pub fn wake_sleeper(tid: usize) {
+    if tid >= MAX_TASKS {
+        return;
+    }
+    let flags = irq_save();
+    unsafe {
+        if matches!(TASK_IPC[tid].state, IpcState::RecvBlocked(t) if t == tid) {
+            TASK_IPC[tid].state = IpcState::None;
+            TASK_TIMEOUT[tid] = 0;
+            scheduler::unblock_task(tid);
+        }
+    }
+    irq_restore(flags);
+}
+
 pub fn sys_notify(dest: usize, badge: u64) -> Result<(), IpcError> {
     if dest >= MAX_TASKS || badge == 0 {
         return Err(IpcError::InvalidTid);

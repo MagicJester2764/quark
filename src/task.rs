@@ -9,7 +9,14 @@ use alloc::alloc::{alloc, dealloc, Layout};
 pub const MAX_TASKS: usize = 64;
 pub const KERNEL_STACK_SIZE: usize = 65536; // 64 KiB per task
 const STACK_ALIGN: usize = 16;
-pub const MAX_FDS: usize = 8;
+/// Descriptors per task.
+///
+/// Eight was three spoken for and five left, which is not enough for a program
+/// holding a display-server connection, a memory object per buffer pool and a
+/// pipe or two. Thirty-two costs `MAX_TASKS * 32 * size_of::<FdKind>()` of
+/// kernel memory — about fifty kilobytes for the whole system — and is spent
+/// whether or not it is used, because the table is inline in the task.
+pub const MAX_FDS: usize = 32;
 
 /// File descriptor kind — routes I/O to either an IPC service or a kernel pipe.
 #[derive(Debug, Clone, Copy)]
@@ -18,6 +25,14 @@ pub enum FdKind {
     Ipc { target_tid: usize, tag: u64 },
     PipeRead(usize),   // pipe handle index
     PipeWrite(usize),  // pipe handle index
+    /// Shared memory, named by a descriptor so that it can be passed across a
+    /// stream, inherited, and closed like anything else a program holds.
+    MemFd { handle: usize },
+    /// One end of a connected pair. `end` is 0 or 1.
+    StreamEnd { stream: usize, end: u8 },
+    /// A set of descriptors to wait on. A set is a descriptor itself, so it
+    /// can be held, closed and passed like any other.
+    PollSet { set: usize },
     /// A network connection, held by the net server as `handle`.
     ///
     /// Unlike `Ipc`, which is one-directional and carries a fixed tag, a

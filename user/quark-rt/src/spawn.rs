@@ -212,32 +212,55 @@ pub fn load(elf: &[u8], scratch: &Scratch) -> Result<Spawned, ()> {
     Ok(Spawned { tid, entry, stack_top: STACK_TOP as u64, cr3 })
 }
 
-/// Write `args` into the child's argv page, read back by `quark_rt::args`.
+/// Write `args` and `env` into the child's argument page, read back by
+/// `quark_rt::args`.
 ///
-/// Layout: a count, then each argument as a length followed by its bytes.
-/// Arguments that would overflow the page are dropped rather than truncated.
-pub fn set_args(info: &Spawned, args: &[&[u8]], scratch: &Scratch) -> Result<(), ()> {
+/// Layout: a count, then each entry as a length followed by its bytes; the
+/// arguments first and the environment after them. An entry that would
+/// overflow the page is dropped rather than truncated — half an environment
+/// variable is worse than a missing one.
+///
+/// The page is mapped read-only in the child. That is safe for an environment
+/// as well as for argv, because nothing writes through these bytes: a C
+/// library builds its own array of pointers into them, and `setenv` allocates
+/// a new string rather than editing one in place.
+pub fn set_args_env(
+    info: &Spawned,
+    args: &[&[u8]],
+    env: &[&[u8]],
+    scratch: &Scratch,
+) -> Result<(), ()> {
     let frame = syscall::sys_phys_alloc(1)?;
     syscall::sys_map_phys(frame, scratch.args, 1)?;
 
     let base = scratch.args as *mut u8;
     unsafe {
         core::ptr::write_bytes(base, 0, PAGE_SIZE);
-        *(base as *mut u64) = args.len() as u64;
 
-        let mut offset = 8usize;
-        for arg in args {
-            if offset + 8 + arg.len() > PAGE_SIZE {
-                break;
-            }
-            *(base.add(offset) as *mut u64) = arg.len() as u64;
+        let mut offset = 0usize;
+        for section in [args, env] {
+            let count_at = offset;
             offset += 8;
-            core::ptr::copy_nonoverlapping(arg.as_ptr(), base.add(offset), arg.len());
-            offset += arg.len();
+            let mut written = 0u64;
+            for item in section {
+                if offset + 8 + item.len() > PAGE_SIZE {
+                    break;
+                }
+                *(base.add(offset) as *mut u64) = item.len() as u64;
+                offset += 8;
+                core::ptr::copy_nonoverlapping(item.as_ptr(), base.add(offset), item.len());
+                offset += item.len();
+                written += 1;
+            }
+            *(base.add(count_at) as *mut u64) = written;
         }
     }
 
-    // Read-only in the child: argv is not its to rewrite.
     syscall::sys_addrspace_map(info.cr3, ARGS_PAGE_ADDR, frame, 1, 0)?;
     Ok(())
+}
+
+/// As [`set_args_env`], with no environment.
+pub fn set_args(info: &Spawned, args: &[&[u8]], scratch: &Scratch) -> Result<(), ()> {
+    set_args_env(info, args, &[], scratch)
 }

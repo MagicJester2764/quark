@@ -27,6 +27,8 @@ mod elf;
 mod futex;
 mod services;
 mod shmem;
+mod pollset;
+mod stream;
 pub mod pipe;
 pub mod serial;
 pub mod task;

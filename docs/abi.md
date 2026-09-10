@@ -1,6 +1,6 @@
 # Quark syscall ABI
 
-**Version 1.5.** Query the running kernel with `SYS_ABI_VERSION` (240), which
+**Version 1.6.** Query the running kernel with `SYS_ABI_VERSION` (240), which
 returns `(major << 16) | minor`.
 
 This document is the contract between the Quark kernel and everything above it.
@@ -91,6 +91,7 @@ so it is built from calls that already existed.
 | 1.3 | `SYS_SOCK_FD` (176), `SYS_SOCK_INFO` (177) — a network connection as a file descriptor. |
 | 1.4 | `SYS_TASK_WATCH` (104) — be told when a task dies, so what it was lent can be taken back. |
 | 1.5 | `SYS_TASK_PRIORITY` (105) — which scheduling band a task runs in. |
+| 1.6 | `SYS_MMAP_FD` (42), `SYS_MEMFD_CREATE` (53), `SYS_FD_CLOSE` (71), `SYS_SOCKETPAIR` (72), `SYS_FD_SEND` (73), `SYS_FD_RECV` (74), `SYS_POLLSET_CREATE` (75), `SYS_POLLSET_CTL` (76), `SYS_POLLSET_WAIT` (77), `SYS_POLL` (78) — a bidirectional stream, descriptor passing, memory named by a descriptor, and waiting on more than one thing at once. The descriptor table also goes from 8 entries to 32. |
 
 A capability may only be minted from one the caller already holds, and only
 narrowed — with one exception. **An `Endpoint` naming only the caller may
@@ -186,6 +187,7 @@ call to a task that never reaches `SYS_RECV` blocks forever.
 | # | Name | Arguments | Returns | Cap |
 |---|---|---|---|---|
 | 32 | `SYS_MMAP` | arg0 = vaddr, arg1 = pages | 0 / `u64::MAX` | — (quota enforced) |
+| 42 | `SYS_MMAP_FD` | arg0 = fd naming memory, arg1 = vaddr | 0 / `u64::MAX` | — |
 | 33 | `SYS_MUNMAP` | arg0 = vaddr, arg1 = pages | 0 / `u64::MAX` | — |
 | 34 | `SYS_PHYS_ALLOC` | arg0 = pages | physical address / `u64::MAX` | `PhysAlloc` |
 | 35 | `SYS_PHYS_FREE` | arg0 = phys, arg1 = count | 0 / `u64::MAX` | `PhysAlloc` + frame ownership |
@@ -211,16 +213,23 @@ Physical addresses are page aligned; a request that is not is rejected.
 
 | # | Name | Arguments | Returns | Cap |
 |---|---|---|---|---|
-| 48 | `SYS_SHMEM_CREATE` | arg0 = pages (1–1024) | handle / `u64::MAX` | — (charged to creator's quota) |
+| 48 | `SYS_SHMEM_CREATE` | arg0 = pages (1–4096) | handle / `u64::MAX` | — (charged to creator's quota) |
 | 49 | `SYS_SHMEM_MAP` | arg0 = handle, arg1 = vaddr | 0 / `u64::MAX` | must have been granted |
 | 50 | `SYS_SHMEM_UNMAP` | arg0 = handle, arg1 = vaddr | 0 / `u64::MAX` | — |
 | 51 | `SYS_SHMEM_GRANT` | arg0 = handle, arg1 = target tid | 0 / `u64::MAX` | must be the creator |
 | 52 | `SYS_SHMEM_DESTROY` | arg0 = handle | 0 / `u64::MAX` | must be the creator |
+| 53 | `SYS_MEMFD_CREATE` | arg0 = pages | fd naming the region / `u64::MAX` | — (charged to creator's quota) |
 
-A region is one contiguous run of physical frames, which is what makes a
-window-sized one possible: 1024 pages is four megabytes, the same ceiling
-`SYS_PHYS_ALLOC` has. It was sixteen pages until the display server needed to
-share a screenful with a client.
+A region is assembled from up to sixteen contiguous runs of physical frames, so
+a large one does not need a large unfragmented span: 4096 pages is sixteen
+megabytes, which no allocator on a small machine will give in one piece. It was
+sixteen pages until the display server needed to share a screenful with a
+client, then one run of 1024 — which was exactly one 1280x800 buffer, and
+therefore not two. There are 256 regions in the system.
+
+`SYS_MEMFD_CREATE` makes the same region and names it with a descriptor, which
+is what lets it be passed over a stream, inherited across a spawn, or closed
+like anything else a program holds.
 
 Destruction is deferred while any mapping remains. Futexes are keyed on physical
 address, so a futex word inside a shared region is one object to every task that
@@ -228,9 +237,13 @@ maps it.
 
 ### File descriptors and pipes (0x40)
 
-Eight descriptors per task. 0, 1 and 2 are stdin, stdout and stderr by
+Thirty-two descriptors per task. 0, 1 and 2 are stdin, stdout and stderr by
 convention. A descriptor is one of: unset, an IPC endpoint (a service TID plus a
-tag), a pipe read end, or a pipe write end.
+tag), a pipe read end, a pipe write end, one end of a stream, shared memory, or
+a set of descriptors to wait on.
+
+A descriptor names an object and holds a reference to it. Closing the last one
+frees the object, and is what makes a pipe's reader see end-of-file.
 
 | # | Name | Arguments | Returns | Cap |
 |---|---|---|---|---|
@@ -241,6 +254,33 @@ tag), a pipe read end, or a pipe write end.
 | 68 | `SYS_FD_DUP` | arg0 = target tid, arg1 = target fd, arg2 = source fd | 0 / `u64::MAX` | `TaskMgmt` |
 | 69 | `SYS_PIPE_CREATE` | — | handle / `u64::MAX` | — (bounded per task) |
 | 70 | `SYS_PIPE_FD_SET` | arg0 = target tid, arg1 = fd, arg2 = pipe handle, arg3 = 1 for write end | 0 / `u64::MAX` | `TaskMgmt` |
+| 71 | `SYS_FD_CLOSE` | arg0 = fd | 0 / `u64::MAX` | — |
+| 72 | `SYS_SOCKETPAIR` | — | `(fd0 << 32) \| fd1`, both in the caller's table / `u64::MAX` | — |
+| 73 | `SYS_FD_SEND` | arg0 = stream fd, arg1 = buf, arg2 = len, arg3 = fd to pass or `u64::MAX` | bytes written / `u64::MAX` | — |
+| 74 | `SYS_FD_RECV` | arg0 = stream fd, arg1 = buf, arg2 = len, arg3 = fd to install a passed descriptor at, or `u64::MAX` | `(got_fd << 32) \| bytes` / `u64::MAX` | — |
+| 75 | `SYS_POLLSET_CREATE` | — | fd naming the set / `u64::MAX` | — |
+| 76 | `SYS_POLLSET_CTL` | arg0 = set fd, arg1 = op (0 add, 1 modify, 2 remove), arg2 = fd, arg3 = events, arg4 = token | 0 / `u64::MAX` | — |
+| 77 | `SYS_POLLSET_WAIT` | arg0 = set fd, arg1 = array of `(u64 token, u32 events, u32 pad)`, arg2 = capacity, arg3 = timeout in ticks | entries filled, 0 = timed out / `u64::MAX` | — |
+| 78 | `SYS_POLL` | arg0 = array of `(u32 fd, u32 events, u32 revents, u32 pad)`, arg1 = count, arg2 = timeout in ticks | entries with non-zero `revents` / `u64::MAX` | — |
+
+**Streams.** `SYS_SOCKETPAIR` makes two connected ends and puts both in the
+caller's table; moving one into another task is `SYS_FD_DUP` followed by closing
+the caller's copy. An end is reference counted, so that last step does not tell
+the peer the connection has gone.
+
+**Passing a descriptor needs no authority over the peer.** `SYS_FD_DUP` puts one
+into a task that never asked, so it requires `TaskMgmt` over that task.
+`SYS_FD_SEND` hands one to a task that called `SYS_FD_RECV`: the sender chose to
+send and the receiver asked to take, and consent on both sides is the whole
+authorisation. Memory arriving this way admits the receiver to the region.
+
+**Waiting.** Events are `1` readable, `2` writable, `4` hangup, `8` invalid.
+Hangup is reported whether or not it was asked for, because waiting for readable
+on a stream whose peer has gone is waiting for something that cannot arrive.
+`SYS_POLLSET_CTL` refuses a descriptor that can never become ready — an IPC
+endpoint has no buffer — while `SYS_POLL` reports `8` in that entry's `revents`
+instead, because one bad entry should not deny the caller the answer about the
+others.
 
 `SYS_PIPE_CREATE` needs no capability because a shell needs it for pipelines.
 Pipes are reference counted through the descriptors that hold them; a read
