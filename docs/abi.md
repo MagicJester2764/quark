@@ -1,6 +1,6 @@
 # Quark syscall ABI
 
-**Version 1.3.** Query the running kernel with `SYS_ABI_VERSION` (240), which
+**Version 1.5.** Query the running kernel with `SYS_ABI_VERSION` (240), which
 returns `(major << 16) | minor`.
 
 This document is the contract between the Quark kernel and everything above it.
