@@ -139,6 +139,20 @@ impl ShmemRegion {
 
 /// Release a region's frames and reset the slot. Interrupts must be off.
 unsafe fn release(region: &mut ShmemRegion) {
+    let creator = region.creator;
+    let freed = unsafe { release_frames(region) };
+    // Refund the creator's quota.
+    scheduler::uncharge_task_mem(creator, freed);
+    *region = ShmemRegion::empty();
+}
+
+/// Return a region's frames to the allocator and empty its run list, leaving
+/// the slot claimed. Returns how many pages went back. Interrupts must be off.
+///
+/// Split out from `release` for `resize`, which gives the frames up and takes
+/// new ones without the slot ever ceasing to exist — the handle stays valid
+/// throughout, because a descriptor already names it.
+unsafe fn release_frames(region: &mut ShmemRegion) -> usize {
     let mut freed = 0;
     for r in &region.runs[..region.run_count] {
         for j in 0..r.pages {
@@ -146,9 +160,9 @@ unsafe fn release(region: &mut ShmemRegion) {
             freed += 1;
         }
     }
-    // Refund the creator's quota.
-    scheduler::uncharge_task_mem(region.creator, freed);
-    *region = ShmemRegion::empty();
+    region.runs = [Run { base: 0, pages: 0 }; MAX_RUNS];
+    region.run_count = 0;
+    freed
 }
 
 /// Create a shared memory region. Returns handle (0..31) or u64::MAX on error.
@@ -190,6 +204,20 @@ pub fn create(pages: usize) -> u64 {
     }
     irq_restore(flags);
 
+    if !fill(handle, pages) {
+        return u64::MAX;
+    }
+
+    scheduler::current_task_charge_mem(pages);
+    handle as u64
+}
+
+/// Give a claimed region its frames. False if the machine has not got them, in
+/// which case the slot is released and the handle is no longer valid.
+///
+/// The caller has already claimed the slot and set `page_count`; this is only
+/// the allocation, which is the part `resize` needs to do again.
+fn fill(handle: usize, pages: usize) -> bool {
     // Take the largest contiguous runs the allocator will give, halving the
     // request whenever it refuses. A fresh machine satisfies this in one run;
     // a fragmented one in several, which is the entire point of a run list.
@@ -219,7 +247,7 @@ pub fn create(pages: usize) -> u64 {
             release(region);
         }
         irq_restore(flags);
-        return u64::MAX;
+        return false;
     }
     // Zero every run (identity-mapped) so nothing leaks from a previous owner.
     for r in &runs[..run_count] {
@@ -230,15 +258,76 @@ pub fn create(pages: usize) -> u64 {
         let region = &mut regions()[handle];
         region.runs = runs;
         region.run_count = run_count;
+        region.page_count = pages;
     }
     irq_restore(flags);
+    true
+}
 
+/// Give an existing region a new size, in pages.
+///
+/// This is `ftruncate` on a memory descriptor, and it is deliberately narrow:
+/// only while nobody has the region mapped, nobody else has been admitted to
+/// it, and no descriptor for it is travelling. That is the whole of how a libc
+/// uses it — `memfd_create` then `ftruncate` then `mmap`, before the descriptor
+/// has been anywhere — and outside that window growing a region would change
+/// what is behind somebody else's live mapping.
+pub fn resize(handle: usize, pages: usize) -> u64 {
+    if handle >= MAX_SHMEM || pages == 0 || pages > MAX_PAGES_PER_REGION {
+        return u64::MAX;
+    }
+    let tid = scheduler::current_tid();
+    if tid >= MAX_TASKS {
+        return u64::MAX;
+    }
+
+    let flags = irq_save();
+    let old_pages = unsafe {
+        let region = &mut regions()[handle];
+        if !region.in_use
+            || region.pending_destroy
+            || region.mapped != 0
+            || region.in_flight != 0
+            || region.access != 1u64 << tid
+            || region.creator != tid
+        {
+            irq_restore(flags);
+            return u64::MAX;
+        }
+        if region.page_count == pages {
+            irq_restore(flags);
+            return pages as u64;
+        }
+        let old = region.page_count;
+        // Let go of the old frames before asking for new ones: on a machine
+        // with just enough memory, holding both is the difference between a
+        // resize that works and one that does not.
+        release_frames(region);
+        region.page_count = pages;
+        old
+    };
+    irq_restore(flags);
+    scheduler::uncharge_task_mem(tid, old_pages);
+
+    if !scheduler::current_task_check_mem(pages) {
+        // Put it back the way it was found, so a refused resize does not also
+        // destroy the memory the caller already had.
+        let flags = irq_save();
+        unsafe { regions()[handle].page_count = 0 };
+        irq_restore(flags);
+        let _ = fill(handle, old_pages);
+        return u64::MAX;
+    }
+    if !fill(handle, pages) {
+        return u64::MAX;
+    }
     scheduler::current_task_charge_mem(pages);
-    handle as u64
+    pages as u64
 }
 
 /// Map a shared memory region into the caller's address space.
 /// vaddr must be page-aligned and in user space.
+/// Map a region into the caller. Returns the number of pages, or `u64::MAX`.
 pub fn map(handle: usize, vaddr: usize) -> u64 {
     if handle >= MAX_SHMEM {
         return u64::MAX;
@@ -294,7 +383,7 @@ pub fn map(handle: usize, vaddr: usize) -> u64 {
             }
         }
         region.mapped |= 1u64 << tid;
-        0
+        page_count as u64
     };
     irq_restore(flags);
     result

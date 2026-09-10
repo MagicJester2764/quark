@@ -74,6 +74,10 @@ pub const SYS_ADDRSPACE_SELF: u64 = 41;
 pub const SYS_MMAP_FD: u64 = 42;
 pub const SYS_SHMEM_CREATE: u64 = 48;
 pub const SYS_MEMFD_CREATE: u64 = 53;
+/// Give memory named by a descriptor a new size. This is `ftruncate`, and the
+/// reason it exists is that every Wayland client makes its buffer pool that
+/// way: `memfd_create` then `ftruncate` then `mmap`.
+pub const SYS_MEMFD_TRUNCATE: u64 = 54;
 pub const SYS_SHMEM_MAP: u64 = 49;
 pub const SYS_SHMEM_UNMAP: u64 = 50;
 pub const SYS_SHMEM_GRANT: u64 = 51;
@@ -180,7 +184,7 @@ pub const SYS_ABI_VERSION: u64 = 240;
 /// minor when calls are added. User space can refuse to run against a major it
 /// does not know, which is the point of exposing it at all.
 pub const ABI_VERSION_MAJOR: u64 = 1;
-pub const ABI_VERSION_MINOR: u64 = 8;
+pub const ABI_VERSION_MINOR: u64 = 9;
 
 /// Threads a task may make with no capability at all.
 ///
@@ -1197,15 +1201,28 @@ extern "C" fn syscall_dispatch(
             }
         }
         SYS_FD_DUP => {
-            // arg0 = target tid, arg1 = target fd, arg2 = source fd (from current task)
-            // Copies the caller's source fd to the target task's target fd.
-            // Increments pipe refcount if the fd is a pipe endpoint.
-            // Requires CAP_TASK_MGMT.
-            if !crate::cap::task_has_task_mgmt(scheduler::current_tid(), 0) {
+            // arg0 = target tid, arg1 = target fd or ANY_FD, arg2 = source fd
+            // (from current task), arg3 = lowest acceptable fd when arg1 asks
+            // for any. Copies the caller's source fd into the target's table.
+            //
+            // Putting a descriptor into *another* task hands it authority it
+            // never asked for, and needs `TaskMgmt`. Putting one into your own
+            // needs nothing: a second name for something you already hold is
+            // not more authority, and `dup` is a libc's most ordinary call.
+            let me = scheduler::current_tid();
+            let target_tid = arg0 as usize;
+            if target_tid != me && !crate::cap::task_has_task_mgmt(me, 0) {
                 return u64::MAX;
             }
-            let target_tid = arg0 as usize;
-            let target_fd = arg1 as usize;
+            let target_fd = if arg1 == ANY_FD {
+                let low = (arg3 as usize).max(3);
+                match scheduler::free_fd_at_or_above(target_tid, low) {
+                    Some(f) => f,
+                    None => return u64::MAX,
+                }
+            } else {
+                arg1 as usize
+            };
             let source_fd = arg2 as usize;
             let kind = scheduler::current_fd(source_fd);
             if kind.is_empty() {
@@ -1219,8 +1236,12 @@ extern "C" fn syscall_dispatch(
                 return u64::MAX;
             }
             match scheduler::set_fd(target_tid, target_fd, kind) {
-                Ok(()) => 0,
-                Err(()) => u64::MAX,
+                // The number, since the caller may have let us choose it.
+                Ok(()) => target_fd as u64,
+                Err(()) => {
+                    crate::pipe::release_fd(&kind, target_tid);
+                    u64::MAX
+                }
             }
         }
         SYS_SOCKETPAIR => {
@@ -1502,7 +1523,14 @@ extern "C" fn syscall_dispatch(
                 Some(p) => p,
                 None => return u64::MAX,
             };
-            let n = if arg4 & FD_DONTWAIT != 0 {
+            // A zero-length receive asks for a descriptor and nothing else.
+            // It never blocks and never reports end of file, because a caller
+            // draining the descriptor queue has to be able to ask once more
+            // after the bytes have run out — and the alternative, parking on an
+            // empty stream, is exactly the hang that made this call take flags.
+            let n = if len == 0 {
+                0
+            } else if arg4 & FD_DONTWAIT != 0 {
                 crate::pipe::read_nonblock(rd, arg1 as *mut u8, len)
             } else {
                 crate::pipe::read(rd, arg1 as *mut u8, len)
@@ -1595,6 +1623,28 @@ extern "C" fn syscall_dispatch(
                 }
             }
         }
+        SYS_MEMFD_TRUNCATE => {
+            // arg0 = descriptor naming memory, arg1 = size in bytes
+            let fd = arg0 as usize;
+            let bytes = arg1 as usize;
+            if fd >= crate::task::MAX_FDS {
+                return u64::MAX;
+            }
+            let tid = scheduler::current_tid();
+            let handle = unsafe {
+                match scheduler::get_task_mut(tid) {
+                    Some(t) => match t.fds[fd] {
+                        crate::task::FdKind::MemFd { handle } => handle,
+                        _ => return u64::MAX,
+                    },
+                    None => return u64::MAX,
+                }
+            };
+            match crate::shmem::resize(handle, bytes.div_ceil(4096)) {
+                u64::MAX => u64::MAX,
+                pages => pages * 4096,
+            }
+        }
         SYS_MMAP_FD => {
             // arg0 = descriptor naming memory, arg1 = where to map it
             let fd = arg0 as usize;
@@ -1612,7 +1662,15 @@ extern "C" fn syscall_dispatch(
                     None => return u64::MAX,
                 }
             };
-            crate::shmem::map(handle, vaddr)
+            // The size comes back, not merely success. A receiver of a
+            // descriptor knows nothing about how big the memory behind it is,
+            // and the sender's word for it is the one thing it must not take:
+            // a client that says its pool is sixteen megabytes when it is one
+            // page is asking the compositor to read memory that is not there.
+            match crate::shmem::map(handle, vaddr) {
+                u64::MAX => u64::MAX,
+                pages => pages * 4096,
+            }
         }
         SYS_FD_CLOSE => {
             // Releasing a descriptor is releasing whatever it refers to: a
@@ -1781,7 +1839,10 @@ extern "C" fn syscall_dispatch(
         }
         SYS_SHMEM_MAP => {
             // arg0 = handle, arg1 = vaddr
-            crate::shmem::map(arg0 as usize, arg1 as usize)
+            match crate::shmem::map(arg0 as usize, arg1 as usize) {
+                u64::MAX => u64::MAX,
+                _ => 0,
+            }
         }
         SYS_SHMEM_GRANT => {
             // arg0 = handle, arg1 = target tid

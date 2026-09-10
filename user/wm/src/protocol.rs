@@ -37,5 +37,30 @@ pub const REGISTRY_GLOBAL: u16 = 0;
 // wl_callback events.
 pub const CALLBACK_DONE: u16 = 0;
 
+// wl_shm requests and events.
+pub const SHM_CREATE_POOL: u16 = 0;
+pub const SHM_FORMAT: u16 = 0;
+
+// wl_shm_pool requests.
+pub const SHM_POOL_CREATE_BUFFER: u16 = 0;
+pub const SHM_POOL_DESTROY: u16 = 1;
+pub const SHM_POOL_RESIZE: u16 = 2;
+
+// wl_buffer requests and events.
+pub const BUFFER_DESTROY: u16 = 0;
+pub const BUFFER_RELEASE: u16 = 0;
+
+/// `wl_display.error` codes. `INVALID_METHOD` is what a request the compositor
+/// cannot honour earns: telling the client which object and why is the
+/// difference between a bug it can find and a connection that simply stopped.
+pub const ERR_INVALID_OBJECT: u32 = 0;
+pub const ERR_INVALID_METHOD: u32 = 1;
+pub const ERR_NO_MEMORY: u32 = 2;
+
+/// `wl_shm.error`: the client asked for a format nothing here can composite.
+pub const SHM_ERR_INVALID_FORMAT: u32 = 0;
+pub const SHM_ERR_INVALID_STRIDE: u32 = 1;
+pub const SHM_ERR_INVALID_FD: u32 = 2;
+
 /// The object id of `wl_display`, which exists before anything is asked for.
 pub const DISPLAY_ID: u32 = 1;

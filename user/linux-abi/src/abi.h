@@ -40,6 +40,9 @@ long __quark_access(const char *path, long mode);
 
 /* Streams, descriptor passing and waiting, in net.c. */
 long __quark_memfd(const char *name, long flags);
+long __quark_ftruncate(long fd, long length);
+long __quark_fcntl(long fd, long cmd, long arg);
+int __quark_fd_is_nonblock(long fd);
 long __quark_socketpair(long domain, long type, long protocol, int *sv);
 long __quark_sendmsg(long fd, const void *msg, long flags);
 long __quark_recvmsg(long fd, void *msg, long flags);

@@ -81,6 +81,8 @@ typedef unsigned long size_t;
 #define LX_epoll_ctl       233
 #define LX_ppoll           271
 #define LX_epoll_create1   291
+#define LX_ftruncate       77
+#define LX_fallocate      285
 #define LX_memfd_create    319
 #define LX_faccessat2      439
 
@@ -172,10 +174,17 @@ static long do_mmap_fd(long fd, unsigned long len) {
     if (at + pages * PAGE_SIZE > MMAP_LIMIT) {
         return -LX_ENOMEM;
     }
-    if (__syscall2(SYS_MMAP_FD, (unsigned long)fd, at) == QUARK_ERR) {
+    /* The whole region is mapped, whatever the caller asked to see of it --
+       Quark has no partial mapping of a descriptor. The call says how much
+       that was, and the arena must step over all of it: advancing by the
+       caller's length instead would hand the next mapping addresses that are
+       already occupied, and the kernel refuses to map over them. */
+    unsigned long got = __syscall2(SYS_MMAP_FD, (unsigned long)fd, at);
+    if (got == QUARK_ERR) {
         return -LX_ENODEV;
     }
-    mmap_next = at + pages * PAGE_SIZE;
+    unsigned long real = (got + PAGE_SIZE - 1) / PAGE_SIZE;
+    mmap_next = at + (real > pages ? real : pages) * PAGE_SIZE;
     return (long)at;
 }
 
@@ -437,16 +446,21 @@ long __quark_syscall(long n, long a1, long a2, long a3, long a4, long a5, long a
         }
         return __quark_access((const char *)a2, a3);
 
-    /* musl probes this when fstat says EBADF, to tell a closed descriptor
-       from one the kernel will not stat. Answering keeps it on the path that
-       works rather than sending it to /proc, which does not exist. */
     case LX_fcntl:
-        return 0;
+        return __quark_fcntl(a1, a2, a3);
 
     /* Streams, descriptors in flight, and waiting. Each is the same operation
        Quark has with Linux's packaging around it. */
     case LX_memfd_create:
         return __quark_memfd((const char *)a1, a2);
+    case LX_ftruncate:
+        return __quark_ftruncate(a1, a2);
+    case LX_fallocate:
+        /* posix_fallocate(fd, offset, len) is what musl uses when it has it,
+           and libwayland's os_create_anonymous_file prefers it to ftruncate.
+           There is nothing to preallocate here -- a region's frames are taken
+           when it is sized -- so the size is all of it. */
+        return __quark_ftruncate(a1, a3 + a4);
     case LX_socketpair:
         return __quark_socketpair(a1, a2, a3, (int *)a4);
     case LX_sendmsg:

@@ -71,6 +71,7 @@ mod client;
 mod draw;
 mod objects;
 mod protocol;
+mod shm;
 
 use draw::{draw_text, fill_rect, pack_colour, present, Rect, Screen, CLIP, GLYPH_H, SCREEN};
 

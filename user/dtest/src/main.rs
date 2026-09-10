@@ -276,6 +276,48 @@ fn test_fd_passing() {
     let _ = syscall::sys_fd_close(slot);
     let _ = syscall::sys_fd_close(any);
 
+    // Sizing memory after making it. This is `ftruncate`, and every Wayland
+    // client's buffer pool is made that way: memfd_create, then ftruncate,
+    // then mmap.
+    let grow = match syscall::sys_memfd_create(1) {
+        Ok(f) => f,
+        Err(()) => { check("memory to grow", false); return; }
+    };
+    check("one page to start with", syscall::sys_memfd_truncate(grow, 0).is_err());
+    check("grow it to ten", syscall::sys_memfd_truncate(grow, 10 * 4096) == Ok(10 * 4096));
+    check(
+        "a size that is not a whole page rounds up",
+        syscall::sys_memfd_truncate(grow, 4097) == Ok(2 * 4096),
+    );
+    check(
+        "and mapping it says how big it became",
+        syscall::sys_mmap_fd(grow, PASSED_AT + 0x40000) == Ok(2 * 4096),
+    );
+    unsafe { core::ptr::write_volatile((PASSED_AT + 0x40000 + 4096) as *mut u64, 0x1234) };
+    check(
+        "the second page is really there",
+        unsafe { core::ptr::read_volatile((PASSED_AT + 0x40000 + 4096) as *const u64) } == 0x1234,
+    );
+    // Not while somebody holds a mapping: growing would change what is behind
+    // it, and nothing would tell them.
+    check("no resizing what is mapped", syscall::sys_memfd_truncate(grow, 4 * 4096).is_err());
+    let _ = syscall::sys_munmap(PASSED_AT + 0x40000, 2);
+
+    // A second name for one of your own descriptors, which needs no authority.
+    let copy = match syscall::sys_fd_dup_self(grow, 3) {
+        Ok(f) => f,
+        Err(()) => { check("duplicate a descriptor", false); return; }
+    };
+    check("the duplicate is a different number", copy != grow);
+    check("and it names the same memory", syscall::sys_mmap_fd(copy, PASSED_AT + 0x48000).is_ok());
+    check(
+        "a floor is respected",
+        matches!(syscall::sys_fd_dup_self(grow, 20), Ok(f) if f >= 20),
+    );
+    let _ = syscall::sys_munmap(PASSED_AT + 0x48000, 2);
+    let _ = syscall::sys_fd_close(copy);
+    let _ = syscall::sys_fd_close(grow);
+
     let _ = syscall::sys_fd_close(a);
     let _ = syscall::sys_fd_close(b);
 }

@@ -718,9 +718,18 @@ pub fn install_fd(tid: usize, kind: crate::task::FdKind) -> Option<usize> {
 
 /// The lowest free descriptor at or above 3.
 pub fn lowest_free_fd(tid: usize) -> Option<usize> {
+    free_fd_at_or_above(tid, 3)
+}
+
+/// The lowest free descriptor at or above `floor`, which is what `dup` with a
+/// minimum asks for.
+pub fn free_fd_at_or_above(tid: usize, floor: usize) -> Option<usize> {
+    if tid >= crate::task::MAX_TASKS {
+        return None;
+    }
     unsafe {
         let task = TASKS[tid].as_ref()?;
-        (3..crate::task::MAX_FDS).find(|&fd| task.fds[fd].is_empty())
+        (floor..crate::task::MAX_FDS).find(|&fd| task.fds[fd].is_empty())
     }
 }
 

@@ -404,6 +404,74 @@ long __quark_write(long fd, const void *buf, unsigned long n) {
    directory here — no server keeps one, and inventing one in this layer would
    make every program disagree with every other — so only AT_FDCWD is
    accepted, and paths are what the VFS is given. */
+/* `fcntl`, for the commands a program on this system can actually be answered.
+ *
+ * It used to return 0 for everything, on the theory that musl only probes it.
+ * That is true of musl and false of everything above it: libwayland duplicates
+ * a descriptor with F_DUPFD_CLOEXEC before sending it, believed the 0, and sent
+ * descriptor zero -- its own standard input -- to the compositor. A stub that
+ * answers "fine" to a question it did not understand is worse than one that
+ * answers "no", because the caller has no way to find out. */
+#define LX_F_DUPFD          0
+#define LX_F_GETFD          1
+#define LX_F_SETFD          2
+#define LX_F_GETFL          3
+#define LX_F_SETFL          4
+#define LX_F_DUPFD_CLOEXEC  1030
+
+#define LX_O_NONBLOCK  04000
+#define LX_O_RDWR      2
+
+/* Which descriptors a program has asked to be non-blocking. One bit per
+   kernel descriptor; this layer's own file numbers are always blocking,
+   because the VFS is a synchronous call and there is nothing to wait for. */
+static unsigned int nonblock_mask;
+
+int __quark_fd_is_nonblock(long fd) {
+    return fd >= 0 && fd < FIRST_FD && (nonblock_mask & (1u << fd)) != 0;
+}
+
+long __quark_fcntl(long fd, long cmd, long arg) {
+    switch (cmd) {
+    case LX_F_DUPFD:
+    case LX_F_DUPFD_CLOEXEC: {
+        /* Close-on-exec is not a distinction here: nothing execs, so a
+           duplicate is a duplicate. */
+        if (fd < 0 || fd >= FIRST_FD) {
+            /* A VFS file has a handle this layer holds one reference to, and
+               a second descriptor for it would need that refcounted -- which
+               the VFS protocol does not offer. Saying so beats inventing an
+               alias whose close destroys the original. */
+            return -LX_ENOSYS;
+        }
+        unsigned long r = __syscall4(SYS_FD_DUP, __syscall0(SYS_GETPID),
+                                     QUARK_ANY_FD, (unsigned long)fd,
+                                     arg < 0 ? 0 : (unsigned long)arg);
+        return r == QUARK_ERR ? -LX_EMFILE : (long)r;
+    }
+    case LX_F_GETFD:
+    case LX_F_SETFD:
+        /* FD_CLOEXEC and nothing else. There is no exec, so every descriptor
+           behaves as though the bit were clear, and setting it changes
+           nothing that can be observed. */
+        return 0;
+    case LX_F_GETFL:
+        return LX_O_RDWR | (__quark_fd_is_nonblock(fd) ? LX_O_NONBLOCK : 0);
+    case LX_F_SETFL:
+        if (fd < 0 || fd >= FIRST_FD) {
+            return (arg & LX_O_NONBLOCK) ? -LX_EINVAL : 0;
+        }
+        if (arg & LX_O_NONBLOCK) {
+            nonblock_mask |= 1u << fd;
+        } else {
+            nonblock_mask &= ~(1u << fd);
+        }
+        return 0;
+    default:
+        return -LX_EINVAL;
+    }
+}
+
 long __quark_openat(long dirfd, const char *path, long flags) {
     if (dirfd != LX_AT_FDCWD) {
         return -LX_ENOSYS;

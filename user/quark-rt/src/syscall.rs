@@ -41,6 +41,7 @@ pub const SYS_ADDRSPACE_SELF: u64 = 41;
 pub const SYS_MMAP_FD: u64 = 42;
 pub const SYS_SHMEM_CREATE: u64 = 48;
 pub const SYS_MEMFD_CREATE: u64 = 53;
+pub const SYS_MEMFD_TRUNCATE: u64 = 54;
 pub const SYS_SHMEM_MAP: u64 = 49;
 pub const SYS_SHMEM_UNMAP: u64 = 50;
 pub const SYS_SHMEM_GRANT: u64 = 51;
@@ -833,10 +834,25 @@ pub fn sys_memfd_create(pages: usize) -> Result<usize, ()> {
     if ret == u64::MAX { Err(()) } else { Ok(ret as usize) }
 }
 
-/// Map memory named by a descriptor at `vaddr`.
-pub fn sys_mmap_fd(fd: usize, vaddr: usize) -> Result<(), ()> {
+/// Give memory named by a descriptor a new size, and say what it became.
+///
+/// Only before anybody has mapped it and before the descriptor has been sent
+/// anywhere: growing a region is changing what is behind a live mapping, and
+/// nothing here would tell the holder of that mapping it had happened. That
+/// window is exactly how a libc uses `ftruncate` on a fresh `memfd`.
+pub fn sys_memfd_truncate(fd: usize, bytes: usize) -> Result<usize, ()> {
+    let ret = unsafe { syscall2(SYS_MEMFD_TRUNCATE, fd as u64, bytes as u64) };
+    if ret == u64::MAX { Err(()) } else { Ok(ret as usize) }
+}
+
+/// Map the memory a descriptor names, and say how much of it there was.
+///
+/// The size is the point of the return value. A task that received the
+/// descriptor over a stream has no other way to learn it, and the sender's
+/// claim about it is the one thing it must not believe.
+pub fn sys_mmap_fd(fd: usize, vaddr: usize) -> Result<usize, ()> {
     let ret = unsafe { syscall2(SYS_MMAP_FD, fd as u64, vaddr as u64) };
-    if ret == u64::MAX { Err(()) } else { Ok(()) }
+    if ret == u64::MAX { Err(()) } else { Ok(ret as usize) }
 }
 
 /// Release a descriptor.
@@ -969,6 +985,17 @@ pub fn sys_fd_dup(target_tid: usize, target_fd: usize, source_fd: usize) -> Resu
         syscall3(SYS_FD_DUP, target_tid as u64, target_fd as u64, source_fd as u64)
     };
     if ret == u64::MAX { Err(()) } else { Ok(()) }
+}
+
+/// A second name for one of your own descriptors, at the lowest free number at
+/// or above `floor`. This is `dup`, and it needs no authority: a second name
+/// for something already held is not more of anything.
+pub fn sys_fd_dup_self(source_fd: usize, floor: usize) -> Result<usize, ()> {
+    let me = sys_getpid();
+    let ret = unsafe {
+        syscall4(SYS_FD_DUP, me as u64, ANY_FD as u64, source_fd as u64, floor as u64)
+    };
+    if ret == u64::MAX { Err(()) } else { Ok(ret as usize) }
 }
 
 // Signal constants (badge bits, high to avoid collision with app notifications)

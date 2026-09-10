@@ -84,14 +84,28 @@ struct qw_pollfd {
 long __quark_memfd(const char *name, long flags) {
     (void)name;  /* Linux keeps it for /proc; there is no /proc here. */
     (void)flags;
-    /* Size comes from a later ftruncate on Linux. Nothing here has one, so a
-       page is allocated now and `ftruncate` grows nothing — callers that need
-       more ask for it up front through mmap of a larger region. */
+    /* One page, because the size comes from the ftruncate that follows -- and
+       on Linux it must, since memfd_create takes no size at all. */
     unsigned long fd = __syscall1(SYS_MEMFD_CREATE, 1);
     if (fd == QUARK_ERR) {
         return -LX_ENOMEM;
     }
     return (long)fd;
+}
+
+/* Set the size of memory named by a descriptor.
+ *
+ * Only memory: a file's size is the VFS's business and nothing here can change
+ * it, so a file earns EINVAL rather than a lie about having been resized. The
+ * memory case is the one that matters, because `memfd_create` then `ftruncate`
+ * then `mmap` is how every Wayland client makes its buffer pool. */
+long __quark_ftruncate(long fd, long length) {
+    if (length < 0) {
+        return -LX_EINVAL;
+    }
+    unsigned long r = __syscall2(SYS_MEMFD_TRUNCATE, (unsigned long)fd,
+                                 (unsigned long)length);
+    return r == QUARK_ERR ? -LX_EINVAL : 0;
 }
 
 long __quark_socketpair(long domain, long type, long protocol, int *sv) {
@@ -134,7 +148,11 @@ static long control_fd(const struct msghdr *m, int *too_many) {
 }
 
 long __quark_sendmsg(long fd, const void *msg, long flags) {
-    unsigned long fl = (flags & MSG_DONTWAIT) ? QUARK_DONTWAIT : 0;
+    /* Either the call or the descriptor may ask not to wait, and both mean the
+       same thing to the kernel. */
+    unsigned long fl = ((flags & MSG_DONTWAIT) || __quark_fd_is_nonblock(fd))
+                           ? QUARK_DONTWAIT
+                           : 0;
     const struct msghdr *m = msg;
     if (!m) {
         return -LX_EFAULT;
@@ -181,7 +199,9 @@ long __quark_sendmsg(long fd, const void *msg, long flags) {
 }
 
 long __quark_recvmsg(long fd, void *msg, long flags) {
-    unsigned long fl = (flags & MSG_DONTWAIT) ? QUARK_DONTWAIT : 0;
+    unsigned long fl = ((flags & MSG_DONTWAIT) || __quark_fd_is_nonblock(fd))
+                           ? QUARK_DONTWAIT
+                           : 0;
     struct msghdr *m = msg;
     if (!m) {
         return -LX_EFAULT;

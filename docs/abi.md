@@ -1,6 +1,6 @@
 # Quark syscall ABI
 
-**Version 1.8.** Query the running kernel with `SYS_ABI_VERSION` (240), which
+**Version 1.9.** Query the running kernel with `SYS_ABI_VERSION` (240), which
 returns `(major << 16) | minor`.
 
 This document is the contract between the Quark kernel and everything above it.
@@ -94,6 +94,7 @@ so it is built from calls that already existed.
 | 1.6 | `SYS_MMAP_FD` (42), `SYS_MEMFD_CREATE` (53), `SYS_FD_CLOSE` (71), `SYS_SOCKETPAIR` (72), `SYS_FD_SEND` (73), `SYS_FD_RECV` (74), `SYS_POLLSET_CREATE` (75), `SYS_POLLSET_CTL` (76), `SYS_POLLSET_WAIT` (77), `SYS_POLL` (78) — a bidirectional stream, descriptor passing, memory named by a descriptor, and waiting on more than one thing at once. The descriptor table also goes from 8 entries to 32. |
 | 1.7 | `SYS_SET_CLEAR_TID` (106) — a word to clear and wake when a task exits. Also: making a task in your own address space no longer needs `TaskMgmt`, because a thread is not a new principal. |
 | 1.8 | `SYS_FD_RECV` (74) learns to choose: `at = u64::MAX - 1` asks for any free descriptor and the call returns which one it took. A caller translating `recvmsg` cannot name a slot — Linux picks the number — and probing for a free one would mean reading, which is the thing a receive must do exactly once. Both it and `SYS_FD_SEND` (73) also take flags in arg4, where bit 0 is `MSG_DONTWAIT`: return `0xFFFF_FFFE` rather than park. A reader that loops until a read finds nothing — libwayland does — hangs for ever without it, because the last turn of every such loop is the empty one. |
+| 1.9 | `SYS_MEMFD_TRUNCATE` (54) — `ftruncate` on memory named by a descriptor, which is how every Wayland client makes its buffer pool: `memfd_create`, `ftruncate`, `mmap`. Only while nobody has the region mapped and no descriptor for it is travelling, because growing it otherwise changes what is behind somebody else's live mapping. `SYS_MMAP_FD` (42) also returns the size it mapped instead of 0: a task that received a descriptor has no other way to learn how big the memory is, and the sender's word for it is the one thing it must not take. |
 
 A capability may only be minted from one the caller already holds, and only
 narrowed — with one exception. **An `Endpoint` naming only the caller may
@@ -189,7 +190,7 @@ call to a task that never reaches `SYS_RECV` blocks forever.
 | # | Name | Arguments | Returns | Cap |
 |---|---|---|---|---|
 | 32 | `SYS_MMAP` | arg0 = vaddr, arg1 = pages | 0 / `u64::MAX` | — (quota enforced) |
-| 42 | `SYS_MMAP_FD` | arg0 = fd naming memory, arg1 = vaddr | 0 / `u64::MAX` | — |
+| 42 | `SYS_MMAP_FD` | arg0 = fd naming memory, arg1 = vaddr | bytes mapped / `u64::MAX` | — |
 | 33 | `SYS_MUNMAP` | arg0 = vaddr, arg1 = pages | 0 / `u64::MAX` | — |
 | 34 | `SYS_PHYS_ALLOC` | arg0 = pages | physical address / `u64::MAX` | `PhysAlloc` |
 | 35 | `SYS_PHYS_FREE` | arg0 = phys, arg1 = count | 0 / `u64::MAX` | `PhysAlloc` + frame ownership |
@@ -221,6 +222,7 @@ Physical addresses are page aligned; a request that is not is rejected.
 | 51 | `SYS_SHMEM_GRANT` | arg0 = handle, arg1 = target tid | 0 / `u64::MAX` | must be the creator |
 | 52 | `SYS_SHMEM_DESTROY` | arg0 = handle | 0 / `u64::MAX` | must be the creator |
 | 53 | `SYS_MEMFD_CREATE` | arg0 = pages | fd naming the region / `u64::MAX` | — (charged to creator's quota) |
+| 54 | `SYS_MEMFD_TRUNCATE` | arg0 = fd naming memory, arg1 = size in bytes | bytes the region became / `u64::MAX` | — (charged to creator's quota) |
 
 A region is assembled from up to sixteen contiguous runs of physical frames, so
 a large one does not need a large unfragmented span: 4096 pages is sixteen

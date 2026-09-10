@@ -14,10 +14,20 @@ use quark_rt::syscall;
 
 use crate::objects::{self, Kind, Table};
 use crate::protocol as proto;
+use crate::shm;
 
 pub const MAX_CLIENTS: usize = 4;
 const READ_BUF: usize = 4096;
 const WRITE_BUF: usize = 4096;
+
+/// Descriptors received but not yet claimed by a request.
+///
+/// A descriptor travels beside the byte stream rather than in it, so it cannot
+/// be found by parsing: it is matched to a request by *order*, which is how
+/// `SCM_RIGHTS` works on Unix and what libwayland's own demarshaller assumes.
+/// Four is more outstanding descriptors than any client here sends — the only
+/// request that carries one is `wl_shm.create_pool`.
+const MAX_PENDING_FDS: usize = 4;
 
 pub struct Client {
     pub used: bool,
@@ -29,6 +39,8 @@ pub struct Client {
     rlen: usize,
     wbuf: [u8; WRITE_BUF],
     wlen: usize,
+    fds: [usize; MAX_PENDING_FDS],
+    nfds: usize,
 }
 
 pub const NO_CLIENT: Client = Client {
@@ -40,6 +52,8 @@ pub const NO_CLIENT: Client = Client {
     rlen: 0,
     wbuf: [0; WRITE_BUF],
     wlen: 0,
+    fds: [0; MAX_PENDING_FDS],
+    nfds: 0,
 };
 
 impl Client {
@@ -50,6 +64,7 @@ impl Client {
         self.objects.clear();
         self.rlen = 0;
         self.wlen = 0;
+        self.nfds = 0;
         // wl_display is object 1 and exists before anything is asked for.
         self.objects.insert(proto::DISPLAY_ID, Kind::Display);
     }
@@ -57,13 +72,44 @@ impl Client {
     pub fn close(&mut self) {
         if self.used {
             let _ = syscall::sys_fd_close(self.fd);
+            shm::forget_client(self.tid);
         }
+        // Descriptors that arrived and were never claimed by a request. The
+        // client is gone and nothing will ever ask for them, so they are ours
+        // to drop — and not dropping them holds the memory behind them for the
+        // life of the compositor.
+        for i in 0..self.nfds {
+            let _ = syscall::sys_fd_close(self.fds[i]);
+        }
+        self.nfds = 0;
         self.used = false;
         self.fd = 0;
         self.tid = 0;
         self.objects.clear();
         self.rlen = 0;
         self.wlen = 0;
+    }
+
+    /// Take the oldest descriptor a client has sent, if any.
+    fn take_fd(&mut self) -> Option<usize> {
+        if self.nfds == 0 {
+            return None;
+        }
+        let fd = self.fds[0];
+        self.fds.copy_within(1..self.nfds, 0);
+        self.nfds -= 1;
+        Some(fd)
+    }
+
+    fn push_fd(&mut self, fd: usize) {
+        if self.nfds < MAX_PENDING_FDS {
+            self.fds[self.nfds] = fd;
+            self.nfds += 1;
+        } else {
+            // More outstanding descriptors than any request here can want.
+            // Dropping is better than growing a queue on a client's say-so.
+            let _ = syscall::sys_fd_close(fd);
+        }
     }
 
     /// Start an event. Returns where its arguments go, or `None` if the write
@@ -149,14 +195,28 @@ impl Client {
         if self.rlen < READ_BUF {
             let mut scratch = [0u8; READ_BUF];
             let want = READ_BUF - self.rlen;
-            match syscall::sys_fd_recv_nb(self.fd, &mut scratch[..want], None) {
+            let at = if self.nfds < MAX_PENDING_FDS { Some(syscall::ANY_FD) } else { None };
+            match syscall::sys_fd_recv_nb(self.fd, &mut scratch[..want], at) {
                 Err(()) => return false,
-                Ok(Some((0, _))) => return false, // end of file: the client has gone
-                Ok(Some((got, _))) => {
+                Ok(Some((0, None))) => return false, // end of file: the client has gone
+                Ok(Some((got, fd))) => {
+                    if let Some(fd) = fd {
+                        self.push_fd(fd);
+                    }
                     self.rbuf[self.rlen..self.rlen + got].copy_from_slice(&scratch[..got]);
                     self.rlen += got;
                 }
                 Ok(None) => {} // nothing new; act on what is already buffered
+            }
+            // One receive collects at most one descriptor, so a client that
+            // sent two requests carrying one each would have the second's
+            // arrive a whole read late — and be matched to the wrong request.
+            // A zero-length receive asks for a descriptor and nothing else.
+            while self.nfds < MAX_PENDING_FDS {
+                match syscall::sys_fd_recv_nb(self.fd, &mut [], Some(syscall::ANY_FD)) {
+                    Ok(Some((_, Some(fd)))) => self.push_fd(fd),
+                    _ => break,
+                }
             }
         }
 
@@ -194,8 +254,139 @@ impl Client {
         match kind {
             Kind::Display => self.display_request(h.opcode, body),
             Kind::Registry => self.registry_request(h.opcode, body),
+            Kind::Shm => self.shm_request(h.object, h.opcode, body),
+            Kind::ShmPool { pool } => self.pool_request(h.object, pool, h.opcode, body),
+            Kind::Buffer { buffer } => self.buffer_request(h.object, buffer, h.opcode),
             _ => true, // interfaces that arrive in later tasks
         }
+    }
+
+    /// Tell the client its request cannot be honoured, and which one.
+    ///
+    /// A protocol error is fatal to the connection by design: the client's idea
+    /// of the object graph and the compositor's have diverged, and everything
+    /// after this point would be read against the wrong one. Saying so is still
+    /// worth the bytes — libwayland prints it, and a client author reads the
+    /// object id and the reason rather than guessing why a socket closed.
+    fn protocol_error(&mut self, object: u32, code: u32, message: &[u8]) -> bool {
+        if let Some(a) = self.begin(proto::DISPLAY_ID, proto::DISPLAY_ERROR) {
+            self.arg_u32(object);
+            self.arg_u32(code);
+            self.arg_str(message);
+            self.end(a);
+        }
+        self.flush();
+        false
+    }
+
+    fn shm_request(&mut self, object: u32, opcode: u16, body: usize) -> bool {
+        if opcode != proto::SHM_CREATE_POOL {
+            return true;
+        }
+        // create_pool(new_id, fd, size). The descriptor is not in the message:
+        // it came alongside it, and is claimed in the order requests ask.
+        let (Some(id), Some(size)) =
+            (wire::get_u32(&self.rbuf, body), wire::get_i32(&self.rbuf, body + 4))
+        else {
+            return false;
+        };
+        let Some(fd) = self.take_fd() else {
+            return self.protocol_error(
+                object,
+                proto::SHM_ERR_INVALID_FD,
+                b"create_pool without a descriptor",
+            );
+        };
+        if size <= 0 {
+            let _ = syscall::sys_fd_close(fd);
+            return self.protocol_error(object, proto::SHM_ERR_INVALID_STRIDE, b"pool size");
+        }
+        // `create_pool` consumes the descriptor whether or not it works out.
+        let Some(pool) = shm::create_pool(self.tid, fd, size as usize) else {
+            return self.protocol_error(object, proto::ERR_NO_MEMORY, b"cannot map that pool");
+        };
+        if !self.objects.insert(id, Kind::ShmPool { pool }) {
+            shm::destroy_pool(pool);
+            return false;
+        }
+        true
+    }
+
+    fn pool_request(&mut self, object: u32, pool: usize, opcode: u16, body: usize) -> bool {
+        match opcode {
+            proto::SHM_POOL_CREATE_BUFFER => {
+                // create_buffer(new_id, offset, width, height, stride, format)
+                let mut args = [0i32; 5];
+                for (i, a) in args.iter_mut().enumerate() {
+                    match wire::get_i32(&self.rbuf, body + 4 + i * 4) {
+                        Some(v) => *a = v,
+                        None => return false,
+                    }
+                }
+                let Some(id) = wire::get_u32(&self.rbuf, body) else {
+                    return false;
+                };
+                let [offset, width, height, stride, format] = args;
+                if offset < 0 || width <= 0 || height <= 0 || stride <= 0 {
+                    return self.protocol_error(
+                        object,
+                        proto::SHM_ERR_INVALID_STRIDE,
+                        b"negative buffer geometry",
+                    );
+                }
+                if !shm::format_supported(format as u32) {
+                    return self.protocol_error(
+                        object,
+                        proto::SHM_ERR_INVALID_FORMAT,
+                        b"unsupported pixel format",
+                    );
+                }
+                let made = shm::create_buffer(
+                    pool,
+                    offset as usize,
+                    width as usize,
+                    height as usize,
+                    stride as usize,
+                    format as u32,
+                );
+                let Some(buffer) = made else {
+                    // The arithmetic did not fit inside the pool. This is the
+                    // check standing between a client's numbers and the
+                    // compositor reading memory that is not there.
+                    return self.protocol_error(
+                        object,
+                        proto::SHM_ERR_INVALID_STRIDE,
+                        b"buffer runs past its pool",
+                    );
+                };
+                if !self.objects.insert(id, Kind::Buffer { buffer }) {
+                    shm::destroy_buffer(buffer);
+                    return false;
+                }
+                true
+            }
+            proto::SHM_POOL_DESTROY => {
+                shm::destroy_pool(pool);
+                self.objects.remove(object);
+                true
+            }
+            proto::SHM_POOL_RESIZE => {
+                // A pool may only grow, and growing means new memory, which
+                // means a new descriptor -- which resize does not carry. It is
+                // refused rather than ignored: a client that resized and then
+                // drew past the old end would fault the compositor.
+                self.protocol_error(object, proto::ERR_INVALID_METHOD, b"resize is not supported")
+            }
+            _ => true,
+        }
+    }
+
+    fn buffer_request(&mut self, object: u32, buffer: usize, opcode: u16) -> bool {
+        if opcode == proto::BUFFER_DESTROY {
+            shm::destroy_buffer(buffer);
+            self.objects.remove(object);
+        }
+        true
     }
 
     fn display_request(&mut self, opcode: u16, body: usize) -> bool {
@@ -268,6 +459,20 @@ impl Client {
             4 => Kind::XdgWmBase,
             _ => return false,
         };
-        self.objects.insert(id, kind)
+        if !self.objects.insert(id, kind) {
+            return false;
+        }
+        if kind == Kind::Shm {
+            // wl_shm announces its formats the moment it is bound, and a client
+            // that supports none of them is expected to find that out here
+            // rather than by having a buffer refused later.
+            for f in [shm::FORMAT_ARGB8888, shm::FORMAT_XRGB8888] {
+                if let Some(a) = self.begin(id, proto::SHM_FORMAT) {
+                    self.arg_u32(f);
+                    self.end(a);
+                }
+            }
+        }
+        true
     }
 }

@@ -33,6 +33,7 @@
 /* 0x40  file descriptors */
 #define SYS_FD_READ         64
 #define SYS_FD_WRITE        65
+#define SYS_FD_DUP          68
 #define SYS_FD_CLOSE        71
 #define SYS_SOCKETPAIR      72
 #define SYS_FD_SEND         73
@@ -44,6 +45,7 @@
 
 /* 0x30  shared memory */
 #define SYS_MEMFD_CREATE    53
+#define SYS_MEMFD_TRUNCATE  54
 
 /* 0x60  task */
 #define SYS_TASK_CREATE     96
