@@ -58,6 +58,13 @@ pub const SYS_FD_CLOSE: u64 = 71;
 pub const SYS_SOCKETPAIR: u64 = 72;
 pub const SYS_FD_SEND: u64 = 73;
 pub const SYS_FD_RECV: u64 = 74;
+pub const SYS_POLLSET_CREATE: u64 = 75;
+pub const SYS_POLLSET_CTL: u64 = 76;
+pub const SYS_POLLSET_WAIT: u64 = 77;
+
+pub const POLL_READABLE: u32 = 1;
+pub const POLL_WRITABLE: u32 = 2;
+pub const POLL_HANGUP: u32 = 4;
 
 // --- 0x50  capabilities ---
 pub const SYS_CAP_MINT: u64 = 80;
@@ -601,6 +608,68 @@ pub fn sleep_ms(ms: u64) {
     // PIT runs at 100 Hz → 1 tick = 10 ms. Round up.
     let ticks = (ms + 9) / 10;
     sleep_ticks(ticks);
+}
+
+/// One ready descriptor, as the kernel writes it.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct Ready {
+    pub token: u64,
+    pub events: u32,
+    pub _pad: u32,
+}
+
+impl Ready {
+    pub const fn empty() -> Self {
+        Ready { token: 0, events: 0, _pad: 0 }
+    }
+}
+
+/// A set of descriptors to wait on. It is itself a descriptor.
+///
+/// Built once and waited on many times, which is the reason it is an object
+/// rather than an array handed over on every call. [`sys_poll`] is the other
+/// shape, for a caller that waits once.
+pub fn sys_pollset_create() -> Result<usize, ()> {
+    let ret = unsafe { syscall0(SYS_POLLSET_CREATE) };
+    if ret == u64::MAX { Err(()) } else { Ok(ret as usize) }
+}
+
+/// Watch `fd` for `events`, reporting `token` when it fires.
+///
+/// A descriptor that can never become ready is refused here rather than
+/// accepted and never reported.
+pub fn sys_pollset_add(set: usize, fd: usize, events: u32, token: u64) -> Result<(), ()> {
+    let ret = unsafe { syscall5(SYS_POLLSET_CTL, set as u64, 0, fd as u64, events as u64, token) };
+    if ret == u64::MAX { Err(()) } else { Ok(()) }
+}
+
+/// Change what an already-watched descriptor is watched for.
+pub fn sys_pollset_modify(set: usize, fd: usize, events: u32, token: u64) -> Result<(), ()> {
+    let ret = unsafe { syscall5(SYS_POLLSET_CTL, set as u64, 1, fd as u64, events as u64, token) };
+    if ret == u64::MAX { Err(()) } else { Ok(()) }
+}
+
+/// Stop watching a descriptor.
+pub fn sys_pollset_remove(set: usize, fd: usize) -> Result<(), ()> {
+    let ret = unsafe { syscall5(SYS_POLLSET_CTL, set as u64, 2, fd as u64, 0, 0) };
+    if ret == u64::MAX { Err(()) } else { Ok(()) }
+}
+
+/// Wait until something in the set is ready, or `timeout_ticks` pass.
+///
+/// Returns how many entries of `out` were filled; 0 means it timed out.
+pub fn sys_pollset_wait(set: usize, out: &mut [Ready], timeout_ticks: u64) -> Result<usize, ()> {
+    let ret = unsafe {
+        syscall4(
+            SYS_POLLSET_WAIT,
+            set as u64,
+            out.as_mut_ptr() as u64,
+            out.len() as u64,
+            timeout_ticks,
+        )
+    };
+    if ret == u64::MAX { Err(()) } else { Ok(ret as usize) }
 }
 
 /// Write to a stream, optionally handing the peer one of our descriptors.

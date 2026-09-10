@@ -305,6 +305,78 @@ fn test_no_leak() {
     }
 }
 
+fn test_pollset() {
+    println!("waiting on a set:");
+    let (a, b) = match syscall::sys_socketpair() {
+        Ok(p) => p,
+        Err(()) => { check("a pair to watch", false); return; }
+    };
+    let set = match syscall::sys_pollset_create() {
+        Ok(s) => s,
+        Err(()) => { check("create a set", false); return; }
+    };
+    check("create a set", set >= 3);
+    check(
+        "watch b for readable",
+        syscall::sys_pollset_add(set, b, syscall::POLL_READABLE, 0xB).is_ok(),
+    );
+    check(
+        "watch a for writable",
+        syscall::sys_pollset_add(set, a, syscall::POLL_WRITABLE, 0xA).is_ok(),
+    );
+
+    let mut ready = [syscall::Ready::empty(); 4];
+
+    // `a` is writable now and `b` is not readable, so exactly one fires.
+    check("one is ready", syscall::sys_pollset_wait(set, &mut ready, 50) == Ok(1));
+    check("and it is the writable one", ready[0].token == 0xA);
+
+    // Stop watching `a`, then nothing is ready until something is written.
+    check("stop watching a", syscall::sys_pollset_remove(set, a).is_ok());
+    check(
+        "nothing ready, and it timed out",
+        syscall::sys_pollset_wait(set, &mut ready, 5) == Ok(0),
+    );
+
+    check("write to a", syscall::sys_fd_write(a, b"go") == 2);
+    let n = syscall::sys_pollset_wait(set, &mut ready, 50);
+    check("now b is ready", n == Ok(1) && ready[0].token == 0xB);
+    check(
+        "readable is what it reports",
+        ready[0].events & syscall::POLL_READABLE != 0,
+    );
+
+    // A closed peer is a hangup rather than a silence.
+    let mut buf = [0u8; 4];
+    let _ = syscall::sys_fd_read(b, &mut buf);
+    check("close a", syscall::sys_fd_close(a).is_ok());
+    let n = syscall::sys_pollset_wait(set, &mut ready, 50);
+    check(
+        "b reports hangup",
+        n == Ok(1) && ready[0].events & syscall::POLL_HANGUP != 0,
+    );
+
+    // A descriptor that can never become ready is refused, not accepted and
+    // then silent. Note that stdout is *not* an example: init wires it to a
+    // pipe, so watching it for writable is a reasonable thing to ask and the
+    // kernel is right to allow it.
+    check(
+        "watching an empty descriptor is refused",
+        syscall::sys_pollset_add(set, 30, syscall::POLL_READABLE, 0xC).is_err(),
+    );
+    check(
+        "watching stdin, an IPC endpoint, is refused",
+        syscall::sys_pollset_add(set, 0, syscall::POLL_READABLE, 0xD).is_err(),
+    );
+    check(
+        "watching stdout, which really is a pipe, is allowed",
+        syscall::sys_pollset_add(set, 1, syscall::POLL_WRITABLE, 0xE).is_ok(),
+    );
+
+    let _ = syscall::sys_fd_close(set);
+    let _ = syscall::sys_fd_close(b);
+}
+
 #[unsafe(no_mangle)]
 #[link_section = ".text.entry"]
 pub extern "C" fn _start() -> ! {
@@ -316,6 +388,7 @@ pub extern "C" fn _start() -> ! {
     test_socketpair();
     test_fd_passing();
     test_no_leak();
+    test_pollset();
 
     unsafe {
         println!("[dtest] {} passed, {} failed", PASSED, FAILED);

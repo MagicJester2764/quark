@@ -91,6 +91,9 @@ pub const SYS_FD_CLOSE: u64 = 71;
 pub const SYS_SOCKETPAIR: u64 = 72;
 pub const SYS_FD_SEND: u64 = 73;
 pub const SYS_FD_RECV: u64 = 74;
+pub const SYS_POLLSET_CREATE: u64 = 75;
+pub const SYS_POLLSET_CTL: u64 = 76;
+pub const SYS_POLLSET_WAIT: u64 = 77;
 
 // --- 0x50  capabilities ---
 pub const SYS_CAP_MINT: u64 = 80;
@@ -279,6 +282,19 @@ fn validate_user_range(addr: u64, len: u64, write: bool) -> bool {
 }
 
 /// Read-only user buffer check.
+/// The set a descriptor names, or `None` if it names something else.
+fn pollset_of(tid: usize, fd: usize) -> Option<usize> {
+    if fd >= crate::task::MAX_FDS {
+        return None;
+    }
+    unsafe {
+        match scheduler::get_task_mut(tid)?.fds[fd] {
+            crate::task::FdKind::PollSet { set } => Some(set),
+            _ => None,
+        }
+    }
+}
+
 /// The stream and end a descriptor names, or `None` if it names something else.
 fn stream_end_of(tid: usize, fd: usize) -> Option<(usize, u8)> {
     if fd >= crate::task::MAX_FDS {
@@ -969,6 +985,8 @@ extern "C" fn syscall_dispatch(
                         None => u64::MAX,
                     }
                 }
+                // A set is waited on, not written to.
+                crate::task::FdKind::PollSet { .. } => u64::MAX,
                 // Memory is mapped, not written through. A stream of bytes is
                 // the wrong shape for it, and answering as if it were would
                 // put the caller's data somewhere it will never look.
@@ -1011,6 +1029,7 @@ extern "C" fn syscall_dispatch(
                         None => u64::MAX,
                     }
                 }
+                crate::task::FdKind::PollSet { .. } => u64::MAX,
                 // As with write: it is mapped, not read.
                 crate::task::FdKind::MemFd { .. } => u64::MAX,
                 crate::task::FdKind::Socket { net_tid, handle } => {
@@ -1162,6 +1181,81 @@ extern "C" fn syscall_dispatch(
                     crate::stream::close_end(s, 1);
                     u64::MAX
                 }
+            }
+        }
+        SYS_POLLSET_CREATE => {
+            let tid = scheduler::current_tid();
+            match crate::pollset::create(tid) {
+                Some(set) => match scheduler::install_fd(tid, crate::task::FdKind::PollSet { set }) {
+                    Some(fd) => fd as u64,
+                    None => {
+                        crate::pollset::destroy(set);
+                        u64::MAX
+                    }
+                },
+                None => u64::MAX,
+            }
+        }
+        SYS_POLLSET_CTL => {
+            // arg0 = set fd, arg1 = op, arg2 = fd, arg3 = events, arg4 = token
+            let tid = scheduler::current_tid();
+            let set = match pollset_of(tid, arg0 as usize) {
+                Some(s) => s,
+                None => return u64::MAX,
+            };
+            let target = arg2 as usize;
+            // Refuse what can never become ready rather than accept it and go
+            // quiet.
+            if arg1 != 2 && !crate::pollset::watchable(tid, target) {
+                return u64::MAX;
+            }
+            if crate::pollset::ctl(set, tid, arg1, target, arg3 as u32, arg4) {
+                0
+            } else {
+                u64::MAX
+            }
+        }
+        SYS_POLLSET_WAIT => {
+            // arg0 = set fd, arg1 = out array of (u64 token, u32 events,
+            // u32 pad), arg2 = capacity, arg3 = timeout in ticks.
+            let tid = scheduler::current_tid();
+            let set = match pollset_of(tid, arg0 as usize) {
+                Some(s) => s,
+                None => return u64::MAX,
+            };
+            let cap = (arg2 as usize).min(64);
+            if cap == 0 || !validate_user_ptr_mut(arg1, (cap * 16) as u64) {
+                return u64::MAX;
+            }
+
+            let deadline = crate::pit::ticks().saturating_add(arg3);
+            let mut found = [(0u64, 0u32); 64];
+            loop {
+                let n = crate::pollset::scan(set, tid, &mut found[..cap]);
+                if n > 0 {
+                    let _ua = crate::cpu::UserAccess::begin();
+                    for i in 0..n {
+                        unsafe {
+                            let p = (arg1 as *mut u8).add(i * 16);
+                            *(p as *mut u64) = found[i].0;
+                            *(p.add(8) as *mut u32) = found[i].1;
+                            *(p.add(12) as *mut u32) = 0;
+                        }
+                    }
+                    return n as u64;
+                }
+                let now = crate::pit::ticks();
+                if now >= deadline {
+                    return 0;
+                }
+                // There is no `sleep` in this kernel. A task sleeps by
+                // receiving from its own TID with a timeout — nobody can send
+                // to that, so only the deadline ends it — and `sleep_ticks` in
+                // quark-rt is exactly this. Reusing it means the existing
+                // timeout sweep already knows how to abandon the block, and no
+                // second sweep has to be written. The next commit makes a pipe
+                // that becomes ready end this early.
+                let _ = crate::ipc::sys_recv_timeout(tid, deadline - now);
             }
         }
         SYS_FD_SEND => {

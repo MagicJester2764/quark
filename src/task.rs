@@ -30,6 +30,9 @@ pub enum FdKind {
     MemFd { handle: usize },
     /// One end of a connected pair. `end` is 0 or 1.
     StreamEnd { stream: usize, end: u8 },
+    /// A set of descriptors to wait on. A set is a descriptor itself, so it
+    /// can be held, closed and passed like any other.
+    PollSet { set: usize },
     /// A network connection, held by the net server as `handle`.
     ///
     /// Unlike `Ipc`, which is one-directional and carries a fixed tag, a

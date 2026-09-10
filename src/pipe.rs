@@ -112,6 +112,22 @@ pub fn create_for_stream() -> Option<usize> {
     result
 }
 
+/// No writer remains, so a read will never block again.
+pub fn no_writers(handle: usize) -> bool {
+    let flags = irq_save();
+    let out = unsafe { handle < MAX_PIPES && PIPES[handle].in_use && PIPES[handle].writers == 0 };
+    irq_restore(flags);
+    out
+}
+
+/// No reader remains, so a write has nowhere to go.
+pub fn no_readers(handle: usize) -> bool {
+    let flags = irq_save();
+    let out = unsafe { handle < MAX_PIPES && PIPES[handle].in_use && PIPES[handle].readers == 0 };
+    irq_restore(flags);
+    out
+}
+
 /// Is a read able to return now — with bytes, or with the end-of-file a
 /// departed writer means?
 pub fn readable(handle: usize) -> bool {
@@ -422,6 +438,7 @@ pub fn release_fd(kind: &FdKind, owner: usize) {
         FdKind::PipeWrite(handle) => drop_ref(*handle, true),
         FdKind::MemFd { handle } => crate::shmem::close_ref(*handle, owner),
         FdKind::StreamEnd { stream, end } => crate::stream::close_end(*stream, *end),
+        FdKind::PollSet { set } => crate::pollset::destroy(*set),
         _ => {}
     }
 }
