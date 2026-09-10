@@ -129,6 +129,7 @@ pub const SYS_TASK_START_ARG: u64 = 103;
 /// Put a task in a scheduling band. Requires `TaskMgmt` over the target, and
 /// refuses to grant a better band than the caller is in itself.
 pub const SYS_TASK_PRIORITY: u64 = 105;
+pub const SYS_SET_CLEAR_TID: u64 = 106;
 
 /// Be told when a task dies, so that whatever it was lent can be taken back.
 /// Takes no capability: SYS_TASK_INFO already answers the same question by
@@ -179,7 +180,13 @@ pub const SYS_ABI_VERSION: u64 = 240;
 /// minor when calls are added. User space can refuse to run against a major it
 /// does not know, which is the point of exposing it at all.
 pub const ABI_VERSION_MAJOR: u64 = 1;
-pub const ABI_VERSION_MINOR: u64 = 6;
+pub const ABI_VERSION_MINOR: u64 = 7;
+
+/// Threads a task may make with no capability at all.
+///
+/// Enough for any program that has one, and far short of exhausting a table of
+/// sixty-four. `TaskMgmt` lifts it, which is what a spawner holds.
+const THREADS_WITHOUT_CAP: usize = 16;
 
 
 
@@ -468,6 +475,24 @@ extern "C" fn syscall_dispatch(
         SYS_EXIT_CODE => {
             scheduler::exit_with(arg0 as i32)
         }
+        SYS_SET_CLEAR_TID => {
+            // Register a word to clear and wake when this task exits, which is
+            // Linux's CLONE_CHILD_CLEARTID and `set_tid_address`. Nothing to
+            // check but the address: a task may only name its own memory, and
+            // clearing it harms nobody else.
+            let addr = arg0;
+            if addr != 0 && (addr >= USER_ADDR_LIMIT || addr % 4 != 0) {
+                return u64::MAX;
+            }
+            let tid = scheduler::current_tid();
+            match unsafe { scheduler::get_task_mut(tid) } {
+                Some(t) => {
+                    t.clear_child_tid = addr;
+                    tid as u64
+                }
+                None => u64::MAX,
+            }
+        }
         SYS_SET_FS_BASE => {
             let base = arg0;
             // Must be a user address: FS is used by user code, and a kernel
@@ -745,7 +770,22 @@ extern "C" fn syscall_dispatch(
             0
         }
         SYS_TASK_CREATE => {
-            if !crate::cap::task_has_task_mgmt(scheduler::current_tid(), 0) {
+            // A thread is not a new principal. A task started in the address
+            // space you are already in *is* you: it can read what you can
+            // read, call what you can call, and do nothing you could not do
+            // yourself. Requiring authority over other tasks in order to make
+            // one is the wrong check, and it is why a C program had to be
+            // handed the right to kill anything in order to call
+            // pthread_create.
+            //
+            // So this is allowed without a capability and bounded instead. The
+            // capability still buys the unbounded form, which is what a
+            // spawner needs. What decides whether the new task may actually
+            // *run* is SYS_TASK_START, which checks the address space.
+            let caller = scheduler::current_tid();
+            if !crate::cap::task_has_task_mgmt(caller, 0)
+                && scheduler::children_of(caller) >= THREADS_WITHOUT_CAP
+            {
                 return u64::MAX;
             }
             match scheduler::create_empty_task() {
@@ -808,10 +848,23 @@ extern "C" fn syscall_dispatch(
         }
         SYS_TASK_START | SYS_TASK_START_ARG => {
             // arg0=tid, arg1=rip, arg2=rsp, arg3=cr3
-            if !crate::cap::task_has_task_mgmt(scheduler::current_tid(), 0) {
-                return u64::MAX;
-            }
+            //
+            // Without `TaskMgmt` this may only start a task in the caller's
+            // *own* address space — a thread of itself — and only one it
+            // created. Starting somebody else's task, or one in an address
+            // space built for it, is spawning, and that needs the capability.
+            let caller = scheduler::current_tid();
+            let privileged = crate::cap::task_has_task_mgmt(caller, 0);
             let tid = arg0 as usize;
+            if !privileged {
+                let own_cr3 = unsafe { scheduler::get_task_mut(caller).map(|t| t.cr3) };
+                let is_child = unsafe {
+                    scheduler::get_task_mut(tid).map(|t| t.parent_tid) == Some(caller)
+                };
+                if own_cr3 != Some(arg3 as usize) || !is_child {
+                    return u64::MAX;
+                }
+            }
             let rip = arg1;
             // Ensure RSP ≡ 8 mod 16 for x86_64 ABI (as if call pushed return addr).
             // Align DOWN to 16, then subtract 8 — never go above the caller's value.

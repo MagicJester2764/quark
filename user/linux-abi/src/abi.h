@@ -20,6 +20,7 @@
 #define LX_ENOTDIR  20
 #define LX_EISDIR   21
 #define LX_ENODEV   19
+#define LX_EAGAIN   11
 
 /* There is no working directory anywhere in this system, so this is the only
    value the *at calls accept for one. */

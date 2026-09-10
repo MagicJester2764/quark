@@ -101,6 +101,7 @@ pub fn init() {
             mem_limit: 0,
             exit_code: 0,
             fs_base: 0,
+            clear_child_tid: 0,
             uid: 0,
             gid: 0,
         });
@@ -197,7 +198,24 @@ pub fn exit_with(code: i32) -> ! {
         crate::serial::puts(b"[exit tid=");
         crate::serial::put_usize(current);
         crate::serial::puts(b"]\n");
+        // Before anything else: clear the word this task registered and wake
+        // whoever is waiting on it. musl's thread-list lock *is* that word, and
+        // a dying thread holds it — so this is what publishes the thread's
+        // removal and lets the next `pthread_join` proceed. It has to happen
+        // while the address space is still ours to write.
+        let clear_at = TASKS[current].as_ref().map_or(0, |t| t.clear_child_tid);
+        if clear_at != 0 {
+            let cr3 = read_cr3_of(current);
+            if crate::paging::user_range_accessible(cr3, clear_at, 4, true) {
+                let _ua = crate::cpu::UserAccess::begin();
+                core::ptr::write_volatile(clear_at as *mut u32, 0);
+                drop(_ua);
+                crate::futex::futex_wake(clear_at, u64::MAX);
+            }
+        }
+
         if let Some(ref mut task) = TASKS[current] {
+            task.clear_child_tid = 0;
             task.state = TaskState::Dead;
             task.exit_code = code;
             crate::ipc::clear_signal_deadline(current);
@@ -940,6 +958,30 @@ pub fn set_task_gid(tid: usize, gid: u32) -> Result<(), ()> {
 }
 
 /// Create an empty task slot (Blocked, cr3=0, caps=0). Returns TID.
+/// The address space a task is running in.
+fn read_cr3_of(tid: usize) -> usize {
+    unsafe { TASKS[tid].as_ref().map_or(0, |t| t.cr3) }
+}
+
+/// How many live tasks `tid` has created.
+///
+/// The bound on making threads without any authority: a task may make itself
+/// more stacks, and cannot make so many that it exhausts the table for
+/// everybody else.
+pub fn children_of(tid: usize) -> usize {
+    unsafe {
+        let mut n = 0;
+        for i in 1..MAX_TASKS {
+            if let Some(ref t) = TASKS[i] {
+                if t.parent_tid == tid && t.state != TaskState::Dead {
+                    n += 1;
+                }
+            }
+        }
+        n
+    }
+}
+
 pub fn create_empty_task() -> Option<usize> {
     // Allocate the stack up front: this takes the heap lock and can re-enable
     // interrupts, so it must happen before the slot is claimed.
@@ -986,6 +1028,7 @@ pub fn create_empty_task() -> Option<usize> {
             mem_limit: 0,
             exit_code: 0,
             fs_base: 0,
+            clear_child_tid: 0,
             uid: parent_uid,
             gid: parent_gid,
         });

@@ -28,6 +28,7 @@
 #define SYS_PHYS_ALLOC      34
 #define SYS_MAP_PHYS        38
 #define SYS_MMAP_FD         42
+#define SYS_ADDRSPACE_SELF  41
 
 /* 0x40  file descriptors */
 #define SYS_FD_READ         64
@@ -45,7 +46,10 @@
 #define SYS_MEMFD_CREATE    53
 
 /* 0x60  task */
+#define SYS_TASK_CREATE     96
 #define SYS_SET_FS_BASE     102
+#define SYS_TASK_START_ARG  103
+#define SYS_SET_CLEAR_TID   106
 
 /* 0x80  futex */
 #define SYS_FUTEX_WAIT      128

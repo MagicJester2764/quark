@@ -1,6 +1,6 @@
 # Quark syscall ABI
 
-**Version 1.6.** Query the running kernel with `SYS_ABI_VERSION` (240), which
+**Version 1.7.** Query the running kernel with `SYS_ABI_VERSION` (240), which
 returns `(major << 16) | minor`.
 
 This document is the contract between the Quark kernel and everything above it.
@@ -91,6 +91,7 @@ so it is built from calls that already existed.
 | 1.3 | `SYS_SOCK_FD` (176), `SYS_SOCK_INFO` (177) — a network connection as a file descriptor. |
 | 1.4 | `SYS_TASK_WATCH` (104) — be told when a task dies, so what it was lent can be taken back. |
 | 1.5 | `SYS_TASK_PRIORITY` (105) — which scheduling band a task runs in. |
+| 1.7 | `SYS_SET_CLEAR_TID` (106) — a word to clear and wake when a task exits. Also: making a task in your own address space no longer needs `TaskMgmt`, because a thread is not a new principal. |
 | 1.6 | `SYS_MMAP_FD` (42), `SYS_MEMFD_CREATE` (53), `SYS_FD_CLOSE` (71), `SYS_SOCKETPAIR` (72), `SYS_FD_SEND` (73), `SYS_FD_RECV` (74), `SYS_POLLSET_CREATE` (75), `SYS_POLLSET_CTL` (76), `SYS_POLLSET_WAIT` (77), `SYS_POLL` (78) — a bidirectional stream, descriptor passing, memory named by a descriptor, and waiting on more than one thing at once. The descriptor table also goes from 8 entries to 32. |
 
 A capability may only be minted from one the caller already holds, and only
@@ -322,6 +323,7 @@ cannot resurrect a revoked capability in practice.
 | 100 | `SYS_SET_GID` | arg0 = tid, arg1 = gid | 0 / `u64::MAX` | `SetUid` |
 | 101 | `SYS_GET_TUID` | arg0 = tid | that task's UID | — |
 | 104 | `SYS_TASK_WATCH` | arg0 = tid | 0, or `u64::MAX` if that task is already gone | — |
+| 106 | `SYS_SET_CLEAR_TID` | arg0 = address of a `u32`, or 0 | this task's id / `u64::MAX` | — |
 | 105 | `SYS_TASK_PRIORITY` | arg0 = tid, arg1 = band | 0 / `u64::MAX` | `TaskMgmt` for target, and the caller's own band or worse |
 
 There is no fork or exec. A parent creates a task, builds its address space,

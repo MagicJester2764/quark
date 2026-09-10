@@ -18,7 +18,8 @@ CFLAGS  += $(EXTRA_CFLAGS)
 # protocol drift. Compiled here into an object of our own, though — building it
 # in place would have two Makefiles writing one path with their own flags, and
 # whichever ran last would decide what the other one linked.
-OBJS    := src/syscall.o src/start.o src/files.o src/net.o src/vfs-client.o
+OBJS    := src/syscall.o src/start.o src/files.o src/net.o src/clone.o \
+           src/clone-entry.o src/vfs-client.o
 # Linked for its section rather than its symbols, so it cannot live in the
 # archive: nothing references it and it would never be pulled in.
 MANIFEST := src/manifest.o
@@ -30,6 +31,9 @@ liblinux-abi.a: $(OBJS)
 	$(AR) rcs $@ $(OBJS)
 
 %.o: %.c
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+%.o: %.s
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 src/vfs-client.o: ../libc/src/quark.c

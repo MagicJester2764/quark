@@ -326,7 +326,9 @@ long __quark_syscall(long n, long a1, long a2, long a3, long a4, long a5, long a
     }
 
     case LX_set_tid_address:
-        return (long)__syscall0(SYS_GETPID);
+        // Not a formality: this is where the word to clear on exit is
+        // registered, and musl's thread-list lock is that word.
+        return (long)__syscall1(SYS_SET_CLEAR_TID, (unsigned long)a1);
 
     case LX_getpid:
         return (long)__syscall0(SYS_GETPID);

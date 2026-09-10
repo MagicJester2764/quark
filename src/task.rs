@@ -112,6 +112,15 @@ pub struct Task {
     /// register to distinguish one thread's copy from another's. FS is that
     /// register: `thread_local!` compiles to an offset from it.
     pub fs_base: u64,
+    /// A word in this task's address space to clear and wake when it exits.
+    ///
+    /// Linux calls this `CLONE_CHILD_CLEARTID`, and musl does not treat it as
+    /// optional: its `pthread_exit` takes the thread-list lock and never
+    /// unlocks it, because the lock *is* this word and the kernel releasing it
+    /// is what publishes the thread's removal from the list. Without this, a
+    /// thread that exits leaves the list locked by a dead task and the next
+    /// `pthread_join` waits for ever.
+    pub clear_child_tid: u64,
     /// User ID. 0 = root.
     pub uid: u32,
     /// Group ID. 0 = root.
@@ -178,6 +187,7 @@ impl Task {
             mem_limit: 0,
             exit_code: 0,
             fs_base: 0,
+            clear_child_tid: 0,
             uid: 0,
             gid: 0,
         }

@@ -94,6 +94,7 @@ pub const SYS_SET_FS_BASE: u64 = 102;
 pub const SYS_TASK_START_ARG: u64 = 103;
 pub const SYS_TASK_WATCH: u64 = 104;
 pub const SYS_TASK_PRIORITY: u64 = 105;
+pub const SYS_SET_CLEAR_TID: u64 = 106;
 
 // --- 0x70  hardware and drivers ---
 pub const SYS_IRQ_REGISTER: u64 = 112;
@@ -732,6 +733,17 @@ pub fn sys_fd_recv(fd: usize, buf: &mut [u8], at: Option<usize>) -> Result<(usiz
     } else {
         Ok(((ret & 0xFFFF_FFFF) as usize, (ret >> 32) != 0))
     }
+}
+
+/// Register a word to clear and wake when this task exits.
+///
+/// Linux calls this `set_tid_address`, and its clone flag
+/// `CLONE_CHILD_CLEARTID`. musl does not treat it as optional: its
+/// `pthread_exit` takes the thread-list lock and never unlocks it, because the
+/// lock is this word and the kernel releasing it is what publishes the
+/// thread's removal from the list.
+pub fn sys_set_clear_tid(addr: *const u32) -> usize {
+    unsafe { syscall1(SYS_SET_CLEAR_TID, addr as u64) as usize }
 }
 
 /// A connected pair of byte streams, both ends in this task's table.
