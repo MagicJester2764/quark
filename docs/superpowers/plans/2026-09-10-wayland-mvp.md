@@ -90,7 +90,7 @@ A pure move, done first and alone so that every later diff is about Wayland
 rather than about where a function lives. If this task changes behaviour, it is
 wrong.
 
-- [ ] **Step 1: Establish the baseline**
+- [x] **Step 1: Establish the baseline**
 
 Run the compositor and record what it looks like, so the move can be checked
 against a picture rather than a memory:
@@ -104,7 +104,7 @@ cd ../explosion && make hd
 Expected: a window titled `wmdemo #1` with a gradient and an advancing frame
 counter, and the display returned to the console on Escape.
 
-- [ ] **Step 2: Move the drawing code**
+- [x] **Step 2: Move the drawing code**
 
 Move these from `main.rs` to a new `draw.rs`, unchanged: `Rect` and its `impl`,
 `CLIP`, `pack_colour`, `put_pixel`, `fill_rect`, `draw_text`, `refresh`,
@@ -115,18 +115,18 @@ Move these from `main.rs` to a new `draw.rs`, unchanged: `Rect` and its `impl`,
 for now and pass what they need as arguments, so that `draw.rs` knows about
 pixels and nothing else.
 
-- [ ] **Step 3: Build**
+- [x] **Step 3: Build**
 
 Run: `make 2>&1 | grep -E "^error|error\["`
 Expected: no output.
 
-- [ ] **Step 4: Verify nothing changed**
+- [x] **Step 4: Verify nothing changed**
 
 Boot, `wm wmdemo`, screendump, Escape. Compare against Step 1's picture: the
 window, the gradient, the advancing counter and the handover must all be as
 they were.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add user/wm/src/
@@ -172,7 +172,7 @@ to get right and unforgiving enough that getting it wrong looks like a
 different bug — so it is tested on its own, against bytes libwayland actually
 produced.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 The twelve bytes in the test are not invented: they are what `wl_display.get_registry`
 put on the wire in the spike, and they are the only fixture in this plan with
@@ -225,12 +225,12 @@ fn test_wire() {
 protocol is a contract between two programs, which is what `quark-rt` is for,
 and `dtest` can then reach it as `quark_rt::wl::wire`. Use that path in the
 
-- [ ] **Step 2: Run it to verify it fails**
+- [x] **Step 2: Run it to verify it fails**
 
 Run `make`.
 Expected: `cannot find module wl in quark_rt`.
 
-- [ ] **Step 3: Write the implementation**
+- [x] **Step 3: Write the implementation**
 
 Create `user/quark-rt/src/wl/mod.rs` with `pub mod wire;`, add `pub mod wl;` to
 `lib.rs`, and write `wire.rs`:
@@ -319,12 +319,12 @@ pub fn put_str(b: &mut [u8], at: usize, s: &[u8]) -> usize {
 }
 ```
 
-- [ ] **Step 4: Run it to verify it passes**
+- [x] **Step 4: Run it to verify it passes**
 
 Build, boot, run `dtest`.
 Expected: eleven more `ok` lines, `0 failed`.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add user/quark-rt/src/wl user/quark-rt/src/lib.rs user/dtest/src/main.rs
@@ -364,7 +364,7 @@ its `get_registry`, and answers with `global` events. If the client's
 `wl_display_roundtrip` returns, the whole loop — spawn, connect, read, marshal,
 write — is closed.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 The client is `weston-simple-shm`'s connect prologue and nothing more. Write
 `explosion/toolchain/wlprobe.c`, built by
@@ -409,12 +409,12 @@ int main(void) {
 Expected before the compositor answers: `connect: OK`, then `roundtrip: -1`
 and `globals: 0`.
 
-- [ ] **Step 2: Run it to verify it fails**
+- [x] **Step 2: Run it to verify it fails**
 
 Boot, `wm wlprobe`. Expected: the connect succeeds and the roundtrip fails,
 because nothing is listening.
 
-- [ ] **Step 3: Write the implementation**
+- [x] **Step 3: Write the implementation**
 
 `protocol.rs` — the interface table, hand-written for now:
 
@@ -526,7 +526,7 @@ Answer two requests: `wl_display.get_registry`, which sends a `global` event per
 entry of `GLOBALS`, and `wl_display.sync`, which sends `wl_callback.done` and
 then `wl_display.delete_id`.
 
-- [ ] **Step 4: Run it to verify it passes**
+- [x] **Step 4: Run it to verify it passes**
 
 Boot, `wm wlprobe`.
 Expected on screen:
@@ -545,7 +545,7 @@ globals: 5
 A roundtrip returning 0 is the whole loop closed: the client marshalled, the
 compositor parsed, answered, and the client's own dispatch believed the answer.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add user/wm/src
@@ -588,7 +588,7 @@ the reason `SCM_RIGHTS` was built in Phase 10. The client makes memory with
 `memfd_create`, maps it, and sends the descriptor; the compositor receives it,
 maps it, and carves buffers out of it.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Extend `wlprobe` to bind `wl_shm`, make a pool and a buffer, and report:
 
@@ -605,11 +605,11 @@ Expected before the compositor answers: the roundtrip fails, because
 `wl_shm.create_pool` is not answered and libwayland's protocol error path
 disconnects.
 
-- [ ] **Step 2: Run it to verify it fails**
+- [x] **Step 2: Run it to verify it fails**
 
 Boot, `wm wlprobe`. Expected: `pool: OK` locally, then `roundtrip: -1`.
 
-- [ ] **Step 3: Write the implementation**
+- [x] **Step 3: Write the implementation**
 
 The read path already uses `sys_fd_recv`; give it somewhere to put a descriptor
 and note which message it arrived with. A descriptor arrives *with* the message
@@ -625,11 +625,11 @@ client's arithmetic and the compositor reading memory that is not there.
 Advertise `WL_SHM_FORMAT_XRGB8888` (0) and `ARGB8888` (1) with a `format` event
 on bind, and refuse any other.
 
-- [ ] **Step 4: Run it to verify it passes**
+- [x] **Step 4: Run it to verify it passes**
 
 Boot, `wm wlprobe`. Expected: `pool: OK`, `buffer: OK`, `roundtrip: 0`.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add user/wm/src
@@ -672,7 +672,7 @@ nothing until `xdg_surface.get_toplevel` gives it a role; `attach`, `damage`
 and `frame` accumulate *pending* state and `commit` applies all of it at once;
 and the compositor sends `wl_buffer.release` when it has finished reading.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 `wlprobe` becomes the full `weston-simple-shm` prologue: create a surface, get
 an `xdg_surface` and an `xdg_toplevel`, commit, wait for the `configure`, ack
@@ -680,12 +680,12 @@ it, attach, damage, commit, and count `frame` callbacks over a second.
 
 Expected before implementation: no `configure` arrives and the client waits.
 
-- [ ] **Step 2: Run it to verify it fails**
+- [x] **Step 2: Run it to verify it fails**
 
 Boot, `wm wlprobe`. Expected: it hangs waiting for a configure. Use a
 screendump after ten seconds rather than waiting for an exit.
 
-- [ ] **Step 3: Write the implementation**
+- [x] **Step 3: Write the implementation**
 
 Pending and current state as two structs of the same shape, with `commit`
 copying one to the other and clearing the pending damage — the atomicity is
@@ -701,13 +701,13 @@ present the damaged region, then send `wl_buffer.release`. Send
 milliseconds — that is what throttles the client, and without it
 `weston-simple-shm` will draw as fast as it can.
 
-- [ ] **Step 4: Run it to verify it passes**
+- [x] **Step 4: Run it to verify it passes**
 
 Boot, `wm wlprobe`, screendump. Expected: a window on screen with the client's
 own pixels in it, and a frame count that advances at roughly the rate the
 compositor presents rather than as fast as the client can loop.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add user/wm/src
@@ -746,32 +746,32 @@ EOF
 - Consumes: Tasks 1–5.
 - Produces: nothing; this is the milestone.
 
-- [ ] **Step 1: Fetch the client**
+- [x] **Step 1: Fetch the client**
 
 `weston-simple-shm` is one file. Take it from the weston tree at a pinned tag,
 build it against the ported libwayland and the scanner-generated `xdg-shell`
 code, and change nothing in it. If it needs changing, that is a compositor bug
 and the change belongs there.
 
-- [ ] **Step 2: Run it to verify it fails**
+- [x] **Step 2: Run it to verify it fails**
 
 Boot, `wm weston-simple-shm`, screendump.
 Record exactly what happens; it will not work first time, and what it does
 instead is the list of what Task 5 got wrong.
 
-- [ ] **Step 3: Fix what it finds**
+- [x] **Step 3: Fix what it finds**
 
 Nothing new should be needed. The likely three, in the order they will bite:
 the `xdg_wm_base.ping`/`pong` handshake, which a client may insist on; the
 exact `wl_output` event sequence ending in `done`; and a protocol version the
 client asks for that the compositor advertises but does not fully implement.
 
-- [ ] **Step 4: Run it to verify it passes**
+- [x] **Step 4: Run it to verify it passes**
 
 Boot, `wm weston-simple-shm`, screendump. Expected: the moving coloured pattern
 that `weston-simple-shm` draws, on Quark, in a window with a title bar.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git commit -m "$(cat <<'EOF'
