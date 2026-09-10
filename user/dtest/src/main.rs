@@ -186,6 +186,125 @@ fn test_socketpair() {
     check("close b", syscall::sys_fd_close(b).is_ok());
 }
 
+const PASSED_AT: usize = 0x96_0000_0000;
+
+fn test_fd_passing() {
+    println!("descriptor passing:");
+    let (a, b) = match syscall::sys_socketpair() {
+        Ok(p) => p,
+        Err(()) => { check("a pair to pass over", false); return; }
+    };
+    let mem = match syscall::sys_memfd_create(2) {
+        Ok(f) => f,
+        Err(()) => { check("memory to pass", false); return; }
+    };
+    check("a pair and some memory", true);
+
+    // Write a witness through the sender's own mapping first.
+    check("map it here", syscall::sys_mmap_fd(mem, PASSED_AT).is_ok());
+    unsafe { core::ptr::write_volatile(PASSED_AT as *mut u64, 0xC0FFEE) };
+
+    check(
+        "send the descriptor with a byte",
+        syscall::sys_fd_send(a, b"m", Some(mem)) == Ok(1),
+    );
+
+    let mut buf = [0u8; 4];
+    check(
+        "receive says a descriptor came",
+        syscall::sys_fd_recv(b, &mut buf, Some(20)) == Ok((1, true)),
+    );
+
+    // The received descriptor is a different number naming the same memory.
+    check(
+        "map the received descriptor",
+        syscall::sys_mmap_fd(20, PASSED_AT + 0x8000).is_ok(),
+    );
+    check(
+        "it is the same memory",
+        unsafe { core::ptr::read_volatile((PASSED_AT + 0x8000) as *const u64) } == 0xC0FFEE,
+    );
+
+    // Receiving when nothing was attached must not invent one.
+    check("send with no descriptor", syscall::sys_fd_send(a, b"x", None) == Ok(1));
+    check(
+        "receive says none came",
+        syscall::sys_fd_recv(b, &mut buf, Some(21)) == Ok((1, false)),
+    );
+
+    let _ = syscall::sys_fd_close(20);
+    let _ = syscall::sys_fd_close(mem);
+
+    // In flight, with the sender's own copy gone. The queue has to hold a
+    // reference of its own, or the region is freed under the descriptor
+    // travelling towards the peer and the receiver maps freed memory.
+    let orphan = match syscall::sys_memfd_create(1) {
+        Ok(f) => f,
+        Err(()) => { check("memory to orphan", false); return; }
+    };
+    check("map the orphan here", syscall::sys_mmap_fd(orphan, PASSED_AT + 0x20000).is_ok());
+    unsafe { core::ptr::write_volatile((PASSED_AT + 0x20000) as *mut u64, 0xBEEF) };
+    check("send it", syscall::sys_fd_send(a, b"o", Some(orphan)) == Ok(1));
+    check("close the only other copy", syscall::sys_fd_close(orphan).is_ok());
+    check(
+        "receive it anyway",
+        syscall::sys_fd_recv(b, &mut buf, Some(22)) == Ok((1, true)),
+    );
+    check("map what arrived", syscall::sys_mmap_fd(22, PASSED_AT + 0x28000).is_ok());
+    check(
+        "and it still holds what was written",
+        unsafe { core::ptr::read_volatile((PASSED_AT + 0x28000) as *const u64) } == 0xBEEF,
+    );
+
+    let _ = syscall::sys_fd_close(22);
+    let _ = syscall::sys_fd_close(a);
+    let _ = syscall::sys_fd_close(b);
+}
+
+fn test_no_leak() {
+    println!("abandoned descriptors are reclaimed:");
+    // Send a descriptor and throw the connection away without receiving it,
+    // forty times. There are thirty-two streams and the region table is
+    // finite, so anything that fails to give back what it took runs out
+    // before this loop does.
+    let mut rounds = 0;
+    for _ in 0..40 {
+        let Ok((a, b)) = syscall::sys_socketpair() else { break };
+        let Ok(mem) = syscall::sys_memfd_create(1) else {
+            let _ = syscall::sys_fd_close(a);
+            let _ = syscall::sys_fd_close(b);
+            break;
+        };
+        if syscall::sys_fd_send(a, b"z", Some(mem)) != Ok(1) {
+            break;
+        }
+        // Everybody drops it: the sender's copy, and both ends of the stream
+        // that was carrying the one in flight.
+        let _ = syscall::sys_fd_close(mem);
+        let _ = syscall::sys_fd_close(a);
+        let _ = syscall::sys_fd_close(b);
+        rounds += 1;
+    }
+    check("forty rounds of send-and-abandon", rounds == 40);
+
+    // And the tables still work afterwards.
+    match syscall::sys_socketpair() {
+        Ok((a, b)) => {
+            check("a stream can still be made", true);
+            let _ = syscall::sys_fd_close(a);
+            let _ = syscall::sys_fd_close(b);
+        }
+        Err(()) => check("a stream can still be made", false),
+    }
+    match syscall::sys_memfd_create(1) {
+        Ok(m) => {
+            check("memory can still be made", true);
+            let _ = syscall::sys_fd_close(m);
+        }
+        Err(()) => check("memory can still be made", false),
+    }
+}
+
 #[unsafe(no_mangle)]
 #[link_section = ".text.entry"]
 pub extern "C" fn _start() -> ! {
@@ -195,6 +314,8 @@ pub extern "C" fn _start() -> ! {
     test_big_region();
     test_memfd();
     test_socketpair();
+    test_fd_passing();
+    test_no_leak();
 
     unsafe {
         println!("[dtest] {} passed, {} failed", PASSED, FAILED);

@@ -431,6 +431,35 @@ pub fn release_fd(kind: &FdKind, owner: usize) {
 /// The mirror of `release_fd`, and deliberately beside it: `SYS_FD_DUP` and
 /// `SYS_PIPE_FD_SET` both make a second descriptor for one object, and a kind
 /// added to one of these and not the other leaks or double-frees.
+/// Take a reference for a descriptor in flight, belonging to no task yet.
+///
+/// A queued descriptor has no owner — the receiver is not decided until it
+/// calls recv — so this is the tid-free counterpart of `retain_fd`, and its
+/// reference is released by `release_in_flight` whether the descriptor
+/// arrives or is dropped with the stream carrying it.
+pub fn retain_in_flight(kind: &FdKind) -> Result<(), ()> {
+    match kind {
+        FdKind::PipeRead(handle) => add_ref(*handle, false),
+        FdKind::PipeWrite(handle) => add_ref(*handle, true),
+        FdKind::MemFd { handle } => {
+            if crate::shmem::hold_in_flight(*handle) { Ok(()) } else { Err(()) }
+        }
+        FdKind::StreamEnd { stream, end } => crate::stream::retain_end(*stream, *end),
+        _ => Ok(()),
+    }
+}
+
+/// Give back what `retain_in_flight` took.
+pub fn release_in_flight(kind: &FdKind) {
+    match kind {
+        FdKind::PipeRead(handle) => drop_ref(*handle, false),
+        FdKind::PipeWrite(handle) => drop_ref(*handle, true),
+        FdKind::MemFd { handle } => crate::shmem::drop_in_flight(*handle),
+        FdKind::StreamEnd { stream, end } => crate::stream::close_end(*stream, *end),
+        _ => {}
+    }
+}
+
 /// `owner` is the task the *new* descriptor will belong to, which for
 /// `SYS_FD_DUP` is the target rather than the caller.
 pub fn retain_fd(kind: &FdKind, owner: usize) -> Result<(), ()> {

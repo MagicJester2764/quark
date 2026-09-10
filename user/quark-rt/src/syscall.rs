@@ -56,6 +56,8 @@ pub const SYS_PIPE_CREATE: u64 = 69;
 pub const SYS_PIPE_FD_SET: u64 = 70;
 pub const SYS_FD_CLOSE: u64 = 71;
 pub const SYS_SOCKETPAIR: u64 = 72;
+pub const SYS_FD_SEND: u64 = 73;
+pub const SYS_FD_RECV: u64 = 74;
 
 // --- 0x50  capabilities ---
 pub const SYS_CAP_MINT: u64 = 80;
@@ -599,6 +601,33 @@ pub fn sleep_ms(ms: u64) {
     // PIT runs at 100 Hz → 1 tick = 10 ms. Round up.
     let ticks = (ms + 9) / 10;
     sleep_ticks(ticks);
+}
+
+/// Write to a stream, optionally handing the peer one of our descriptors.
+///
+/// Passing needs no authority over the peer: it takes delivery by calling
+/// [`sys_fd_recv`]. That is the difference from [`sys_fd_dup`], which puts a
+/// descriptor into a task that did not ask and therefore needs `TaskMgmt`.
+pub fn sys_fd_send(fd: usize, buf: &[u8], pass: Option<usize>) -> Result<usize, ()> {
+    let p = match pass { Some(f) => f as u64, None => u64::MAX };
+    let ret = unsafe {
+        syscall4(SYS_FD_SEND, fd as u64, buf.as_ptr() as u64, buf.len() as u64, p)
+    };
+    if ret == u64::MAX { Err(()) } else { Ok((ret & 0xFFFF_FFFF) as usize) }
+}
+
+/// Read from a stream. If `at` is given and a descriptor was attached, it is
+/// installed there. Returns the byte count and whether one arrived.
+pub fn sys_fd_recv(fd: usize, buf: &mut [u8], at: Option<usize>) -> Result<(usize, bool), ()> {
+    let a = match at { Some(f) => f as u64, None => u64::MAX };
+    let ret = unsafe {
+        syscall4(SYS_FD_RECV, fd as u64, buf.as_mut_ptr() as u64, buf.len() as u64, a)
+    };
+    if ret == u64::MAX {
+        Err(())
+    } else {
+        Ok(((ret & 0xFFFF_FFFF) as usize, (ret >> 32) != 0))
+    }
 }
 
 /// A connected pair of byte streams, both ends in this task's table.

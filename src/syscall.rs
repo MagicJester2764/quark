@@ -89,6 +89,8 @@ pub const SYS_PIPE_CREATE: u64 = 69;
 pub const SYS_PIPE_FD_SET: u64 = 70;
 pub const SYS_FD_CLOSE: u64 = 71;
 pub const SYS_SOCKETPAIR: u64 = 72;
+pub const SYS_FD_SEND: u64 = 73;
+pub const SYS_FD_RECV: u64 = 74;
 
 // --- 0x50  capabilities ---
 pub const SYS_CAP_MINT: u64 = 80;
@@ -277,6 +279,19 @@ fn validate_user_range(addr: u64, len: u64, write: bool) -> bool {
 }
 
 /// Read-only user buffer check.
+/// The stream and end a descriptor names, or `None` if it names something else.
+fn stream_end_of(tid: usize, fd: usize) -> Option<(usize, u8)> {
+    if fd >= crate::task::MAX_FDS {
+        return None;
+    }
+    unsafe {
+        match scheduler::get_task_mut(tid)?.fds[fd] {
+            crate::task::FdKind::StreamEnd { stream, end } => Some((stream, end)),
+            _ => None,
+        }
+    }
+}
+
 fn validate_user_ptr(addr: u64, len: u64) -> bool {
     validate_user_range(addr, len, false)
 }
@@ -1148,6 +1163,114 @@ extern "C" fn syscall_dispatch(
                     u64::MAX
                 }
             }
+        }
+        SYS_FD_SEND => {
+            // arg0 = stream fd, arg1 = buf, arg2 = len, arg3 = fd to pass or
+            // u64::MAX. This needs no authority over the peer: it takes
+            // delivery by calling recv. That is the difference from
+            // SYS_FD_DUP, which puts a descriptor into a task that never asked
+            // and therefore requires TaskMgmt over it.
+            let fd = arg0 as usize;
+            let len = arg2 as usize;
+            let pass = arg3;
+            let tid = scheduler::current_tid();
+            if fd >= crate::task::MAX_FDS {
+                return u64::MAX;
+            }
+            if len > 0 && !validate_user_ptr(arg1, arg2) {
+                return u64::MAX;
+            }
+            let (stream, end) = match stream_end_of(tid, fd) {
+                Some(p) => p,
+                None => return u64::MAX,
+            };
+
+            // The descriptor goes on the queue before the bytes, so a peer
+            // that reads the bytes never has to wonder whether the handle is
+            // still coming.
+            if pass != u64::MAX {
+                let pfd = pass as usize;
+                if pfd >= crate::task::MAX_FDS {
+                    return u64::MAX;
+                }
+                let kind = scheduler::current_fd(pfd);
+                if kind.is_empty() {
+                    return u64::MAX;
+                }
+                // Hold it on the queue's behalf. Without this the sender
+                // closing its own copy frees the object underneath a
+                // descriptor still travelling.
+                if crate::pipe::retain_in_flight(&kind).is_err() {
+                    return u64::MAX;
+                }
+                if !crate::stream::push_fd(stream, end, kind) {
+                    crate::pipe::release_in_flight(&kind);
+                    return u64::MAX;
+                }
+            }
+
+            let (_, wr) = match crate::stream::pipes_for(stream, end) {
+                Some(p) => p,
+                None => return u64::MAX,
+            };
+            crate::pipe::write(wr, arg1 as *const u8, len)
+        }
+        SYS_FD_RECV => {
+            // arg0 = stream fd, arg1 = buf, arg2 = len, arg3 = where to
+            // install any attached descriptor, or u64::MAX to leave it queued.
+            let fd = arg0 as usize;
+            let len = arg2 as usize;
+            let at = arg3;
+            let tid = scheduler::current_tid();
+            if fd >= crate::task::MAX_FDS {
+                return u64::MAX;
+            }
+            if len > 0 && !validate_user_ptr_mut(arg1, arg2) {
+                return u64::MAX;
+            }
+            let (stream, end) = match stream_end_of(tid, fd) {
+                Some(p) => p,
+                None => return u64::MAX,
+            };
+            let (rd, _) = match crate::stream::pipes_for(stream, end) {
+                Some(p) => p,
+                None => return u64::MAX,
+            };
+            let n = crate::pipe::read(rd, arg1 as *mut u8, len);
+            if n == u64::MAX {
+                return u64::MAX;
+            }
+
+            let mut got = 0u64;
+            if at != u64::MAX {
+                let slot = at as usize;
+                if slot < crate::task::MAX_FDS {
+                    if let Some(kind) = crate::stream::pop_fd(stream, end) {
+                        // Turn the queue's anonymous reference into one owned
+                        // by this task. Memory arriving this way admits the
+                        // receiver to the region: the sender chose to send and
+                        // the receiver asked to take.
+                        let installed = unsafe {
+                            match scheduler::get_task_mut(tid) {
+                                Some(t) if t.fds[slot].is_empty() => {
+                                    if crate::pipe::retain_fd(&kind, tid).is_ok() {
+                                        t.fds[slot] = kind;
+                                        true
+                                    } else {
+                                        false
+                                    }
+                                }
+                                _ => false,
+                            }
+                        };
+                        crate::pipe::release_in_flight(&kind);
+                        if installed {
+                            got = 1;
+                        }
+                    }
+                }
+            }
+            (got << 32) | n
         }
         SYS_MEMFD_CREATE => {
             // Memory a program can name and hand over. The region is exactly

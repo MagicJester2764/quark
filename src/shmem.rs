@@ -64,6 +64,15 @@ struct ShmemRegion {
     /// Set when destroy was requested while the region was still mapped.
     /// The last task to unmap frees the frames and releases the handle.
     pending_destroy: bool,
+    /// Descriptors for this region sitting in a stream's queue, sent but not
+    /// yet received.
+    ///
+    /// The access mask is keyed by task, and a queued descriptor belongs to no
+    /// task yet — the receiver is not decided until it calls recv. Without a
+    /// count that belongs to nobody, a sender that passes a region and then
+    /// closes its own copy drops the last reference and the region is freed
+    /// under the descriptor still travelling towards its peer.
+    in_flight: u32,
 }
 
 impl ShmemRegion {
@@ -77,6 +86,7 @@ impl ShmemRegion {
             access: 0,
             mapped: 0,
             pending_destroy: false,
+            in_flight: 0,
         }
     }
 }
@@ -329,7 +339,7 @@ pub fn close_ref(handle: usize, tid: usize) {
         let r = &mut regions()[handle];
         if r.in_use {
             r.access &= !(1u64 << tid);
-            if r.access == 0 {
+            if r.access == 0 && r.in_flight == 0 {
                 if r.mapped == 0 {
                     release(r);
                 } else {
@@ -338,6 +348,44 @@ pub fn close_ref(handle: usize, tid: usize) {
                     // frames go when the last mapper unmaps.
                     r.pending_destroy = true;
                 }
+            }
+        }
+    }
+    irq_restore(flags);
+}
+
+/// Take a reference held by nobody, for a descriptor in flight.
+pub fn hold_in_flight(handle: usize) -> bool {
+    if handle >= MAX_SHMEM {
+        return false;
+    }
+    let flags = irq_save();
+    let ok = unsafe {
+        let r = &mut regions()[handle];
+        if r.in_use && !r.pending_destroy {
+            r.in_flight += 1;
+            true
+        } else {
+            false
+        }
+    };
+    irq_restore(flags);
+    ok
+}
+
+/// Release an in-flight reference — the descriptor arrived, or was dropped
+/// with the stream that was carrying it.
+pub fn drop_in_flight(handle: usize) {
+    if handle >= MAX_SHMEM {
+        return;
+    }
+    let flags = irq_save();
+    unsafe {
+        let r = &mut regions()[handle];
+        if r.in_use && r.in_flight > 0 {
+            r.in_flight -= 1;
+            if r.in_flight == 0 && r.access == 0 && r.mapped == 0 {
+                release(r);
             }
         }
     }

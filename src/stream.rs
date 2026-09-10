@@ -188,12 +188,32 @@ pub fn close_end(stream: usize, end: u8) {
         } else {
             (s.zero_to_one, s.one_to_zero)
         };
+        // Anything still travelling towards the peer will never arrive: this
+        // end is the one that would have delivered it. Take the queue out
+        // under the lock and release it after, since releasing a descriptor
+        // can reach back into this table.
+        let mut orphans = [FdKind::Empty; FD_QUEUE * 2];
+        let mut n = 0;
+        for side in 0..2 {
+            if side == 1 - end as usize || both {
+                for i in 0..s.q_len[side] {
+                    orphans[n] = s.q[side][i];
+                    n += 1;
+                }
+                s.q_len[side] = 0;
+            }
+        }
         if both {
             *s = Stream::empty();
         }
-        pipes
+        (pipes, orphans, n)
     };
     irq_restore(flags);
+
+    let (gone, orphans, n) = gone;
+    for kind in &orphans[..n] {
+        crate::pipe::release_in_flight(kind);
+    }
 
     // Dropping the writer this end held is what gives the peer end-of-file,
     // and dropping the reader is what tells the peer nobody is listening. The
@@ -201,6 +221,58 @@ pub fn close_end(stream: usize, end: u8) {
     let (rd, wr) = gone;
     pipe::drop_ref(rd, false);
     pipe::drop_ref(wr, true);
+}
+
+/// Queue a descriptor for the peer of `end`. False if the queue is full or
+/// the peer has gone.
+///
+/// The caller has already taken an in-flight reference; on refusal it is the
+/// caller's to give back.
+pub fn push_fd(stream: usize, end: u8, kind: FdKind) -> bool {
+    if stream >= MAX_STREAMS || end > 1 {
+        return false;
+    }
+    let to = 1 - end as usize;
+    let flags = irq_save();
+    let ok = unsafe {
+        let s = &mut streams()[stream];
+        if !s.in_use || s.refs[to] == 0 || s.q_len[to] == FD_QUEUE {
+            false
+        } else {
+            s.q[to][s.q_len[to]] = kind;
+            s.q_len[to] += 1;
+            true
+        }
+    };
+    irq_restore(flags);
+    ok
+}
+
+/// Take the descriptor at the head of this end's queue, if any.
+///
+/// Its in-flight reference comes with it and is the caller's to convert into
+/// an owned one or to release.
+pub fn pop_fd(stream: usize, end: u8) -> Option<FdKind> {
+    if stream >= MAX_STREAMS || end > 1 {
+        return None;
+    }
+    let me = end as usize;
+    let flags = irq_save();
+    let out = unsafe {
+        let s = &mut streams()[stream];
+        if !s.in_use || s.q_len[me] == 0 {
+            None
+        } else {
+            let head = s.q[me][0];
+            for i in 1..s.q_len[me] {
+                s.q[me][i - 1] = s.q[me][i];
+            }
+            s.q_len[me] -= 1;
+            Some(head)
+        }
+    };
+    irq_restore(flags);
+    out
 }
 
 /// Is there something for this end to read?
