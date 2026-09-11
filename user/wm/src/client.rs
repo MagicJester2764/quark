@@ -451,18 +451,32 @@ impl Client {
 
     /// `wl_keyboard.keymap`, which carries a descriptor whatever its format.
     ///
-    /// `NO_KEYMAP` says the client should use a layout of its own, and that is
-    /// the truthful answer until the compositor has one to send. The empty page
-    /// exists because the event's shape requires a descriptor regardless.
+    /// The client maps it and hands it to xkbcommon; the compositor never reads
+    /// it back. Saying `NO_KEYMAP` instead would leave every client to guess
+    /// what the key codes mean, and the guesses do not agree.
     fn send_keymap(&mut self, id: u32) {
         // Alone in the buffer: see `pending_fd`.
         self.flush();
-        let Ok(fd) = syscall::sys_memfd_create(1) else {
-            return;
+        // Without a keymap the event still has to go out, and still has to
+        // carry a descriptor: a client waits for it before it will believe the
+        // keyboard exists at all.
+        let (format, size, fd) = match crate::keymap::descriptor() {
+            Some(fd) if crate::keymap::ready() => {
+                (proto::KEYMAP_FORMAT_XKB_V1, crate::keymap::size(), fd)
+            }
+            other => {
+                if let Some(fd) = other {
+                    let _ = syscall::sys_fd_close(fd);
+                }
+                match syscall::sys_memfd_create(1) {
+                    Ok(fd) => (proto::KEYMAP_FORMAT_NO_KEYMAP, 0, fd),
+                    Err(()) => return,
+                }
+            }
         };
         if let Some(a) = self.begin(id, proto::KEYBOARD_KEYMAP) {
-            self.arg_u32(proto::KEYMAP_FORMAT_NO_KEYMAP);
-            self.arg_u32(0); // size
+            self.arg_u32(format);
+            self.arg_u32(size);
             self.end(a);
         }
         self.pending_fd = fd;

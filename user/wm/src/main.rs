@@ -69,6 +69,7 @@ use quark_rt::{args, nameserver, println, syscall, vfs};
 // then looks like an unrelated failure much later.
 mod client;
 mod draw;
+mod keymap;
 mod objects;
 mod protocol;
 mod seat;
@@ -794,6 +795,13 @@ fn ok() -> Message {
 #[unsafe(no_mangle)]
 #[link_section = ".text.entry"]
 pub extern "C" fn _start() -> ! {
+    // The keymap before the display, because it is the one piece of start-up
+    // that allocates and copies forty kilobytes, and a failure here has to be
+    // sayable on a console this process has not yet taken away.
+    if !keymap::prepare() {
+        println!("wm: no keymap; clients will guess the layout");
+    }
+
     let Some(fb) = nameserver::lookup_retry(b"fb", 20) else {
         println!("wm: no framebuffer device");
         syscall::sys_exit_code(1);

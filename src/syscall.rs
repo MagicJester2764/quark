@@ -2061,11 +2061,23 @@ extern "C" fn syscall_dispatch(
             //   claimant it never spawned — while that claimant is blocked in
             //   `sys_call` to it.
             //
-            // So: authority over the destination, or the destination asked.
-            // Being blocked in a call *is* the asking, which is why this needs
-            // no new system call and no new state.
+            // - A server *returning* something. The framebuffer device takes the
+            //   display back from whoever has it and hands it to whoever had it
+            //   before, which is a task that is not calling anybody: it is
+            //   sitting in its own loop waiting to be told. The console gets
+            //   its display back this way, and a rule without this arm boots to
+            //   a black screen the moment a compositor exits.
+            //
+            // So: authority over the destination, or its consent. Consent is
+            // either a call in progress — being blocked in one *is* the asking —
+            // or a standing `Endpoint` naming the granter, which is the
+            // destination having already said it is willing to talk to this
+            // task. Neither can be manufactured by a stranger: a service holds
+            // endpoints to the things it calls, not to everything that calls
+            // it, so nobody can push a capability into the nameserver.
             if !crate::cap::task_has_task_mgmt(caller_tid, dest_tid)
                 && !crate::ipc::is_calling(dest_tid, caller_tid)
+                && !crate::cap::task_has_endpoint(dest_tid, caller_tid)
             {
                 return u64::MAX;
             }
