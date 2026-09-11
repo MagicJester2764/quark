@@ -231,6 +231,12 @@ pub struct Applied {
 /// what to tell the client afterwards.
 pub fn commit(idx: usize) -> Option<Applied> {
     let mut out = Applied { release: NONE, frames: [0; MAX_FRAME], nframes: 0, repaint: false };
+    // Focus is announced after this block rather than inside it. A surface
+    // learns its window here, and until it has, `by_window` cannot find it —
+    // so announcing from `adopt_window`, which is where focus actually moves,
+    // told the seat about a window no surface claimed yet and no client was
+    // ever sent an enter.
+    let mut adopted = false;
     unsafe {
         let s = SURFACES.get_mut(idx).filter(|s| s.used)?;
 
@@ -288,6 +294,7 @@ pub fn commit(idx: usize) -> Option<Applied> {
                             s.window = new;
                             crate::set_window_title(new, &s.title[..s.title_len]);
                             out.repaint = false; // a new window repaints everything
+                            adopted = true;
                         }
                         None => return Some(out),
                     }
@@ -300,7 +307,25 @@ pub fn commit(idx: usize) -> Option<Applied> {
             shm::set_in_use(previous, false);
         }
     }
+    if adopted {
+        crate::announce_focus();
+    }
     Some(out)
+}
+
+/// The surface showing in a window, if any.
+///
+/// Routing knows a window — that is what the compositor's focus is — and the
+/// protocol needs a surface and the client that owns it. This is the hop
+/// between the two, and it is a search because a window does not point back.
+pub fn by_window(window: usize) -> Option<usize> {
+    if window == NONE {
+        return None;
+    }
+    (0..MAX_SURFACES).find(|&i| {
+        let s = unsafe { SURFACES[i] };
+        s.used && s.window == window
+    })
 }
 
 /// The window this surface is showing in, if it is showing.
@@ -315,6 +340,10 @@ pub fn destroy(idx: usize) {
         };
         let window = s.window;
         *s = NO_SURFACE;
+        // Before the window goes: `destroy_window` moves focus, and the seat
+        // would otherwise be asked to announce a leave for a surface that no
+        // longer exists.
+        crate::seat::surface_gone(idx);
         if window != NONE {
             crate::destroy_window(window);
             crate::composite();

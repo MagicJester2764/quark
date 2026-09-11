@@ -71,6 +71,7 @@ mod client;
 mod draw;
 mod objects;
 mod protocol;
+mod seat;
 mod shell;
 mod shm;
 mod surface;
@@ -341,6 +342,17 @@ fn raise(idx: usize) {
         STACK[STACK_LEN - 1] = idx;
         FOCUS = idx;
     }
+    announce_focus();
+}
+
+/// Tell whoever has keyboard focus that it has it, and whoever had it that it
+/// does not. Called wherever `FOCUS` moves — and, for a window being adopted,
+/// once the surface behind it can be found from it.
+pub fn announce_focus() {
+    unsafe {
+        let ptr = &raw mut CLIENTS;
+        seat::focus_changed(&mut *ptr, FOCUS);
+    }
 }
 
 /// End the session.
@@ -494,7 +506,15 @@ fn dispatch_key(press: bool, ascii: u8, scancode: u8, modifiers: u8) {
     if focus == usize::MAX {
         return;
     }
+    // Both, because a window is one or the other and the compositor does not
+    // ask which: a Wayland client never reads the event queue, and a client of
+    // the compositor's own IPC has no seat to hear from. Sending to both costs
+    // a queue push nobody reads, and needs no flag that could be wrong.
     push_event(focus, pack_event(press, ascii, scancode, modifiers));
+    unsafe {
+        let ptr = &raw mut CLIENTS;
+        seat::key(&mut *ptr, press, scancode, modifiers);
+    }
 }
 
 /// Lay a new window out.
@@ -671,6 +691,9 @@ pub fn adopt_window(owner: usize, buf: usize, w: usize, h: usize, stride: usize)
     }
     place(idx);
     composite();
+    // No focus announcement here, though this is where focus moves: the
+    // surface does not know its window until `surface::commit` records it, so
+    // the announcement waits for that and happens there.
     Some(idx)
 }
 
@@ -757,6 +780,7 @@ fn destroy_window(idx: usize) {
         // surprising place for it to go.
         FOCUS = if STACK_LEN > 0 { STACK[STACK_LEN - 1] } else { usize::MAX };
     }
+    announce_focus();
 }
 
 fn error(code: u64) -> Message {

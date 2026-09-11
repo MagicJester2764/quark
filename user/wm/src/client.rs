@@ -67,6 +67,17 @@ pub struct Client {
     due: [u32; MAX_DUE],
     ndue: usize,
     fired_at: u64,
+    /// The `wl_keyboard` this client asked for, if it did. Events go to
+    /// objects, and a client that never took a keyboard has none to send to.
+    keyboard: u32,
+    /// A descriptor to attach to the next flush.
+    ///
+    /// `wl_keyboard.keymap` carries one, and the kernel queues a descriptor
+    /// ahead of the bytes of the write it rode on — so the event it belongs to
+    /// has to be the only thing in the buffer when that write happens.
+    /// libwayland pops descriptors in message order, and one outstanding at a
+    /// time is what keeps the two orders the same.
+    pending_fd: usize,
     /// An argument did not fit in the write buffer, so the event being built
     /// is not the event it claims to be.
     ///
@@ -92,6 +103,8 @@ pub const NO_CLIENT: Client = Client {
     due: [0; MAX_DUE],
     ndue: 0,
     fired_at: 0,
+    keyboard: 0,
+    pending_fd: usize::MAX,
     wfail: false,
 };
 
@@ -105,6 +118,8 @@ impl Client {
         self.rlen = 0;
         self.wlen = 0;
         self.nfds = 0;
+        self.keyboard = 0;
+        self.pending_fd = usize::MAX;
         // wl_display is object 1 and exists before anything is asked for.
         self.objects.insert(proto::DISPLAY_ID, Kind::Display);
     }
@@ -123,6 +138,11 @@ impl Client {
             let _ = syscall::sys_fd_close(self.fds[i]);
         }
         self.nfds = 0;
+        if self.pending_fd != usize::MAX {
+            let _ = syscall::sys_fd_close(self.pending_fd);
+            self.pending_fd = usize::MAX;
+        }
+        self.keyboard = 0;
         self.used = false;
         self.fd = 0;
         self.tid = 0;
@@ -244,14 +264,25 @@ impl Client {
         }
         // Non-blocking on purpose. A client that stops reading must not be
         // able to park the compositor, which is serving everybody else.
-        let n = match syscall::sys_fd_send_nb(self.fd, &self.wbuf[..self.wlen], None) {
+        let pass = if self.pending_fd == usize::MAX { None } else { Some(self.pending_fd) };
+        let n = match syscall::sys_fd_send_nb(self.fd, &self.wbuf[..self.wlen], pass) {
             Err(()) => {
                 self.wlen = 0; // the client has gone; the bytes have nowhere to go
+                if self.pending_fd != usize::MAX {
+                    let _ = syscall::sys_fd_close(self.pending_fd);
+                    self.pending_fd = usize::MAX;
+                }
                 return;
             }
             Ok(None) => 0,
             Ok(Some(n)) => n,
         };
+        if self.pending_fd != usize::MAX {
+            // Sent, and ours to let go of: the peer took a reference when the
+            // kernel queued it, so this only drops our own.
+            let _ = syscall::sys_fd_close(self.pending_fd);
+            self.pending_fd = usize::MAX;
+        }
         // A short write means the stream is full. Dropping the remainder would
         // desynchronise it, so keep it and try again next time.
         if n < self.wlen {
@@ -346,8 +377,166 @@ impl Client {
             Kind::XdgToplevel { surface } => {
                 self.toplevel_request(h.object, surface, h.opcode, body)
             }
+            Kind::Seat => self.seat_request(h.object, h.opcode, body),
+            Kind::Keyboard => {
+                if h.opcode == proto::KEYBOARD_RELEASE {
+                    self.objects.remove(h.object);
+                    if self.keyboard == h.object {
+                        self.keyboard = 0;
+                    }
+                }
+                true
+            }
             Kind::Output | Kind::Callback | Kind::None => true,
         }
+    }
+
+    /// The keyboard object this client asked for, if it did.
+    pub fn keyboard_id(&self) -> Option<u32> {
+        if self.keyboard == 0 { None } else { Some(self.keyboard) }
+    }
+
+    fn seat_request(&mut self, object: u32, opcode: u16, body: usize) -> bool {
+        match opcode {
+            proto::SEAT_GET_KEYBOARD => {
+                let Some(id) = wire::get_u32(&self.rbuf, body) else {
+                    return false;
+                };
+                // An object made by a request inherits the version of the
+                // object it was made from — that is how a client that bound
+                // wl_seat at 1 gets a wl_keyboard at 1, with five events and
+                // not six.
+                let version = self.objects.version_of(object);
+                if !self.objects.insert_at(id, Kind::Keyboard, version) {
+                    return false;
+                }
+                self.keyboard = id;
+                self.send_keymap(id);
+                if version >= 4 {
+                    if let Some(a) = self.begin(id, proto::KEYBOARD_REPEAT_INFO) {
+                        self.arg_u32(crate::seat::REPEAT_RATE as u32);
+                        self.arg_u32(crate::seat::REPEAT_DELAY as u32);
+                        self.end(a);
+                    }
+                }
+                // A client may take its keyboard while already focused --
+                // `wlprobe` does, because it waits for a configure first -- and
+                // would otherwise hear nothing until focus moved away and back.
+                let focus = crate::seat::focus();
+                if let Some(s) = surface::get(focus) {
+                    if s.client == self.slot {
+                        self.keyboard_enter(id, focus, crate::seat::mods());
+                    }
+                }
+                self.flush();
+                true
+            }
+            // A pointer and a touch are not among the advertised capabilities,
+            // so asking for one is a client ignoring what it was told. The
+            // object is recorded so that destroying it does not look like a
+            // reference to nothing; it simply never hears anything.
+            proto::SEAT_GET_POINTER | proto::SEAT_GET_TOUCH => {
+                match wire::get_u32(&self.rbuf, body) {
+                    Some(id) => self.objects.insert(id, Kind::None),
+                    None => false,
+                }
+            }
+            proto::SEAT_RELEASE => {
+                self.objects.remove(object);
+                true
+            }
+            _ => true,
+        }
+    }
+
+    /// `wl_keyboard.keymap`, which carries a descriptor whatever its format.
+    ///
+    /// `NO_KEYMAP` says the client should use a layout of its own, and that is
+    /// the truthful answer until the compositor has one to send. The empty page
+    /// exists because the event's shape requires a descriptor regardless.
+    fn send_keymap(&mut self, id: u32) {
+        // Alone in the buffer: see `pending_fd`.
+        self.flush();
+        let Ok(fd) = syscall::sys_memfd_create(1) else {
+            return;
+        };
+        if let Some(a) = self.begin(id, proto::KEYBOARD_KEYMAP) {
+            self.arg_u32(proto::KEYMAP_FORMAT_NO_KEYMAP);
+            self.arg_u32(0); // size
+            self.end(a);
+        }
+        self.pending_fd = fd;
+        self.flush();
+    }
+
+    pub fn keyboard_enter(&mut self, id: u32, surface_idx: usize, mods: u32) {
+        let Some(surface_id) = self.surface_id(surface_idx) else {
+            return;
+        };
+        if let Some(a) = self.begin(id, proto::KEYBOARD_ENTER) {
+            self.arg_u32(proto::next_serial());
+            self.arg_u32(surface_id);
+            // The keys already held down. Empty: the compositor does not track
+            // which are held, and telling a client a key is down when it is not
+            // leaves it waiting for a release that never comes.
+            self.arg_array(&[]);
+            self.end(a);
+        }
+        if let Some(a) = self.begin(id, proto::KEYBOARD_MODIFIERS) {
+            self.arg_u32(proto::next_serial());
+            self.arg_u32(mods); // depressed
+            self.arg_u32(0); // latched
+            self.arg_u32(0); // locked
+            self.arg_u32(0); // group
+            self.end(a);
+        }
+        self.flush();
+    }
+
+    /// `surface_idx` is passed rather than read from the seat because by the
+    /// time a leave is sent the focus has already moved: reading it would name
+    /// the surface that just *gained* focus, or — when the two belong to
+    /// different clients, which is the only case a leave matters in — name
+    /// nothing this client knows and send no leave at all.
+    pub fn keyboard_leave(&mut self, id: u32, surface_idx: usize) {
+        let Some(surface_id) = self.surface_id(surface_idx) else {
+            return;
+        };
+        if let Some(a) = self.begin(id, proto::KEYBOARD_LEAVE) {
+            self.arg_u32(proto::next_serial());
+            self.arg_u32(surface_id);
+            self.end(a);
+        }
+        self.flush();
+    }
+
+    pub fn keyboard_key(&mut self, id: u32, keycode: u32, press: bool) {
+        if let Some(a) = self.begin(id, proto::KEYBOARD_KEY) {
+            self.arg_u32(proto::next_serial());
+            self.arg_u32(crate::now_ms());
+            self.arg_u32(keycode);
+            self.arg_u32(if press { proto::KEY_PRESSED } else { proto::KEY_RELEASED });
+            self.end(a);
+        }
+        self.flush();
+    }
+
+    pub fn keyboard_modifiers(&mut self, id: u32, mods: u32) {
+        if let Some(a) = self.begin(id, proto::KEYBOARD_MODIFIERS) {
+            self.arg_u32(proto::next_serial());
+            self.arg_u32(mods);
+            self.arg_u32(0);
+            self.arg_u32(0);
+            self.arg_u32(0);
+            self.end(a);
+        }
+        self.flush();
+    }
+
+    /// The object id this client knows a surface by.
+    fn surface_id(&self, surface_idx: usize) -> Option<u32> {
+        self.objects
+            .find(|k| matches!(k, Kind::Surface { surface: s } if *s == surface_idx))
     }
 
     fn compositor_request(&mut self, opcode: u16, body: usize) -> bool {
@@ -836,7 +1025,7 @@ impl Client {
         let Some((_iface, used)) = wire::get_str(&self.rbuf, body + 4) else {
             return false;
         };
-        let Some(_version) = wire::get_u32(&self.rbuf, body + 4 + used) else {
+        let Some(version) = wire::get_u32(&self.rbuf, body + 4 + used) else {
             return false;
         };
         let Some(id) = wire::get_u32(&self.rbuf, body + 8 + used) else {
@@ -847,10 +1036,31 @@ impl Client {
             2 => Kind::Shm,
             3 => Kind::Output,
             4 => Kind::XdgWmBase,
+            5 => Kind::Seat,
             _ => return false,
         };
-        if !self.objects.insert(id, kind) {
+        // Clamped to what was advertised. A client asking for more than it was
+        // offered is a client that did not read the registry, and honouring the
+        // number it sent would have the compositor promising events it has no
+        // code for.
+        let advertised = proto::GLOBALS[name as usize - 1].version;
+        let version = version.min(advertised).max(1);
+        if !self.objects.insert_at(id, kind, version) {
             return false;
+        }
+        if kind == Kind::Seat {
+            // What this seat has. A client reads it to decide what to ask for,
+            // so a capability advertised is a request that must be answered.
+            if let Some(a) = self.begin(id, proto::SEAT_CAPABILITIES) {
+                self.arg_u32(proto::SEAT_CAP_KEYBOARD);
+                self.end(a);
+            }
+            if version >= 2 {
+                if let Some(a) = self.begin(id, proto::SEAT_NAME) {
+                    self.arg_str(b"seat0");
+                    self.end(a);
+                }
+            }
         }
         if kind == Kind::Output {
             // A client that binds an output waits for `done` before it
@@ -874,12 +1084,14 @@ impl Client {
                 self.arg_u32(0); // refresh in mHz: the framebuffer does not say
                 self.end(a);
             }
-            if let Some(a) = self.begin(id, proto::OUTPUT_SCALE) {
-                self.arg_u32(1);
-                self.end(a);
-            }
-            if let Some(a) = self.begin(id, proto::OUTPUT_DONE) {
-                self.end(a);
+            if version >= 2 {
+                if let Some(a) = self.begin(id, proto::OUTPUT_SCALE) {
+                    self.arg_u32(1);
+                    self.end(a);
+                }
+                if let Some(a) = self.begin(id, proto::OUTPUT_DONE) {
+                    self.end(a);
+                }
             }
         }
         if kind == Kind::Shm {

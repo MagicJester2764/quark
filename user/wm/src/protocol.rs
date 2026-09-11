@@ -18,10 +18,14 @@ pub const COMPOSITOR: Interface = Interface { name: b"wl_compositor", version: 1
 pub const SHM: Interface = Interface { name: b"wl_shm", version: 1 };
 pub const OUTPUT: Interface = Interface { name: b"wl_output", version: 2 };
 pub const XDG_WM_BASE: Interface = Interface { name: b"xdg_wm_base", version: 1 };
+/// Version 4, which is `wl_seat.name` and `wl_keyboard.repeat_info`. Stopping
+/// there is deliberate: version 5 adds `wl_pointer.frame` and the axis detail
+/// that goes with it, and a client binding 5 would be right to expect them.
+pub const SEAT: Interface = Interface { name: b"wl_seat", version: 4 };
 
 /// What the registry advertises, and the order it advertises them in. The
 /// index is the `name` a client binds by.
-pub const GLOBALS: [&Interface; 4] = [&COMPOSITOR, &SHM, &OUTPUT, &XDG_WM_BASE];
+pub const GLOBALS: [&Interface; 5] = [&COMPOSITOR, &SHM, &OUTPUT, &XDG_WM_BASE, &SEAT];
 
 // wl_display requests.
 pub const DISPLAY_SYNC: u16 = 0;
@@ -121,6 +125,34 @@ pub const TOPLEVEL_CLOSE: u16 = 1;
 /// acknowledged the configure that told it how big to be.
 pub const XDG_ERR_ROLE: u32 = 0;
 pub const XDG_ERR_UNCONFIGURED_BUFFER: u32 = 3;
+
+// wl_seat requests and events.
+pub const SEAT_GET_POINTER: u16 = 0;
+pub const SEAT_GET_KEYBOARD: u16 = 1;
+pub const SEAT_GET_TOUCH: u16 = 2;
+pub const SEAT_RELEASE: u16 = 3;
+pub const SEAT_CAPABILITIES: u16 = 0;
+pub const SEAT_NAME: u16 = 1;
+/// `wl_seat.capability` bits. A client reads these to decide what to ask for,
+/// so advertising one means answering the request that follows.
+pub const SEAT_CAP_POINTER: u32 = 1;
+pub const SEAT_CAP_KEYBOARD: u32 = 2;
+
+// wl_keyboard requests and events.
+pub const KEYBOARD_RELEASE: u16 = 0;
+pub const KEYBOARD_KEYMAP: u16 = 0;
+pub const KEYBOARD_ENTER: u16 = 1;
+pub const KEYBOARD_LEAVE: u16 = 2;
+pub const KEYBOARD_KEY: u16 = 3;
+pub const KEYBOARD_MODIFIERS: u16 = 4;
+pub const KEYBOARD_REPEAT_INFO: u16 = 5;
+/// `wl_keyboard.keymap_format`. `NO_KEYMAP` means the client uses a layout of
+/// its own, which is the honest thing to say until the compositor has one.
+pub const KEYMAP_FORMAT_NO_KEYMAP: u32 = 0;
+pub const KEYMAP_FORMAT_XKB_V1: u32 = 1;
+/// `wl_keyboard.key_state`.
+pub const KEY_RELEASED: u32 = 0;
+pub const KEY_PRESSED: u32 = 1;
 
 /// The object id of `wl_display`, which exists before anything is asked for.
 pub const DISPLAY_ID: u32 = 1;

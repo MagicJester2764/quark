@@ -166,11 +166,17 @@ pub extern "C" fn _start() -> ! {
             // keystroke behind them. Draining means a lost notification costs
             // nothing: the next wake-up collects what the last one left.
             //
-            // Bit 0 of the status port says there is a byte waiting. The bound
-            // is in case a controller lies about that, so a wedged keyboard
-            // cannot become a wedged system.
+            // Bit 0 of the status port says there is a byte waiting, and it is
+            // asked before the first read as well as before each one after it.
+            // The drain takes everything the controller has, so when two
+            // notifications are queued the first one's loop consumes both
+            // bytes and the second arrives to an empty buffer — and reading
+            // 0x60 when it is empty hands back the last byte again. That is
+            // one duplicated key per burst of typing: invisible in a shell
+            // that echoes, and obvious to a Wayland client counting presses
+            // against releases.
             let mut budget = 64;
-            loop {
+            while syscall::sys_ioport_read(0x64) & 1 != 0 {
                 let raw = syscall::sys_ioport_read(0x60) as u8;
                 handle_scancode(
                     raw,
@@ -181,12 +187,9 @@ pub extern "C" fn _start() -> ! {
                     &mut waiting_client,
                 );
                 budget -= 1;
-                // Bit 0 of the status port says another byte is already
-                // waiting. Asked after the read rather than before it: the
-                // byte this notification is about is there whether or not the
-                // controller admits it, and reading unconditionally is what
-                // the driver always did.
-                if budget == 0 || syscall::sys_ioport_read(0x64) & 1 == 0 {
+                // The bound is in case a controller lies about bit 0, so a
+                // wedged keyboard cannot become a wedged system.
+                if budget == 0 {
                     break;
                 }
             }
