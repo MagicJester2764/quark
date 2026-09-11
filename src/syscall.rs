@@ -2042,6 +2042,33 @@ extern "C" fn syscall_dispatch(
                 return u64::MAX;
             }
             let caller_tid = scheduler::current_tid();
+
+            // Who may put a capability into somebody else's CSpace.
+            //
+            // A grant can never *raise* the destination's authority — it only
+            // ever adds, and what it adds the granter already held. What it can
+            // do is fill sixteen slots, and a service that can no longer
+            // receive a capability can no longer be handed the display, a file,
+            // or an endpoint. Unrestricted, that is a denial of service any
+            // task can perform on any other.
+            //
+            // Two things really do this, and the rule is written from both:
+            //
+            // - A spawner granting to its child, which holds `TaskMgmt` over
+            //   it. `init`, `login`, the shell and the compositor all do this.
+            // - A server answering a request, which does not. The framebuffer
+            //   device mints a derived `PhysRange` and grants it into a
+            //   claimant it never spawned — while that claimant is blocked in
+            //   `sys_call` to it.
+            //
+            // So: authority over the destination, or the destination asked.
+            // Being blocked in a call *is* the asking, which is why this needs
+            // no new system call and no new state.
+            if !crate::cap::task_has_task_mgmt(caller_tid, dest_tid)
+                && !crate::ipc::is_calling(dest_tid, caller_tid)
+            {
+                return u64::MAX;
+            }
             unsafe {
                 let src_cap = match scheduler::get_task_mut(caller_tid) {
                     Some(t) => t.cspace[src_slot],

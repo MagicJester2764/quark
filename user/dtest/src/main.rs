@@ -669,6 +669,14 @@ fn test_across_address_spaces() {
         "and read what it wrote there",
         unsafe { core::ptr::read_volatile(THEIR_MEM as *const u64) } == WITNESS,
     );
+    // The child has no TaskMgmt over anybody and nobody is calling it, so the
+    // kernel must have refused to let it put a capability into this task's
+    // CSpace. Filling sixteen slots is a denial of service even though a grant
+    // can never raise the authority of the task it lands in.
+    check(
+        "a task cannot fill another's CSpace",
+        unsafe { core::ptr::read_volatile((THEIR_MEM + 128) as *const u64) } == 1,
+    );
 
     // A lock living in memory the two processes share. The child blocks on it
     // in its own address space and is woken from this one, which works only

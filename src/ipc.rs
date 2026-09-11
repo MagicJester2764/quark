@@ -54,6 +54,33 @@ pub enum IpcState {
     CallBlocked(usize),
 }
 
+/// Is `tid` blocked in a `sys_call` to `dest`?
+///
+/// Which is to say: has it asked `dest` for something? A capability granted in
+/// answer is not an imposition, and this is how the kernel tells the two apart
+/// without a system call whose only purpose is to say "I am expecting one" —
+/// which a task already blocked in a call could not make anyway.
+///
+/// Both call states count. `CallSendBlocked` is a call whose message the
+/// destination has not picked up yet, and the caller is no less committed for
+/// that; a server that replies out of its receive loop will see the state move
+/// to `CallBlocked` underneath it, and a rule that only accepted the second
+/// would depend on which side ran first.
+pub fn is_calling(tid: usize, dest: usize) -> bool {
+    if tid >= MAX_TASKS || dest >= MAX_TASKS {
+        return false;
+    }
+    let flags = irq_save();
+    let out = unsafe {
+        matches!(
+            TASK_IPC[tid].state,
+            IpcState::CallBlocked(d) | IpcState::CallSendBlocked(d) if d == dest
+        )
+    };
+    irq_restore(flags);
+    out
+}
+
 /// IPC state and pending message for each task.
 struct TaskIpc {
     state: IpcState,
