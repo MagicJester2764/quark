@@ -48,6 +48,9 @@ const TAG_SET_FOREGROUND: u64 = 2;
 
 // Keyboard registration
 const TAG_REGISTER_SIGINT: u64 = 4;
+/// The keyboard driver's own tags for the pointer half of its controller.
+const TAG_GET_MOUSE_NB: u64 = 6;
+const TAG_MOUSE_EVENT: u64 = 7;
 
 /// Take the keyboard: raw key events, no line discipline, until released.
 ///
@@ -64,6 +67,15 @@ const TAG_INPUT_POLL: u64 = 0x202;
 const TAG_INPUT_KEY: u64 = 0x203;
 /// Nothing typed.
 const TAG_INPUT_NONE: u64 = 0x204;
+/// Has the pointer moved? Answers [`TAG_INPUT_MOUSE`] or [`TAG_INPUT_NONE`].
+///
+/// Behind the same claim as the keys, because they are the same device as far
+/// as this system is concerned: whoever owns the screen owns the input, and a
+/// pointer delivered to somebody other than the holder of the display would be
+/// clicking on windows it cannot see.
+const TAG_INPUT_POLL_MOUSE: u64 = 0x205;
+/// `data[0] = dx`, `data[1] = dy` as signed values, `data[2] = buttons`.
+const TAG_INPUT_MOUSE: u64 = 0x206;
 
 const TAG_OK: u64 = 0;
 const TAG_ERROR: u64 = u64::MAX;
@@ -229,6 +241,24 @@ pub extern "C" fn _start() -> ! {
                             ],
                         },
                         None => Message { sender: 0, tag: TAG_INPUT_NONE, data: [0; 6] },
+                    }
+                };
+                let _ = syscall::sys_reply(sender, &reply);
+            }
+
+            TAG_INPUT_POLL_MOUSE => {
+                let reply = if raw_owner != sender {
+                    error()
+                } else {
+                    let ask = Message { sender: 0, tag: TAG_GET_MOUSE_NB, data: [0; 6] };
+                    let mut got = Message::empty();
+                    match syscall::sys_call(kbd_tid, &ask, &mut got) {
+                        Ok(()) if got.tag == TAG_MOUSE_EVENT => Message {
+                            sender: 0,
+                            tag: TAG_INPUT_MOUSE,
+                            data: got.data,
+                        },
+                        _ => Message { sender: 0, tag: TAG_INPUT_NONE, data: [0; 6] },
                     }
                 };
                 let _ = syscall::sys_reply(sender, &reply);

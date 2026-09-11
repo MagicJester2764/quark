@@ -10,6 +10,7 @@ quark_rt::manifest!([
     quark_rt::manifest::CapReq::priority(quark_rt::syscall::PRIO_DRIVER),
     quark_rt::manifest::CapReq::ioport(0x60, 0x64),
     quark_rt::manifest::CapReq::irq(1),
+    quark_rt::manifest::CapReq::irq(12),
 ]);
 
 // Keyboard IPC tags
@@ -29,6 +30,14 @@ const TAG_REGISTER_SIGINT: u64 = 4;
 /// default arm, so the failure is "no keys ever" rather than a caller that
 /// hangs on an unrecognised tag.
 const TAG_GET_KEY_NB: u64 = 5;
+/// Take a pointer movement if one is waiting, but do not wait for one.
+///
+/// `data[0] = dx`, `data[1] = dy` as signed values widened to u64, and
+/// `data[2] = buttons`, bit 0 left, bit 1 right, bit 2 middle. Answered with
+/// [`TAG_NO_KEY`] when there is nothing, so a caller that asks a driver
+/// predating the mouse gets "no movement ever" rather than hanging.
+const TAG_GET_MOUSE_NB: u64 = 6;
+const TAG_MOUSE_EVENT: u64 = 7;
 
 // Key event types
 const KEY_PRESS: u64 = 1;
@@ -48,6 +57,205 @@ struct KeyEvent {
     ascii: u8,
     scancode: u8,
     modifiers: u8,
+}
+
+/// The i8042's status port bits this driver acts on.
+///
+/// Bit 0 says a byte is waiting to be read. Bit 1 says the controller has not
+/// yet taken the last byte written to it. Bit 5 says the waiting byte came from
+/// the *auxiliary* device — the mouse — rather than the keyboard.
+///
+/// That last bit is why there is one driver here and not two. A PS/2 mouse is
+/// not a second device with a second port: it is the same controller answering
+/// on the same data port, and two tasks reading 0x60 would take each other's
+/// bytes. Which interrupt fired is not the answer either, because a byte for
+/// one device can be waiting when the other's interrupt arrives.
+const STATUS_OUTPUT_FULL: u64 = 1 << 0;
+const STATUS_INPUT_FULL: u64 = 1 << 1;
+const STATUS_FROM_MOUSE: u64 = 1 << 5;
+
+const PORT_DATA: u16 = 0x60;
+const PORT_STATUS: u16 = 0x64;
+const PORT_CMD: u16 = 0x64;
+
+/// Controller commands.
+const CMD_ENABLE_AUX: u8 = 0xA8;
+const CMD_READ_CONFIG: u8 = 0x20;
+const CMD_WRITE_CONFIG: u8 = 0x60;
+/// "The next byte written to the data port is for the mouse, not the keyboard."
+const CMD_TO_MOUSE: u8 = 0xD4;
+
+/// Mouse commands, and the byte it answers them with.
+const MOUSE_SET_DEFAULTS: u8 = 0xF6;
+const MOUSE_ENABLE_REPORTING: u8 = 0xF4;
+const MOUSE_ACK: u8 = 0xFA;
+
+/// Configuration byte bits: bit 1 lets the auxiliary device raise IRQ 12, and
+/// bit 5 *disables* its clock, so it has to be cleared.
+const CONFIG_AUX_IRQ: u8 = 1 << 1;
+const CONFIG_AUX_CLOCK_OFF: u8 = 1 << 5;
+
+/// One movement, as the compositor will want it.
+#[derive(Clone, Copy)]
+struct MouseEvent {
+    dx: i32,
+    dy: i32,
+    buttons: u8,
+}
+
+const MOUSE_BUF_SIZE: usize = 32;
+
+/// Movements waiting to be collected.
+///
+/// Coalescing would be wrong here even though it is tempting: a click at the
+/// end of a fast movement must not arrive at a position the pointer had already
+/// left, and only the consumer knows which movements it can afford to merge.
+struct MouseBuffer {
+    buf: [MouseEvent; MOUSE_BUF_SIZE],
+    head: usize,
+    tail: usize,
+}
+
+impl MouseBuffer {
+    const fn new() -> Self {
+        const EMPTY: MouseEvent = MouseEvent { dx: 0, dy: 0, buttons: 0 };
+        MouseBuffer { buf: [EMPTY; MOUSE_BUF_SIZE], head: 0, tail: 0 }
+    }
+
+    fn push(&mut self, ev: MouseEvent) {
+        let next = (self.head + 1) % MOUSE_BUF_SIZE;
+        if next != self.tail {
+            self.buf[self.head] = ev;
+            self.head = next;
+        }
+    }
+
+    fn pop(&mut self) -> Option<MouseEvent> {
+        if self.head == self.tail {
+            return None;
+        }
+        let ev = self.buf[self.tail];
+        self.tail = (self.tail + 1) % MOUSE_BUF_SIZE;
+        Some(ev)
+    }
+}
+
+/// Assembles the controller's three-byte packets.
+///
+/// Bit 3 of the first byte is always set, which is the only synchronisation
+/// signal there is: a stream that has lost its place is found by a first byte
+/// without it, and skipping that byte is how it is recovered.
+struct MouseDecoder {
+    bytes: [u8; 3],
+    have: usize,
+}
+
+impl MouseDecoder {
+    const fn new() -> Self {
+        MouseDecoder { bytes: [0; 3], have: 0 }
+    }
+
+    fn feed(&mut self, b: u8) -> Option<MouseEvent> {
+        if self.have == 0 && b & 0x08 == 0 {
+            return None; // out of step; this cannot be a first byte
+        }
+        self.bytes[self.have] = b;
+        self.have += 1;
+        if self.have < 3 {
+            return None;
+        }
+        self.have = 0;
+        let flags = self.bytes[0];
+        // Overflow means the controller gave up counting, and the magnitude it
+        // reports is meaningless. Dropping the movement is better than jumping
+        // the pointer across the screen; the buttons in it are still current
+        // and are reported with no movement.
+        let (dx, dy) = if flags & 0xC0 != 0 {
+            (0, 0)
+        } else {
+            (sign_extend(self.bytes[1], flags & 0x10 != 0),
+             sign_extend(self.bytes[2], flags & 0x20 != 0))
+        };
+        Some(MouseEvent {
+            dx,
+            // The mouse counts upwards and the screen counts downwards.
+            dy: -dy,
+            buttons: flags & 0x07,
+        })
+    }
+}
+
+/// A nine-bit signed quantity, split across a byte and a sign bit in the flags.
+fn sign_extend(value: u8, negative: bool) -> i32 {
+    if negative { value as i32 - 256 } else { value as i32 }
+}
+
+/// Wait for the controller to take what was last written to it.
+///
+/// Bounded: a controller that never clears the bit must not become a driver
+/// that never returns, and on a machine with no mouse that is exactly what
+/// would happen during start-up.
+fn wait_writable() -> bool {
+    for _ in 0..100_000 {
+        if syscall::sys_ioport_read(PORT_STATUS) & STATUS_INPUT_FULL == 0 {
+            return true;
+        }
+    }
+    false
+}
+
+fn wait_readable() -> bool {
+    for _ in 0..100_000 {
+        if syscall::sys_ioport_read(PORT_STATUS) & STATUS_OUTPUT_FULL != 0 {
+            return true;
+        }
+    }
+    false
+}
+
+fn command(byte: u8) {
+    if wait_writable() {
+        syscall::sys_ioport_write(PORT_CMD, byte);
+    }
+}
+
+/// Send a byte to the mouse and collect its acknowledgement.
+fn mouse_command(byte: u8) -> bool {
+    command(CMD_TO_MOUSE);
+    if !wait_writable() {
+        return false;
+    }
+    syscall::sys_ioport_write(PORT_DATA, byte);
+    if !wait_readable() {
+        return false;
+    }
+    syscall::sys_ioport_read(PORT_DATA) as u8 == MOUSE_ACK
+}
+
+/// Turn the auxiliary device on and ask it to report.
+///
+/// Returns whether there is a mouse. A machine without one is not an error —
+/// it is most machines this has ever run on — so the failure is quiet and the
+/// driver carries on being a keyboard.
+fn enable_mouse() -> bool {
+    command(CMD_ENABLE_AUX);
+
+    command(CMD_READ_CONFIG);
+    if !wait_readable() {
+        return false;
+    }
+    let mut config = syscall::sys_ioport_read(PORT_DATA) as u8;
+    config |= CONFIG_AUX_IRQ;
+    config &= !CONFIG_AUX_CLOCK_OFF;
+    command(CMD_WRITE_CONFIG);
+    if !wait_writable() {
+        return false;
+    }
+    syscall::sys_ioport_write(PORT_DATA, config);
+
+    // Defaults first, so that whatever the firmware left behind — a different
+    // sample rate, a different resolution — is not inherited.
+    mouse_command(MOUSE_SET_DEFAULTS) && mouse_command(MOUSE_ENABLE_REPORTING)
 }
 
 struct KeyBuffer {
@@ -138,6 +346,12 @@ pub extern "C" fn _start() -> ! {
         println!("[keyboard] Failed to register IRQ 1!");
         syscall::sys_exit();
     }
+    // And IRQ 12, the same controller's other device. Registered before the
+    // mouse is enabled, so that the first packet it sends has somewhere to go.
+    let mouse_irq = syscall::sys_irq_register(12).is_ok();
+    if !mouse_irq {
+        println!("[keyboard] No IRQ 12; the mouse will not be heard.");
+    }
 
     // Register with nameserver as "keyboard"
     if nameserver::register(b"keyboard").is_ok() {
@@ -151,6 +365,15 @@ pub extern "C" fn _start() -> ! {
     let mut extended = false;
     let mut waiting_client: Option<usize> = None;
     let mut sigint_tid: usize = 0;
+
+    let mut mousebuf = MouseBuffer::new();
+    let mut mouse = MouseDecoder::new();
+    let have_mouse = mouse_irq && enable_mouse();
+    if have_mouse {
+        println!("[keyboard] Mouse enabled on the auxiliary port.");
+    } else {
+        println!("[keyboard] No mouse; keys only.");
+    }
 
     loop {
         let mut msg = Message::empty();
@@ -175,17 +398,32 @@ pub extern "C" fn _start() -> ! {
             // one duplicated key per burst of typing: invisible in a shell
             // that echoes, and obvious to a Wayland client counting presses
             // against releases.
+            //
+            // Which device a byte came from is read from the status, not from
+            // which interrupt fired: a keyboard byte can be waiting when IRQ 12
+            // arrives, and feeding one to the packet decoder loses the mouse's
+            // place in its three-byte stream.
             let mut budget = 64;
-            while syscall::sys_ioport_read(0x64) & 1 != 0 {
-                let raw = syscall::sys_ioport_read(0x60) as u8;
-                handle_scancode(
-                    raw,
-                    &mut extended,
-                    &mut modifiers,
-                    &mut keybuf,
-                    sigint_tid,
-                    &mut waiting_client,
-                );
+            loop {
+                let status = syscall::sys_ioport_read(PORT_STATUS);
+                if status & STATUS_OUTPUT_FULL == 0 {
+                    break;
+                }
+                let raw = syscall::sys_ioport_read(PORT_DATA) as u8;
+                if status & STATUS_FROM_MOUSE != 0 {
+                    if let Some(ev) = mouse.feed(raw) {
+                        mousebuf.push(ev);
+                    }
+                } else {
+                    handle_scancode(
+                        raw,
+                        &mut extended,
+                        &mut modifiers,
+                        &mut keybuf,
+                        sigint_tid,
+                        &mut waiting_client,
+                    );
+                }
                 budget -= 1;
                 // The bound is in case a controller lies about bit 0, so a
                 // wedged keyboard cannot become a wedged system.
@@ -193,7 +431,12 @@ pub extern "C" fn _start() -> ! {
                     break;
                 }
             }
+            // Both lines, because one notification can carry bytes for either
+            // device and an unacknowledged line stops delivering for good.
             syscall::sys_irq_ack(1);
+            if have_mouse {
+                syscall::sys_irq_ack(12);
+            }
         } else {
             // Client IPC request
             match msg.tag {
@@ -209,6 +452,24 @@ pub extern "C" fn _start() -> ! {
                 TAG_GET_KEY_NB => {
                     let reply = match keybuf.pop() {
                         Some(ev) => make_key_reply(&ev),
+                        None => Message { sender: 0, tag: TAG_NO_KEY, data: [0; 6] },
+                    };
+                    let _ = syscall::sys_reply(msg.sender, &reply);
+                }
+                TAG_GET_MOUSE_NB => {
+                    let reply = match mousebuf.pop() {
+                        Some(ev) => Message {
+                            sender: 0,
+                            tag: TAG_MOUSE_EVENT,
+                            data: [
+                                ev.dx as i64 as u64,
+                                ev.dy as i64 as u64,
+                                ev.buttons as u64,
+                                0,
+                                0,
+                                0,
+                            ],
+                        },
                         None => Message { sender: 0, tag: TAG_NO_KEY, data: [0; 6] },
                     };
                     let _ = syscall::sys_reply(msg.sender, &reply);
