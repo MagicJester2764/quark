@@ -117,6 +117,25 @@ These were established deliberately. Breaking one silently re-opens a hole.
   child it returns; the idle loop reaps the rest. Anything that collects a
   child some other way must reap it too, or a parent running programs back to
   back — which never lets the machine idle — runs out of memory.
+- **Every task has its own floating-point state**, saved and restored on every
+  switch (`fpu.rs`). The kernel is soft-float and never touches the registers,
+  so this is the whole of it. FXSAVE is enough only while CR4.OSXSAVE is clear:
+  enabling AVX without moving to XSAVE hands one task another's YMM registers.
+- **The argument page carries the program's own header table** — its end
+  belongs to it however long the command line is (`spawn::PHDRS_AT`, mirrored
+  in `user/libc/include/quark/layout.h`). musl finds a static program's
+  thread-local template through it, and without it every thread-local lands
+  outside its block. So every spawner calls `set_args`, even with no
+  arguments; a program reading an argument page that was never mapped faults.
+- **A fault in ring 3 ends the task, never the machine.** The task exits with
+  the negated Linux signal number (`idt.rs`), and only a fault taken in ring 0
+  halts. musl's `abort()` is a privileged `hlt`, so before this, one failed
+  assert stopped everything.
+- **C objects must put constructors in `.init_array`.** The cross compiler is
+  configured `--enable-initfini-array`, and the user link script places the
+  arrays and refuses `.ctors` outright: nothing here links the crtbegin that
+  would run them, so an object carrying them has constructors that silently
+  never run.
 - **Capabilities are the authority.** There is no UID 0 bypass; `uid == 0` no
   longer short-circuits `cap::task_has_*`. A service that cannot do something
   is missing a capability, not a privilege level.
