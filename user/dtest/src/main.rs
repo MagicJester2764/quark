@@ -791,6 +791,136 @@ fn test_sync() {
     check("and there is not a second one", !SEM.try_acquire());
 }
 
+// --- floating-point state across a context switch ---
+
+/// The go-ahead for the worker, and its report that it ran.
+static FPU_GO: sync::Semaphore = sync::Semaphore::new(0);
+static FPU_RAN: sync::Semaphore = sync::Semaphore::new(0);
+
+/// A different value in each of the sixteen SSE registers, derived from a seed
+/// so that two tasks' patterns can never agree by accident.
+fn fpu_pattern(seed: u64, reg: u64) -> u64 {
+    seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ (reg << 56) ^ reg
+}
+
+/// Load every SSE register and MXCSR with this task's pattern.
+///
+/// Assembly because this program, like everything built for
+/// x86_64-unknown-none, is compiled soft-float: no Rust statement here touches
+/// an SSE register, which is exactly what makes the test deterministic. The only
+/// SSE state in the system is what this function and its twin in the worker put
+/// there — so if one task sees the other's, the kernel handed it over.
+unsafe fn fpu_load(seed: u64, mxcsr: u32) {
+    let mut vals = [0u64; 16];
+    for (i, v) in vals.iter_mut().enumerate() {
+        *v = fpu_pattern(seed, i as u64);
+    }
+    let m = mxcsr;
+    unsafe {
+        core::arch::asm!(
+            "movq xmm0,  [{v} + 0*8]",
+            "movq xmm1,  [{v} + 1*8]",
+            "movq xmm2,  [{v} + 2*8]",
+            "movq xmm3,  [{v} + 3*8]",
+            "movq xmm4,  [{v} + 4*8]",
+            "movq xmm5,  [{v} + 5*8]",
+            "movq xmm6,  [{v} + 6*8]",
+            "movq xmm7,  [{v} + 7*8]",
+            "movq xmm8,  [{v} + 8*8]",
+            "movq xmm9,  [{v} + 9*8]",
+            "movq xmm10, [{v} + 10*8]",
+            "movq xmm11, [{v} + 11*8]",
+            "movq xmm12, [{v} + 12*8]",
+            "movq xmm13, [{v} + 13*8]",
+            "movq xmm14, [{v} + 14*8]",
+            "movq xmm15, [{v} + 15*8]",
+            "ldmxcsr [{m}]",
+            v = in(reg) vals.as_ptr(),
+            m = in(reg) &m as *const u32,
+            options(nostack, preserves_flags),
+        );
+    }
+}
+
+/// Read every SSE register and MXCSR back.
+unsafe fn fpu_read() -> ([u64; 16], u32) {
+    let mut vals = [0u64; 16];
+    let mut m: u32 = 0;
+    unsafe {
+        core::arch::asm!(
+            "movq [{v} + 0*8],  xmm0",
+            "movq [{v} + 1*8],  xmm1",
+            "movq [{v} + 2*8],  xmm2",
+            "movq [{v} + 3*8],  xmm3",
+            "movq [{v} + 4*8],  xmm4",
+            "movq [{v} + 5*8],  xmm5",
+            "movq [{v} + 6*8],  xmm6",
+            "movq [{v} + 7*8],  xmm7",
+            "movq [{v} + 8*8],  xmm8",
+            "movq [{v} + 9*8],  xmm9",
+            "movq [{v} + 10*8], xmm10",
+            "movq [{v} + 11*8], xmm11",
+            "movq [{v} + 12*8], xmm12",
+            "movq [{v} + 13*8], xmm13",
+            "movq [{v} + 14*8], xmm14",
+            "movq [{v} + 15*8], xmm15",
+            "stmxcsr [{m}]",
+            v = in(reg) vals.as_mut_ptr(),
+            m = in(reg) &mut m as *mut u32,
+            options(nostack, preserves_flags),
+        );
+    }
+    (vals, m)
+}
+
+/// Round toward zero, all exceptions masked — distinct from the default
+/// (round to nearest) so that a lost MXCSR is visible too.
+const FPU_MXCSR_MAIN: u32 = 0x7F80;
+/// Round down, all exceptions masked.
+const FPU_MXCSR_WORKER: u32 = 0x3F80;
+
+extern "C" fn fpu_worker() -> ! {
+    FPU_GO.acquire();
+    // The main task's pattern is loaded by now and it is asleep. Overwrite
+    // every register with a different one; without a per-task save area, this
+    // is what the main task will find when it wakes.
+    unsafe { fpu_load(0xB0B, FPU_MXCSR_WORKER) };
+    FPU_RAN.release();
+    syscall::sys_exit_code(0);
+}
+
+fn test_fpu() {
+    println!("floating-point state:");
+    // A new task starts from a clean state rather than whatever the last task
+    // left: MXCSR is the power-on default. Anything else is one task reading
+    // another's.
+    let (_, fresh) = unsafe { fpu_read() };
+    check("a task starts with the default MXCSR", fresh & 0xFFC0 == 0x1F80);
+
+    let Ok(_t) = thread::spawn_with_stack(fpu_worker, 8) else {
+        check("start a task to share the SSE registers with", false);
+        return;
+    };
+    unsafe { fpu_load(0xA11CE, FPU_MXCSR_MAIN) };
+    FPU_GO.release();
+    // Blocks, so the worker runs and loads its own pattern.
+    FPU_RAN.acquire();
+    let (vals, m) = unsafe { fpu_read() };
+
+    let mut intact = true;
+    for (i, v) in vals.iter().enumerate() {
+        if *v != fpu_pattern(0xA11CE, i as u64) {
+            intact = false;
+        }
+    }
+    check("every SSE register survives another task using them", intact);
+    check("and so does MXCSR", m == FPU_MXCSR_MAIN);
+    check(
+        "none of them is the other task's",
+        vals[0] != fpu_pattern(0xB0B, 0),
+    );
+}
+
 fn test_wire() {
     println!("wayland wire format:");
     // wl_display.get_registry as libwayland actually sent it down a Quark
@@ -848,6 +978,7 @@ pub extern "C" fn _start() -> ! {
     test_environment();
     test_across_address_spaces();
     test_sync();
+    test_fpu();
     test_wire();
 
     unsafe {

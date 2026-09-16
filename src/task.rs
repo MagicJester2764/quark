@@ -125,6 +125,9 @@ pub struct Task {
     pub uid: u32,
     /// Group ID. 0 = root.
     pub gid: u32,
+    /// This task's floating-point and SSE registers while it is not running.
+    /// See `fpu.rs` for why this exists and why it is only as wide as FXSAVE.
+    pub fpu: crate::fpu::FpuState,
 }
 
 unsafe impl Send for Task {}
@@ -190,6 +193,7 @@ impl Task {
             clear_child_tid: 0,
             uid: 0,
             gid: 0,
+            fpu: crate::fpu::clean(),
         }
     }
 

@@ -104,6 +104,7 @@ pub fn init() {
             clear_child_tid: 0,
             uid: 0,
             gid: 0,
+            fpu: crate::fpu::clean(),
         });
     }
     CURRENT_TID.store(0, Ordering::SeqCst);
@@ -360,6 +361,15 @@ unsafe fn switch_to(current_tid: usize, next_tid: usize, flags: u64) { unsafe {
     // the outgoing value first would need per-CPU state for no measurable gain
     // at this scheduler's switch rate.
     crate::cpu::set_fs_base(new_task.fs_base);
+
+    // The floating-point and SSE registers, which are nobody's until this says
+    // whose. Saved from the outgoing task and loaded for the incoming one
+    // *before* the switch rather than after it: the kernel is soft-float and
+    // never touches them, so loading early is safe, and it means a task that
+    // has never run starts from its own clean state without its entry
+    // trampoline having to know anything about this.
+    crate::fpu::save(&raw mut TASKS[current_tid].as_mut().unwrap().fpu);
+    crate::fpu::restore(&raw const TASKS[next_tid].as_ref().unwrap().fpu);
 
     // Get raw pointers to contexts
     let old_ctx = &raw mut TASKS[current_tid].as_mut().unwrap().context;
@@ -1048,6 +1058,11 @@ pub fn create_empty_task() -> Option<usize> {
             clear_child_tid: 0,
             uid: parent_uid,
             gid: parent_gid,
+            // Clean, not the parent's. A new task inheriting whatever the
+            // registers held when it was created would be reading its
+            // creator's data, and a thread has no more right to that than a
+            // stranger: it can already read the memory, but not the moment.
+            fpu: crate::fpu::clean(),
         });
     }
     irq_restore(flags);

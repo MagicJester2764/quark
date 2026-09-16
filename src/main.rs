@@ -9,6 +9,7 @@ mod console;
 mod cpu;
 mod context;
 mod fat32;
+mod fpu;
 mod heap;
 mod idt;
 mod io;
@@ -59,6 +60,9 @@ pub extern "C" fn kernel_main(multiboot_info: usize) -> ! {
     console::clear();
     unsafe { heap::init() };
     console::puts(b"Heap initialized.\n");
+    // Before any task exists: the clean state every task is created with is
+    // captured here, and the first task is entered without a switch to load it.
+    fpu::init();
     unsafe { idt::init() };
 
     // SMEP/SMAP: block ring 0 from executing or casually touching user pages.
