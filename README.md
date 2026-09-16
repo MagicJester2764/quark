@@ -34,13 +34,13 @@ User space provides:
 - **Init** (`user/init`) — Two-phase ELF loader: essential services from boot image, remaining programs from disk via GPT/FAT32. Passes program arguments, wires fds, grants capabilities, enforces sequential startup. Launches login (or shell as fallback).
 - **Login** (`user/login`) — multi-user login program: prompts for username, reads `/etc/PASSWD`, sets UID/GID, spawns shell with user's home directory
 - **Nameserver** (`user/nameserver`) — service discovery via name registration/lookup
-- **Console server** (`user/console`) — framebuffer text rendering via font8x16 with ANSI escape sequence support (cursor movement, colors, clear screen), blinking underline cursor, pipe-based I/O transport
+- **Text console** (`user/qtty`) — framebuffer text rendering via font8x16 with ANSI escape sequence support (cursor movement, colors, clear screen), blinking underline cursor, pipe-based I/O transport
 - **Keyboard driver** (`user/keyboard`) — PS/2 scancode translation, IRQ 1 handling
 - **Input server** (`user/input`) — line discipline (echo, backspace, newline) wrapping the keyboard driver
 - **Disk driver** (`user/disk`) — ATA PIO disk driver (read + write), multi-sector reads, registers as "disk" with nameserver
 - **VFS** (`user/vfs`) — FAT32 filesystem service: read, write, create files/directories over IPC. Sector cache, trailing-slash validation. Registers as "vfs" with nameserver.
 - **Net** (`user/net`) — RTL8139 NIC driver with PCI enumeration, DMA ring buffers, Ethernet/ARP/IPv4/ICMP/UDP. Registers as "net" with nameserver. Client API in `libquark::net`.
-- **Shell** (`user/shell`) — interactive command interpreter with cwd tracking, `cd`/`pwd`/`kill` builtins, `~` home directory display in prompt, `.`/`..` path resolution, loads ELFs from `/usr/bin/` via VFS, spawns tasks with pipe-based fd wiring
+- **Shell** (`user/qsh`) — interactive command interpreter with cwd tracking, `cd`/`pwd`/`kill` builtins, `~` home directory display in prompt, `.`/`..` path resolution, loads ELFs from `/usr/bin/` via VFS, spawns tasks with pipe-based fd wiring
 - **Echo** (`user/echo`) — prints arguments to stdout
 - **Ls** (`user/ls`) — lists directory contents or file info via VFS (defaults to cwd)
 - **Cat** (`user/cat`) — reads and prints files via VFS
@@ -68,7 +68,7 @@ User space provides:
 6. **Phase 2** — Init starts VFS and loads the login program:
    - Starts VFS (loaded in Phase 1), waits for it to register with nameserver
    - VFS discovers disk service and serves the FAT32 rootfs
-   - Init loads LOGIN.ELF from `/usr/bin/` via VFS (falls back to SHELL.ELF)
+   - Init loads LOGIN.ELF from `/usr/bin/` via VFS (falls back to QSH.ELF)
    - Grants capabilities, wires fds, starts the login/shell task
 7. The kernel enters an idle HLT loop
 

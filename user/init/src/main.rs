@@ -335,7 +335,7 @@ fn fat_name_to_buf(name: &[u8; 11], buf: &mut [u8; 16]) -> usize {
 fn is_essential_elf(name: &[u8; 11]) -> bool {
     if &name[8..11] != b"ELF" { return false; }
     let base = &name[0..8];
-    base == b"NAMESRVR" || base == b"CONSOLE " || base == b"KEYBOARD"
+    base == b"NAMESRVR" || base == b"QTTY    " || base == b"KEYBOARD"
         || base == b"DISK    " || base == b"INPUT   " || base == b"VFS     "
         || base == b"NET     "
 }
@@ -540,11 +540,11 @@ fn load_essentials_from_boot_image(rootfs_phys: usize, rootfs_size: usize) -> Bo
         }
     }
 
-    // Pass 2: spawn CONSOLE.ELF
+    // Pass 2: spawn QTTY.ELF, the text console
     let mut console_pipe: usize = 0;
     for i in 0..count {
         let e = &entries[i];
-        if &e.name[0..8] == b"CONSOLE " && &e.name[8..11] == b"ELF" {
+        if &e.name[0..8] == b"QTTY    " && &e.name[8..11] == b"ELF" {
             if let Ok(data) = read_file_to_buffer(rootfs, &bpb, e.first_cluster, e.file_size) {
                 match spawn::load(data, &SPAWN_SCRATCH) {
                     Ok(info) => {
@@ -554,7 +554,7 @@ fn load_essentials_from_boot_image(rootfs_phys: usize, rootfs_size: usize) -> Bo
                         grant_caps_from_manifest(data, info.tid);
                         add_service(info.tid);
                         grant_endpoints(info.tid, syscall::SLOT_ENDPOINT);
-                        let _ = spawn::set_args(&info, &[b"console"], &SPAWN_SCRATCH);
+                        let _ = spawn::set_args(&info, &[b"qtty"], &SPAWN_SCRATCH);
                         // Create console pipe and set fds BEFORE starting console
                         // to avoid race where console reaches main loop before fd 0 is set
                         if let Ok(pipe) = syscall::sys_pipe_create() {
@@ -591,7 +591,7 @@ fn load_essentials_from_boot_image(rootfs_phys: usize, rootfs_size: usize) -> Bo
         let e = &entries[i];
 
         // Skip already-spawned
-        if &e.name[0..8] == b"NAMESRVR" || (&e.name[0..8] == b"CONSOLE " && &e.name[8..11] == b"ELF") {
+        if &e.name[0..8] == b"NAMESRVR" || (&e.name[0..8] == b"QTTY    " && &e.name[8..11] == b"ELF") {
             continue;
         }
         // Skip INPUT (deferred to after keyboard) and VFS (deferred to after phase 2)
@@ -746,7 +746,7 @@ fn load_from_vfs(vfs_tid: usize, console_pipe: usize, input_tid: usize) -> Defer
         }
     };
 
-    // Find LOGIN.ELF (or SHELL.ELF as fallback) in /usr/bin
+    // Find LOGIN.ELF (or QSH.ELF as fallback) in /usr/bin
     let mut login_entry: Option<vfs::DirEntry> = None;
     let mut shell_entry: Option<vfs::DirEntry> = None;
     let mut index = 0u32;
@@ -758,7 +758,7 @@ fn load_from_vfs(vfs_tid: usize, console_pipe: usize, input_tid: usize) -> Defer
                     login_entry = Some(entry);
                     break;
                 }
-                if !entry.is_dir && name_matches_entry(&entry, b"SHELL", b"ELF") {
+                if !entry.is_dir && name_matches_entry(&entry, b"QSH", b"ELF") {
                     shell_entry = Some(entry);
                 }
                 index += 1;
@@ -784,7 +784,7 @@ fn load_from_vfs(vfs_tid: usize, console_pipe: usize, input_tid: usize) -> Defer
     namebuf[..namelen].copy_from_slice(name_bytes);
     let loading_name = if login_entry.is_some() { "login" } else { "shell" };
 
-    // Build path: "/usr/bin/SHELL.ELF" or "/usr/bin/LOGIN.ELF"
+    // Build path: "/usr/bin/QSH.ELF" or "/usr/bin/LOGIN.ELF"
     let mut path = [0u8; 48];
     let prefix = b"/usr/bin/";
     path[..prefix.len()].copy_from_slice(prefix);

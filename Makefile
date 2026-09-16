@@ -36,12 +36,12 @@ NS_ELF := $(NS_DIR)/target/$(TARGET)/release/nameserver
 KBD_DIR := user/keyboard
 KBD_ELF := $(KBD_DIR)/target/$(TARGET)/release/keyboard
 
-CON_DIR := user/console
+QTTY_DIR := user/qtty
 FB_DIR := user/fb
 WM_DIR := user/wm
 WMDEMO_DIR := user/wmdemo
 WMTYPE_DIR := user/wmtype
-CON_ELF := $(CON_DIR)/target/$(TARGET)/release/console
+QTTY_ELF := $(QTTY_DIR)/target/$(TARGET)/release/qtty
 FB_ELF := $(FB_DIR)/target/$(TARGET)/release/fb
 WM_ELF := $(WM_DIR)/target/$(TARGET)/release/wm
 WMDEMO_ELF := $(WMDEMO_DIR)/target/$(TARGET)/release/wmdemo
@@ -62,8 +62,8 @@ VFS_ELF := $(VFS_DIR)/target/$(TARGET)/release/vfs
 NET_DIR := user/net
 NET_ELF := $(NET_DIR)/target/$(TARGET)/release/net
 
-SHELL_DIR := user/shell
-SHELL_ELF := $(SHELL_DIR)/target/$(TARGET)/release/shell
+QSH_DIR := user/qsh
+QSH_ELF := $(QSH_DIR)/target/$(TARGET)/release/qsh
 
 ECHO_DIR := user/echo
 ECHO_ELF := $(ECHO_DIR)/target/$(TARGET)/release/echo
@@ -148,7 +148,7 @@ $(FAT32_DRV_BIN): FORCE
 	cd $(FAT32_DRV_DIR) && cargo build --release
 	objcopy -O binary $(FAT32_DRV_ELF) $(FAT32_DRV_BIN)
 
-user: $(INIT_ELF) $(HOSTED_ELFS) $(NS_ELF) $(KBD_ELF) $(CON_ELF) $(FB_ELF) $(WM_ELF) $(INP_ELF) $(DISK_ELF) $(DISKTEST_ELF) $(VFS_ELF) $(NET_ELF) $(SHELL_ELF) $(ECHO_ELF) $(LS_ELF) $(CAT_ELF) $(LOGIN_ELF) $(PS_ELF) $(IPCPING_ELF) $(PING_ELF) $(SHUTDOWN_ELF) $(CAPDEMO_ELF) $(THREADTEST_ELF) $(SOCKTEST_ELF) $(FSTEST_ELF) $(WMDEMO_ELF) $(WMTYPE_ELF) $(CWC_ELF) $(DTEST_ELF) $(DCHILD_ELF) $(MOUSETEST_ELF) $(ENVTEST_ELF)
+user: $(INIT_ELF) $(HOSTED_ELFS) $(NS_ELF) $(KBD_ELF) $(QTTY_ELF) $(FB_ELF) $(WM_ELF) $(INP_ELF) $(DISK_ELF) $(DISKTEST_ELF) $(VFS_ELF) $(NET_ELF) $(QSH_ELF) $(ECHO_ELF) $(LS_ELF) $(CAT_ELF) $(LOGIN_ELF) $(PS_ELF) $(IPCPING_ELF) $(PING_ELF) $(SHUTDOWN_ELF) $(CAPDEMO_ELF) $(THREADTEST_ELF) $(SOCKTEST_ELF) $(FSTEST_ELF) $(WMDEMO_ELF) $(WMTYPE_ELF) $(CWC_ELF) $(DTEST_ELF) $(DCHILD_ELF) $(MOUSETEST_ELF) $(ENVTEST_ELF)
 
 $(INIT_ELF): FORCE
 	cd $(INIT_DIR) && cargo build --release
@@ -205,8 +205,8 @@ $(NS_ELF): FORCE
 $(KBD_ELF): FORCE
 	cd $(KBD_DIR) && cargo build --release
 
-$(CON_ELF): FORCE
-	cd $(CON_DIR) && cargo build --release
+$(QTTY_ELF): FORCE
+	cd $(QTTY_DIR) && cargo build --release
 
 $(FB_ELF): FORCE
 	cd $(FB_DIR) && cargo build --release
@@ -235,8 +235,8 @@ $(VFS_ELF): FORCE
 $(NET_ELF): FORCE
 	cd $(NET_DIR) && cargo build --release
 
-$(SHELL_ELF): FORCE
-	cd $(SHELL_DIR) && cargo build --release
+$(QSH_ELF): FORCE
+	cd $(QSH_DIR) && cargo build --release
 
 $(ECHO_ELF): FORCE
 	cd $(ECHO_DIR) && cargo build --release
@@ -291,7 +291,7 @@ $(SHUTDOWN_ELF): FORCE
 
 rootfs:
 	@mkdir -p rootfs/etc
-	@echo 'root:0:0:/home/root:/usr/bin/SHELL.ELF' > rootfs/etc/passwd
+	@echo 'root:0:0:/home/root:/usr/bin/QSH.ELF' > rootfs/etc/passwd
 
 iso: $(KERNEL)
 	@mkdir -p isodir/boot/grub
@@ -322,9 +322,9 @@ run-uefi: iso
 #   $(DESTDIR)/etc/
 DESTDIR ?= dist
 
-BOOT_SERVICES := nameserver:NAMESRVR keyboard:KEYBOARD console:CONSOLE \
+BOOT_SERVICES := nameserver:NAMESRVR keyboard:KEYBOARD qtty:QTTY \
                  input:INPUT disk:DISK vfs:VFS net:NET fb:FB
-USR_PROGRAMS  := disktest:DISKTEST shell:SHELL echo:ECHO ls:LS cat:CAT \
+USR_PROGRAMS  := disktest:DISKTEST qsh:QSH echo:ECHO ls:LS cat:CAT \
                  login:LOGIN ps:PS ipcping:IPCPING ping:PING \
                  shutdown:SHUTDOWN dtest:DTEST dchild:DCHILD capdemo:CAPDEMO threadtest:THREADTEST socktest:SOCKTEST fstest:FSTEST wm:WM wmdemo:WMDEMO wmtype:WMTYPE mousetest:MOUSETEST
 
@@ -333,6 +333,12 @@ C_PROGRAMS    := cwc:CWC envtest:ENVTEST
 
 install: all
 	@mkdir -p $(DESTDIR)/drivers $(DESTDIR)/boot $(DESTDIR)/usr/bin $(DESTDIR)/etc
+	@# Take back what a previous install put there, so that a program renamed
+	@# or removed here does not linger in a staging directory for ever. Only
+	@# `.ELF` is cleared, which is exactly the set this target owns: coreutils
+	@# and the Wayland clients are staged by ExplOSion afterwards, under their
+	@# own names, and must survive this.
+	@rm -f $(DESTDIR)/boot/*.ELF $(DESTDIR)/usr/bin/*.ELF
 	@cp $(KERNEL) $(DESTDIR)/kernel.bin
 	@cp $(VGA_DRV_BIN) $(FAT32_DRV_BIN) $(DESTDIR)/drivers/
 	@cp $(INIT_ELF) $(DESTDIR)/drivers/init.elf
@@ -371,13 +377,13 @@ clean:
 	cd $(INIT_DIR) && cargo clean
 	cd $(NS_DIR) && cargo clean
 	cd $(KBD_DIR) && cargo clean
-	cd $(CON_DIR) && cargo clean
+	cd $(QTTY_DIR) && cargo clean
 	cd $(INP_DIR) && cargo clean
 	cd $(DISK_DIR) && cargo clean
 	cd $(DISKTEST_DIR) && cargo clean
 	cd $(VFS_DIR) && cargo clean
 	cd $(NET_DIR) && cargo clean
-	cd $(SHELL_DIR) && cargo clean
+	cd $(QSH_DIR) && cargo clean
 	cd $(ECHO_DIR) && cargo clean
 	cd $(LS_DIR) && cargo clean
 	cd $(CAT_DIR) && cargo clean
