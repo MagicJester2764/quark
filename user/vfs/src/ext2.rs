@@ -26,6 +26,7 @@ pub const EXT2_ROOT_INO: u32 = 2;
 pub const S_IFMT: u16 = 0xF000;
 pub const S_IFDIR: u16 = 0x4000;
 pub const S_IFREG: u16 = 0x8000;
+pub const S_IFLNK: u16 = 0xA000;
 
 // Directory entry file types
 pub const FT_REG_FILE: u8 = 1;
@@ -254,6 +255,8 @@ pub struct Ext2State {
     pub total_inodes: u32,
     pub free_blocks_count: u32,
     pub free_inodes_count: u32,
+    /// Blocks only the superuser may take, of the free ones.
+    pub reserved_blocks: u32,
     /// Size of one block group descriptor: 32, or 64 with `INCOMPAT_64BIT`.
     pub desc_size: usize,
     pub feature_compat: u32,
@@ -296,6 +299,7 @@ impl Ext2State {
             total_inodes: 0,
             free_blocks_count: 0,
             free_inodes_count: 0,
+            reserved_blocks: 0,
             desc_size: 32,
             feature_compat: 0,
             feature_incompat: 0,
@@ -505,6 +509,7 @@ pub fn init_ext2(ext2: &mut Ext2State, disk_tid: usize, part_lba: u32) -> Result
 
     let s_inodes_count = read_u32(&sb_buf, 0);
     let s_blocks_count = read_u32(&sb_buf, 4);
+    let s_r_blocks_count = read_u32(&sb_buf, 8);
     let s_free_blocks_count = read_u32(&sb_buf, 12);
     let s_free_inodes_count = read_u32(&sb_buf, 16);
     let s_first_data_block = read_u32(&sb_buf, 20);
@@ -586,6 +591,7 @@ pub fn init_ext2(ext2: &mut Ext2State, disk_tid: usize, part_lba: u32) -> Result
     ext2.total_inodes = s_inodes_count;
     ext2.free_blocks_count = s_free_blocks_count;
     ext2.free_inodes_count = s_free_inodes_count;
+    ext2.reserved_blocks = s_r_blocks_count;
     ext2.desc_size = desc_size;
     ext2.feature_compat = feature_compat;
     ext2.feature_incompat = feature_incompat;

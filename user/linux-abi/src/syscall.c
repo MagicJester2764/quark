@@ -99,6 +99,11 @@ typedef unsigned long size_t;
 #define LX_linkat          265
 #define LX_renameat2       316
 #define LX_AT_REMOVEDIR  0x200
+#define LX_getdents64      217
+#define LX_readlink         89
+#define LX_readlinkat      267
+#define LX_statfs          137
+#define LX_fstatfs         138
 
 #define LX_CLOCK_REALTIME        0
 #define LX_CLOCK_REALTIME_COARSE 5
@@ -255,6 +260,51 @@ long __quark_set_fs(unsigned long tp) {
     if (__syscall1(SYS_SET_FS_BASE, tp) == QUARK_ERR) {
         return -LX_EINVAL;
     }
+    return 0;
+}
+
+/* uname: six fields of 65 bytes. The release is the kernel's ABI version,
+   which is the thing a program built for Quark would want to compare. */
+static void put_field(char *field, const char *text) {
+    int i = 0;
+    for (; text[i] && i < 64; i++) {
+        field[i] = text[i];
+    }
+    for (; i < 65; i++) {
+        field[i] = 0;
+    }
+}
+
+static long do_uname(char *u) {
+    if (!u) {
+        return -LX_EFAULT;
+    }
+    unsigned long v = __syscall0(SYS_ABI_VERSION);
+    char release[16];
+    int n = 0;
+    unsigned long parts[2] = { v >> 16, v & 0xffff };
+    for (int p = 0; p < 2; p++) {
+        char digits[8];
+        int d = 0;
+        unsigned long x = parts[p];
+        do {
+            digits[d++] = (char)('0' + x % 10);
+            x /= 10;
+        } while (x && d < 7);
+        while (d) {
+            release[n++] = digits[--d];
+        }
+        if (p == 0) {
+            release[n++] = '.';
+        }
+    }
+    release[n] = 0;
+    put_field(u, "Quark");
+    put_field(u + 65, "quark");
+    put_field(u + 130, release);
+    put_field(u + 195, "Quark microkernel");
+    put_field(u + 260, "x86_64");
+    put_field(u + 325, "(none)");
     return 0;
 }
 
@@ -436,9 +486,36 @@ long __quark_syscall(long n, long a1, long a2, long a3, long a4, long a5, long a
     case LX_rseq:
     case LX_prlimit64:
     case LX_getrandom:
-    case LX_uname:
-    case LX_getcwd:
         return -LX_ENOSYS;
+
+    case LX_uname:
+        return do_uname((char *)a1);
+
+    /* Relative paths resolve from the root here, so that is the working
+       directory, and saying so is what lets realpath work. */
+    case LX_getcwd: {
+        char *buf = (char *)a1;
+        if (!buf || (unsigned long)a2 < 2) {
+            return -LX_ERANGE;
+        }
+        buf[0] = '/';
+        buf[1] = 0;
+        return 2;
+    }
+
+    case LX_getdents64:
+        return __quark_getdents(a1, (void *)a2, (unsigned long)a3);
+    case LX_readlink:
+        return __quark_readlink((const char *)a1, (char *)a2, (unsigned long)a3);
+    case LX_readlinkat:
+        if (a1 != LX_AT_FDCWD) {
+            return -LX_ENOSYS;
+        }
+        return __quark_readlink((const char *)a2, (char *)a3, (unsigned long)a4);
+    case LX_statfs:
+        return __quark_statfs((const char *)a1, (void *)a2);
+    case LX_fstatfs:
+        return __quark_fstatfs(a1, (void *)a2);
 
     /* Files. The VFS answers all of these; `files.c` is where a handle and an
        offset become a descriptor. */

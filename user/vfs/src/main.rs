@@ -1359,7 +1359,6 @@ pub extern "C" fn _start() -> ! {
             TAG_OPEN => handle_open(&disk, sender, &msg),
             TAG_READ => handle_read(&disk, sender, &msg),
             TAG_CLOSE => handle_close(sender, &msg),
-            TAG_READDIR => handle_readdir(&disk, sender, &msg),
             TAG_STAT => handle_stat(sender, &msg),
             TAG_WRITE => transacted(|| handle_write(&disk, sender, &msg)),
             TAG_MKDIR => transacted(|| handle_mkdir(&disk, sender, &msg)),
@@ -1367,6 +1366,7 @@ pub extern "C" fn _start() -> ! {
                 transacted(|| handle_namespace(sender, &msg))
             }
             TAG_TRUNCATE => transacted(|| handle_truncate(sender, &msg)),
+            TAG_STATFS => handle_statfs(sender),
             // From the kernel, which is not waiting for an answer.
             quark_rt::ipc::TAG_TASK_DIED => client_died(msg.data[0] as usize),
             TAG_READDIR_BULK => handle_readdir_bulk(&disk, sender, &msg),
@@ -1690,59 +1690,6 @@ fn handle_truncate(sender: usize, msg: &Message) {
         Err(code) => error_reply(sender, code),
     }
 }
-/// TAG_READDIR: data[0]=handle (must be a directory), data[1]=entry_index
-/// Reply: tag=TAG_OK, data[0..1]=name (11 bytes), data[2]=size, data[3]=flags, data[4]=cluster
-///    OR: tag=TAG_ERROR with ERR_NOT_FOUND when no more entries
-fn handle_readdir(disk: &DiskState, sender: usize, msg: &Message) {
-    if unsafe { FS_TYPE } == FsType::Ext2 {
-        handle_readdir_ext2(sender, msg);
-        return;
-    }
-
-    let handle = msg.data[0] as usize;
-    let index = msg.data[1] as u32;
-
-    let dir_cluster = match get_handle(handle, sender) {
-        Some(file) => {
-            if !file.is_dir {
-                error_reply(sender, ERR_NOT_DIR);
-                return;
-            }
-            match &file.fs {
-                FsFileData::Fat32 { first_cluster, .. } => *first_cluster,
-                _ => { error_reply(sender, ERR_IO); return; }
-            }
-        }
-        None => {
-            error_reply(sender, ERR_INVALID_HANDLE);
-            return;
-        }
-    };
-
-    match read_dir_entry(disk, dir_cluster, index) {
-        Ok(Some((_cluster, name, size, is_dir, attr))) => {
-            // Pack 11-byte FAT name into 4 u64 words (32 bytes, padded with zeros)
-            let mut name_bytes = [0u8; 32];
-            name_bytes[..11].copy_from_slice(&name);
-            let w0 = u64::from_le_bytes(name_bytes[0..8].try_into().unwrap());
-            let w1 = u64::from_le_bytes(name_bytes[8..16].try_into().unwrap());
-            let w2 = u64::from_le_bytes(name_bytes[16..24].try_into().unwrap());
-            let w3 = u64::from_le_bytes(name_bytes[24..32].try_into().unwrap());
-
-            // data[4]: name_len(8) | attr(8) | ...
-            let packed = 11u64 | ((attr as u64) << 8);
-
-            let reply = Message {
-                sender: 0,
-                tag: TAG_OK,
-                data: [w0, w1, w2, w3, packed, size as u64],
-            };
-            let _ = syscall::sys_reply(sender, &reply);
-        }
-        Ok(None) => error_reply(sender, ERR_NOT_FOUND),
-        Err(code) => error_reply(sender, code),
-    }
-}
 
 /// TAG_STAT: data[0]=handle, with an 88-byte buffer lent for writing.
 /// Reply: tag=TAG_OK, data[0]=88, the record in the buffer.
@@ -1838,53 +1785,48 @@ fn handle_write(disk: &DiskState, sender: usize, msg: &Message) {
 }
 
 
-/// TAG_READDIR_BULK: data[0]=handle, with a page lent for writing.
-/// The page is filled with packed 64-byte entries and the reply carries the
-/// count. Entry format: [0..48] name, [48] name length, [49] attr, [52..56]
-/// size LE, [56..60] cluster or inode LE.
-///
-/// This used to take a shared-memory handle and map it. Handles are global
-/// numbers, so a client could name a region another client had shared with
-/// this server and have a directory listing written over it.
+/// TAG_READDIR_BULK: data[0] = handle, data[1] = the index of the first entry
+/// wanted, data[2] = the length of the buffer lent for writing. Fills it with
+/// directory records (see `protocol::put_dirent`) and replies
+/// `[bytes, next index, end]`.
 fn handle_readdir_bulk(disk: &DiskState, sender: usize, msg: &Message) {
     if unsafe { FS_TYPE } == FsType::Ext2 {
         handle_readdir_bulk_ext2(sender, msg);
         return;
     }
 
-    let handle = msg.data[0] as usize;
-
-    let dir_cluster = match get_handle(handle, sender) {
-        Some(file) => {
-            if !file.is_dir {
-                error_reply(sender, ERR_NOT_DIR);
-                return;
-            }
-            match &file.fs {
-                FsFileData::Fat32 { first_cluster, .. } => *first_cluster,
-                _ => { error_reply(sender, ERR_IO); return; }
-            }
-        }
-        None => {
-            error_reply(sender, ERR_INVALID_HANDLE);
-            return;
-        }
+    let start = msg.data[1];
+    let room = (msg.data[2] as usize).min(PAGE_SIZE);
+    let dir_cluster = match get_handle(msg.data[0] as usize, sender) {
+        Some(file) if file.is_dir => match &file.fs {
+            FsFileData::Fat32 { first_cluster, .. } => *first_cluster,
+            _ => return error_reply(sender, ERR_IO),
+        },
+        Some(_) => return error_reply(sender, ERR_NOT_DIR),
+        None => return error_reply(sender, ERR_INVALID_HANDLE),
     };
 
-    let buf = unsafe { core::slice::from_raw_parts_mut(CLIENT_BUF as *mut u8, 4096) };
-    let max_entries = 4096 / 64; // 64
-    let mut count: u32 = 0;
-
+    let buf = unsafe { core::slice::from_raw_parts_mut(CLIENT_BUF as *mut u8, PAGE_SIZE) };
     let spc = disk.bpb.sectors_per_cluster;
     let mut cluster = dir_cluster;
+    let mut index = 0u64;
+    let mut used = 0usize;
+    let mut next = start;
+    let mut end = true;
 
     'outer: loop {
         let start_lba = disk.cluster_start_lba(cluster);
         disk.prefetch_sectors(start_lba, spc);
-        for s in 0..spc {
-            let sec_data = match disk.cached_read_sector(start_lba + s) {
+        for sector in 0..spc {
+            let sec_data = match disk.cached_read_sector(start_lba + sector) {
                 Ok(d) => d,
-                Err(_) => break 'outer,
+                // What was read so far is still good; the next request
+                // starts at the sector that failed and reports it.
+                Err(_) if used > 0 => {
+                    end = false;
+                    break 'outer;
+                }
+                Err(_) => return error_reply(sender, ERR_IO),
             };
             let mut sec_buf = [0u8; 512];
             sec_buf.copy_from_slice(sec_data);
@@ -1895,57 +1837,95 @@ fn handle_readdir_bulk(disk: &DiskState, sender: usize, msg: &Message) {
                 if first_byte == 0x00 {
                     break 'outer;
                 }
-                if first_byte == 0xE5 {
+                let attr = sec_buf[off + 11];
+                // Deleted, long-name pieces and the volume label are not entries.
+                if first_byte == 0xE5 || attr & 0x0F == 0x0F || attr & 0x08 != 0 {
                     continue;
                 }
-                let attr = sec_buf[off + 11];
-                if attr & 0x0F == 0x0F {
-                    continue; // LFN
+                if index < start {
+                    index += 1;
+                    continue;
                 }
-                if attr & 0x08 != 0 {
-                    continue; // volume label
+                let mut name = [0u8; 12];
+                let name_len = fat_display_name(&sec_buf[off..off + 11], &mut name);
+                let hi = read_u16(&sec_buf, off + 20) as u64;
+                let lo = read_u16(&sec_buf, off + 26) as u64;
+                let size = read_u32(&sec_buf, off + 28) as u64;
+                let kind = if attr & 0x10 != 0 { DT_DIR } else { DT_REG };
+                match put_dirent(&mut buf[..room], used, (hi << 16) | lo, index + 1, size, kind, &name[..name_len]) {
+                    Some(len) => {
+                        used += len;
+                        next = index + 1;
+                        index += 1;
+                    }
+                    None => {
+                        end = false;
+                        break 'outer;
+                    }
                 }
-
-                if (count as usize) >= max_entries {
-                    break 'outer;
-                }
-
-                // 64-byte entry: 48 name + 1 name_len + 1 attr + 2 pad + 4 size + 4 cluster + 4 pad
-                let base = (count as usize) * 64;
-                buf[base..base + 48].fill(0);
-                buf[base..base + 11].copy_from_slice(&sec_buf[off..off + 11]);
-                buf[base + 48] = 11; // name_len
-                buf[base + 49] = attr;
-                let size = read_u32(&sec_buf, off + 28);
-                buf[base + 52..base + 56].copy_from_slice(&size.to_le_bytes());
-                let hi = read_u16(&sec_buf, off + 20) as u32;
-                let lo = read_u16(&sec_buf, off + 26) as u32;
-                let entry_cluster = (hi << 16) | lo;
-                buf[base + 56..base + 60].copy_from_slice(&entry_cluster.to_le_bytes());
-                buf[base + 60..base + 64].fill(0);
-                count += 1;
             }
         }
         match disk.fat_next(cluster) {
-            Some(next) => cluster = next,
+            Some(n) => cluster = n,
             None => break,
         }
     }
 
-    reply_entries(sender, count);
+    reply_dirents(sender, used, next, end);
 }
 
-/// Reply to a bulk readdir: `count` 64-byte entries from `CLIENT_BUF` into
-/// what the caller lent, and the count into the reply.
-fn reply_entries(sender: usize, count: u32) {
-    if !lend_out(sender, count as usize * 64) {
-        error_reply(sender, ERR_IO);
-        return;
+/// A FAT short name as a name: `HELLO   ELF` is `HELLO.ELF`, `USR        `
+/// is `USR`.
+fn fat_display_name(raw: &[u8], out: &mut [u8; 12]) -> usize {
+    let base = raw[..8].iter().rposition(|&b| b != b' ').map_or(0, |p| p + 1);
+    let ext = raw[8..11].iter().rposition(|&b| b != b' ').map_or(0, |p| p + 1);
+    out[..base].copy_from_slice(&raw[..base]);
+    if ext == 0 {
+        return base;
     }
-    let reply = Message { sender: 0, tag: TAG_OK, data: [count as u64, 0, 0, 0, 0, 0] };
-    let _ = syscall::sys_reply(sender, &reply);
+    out[base] = b'.';
+    out[base + 1..base + 1 + ext].copy_from_slice(&raw[8..8 + ext]);
+    base + 1 + ext
 }
 
+/// Reply to a bulk readdir: `used` bytes of records from `CLIENT_BUF` into
+/// what the caller lent, and where to carry on.
+fn reply_dirents(sender: usize, used: usize, next: u64, end: bool) {
+    if !lend_out(sender, used) {
+        return error_reply(sender, ERR_IO);
+    }
+    reply_opened(sender, [used as u64, next, end as u64, 0, 0, 0]);
+}
+
+/// TAG_STATFS, with 64 bytes lent for writing.
+fn handle_statfs(sender: usize) {
+    let words: [u64; 8] = if unsafe { FS_TYPE } == FsType::Ext2 {
+        let e2 = ext2_state();
+        let free = e2.free_blocks_count as u64;
+        [
+            0xEF53,
+            e2.block_size as u64,
+            e2.total_blocks as u64,
+            free,
+            free.saturating_sub(e2.reserved_blocks as u64),
+            e2.total_inodes as u64,
+            e2.free_inodes_count as u64,
+            MAX_NAME as u64,
+        ]
+    } else {
+        // FAT keeps its free count in a hint nothing here reads; say what is
+        // known and leave the counts empty.
+        [0x4d44, unsafe { FAT_CLUSTER_BYTES } as u64, 0, 0, 0, 0, 0, 12]
+    };
+    let mut record = [0u8; STATFS_LEN];
+    for (i, w) in words.iter().enumerate() {
+        record[i * 8..i * 8 + 8].copy_from_slice(&w.to_le_bytes());
+    }
+    match syscall::sys_lent_write(sender, 0, &record) {
+        Ok(n) if n == STATFS_LEN => reply_opened(sender, [STATFS_LEN as u64, 0, 0, 0, 0, 0]),
+        _ => error_reply(sender, ERR_IO),
+    }
+}
 // ---------------------------------------------------------------------------
 // ext2 IPC handlers
 // ---------------------------------------------------------------------------
@@ -2034,113 +2014,53 @@ fn handle_write_ext2(sender: usize, msg: &Message) {
     }
 }
 
-fn handle_readdir_ext2(sender: usize, msg: &Message) {
-    let handle = msg.data[0] as usize;
-    let index = msg.data[1] as u32;
-
-    let dir_inode = match get_handle(handle, sender) {
-        Some(file) => {
-            if !file.is_dir {
-                error_reply(sender, ERR_NOT_DIR);
-                return;
-            }
-            match ext2::read_inode(ext2_state(), file.inode_num()) {
-                Ok(inode) => inode,
-                Err(code) => return error_reply(sender, code),
-            }
-        }
-        None => {
-            error_reply(sender, ERR_INVALID_HANDLE);
-            return;
-        }
-    };
-
-    let e2 = ext2_state();
-    match ext2_dir::read_dir_entry(e2, &dir_inode, index) {
-        Ok(Some(entry)) => {
-            let is_dir = entry.file_type == ext2::FT_DIR;
-            let attr: u8 = if is_dir { 0x10 } else { 0x20 };
-            let name_len = entry.name_len.min(32) as u8; // 32 bytes fit in 4 u64 words
-
-            // Pack name into 4 u64 words (32 bytes)
-            let mut name_bytes = [0u8; 32];
-            name_bytes[..name_len as usize].copy_from_slice(&entry.name[..name_len as usize]);
-            let w0 = u64::from_le_bytes(name_bytes[0..8].try_into().unwrap());
-            let w1 = u64::from_le_bytes(name_bytes[8..16].try_into().unwrap());
-            let w2 = u64::from_le_bytes(name_bytes[16..24].try_into().unwrap());
-            let w3 = u64::from_le_bytes(name_bytes[24..32].try_into().unwrap());
-
-            let packed = name_len as u64 | ((attr as u64) << 8);
-
-            let reply = Message {
-                sender: 0,
-                tag: TAG_OK,
-                data: [w0, w1, w2, w3, packed, entry.file_size as u64],
-            };
-            let _ = syscall::sys_reply(sender, &reply);
-        }
-        Ok(None) => error_reply(sender, ERR_NOT_FOUND),
-        Err(code) => error_reply(sender, code),
-    }
-}
 
 fn handle_readdir_bulk_ext2(sender: usize, msg: &Message) {
-    let handle = msg.data[0] as usize;
-
-    let dir_inode = match get_handle(handle, sender) {
-        Some(file) => {
-            if !file.is_dir {
-                error_reply(sender, ERR_NOT_DIR);
-                return;
-            }
-            match ext2::read_inode(ext2_state(), file.inode_num()) {
-                Ok(inode) => inode,
-                Err(code) => return error_reply(sender, code),
-            }
-        }
-        None => {
-            error_reply(sender, ERR_INVALID_HANDLE);
-            return;
-        }
+    let start = msg.data[1];
+    let room = (msg.data[2] as usize).min(PAGE_SIZE);
+    let e2 = ext2_state();
+    let dir = match get_handle(msg.data[0] as usize, sender) {
+        Some(file) if file.is_dir => match ext2::read_inode(e2, file.inode_num()) {
+            Ok(inode) => inode,
+            Err(code) => return error_reply(sender, code),
+        },
+        Some(_) => return error_reply(sender, ERR_NOT_DIR),
+        None => return error_reply(sender, ERR_INVALID_HANDLE),
     };
 
-    let buf = unsafe { core::slice::from_raw_parts_mut(CLIENT_BUF as *mut u8, 4096) };
-    let max_entries = 4096 / 64; // 64
-    let mut count: u32 = 0;
-    let e2 = ext2_state();
-
-    // Iterate directory entries
-    let mut idx = 0u32;
-    loop {
-        if count as usize >= max_entries {
-            break;
+    let buf = unsafe { core::slice::from_raw_parts_mut(CLIENT_BUF as *mut u8, PAGE_SIZE) };
+    let mut used = 0usize;
+    let mut next = start;
+    let mut end = true;
+    let walked = ext2_dir::for_each_entry(e2, &dir, |index, ino, kind, name| {
+        if (index as u64) < start {
+            return true;
         }
-        match ext2_dir::read_dir_entry(e2, &dir_inode, idx) {
-            Ok(Some(entry)) => {
-                // 64-byte entry: 48 name + 1 name_len + 1 attr + 2 pad + 4 size + 4 cluster + 4 pad
-                let base = (count as usize) * 64;
-                buf[base..base + 48].fill(0);
-                let copy_len = entry.name_len.min(48);
-                buf[base..base + copy_len].copy_from_slice(&entry.name[..copy_len]);
-                buf[base + 48] = copy_len as u8;
-
-                let attr: u8 = if entry.file_type == ext2::FT_DIR { 0x10 } else { 0x20 };
-                buf[base + 49] = attr;
-                buf[base + 50..base + 52].fill(0);
-                buf[base + 52..base + 56].copy_from_slice(&entry.file_size.to_le_bytes());
-                buf[base + 56..base + 60].copy_from_slice(&entry.inode_num.to_le_bytes());
-                buf[base + 60..base + 64].fill(0);
-                count += 1;
-                idx += 1;
+        // The inode says what the entry is even where the entry does not.
+        let (size, dt) = match ext2::read_inode(e2, ino) {
+            Ok(i) if i.is_dir() => (i.size64(), DT_DIR),
+            Ok(i) if i.is_regular() => (i.size64(), DT_REG),
+            Ok(i) if i.i_mode & ext2::S_IFMT == ext2::S_IFLNK => (i.size64(), DT_LNK),
+            Ok(i) => (i.size64(), DT_UNKNOWN),
+            Err(_) => (0, if kind == ext2::FT_DIR { DT_DIR } else { DT_UNKNOWN }),
+        };
+        match put_dirent(&mut buf[..room], used, ino as u64, index as u64 + 1, size, dt, name) {
+            Some(len) => {
+                used += len;
+                next = index as u64 + 1;
+                true
             }
-            Ok(None) => break,
-            Err(_) => break,
+            None => {
+                end = false;
+                false
+            }
         }
+    });
+    if let Err(code) = walked {
+        return error_reply(sender, code);
     }
-
-    reply_entries(sender, count);
+    reply_dirents(sender, used, next, end);
 }
-
 
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {

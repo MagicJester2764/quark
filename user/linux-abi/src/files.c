@@ -44,6 +44,8 @@ struct openfile {
     unsigned long size;
     int is_dir;
     unsigned int mode;    /* permission bits, as the server reports them */
+    unsigned long dir_next; /* a directory's position: the next entry's index */
+    int dir_end;            /* and whether the last read reached its end */
 };
 
 static struct openfile files[MAX_FILES];
@@ -155,6 +157,8 @@ long __quark_open(const char *path, long flags) {
        asking for one gets a file it can overwrite but not shorten, which is
        worth knowing about rather than pretending away. */
     f->offset = (flags & LX_O_APPEND) ? info.size : 0;
+    f->dir_next = 0;
+    f->dir_end = 0;
     return fd;
 }
 
@@ -283,6 +287,12 @@ long __quark_lseek(long fd, long offset, long whence) {
         return -LX_EINVAL;
     }
     f->offset = (unsigned long)to;
+    /* A directory's position is an entry index: rewinddir seeks to 0, and
+       seekdir to a d_off getdents handed out. */
+    if (f->is_dir) {
+        f->dir_next = (unsigned long)to;
+        f->dir_end = 0;
+    }
     return to;
 }
 
@@ -365,6 +375,135 @@ long __quark_stat(const char *path, void *statbuf) {
     }
     fill_stat(statbuf, &r);
     return 0;
+}
+
+static unsigned long rd(const unsigned char *p, int n) {
+    unsigned long v = 0;
+    for (int i = n - 1; i >= 0; i--) {
+        v = (v << 8) | p[i];
+    }
+    return v;
+}
+
+static void wr(unsigned char *p, int n, unsigned long v) {
+    for (int i = 0; i < n; i++) {
+        p[i] = (unsigned char)(v >> (8 * i));
+    }
+}
+
+/* getdents64: the server's records, copied field by field into Linux's
+   (d_ino, d_off, d_reclen, d_type, d_name). A Linux record is always the
+   shorter of the two, so what fits a page of the server's fits the caller's
+   buffer of the same size. */
+long __quark_getdents(long fd, void *buf, unsigned long count) {
+    struct openfile *f = slot(fd);
+    if (!f) {
+        return -LX_EBADF;
+    }
+    if (!f->is_dir) {
+        return -LX_ENOTDIR;
+    }
+    if (f->dir_end) {
+        return 0;
+    }
+    unsigned char page[4096];
+    unsigned long want = count < sizeof page ? count : sizeof page;
+    unsigned long used = 0, next = 0;
+    int end = 0;
+    int e = quark_vfs_readdir(f->handle, f->dir_next, page, want, &used, &next, &end);
+    if (e) {
+        return vfs_errno(e);
+    }
+    unsigned char *out = buf;
+    unsigned long in = 0, put = 0;
+    while (in + QUARK_VFS_DIRENT_HEADER <= used) {
+        const unsigned char *r = page + in;
+        unsigned long reclen = rd(r + 24, 2);
+        unsigned long namelen = r[27];
+        unsigned long lreclen = (19 + namelen + 1 + 7) & ~7UL;
+        if (reclen < QUARK_VFS_DIRENT_HEADER + namelen || in + reclen > used) {
+            return put ? (long)put : -LX_EIO;
+        }
+        if (put + lreclen > count) {
+            break;
+        }
+        bytes_zero(out + put, lreclen);
+        wr(out + put, 8, rd(r, 8));           /* d_ino */
+        wr(out + put + 8, 8, rd(r + 8, 8));   /* d_off: where to resume after it */
+        wr(out + put + 16, 2, lreclen);       /* d_reclen */
+        out[put + 18] = r[26];                /* d_type */
+        for (unsigned long i = 0; i < namelen; i++) {
+            out[put + 19 + i] = r[QUARK_VFS_DIRENT_HEADER + i];
+        }
+        f->dir_next = rd(r + 8, 8);
+        put += lreclen;
+        in += reclen;
+    }
+    if (put == 0) {
+        if (used == 0 && end) {
+            f->dir_end = 1;
+            return 0;
+        }
+        return -LX_EINVAL; /* the caller's buffer holds no entry */
+    }
+    if (in >= used && end) {
+        f->dir_end = 1;
+    }
+    return (long)put;
+}
+
+/* readlink. Nothing here makes links, and the server does not follow or read
+   them, so the honest answers are "that is not a link" and, for a link made
+   elsewhere, "not something this can do". */
+long __quark_readlink(const char *path, char *buf, unsigned long size) {
+    (void)buf;
+    (void)size;
+    struct quark_vfs_file info;
+    int err = quark_vfs_open(path, 0, &info);
+    if (err) {
+        return vfs_errno(err);
+    }
+    quark_vfs_close(info.handle);
+    return ((info.mode & 0170000) == 0120000) ? -LX_EOPNOTSUPP : -LX_EINVAL;
+}
+
+/* Linux's struct statfs for x86-64: seven words, a two-int fsid, four more
+   words and four spare. */
+static long fill_statfs(unsigned char *out) {
+    struct quark_vfs_statfs fs;
+    int err = quark_vfs_statfs(&fs);
+    if (err) {
+        return vfs_errno(err);
+    }
+    bytes_zero(out, 120);
+    wr(out + 0, 8, fs.magic);
+    wr(out + 8, 8, fs.bsize);
+    wr(out + 16, 8, fs.blocks);
+    wr(out + 24, 8, fs.bfree);
+    wr(out + 32, 8, fs.bavail);
+    wr(out + 40, 8, fs.files);
+    wr(out + 48, 8, fs.ffree);
+    wr(out + 64, 8, fs.namemax);  /* f_namelen */
+    wr(out + 72, 8, fs.bsize);    /* f_frsize */
+    return 0;
+}
+
+/* One filesystem is mounted, so the path only has to exist. */
+long __quark_statfs(const char *path, void *buf) {
+    struct quark_vfs_file info;
+    int err = quark_vfs_open(path, 0, &info);
+    if (err) {
+        return vfs_errno(err);
+    }
+    quark_vfs_close(info.handle);
+    return fill_statfs(buf);
+}
+
+long __quark_fstatfs(long fd, void *buf) {
+    if (!slot(fd) && (fd < 0 || fd >= FIRST_FD)) {
+        return -LX_EBADF;
+    }
+    return fill_statfs(buf);
 }
 
 long __quark_mkdir(const char *path) {

@@ -52,13 +52,18 @@ directory.
 | 1 | `OPEN` | `[len, flags]` | path | `[handle, size, is_dir, mode, access, id]` |
 | 2 | `READ` | `[handle, -, offset, len]` | `len` bytes to fill (at most 4096) | `[bytes read]` |
 | 3 | `CLOSE` | `[handle]` | — | — |
-| 4 | `READDIR` | `[handle, index]` | — | one entry: name (32 bytes) in `data[0..4]`, `len \| attr << 8`, size |
 | 5 | `STAT` | `[handle]` | 88 bytes to fill | `[88]` |
 | 6 | `WRITE` | `[handle, -, offset, len]` | `len` bytes to copy (at most 4096) | `[bytes written]` |
-| 8 | `READDIR_BULK` | `[handle]` | 4096 bytes to fill | `[count]` |
+| 8 | `READDIR_BULK` | `[handle, start, len]` | `len` bytes to fill (at most 4096) | `[bytes, next, end]` |
 | 9 | `MKDIR` | `[len]` | path | — |
+| 10 | `UNLINK` | `[len]` | path | — |
+| 11 | `RMDIR` | `[len]` | path | — |
+| 12 | `RENAME` | `[from_len, to_len]` | both paths, end to end | — |
+| 13 | `TRUNCATE` | `[handle, size]` | — | — |
+| 14 | `STATFS` | — | 64 bytes to fill | `[64]` |
 
-Numbers are never reused. 7 was `CREATE`, which carried its path in the
+Numbers are never reused. 4 was `READDIR`, which returned one entry per call
+and cut its name to 32 bytes. 7 was `CREATE`, which carried its path in the
 message and cut it to 40 bytes.
 
 ### OPEN
@@ -98,18 +103,62 @@ The lent buffer is filled with eleven little-endian 64-bit words:
 | 9 | `blocks`, in 512-byte units |
 | 10 | `block_size` |
 
-Times are seconds since this machine booted: there is no clock, and the C
-library's `time()` counts on the same scale. A file written on another machine
-keeps whatever time that machine gave it.
+Times are seconds since 1970, from the clock the kernel reads at boot
+(`SYS_BOOT_TIME`). A machine whose clock cannot be read counts from boot
+instead, and so does everything else on it.
 
 ### MKDIR
 
 Makes a directory, mode 0755, owned by the caller. `EXISTS` if the name is
 taken.
 
+### UNLINK, RMDIR and RENAME
+
+`UNLINK` removes a name that is not a directory's; the file goes with its last
+name, or, if a handle still names it, when that handle closes. `RMDIR` removes
+an empty directory (`NOT_EMPTY` otherwise). Both need write permission on the
+parent.
+
+`RENAME` lends the source path followed directly by the destination, with the
+two lengths in `data[0]` and `data[1]`. It replaces a destination of the same
+kind — a file for a file, an empty directory for a directory — and refuses to
+move a directory inside itself (`INVALID_PATH`). FAT32 answers all three with
+`NOT_SUPPORTED`.
+
+### TRUNCATE
+
+Sets a writable handle's regular file to `size` bytes, which must fit in 32
+bits. Growing it adds a hole, which reads as zeroes and takes no blocks until
+it is written. ext4 shortens only files whose extent tree fits in the inode;
+that, and FAT32 at all, is `NOT_SUPPORTED`. `OPEN_TRUNCATE` is the same
+operation to size 0.
+
 ### READDIR_BULK
 
-Fills the lent page with up to 64 fixed entries of 64 bytes — 48 bytes of
-name, its length, an attribute byte (`0x10` for a directory), two spare, the
-size and the inode or cluster as 32-bit words, four spare — starting from the
-directory's first entry. A name longer than 48 bytes is cut.
+Fills up to `len` bytes of the lent buffer with directory records, starting
+with entry `start` (the first is 0). Each record is:
+
+| Offset | Size | Field |
+|---|---|---|
+| 0 | 8 | `id` — the entry's inode number, or FAT32 first cluster |
+| 8 | 8 | `next` — the `start` that continues after this entry |
+| 16 | 8 | `size` in bytes |
+| 24 | 2 | `reclen` — this record's length, a multiple of 8 |
+| 26 | 1 | `type` — `DT_DIR` 4, `DT_REG` 8, `DT_LNK` 10, or 0 |
+| 27 | 1 | `namelen` |
+| 28 | | the name, a NUL, and padding to `reclen` |
+
+The reply says how many bytes were written, where to continue, and whether
+that is the end of the directory. A buffer too small for the next record
+yields zero bytes and `end` clear. `.` and `..` are listed where the
+filesystem stores them. A position is only meaningful for the directory it
+came from, and entries made or removed between two calls may be missed or
+seen twice, as with any `readdir`.
+
+### STATFS
+
+The lent buffer is filled with eight little-endian 64-bit words: the
+filesystem's magic (`0xEF53` for ext2 and ext4, `0x4d44` for FAT32), block
+size, block count, free blocks, blocks free to anyone (less those reserved
+for user 0), inodes, free inodes, and the longest name. FAT32 reports its
+cluster size and zeroes for the counts.

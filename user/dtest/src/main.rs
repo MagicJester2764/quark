@@ -1175,6 +1175,21 @@ fn test_runtime_service() {
     check("and can be taken again", nameserver::register(b"dchild-svc").is_ok());
 }
 
+/// `dir`/entry-NN-nnn…, the name 100 bytes long. Returns the path's length.
+fn listing_entry(buf: &mut [u8; 160], dir: &[u8], i: usize) -> usize {
+    buf[..dir.len()].copy_from_slice(dir);
+    let mut n = dir.len();
+    buf[n..n + 7].copy_from_slice(b"/entry-");
+    n += 7;
+    buf[n] = b'0' + (i / 10) as u8;
+    buf[n + 1] = b'0' + (i % 10) as u8;
+    buf[n + 2] = b'-';
+    n += 3;
+    let end = dir.len() + 1 + 100;
+    buf[n..end].fill(b'n');
+    end
+}
+
 fn test_files() {
     println!("files:");
     let Some(vfs_tid) = nameserver::lookup_retry(b"vfs", 20) else {
@@ -1250,6 +1265,73 @@ fn test_files() {
         "then the directory can go",
         vfs::rmdir(vfs_tid, dir).is_ok() && vfs::open(vfs_tid, dir).err() == Some(vfs::ERR_NOT_FOUND),
     );
+
+    // A directory read a page at a time, with names longer than a page's
+    // fixed entries used to hold.
+    const LISTING: &[u8] = b"/tmp/dtest-listing";
+    let _ = vfs::mkdir(vfs_tid, LISTING);
+    let mut path = [0u8; 160];
+    let mut made = 0;
+    for i in 0..80 {
+        let n = listing_entry(&mut path, LISTING, i);
+        if let Ok(o) = vfs::open_with(vfs_tid, &path[..n], vfs::OPEN_CREATE) {
+            let _ = vfs::close(vfs_tid, o.handle);
+            made += 1;
+        }
+    }
+    check("make 80 files with 100-byte names", made == 80);
+    let mut seen = [false; 80];
+    let mut listed = 0;
+    if let Ok((h, _, _)) = vfs::open(vfs_tid, LISTING) {
+        let mut out = [vfs::DirEntry::empty(); 16];
+        let mut next = 0u64;
+        loop {
+            let Ok(page) = vfs::readdir_bulk(vfs_tid, h, next, &mut out) else {
+                break;
+            };
+            for e in &out[..page.count] {
+                let name = e.name_bytes();
+                if name.len() == 100 && name.starts_with(b"entry-") {
+                    let i = ((name[6] - b'0') * 10 + (name[7] - b'0')) as usize;
+                    if i < 80 && !seen[i] {
+                        seen[i] = true;
+                        listed += 1;
+                    }
+                }
+            }
+            next = page.next;
+            if page.end || page.count == 0 {
+                break;
+            }
+        }
+        let _ = vfs::close(vfs_tid, h);
+    }
+    check("list all of them, sixteen at a time", listed == 80);
+
+    // Space: a 64 KiB file takes it, and gives it back.
+    let big: &[u8] = b"/tmp/dtest-listing/big";
+    let before = vfs::statfs(vfs_tid).map(|s| s.free_blocks);
+    if let Ok(o) = vfs::open_with(vfs_tid, big, vfs::OPEN_CREATE | vfs::OPEN_TRUNCATE) {
+        let chunk = [0x5Au8; 4096];
+        for i in 0..16u32 {
+            let _ = vfs::write(vfs_tid, o.handle, &chunk, i * 4096);
+        }
+        let _ = vfs::close(vfs_tid, o.handle);
+    }
+    let during = vfs::statfs(vfs_tid).map(|s| s.free_blocks);
+    let _ = vfs::unlink(vfs_tid, big);
+    let after = vfs::statfs(vfs_tid).map(|s| s.free_blocks);
+    let block = vfs::statfs(vfs_tid).map_or(1024, |s| s.block_size);
+    check(
+        "a 64 KiB file takes 64 KiB",
+        matches!((before, during), (Ok(b), Ok(d)) if b >= d + 65536 / block),
+    );
+    check("and gives it back when it goes", before.is_ok() && before == after);
+    for i in 0..80 {
+        let n = listing_entry(&mut path, LISTING, i);
+        let _ = vfs::unlink(vfs_tid, &path[..n]);
+    }
+    check("and the directory empties and goes", vfs::rmdir(vfs_tid, LISTING).is_ok());
 
     // A program that exits holding files gives them back. Two of these hold
     // more handles between them than the table has room for.

@@ -17,7 +17,6 @@
 #define QUARK_VFS_TAG_OPEN    1
 #define QUARK_VFS_TAG_READ    2
 #define QUARK_VFS_TAG_CLOSE   3
-#define QUARK_VFS_TAG_READDIR 4
 #define QUARK_VFS_TAG_STAT    5
 #define QUARK_VFS_TAG_WRITE   6
 #define QUARK_VFS_TAG_MKDIR   9
@@ -25,6 +24,14 @@
 #define QUARK_VFS_TAG_RMDIR   11
 #define QUARK_VFS_TAG_RENAME  12
 #define QUARK_VFS_TAG_TRUNCATE 13
+#define QUARK_VFS_TAG_READDIR  8   /* the bulk read; 4 is retired */
+#define QUARK_VFS_TAG_STATFS  14
+
+/* A directory record, as QUARK_VFS_TAG_READDIR fills a buffer with them:
+   `id`, `next` and `size` (8 bytes each), `reclen` (2), `type` (1) and
+   `namelen` (1), then the name and a NUL, padded to 8. `type` uses Linux's
+   DT_ values. */
+#define QUARK_VFS_DIRENT_HEADER 28
 
 /* What `quark_vfs_open` may be asked to do besides open. */
 #define QUARK_VFS_OPEN_CREATE    1UL  /* make the file if the name is free */
@@ -100,6 +107,26 @@ int quark_vfs_unlink(const char *path);
 int quark_vfs_rmdir(const char *path);
 int quark_vfs_rename(const char *from, const char *to);
 int quark_vfs_truncate(unsigned long handle, unsigned long size);
+
+/* Fill `buf` (at most a page) with the records of a directory from entry
+   `start`. `*next` is where the next call should start, `*end` says there is
+   nothing more. A buffer too small for even one record comes back empty with
+   `*end` clear. */
+int quark_vfs_readdir(unsigned long handle, unsigned long start, void *buf, unsigned long len,
+                      unsigned long *used, unsigned long *next, int *end);
+
+/* What the mounted filesystem is and how full: eight words, in this order. */
+struct quark_vfs_statfs {
+    unsigned long magic;   /* 0xEF53 for ext2/ext4, 0x4d44 for FAT */
+    unsigned long bsize;
+    unsigned long blocks;
+    unsigned long bfree;
+    unsigned long bavail;
+    unsigned long files;
+    unsigned long ffree;
+    unsigned long namemax;
+};
+int quark_vfs_statfs(struct quark_vfs_statfs *out);
 /* A read or write carries at most QUARK_VFS_MAX_IO bytes, which the VFS is
    lent for the call: it fills `buf` or copies out of it, and never maps it. */
 #define QUARK_VFS_MAX_IO 4096UL

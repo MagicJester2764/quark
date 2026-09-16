@@ -10,7 +10,6 @@ use crate::syscall;
 const TAG_OPEN: u64 = 1;
 const TAG_READ: u64 = 2;
 const TAG_CLOSE: u64 = 3;
-const TAG_READDIR: u64 = 4;
 const TAG_STAT: u64 = 5;
 const TAG_WRITE: u64 = 6;
 const TAG_READDIR_BULK: u64 = 8;
@@ -19,6 +18,7 @@ const TAG_UNLINK: u64 = 10;
 const TAG_RMDIR: u64 = 11;
 const TAG_RENAME: u64 = 12;
 const TAG_TRUNCATE: u64 = 13;
+const TAG_STATFS: u64 = 14;
 const TAG_ERROR: u64 = u64::MAX;
 
 /// The most one read or write carries.
@@ -108,32 +108,57 @@ fn call_with_path(vfs_tid: usize, tag: u64, path: &[u8], mut data: [u64; 6]) -> 
     Ok(reply)
 }
 
+/// One entry of a directory, as a bulk read reports it.
 #[derive(Clone, Copy)]
 pub struct DirEntry {
-    pub name: [u8; 48],
-    pub name_len: u8,
-    pub size: u32,
+    pub name: [u8; 255],
+    pub name_len: usize,
+    pub size: u64,
     pub is_dir: bool,
-    pub cluster: u32,
-    pub attr: u8,
+    /// The inode number (FAT32: the first cluster).
+    pub id: u64,
+    /// `DT_DIR`, `DT_REG`, `DT_LNK` or `DT_UNKNOWN`.
+    pub kind: u8,
 }
+
+pub const DT_UNKNOWN: u8 = 0;
+pub const DT_DIR: u8 = 4;
+pub const DT_REG: u8 = 8;
+pub const DT_LNK: u8 = 10;
 
 impl DirEntry {
     pub const fn empty() -> Self {
-        Self {
-            name: [0u8; 48],
-            name_len: 0,
-            size: 0,
-            is_dir: false,
-            cluster: 0,
-            attr: 0,
-        }
+        Self { name: [0u8; 255], name_len: 0, size: 0, is_dir: false, id: 0, kind: DT_UNKNOWN }
     }
 
     /// Return the name as a byte slice.
     pub fn name_bytes(&self) -> &[u8] {
-        &self.name[..self.name_len as usize]
+        &self.name[..self.name_len]
     }
+}
+
+/// What one bulk read returned: how many entries, where the next read should
+/// start, and whether that is the end.
+#[derive(Clone, Copy, Debug)]
+pub struct Page {
+    pub count: usize,
+    pub next: u64,
+    pub end: bool,
+}
+
+/// What `STATFS` reports.
+#[derive(Clone, Copy, Debug)]
+pub struct FsStat {
+    /// 0xEF53 for ext2 and ext4, 0x4d44 for FAT.
+    pub magic: u64,
+    pub block_size: u64,
+    pub blocks: u64,
+    pub free_blocks: u64,
+    /// Free to anybody, not only the superuser.
+    pub avail_blocks: u64,
+    pub files: u64,
+    pub free_files: u64,
+    pub name_max: u64,
 }
 
 /// Open a file or directory by path, with `OPEN_*` flags.
@@ -197,56 +222,21 @@ pub fn close(vfs_tid: usize, handle: usize) -> Result<(), u64> {
     Ok(())
 }
 
-/// Read a directory entry by index.
-/// Returns None when no more entries.
+/// The entry of a directory at `index`, or None past its end.
 pub fn readdir(vfs_tid: usize, handle: usize, index: u32) -> Result<Option<DirEntry>, u64> {
-    let msg = Message {
-        sender: 0,
-        tag: TAG_READDIR,
-        data: [handle as u64, index as u64, 0, 0, 0, 0],
-    };
-    let mut reply = Message::empty();
-    if syscall::sys_call(vfs_tid, &msg, &mut reply).is_err() {
-        return Err(ERR_IO);
-    }
-    if reply.tag == TAG_ERROR {
-        if reply.data[0] == ERR_NOT_FOUND {
-            return Ok(None);
-        }
-        return Err(reply.data[0]);
-    }
-
-    // Unpack name from first 4 u64 words (32 bytes, name_len in data[4] low byte)
-    let mut name = [0u8; 48];
-    let name_data = [
-        reply.data[0].to_le_bytes(),
-        reply.data[1].to_le_bytes(),
-        reply.data[2].to_le_bytes(),
-        reply.data[3].to_le_bytes(),
-    ];
-    for (i, chunk) in name_data.iter().enumerate() {
-        name[i * 8..(i + 1) * 8].copy_from_slice(chunk);
-    }
-
-    let packed = reply.data[4];
-    let name_len = (packed & 0xFF) as u8;
-    let attr = ((packed >> 8) & 0xFF) as u8;
-    let is_dir = attr & 0x10 != 0;
-
-    let size = reply.data[5] as u32;
-    let cluster = 0u32; // not used for ext2
-
-    Ok(Some(DirEntry { name, name_len, size, is_dir, cluster, attr }))
+    let mut one = [DirEntry::empty(); 1];
+    let page = readdir_bulk(vfs_tid, handle, index as u64, &mut one)?;
+    Ok(if page.count == 1 { Some(one[0]) } else { None })
 }
 
-/// Read a directory's entries — as many as fit a page — in one call.
-/// Returns the number of entries written into `out`.
-pub fn readdir_bulk(vfs_tid: usize, handle: usize, out: &mut [DirEntry]) -> Result<usize, u64> {
+/// Read a directory's entries from `start`, as many as fit `out` and a page.
+/// `Page::next` is where the next call should start.
+pub fn readdir_bulk(vfs_tid: usize, handle: usize, start: u64, out: &mut [DirEntry]) -> Result<Page, u64> {
     let mut buf = [0u8; 4096];
     let msg = Message {
         sender: 0,
         tag: TAG_READDIR_BULK,
-        data: [handle as u64, 0, 0, 0, 0, 0],
+        data: [handle as u64, start, buf.len() as u64, 0, 0, 0],
     };
     let mut reply = Message::empty();
     if syscall::sys_call_lend_mut(vfs_tid, &msg, &mut reply, &mut buf).is_err() {
@@ -255,24 +245,61 @@ pub fn readdir_bulk(vfs_tid: usize, handle: usize, out: &mut [DirEntry]) -> Resu
     if reply.tag == TAG_ERROR {
         return Err(reply.data[0]);
     }
-
-    // Entry layout: 64 bytes each (48 name + 1 name_len + 1 attr + 2 pad + 4 size + 4 cluster + 4 pad)
-    let max_per_page = 4096 / 64; // 64
-    let count = (reply.data[0] as usize).min(out.len()).min(max_per_page);
-
-    for i in 0..count {
-        let base = i * 64;
-        let mut name = [0u8; 48];
-        name.copy_from_slice(&buf[base..base + 48]);
-        let name_len = buf[base + 48];
-        let attr = buf[base + 49];
-        let size = u32::from_le_bytes(buf[base + 52..base + 56].try_into().unwrap());
-        let cluster = u32::from_le_bytes(buf[base + 56..base + 60].try_into().unwrap());
-        let is_dir = attr & 0x10 != 0;
-        out[i] = DirEntry { name, name_len, size, is_dir, cluster, attr };
+    let used = (reply.data[0] as usize).min(buf.len());
+    let mut page = Page { count: 0, next: reply.data[1], end: reply.data[2] != 0 };
+    if used == 0 && !page.end {
+        return Err(ERR_INVALID_PATH); // not even one entry fits a page
     }
+    let mut at = 0;
+    while at + 28 <= used && page.count < out.len() {
+        let r = &buf[at..used];
+        let word = |i: usize| u64::from_le_bytes(r[i..i + 8].try_into().unwrap());
+        let reclen = u16::from_le_bytes([r[24], r[25]]) as usize;
+        let len = r[27] as usize;
+        if reclen < 28 + len || reclen > r.len() {
+            return Err(ERR_IO);
+        }
+        let mut e = DirEntry::empty();
+        e.name[..len].copy_from_slice(&r[28..28 + len]);
+        e.name_len = len;
+        e.id = word(0);
+        e.size = word(16);
+        e.kind = r[26];
+        e.is_dir = r[26] == DT_DIR;
+        out[page.count] = e;
+        page.count += 1;
+        page.next = word(8);
+        at += reclen;
+    }
+    // Entries the server sent that `out` had no room for are read again.
+    if at < used {
+        page.end = false;
+    }
+    Ok(page)
+}
 
-    Ok(count)
+/// What the mounted filesystem is and how full.
+pub fn statfs(vfs_tid: usize) -> Result<FsStat, u64> {
+    let mut rec = [0u8; 64];
+    let msg = Message { sender: 0, tag: TAG_STATFS, data: [0; 6] };
+    let mut reply = Message::empty();
+    if syscall::sys_call_lend_mut(vfs_tid, &msg, &mut reply, &mut rec).is_err() {
+        return Err(ERR_IO);
+    }
+    if reply.tag == TAG_ERROR {
+        return Err(reply.data[0]);
+    }
+    let w = |i: usize| u64::from_le_bytes(rec[i * 8..i * 8 + 8].try_into().unwrap());
+    Ok(FsStat {
+        magic: w(0),
+        block_size: w(1),
+        blocks: w(2),
+        free_blocks: w(3),
+        avail_blocks: w(4),
+        files: w(5),
+        free_files: w(6),
+        name_max: w(7),
+    })
 }
 
 /// Write at most [`MAX_IO`] bytes of `buf` at `offset`, lending them to the

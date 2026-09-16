@@ -26,6 +26,7 @@
 #define LX_ENAMETOOLONG 36
 #define LX_ENOTEMPTY 39
 #define LX_EOPNOTSUPP 95
+#define LX_ERANGE   34
 
 /* Descriptors from here up are files.c's VFS files; below, the kernel's.
    The split sits at the kernel's MAX_FDS — see files.c. */
@@ -57,6 +58,10 @@ long __quark_rmdir(const char *path);
 long __quark_rename(const char *from, const char *to);
 long __quark_truncate(const char *path, long length);
 long __quark_file_truncate(long fd, long length);
+long __quark_getdents(long fd, void *buf, unsigned long count);
+long __quark_readlink(const char *path, char *buf, unsigned long size);
+long __quark_statfs(const char *path, void *buf);
+long __quark_fstatfs(long fd, void *buf);
 
 /* Streams, descriptor passing and waiting, in net.c. */
 long __quark_memfd(const char *name, long flags);

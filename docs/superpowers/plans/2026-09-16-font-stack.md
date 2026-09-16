@@ -743,7 +743,7 @@ change to it in one transaction was made to the old contents.
 - Produces (Rust): `struct DirEntry { name: [u8; 256], name_len: usize, size: u64, is_dir: bool, id: u64, kind: u8 }` with `empty()` and `name_bytes()`; `struct Page { count: usize, next: u64, end: bool }`; `readdir_bulk(vfs, handle, start: u64, out: &mut [DirEntry]) -> Result<Page, u64>`; `readdir(vfs, handle, index: u32) -> Result<Option<DirEntry>, u64>` (one entry through the bulk call); `struct FsStat { magic, block_size, blocks, free_blocks, avail_blocks, files, free_files, name_max }` (all `u64`); `statfs(vfs) -> Result<FsStat, u64>`.
 - Produces (C): `quark_vfs_readdir(handle, start, buf, len, *used, *next, *end)`, `quark_vfs_statfs(struct quark_vfs_statfs *)`; linux-abi `getdents64`(217), `readlink`(89)/`readlinkat`(267), `uname`(63), `getcwd`(79), `statfs`(137), `fstatfs`(138).
 
-- [ ] **Step 1: The failing test.** `dirtest.c` (no `LINK:`), added to `libc.tests`:
+- [x] **Step 1: The failing test.** `dirtest.c` (no `LINK:`), added to `libc.tests`:
 
 ```c
 /* Reading directories, and the calls realpath and df lean on. */
@@ -768,7 +768,7 @@ static void check(const char *what, int ok) {
     }
 }
 
-#define DIR "/tmp/dirtest"
+#define TESTDIR "/tmp/dirtest"
 #define COUNT 100
 /* Long enough that a page of them needs more than one read. */
 #define NAME "%s/entry-%03d-with-a-name-long-enough-to-need-more-than-one-page"
@@ -797,15 +797,15 @@ int main(void) {
     char path[256], seen[COUNT];
     int dots, types_ok;
     printf("directories:\n");
-    mkdir(DIR, 0755);
+    mkdir(TESTDIR, 0755);
     for (int i = 0; i < COUNT; i++) {
-        snprintf(path, sizeof path, NAME, DIR, i);
+        snprintf(path, sizeof path, NAME, TESTDIR, i);
         int fd = open(path, O_WRONLY | O_CREAT, 0644);
         if (fd >= 0) {
             close(fd);
         }
     }
-    DIR *d = opendir(DIR);
+    DIR *d = opendir(TESTDIR);
     check("open a directory", d != NULL);
     int n = d ? list(d, seen, &dots, &types_ok) : 0;
     int once = 1;
@@ -836,10 +836,10 @@ int main(void) {
 
     int gone = 1;
     for (int i = 0; i < COUNT; i++) {
-        snprintf(path, sizeof path, NAME, DIR, i);
+        snprintf(path, sizeof path, NAME, TESTDIR, i);
         gone &= unlink(path) == 0;
     }
-    check("tidy up", gone && rmdir(DIR) == 0);
+    check("tidy up", gone && rmdir(TESTDIR) == 0);
     printf("dirtest: %s\n", failed ? "FAILED" : "ok");
     return failed ? 1 : 0;
 }
@@ -847,9 +847,9 @@ int main(void) {
 
 dtest `files` gains: 80 files with 100-byte names in a new directory are all listed by paging `vfs::readdir_bulk` (a 16-entry `out` forces several calls), and `vfs::statfs` reports free blocks that go down by at least 64 KiB worth while a 64 KiB file exists and come back when it is unlinked.
 
-- [ ] **Step 2: Run it.** Expected: `opendir` works (open) but `readdir` returns nothing (`getdents64` is `ENOSYS`); `statfs`, `readlink`, `uname` fail.
+- [x] **Step 2: Run it.** Expected: `opendir` works (open) but `readdir` returns nothing (`getdents64` is `ENOSYS`); `statfs`, `readlink`, `uname` fail. *(Built against the old layer only; its first boot came after Step 5.)*
 
-- [ ] **Step 3: The server.** `protocol.rs`:
+- [x] **Step 3: The server.** `protocol.rs`:
 
 ```rust
 pub const DIRENT_HEADER: usize = 28;
@@ -880,9 +880,9 @@ pub fn put_dirent(buf: &mut [u8], at: usize, id: u64, next: u64, size: u64, kind
 
 `ext2_dir::for_each_entry(ext2, dir, mut f: impl FnMut(u32 index, u32 ino, u8 ftype, &[u8] name) -> bool)` walks in-use entries in order and stops when `f` says so. The ext2 bulk handler skips entries before `data[1]`, reads each entry's inode for its size, maps `ftype` (1 regular, 2 directory, 7 symbolic link), and fills `CLIENT_BUF` up to the lent length; FAT32 does the same with `NAME.EXT` names made from the 8.3 fields (trailing spaces dropped, no dot without an extension). `TAG_STATFS` answers from the superblock counts (`Ext2State` keeps the reserved block count it reads at mount for `bavail`) or, on FAT32, the magic, the cluster size and zeros. `handle_readdir*` for tag 4 and the `DirEntryInfo` name copies go.
 
-- [ ] **Step 4: Rust clients.** quark-rt as in Interfaces: `readdir_bulk` parses records into `out` and reports the `next` of the last one it kept, so a caller with a small `out` loses nothing. `ls` pages through the directory with a 64-entry buffer and prints every entry; `init` and `disktest` keep calling `readdir(index)`, now with names up to 255 bytes.
+- [x] **Step 4: Rust clients.** quark-rt as in Interfaces: `readdir_bulk` parses records into `out` and reports the `next` of the last one it kept, so a caller with a small `out` loses nothing. `ls` pages through the directory with a 64-entry buffer and prints every entry; `init` and `disktest` keep calling `readdir(index)`, now with names up to 255 bytes.
 
-- [ ] **Step 5: C clients.** `quark_vfs_readdir` lends the caller's buffer; `quark_vfs_statfs` lends 64 bytes. In linux-abi, `struct openfile` gains `unsigned long dir_next` and `int dir_end` (reset by `lseek(fd, 0, SEEK_SET)`, set to the offset by any other seek, which is what `seekdir` passes back):
+- [x] **Step 5: C clients.** `quark_vfs_readdir` lends the caller's buffer; `quark_vfs_statfs` lends 64 bytes. In linux-abi, `struct openfile` gains `unsigned long dir_next` and `int dir_end` (reset by `lseek(fd, 0, SEEK_SET)`, set to the offset by any other seek, which is what `seekdir` passes back):
 
 ```c
 /* getdents64: Quark's records, copied field by field into Linux's. */
@@ -942,9 +942,9 @@ long __quark_getdents(long fd, void *buf, unsigned long count) {
 
 `rd64`/`rd16`/`wr64`/`wr16`/`copy_bytes` are little-endian byte helpers beside `bytes_zero`. `readlink`: the path exists and is not a link → `EINVAL`, a link → `EOPNOTSUPP` (links cannot be read yet), missing → the open's error. `uname`: `Quark`, `quark`, the kernel's ABI version as `major.minor`, `Quark microkernel`, `x86_64`, domain `(none)`. `getcwd`: `/` — relative paths resolve from the root here, which this now says rather than refusing. `statfs`/`fstatfs` fill Linux's `struct statfs` (`f_type, f_bsize, f_blocks, f_bfree, f_bavail, f_files, f_ffree, f_fsid, f_namelen, f_frsize, f_flags, f_spare`).
 
-- [ ] **Step 6: Verify.** ext2 boot: `runtests /etc/libc.tests` (tlstest, ctortest, mmaptest, filetest, dirtest), `dtest files`, `dtest`, `ls /usr/bin` (more than 64 names), `cat /etc/passwd`; `tools/check-rootfs.sh`. Then `make hd-fat32 …` and boot once: `ls /`, `ls /usr/bin`, `cat /etc/passwd`, `dtest spaces` (it loads a program by path) — FAT32 still reads and lists, and says no to what it cannot do.
+- [x] **Step 6: Verify.** ext2 boot: `runtests /etc/libc.tests` (tlstest, ctortest, mmaptest, filetest, dirtest), `dtest files`, `dtest`, `ls /usr/bin` (more than 64 names), `cat /etc/passwd`; `tools/check-rootfs.sh`. Then `make hd-fat32 …` and boot once: `ls /`, `ls /usr/bin`, `cat /etc/passwd`, `dtest spaces` (it loads a program by path) — FAT32 still reads and lists, and says no to what it cannot do.
 
-- [ ] **Step 7: Commit.** quark: "C programs can read directories"; explosion: "dirtest".
+- [x] **Step 7: Commit.** quark: "C programs can read directories"; explosion: "dirtest".
 
 ---
 ### Task 4: The sources, the tools, and zlib

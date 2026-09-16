@@ -9,8 +9,8 @@ use quark_rt::syscall;
 pub const TAG_OPEN: u64 = 1;
 pub const TAG_READ: u64 = 2;
 pub const TAG_CLOSE: u64 = 3;
-/// One entry at a time, with its name cut to 32 bytes.
-pub const TAG_READDIR: u64 = 4;
+// 4 read one directory entry at a time and cut its name to 32 bytes;
+// TAG_READDIR_BULK replaces it and the number stays taken.
 pub const TAG_STAT: u64 = 5;
 pub const TAG_WRITE: u64 = 6;
 // 7 was CREATE, whose path travelled in the message and was cut to 40 bytes.
@@ -23,6 +23,8 @@ pub const TAG_RMDIR: u64 = 11;
 /// Two paths, lent end to end.
 pub const TAG_RENAME: u64 = 12;
 pub const TAG_TRUNCATE: u64 = 13;
+/// What the filesystem is and how full.
+pub const TAG_STATFS: u64 = 14;
 pub const TAG_OK: u64 = 0;
 pub const TAG_ERROR: u64 = u64::MAX;
 
@@ -87,6 +89,38 @@ pub fn lent_path(sender: usize, offset: usize, len: usize, at: usize) -> Result<
     }
     Ok(buf)
 }
+
+/// A directory record: `id`, `next`, `size` (8 bytes each), `reclen` (2),
+/// `type` (1), `namelen` (1), then the name and a NUL, padded to 8.
+pub const DIRENT_HEADER: usize = 28;
+pub const DT_UNKNOWN: u8 = 0;
+pub const DT_DIR: u8 = 4;
+pub const DT_REG: u8 = 8;
+pub const DT_LNK: u8 = 10;
+
+/// Write one directory record at `at` in `buf`. Returns its length, or None
+/// if it does not fit.
+pub fn put_dirent(buf: &mut [u8], at: usize, id: u64, next: u64, size: u64, kind: u8, name: &[u8]) -> Option<usize> {
+    let reclen = (DIRENT_HEADER + name.len() + 1 + 7) & !7;
+    if name.len() > MAX_NAME || at + reclen > buf.len() {
+        return None;
+    }
+    let r = &mut buf[at..at + reclen];
+    r.fill(0);
+    r[0..8].copy_from_slice(&id.to_le_bytes());
+    r[8..16].copy_from_slice(&next.to_le_bytes());
+    r[16..24].copy_from_slice(&size.to_le_bytes());
+    r[24..26].copy_from_slice(&(reclen as u16).to_le_bytes());
+    r[26] = kind;
+    r[27] = name.len() as u8;
+    r[DIRENT_HEADER..DIRENT_HEADER + name.len()].copy_from_slice(name);
+    Some(reclen)
+}
+
+/// What STATFS fills a lent buffer with: eight little-endian words — magic,
+/// block size, blocks, free, free to anybody, inodes, free inodes, the longest
+/// name.
+pub const STATFS_LEN: usize = 64;
 
 pub const STAT_LEN: usize = 88;
 

@@ -219,6 +219,42 @@ int quark_vfs_truncate(unsigned long handle, unsigned long size) {
     return vfs_call(&msg, &reply);
 }
 
+int quark_vfs_readdir(unsigned long handle, unsigned long start, void *buf, unsigned long len,
+                      unsigned long *used, unsigned long *next, int *end) {
+    struct quark_msg msg;
+    struct quark_msg reply;
+
+    zero(&msg, sizeof msg);
+    msg.tag = QUARK_VFS_TAG_READDIR;
+    msg.data[0] = handle;
+    msg.data[1] = start;
+    msg.data[2] = len;
+    int err = vfs_call_lend(&msg, &reply, buf, len, QUARK_LEND_WRITE);
+    if (err) {
+        return err;
+    }
+    *used = reply.data[0] < len ? reply.data[0] : len;
+    *next = reply.data[1];
+    *end = reply.data[2] != 0;
+    return 0;
+}
+
+int quark_vfs_statfs(struct quark_vfs_statfs *out) {
+    struct quark_msg msg;
+    struct quark_msg reply;
+    struct quark_vfs_statfs rec;
+
+    zero(&msg, sizeof msg);
+    zero(&rec, sizeof rec);
+    msg.tag = QUARK_VFS_TAG_STATFS;
+    int err = vfs_call_lend(&msg, &reply, &rec, sizeof rec, QUARK_LEND_WRITE);
+    if (err) {
+        return err;
+    }
+    copy(out, &rec, sizeof rec);
+    return 0;
+}
+
 int quark_vfs_stat(unsigned long handle, struct quark_vfs_stat *out) {
     struct quark_msg msg;
     struct quark_msg reply;

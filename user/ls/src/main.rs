@@ -4,42 +4,6 @@
 use quark_rt::nameserver;
 use quark_rt::{args, println, syscall, vfs};
 
-/// Convert a DirEntry name to a displayable string.
-/// For FAT32 8.3 names (name_len=11 with spaces), converts to "NAME.EXT" format.
-/// For ext2 names, uses the name directly.
-fn entry_name_to_str<'a>(entry: &vfs::DirEntry, buf: &'a mut [u8; 48]) -> &'a [u8] {
-    let name = entry.name_bytes();
-    // Detect FAT32 8.3 format: exactly 11 bytes, no dot, has trailing spaces
-    if entry.name_len == 11 && !name.contains(&b'.') {
-        let base_len = name[0..8]
-            .iter()
-            .rposition(|&b| b != b' ')
-            .map_or(0, |p| p + 1);
-        let mut pos = 0;
-        for i in 0..base_len {
-            buf[pos] = name[i];
-            pos += 1;
-        }
-        let ext_len = name[8..11]
-            .iter()
-            .rposition(|&b| b != b' ')
-            .map_or(0, |p| p + 1);
-        if ext_len > 0 {
-            buf[pos] = b'.';
-            pos += 1;
-            for i in 0..ext_len {
-                buf[pos] = name[8 + i];
-                pos += 1;
-            }
-        }
-        &buf[..pos]
-    } else {
-        // ext2 or other: use name directly
-        buf[..name.len()].copy_from_slice(name);
-        &buf[..name.len()]
-    }
-}
-
 #[unsafe(no_mangle)]
 #[link_section = ".text.entry"]
 pub extern "C" fn _start() -> ! {
@@ -91,28 +55,32 @@ pub extern "C" fn _start() -> ! {
         syscall::sys_exit();
     }
 
-    // Read all directory entries in one bulk IPC call (static to avoid stack overflow)
+    // A page of entries at a time, however many pages the directory takes.
     static mut ENTRIES: [vfs::DirEntry; 64] = [vfs::DirEntry::empty(); 64];
-    let entries = unsafe { &mut ENTRIES };
-    let count = match vfs::readdir_bulk(vfs_tid, handle, entries) {
-        Ok(n) => n,
-        Err(e) => {
-            println!("ls: readdir error: {}", e);
-            let _ = vfs::close(vfs_tid, handle);
-            syscall::sys_exit_code(1);
-        }
-    };
-
-    for i in 0..count {
-        let entry = &entries[i];
-        let name = entry.name_bytes();
-        if let Ok(s) = core::str::from_utf8(name) {
-            if entry.is_dir {
-                println!("{}/ ", s);
-            } else {
-                println!("{}  {}", s, entry.size);
+    let entries = unsafe { &mut *core::ptr::addr_of_mut!(ENTRIES) };
+    let mut next = 0u64;
+    loop {
+        let page = match vfs::readdir_bulk(vfs_tid, handle, next, entries) {
+            Ok(p) => p,
+            Err(e) => {
+                println!("ls: readdir error: {}", e);
+                let _ = vfs::close(vfs_tid, handle);
+                syscall::sys_exit_code(1);
+            }
+        };
+        for entry in &entries[..page.count] {
+            if let Ok(s) = core::str::from_utf8(entry.name_bytes()) {
+                if entry.is_dir {
+                    println!("{}/ ", s);
+                } else {
+                    println!("{}  {}", s, entry.size);
+                }
             }
         }
+        if page.end || page.count == 0 {
+            break;
+        }
+        next = page.next;
     }
 
     let _ = vfs::close(vfs_tid, handle);
