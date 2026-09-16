@@ -155,9 +155,8 @@ pub extern "C" fn _start() -> ! {
             tid,
             syscall::CAP_TASK_MGMT | syscall::CAP_PHYS_ALLOC | syscall::CAP_IOPORT,
         );
-        // Pass on our own IPC reach. Delegating the capability itself rather
-        // than minting a new one means we do not need to know which services
-        // it names — sys_cap_inspect cannot report a 64-bit destination set.
+        // Pass on our capability to the nameserver, which is how the shell
+        // finds, and is given the right to call, everything else.
         let _ = syscall::sys_cap_grant(tid, syscall::SLOT_ENDPOINT, syscall::SLOT_ENDPOINT);
 
         // Fine-grained caps for shell: TaskMgmt, PhysAlloc, IOPORT (ACPI

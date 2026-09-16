@@ -785,8 +785,8 @@ against quark-rt).
 
 ### Task 10: Write it down
 
-- [ ] `ROADMAP.md`: Phase 12 done, with what it found; the running order.
-- [ ] Tick this plan; commit it; push quark and explosion.
+- [x] `ROADMAP.md`: Phase 12 done, with what it found; the running order.
+- [x] Tick this plan; commit it; push quark and explosion.
 
 ---
 
