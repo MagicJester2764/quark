@@ -87,6 +87,8 @@ typedef unsigned long size_t;
 #define LX_fallocate      285
 #define LX_memfd_create    319
 #define LX_faccessat2      439
+#define LX_mkdir            83
+#define LX_mkdirat         258
 
 #define ARCH_SET_FS 0x1002
 #define ARCH_GET_FS 0x1003
@@ -459,6 +461,16 @@ long __quark_syscall(long n, long a1, long a2, long a3, long a4, long a5, long a
 
     case LX_fcntl:
         return __quark_fcntl(a1, a2, a3);
+
+    /* The mode is the server's to choose: it makes every directory 0755 for
+       the caller, which is what a umask of 022 would leave of most requests. */
+    case LX_mkdir:
+        return __quark_mkdir((const char *)a1);
+    case LX_mkdirat:
+        if (a1 != LX_AT_FDCWD) {
+            return -LX_ENOSYS;
+        }
+        return __quark_mkdir((const char *)a2);
 
     /* Streams, descriptors in flight, and waiting. Each is the same operation
        Quark has with Linux's packaging around it. */

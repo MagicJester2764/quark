@@ -11,11 +11,12 @@
 //! run; given `orphan` it leaves a dead thread behind for the parent to check
 //! on; given `serve` it answers one call with 42, and given `register NAME` it
 //! does that under a name. `lookup NAME` calls whatever has that name and exits
-//! with the answer.
+//! with the answer. `hold N` opens a file N times and exits without closing
+//! any of them, saying how many it got.
 
 use quark_rt::ipc::{Message, TID_ANY};
 use quark_rt::manifest::CapReq;
-use quark_rt::{nameserver, println, sync, syscall, thread};
+use quark_rt::{nameserver, println, sync, syscall, thread, vfs};
 
 quark_rt::manifest!([CapReq::phys_alloc(16)]);
 
@@ -70,6 +71,21 @@ pub extern "C" fn _start() -> ! {
             syscall::sys_exit_code(2);
         }
         serve_once();
+    }
+    if quark_rt::args::argv(1) == Some(&b"hold"[..]) {
+        let want = quark_rt::args::argv(2).map_or(0, |n| {
+            n.iter().fold(0usize, |acc, &d| acc * 10 + (d.wrapping_sub(b'0') as usize % 10))
+        });
+        let Some(vfs_tid) = nameserver::lookup_retry(b"vfs", 20) else {
+            syscall::sys_exit_code(-1);
+        };
+        let mut held = 0;
+        for _ in 0..want {
+            if vfs::open(vfs_tid, b"/etc/passwd").is_ok() {
+                held += 1;
+            }
+        }
+        syscall::sys_exit_code(held);
     }
     // Reach a service by name alone: nothing but the lookup gives this the
     // right to call it.

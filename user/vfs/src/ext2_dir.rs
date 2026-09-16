@@ -113,6 +113,9 @@ pub fn resolve_path(
             continue;
         }
 
+        if component.len() > crate::protocol::MAX_NAME {
+            return Err(crate::ERR_NAME_TOO_LONG);
+        }
         let is_last = rest.is_empty();
 
         match find_entry(ext2, &current_inode, component)? {
@@ -228,6 +231,7 @@ pub fn create_dir_entry(
     let usable = crate::csum::dir_usable_len(ext2, bs);
     let needed = align4(8 + name.len() as u32);
     let total_blocks = (dir_inode.i_size + bs - 1) / bs;
+    drop_index(ext2, dir_inode_num, dir_inode)?;
 
     // Try to find space in existing blocks by splitting an entry with excess rec_len
     for logical in 0..total_blocks {
@@ -367,6 +371,20 @@ pub fn init_dir_block(
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Forget a directory's htree index before its entries change.
+///
+/// This server keeps no index, so an entry it adds or removes would leave the
+/// index describing a directory that no longer exists. Without the flag every
+/// reader, Linux's included, searches the entries themselves, and the blocks
+/// that held the index read as empty entries.
+pub fn drop_index(ext2: &Ext2State, dir_ino: u32, dir: &mut Ext2Inode) -> Result<(), u64> {
+    if dir.i_flags & crate::ext2::EXT2_INDEX_FL != 0 {
+        dir.i_flags &= !crate::ext2::EXT2_INDEX_FL;
+        write_inode(ext2, dir_ino, dir)?;
+    }
+    Ok(())
+}
 
 /// Align a value up to a 4-byte boundary.
 fn align4(val: u32) -> u32 {

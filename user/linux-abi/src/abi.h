@@ -21,6 +21,11 @@
 #define LX_EISDIR   21
 #define LX_ENODEV   19
 #define LX_EAGAIN   11
+#define LX_EEXIST   17
+#define LX_EXDEV    18
+#define LX_ENAMETOOLONG 36
+#define LX_ENOTEMPTY 39
+#define LX_EOPNOTSUPP 95
 
 /* There is no working directory anywhere in this system, so this is the only
    value the *at calls accept for one. */
@@ -42,6 +47,7 @@ long __quark_lseek(long fd, long offset, long whence);
 long __quark_fstat(long fd, void *statbuf);
 long __quark_stat(const char *path, void *statbuf);
 long __quark_access(const char *path, long mode);
+long __quark_mkdir(const char *path);
 
 /* Streams, descriptor passing and waiting, in net.c. */
 long __quark_memfd(const char *name, long flags);

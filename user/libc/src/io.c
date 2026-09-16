@@ -6,9 +6,8 @@
  * held by the VFS rather than an object the kernel knows about. `open` asks
  * the VFS for one and remembers which descriptor number stands for it.
  *
- * The VFS moves file data through a page the client owns and the server maps,
- * so this library allocates one at startup and every read and write goes
- * through it. That bounds a transfer to a page, which `read` loops over.
+ * The caller's buffer is lent to the VFS for each read and write, a page at
+ * most, which `read` and `write` loop over.
  */
 
 #include <errno.h>
@@ -46,6 +45,10 @@ static int vfs_errno(int code) {
     case QUARK_VFS_IS_DIR:         return EISDIR;
     case QUARK_VFS_PERMISSION:     return EACCES;
     case QUARK_VFS_READ_ONLY:      return EROFS;
+    case QUARK_VFS_EXISTS:         return EEXIST;
+    case QUARK_VFS_NOT_EMPTY:      return ENOTEMPTY;
+    case QUARK_VFS_NOT_SUPPORTED:  return EOPNOTSUPP;
+    case QUARK_VFS_NAME_TOO_LONG:  return ENAMETOOLONG;
     default:                       return EIO;
     }
 }
@@ -72,9 +75,24 @@ int open(const char *path, int flags, ...) {
     }
 
     struct quark_vfs_file info;
-    int err = quark_vfs_open(path, (flags & O_CREAT) != 0, &info);
+    unsigned long how = 0;
+    if (flags & O_CREAT) {
+        how |= QUARK_VFS_OPEN_CREATE;
+        if (flags & O_EXCL) {
+            how |= QUARK_VFS_OPEN_EXCLUSIVE;
+        }
+    }
+    if (flags & O_DIRECTORY) {
+        how |= QUARK_VFS_OPEN_DIRECTORY;
+    }
+    int err = quark_vfs_open(path, how, &info);
     if (err) {
         errno = vfs_errno(err);
+        return -1;
+    }
+    if ((flags & O_ACCMODE) != O_RDONLY && (info.is_dir || !(info.access & QUARK_VFS_W_OK))) {
+        quark_vfs_close(info.handle);
+        errno = info.is_dir ? EISDIR : EACCES;
         return -1;
     }
 

@@ -1,4 +1,7 @@
-/// VFS client helpers — wraps VFS IPC protocol for user-space callers.
+//! The file server, as a client sees it.
+//!
+//! `docs/vfs.md` is the protocol. Paths are lent with the call, so their
+//! length is the filesystem's business rather than the message's.
 
 use crate::ipc::Message;
 use crate::syscall;
@@ -10,12 +13,23 @@ const TAG_CLOSE: u64 = 3;
 const TAG_READDIR: u64 = 4;
 const TAG_STAT: u64 = 5;
 const TAG_WRITE: u64 = 6;
-const TAG_CREATE: u64 = 7;
 const TAG_READDIR_BULK: u64 = 8;
+const TAG_MKDIR: u64 = 9;
 const TAG_ERROR: u64 = u64::MAX;
 
 /// The most one read or write carries.
 pub const MAX_IO: usize = 4096;
+/// The longest path the server takes. A longer one is refused, not cut.
+pub const MAX_PATH: usize = 4095;
+
+/// [`open_with`] makes the file if the name is free.
+pub const OPEN_CREATE: u64 = 1;
+/// With [`OPEN_CREATE`], the name must be free.
+pub const OPEN_EXCLUSIVE: u64 = 2;
+/// Empty a regular file the caller may write.
+pub const OPEN_TRUNCATE: u64 = 4;
+/// The path must name a directory.
+pub const OPEN_DIRECTORY: u64 = 8;
 
 // Error codes (match VFS server)
 pub const ERR_NOT_FOUND: u64 = 1;
@@ -26,6 +40,69 @@ pub const ERR_INVALID_PATH: u64 = 5;
 pub const ERR_NOT_DIR: u64 = 6;
 pub const ERR_IS_DIR: u64 = 7;
 pub const ERR_PERMISSION: u64 = 8;
+pub const ERR_READ_ONLY: u64 = 9;
+pub const ERR_EXISTS: u64 = 10;
+pub const ERR_NOT_EMPTY: u64 = 11;
+pub const ERR_NOT_SUPPORTED: u64 = 12;
+pub const ERR_NAME_TOO_LONG: u64 = 13;
+
+/// File-type bits of a mode, as [`Stat::mode`] carries them.
+pub const S_IFMT: u32 = 0o170000;
+pub const S_IFDIR: u32 = 0o040000;
+pub const S_IFREG: u32 = 0o100000;
+pub const S_IFLNK: u32 = 0o120000;
+
+/// What [`open_with`] learns about the file it opened.
+#[derive(Clone, Copy, Debug)]
+pub struct Opened {
+    pub handle: usize,
+    pub size: u64,
+    pub is_dir: bool,
+    /// With the file-type bits.
+    pub mode: u32,
+    /// What this caller may do with it: 4 read, 2 write, 1 execute.
+    pub access: u32,
+    /// The inode number, stable while the file exists.
+    pub id: u64,
+}
+
+/// A file's attributes, as `STAT` reports them.
+#[derive(Clone, Copy, Debug)]
+pub struct Stat {
+    pub id: u64,
+    pub size: u64,
+    pub mode: u32,
+    pub links: u32,
+    pub uid: u32,
+    pub gid: u32,
+    /// Seconds since boot; see `docs/vfs.md`.
+    pub atime: u64,
+    pub mtime: u64,
+    pub ctime: u64,
+    /// In 512-byte units.
+    pub blocks: u64,
+    pub block_size: u32,
+}
+
+/// Call the server with `path` lent, its length in `data[0]`.
+fn call_with_path(vfs_tid: usize, tag: u64, path: &[u8], mut data: [u64; 6]) -> Result<Message, u64> {
+    if path.is_empty() {
+        return Err(ERR_INVALID_PATH);
+    }
+    if path.len() > MAX_PATH {
+        return Err(ERR_NAME_TOO_LONG);
+    }
+    data[0] = path.len() as u64;
+    let msg = Message { sender: 0, tag, data };
+    let mut reply = Message::empty();
+    if syscall::sys_call_lend(vfs_tid, &msg, &mut reply, path).is_err() {
+        return Err(ERR_IO);
+    }
+    if reply.tag == TAG_ERROR {
+        return Err(reply.data[0]);
+    }
+    Ok(reply)
+}
 
 #[derive(Clone, Copy)]
 pub struct DirEntry {
@@ -55,23 +132,29 @@ impl DirEntry {
     }
 }
 
-/// Open a file or directory by path (up to 47 bytes, null-terminated).
+/// Open a file or directory by path, with `OPEN_*` flags.
+pub fn open_with(vfs_tid: usize, path: &[u8], flags: u64) -> Result<Opened, u64> {
+    let r = call_with_path(vfs_tid, TAG_OPEN, path, [0, flags, 0, 0, 0, 0])?;
+    Ok(Opened {
+        handle: r.data[0] as usize,
+        size: r.data[1],
+        is_dir: r.data[2] != 0,
+        mode: r.data[3] as u32,
+        access: r.data[4] as u32,
+        id: r.data[5],
+    })
+}
+
+/// Open an existing file or directory by path.
 /// Returns (handle, file_size, is_dir).
 pub fn open(vfs_tid: usize, path: &[u8]) -> Result<(usize, u32, bool), u64> {
-    let mut data = [0u64; 6];
-    let bytes = unsafe { core::slice::from_raw_parts_mut(data.as_mut_ptr() as *mut u8, 48) };
-    let len = path.len().min(47);
-    bytes[..len].copy_from_slice(&path[..len]);
+    let o = open_with(vfs_tid, path, 0)?;
+    Ok((o.handle, o.size as u32, o.is_dir))
+}
 
-    let msg = Message { sender: 0, tag: TAG_OPEN, data };
-    let mut reply = Message::empty();
-    if syscall::sys_call(vfs_tid, &msg, &mut reply).is_err() {
-        return Err(ERR_IO);
-    }
-    if reply.tag == TAG_ERROR {
-        return Err(reply.data[0]);
-    }
-    Ok((reply.data[0] as usize, reply.data[1] as u32, reply.data[2] != 0))
+/// Make a directory.
+pub fn mkdir(vfs_tid: usize, path: &[u8]) -> Result<(), u64> {
+    call_with_path(vfs_tid, TAG_MKDIR, path, [0; 6]).map(|_| ())
 }
 
 /// Read from `offset` into `buf`, at most [`MAX_IO`] bytes of it, which the
@@ -207,41 +290,46 @@ pub fn write(vfs_tid: usize, handle: usize, buf: &[u8], offset: u32) -> Result<u
     Ok(reply.data[0] as u32)
 }
 
-/// Create a new file or directory.
+/// Create a new file or directory, which must not exist, and open it.
 /// Returns (handle, size=0, is_dir).
-/// If `is_dir` is true, creates a directory; otherwise creates a file.
 pub fn create(vfs_tid: usize, path: &[u8], is_dir: bool) -> Result<(usize, u32, bool), u64> {
-    let mut data = [0u64; 6];
-    let bytes = unsafe { core::slice::from_raw_parts_mut(data.as_mut_ptr() as *mut u8, 48) };
-    let len = path.len().min(40); // leave room for flags in data[5]
-    bytes[..len].copy_from_slice(&path[..len]);
-    data[5] = if is_dir { 1 } else { 0 };
-
-    let msg = Message { sender: 0, tag: TAG_CREATE, data };
-    let mut reply = Message::empty();
-    if syscall::sys_call(vfs_tid, &msg, &mut reply).is_err() {
-        return Err(ERR_IO);
+    if is_dir {
+        mkdir(vfs_tid, path)?;
+        return open(vfs_tid, path);
     }
-    if reply.tag == TAG_ERROR {
-        return Err(reply.data[0]);
-    }
-    Ok((reply.data[0] as usize, reply.data[1] as u32, reply.data[2] != 0))
+    let o = open_with(vfs_tid, path, OPEN_CREATE | OPEN_EXCLUSIVE)?;
+    Ok((o.handle, 0, false))
 }
 
-/// Get file/directory info for an open handle.
-/// Returns (size, is_dir).
-pub fn stat(vfs_tid: usize, handle: usize) -> Result<(u32, bool), u64> {
-    let msg = Message {
-        sender: 0,
-        tag: TAG_STAT,
-        data: [handle as u64, 0, 0, 0, 0, 0],
-    };
+/// Everything the server knows about an open file.
+pub fn stat_full(vfs_tid: usize, handle: usize) -> Result<Stat, u64> {
+    let mut rec = [0u8; 88];
+    let msg = Message { sender: 0, tag: TAG_STAT, data: [handle as u64, 0, 0, 0, 0, 0] };
     let mut reply = Message::empty();
-    if syscall::sys_call(vfs_tid, &msg, &mut reply).is_err() {
+    if syscall::sys_call_lend_mut(vfs_tid, &msg, &mut reply, &mut rec).is_err() {
         return Err(ERR_IO);
     }
     if reply.tag == TAG_ERROR {
         return Err(reply.data[0]);
     }
-    Ok((reply.data[0] as u32, reply.data[1] != 0))
+    let w = |i: usize| u64::from_le_bytes(rec[i * 8..i * 8 + 8].try_into().unwrap());
+    Ok(Stat {
+        id: w(0),
+        size: w(1),
+        mode: w(2) as u32,
+        links: w(3) as u32,
+        uid: w(4) as u32,
+        gid: w(5) as u32,
+        atime: w(6),
+        mtime: w(7),
+        ctime: w(8),
+        blocks: w(9),
+        block_size: w(10) as u32,
+    })
+}
+
+/// An open file's size and whether it is a directory.
+pub fn stat(vfs_tid: usize, handle: usize) -> Result<(u32, bool), u64> {
+    let s = stat_full(vfs_tid, handle)?;
+    Ok((s.size as u32, s.mode & S_IFMT == S_IFDIR))
 }

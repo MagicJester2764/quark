@@ -10,7 +10,7 @@
 
 use quark_rt::manifest::CapReq;
 use quark_rt::wl::wire;
-use quark_rt::{nameserver, println, spawn, sync, syscall, thread};
+use quark_rt::{nameserver, println, spawn, sync, syscall, thread, vfs};
 
 quark_rt::manifest!([CapReq::task_mgmt(0), CapReq::phys_alloc(64)]);
 
@@ -1175,6 +1175,74 @@ fn test_runtime_service() {
     check("and can be taken again", nameserver::register(b"dchild-svc").is_ok());
 }
 
+fn test_files() {
+    println!("files:");
+    let Some(vfs_tid) = nameserver::lookup_retry(b"vfs", 20) else {
+        check("find the VFS", false);
+        return;
+    };
+    // Paths are lent, so their length is the filesystem's business.
+    let dir: &[u8] = b"/tmp/dtest-a-directory-whose-name-alone-is-past-the-old-limit";
+    let file: &[u8] = b"/tmp/dtest-a-directory-whose-name-alone-is-past-the-old-limit/and-a-file";
+    check(
+        "make a directory with a long path",
+        matches!(vfs::mkdir(vfs_tid, dir), Ok(()) | Err(vfs::ERR_EXISTS)),
+    );
+    if let Ok(o) = vfs::open_with(vfs_tid, file, vfs::OPEN_CREATE) {
+        let _ = vfs::write(vfs_tid, o.handle, b"long paths", 0);
+        let _ = vfs::close(vfs_tid, o.handle);
+    }
+    let again = vfs::open_with(vfs_tid, file, vfs::OPEN_CREATE);
+    check("creating a file again opens it", again.as_ref().is_ok_and(|o| o.size == 10 && !o.is_dir));
+    let other = vfs::open(vfs_tid, b"/etc/passwd");
+    if let (Ok(a), Ok((b, _, _))) = (&again, &other) {
+        let ids = (vfs::stat_full(vfs_tid, a.handle), vfs::stat_full(vfs_tid, *b));
+        check(
+            "stat names the inode, not the handle",
+            matches!(ids, (Ok(x), Ok(y)) if x.id == a.id && x.id != y.id && x.links >= 1),
+        );
+    }
+    for h in [again.map(|o| o.handle), other.map(|o| o.0)].into_iter().flatten() {
+        let _ = vfs::close(vfs_tid, h);
+    }
+    check(
+        "creating it exclusively fails",
+        vfs::open_with(vfs_tid, file, vfs::OPEN_CREATE | vfs::OPEN_EXCLUSIVE).err() == Some(vfs::ERR_EXISTS),
+    );
+    check(
+        "a file is not a directory",
+        vfs::open_with(vfs_tid, file, vfs::OPEN_DIRECTORY).err() == Some(vfs::ERR_NOT_DIR),
+    );
+    let mut long = [b'y'; 300];
+    long[..5].copy_from_slice(b"/tmp/");
+    check(
+        "a name past 255 bytes is refused",
+        vfs::open_with(vfs_tid, &long, vfs::OPEN_CREATE).err() == Some(vfs::ERR_NAME_TOO_LONG),
+    );
+    // A program that exits holding files gives them back. Two of these hold
+    // more handles between them than the table has room for.
+    for _ in 0..2 {
+        let Some(child) = load_child(&[b"dchild", b"hold", b"100"]) else {
+            check("start a program that holds files", false);
+            return;
+        };
+        let _ = child.start();
+        check("it opened a hundred files", wait_for(child.tid) == Some(100));
+    }
+    let mut held = [0usize; 60];
+    let mut n = 0;
+    for slot in held.iter_mut() {
+        if let Ok((h, _, _)) = vfs::open(vfs_tid, b"/etc/passwd") {
+            *slot = h;
+            n += 1;
+        }
+    }
+    check("and their handles went when they did", n == 60);
+    for &h in &held[..n] {
+        let _ = vfs::close(vfs_tid, h);
+    }
+}
+
 static LOCK: sync::Mutex<u32> = sync::Mutex::new(0);
 static COND: sync::Condvar = sync::Condvar::new();
 static ONCE: sync::Once = sync::Once::new();
@@ -1450,6 +1518,7 @@ pub extern "C" fn _start() -> ! {
         ("lend", test_lent_buffers),
         ("endpoints", test_endpoint_objects),
         ("service", test_runtime_service),
+        ("files", test_files),
         ("sync", test_sync),
         ("fpu", test_fpu),
         ("wire", test_wire),

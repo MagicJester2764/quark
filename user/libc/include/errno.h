@@ -15,5 +15,8 @@
 #define EMFILE 24
 #define ENOSPC 28
 #define EROFS  30
+#define ENAMETOOLONG 36
+#define ENOTEMPTY    39
+#define EOPNOTSUPP   95
 extern int errno;
 #endif

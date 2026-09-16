@@ -30,6 +30,20 @@ pub const S_IFREG: u16 = 0x8000;
 // Directory entry file types
 pub const FT_REG_FILE: u8 = 1;
 pub const FT_DIR: u8 = 2;
+pub const FT_SYMLINK: u8 = 7;
+
+/// A directory whose blocks carry an htree index as well as entries.
+pub const EXT2_INDEX_FL: u32 = 0x1000;
+
+/// Now, in seconds since this machine booted.
+///
+/// There is no clock to read. The C library's `time()` counts from boot too,
+/// so a file written here is dated on the same scale as anything a program
+/// compares it with; a file from the machine that built the image keeps that
+/// machine's date.
+pub fn now() -> u32 {
+    (quark_rt::syscall::sys_ticks() / 100) as u32
+}
 
 // ---------------------------------------------------------------------------
 // On-disk structures
@@ -875,7 +889,7 @@ pub fn read_block_bytes(
 }
 
 /// Read a u32 block pointer from an indirect block at the given index.
-fn read_block_ptr(ext2: &Ext2State, block: u32, index: u32) -> Result<u32, u64> {
+pub fn read_block_ptr(ext2: &Ext2State, block: u32, index: u32) -> Result<u32, u64> {
     let byte_offset = index * 4;
     let sector_in_block = byte_offset / 512;
     let offset_in_sector = (byte_offset % 512) as usize;
@@ -1056,6 +1070,9 @@ pub fn write_file_data(
     if end_offset > inode.i_size {
         inode.i_size = end_offset;
     }
+    let t = now();
+    inode.i_mtime = t;
+    inode.i_ctime = t;
 
     // Write inode back
     write_inode(ext2, inode_num, inode)?;

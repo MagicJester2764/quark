@@ -1,9 +1,9 @@
 /* Files, for a libc that thinks it is talking to Linux.
  *
  * A file on Quark is a handle held by the VFS, not an object the kernel knows
- * about, and its bytes move through a page this program owns and the server
- * maps. Linux's file calls are descriptors, offsets and a `struct stat`. This
- * is where one becomes the other.
+ * about, and its bytes and paths travel in buffers lent to the server with
+ * each call. Linux's file calls are descriptors, offsets and a `struct stat`.
+ * This is where one becomes the other.
  *
  * Descriptors 0, 1 and 2 are the kernel's — a spawner wired them to services,
  * and reading or writing one really is a system call. Everything above them is
@@ -49,11 +49,14 @@ struct openfile {
 static struct openfile files[MAX_FILES];
 
 /* Linux's open flags, which are what musl passes. */
-#define LX_O_WRONLY 1
-#define LX_O_RDWR   2
-#define LX_O_CREAT  0100
-#define LX_O_TRUNC  01000
-#define LX_O_APPEND 02000
+#define LX_O_ACCMODE   3
+#define LX_O_WRONLY    1
+#define LX_O_RDWR      2
+#define LX_O_CREAT     0100
+#define LX_O_EXCL      0200
+#define LX_O_TRUNC     01000
+#define LX_O_APPEND    02000
+#define LX_O_DIRECTORY 0200000
 
 #define LX_SEEK_SET 0
 #define LX_SEEK_CUR 1
@@ -76,6 +79,10 @@ static long vfs_errno(int code) {
     case QUARK_VFS_PERMISSION:     return -LX_EACCES;
     case QUARK_VFS_READ_ONLY:      return -LX_EROFS;
     case QUARK_VFS_UNREACHABLE:    return -LX_EIO;
+    case QUARK_VFS_EXISTS:         return -LX_EEXIST;
+    case QUARK_VFS_NOT_EMPTY:      return -LX_ENOTEMPTY;
+    case QUARK_VFS_NOT_SUPPORTED:  return -LX_EOPNOTSUPP;
+    case QUARK_VFS_NAME_TOO_LONG:  return -LX_ENAMETOOLONG;
     default:                       return -LX_EIO;
     }
 }
@@ -110,10 +117,28 @@ long __quark_open(const char *path, long flags) {
         return -LX_EMFILE;
     }
 
+    unsigned long how = 0;
+    if (flags & LX_O_CREAT) {
+        how |= QUARK_VFS_OPEN_CREATE;
+        if (flags & LX_O_EXCL) {
+            how |= QUARK_VFS_OPEN_EXCLUSIVE;
+        }
+    }
+    if (flags & LX_O_DIRECTORY) {
+        how |= QUARK_VFS_OPEN_DIRECTORY;
+    }
     struct quark_vfs_file info;
-    int err = quark_vfs_open(path, (flags & LX_O_CREAT) != 0, &info);
+    int err = quark_vfs_open(path, how, &info);
     if (err) {
         return vfs_errno(err);
+    }
+    /* Asked of the server rather than worked out here: whether this caller may
+       write it, and whether it is something that can be written at all. */
+    if ((flags & LX_O_ACCMODE) != 0) {
+        if (info.is_dir || !(info.access & QUARK_VFS_W_OK)) {
+            quark_vfs_close(info.handle);
+            return info.is_dir ? -LX_EISDIR : -LX_EACCES;
+        }
     }
 
     struct openfile *f = &files[fd - FIRST_FD];
@@ -278,17 +303,20 @@ struct lx_kstat {
     long          __unused[3];
 };
 
-static void fill_stat(struct lx_kstat *st, unsigned long size, int is_dir,
-                      unsigned long ino, unsigned int mode) {
+static void fill_stat(struct lx_kstat *st, const struct quark_vfs_stat *r) {
     bytes_zero(st, sizeof *st);
     st->st_dev = 1;
-    st->st_ino = ino;
-    st->st_nlink = 1;
-    st->st_mode = (is_dir ? LX_S_IFDIR : LX_S_IFREG) | (mode & 07777);
-    st->st_size = (long)size;
-    st->st_blksize = (long)PAGE_SIZE;
-    st->st_blocks = (long)((size + 511) / 512);
-    return;
+    st->st_ino = r->id;
+    st->st_nlink = r->links;
+    st->st_mode = (unsigned int)r->mode;
+    st->st_uid = (unsigned int)r->uid;
+    st->st_gid = (unsigned int)r->gid;
+    st->st_size = (long)r->size;
+    st->st_blksize = (long)r->blksize;
+    st->st_blocks = (long)r->blocks;
+    st->st_atime_sec = (long)r->atime;
+    st->st_mtime_sec = (long)r->mtime;
+    st->st_ctime_sec = (long)r->ctime;
 }
 
 long __quark_fstat(long fd, void *statbuf) {
@@ -308,7 +336,15 @@ long __quark_fstat(long fd, void *statbuf) {
         }
         return -LX_EBADF;
     }
-    fill_stat(statbuf, f->size, f->is_dir, f->handle, f->mode);
+    /* Asked, not remembered: another descriptor, or another program, may
+       have changed the file since this one was opened. */
+    struct quark_vfs_stat r;
+    int err = quark_vfs_stat(f->handle, &r);
+    if (err) {
+        return vfs_errno(err);
+    }
+    f->size = r.size;
+    fill_stat(statbuf, &r);
     return 0;
 }
 
@@ -318,9 +354,19 @@ long __quark_stat(const char *path, void *statbuf) {
     if (err) {
         return vfs_errno(err);
     }
-    fill_stat(statbuf, info.size, info.is_dir, info.handle, info.mode);
+    struct quark_vfs_stat r;
+    err = quark_vfs_stat(info.handle, &r);
     quark_vfs_close(info.handle);
+    if (err) {
+        return vfs_errno(err);
+    }
+    fill_stat(statbuf, &r);
     return 0;
+}
+
+long __quark_mkdir(const char *path) {
+    int err = quark_vfs_mkdir(path);
+    return err ? vfs_errno(err) : 0;
 }
 
 /* access(2), and the *at forms of it that gnulib reaches for first.

@@ -124,25 +124,29 @@ static int vfs_call(struct quark_msg *msg, struct quark_msg *reply) {
     return vfs_call_lend(msg, reply, 0, 0, 0);
 }
 
-int quark_vfs_open(const char *path, int create, struct quark_vfs_file *out) {
+/* Ask the VFS something about a path, which is lent with the call. */
+static int vfs_path_call(unsigned long tag, const char *path, struct quark_msg *msg,
+                         struct quark_msg *reply) {
+    unsigned long len = length(path);
+    if (len == 0) {
+        return QUARK_VFS_INVALID_PATH;
+    }
+    if (len > QUARK_VFS_MAX_PATH) {
+        return QUARK_VFS_NAME_TOO_LONG;
+    }
+    msg->tag = tag;
+    msg->data[0] = len;
+    /* Lent for reading only; the cast drops a const the kernel keeps. */
+    return vfs_call_lend(msg, reply, (void *)path, len, QUARK_LEND_READ);
+}
+
+int quark_vfs_open(const char *path, unsigned long flags, struct quark_vfs_file *out) {
     struct quark_msg msg;
     struct quark_msg reply;
 
-    unsigned long len = length(path);
-    if (len == 0 || len > QUARK_VFS_MAX_PATH) {
-        return QUARK_VFS_INVALID_PATH;
-    }
-
     zero(&msg, sizeof msg);
-    msg.tag = create ? QUARK_VFS_TAG_CREATE : QUARK_VFS_TAG_OPEN;
-    copy(msg.data, path, len);
-    if (create) {
-        /* A file rather than a directory. The path can never reach this word:
-           one longer than the protocol carries is refused above. */
-        msg.data[5] = 0;
-    }
-
-    int err = vfs_call(&msg, &reply);
+    msg.data[1] = flags;
+    int err = vfs_path_call(QUARK_VFS_TAG_OPEN, path, &msg, &reply);
     if (err) {
         return err;
     }
@@ -152,28 +156,34 @@ int quark_vfs_open(const char *path, int create, struct quark_vfs_file *out) {
         out->is_dir = reply.data[2] != 0;
         out->mode = (unsigned int)reply.data[3];
         out->access = (unsigned int)reply.data[4];
+        out->id = reply.data[5];
     }
     return 0;
 }
 
-int quark_vfs_stat(unsigned long handle, struct quark_vfs_file *out) {
+int quark_vfs_mkdir(const char *path) {
     struct quark_msg msg;
     struct quark_msg reply;
 
     zero(&msg, sizeof msg);
+    return vfs_path_call(QUARK_VFS_TAG_MKDIR, path, &msg, &reply);
+}
+
+int quark_vfs_stat(unsigned long handle, struct quark_vfs_stat *out) {
+    struct quark_msg msg;
+    struct quark_msg reply;
+    struct quark_vfs_stat rec;
+
+    zero(&msg, sizeof msg);
+    zero(&rec, sizeof rec);
     msg.tag = QUARK_VFS_TAG_STAT;
     msg.data[0] = handle;
-
-    int err = vfs_call(&msg, &reply);
+    int err = vfs_call_lend(&msg, &reply, &rec, sizeof rec, QUARK_LEND_WRITE);
     if (err) {
         return err;
     }
     if (out) {
-        out->handle = handle;
-        out->size = reply.data[0];
-        out->is_dir = reply.data[1] != 0;
-        out->mode = (unsigned int)reply.data[3];
-        out->access = (unsigned int)reply.data[4];
+        copy(out, &rec, sizeof rec);
     }
     return 0;
 }

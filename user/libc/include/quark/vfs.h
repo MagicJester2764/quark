@@ -1,8 +1,8 @@
-/* The VFS protocol, in C.
+/* The VFS protocol, in C. docs/vfs.md is the contract.
  *
  * A file on Quark is a handle held by a server, not an object the kernel
- * knows about, so `open` is a message and `read` moves bytes through a page
- * the client owns and the server maps. That is the same protocol whichever C
+ * knows about, so `open` is a message, and a path or the bytes of a read
+ * travel in a buffer lent with it. That is the same protocol whichever C
  * library is on top of it — ours, or musl through the Linux translation
  * layer — so it is written down once here rather than once per library. Two
  * copies of a wire format drift.
@@ -20,7 +20,13 @@
 #define QUARK_VFS_TAG_READDIR 4
 #define QUARK_VFS_TAG_STAT    5
 #define QUARK_VFS_TAG_WRITE   6
-#define QUARK_VFS_TAG_CREATE  7
+#define QUARK_VFS_TAG_MKDIR   9
+
+/* What `quark_vfs_open` may be asked to do besides open. */
+#define QUARK_VFS_OPEN_CREATE    1UL  /* make the file if the name is free */
+#define QUARK_VFS_OPEN_EXCLUSIVE 2UL  /* with CREATE: the name must be free */
+#define QUARK_VFS_OPEN_TRUNCATE  4UL  /* empty a regular file */
+#define QUARK_VFS_OPEN_DIRECTORY 8UL  /* it must be a directory */
 
 /* What the server reports. Its own small integers, not anybody's errno —
    each library maps them to whatever it calls those conditions. */
@@ -33,10 +39,14 @@
 #define QUARK_VFS_IS_DIR         7
 #define QUARK_VFS_PERMISSION     8
 #define QUARK_VFS_READ_ONLY      9
+#define QUARK_VFS_EXISTS        10
+#define QUARK_VFS_NOT_EMPTY     11
+#define QUARK_VFS_NOT_SUPPORTED 12
+#define QUARK_VFS_NAME_TOO_LONG 13
 
-/* The server has no separate protocol for it, so a path travels in the six
-   data words of one message, with room for a terminator. */
-#define QUARK_VFS_MAX_PATH 47
+/* A path is lent with the call that names it. One longer than this is
+   refused, never shortened. */
+#define QUARK_VFS_MAX_PATH 4095
 
 /* Returned when the call itself could not be made — no VFS, or the message
    did not go. Distinct from every code the server reports. */
@@ -55,15 +65,33 @@ struct quark_vfs_file {
     unsigned long handle;
     unsigned long size;
     int is_dir;
-    unsigned int mode;   /* permission bits, without the file type */
+    unsigned int mode;   /* with the file-type bits */
     unsigned int access; /* QUARK_VFS_{R,W,X}_OK, for the caller */
+    unsigned long id;    /* the inode number, stable while the file exists */
+};
+
+/* What STAT fills in: eleven words, in this order. Times are seconds since
+   boot, the scale time() counts on here. */
+struct quark_vfs_stat {
+    unsigned long id;
+    unsigned long size;
+    unsigned long mode;
+    unsigned long links;
+    unsigned long uid;
+    unsigned long gid;
+    unsigned long atime;
+    unsigned long mtime;
+    unsigned long ctime;
+    unsigned long blocks;   /* 512-byte units */
+    unsigned long blksize;
 };
 
 /* Every one of these returns 0, or a positive error code from the list
    above. Counts come back through the out-parameter, so that a short read is
    never confused with a small error number. */
-int quark_vfs_open(const char *path, int create, struct quark_vfs_file *out);
-int quark_vfs_stat(unsigned long handle, struct quark_vfs_file *out);
+int quark_vfs_open(const char *path, unsigned long flags, struct quark_vfs_file *out);
+int quark_vfs_stat(unsigned long handle, struct quark_vfs_stat *out);
+int quark_vfs_mkdir(const char *path);
 /* A read or write carries at most QUARK_VFS_MAX_IO bytes, which the VFS is
    lent for the call: it fills `buf` or copies out of it, and never maps it. */
 #define QUARK_VFS_MAX_IO 4096UL
