@@ -1,6 +1,6 @@
 # Quark syscall ABI
 
-**Version 1.13.** Query the running kernel with `SYS_ABI_VERSION` (240), which
+**Version 2.0.** Query the running kernel with `SYS_ABI_VERSION` (240), which
 returns `(major << 16) | minor`.
 
 This document is the contract between the Quark kernel and everything above it.
@@ -71,7 +71,8 @@ so it is built from calls that already existed.
 
 - **Numbers are never reused.** A withdrawn call leaves its slot empty. A
   program built against an older minor version that calls a withdrawn number
-  gets a clean failure rather than a different call's behaviour.
+  gets a clean failure rather than a different call's behaviour. Capability
+  type numbers are kept the same way.
 - **Minor version** increases when calls are added. Additions never move or
   change existing calls, so an older program keeps working.
 - **Major version** increases when a call's meaning, arguments, or return
@@ -106,17 +107,32 @@ names, the task that created that one, or a task already holding one for it.**
 Admitting others to call you confers no authority over anybody else, and
 neither does a parent admitting others to call its child.
 
-The deprecated `EndpointSet` has an exception of its own: a set naming only the
-caller may always be minted. Without it a set could only ever shrink, and a
-server started at run time could never admit a client it spawned, because its
-own task ID was in nobody's set.
+### What 2.0 changed
+
+Capability type 7, a set of destination task IDs, is **withdrawn**:
+`SYS_CAP_MINT` refuses it and nothing grants one. The `CAP_ENDPOINT` bit, per
+task or per user, confers nothing; it expanded into a set naming every task.
+Two things went with the sets: the rule that any task could mint one naming
+only itself, and the kernel clearing a dead task's bit from every CSpace
+before its ID could be used again. An `Endpoint` (type 8) is now the only
+permission to originate IPC. Nothing else changed from 1.13, so a program that
+never used type 7 runs as before.
+
+**An exception to the deprecation rule.** Type 7 was deprecated at 1.13 and
+withdrawn at 2.0, without the full major version in between. Keeping it would
+have kept authority named by task ID in the kernel — the sweep, the special
+case, and a capability that outlived the task it named — and removing those is
+the reason for the change. Nothing outside this tree was built against 1.x. The
+rule still holds for everything else.
+
+### Deprecated
 
 Five calls are **deprecated as of 1.0** — the `CAP_*` object-capability calls
 (80–85) replace them:
 
 | Call | Number | Why | Replacement |
 |---|---|---|---|
-| `SYS_GRANT_CAP` | 86 | Expands a bitmask bit into a *wildcard* capability, e.g. `CAP_IOPORT` becomes every port, silently widening any narrow grant made alongside it. (`CAP_MAP_PHYS` expands to nothing as of 1.12.) | `SYS_CAP_MINT` + `SYS_CAP_GRANT` |
+| `SYS_GRANT_CAP` | 86 | Expands a bitmask bit into a *wildcard* capability, e.g. `CAP_IOPORT` becomes every port, silently widening any narrow grant made alongside it. (`CAP_MAP_PHYS` expands to nothing as of 1.12, and `CAP_ENDPOINT` as of 2.0.) | `SYS_CAP_MINT` + `SYS_CAP_GRANT` |
 | `SYS_GRANT_IOPORT` | 87 | Same, for the full port range | `SYS_CAP_MINT` with `IoPort(start, end)` |
 | `SYS_GRANT_IRQ` | 88 | Same shape | `SYS_CAP_MINT` with `Irq(n)` |
 | `SYS_SET_USER_CAPS` | 89 | Per-UID authority predates capabilities and is not consulted by anything that grants correctly | per-task CSpace |
@@ -130,11 +146,8 @@ worst of them, has conferred nothing since 1.12.
 `SYS_ADDRSPACE_GIVE` (43). The frames it maps into a child stay the spawner's,
 which is wrong both ways: they outlive the child, and die with the spawner.
 
-Capability type 7, `EndpointSet`, is **deprecated as of 1.13**, replaced by
-type 8, `Endpoint`. A set names tasks by TID, and a TID outlives its task: the
-kernel has to clear a dead task's bit from every set before its TID can be used
-again, and a set, only ever narrowed, cannot admit a task that did not exist
-when it was made.
+Capability type 7, deprecated at 1.13, was withdrawn at 2.0; see *What 2.0
+changed*.
 
 ## Capabilities
 
@@ -150,7 +163,7 @@ UID 0 bypass in the kernel. Each task has a CSpace of 64 slots holding
 | 4 | `TaskMgmt` | target TID (`0` = any) | — |
 | 5 | `PhysAlloc` | max pages (`0` = unlimited) | — |
 | 6 | `SetUid` | — | — |
-| 7 | `EndpointSet` *(deprecated)* | bitmask of destination TIDs | — |
+| 7 | *withdrawn at 2.0* | — | — |
 | 8 | `Endpoint` | the destination's endpoint number | — |
 
 Delegation may narrow a capability but never widen it; delegating at equal
@@ -396,8 +409,8 @@ inherited, or the previous endpoint's reference is stranded.
 | 86–90 | *deprecated* | see the deprecation table above | | |
 
 `SYS_CAP_INSPECT` truncates parameters to sixteen bits, so it cannot report an
-`EndpointSet` or an `Endpoint`'s number. Delegate those with `SYS_CAP_GRANT`, or
-read them with `SYS_CAP_READ`.
+`Endpoint`'s number. Delegate one with `SYS_CAP_GRANT`, or read it with
+`SYS_CAP_READ`.
 
 `SYS_CAP_READ` reports a slot whole, and for any task the caller manages. It
 exists so that "no task may map more than its device" is something a test can
@@ -614,9 +627,10 @@ zero; a program older than it never reads that far.
 
 **TID reuse.** Reaping returns a task slot to the pool, so TIDs are recycled.
 Anything that names a task by number must cope with the name changing meaning:
-the kernel clears a dead TID's bit from every `EndpointSet` for exactly this
-reason, and an `Endpoint` records a number that is never reused instead. Do not
-cache a TID across the lifetime of the task it named.
+an `Endpoint` records the number of a task's endpoint rather than its TID for
+exactly this reason. A server that keeps a client's TID beyond one call should
+watch it (`SYS_TASK_WATCH`) and forget it when it dies. Do not cache a TID
+across the lifetime of the task it named.
 
 **Threads are tasks.** A thread is a task created in its creator's own address
 space (`SYS_TASK_CREATE` then `SYS_TASK_START_ARG`), with its own FS base

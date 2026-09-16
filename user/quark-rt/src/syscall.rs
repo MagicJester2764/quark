@@ -1174,10 +1174,7 @@ pub const CAP_TYPE_IRQ: u64 = 3;
 pub const CAP_TYPE_TASK_MGMT: u64 = 4;
 pub const CAP_TYPE_PHYS_ALLOC: u64 = 5;
 pub const CAP_TYPE_SET_UID: u64 = 6;
-/// A set of tasks this one may sys_send / sys_call / sys_notify: param0 is a
-/// bitmask of their TIDs, bit N = TID N. Deprecated since ABI 1.13; a set
-/// names TIDs, which outlive the tasks they were given to.
-pub const CAP_TYPE_ENDPOINT_SET: u64 = 7;
+// 7 named a set of TIDs, and was withdrawn at ABI 2.0.
 /// One task this one may sys_send / sys_call / sys_notify. Minted by TID —
 /// by that task, its creator, or a holder of one — and recorded as the number
 /// of its endpoint, which no other task will ever have.

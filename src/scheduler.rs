@@ -919,9 +919,6 @@ unsafe fn reap_one(i: usize) -> u64 { unsafe {
     crate::shmem::cleanup_task(i);
     // Reclaim sys_phys_alloc reservations it never released
     crate::pmm::release_task_frames(i);
-    // Withdraw everyone's permission to send to this TID before
-    // the slot can be handed to a different task.
-    crate::cap::revoke_endpoints_to(i);
     // Destroy the address space only once the last task using
     // it is gone. Threads share one; tearing it down when the
     // first exits would pull it out from under the others.

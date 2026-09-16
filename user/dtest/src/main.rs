@@ -966,6 +966,8 @@ const EMPTY_SLOT: usize = 45;
 /// A task nothing here made or holds a capability to. Not the nameserver:
 /// every program is handed one to that.
 const INIT_TID: usize = 1;
+/// The capability type that named a set of TIDs, withdrawn at ABI 2.0.
+const WITHDRAWN_ENDPOINT_SET: u64 = 7;
 /// The offering thread's own slots.
 const OFFER_SLOT: usize = 8;
 const HOLDER_SLOT: usize = 9;
@@ -1041,6 +1043,13 @@ fn test_endpoint_objects() {
         syscall::sys_cap_read(me, SELF_SLOT).is_ok_and(|c| {
             c.cap_type == syscall::CAP_TYPE_ENDPOINT && c.param0 != me as u64 && c.valid
         }),
+    );
+    let _ = syscall::sys_cap_delete(STRANGER_SLOT);
+    // The sets of TIDs these replaced are gone, even the one naming only the
+    // caller that anybody could once mint.
+    check(
+        "a set of task IDs cannot be minted",
+        syscall::sys_cap_mint(STRANGER_SLOT, WITHDRAWN_ENDPOINT_SET, 1u64 << me, 0).is_err(),
     );
     let _ = syscall::sys_cap_delete(STRANGER_SLOT);
 

@@ -172,12 +172,20 @@ These were established deliberately. Breaking one silently re-opens a hole.
   than it has — the shell holds no `PhysRange` and therefore cannot give one
   away. The framebuffer is the one exception: its address comes from the
   bootloader at runtime, so `init` grants it directly.
-- **IPC needs an Endpoint capability.** `sys_send`/`sys_call`/`sys_notify` are
-  gated by a destination bitmask. IPC the kernel performs through an installed
-  fd bypasses this on purpose: the fd is the authorisation, and only a
-  CAP_TASK_MGMT holder can install one. Reaping clears a dead TID's bit from
-  every CSpace, because TIDs are recycled and a stale bit would otherwise
-  transfer to the slot's next occupant.
+- **IPC needs an Endpoint capability, and an Endpoint names a task, not a
+  TID.** `sys_send`/`sys_call`/`sys_notify` look for an `Endpoint` recording
+  the destination's endpoint number, which the kernel assigns when a task slot
+  is filled and never gives out again. TIDs are recycled; numbers are not, so a
+  capability to a dead task names nothing and nothing has to be swept at reap
+  time. Only the task itself, its creator or a holder may mint one. Everybody
+  else is handed one: every program gets the nameserver's from its spawner, and
+  a lookup grants the one for the name. IPC the kernel performs through an
+  installed fd bypasses this on purpose: the fd is the authorisation, and only
+  a CAP_TASK_MGMT holder can install one.
+- **A server calls a client back only with a capability the client offered.**
+  `sys_call_offer` puts one on a call and `sys_cap_take` accepts it; nothing
+  else can fill a server's CSpace, and a claim or registration made without
+  one is refused.
 
 `init` spawns `FB`, `CONSOLE`, `INPUT` and `VFS` in passes of their own. If a
 program misbehaves for lack of a capability, check that its pass actually calls
@@ -273,8 +281,11 @@ Three things follow from that, and breaking any of them is quiet:
 
 ## Known gaps
 
-- Endpoint sets are TID bitmasks, not true endpoint objects. A service and its
-  clients are named by slot number, not identity.
+- Servers still know their clients by TID (`Message.sender`). The kernel will
+  not deliver a call the caller had no capability for, but a server that keeps
+  a client's TID past one call — a lease, a registration, a foreground task —
+  must watch it with `sys_task_watch` and forget it on death. Otherwise it
+  treats whatever takes the TID next as the same client.
 - Nothing is demand-paged: memory is backed when it is mapped, not when it is
   first touched. A program that maps far more than it uses — pixman's stress
   test asks for a 2.7 GB mask and draws into a corner — is refused where Linux

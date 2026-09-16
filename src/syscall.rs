@@ -205,8 +205,8 @@ pub const SYS_ABI_VERSION: u64 = 240;
 /// Major changes when a call's meaning or signature changes incompatibly;
 /// minor when calls are added. User space can refuse to run against a major it
 /// does not know, which is the point of exposing it at all.
-pub const ABI_VERSION_MAJOR: u64 = 1;
-pub const ABI_VERSION_MINOR: u64 = 13;
+pub const ABI_VERSION_MAJOR: u64 = 2;
+pub const ABI_VERSION_MINOR: u64 = 0;
 
 /// Threads a task may make with no capability at all.
 ///
@@ -2224,7 +2224,7 @@ extern "C" fn syscall_dispatch(
                 4 => crate::cap::CapType::TaskMgmt,
                 5 => crate::cap::CapType::PhysAlloc,
                 6 => crate::cap::CapType::SetUid,
-                7 => crate::cap::CapType::EndpointSet,
+                // 7, a set of task IDs, was withdrawn at 2.0.
                 8 => crate::cap::CapType::Endpoint,
                 _ => return u64::MAX,
             };
@@ -2241,7 +2241,7 @@ extern "C" fn syscall_dispatch(
                         Some(number) => (number, 0),
                         None => return u64::MAX,
                     }
-                } else if crate::cap::can_mint(&task.cspace, tid, cap_type, param0, param1) {
+                } else if crate::cap::can_mint(&task.cspace, cap_type, param0, param1) {
                     // The caller already holds a capability that covers what
                     // it is minting. This used to be skipped for UID 0.
                     (param0, param1)

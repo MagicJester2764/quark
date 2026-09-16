@@ -762,24 +762,24 @@ service), the three suites, `wm weston-simple-shm wlcairo` (then close it so
 - Modify: `src/cap.rs`, `src/scheduler.rs`, `src/syscall.rs`, `docs/abi.md`, `CLAUDE.md`
 - Modify: `user/quark-rt/src/syscall.rs`, `user/dtest/src/main.rs`
 
-- [ ] **Step 1: The failing test** — dtest: minting type 7 fails.
+- [x] **Step 1: The failing test** — dtest: minting type 7 fails.
 
-- [ ] **Step 2: Remove** — type 7 from minting, attenuation, `task_has_endpoint`
+- [x] **Step 2: Remove** — type 7 from minting, attenuation, `task_has_endpoint`
 and `populate_from_bitmask` (the `CAP_ENDPOINT` bit confers nothing); the
 self-bit rule in `can_mint`; `revoke_endpoints_to` and its call in `reap_one`;
 the per-UID `CAP_ENDPOINT` path. `CAP_TYPE_ENDPOINT_SET` leaves quark-rt.
 `ABI_VERSION_MAJOR = 2`, minor 0.
 
-- [ ] **Step 3: Document** — `docs/abi.md`: version 2.0; a "2.0" section saying
+- [x] **Step 3: Document** — `docs/abi.md`: version 2.0; a "2.0" section saying
 what changed and why the usual deprecation period was not kept; type 7 listed
 as withdrawn. CLAUDE.md: the IPC invariant describes endpoint numbers, the
 endpoint known gap goes, and a new gap records that servers still key clients by
 TID (`Message.sender`).
 
-- [ ] **Step 4: Verify** — as Task 8, plus `hello` (the hosted build relinks
+- [x] **Step 4: Verify** — as Task 8, plus `hello` (the hosted build relinks
 against quark-rt).
 
-- [ ] **Step 5: Commit** — "Withdraw TID sets: ABI 2.0".
+- [x] **Step 5: Commit** — "Withdraw TID sets: ABI 2.0".
 
 ---
 

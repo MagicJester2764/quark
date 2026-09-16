@@ -75,15 +75,9 @@ pub enum CapType {
     TaskMgmt = 4,   // param0=target_tid (0=any)
     PhysAlloc = 5,  // param0=max_pages (0=unlimited)
     SetUid = 6,     // no params
-    /// Permission to originate IPC to a set of tasks, named by TID.
-    ///
-    /// param0 is a bitmask of destination TIDs (bit N = may send to TID N),
-    /// which fits exactly because MAX_TASKS is 64.
-    ///
-    /// Deprecated since ABI 1.13 in favour of `Endpoint`. A TID outlives the
-    /// task it named, so every CSpace has to be swept each time a task is
-    /// reaped, and a set can only ever be narrowed.
-    EndpointSet = 7,
+    // 7 was a set of destination TIDs, withdrawn at ABI 2.0 and never to be
+    // reused. A TID outlives the task it named, so every CSpace had to be swept
+    // each time a task was reaped, and a set could only ever be narrowed.
     /// Permission to originate IPC to one task.
     ///
     /// param0 is the number of that task's endpoint (`endpoint_of`), not its
@@ -283,20 +277,14 @@ pub fn task_has_endpoint(tid: usize, dest: usize) -> bool {
     if tid >= MAX_TASKS || dest >= MAX_TASKS {
         return false;
     }
-    if user_has_cap_bit(tid, crate::task::CAP_ENDPOINT) {
-        return true;
-    }
-    let bit = 1u64 << dest;
     let number = endpoint_of(dest);
+    if number == 0 {
+        return false;
+    }
     unsafe {
         match task_cspace(tid) {
             Some(cs) => cs.iter().any(|cap| {
-                let names_dest = match cap.cap_type {
-                    CapType::EndpointSet => cap.param0 & bit != 0,
-                    CapType::Endpoint => number != 0 && cap.param0 == number,
-                    _ => false,
-                };
-                names_dest && is_valid(cap)
+                cap.cap_type == CapType::Endpoint && cap.param0 == number && is_valid(cap)
             }),
             None => false,
         }
@@ -306,9 +294,9 @@ pub fn task_has_endpoint(tid: usize, dest: usize) -> bool {
 /// The number an `Endpoint` to `target` would record, if `caller` may mint
 /// one: `caller` is `target`, created it, or already holds a capability to it.
 ///
-/// That is ownership, not a special case. `EndpointSet` needed one — any task
-/// could add its own TID to a set — because a set could only be narrowed, and a
-/// server started at run time was in nobody's.
+/// That is ownership, not a special case. The TID sets this replaced needed
+/// one — any task could add its own TID to a set — because a set could only be
+/// narrowed, and a server started at run time was in nobody's.
 pub fn endpoint_to_mint(cspace: &CSpace, caller: usize, target: usize) -> Option<u64> {
     let number = endpoint_of(target);
     if number == 0 {
@@ -321,30 +309,6 @@ pub fn endpoint_to_mint(cspace: &CSpace, caller: usize, target: usize) -> Option
         Some(number)
     } else {
         None
-    }
-}
-
-/// Withdraw permission to send to `dead_tid` from every task.
-///
-/// TIDs are reused once a task is reaped, so an `EndpointSet` naming a dead
-/// service would otherwise silently transfer to whatever task next occupies
-/// that slot. An `Endpoint` needs none of this: its number died with the task. Permission to talk to a service dies with it; a new
-/// occupant requires a fresh grant.
-pub fn revoke_endpoints_to(dead_tid: usize) {
-    if dead_tid >= MAX_TASKS {
-        return;
-    }
-    let bit = 1u64 << dead_tid;
-    for tid in 0..MAX_TASKS {
-        unsafe {
-            if let Some(task) = crate::scheduler::get_task_mut(tid) {
-                for cap in task.cspace.iter_mut() {
-                    if cap.cap_type as u8 == CapType::EndpointSet as u8 {
-                        cap.param0 &= !bit;
-                    }
-                }
-            }
-        }
     }
 }
 
@@ -507,18 +471,9 @@ pub fn populate_from_bitmask(cspace: &mut CSpace, caps: u32) {
             };
         }
     }
-    if caps & crate::task::CAP_ENDPOINT != 0 {
-        if let Some(slot) = find_empty_slot(cspace) {
-            cspace[slot] = CapSlot {
-                cap_type: CapType::EndpointSet,
-                generation: 0,
-                root_slot: 0,
-                root_tid: KERNEL_ROOT_TID,
-                param0: u64::MAX, // every destination
-                param1: 0,
-            };
-        }
-    }
+    // `CAP_ENDPOINT` expands to nothing either. It was a set naming every
+    // task; an endpoint is minted for the task it names, by that task, its
+    // creator, or a holder.
     if caps & crate::task::CAP_SET_UID != 0 {
         if let Some(slot) = find_empty_slot(cspace) {
             cspace[slot] = CapSlot {
@@ -608,10 +563,6 @@ pub fn validate_attenuation(source: &CapSlot, new_type: CapType, new_p0: u64, ne
             }
         }
         CapType::SetUid => true,
-        CapType::EndpointSet => {
-            // The delegated destination set must be a subset of the source's.
-            new_p0 & !source.param0 == 0
-        }
         // One endpoint: the same one, or nothing.
         CapType::Endpoint => new_p0 == source.param0,
     }
@@ -628,31 +579,9 @@ pub fn revoke(tid: usize, slot: usize) {
 }
 
 /// Mint a new cap: find a source cap of the same type in the caller's CSpace
-/// that is a superset of the requested params.
-pub fn can_mint(
-    cspace: &CSpace,
-    self_tid: usize,
-    cap_type: CapType,
-    param0: u64,
-    param1: u64,
-) -> bool {
-    // A task may always authorise others to call *it*. That is not an
-    // escalation: it confers no authority over any third party, and the only
-    // task it exposes is the one granting it, which could ignore the messages
-    // anyway.
-    //
-    // Without this rule an EndpointSet can only ever be narrowed, and a server
-    // started at run time can never admit a client it spawned itself — its own
-    // TID is in nobody's destination set, because it did not exist when those
-    // sets were made. A compositor launching its session is exactly that case.
-    let param0 = if matches!(cap_type, CapType::EndpointSet) && self_tid < MAX_TASKS {
-        param0 & !(1u64 << self_tid)
-    } else {
-        param0
-    };
-    if matches!(cap_type, CapType::EndpointSet) && param0 == 0 {
-        return true; // nothing left but the self bit
-    }
+/// that is a superset of the requested params. An `Endpoint` is minted on
+/// ownership instead; see `endpoint_to_mint`.
+pub fn can_mint(cspace: &CSpace, cap_type: CapType, param0: u64, param1: u64) -> bool {
     cspace.iter().any(|cap| validate_attenuation(cap, cap_type, param0, param1))
 }
 

@@ -58,8 +58,8 @@ pub const CAP_IRQ: u32 = 1 << 2;
 pub const CAP_TASK_MGMT: u32 = 1 << 3;
 pub const CAP_PHYS_ALLOC: u32 = 1 << 4;
 pub const CAP_SET_UID: u32 = 1 << 5;
-/// Permission to originate IPC. Expands to an Endpoint capability naming every
-/// destination; narrower sets are minted with sys_cap_mint.
+/// Once permission to originate IPC to anybody. Confers nothing since ABI 2.0:
+/// an `Endpoint` names one task, and is minted for it.
 pub const CAP_ENDPOINT: u32 = 1 << 6;
 pub const CAP_ALL: u32 = CAP_IOPORT
     | CAP_MAP_PHYS
