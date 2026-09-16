@@ -1334,7 +1334,7 @@ fn start_session(name: &[u8], index: usize) -> Option<usize> {
     let _ = syscall::sys_cap_grant(info.tid, syscall::SLOT_ENDPOINT, syscall::SLOT_ENDPOINT);
     let me = syscall::sys_getpid() as u64;
     let slot = syscall::SLOT_ENDPOINT_EXTRA;
-    if syscall::sys_cap_mint(slot, syscall::CAP_TYPE_ENDPOINT, 1u64 << me, 0).is_ok() {
+    if syscall::sys_cap_mint(slot, syscall::CAP_TYPE_ENDPOINT_SET, 1u64 << me, 0).is_ok() {
         let _ = syscall::sys_cap_grant(info.tid, slot, slot);
         let _ = syscall::sys_cap_delete(slot);
     }

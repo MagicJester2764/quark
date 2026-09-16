@@ -910,7 +910,7 @@ fn test_lent_buffers() {
     };
     let t = t.tid();
     // The thread may call this task: an Endpoint naming it, from its creator.
-    let granted = syscall::sys_cap_mint(syscall::SLOT_SCRATCH, syscall::CAP_TYPE_ENDPOINT, 1u64 << me, 0)
+    let granted = syscall::sys_cap_mint(syscall::SLOT_SCRATCH, syscall::CAP_TYPE_ENDPOINT_SET, 1u64 << me, 0)
         .is_ok()
         && syscall::sys_cap_grant(t, syscall::SLOT_SCRATCH, syscall::SLOT_ENDPOINT).is_ok();
     let _ = syscall::sys_cap_delete(syscall::SLOT_SCRATCH);
@@ -952,6 +952,165 @@ fn test_lent_buffers() {
     check("both lending calls were answered", results & 3 == 3);
     check("an unwritable buffer cannot be lent for writing", results & 4 != 0);
     check("nothing is lent to a task nobody is calling", results & 8 != 0);
+}
+
+/// Slots for the endpoint checks. In the range a capability given without a
+/// slot lands in, clear of the fixed ones below 16.
+const SELF_SLOT: usize = 40;
+const STRANGER_SLOT: usize = 41;
+const CHILD_SLOT: usize = 42;
+const NEXT_CHILD_SLOT: usize = 43;
+const THREAD_SLOT: usize = 44;
+/// Never filled, so there is nothing in it to offer.
+const EMPTY_SLOT: usize = 45;
+/// The offering thread's own slots.
+const OFFER_SLOT: usize = 8;
+const HOLDER_SLOT: usize = 9;
+const FOREIGN_SLOT: usize = 10;
+
+fn mint_endpoint(slot: usize, tid: usize) -> bool {
+    syscall::sys_cap_mint(slot, syscall::CAP_TYPE_ENDPOINT, tid as u64, 0).is_ok()
+}
+
+/// Call `tid` and return the tag it answers with: None if the call cannot be
+/// made, or nobody answers within half a second.
+fn call_tag(tid: usize) -> Option<u64> {
+    use quark_rt::ipc::Message;
+    let mut reply = Message::empty();
+    match syscall::sys_call_timeout(tid, &Message::empty(), &mut reply, 50) {
+        syscall::CallOutcome::Replied => Some(reply.tag),
+        _ => None,
+    }
+}
+
+static OFFER_TO: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+static OFFER_GO: sync::Semaphore = sync::Semaphore::new(0);
+/// What the offering thread saw. Bit 0: holding a capability to main, it could
+/// mint another. 1: its offering call was answered. 2: it could not mint one
+/// to the nameserver, which it neither is, made, nor holds one for.
+static OFFER_RESULTS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// The client half of the offer checks: offers main a capability naming
+/// itself, with a call.
+extern "C" fn offerer() -> ! {
+    use quark_rt::ipc::Message;
+    // Not until main has given this thread the right to call it.
+    OFFER_GO.acquire();
+    let main = OFFER_TO.load(core::sync::atomic::Ordering::SeqCst);
+    let me = syscall::sys_getpid() as usize;
+    let mut results = 0;
+    if mint_endpoint(HOLDER_SLOT, main) {
+        results |= 1;
+    }
+    let ask = Message { sender: 0, tag: 1, data: [0; 6] };
+    let mut reply = Message::empty();
+    if mint_endpoint(OFFER_SLOT, me)
+        && syscall::sys_call_offer(main, &ask, &mut reply, OFFER_SLOT).is_ok()
+    {
+        results |= 2;
+    }
+    if !mint_endpoint(FOREIGN_SLOT, nameserver::NAMESERVER_TID) {
+        results |= 4;
+    }
+    OFFER_RESULTS.store(results, core::sync::atomic::Ordering::SeqCst);
+    syscall::sys_exit_code(0);
+}
+
+fn test_endpoint_objects() {
+    use quark_rt::ipc::Message;
+    println!("endpoints:");
+    let me = syscall::sys_getpid() as usize;
+    for slot in SELF_SLOT..=EMPTY_SLOT {
+        let _ = syscall::sys_cap_delete(slot);
+    }
+    // Minting for yourself is ownership; minting for a stranger is not.
+    check("a task may mint a capability to itself", mint_endpoint(SELF_SLOT, me));
+    check(
+        "but not to a task it did not make",
+        !mint_endpoint(STRANGER_SLOT, nameserver::NAMESERVER_TID),
+    );
+    check(
+        "and it records a number, not the task",
+        syscall::sys_cap_read(me, SELF_SLOT).is_ok_and(|c| {
+            c.cap_type == syscall::CAP_TYPE_ENDPOINT && c.param0 != me as u64 && c.valid
+        }),
+    );
+    let _ = syscall::sys_cap_delete(STRANGER_SLOT);
+
+    // A capability names a task, not the slot it ran in.
+    let Some(a) = load_child(&[b"dchild", b"serve"]) else {
+        check("start a child to call", false);
+        return;
+    };
+    let _ = a.start();
+    check("a creator may mint a capability to its child", mint_endpoint(CHILD_SLOT, a.tid));
+    let ask = Message::empty();
+    let mut reply = Message::empty();
+    check(
+        "offering an empty slot is refused",
+        syscall::sys_call_offer(a.tid, &ask, &mut reply, EMPTY_SLOT).is_err(),
+    );
+    check("the capability reaches the child", call_tag(a.tid) == Some(42));
+    check("the child answered and exited", wait_for(a.tid) == Some(0));
+    check("nobody can mint one to a task that is gone", !mint_endpoint(STRANGER_SLOT, a.tid));
+    let Some(b) = load_child(&[b"dchild", b"serve"]) else {
+        check("start a second child", false);
+        return;
+    };
+    let _ = b.start();
+    check("the next child takes the same slot", b.tid == a.tid);
+    check("and the old capability does not reach it", call_tag(b.tid).is_none());
+    check("a fresh one is minted", mint_endpoint(NEXT_CHILD_SLOT, b.tid));
+    // Giving a task an endpoint it already has costs nothing.
+    let first = syscall::sys_cap_grant_any(b.tid, NEXT_CHILD_SLOT);
+    let second = syscall::sys_cap_grant_any(b.tid, NEXT_CHILD_SLOT);
+    check("a grant to any slot lands at 16 or above", first.is_ok_and(|s| s >= 16));
+    check("and the same endpoint again lands in the same slot", first.is_ok() && first == second);
+    check("the fresh one reaches the child", call_tag(b.tid) == Some(42));
+    let _ = wait_for(b.tid);
+
+    // Offers: a capability travels with a call, and the task called takes it.
+    OFFER_TO.store(me, core::sync::atomic::Ordering::SeqCst);
+    let Ok(t) = thread::spawn_with_stack(offerer, 8) else {
+        check("start a thread to offer us a capability", false);
+        return;
+    };
+    let t = t.tid();
+    check(
+        "let the thread call us",
+        syscall::sys_cap_grant(t, SELF_SLOT, syscall::SLOT_ENDPOINT).is_ok(),
+    );
+    OFFER_GO.release();
+    let mut msg = Message::empty();
+    let arrived = syscall::sys_recv_timeout(t, &mut msg, 100).is_ok() && msg.tag == 1;
+    check("the offering call arrives", arrived);
+    if arrived {
+        let taken = syscall::sys_cap_take_any(t);
+        check("take what was offered", taken.is_ok_and(|s| s >= 16));
+        let taken = taken.unwrap_or(0);
+        check("a creator may mint a capability to its thread", mint_endpoint(THREAD_SLOT, t));
+        let number = |slot| syscall::sys_cap_read(me, slot).map(|c| (c.cap_type, c.param0));
+        check(
+            "and what was taken names the same task",
+            number(taken).is_ok() && number(taken) == number(THREAD_SLOT),
+        );
+        check("an offer is taken once", syscall::sys_cap_take_any(t).is_err());
+        check(
+            "and not from a task that is not calling",
+            syscall::sys_cap_take_any(nameserver::NAMESERVER_TID).is_err(),
+        );
+        let _ = syscall::sys_cap_delete(taken);
+        let _ = syscall::sys_reply(t, &Message::empty());
+    }
+    let _ = wait_for(t);
+    let results = OFFER_RESULTS.load(core::sync::atomic::Ordering::SeqCst);
+    check("a holder may mint another", results & 1 != 0);
+    check("the offering call was answered", results & 2 != 0);
+    check("a thread cannot mint one to a stranger", results & 4 != 0);
+
+    for slot in SELF_SLOT..=EMPTY_SLOT {
+        let _ = syscall::sys_cap_delete(slot);
+    }
 }
 
 static LOCK: sync::Mutex<u32> = sync::Mutex::new(0);
@@ -1227,6 +1386,7 @@ pub extern "C" fn _start() -> ! {
         ("spaces", test_across_address_spaces),
         ("spawn", test_spawned_memory),
         ("lend", test_lent_buffers),
+        ("endpoints", test_endpoint_objects),
         ("sync", test_sync),
         ("fpu", test_fpu),
         ("wire", test_wire),

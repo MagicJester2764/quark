@@ -25,6 +25,7 @@ pub const SYS_CALL_TIMEOUT: u64 = 20;
 pub const SYS_RECV_TIMEOUT: u64 = 21;
 pub const SYS_NOTIFY: u64 = 22;
 pub const SYS_CALL_LEND: u64 = 23;
+pub const SYS_CALL_OFFER: u64 = 24;
 pub const SYS_LENT_READ: u64 = 25;
 pub const SYS_LENT_WRITE: u64 = 26;
 
@@ -87,6 +88,7 @@ pub const SYS_GRANT_IOPORT: u64 = 87;
 pub const SYS_GRANT_IRQ: u64 = 88;
 pub const SYS_SET_USER_CAPS: u64 = 89;
 pub const SYS_GET_USER_CAPS: u64 = 90;
+pub const SYS_CAP_TAKE: u64 = 91;
 pub const SYS_CAP_READ: u64 = 92;
 
 // --- 0x60  task lifecycle and identity ---
@@ -429,6 +431,27 @@ pub fn sys_call_lend_rw(
     buf: &mut [u8],
 ) -> Result<(), ()> {
     call_lend(dest, msg, reply, buf.as_ptr(), buf.len(), LEND_READ | LEND_WRITE)
+}
+
+/// [`sys_call`], offering `dest` a copy of the capability in `slot`, which it
+/// may take with [`sys_cap_take`] before it replies. Offering an empty or
+/// revoked slot fails without calling.
+pub fn sys_call_offer(
+    dest: usize,
+    msg: &crate::ipc::Message,
+    reply: &mut crate::ipc::Message,
+    slot: usize,
+) -> Result<(), ()> {
+    let ret = unsafe {
+        syscall4(
+            SYS_CALL_OFFER,
+            dest as u64,
+            msg as *const _ as u64,
+            reply as *mut _ as u64,
+            slot as u64,
+        )
+    };
+    if ret == u64::MAX { Err(()) } else { Ok(()) }
 }
 
 /// Copy out of what `client` lent with the call being served, from `offset`.
@@ -1133,9 +1156,14 @@ pub const CAP_TYPE_IRQ: u64 = 3;
 pub const CAP_TYPE_TASK_MGMT: u64 = 4;
 pub const CAP_TYPE_PHYS_ALLOC: u64 = 5;
 pub const CAP_TYPE_SET_UID: u64 = 6;
-/// Endpoint: param0 is a bitmask of destination TIDs this task may
-/// sys_send / sys_call / sys_notify. Bit N = TID N.
-pub const CAP_TYPE_ENDPOINT: u64 = 7;
+/// A set of tasks this one may sys_send / sys_call / sys_notify: param0 is a
+/// bitmask of their TIDs, bit N = TID N. Deprecated since ABI 1.13; a set
+/// names TIDs, which outlive the tasks they were given to.
+pub const CAP_TYPE_ENDPOINT_SET: u64 = 7;
+/// One task this one may sys_send / sys_call / sys_notify. Minted by TID —
+/// by that task, its creator, or a holder of one — and recorded as the number
+/// of its endpoint, which no other task will ever have.
+pub const CAP_TYPE_ENDPOINT: u64 = 8;
 
 /// CSpace slot conventions shared by init, login and the shell.
 ///
@@ -1178,10 +1206,34 @@ pub fn sys_cap_read(tid: usize, slot: usize) -> Result<CapInfo, ()> {
     Ok(CapInfo { cap_type: out[0], param0: out[1], param1: out[2], valid: out[3] != 0 })
 }
 
+/// A destination slot meaning "wherever it fits", for [`sys_cap_grant_any`]
+/// and [`sys_cap_take_any`]. The kernel picks a slot from 16 up and says which.
+pub const ANY_SLOT: usize = usize::MAX - 1;
+
 /// Delegate a capability from src_slot to dest_tid's dest_slot.
 pub fn sys_cap_grant(dest_tid: usize, src_slot: usize, dest_slot: usize) -> Result<(), ()> {
     let ret = unsafe { syscall3(SYS_CAP_GRANT, dest_tid as u64, src_slot as u64, dest_slot as u64) };
     if ret == u64::MAX { Err(()) } else { Ok(()) }
+}
+
+/// Delegate the capability in `src_slot` to `dest_tid`, wherever it fits, and
+/// say where. An `Endpoint` it already holds is not copied again: the answer
+/// is the slot that one is in.
+pub fn sys_cap_grant_any(dest_tid: usize, src_slot: usize) -> Result<usize, ()> {
+    let ret = unsafe { syscall3(SYS_CAP_GRANT, dest_tid as u64, src_slot as u64, ANY_SLOT as u64) };
+    if ret == u64::MAX { Err(()) } else { Ok(ret as usize) }
+}
+
+/// Take the capability `caller` offered with the call being served, into
+/// `slot`. Only between receiving that call and answering it, and only once.
+pub fn sys_cap_take(caller: usize, slot: usize) -> Result<usize, ()> {
+    let ret = unsafe { syscall2(SYS_CAP_TAKE, caller as u64, slot as u64) };
+    if ret == u64::MAX { Err(()) } else { Ok(ret as usize) }
+}
+
+/// [`sys_cap_take`] into wherever it fits, as [`sys_cap_grant_any`] picks.
+pub fn sys_cap_take_any(caller: usize) -> Result<usize, ()> {
+    sys_cap_take(caller, ANY_SLOT)
 }
 
 /// Revoke a capability slot, invalidating all derived caps.

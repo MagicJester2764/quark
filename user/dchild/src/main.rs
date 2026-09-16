@@ -9,8 +9,9 @@
 //!
 //! Given `quit` it only exits, for counting how many programs a parent can
 //! run; given `orphan` it leaves a dead thread behind for the parent to check
-//! on.
+//! on; given `serve` it answers one call with 42.
 
+use quark_rt::ipc::{Message, TID_ANY};
 use quark_rt::manifest::CapReq;
 use quark_rt::{println, sync, syscall, thread};
 
@@ -56,6 +57,17 @@ pub extern "C" fn _start() -> ! {
         syscall::sys_exit_code(t.tid() as i32);
     }
 
+    // Answer one call, whoever makes it, with 42: something for the parent to
+    // reach, or to fail to reach.
+    if quark_rt::args::argv(1) == Some(&b"serve"[..]) {
+        let mut msg = Message::empty();
+        if syscall::sys_recv(TID_ANY, &mut msg).is_err() {
+            syscall::sys_exit_code(1);
+        }
+        let _ = syscall::sys_reply(msg.sender, &Message { sender: 0, tag: 42, data: [0; 6] });
+        syscall::sys_exit_code(0);
+    }
+
     // Wait for the parent's byte before answering, so this proves the stream
     // carries data in both directions between address spaces.
     let mut buf = [0u8; 8];
@@ -88,7 +100,7 @@ pub extern "C" fn _start() -> ! {
     // about the mint.
     let me = syscall::sys_getpid() as usize;
     let parent = syscall::sys_task_info(me).map(|(_, p, _)| p).unwrap_or(0);
-    let minted = syscall::sys_cap_mint(SCRATCH, syscall::CAP_TYPE_ENDPOINT, 1u64 << me, 0).is_ok();
+    let minted = syscall::sys_cap_mint(SCRATCH, syscall::CAP_TYPE_ENDPOINT_SET, 1u64 << me, 0).is_ok();
     let refused = syscall::sys_cap_grant(parent, SCRATCH, VICTIM_SLOT).is_err();
     unsafe {
         core::ptr::write_volatile(VERDICT as *mut u64, (minted && refused) as u64);

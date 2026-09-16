@@ -56,6 +56,9 @@ pub const SYS_RECV_TIMEOUT: u64 = 21;
 pub const SYS_NOTIFY: u64 = 22;
 /// `SYS_CALL`, lending the task called a buffer until it replies.
 pub const SYS_CALL_LEND: u64 = 23;
+/// `SYS_CALL`, offering the task called a copy of one capability, which it
+/// may take with `SYS_CAP_TAKE` until it replies.
+pub const SYS_CALL_OFFER: u64 = 24;
 /// Copy out of, or into, a buffer a caller lent with the call being served.
 pub const SYS_LENT_READ: u64 = 25;
 pub const SYS_LENT_WRITE: u64 = 26;
@@ -120,10 +123,17 @@ pub const SYS_GRANT_IOPORT: u64 = 87;
 pub const SYS_GRANT_IRQ: u64 = 88;
 pub const SYS_SET_USER_CAPS: u64 = 89;
 pub const SYS_GET_USER_CAPS: u64 = 90;
+/// Take the capability offered with the call being served.
+pub const SYS_CAP_TAKE: u64 = 91;
 /// One slot of a task's CSpace, whole: type, both parameters, and whether it
 /// is still valid. `SYS_CAP_INSPECT` truncates the parameters to sixteen bits
 /// and reads only the caller's own.
 pub const SYS_CAP_READ: u64 = 92;
+
+/// The destination slot for `SYS_CAP_GRANT` and `SYS_CAP_TAKE` that means
+/// "wherever it fits": the kernel picks one in `cap::RECEIVED` and returns it.
+/// Not `u64::MAX`, which is what a failed call returns.
+pub const ANY_SLOT: u64 = u64::MAX - 1;
 
 // --- 0x60  task lifecycle and identity ---
 pub const SYS_TASK_CREATE: u64 = 96;
@@ -196,7 +206,7 @@ pub const SYS_ABI_VERSION: u64 = 240;
 /// minor when calls are added. User space can refuse to run against a major it
 /// does not know, which is the point of exposing it at all.
 pub const ABI_VERSION_MAJOR: u64 = 1;
-pub const ABI_VERSION_MINOR: u64 = 12;
+pub const ABI_VERSION_MINOR: u64 = 13;
 
 /// Threads a task may make with no capability at all.
 ///
@@ -710,6 +720,42 @@ extern "C" fn syscall_dispatch(
             };
             let lent = crate::ipc::Lent { addr: arg3 as usize, len, access };
             match crate::ipc::sys_call_lend(dest, &msg, lent) {
+                Ok(reply) => {
+                    let _ua = crate::cpu::UserAccess::begin();
+                    unsafe { *reply_ptr = reply };
+                    0
+                }
+                Err(_) => u64::MAX,
+            }
+        }
+        SYS_CALL_OFFER => {
+            // arg0 = dest, arg1 = msg, arg2 = reply out, arg3 = slot offered
+            let caller = scheduler::current_tid();
+            let dest = arg0 as usize;
+            if !crate::cap::task_has_endpoint(caller, dest) {
+                return deny_ipc(caller, dest, b"call");
+            }
+            // Checked now, so that offering nothing is the caller's error and
+            // never reaches the server. The take checks again: the capability
+            // can be revoked while the call waits.
+            let slot = arg3 as usize;
+            let offered = slot < crate::cap::MAX_CAPS
+                && unsafe { scheduler::get_task_mut(caller) }
+                    .is_some_and(|t| crate::cap::slot_is_valid(&t.cspace[slot]));
+            if !offered {
+                return u64::MAX;
+            }
+            let msg_ptr = arg1 as *const crate::ipc::Message;
+            let reply_ptr = arg2 as *mut crate::ipc::Message;
+            let msg_size = core::mem::size_of::<crate::ipc::Message>() as u64;
+            if !validate_user_ptr(arg1, msg_size) || !validate_user_ptr_mut(arg2, msg_size) {
+                return u64::MAX;
+            }
+            let msg = {
+                let _ua = crate::cpu::UserAccess::begin();
+                unsafe { *msg_ptr }
+            };
+            match crate::ipc::sys_call_offer(dest, &msg, slot) {
                 Ok(reply) => {
                     let _ua = crate::cpu::UserAccess::begin();
                     unsafe { *reply_ptr = reply };
@@ -2178,7 +2224,8 @@ extern "C" fn syscall_dispatch(
                 4 => crate::cap::CapType::TaskMgmt,
                 5 => crate::cap::CapType::PhysAlloc,
                 6 => crate::cap::CapType::SetUid,
-                7 => crate::cap::CapType::Endpoint,
+                7 => crate::cap::CapType::EndpointSet,
+                8 => crate::cap::CapType::Endpoint,
                 _ => return u64::MAX,
             };
             let tid = scheduler::current_tid();
@@ -2187,11 +2234,20 @@ extern "C" fn syscall_dispatch(
                     Some(t) => t,
                     None => return u64::MAX,
                 };
-                // The caller must already hold a capability that covers what
-                // it is minting. This used to be skipped for UID 0.
-                if !crate::cap::can_mint(&task.cspace, tid, cap_type, param0, param1) {
+                let (param0, param1) = if cap_type == crate::cap::CapType::Endpoint {
+                    // Asked for by TID, recorded by the endpoint's number, and
+                    // minted on ownership rather than from a capability held.
+                    match crate::cap::endpoint_to_mint(&task.cspace, tid, param0 as usize) {
+                        Some(number) => (number, 0),
+                        None => return u64::MAX,
+                    }
+                } else if crate::cap::can_mint(&task.cspace, tid, cap_type, param0, param1) {
+                    // The caller already holds a capability that covers what
+                    // it is minting. This used to be skipped for UID 0.
+                    (param0, param1)
+                } else {
                     return u64::MAX;
-                }
+                };
                 // Target slot must be empty
                 if task.cspace[slot].cap_type as u8 != crate::cap::CapType::Empty as u8 {
                     return u64::MAX;
@@ -2211,12 +2267,16 @@ extern "C" fn syscall_dispatch(
             0
         }
         SYS_CAP_GRANT => {
-            // arg0 = dest_tid, arg1 = src_slot, arg2 = dest_slot
-            // Delegate cap to another task (with attenuation tracking)
+            // arg0 = dest_tid, arg1 = src_slot, arg2 = dest_slot or ANY_SLOT
+            // Delegate cap to another task (with attenuation tracking).
+            // Returns 0, or for ANY_SLOT the slot it is in.
             let dest_tid = arg0 as usize;
             let src_slot = arg1 as usize;
+            let any_slot = arg2 == ANY_SLOT;
             let dest_slot = arg2 as usize;
-            if src_slot >= crate::cap::MAX_CAPS || dest_slot >= crate::cap::MAX_CAPS {
+            if src_slot >= crate::cap::MAX_CAPS
+                || (!any_slot && dest_slot >= crate::cap::MAX_CAPS)
+            {
                 return u64::MAX;
             }
             let caller_tid = scheduler::current_tid();
@@ -2225,7 +2285,7 @@ extern "C" fn syscall_dispatch(
             //
             // A grant can never *raise* the destination's authority — it only
             // ever adds, and what it adds the granter already held. What it can
-            // do is fill sixteen slots, and a service that can no longer
+            // do is fill every slot, and a service that can no longer
             // receive a capability can no longer be handed the display, a file,
             // or an endpoint. Unrestricted, that is a denial of service any
             // task can perform on any other.
@@ -2275,34 +2335,69 @@ extern "C" fn syscall_dispatch(
                     Some(t) => t,
                     None => return u64::MAX,
                 };
+                if any_slot {
+                    let Some(slot) = crate::cap::receive_slot(&dest_task.cspace, &src_cap) else {
+                        return u64::MAX;
+                    };
+                    // An endpoint the destination already holds is not copied
+                    // again; the slot it is in is the answer.
+                    if dest_task.cspace[slot].cap_type == crate::cap::CapType::Empty {
+                        dest_task.cspace[slot] = crate::cap::derive(caller_tid, src_slot, &src_cap);
+                    }
+                    return slot as u64;
+                }
                 if dest_task.cspace[dest_slot].cap_type as u8 != crate::cap::CapType::Empty as u8 {
                     return u64::MAX;
                 }
-                // Derive: copy cap but track provenance for revocation
-                let kernel_minted = src_cap.root_tid == crate::cap::KERNEL_ROOT_TID;
-                let root_tid = if kernel_minted {
-                    // Kernel-minted cap: the granter becomes the root
-                    caller_tid as u8
-                } else {
-                    src_cap.root_tid
-                };
-                let root_slot = if kernel_minted {
-                    src_slot as u8
-                } else {
-                    src_cap.root_slot
-                };
-                let generation =
-                    crate::cap::current_generation(root_tid as usize, root_slot as usize);
-                dest_task.cspace[dest_slot] = crate::cap::CapSlot {
-                    cap_type: src_cap.cap_type,
-                    generation,
-                    root_slot,
-                    root_tid,
-                    param0: src_cap.param0,
-                    param1: src_cap.param1,
-                };
+                dest_task.cspace[dest_slot] = crate::cap::derive(caller_tid, src_slot, &src_cap);
             }
             0
+        }
+        SYS_CAP_TAKE => {
+            // arg0 = the caller whose offer to take, arg1 = slot or ANY_SLOT.
+            // Returns the slot it is in.
+            //
+            // A capability arrives in a server's CSpace only if the server
+            // takes it: an offer is the caller's, and it sits on the call until
+            // the call ends. Nothing can fill a server's slots uninvited.
+            let taker = scheduler::current_tid();
+            let client = arg0 as usize;
+            let any_slot = arg1 == ANY_SLOT;
+            let want = arg1 as usize;
+            if !any_slot && want >= crate::cap::MAX_CAPS {
+                return u64::MAX;
+            }
+            let Some(from) = crate::ipc::offered_to(client, taker) else {
+                return u64::MAX;
+            };
+            unsafe {
+                let offered = match scheduler::get_task_mut(client) {
+                    Some(t) => t.cspace[from],
+                    None => return u64::MAX,
+                };
+                if !crate::cap::slot_is_valid(&offered) {
+                    return u64::MAX;
+                }
+                let task = match scheduler::get_task_mut(taker) {
+                    Some(t) => t,
+                    None => return u64::MAX,
+                };
+                let slot = if any_slot {
+                    match crate::cap::receive_slot(&task.cspace, &offered) {
+                        Some(s) => s,
+                        None => return u64::MAX,
+                    }
+                } else if task.cspace[want].cap_type == crate::cap::CapType::Empty {
+                    want
+                } else {
+                    return u64::MAX;
+                };
+                if task.cspace[slot].cap_type == crate::cap::CapType::Empty {
+                    task.cspace[slot] = crate::cap::derive(client, from, &offered);
+                }
+                crate::ipc::withdraw_offer(client);
+                slot as u64
+            }
         }
         SYS_CAP_REVOKE => {
             // arg0 = slot

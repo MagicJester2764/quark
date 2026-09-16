@@ -96,6 +96,9 @@ struct TaskIpc {
     pending_msg: Option<Message>,
     /// What the task lent with the call it is making, while it is making it.
     lent: Option<Lent>,
+    /// The slot of the capability the task offered with the call it is
+    /// making, until the call ends or the task called takes it.
+    offer: Option<usize>,
 }
 
 const MAX_TASKS: usize = 64;
@@ -104,6 +107,7 @@ static mut TASK_IPC: [TaskIpc; MAX_TASKS] = {
         state: IpcState::None,
         pending_msg: None,
         lent: None,
+        offer: None,
     };
     [INIT; MAX_TASKS]
 };
@@ -130,6 +134,34 @@ pub fn lent_to(client: usize, server: usize) -> Option<(Lent, usize)> {
     };
     irq_restore(flags);
     out
+}
+
+/// The slot `client` offered with the call it is blocked in to `server`.
+///
+/// On the same terms as `lent_to`: only between `server` receiving the call and
+/// answering it, and only until the offer is taken.
+pub fn offered_to(client: usize, server: usize) -> Option<usize> {
+    if client >= MAX_TASKS {
+        return None;
+    }
+    let flags = irq_save();
+    let out = unsafe {
+        match TASK_IPC[client].state {
+            IpcState::CallBlocked(s) if s == server => TASK_IPC[client].offer,
+            _ => None,
+        }
+    };
+    irq_restore(flags);
+    out
+}
+
+/// `client`'s offer has been taken, and is not there to take again.
+pub fn withdraw_offer(client: usize) {
+    if client < MAX_TASKS {
+        let flags = irq_save();
+        unsafe { TASK_IPC[client].offer = None };
+        irq_restore(flags);
+    }
 }
 
 /// Per-task timeout deadline (PIT tick count). 0 = no timeout.
@@ -658,12 +690,18 @@ pub fn sys_recv(from: usize) -> Result<Message, IpcError> {
 
 /// Synchronous RPC: send a message and wait for a reply.
 pub fn sys_call(dest: usize, msg: &Message) -> Result<Message, IpcError> {
-    call_inner(dest, msg, 0, None)
+    call_inner(dest, msg, 0, None, None)
 }
 
 /// A call that lends `dest` a buffer until it replies.
 pub fn sys_call_lend(dest: usize, msg: &Message, lent: Lent) -> Result<Message, IpcError> {
-    call_inner(dest, msg, 0, Some(lent))
+    call_inner(dest, msg, 0, Some(lent), None)
+}
+
+/// A call that offers `dest` a copy of the capability in the caller's `slot`,
+/// for it to take before it replies or leave.
+pub fn sys_call_offer(dest: usize, msg: &Message, slot: usize) -> Result<Message, IpcError> {
+    call_inner(dest, msg, 0, None, Some(slot))
 }
 
 /// Synchronous call that gives up after `timeout_ticks`.
@@ -681,7 +719,7 @@ pub fn sys_call_timeout(
     msg: &Message,
     timeout_ticks: u64,
 ) -> Result<Message, IpcError> {
-    call_inner(dest, msg, timeout_ticks, None)
+    call_inner(dest, msg, timeout_ticks, None, None)
 }
 
 /// `timeout_ticks` of 0 means block indefinitely.
@@ -690,6 +728,7 @@ fn call_inner(
     msg: &Message,
     timeout_ticks: u64,
     lent: Option<Lent>,
+    offer: Option<usize>,
 ) -> Result<Message, IpcError> {
     if dest >= MAX_TASKS {
         return Err(IpcError::InvalidTid);
@@ -706,9 +745,10 @@ fn call_inner(
     unsafe {
         let mut to_send = *msg;
         to_send.sender = caller;
-        // Lent before either path can hand the message over: a server woken
-        // by it may look for the buffer before this task runs again.
+        // Lent and offered before either path can hand the message over: a
+        // server woken by it may look for them before this task runs again.
         TASK_IPC[caller].lent = lent;
+        TASK_IPC[caller].offer = offer;
 
         // Check if dest is recv-blocked
         let dest_state = TASK_IPC[dest].state;
@@ -760,8 +800,9 @@ fn call_inner(
     let flags = irq_save();
     let result = unsafe {
         TASK_TIMEOUT[caller] = 0;
-        // However the call ended, nothing is lent any more.
+        // However the call ended, nothing is lent or offered any more.
         TASK_IPC[caller].lent = None;
+        TASK_IPC[caller].offer = None;
         let reply = match TASK_IPC[caller].pending_msg.take() {
             Some(m) => m,
             None => {
@@ -1055,6 +1096,7 @@ pub fn cleanup_task_ipc(dead_tid: usize) {
         TASK_IPC[dead_tid].state = IpcState::None;
         TASK_IPC[dead_tid].pending_msg = None;
         TASK_IPC[dead_tid].lent = None;
+        TASK_IPC[dead_tid].offer = None;
         TASK_TIMEOUT[dead_tid] = 0;
         TASK_TIMED_OUT[dead_tid] = false;
         TASK_NOTIFY[dead_tid] = 0;

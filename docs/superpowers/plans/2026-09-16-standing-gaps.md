@@ -582,7 +582,7 @@ and the `PhysRange` known gap is gone.
 - Produces (kernel): `cap::endpoint_of(tid) -> u64` (0 = none); `CapType::Endpoint = 8` with `param0` the endpoint's number; `sys_cap_mint(slot, 8, tid, 0)` mints for `tid`'s endpoint if the caller is `tid`, created `tid`, or already holds one for it; `MAX_CAPS = 64`; `ANY_SLOT = u64::MAX - 1` for `SYS_CAP_GRANT`'s destination slot (returns the slot used; an `Endpoint` already held is not copied again); `SYS_CALL_OFFER` 24 `(dest, msg, reply out, slot)`; `SYS_CAP_TAKE` 91 `(caller, slot or ANY_SLOT)` → slot.
 - Produces (quark-rt): `ANY_SLOT`, `sys_cap_grant_any(dest, src_slot) -> Result<usize, ()>`, `sys_call_offer(dest, &Message, &mut Message, slot) -> Result<(), ()>`, `sys_cap_take(caller, slot) -> Result<usize, ()>`, `sys_cap_take_any(caller) -> Result<usize, ()>`.
 
-- [ ] **Step 1: The failing tests** — dchild gains `serve`: receive one call,
+- [x] **Step 1: The failing tests** — dchild gains `serve`: receive one call,
 reply tag 42, exit 0. dtest:
 
 ```rust
@@ -630,9 +630,9 @@ task not calling main fails. The any-slot check: two `sys_cap_grant_any` of the
 same child capability into the child return the same slot, and that slot is 16
 or above.
 
-- [ ] **Step 2: Run it** — it does not build (type 8, the new calls).
+- [x] **Step 2: Run it** — it does not build (type 8, the new calls).
 
-- [ ] **Step 3: Numbers** — in `cap.rs`:
+- [x] **Step 3: Numbers** — in `cap.rs`:
 
 ```rust
 /// Each task's endpoint, as a number no endpoint has had before or will again.
@@ -670,7 +670,7 @@ pub fn endpoint_of(tid: usize) -> u64 {
 slot; `reap_one` calls `close_endpoint` before `TASKS[i] = None`.
 `scheduler::parent_of(tid) -> Option<usize>`.
 
-- [ ] **Step 4: Type 8** — `CapType::EndpointSet = 7` (the old variant,
+- [x] **Step 4: Type 8** — `CapType::EndpointSet = 7` (the old variant,
 renamed, doc says deprecated) and `CapType::Endpoint = 8`.
 `task_has_endpoint(tid, dest)`: any valid slot that is a set with `dest`'s bit,
 or an `Endpoint` whose `param0` equals a non-zero `endpoint_of(dest)`.
@@ -679,13 +679,13 @@ or an `Endpoint` whose `param0` equals a non-zero `endpoint_of(dest)`.
 caller must be `tid`, `parent_of(tid)`, or hold a valid `Endpoint` with that
 number; the slot stores the number and `param1 = 0`.
 
-- [ ] **Step 5: Room** — `MAX_CAPS = 64`; `pub const RECEIVED: Range<usize> =
+- [x] **Step 5: Room** — `MAX_CAPS = 64`; `pub const RECEIVED: Range<usize> =
 16..MAX_CAPS`; `pub fn receive_slot(cs: &CSpace, cap: &CapSlot) -> Option<usize>`
 returns the slot of a valid `Endpoint` with the same number if there is one,
 else the first empty slot in `RECEIVED`. `SYS_CAP_GRANT` with `arg2 ==
 ANY_SLOT` uses it and returns the slot; an explicit slot still returns 0.
 
-- [ ] **Step 6: Offers** — `TaskIpc.offer: Option<usize>`, set by
+- [x] **Step 6: Offers** — `TaskIpc.offer: Option<usize>`, set by
 `sys_call_offer` like `lent`, cleared the same way;
 `ipc::take_offer(caller, taker) -> Option<usize>` returns and clears it when
 `caller` is `CallBlocked(taker)`. `SYS_CALL_OFFER` validates the slot holds a
@@ -694,12 +694,12 @@ taker exactly as `SYS_CAP_GRANT` derives (root provenance, current
 generation), into `receive_slot` for `ANY_SLOT` or the explicit empty slot, and
 returns the slot.
 
-- [ ] **Step 7: Wrappers and renames**; `check-abi.sh`; build.
+- [x] **Step 7: Wrappers and renames**; `check-abi.sh`; build.
 
-- [ ] **Step 8: Verify** — boot, `dtest`: every check passes (Tasks 3–6 made
+- [x] **Step 8: Verify** — boot, `dtest`: every check passes (Tasks 3–6 made
 Task 1's pass). The `runtests` suites and `wm` behave as before.
 
-- [ ] **Step 9: Document and commit** — `docs/abi.md`: rows 24, 91; type 8 and
+- [x] **Step 9: Document and commit** — `docs/abi.md`: rows 24, 91; type 8 and
 `ANY_SLOT` under capabilities; type 7 deprecated; `**Version 1.13.**`. Commit
 "Endpoints with numbers that are never reused".
 

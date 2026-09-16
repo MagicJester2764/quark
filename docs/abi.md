@@ -1,6 +1,6 @@
 # Quark syscall ABI
 
-**Version 1.12.** Query the running kernel with `SYS_ABI_VERSION` (240), which
+**Version 1.13.** Query the running kernel with `SYS_ABI_VERSION` (240), which
 returns `(major << 16) | minor`.
 
 This document is the contract between the Quark kernel and everything above it.
@@ -98,14 +98,18 @@ so it is built from calls that already existed.
 | 1.10 | `SYS_FD_DUP` (68) and `SYS_PIPE_FD_SET` (70) no longer need `TaskMgmt` when the target is the caller, and both accept `u64::MAX - 1` for "any free descriptor" and return the number they took. Putting a descriptor into somebody else's table hands them something they never asked for; putting one into your own is `dup` and `pipe`, which every C library calls and which confer nothing. Also: `sys_cap_grant` (81) requires `TaskMgmt` over the destination, or the destination's consent — either a `sys_call` to the granter in progress, or a standing `Endpoint` naming it. Unrestricted, any task could fill any other's sixteen CSpace slots and leave it unable to be handed a display again. |
 | 1.11 | `SYS_ADDRSPACE_GIVE` (43) — move pages of the caller's own memory into an address space it made, which owns them from then on and frees them with itself. `SYS_ADDRSPACE_MAP` (37) is deprecated in its favour: every program a spawner loaded with it stayed allocated until the spawner exited. Also: `SYS_WAIT` (4) reaps the child it returns, so its memory is free, and its TID may be reused, by the time the call returns. A child used to be reaped only when the machine next went idle, which a parent running programs back to back never let it do. |
 | 1.12 | `SYS_CALL_LEND` (23), `SYS_LENT_READ` (25), `SYS_LENT_WRITE` (26) — a call can lend the task it calls a buffer, which that task copies into and out of through the kernel until it replies. `SYS_CAP_READ` (92) — read one slot of a task's CSpace whole, for any task the caller manages. Also: the `CAP_MAP_PHYS` bit, per task or per user, confers nothing, and init starts with `PhysRange` capabilities over the framebuffer and its boot modules instead of all of memory. |
+| 1.13 | Capability type 8, `Endpoint`: permission to call one task, recorded as the number of that task's endpoint, which no other task will ever have. `SYS_CALL_OFFER` (24) — a call can offer the task it calls a copy of one capability — and `SYS_CAP_TAKE` (91), which takes it. `SYS_CAP_GRANT` (81) accepts `u64::MAX - 1` for "any slot" and returns the slot it used. A CSpace has 64 slots instead of 16. Type 7, the TID set, is renamed `EndpointSet` and deprecated. |
 
 A capability may only be minted from one the caller already holds, and only
-narrowed — with one exception. **An `Endpoint` naming only the caller may
-always be minted**, whoever they are. Admitting others to call you confers no
-authority over anybody else, and without it an `Endpoint` can only ever shrink:
-a server started at run time could never admit a client it spawned, because its
-own task ID is in nobody's destination set. It did not exist when those sets
-were made.
+narrowed — except an `Endpoint`, which is minted on ownership: **by the task it
+names, the task that created that one, or a task already holding one for it.**
+Admitting others to call you confers no authority over anybody else, and
+neither does a parent admitting others to call its child.
+
+The deprecated `EndpointSet` has an exception of its own: a set naming only the
+caller may always be minted. Without it a set could only ever shrink, and a
+server started at run time could never admit a client it spawned, because its
+own task ID was in nobody's set.
 
 Five calls are **deprecated as of 1.0** — the `CAP_*` object-capability calls
 (80–85) replace them:
@@ -126,24 +130,46 @@ worst of them, has conferred nothing since 1.12.
 `SYS_ADDRSPACE_GIVE` (43). The frames it maps into a child stay the spawner's,
 which is wrong both ways: they outlive the child, and die with the spawner.
 
+Capability type 7, `EndpointSet`, is **deprecated as of 1.13**, replaced by
+type 8, `Endpoint`. A set names tasks by TID, and a TID outlives its task: the
+kernel has to clear a dead task's bit from every set before its TID can be used
+again, and a set, only ever narrowed, cannot admit a task that did not exist
+when it was made.
+
 ## Capabilities
 
 Authority comes from capabilities, not from a privilege level — there is no
-UID 0 bypass in the kernel. Each task has a CSpace of 16 slots holding
+UID 0 bypass in the kernel. Each task has a CSpace of 64 slots holding
 `CapSlot { cap_type, generation, root_slot, root_tid, param0, param1 }`.
 
-| Type | param0 | param1 |
-|---|---|---|
-| `IoPort` | first port | last port |
-| `PhysRange` | first address | last address (page aligned) |
-| `Irq` | IRQ number (`0xFF` = any) | — |
-| `TaskMgmt` | target TID (`0` = any) | — |
-| `PhysAlloc` | max pages (`0` = unlimited) | — |
-| `SetUid` | — | — |
-| `Endpoint` | bitmask of destination TIDs | — |
+| # | Type | param0 | param1 |
+|---|---|---|---|
+| 1 | `IoPort` | first port | last port |
+| 2 | `PhysRange` | first address | last address (page aligned) |
+| 3 | `Irq` | IRQ number (`0xFF` = any) | — |
+| 4 | `TaskMgmt` | target TID (`0` = any) | — |
+| 5 | `PhysAlloc` | max pages (`0` = unlimited) | — |
+| 6 | `SetUid` | — | — |
+| 7 | `EndpointSet` *(deprecated)* | bitmask of destination TIDs | — |
+| 8 | `Endpoint` | the destination's endpoint number | — |
 
 Delegation may narrow a capability but never widen it; delegating at equal
 breadth is allowed, since a set is a subset of itself.
+
+**Endpoints.** Every task has an endpoint, with a number the kernel never gives
+to anything else, even once the task is gone. An `Endpoint` capability records
+that number, so it permits calling the task it was minted for and nothing that
+later has the same TID. `SYS_CAP_MINT` takes the destination's *TID* as param0
+and stores its number; `SYS_CAP_READ` shows the number. Numbers start at 64, so
+one cannot be mistaken for a TID. IPC still names its destination by TID: the
+number is what the check compares.
+
+**Slots.** Slots 0–15 are for what spawners and manifests place deliberately.
+A capability given without naming a slot — `SYS_CAP_GRANT` or `SYS_CAP_TAKE`
+with `u64::MAX - 1` — lands in the first empty slot from 16 up, and the call
+returns which. An `Endpoint` the receiver already holds, in any slot, is not
+copied again: the call returns the slot it is in, so asking for the same
+service twice costs nothing.
 
 ## The calls
 
@@ -189,6 +215,7 @@ Messages are fixed size: sender TID, a `u64` tag, and six `u64` payload words.
 | 21 | `SYS_RECV_TIMEOUT` | arg0 = from, arg1 = msg out, arg2 = ticks | 0 / `u64::MAX`. **Blocks** up to the deadline. | — |
 | 22 | `SYS_NOTIFY` | arg0 = dest, arg1 = badge | 0 / `u64::MAX` | `Endpoint` for dest |
 | 23 | `SYS_CALL_LEND` | arg0 = dest, arg1 = msg, arg2 = reply out, arg3 = buffer, arg4 = length \| access bits | as `SYS_CALL` | `Endpoint` for dest |
+| 24 | `SYS_CALL_OFFER` | arg0 = dest, arg1 = msg, arg2 = reply out, arg3 = slot | as `SYS_CALL`; `u64::MAX` without calling if the slot holds no valid capability | `Endpoint` for dest |
 | 25 | `SYS_LENT_READ` | arg0 = caller, arg1 = offset, arg2 = buffer out, arg3 = length | bytes copied / `u64::MAX` | the caller's call is being served |
 | 26 | `SYS_LENT_WRITE` | arg0 = caller, arg1 = offset, arg2 = buffer, arg3 = length | bytes copied / `u64::MAX` | as above |
 
@@ -214,6 +241,14 @@ sharing the caller's address space may have changed it in between.
 This is how a server fills or reads a client's buffer without mapping it, and
 so without any authority over physical memory. It replaces requests that named
 a physical page for the server to map.
+
+**Offering a capability with a call.** `SYS_CALL_OFFER` is `SYS_CALL` with one
+slot of the caller's CSpace on offer. The task called may copy it with
+`SYS_CAP_TAKE` between receiving the call and answering it, once; if it does
+not, nothing happens. This is how a client hands a server the right to call it
+back — a registration, a claim on the display — without the server's CSpace
+being open to anybody who wants to fill it. The copy is derived as a grant
+would derive it, so revoking the original revokes it too.
 
 Prefer `SYS_CALL_TIMEOUT` over `SYS_CALL` for any destination not known to be a
 running server. A TID is not a promise that anything is listening, and a plain
@@ -350,18 +385,19 @@ inherited, or the previous endpoint's reference is stranded.
 
 | # | Name | Arguments | Returns | Cap |
 |---|---|---|---|---|
-| 80 | `SYS_CAP_MINT` | arg0 = slot, arg1 = type, arg2 = param0, arg3 = param1 | 0 / `u64::MAX` | must already hold one covering it |
-| 81 | `SYS_CAP_GRANT` | arg0 = dest tid, arg1 = src slot, arg2 = dest slot | 0 / `u64::MAX` | — |
+| 80 | `SYS_CAP_MINT` | arg0 = slot, arg1 = type, arg2 = param0, arg3 = param1 | 0 / `u64::MAX` | must already hold one covering it; for an `Endpoint`, param0 is the destination's TID and the rule is ownership (above) |
+| 81 | `SYS_CAP_GRANT` | arg0 = dest tid, arg1 = src slot, arg2 = dest slot or `u64::MAX - 1` for any | 0, or the slot used when any; `u64::MAX` on failure | `TaskMgmt` over dest, or its consent |
 | 82 | `SYS_CAP_REVOKE` | arg0 = slot | 0 / `u64::MAX` | must be the minter |
 | 83 | `SYS_CAP_INSPECT` | arg0 = slot | packed descriptor | — |
 | 84 | `SYS_CAP_DELETE` | arg0 = slot | 0 / `u64::MAX` | — |
 | 85 | `SYS_CAP_TRANSFER` | arg0 = dest tid, arg1 = bits | 0 / `u64::MAX` | — |
+| 91 | `SYS_CAP_TAKE` | arg0 = caller, arg1 = slot or `u64::MAX - 1` for any | the slot used / `u64::MAX` | caller's `SYS_CALL_OFFER` to this task is being served |
 | 92 | `SYS_CAP_READ` | arg0 = tid, arg1 = slot, arg2 = out: four `u64`s — type, param0, param1, valid (1/0) | 0 / `u64::MAX` past the last slot | `TaskMgmt` over tid, unless tid is the caller |
 | 86–90 | *deprecated* | see the deprecation table above | | |
 
-`SYS_CAP_INSPECT` truncates parameters and cannot report a 64-bit destination
-set, so an `Endpoint` capability must be **delegated** with `SYS_CAP_GRANT`
-rather than read back and re-minted.
+`SYS_CAP_INSPECT` truncates parameters to sixteen bits, so it cannot report an
+`EndpointSet` or an `Endpoint`'s number. Delegate those with `SYS_CAP_GRANT`, or
+read them with `SYS_CAP_READ`.
 
 `SYS_CAP_READ` reports a slot whole, and for any task the caller manages. It
 exists so that "no task may map more than its device" is something a test can
@@ -389,7 +425,7 @@ cannot resurrect a revoked capability in practice.
 There is no fork or exec. A parent creates a task, builds its address space,
 loads its image, sets its arguments and capabilities, then starts it. TIDs are
 reused once a task is reaped, so a TID identifies a task only for as long as
-that task lives — see the note on `Endpoint` revocation below.
+that task lives — see the note on TID reuse below.
 
 `SYS_GET_TUID` exists for servers doing permission checks on behalf of a
 caller: the VFS uses it to evaluate file modes against the requester.
@@ -578,8 +614,9 @@ zero; a program older than it never reads that far.
 
 **TID reuse.** Reaping returns a task slot to the pool, so TIDs are recycled.
 Anything that names a task by number must cope with the name changing meaning:
-the kernel clears a dead TID's bit from every `Endpoint` capability for exactly
-this reason. Do not cache a TID across the lifetime of the task it named.
+the kernel clears a dead TID's bit from every `EndpointSet` for exactly this
+reason, and an `Endpoint` records a number that is never reused instead. Do not
+cache a TID across the lifetime of the task it named.
 
 **Threads are tasks.** A thread is a task created in its creator's own address
 space (`SYS_TASK_CREATE` then `SYS_TASK_START_ARG`), with its own FS base

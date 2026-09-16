@@ -368,7 +368,7 @@ fn service_mask() -> u64 {
 
 /// Give `tid` permission to send to the current service set.
 fn grant_endpoints(tid: usize, slot: usize) {
-    mint_and_grant(tid, slot, syscall::CAP_TYPE_ENDPOINT, service_mask(), 0);
+    mint_and_grant(tid, slot, syscall::CAP_TYPE_ENDPOINT_SET, service_mask(), 0);
 }
 
 /// Mint a cap in a temporary slot, grant it to a child task, then delete it.
@@ -886,7 +886,7 @@ pub extern "C" fn _start() -> ! {
                     mint_and_grant(
                         tid,
                         syscall::SLOT_ENDPOINT_EXTRA,
-                        syscall::CAP_TYPE_ENDPOINT,
+                        syscall::CAP_TYPE_ENDPOINT_SET,
                         final_mask,
                         0,
                     );

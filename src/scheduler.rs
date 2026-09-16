@@ -154,6 +154,7 @@ pub fn spawn(entry_fn: fn()) -> usize {
                 continue;
             }
             TASKS[tid] = Some(task);
+            crate::cap::open_endpoint(tid);
             enqueue(tid);
         }
         irq_restore(flags);
@@ -936,6 +937,8 @@ unsafe fn reap_one(i: usize) -> u64 { unsafe {
     // Clean up wait state if this task was a parent
     WAIT_BLOCKED[i] = false;
     WAIT_RESULT[i] = 0;
+    // Every capability to it names nothing from here on, whoever holds one.
+    crate::cap::close_endpoint(i);
     TASKS[i] = None;
 
     // Left naming this TID, its children would wait on a parent that is gone,
@@ -1058,6 +1061,22 @@ pub fn task_cr3(tid: usize) -> usize {
     read_cr3_of(tid)
 }
 
+/// The task that created `tid`, while both exist.
+///
+/// Reaping a task orphans its children, so a TID that has been given to
+/// somebody else is never mistaken for their creator.
+pub fn parent_of(tid: usize) -> Option<usize> {
+    if tid >= MAX_TASKS {
+        return None;
+    }
+    unsafe {
+        match TASKS[tid].as_ref() {
+            Some(t) if t.parent_tid != 0 => Some(t.parent_tid),
+            _ => None,
+        }
+    }
+}
+
 /// How many live tasks `tid` has created.
 ///
 /// The bound on making threads without any authority: a task may make itself
@@ -1132,6 +1151,7 @@ pub fn create_empty_task() -> Option<usize> {
             // stranger: it can already read the memory, but not the moment.
             fpu: crate::fpu::clean(),
         });
+        crate::cap::open_endpoint(tid);
     }
     irq_restore(flags);
 
