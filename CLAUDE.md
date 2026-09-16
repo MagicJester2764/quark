@@ -238,10 +238,12 @@ Three things to know before changing any of it:
   four-megabyte copy, which a client committing a dozen times a second turns
   into a compositor with no time left to read the keyboard. `wm` clips every
   drawing primitive to a region and copies only that region out.
-- **Events are pulled, not pushed.** A server cannot originate IPC to a program
-  it spawned: `sys_send`/`sys_call` need an `Endpoint` naming the destination,
-  and a TID that did not exist at spawn time cannot be minted into one. A reply
-  needs no capability, so every hop here is the client asking.
+- **Events are pulled, not pushed.** A server calls a client only when the
+  client asked it to and handed over the right to — `fb` and the keyboard are
+  offered an `Endpoint` with the request that needs one. Otherwise it answers:
+  a call blocks until the client replies, so a slow client would stall the
+  server, and one that is itself calling the server would deadlock with it. A
+  reply needs no capability, so every other hop here is the client asking.
 
 ## Scheduling
 

@@ -154,9 +154,11 @@ fn claim_display() -> bool {
     };
     unsafe { FB_TID = fb };
 
+    // With the right to call this console on offer: the device has to be able
+    // to say when somebody else takes the display, and when it comes back.
     let msg = Message { sender: 0, tag: TAG_FB_CLAIM, data: [0; 6] };
     let mut reply = Message::empty();
-    if syscall::sys_call(fb, &msg, &mut reply).is_err() || reply.tag == TAG_FB_ERROR {
+    if syscall::sys_call_offer_self(fb, &msg, &mut reply).is_err() || reply.tag == TAG_FB_ERROR {
         println!("[console] the framebuffer would not give up the display");
         return false;
     }

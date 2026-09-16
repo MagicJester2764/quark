@@ -365,6 +365,8 @@ pub extern "C" fn _start() -> ! {
     let mut extended = false;
     let mut waiting_client: Option<usize> = None;
     let mut sigint_tid: usize = 0;
+    // Where the capability to notify it is.
+    let mut sigint_slot: usize = 0;
 
     let mut mousebuf = MouseBuffer::new();
     let mut mouse = MouseDecoder::new();
@@ -475,12 +477,20 @@ pub extern "C" fn _start() -> ! {
                     let _ = syscall::sys_reply(msg.sender, &reply);
                 }
                 TAG_REGISTER_SIGINT => {
-                    sigint_tid = msg.sender;
-                    let reply = Message {
-                        sender: 0,
-                        tag: 0,
-                        data: [0; 6],
+                    // Only with the right to tell it: the registration offers
+                    // one, and without it there is nobody this could notify.
+                    let tag = match syscall::sys_cap_take_any(msg.sender) {
+                        Ok(slot) => {
+                            if sigint_slot != 0 && sigint_slot != slot {
+                                let _ = syscall::sys_cap_delete(sigint_slot);
+                            }
+                            sigint_tid = msg.sender;
+                            sigint_slot = slot;
+                            0
+                        }
+                        Err(()) => u64::MAX,
                     };
+                    let reply = Message { sender: 0, tag, data: [0; 6] };
                     let _ = syscall::sys_reply(msg.sender, &reply);
                 }
                 quark_rt::ipc::TAG_PING => {

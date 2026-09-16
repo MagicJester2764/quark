@@ -909,8 +909,8 @@ fn test_lent_buffers() {
         return;
     };
     let t = t.tid();
-    // The thread may call this task: an Endpoint naming it, from its creator.
-    let granted = syscall::sys_cap_mint(syscall::SLOT_SCRATCH, syscall::CAP_TYPE_ENDPOINT_SET, 1u64 << me, 0)
+    // The thread may call this task: an Endpoint to it, from its creator.
+    let granted = syscall::sys_cap_mint(syscall::SLOT_SCRATCH, syscall::CAP_TYPE_ENDPOINT, me as u64, 0)
         .is_ok()
         && syscall::sys_cap_grant(t, syscall::SLOT_SCRATCH, syscall::SLOT_ENDPOINT).is_ok();
     let _ = syscall::sys_cap_delete(syscall::SLOT_SCRATCH);
@@ -963,6 +963,9 @@ const NEXT_CHILD_SLOT: usize = 43;
 const THREAD_SLOT: usize = 44;
 /// Never filled, so there is nothing in it to offer.
 const EMPTY_SLOT: usize = 45;
+/// A task nothing here made or holds a capability to. Not the nameserver:
+/// every program is handed one to that.
+const INIT_TID: usize = 1;
 /// The offering thread's own slots.
 const OFFER_SLOT: usize = 8;
 const HOLDER_SLOT: usize = 9;
@@ -987,7 +990,7 @@ static OFFER_TO: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsi
 static OFFER_GO: sync::Semaphore = sync::Semaphore::new(0);
 /// What the offering thread saw. Bit 0: holding a capability to main, it could
 /// mint another. 1: its offering call was answered. 2: it could not mint one
-/// to the nameserver, which it neither is, made, nor holds one for.
+/// to init, which it neither is, made, nor holds one for.
 static OFFER_RESULTS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
 /// The client half of the offer checks: offers main a capability naming
@@ -1009,7 +1012,7 @@ extern "C" fn offerer() -> ! {
     {
         results |= 2;
     }
-    if !mint_endpoint(FOREIGN_SLOT, nameserver::NAMESERVER_TID) {
+    if !mint_endpoint(FOREIGN_SLOT, INIT_TID) {
         results |= 4;
     }
     OFFER_RESULTS.store(results, core::sync::atomic::Ordering::SeqCst);
@@ -1026,8 +1029,12 @@ fn test_endpoint_objects() {
     // Minting for yourself is ownership; minting for a stranger is not.
     check("a task may mint a capability to itself", mint_endpoint(SELF_SLOT, me));
     check(
-        "but not to a task it did not make",
-        !mint_endpoint(STRANGER_SLOT, nameserver::NAMESERVER_TID),
+        "but not to a task it did not make and cannot call",
+        !mint_endpoint(STRANGER_SLOT, INIT_TID),
+    );
+    check(
+        "though it may to one it can call",
+        mint_endpoint(STRANGER_SLOT, nameserver::NAMESERVER_TID),
     );
     check(
         "and it records a number, not the task",
@@ -1111,6 +1118,52 @@ fn test_endpoint_objects() {
     for slot in SELF_SLOT..=EMPTY_SLOT {
         let _ = syscall::sys_cap_delete(slot);
     }
+}
+
+fn test_runtime_service() {
+    println!("a service started at run time:");
+    let Some(server) = load_child(&[b"dchild", b"register", b"dchild-svc"]) else {
+        check("start a service", false);
+        return;
+    };
+    let _ = server.start();
+    // Its registration is what makes it reachable, so wait for that.
+    let registered = (0..100).any(|_| {
+        nameserver::lookup(b"dchild-svc") == Some(server.tid) || {
+            syscall::sleep_ticks(1);
+            false
+        }
+    });
+    check("it registers", registered);
+    check(
+        "a second task cannot take its name",
+        nameserver::register(b"dchild-svc").is_err(),
+    );
+    let Some(client) = load_child(&[b"dchild", b"lookup", b"dchild-svc"]) else {
+        check("start a client", false);
+        return;
+    };
+    let _ = client.start();
+    // Whichever finishes first: collecting one must not throw the other away.
+    let (mut served, mut reached) = (None, None);
+    while served.is_none() || reached.is_none() {
+        match syscall::sys_wait() {
+            Ok((t, code)) if t == server.tid => served = Some(code),
+            Ok((t, code)) if t == client.tid => reached = Some(code),
+            Ok(_) => {}
+            Err(()) => break,
+        }
+    }
+    check("a program it was never introduced to reaches it by name", reached == Some(42));
+    check("and the service answered", served == Some(0));
+    let gone = (0..100).any(|_| {
+        nameserver::lookup(b"dchild-svc").is_none() || {
+            syscall::sleep_ticks(1);
+            false
+        }
+    });
+    check("its name goes with it", gone);
+    check("and can be taken again", nameserver::register(b"dchild-svc").is_ok());
 }
 
 static LOCK: sync::Mutex<u32> = sync::Mutex::new(0);
@@ -1387,6 +1440,7 @@ pub extern "C" fn _start() -> ! {
         ("spawn", test_spawned_memory),
         ("lend", test_lent_buffers),
         ("endpoints", test_endpoint_objects),
+        ("service", test_runtime_service),
         ("sync", test_sync),
         ("fpu", test_fpu),
         ("wire", test_wire),

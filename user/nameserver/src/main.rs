@@ -1,7 +1,16 @@
 #![no_std]
 #![no_main]
 
-use quark_rt::ipc::{Message, TID_ANY};
+//! Names for services, and the right to call them.
+//!
+//! A service registers by calling here with a capability to itself on offer —
+//! `nameserver::register` does that — and this server takes it and grants a
+//! copy to every program that looks the name up. For most programs that is the
+//! only way to reach a service at all: nothing else hands them the capability.
+//! A registration without one is refused, and so is one for a name a live task
+//! already holds. Registrants are watched, and their names go when they do.
+
+use quark_rt::ipc::{Message, TAG_TASK_DIED, TID_ANY};
 use quark_rt::{println, syscall};
 
 // A server: programs are usually blocked waiting on this, so it runs
@@ -22,11 +31,106 @@ const TAG_NOT_FOUND: u64 = u64::MAX;
 
 const MAX_SERVICES: usize = 32;
 const NAME_LEN: usize = 24; // 3 x u64
+/// Where a capability is minted only to be compared, and deleted at once.
+const CHECK_SLOT: usize = syscall::SLOT_SCRATCH;
 
+#[derive(Clone, Copy)]
 struct ServiceEntry {
     name: [u8; NAME_LEN],
     name_len: usize,
     tid: usize,
+    /// The capability to call it, which a lookup copies. 0 for this server's
+    /// own entry: a program asking here can call it already.
+    slot: usize,
+}
+
+type Services = [Option<ServiceEntry>; MAX_SERVICES];
+
+fn find(services: &Services, name: &[u8; NAME_LEN], len: usize) -> Option<usize> {
+    services
+        .iter()
+        .position(|s| s.is_some_and(|e| e.name_len == len && e.name[..len] == name[..len]))
+}
+
+/// Does the capability in `slot` name `tid`, as `tid` is now?
+///
+/// Minting a capability by TID succeeds only for a task this server already
+/// holds one to, and records that task's current number. So comparing the two
+/// answers both "is what was offered the registrant's own?" and "is that task
+/// still the one it was?" — a TID can have been given to somebody else since.
+fn names(slot: usize, tid: usize) -> bool {
+    let me = syscall::sys_getpid() as usize;
+    let current = match syscall::sys_cap_mint(CHECK_SLOT, syscall::CAP_TYPE_ENDPOINT, tid as u64, 0)
+    {
+        Ok(()) => syscall::sys_cap_read(me, CHECK_SLOT).ok(),
+        Err(()) => None,
+    };
+    let _ = syscall::sys_cap_delete(CHECK_SLOT);
+    match (current, syscall::sys_cap_read(me, slot)) {
+        (Some(now), Ok(held)) => {
+            held.cap_type == syscall::CAP_TYPE_ENDPOINT && held.valid && held.param0 == now.param0
+        }
+        _ => false,
+    }
+}
+
+/// Let go of `slot` unless an entry still uses it.
+fn release(services: &Services, slot: usize) {
+    if slot != 0 && !services.iter().any(|s| s.is_some_and(|e| e.slot == slot)) {
+        let _ = syscall::sys_cap_delete(slot);
+    }
+}
+
+/// Record `sender` under `name`, with the capability its call offered.
+fn register(services: &mut Services, sender: usize, name: [u8; NAME_LEN], len: usize) -> bool {
+    // The capability has to be the caller's own. Anything else would be handed
+    // out under a name that is not its.
+    let Ok(slot) = syscall::sys_cap_take_any(sender) else {
+        return false;
+    };
+    if !names(slot, sender) {
+        release(services, slot);
+        return false;
+    }
+    if let Some(i) = find(services, &name, len) {
+        let Some(held) = services[i] else {
+            return false;
+        };
+        if held.slot == slot {
+            return true; // the holder, asking again
+        }
+        // A live holder keeps its name, and nobody takes this server's own.
+        if held.slot == 0 || names(held.slot, held.tid) {
+            release(services, slot);
+            return false;
+        }
+        // Its holder is gone and the news has not arrived yet.
+        services[i] = None;
+        release(services, held.slot);
+    }
+    let Some(free) = services.iter().position(|s| s.is_none()) else {
+        release(services, slot);
+        return false;
+    };
+    services[free] = Some(ServiceEntry { name, name_len: len, tid: sender, slot });
+    let _ = syscall::sys_task_watch(sender);
+    true
+}
+
+/// `dead` has exited: its names go, and the capability with them.
+fn forget(services: &mut Services, dead: usize) {
+    let mut slots = [0usize; MAX_SERVICES];
+    for (i, s) in services.iter_mut().enumerate() {
+        if let Some(e) = s {
+            if e.tid == dead && e.slot != 0 {
+                slots[i] = e.slot;
+                *s = None;
+            }
+        }
+    }
+    for slot in slots {
+        release(services, slot);
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -34,10 +138,7 @@ struct ServiceEntry {
 pub extern "C" fn _start() -> ! {
     println!("[nameserver] Started.");
 
-    let mut services: [Option<ServiceEntry>; MAX_SERVICES] = {
-        const NONE: Option<ServiceEntry> = None;
-        [NONE; MAX_SERVICES]
-    };
+    let mut services: Services = [None; MAX_SERVICES];
 
     // Register ourselves, so a reverse lookup of the nameserver's own TID
     // resolves like any other service. Nothing looks the nameserver up by
@@ -50,6 +151,7 @@ pub extern "C" fn _start() -> ! {
             name,
             name_len: b"nameserver".len(),
             tid: syscall::sys_getpid() as usize,
+            slot: 0,
         });
     }
 
@@ -61,21 +163,9 @@ pub extern "C" fn _start() -> ! {
 
         match msg.tag {
             TAG_REGISTER => {
-                let name = extract_name(&msg);
+                let (name, len) = extract_name(&msg);
                 let sender = msg.sender;
-
-                let mut registered = false;
-                for slot in services.iter_mut() {
-                    if slot.is_none() {
-                        *slot = Some(ServiceEntry {
-                            name: name.0,
-                            name_len: name.1,
-                            tid: sender,
-                        });
-                        registered = true;
-                        break;
-                    }
-                }
+                let registered = register(&mut services, sender, name, len);
 
                 let reply = Message {
                     sender: 0,
@@ -85,28 +175,24 @@ pub extern "C" fn _start() -> ! {
                 let _ = syscall::sys_reply(sender, &reply);
             }
             TAG_LOOKUP => {
-                let name = extract_name(&msg);
+                let (name, len) = extract_name(&msg);
                 let sender = msg.sender;
 
-                let mut found_tid = None;
-                for slot in services.iter() {
-                    if let Some(entry) = slot {
-                        if entry.name_len == name.1
-                            && entry.name[..entry.name_len] == name.0[..name.1]
-                        {
-                            found_tid = Some(entry.tid);
-                            break;
-                        }
-                    }
-                }
-
-                let reply = Message {
-                    sender: 0,
-                    tag: found_tid.map_or(TAG_NOT_FOUND, |t| t as u64),
-                    data: [0; 6],
+                // A TID is only useful with the right to call it, so the
+                // answer is the TID and a copy of the capability, or nothing.
+                let tag = match find(&services, &name, len).and_then(|i| services[i]) {
+                    Some(entry) if entry.slot == 0 => entry.tid as u64,
+                    Some(entry) => match syscall::sys_cap_grant_any(sender, entry.slot) {
+                        Ok(_) => entry.tid as u64,
+                        Err(()) => TAG_NOT_FOUND,
+                    },
+                    None => TAG_NOT_FOUND,
                 };
+                let reply = Message { sender: 0, tag, data: [0; 6] };
                 let _ = syscall::sys_reply(sender, &reply);
             }
+            // From the kernel, which is not waiting for an answer.
+            TAG_TASK_DIED => forget(&mut services, msg.data[0] as usize),
             TAG_LOOKUP_TID => {
                 let sender = msg.sender;
                 let want = msg.data[0] as usize;

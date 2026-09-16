@@ -14,7 +14,6 @@ const BOOT_IMG_BASE: usize = 0x85_0000_0000;
 /// Not `FILE_BUF_BASE`: the boot image path leaves its last program mapped
 /// there, and staging never maps over anything.
 const VFS_IMAGE_BASE: usize = 0x89_0000_0000;
-const NAMESERVER_TID: usize = 2;
 
 // ---------------------------------------------------------------------------
 // Boot info structures (matches kernel's BootInfo)
@@ -344,31 +343,21 @@ fn is_essential_elf(name: &[u8; 11]) -> bool {
         || base == b"NET     "
 }
 
-/// Set of TIDs that programs are allowed to originate IPC to.
+/// Where init keeps its capability to the nameserver. Every program it starts
+/// is given a copy, in the same slot.
+const NS_SLOT: usize = syscall::SLOT_ENDPOINT;
+/// Where init keeps its capability to the framebuffer device, which it has to
+/// call before the device has registered anywhere.
+const FB_SLOT: usize = syscall::SLOT_ENDPOINT_EXTRA;
+
+/// Give `tid` the right to call the nameserver.
 ///
-/// Grows as system services are spawned. Everything init starts gets an
-/// Endpoint capability carrying this mask, which is what lets a program reach
-/// the nameserver and the services — and nothing else. Two user programs are
-/// never in each other's mask, so they cannot talk to one another directly.
-static mut SERVICE_MASK: u64 = (1 << INIT_TID) | (1 << NAMESERVER_TID);
-
-/// init is always TID 1; NAMESERVER_TID is defined at the top of this file.
-const INIT_TID: usize = 1;
-
-/// Record `tid` as a system service reachable by everything init starts.
-fn add_service(tid: usize) {
-    if tid < 64 {
-        unsafe { SERVICE_MASK |= 1u64 << tid };
-    }
-}
-
-fn service_mask() -> u64 {
-    unsafe { SERVICE_MASK }
-}
-
-/// Give `tid` permission to send to the current service set.
-fn grant_endpoints(tid: usize, slot: usize) {
-    mint_and_grant(tid, slot, syscall::CAP_TYPE_ENDPOINT_SET, service_mask(), 0);
+/// That is the only endpoint a program needs to be given. It finds everything
+/// else by asking there, and an answer comes with the right to call what it
+/// names — so two programs can reach each other only through a name one of
+/// them registered.
+fn grant_endpoints(tid: usize) {
+    let _ = syscall::sys_cap_grant(tid, NS_SLOT, syscall::SLOT_ENDPOINT);
 }
 
 /// Mint a cap in a temporary slot, grant it to a child task, then delete it.
@@ -393,16 +382,16 @@ fn mint_and_grant(tid: usize, dest_slot: usize, cap_type: u64, param0: u64, para
 /// less simply cannot mint what it does not have, and the kernel enforces that
 /// rather than trusting the caller.
 fn grant_caps_from_manifest(image: &[u8], tid: usize) {
-    // Everything init starts may reach the service set. Without this no
-    // program could even look up a name, since the nameserver is itself an
-    // IPC destination.
-    grant_endpoints(tid, syscall::SLOT_ENDPOINT);
+    // Everything init starts may call the nameserver. Without this no program
+    // could even look up a name, since the nameserver is itself an IPC
+    // destination.
+    grant_endpoints(tid);
 
     quark_rt::manifest::grant_image(tid, image, MANIFEST_SCRATCH_SLOT);
 }
 
 /// Slot in init's own CSpace used to hold a capability while handing it over.
-/// Below SLOT_ENDPOINT_EXTRA (13) so it cannot tread on the endpoint sets.
+/// Below the slots init keeps its endpoints in, so it cannot tread on them.
 const MANIFEST_SCRATCH_SLOT: usize = 12;
 
 // (Disk-based FAT32 reader removed — init now uses VFS for disk files)
@@ -489,6 +478,13 @@ fn load_essentials_from_boot_image(rootfs_phys: usize, rootfs_size: usize) -> Bo
             if let Ok(data) = read_file_to_buffer(rootfs, &bpb, e.first_cluster, e.file_size) {
                 match spawn::load(data, &SPAWN_SCRATCH) {
                     Ok(info) => {
+                        // init made it, so init may mint the right to call it,
+                        // and everything below is handed a copy.
+                        if syscall::sys_cap_mint(NS_SLOT, syscall::CAP_TYPE_ENDPOINT, info.tid as u64, 0)
+                            .is_err()
+                        {
+                            println!("[init] no capability to the nameserver");
+                        }
                         // Every pass has to do this for itself; there is no
                         // shared path that does it for them. The nameserver
                         // asks for no capabilities, but it does ask to be
@@ -529,11 +525,13 @@ fn load_essentials_from_boot_image(rootfs_phys: usize, rootfs_size: usize) -> Bo
                         let (fb_base, fb_end) = framebuffer_range();
                         mint_and_grant(info.tid, 0, syscall::CAP_TYPE_PHYS_RANGE, fb_base, fb_end);
                         grant_caps_from_manifest(data, info.tid);
-                        add_service(info.tid);
-                        grant_endpoints(info.tid, syscall::SLOT_ENDPOINT);
                         let _ = spawn::set_args(&info, &[b"fb"], &SPAWN_SCRATCH);
                         fb_tid = info.tid;
                         let _ = info.start();
+                        // It learns the mode from init before it registers, so
+                        // this is the one call init cannot make with a
+                        // capability from a lookup.
+                        let _ = syscall::sys_cap_mint(FB_SLOT, syscall::CAP_TYPE_ENDPOINT, info.tid as u64, 0);
                         send_fb_info(info.tid);
                         println!("[init] Spawned fb (TID {})", info.tid);
                     }
@@ -556,8 +554,6 @@ fn load_essentials_from_boot_image(rootfs_phys: usize, rootfs_size: usize) -> Bo
                         // framebuffer device for the display, and is lent the
                         // right to map it for as long as it holds it.
                         grant_caps_from_manifest(data, info.tid);
-                        add_service(info.tid);
-                        grant_endpoints(info.tid, syscall::SLOT_ENDPOINT);
                         let _ = spawn::set_args(&info, &[b"qtty"], &SPAWN_SCRATCH);
                         // Create console pipe and set fds BEFORE starting console
                         // to avoid race where console reaches main loop before fd 0 is set
@@ -617,7 +613,6 @@ fn load_essentials_from_boot_image(rootfs_phys: usize, rootfs_size: usize) -> Bo
             match spawn::load(data, &SPAWN_SCRATCH) {
                 Ok(info) => {
                     let tid = info.tid;
-                    add_service(tid);
                     grant_caps_from_manifest(data, tid);
                     if console_pipe != 0 {
                         let _ = syscall::sys_pipe_fd_set(tid, 1, console_pipe, true);
@@ -654,7 +649,6 @@ fn load_essentials_from_boot_image(rootfs_phys: usize, rootfs_size: usize) -> Bo
                         // with an empty CSpace — invisible while UID 0 bypassed
                         // every check. Each pass must grant; there is no shared
                         // path that does it for them.
-                        add_service(info.tid);
                         grant_caps_from_manifest(data, info.tid);
                         if console_pipe != 0 {
                             let _ = syscall::sys_pipe_fd_set(info.tid, 1, console_pipe, true);
@@ -686,7 +680,6 @@ fn load_essentials_from_boot_image(rootfs_phys: usize, rootfs_size: usize) -> Bo
             if let Ok(data) = read_file_to_buffer(rootfs, &bpb, e.first_cluster, e.file_size) {
                 match spawn::load(data, &SPAWN_SCRATCH) {
                     Ok(info) => {
-                        add_service(info.tid);
                         grant_caps_from_manifest(data, info.tid);
                         if console_pipe != 0 {
                             let _ = syscall::sys_pipe_fd_set(info.tid, 1, console_pipe, true);
@@ -876,23 +869,6 @@ pub extern "C" fn _start() -> ! {
             };
 
             // Phase 4: Start non-essential programs
-            // Services are started as they are spawned, so an early one holds a
-            // mask that predates its peers. Hand every service a second
-            // Endpoint capability carrying the completed set; task_has_endpoint
-            // takes the union across a CSpace, so this only ever widens.
-            let final_mask = service_mask();
-            for tid in 0..64usize {
-                if tid > NAMESERVER_TID && final_mask & (1u64 << tid) != 0 {
-                    mint_and_grant(
-                        tid,
-                        syscall::SLOT_ENDPOINT_EXTRA,
-                        syscall::CAP_TYPE_ENDPOINT_SET,
-                        final_mask,
-                        0,
-                    );
-                }
-            }
-
             println!("[init] All programs loaded. Starting deferred tasks.");
             deferred.start_sequentially();
 

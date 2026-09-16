@@ -27,6 +27,11 @@
 //!                          revoke, mint, grant
 //!     wm <--- mode -------
 //! ```
+//!
+//! Telling them takes the right to call them, which nothing else gives this
+//! server: a claim is made with a capability to the claimant on offer, and a
+//! claim without one is refused. It is kept for as long as the claimant owns
+//! the display or is next in line for it.
 
 use quark_rt::ipc::{Message, TAG_TASK_DIED, TID_ANY};
 use quark_rt::{nameserver, println, syscall};
@@ -107,6 +112,32 @@ static mut MODE: Mode = Mode {
 /// stack would be inventing a policy nothing has asked for.
 static mut OWNER: usize = 0;
 static mut PREVIOUS: usize = 0;
+/// Where the capability to call each of them is, or 0.
+static mut OWNER_SLOT: usize = 0;
+static mut PREVIOUS_SLOT: usize = 0;
+
+/// Delete `slot` unless the owner or the one before still needs it.
+fn drop_slot(slot: usize) {
+    unsafe {
+        if slot != 0 && slot != OWNER_SLOT && slot != PREVIOUS_SLOT {
+            let _ = syscall::sys_cap_delete(slot);
+        }
+    }
+}
+
+/// Nobody has the display, or is waiting for it; returns who was waiting.
+fn clear_owners() -> (usize, usize) {
+    unsafe {
+        let back = (PREVIOUS, PREVIOUS_SLOT);
+        let gone = OWNER_SLOT;
+        OWNER = 0;
+        PREVIOUS = 0;
+        OWNER_SLOT = 0;
+        PREVIOUS_SLOT = 0;
+        drop_slot(gone);
+        back
+    }
+}
 
 fn mode_reply() -> Message {
     let m = unsafe { &MODE };
@@ -133,11 +164,16 @@ fn ok() -> Message {
 }
 
 /// Give the display to `back`, which had it before, and tell it the mode.
-fn hand_back(back: usize) {
+/// `slot` holds the capability to call it.
+fn hand_back((back, slot): (usize, usize)) {
     if back == 0 || !lease_to(back) {
+        drop_slot(slot);
         return;
     }
-    unsafe { OWNER = back };
+    unsafe {
+        OWNER = back;
+        OWNER_SLOT = slot;
+    }
     let _ = syscall::sys_task_watch(back);
     println!("[fb] display returned to tid {}", back);
     let msg = mode_reply();
@@ -232,13 +268,20 @@ pub extern "C" fn _start() -> ! {
                 let owner = unsafe { OWNER };
                 if owner == sender {
                     mode_reply() // already theirs
-                } else {
+                } else if let Ok(slot) = syscall::sys_cap_take_any(sender) {
+                    let dropped = unsafe { PREVIOUS_SLOT };
                     if owner != 0 {
                         take_back();
-                        unsafe { PREVIOUS = owner };
+                        unsafe {
+                            PREVIOUS = owner;
+                            PREVIOUS_SLOT = OWNER_SLOT;
+                        }
                     }
-                    if lease_to(sender) {
-                        unsafe { OWNER = sender };
+                    let reply = if lease_to(sender) {
+                        unsafe {
+                            OWNER = sender;
+                            OWNER_SLOT = slot;
+                        }
                         // A program that dies still holding the display would
                         // otherwise keep it for good: revocation stops it
                         // mapping the framebuffer again, but nothing gives the
@@ -247,9 +290,18 @@ pub extern "C" fn _start() -> ! {
                         println!("[fb] display claimed by tid {}", sender);
                         mode_reply()
                     } else {
-                        unsafe { OWNER = 0 };
+                        unsafe {
+                            OWNER = 0;
+                            OWNER_SLOT = 0;
+                        }
                         error()
-                    }
+                    };
+                    drop_slot(dropped);
+                    drop_slot(slot);
+                    reply
+                } else {
+                    // Nothing to tell it with when somebody else claims.
+                    error()
                 }
             }
 
@@ -258,11 +310,7 @@ pub extern "C" fn _start() -> ! {
                     error()
                 } else {
                     let _ = syscall::sys_cap_revoke(LEASE_SLOT);
-                    let back = unsafe { PREVIOUS };
-                    unsafe {
-                        OWNER = 0;
-                        PREVIOUS = 0;
-                    }
+                    let back = clear_owners();
                     // Answer the releaser before telling the next owner: they
                     // are waiting on this reply, and handing the display over
                     // is a call of its own.
@@ -280,7 +328,10 @@ pub extern "C" fn _start() -> ! {
                 let dead = msg.data[0] as usize;
                 unsafe {
                     if PREVIOUS == dead {
+                        let slot = PREVIOUS_SLOT;
                         PREVIOUS = 0;
+                        PREVIOUS_SLOT = 0;
+                        drop_slot(slot);
                     }
                     if OWNER != dead {
                         continue;
@@ -288,11 +339,7 @@ pub extern "C" fn _start() -> ! {
                 }
                 println!("[fb] tid {} died holding the display", dead);
                 let _ = syscall::sys_cap_revoke(LEASE_SLOT);
-                let back = unsafe { PREVIOUS };
-                unsafe {
-                    OWNER = 0;
-                    PREVIOUS = 0;
-                }
+                let back = clear_owners();
                 hand_back(back);
                 continue; // the kernel is not waiting for a reply
             }

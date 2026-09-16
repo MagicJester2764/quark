@@ -454,6 +454,24 @@ pub fn sys_call_offer(
     if ret == u64::MAX { Err(()) } else { Ok(()) }
 }
 
+/// [`sys_call`], offering `dest` the right to call this task back.
+///
+/// A server that only ever answers needs nothing of the kind. One that has to
+/// tell a client something unprompted — the display is going, Ctrl-C was
+/// pressed — does, and this is the only way it gets it: the capability is
+/// minted into [`SLOT_SCRATCH`] for the length of the call.
+pub fn sys_call_offer_self(
+    dest: usize,
+    msg: &crate::ipc::Message,
+    reply: &mut crate::ipc::Message,
+) -> Result<(), ()> {
+    let me = sys_getpid();
+    sys_cap_mint(SLOT_SCRATCH, CAP_TYPE_ENDPOINT, me, 0)?;
+    let called = sys_call_offer(dest, msg, reply, SLOT_SCRATCH);
+    let _ = sys_cap_delete(SLOT_SCRATCH);
+    called
+}
+
 /// Copy out of what `client` lent with the call being served, from `offset`.
 /// Only between receiving that call and answering it.
 pub fn sys_lent_read(client: usize, offset: usize, dst: &mut [u8]) -> Result<usize, ()> {
@@ -1167,12 +1185,12 @@ pub const CAP_TYPE_ENDPOINT: u64 = 8;
 
 /// CSpace slot conventions shared by init, login and the shell.
 ///
-/// The endpoint capability lives at a fixed slot so a parent can delegate it
-/// to a child with sys_cap_grant without having to know the mask it carries;
-/// sys_cap_inspect truncates params and cannot report a 64-bit set.
+/// Every program starts with a capability to the nameserver here, and a
+/// spawner passes its own on with sys_cap_grant. That one is enough: looking a
+/// service up is also how a program is given the right to call it.
 pub const SLOT_ENDPOINT: usize = 15;
-/// Second endpoint slot, used by init to top up services that were started
-/// before their peers existed.
+/// A second fixed slot for an endpoint a spawner hands over itself: the
+/// compositor puts one to itself here in each program it starts.
 pub const SLOT_ENDPOINT_EXTRA: usize = 13;
 /// Scratch slot used for the mint-grant-delete idiom.
 pub const SLOT_SCRATCH: usize = 14;

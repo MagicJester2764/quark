@@ -985,10 +985,11 @@ pub extern "C" fn _start() -> ! {
     unsafe { FB_TID = fb };
 
     // Take the display. Whoever had it — the text console, on a fresh boot —
-    // is told to stop before this returns.
+    // is told to stop before this returns, and this compositor will be told
+    // the same way, which is what the capability on offer is for.
     let claim = Message { sender: 0, tag: TAG_FB_CLAIM, data: [0; 6] };
     let mut reply = Message::empty();
-    if syscall::sys_call(fb, &claim, &mut reply).is_err() || reply.tag == TAG_ERROR {
+    if syscall::sys_call_offer_self(fb, &claim, &mut reply).is_err() || reply.tag == TAG_ERROR {
         println!("wm: could not claim the display");
         syscall::sys_exit_code(1);
     }
@@ -1328,13 +1329,12 @@ fn start_session(name: &[u8], index: usize) -> Option<usize> {
     };
     // A client needs no authority over anything — the memory it draws into is
     // memory this hands it — but it does need to be able to *ask*. Two grants:
-    // this compositor's own IPC reach, so it can find the nameserver, and
-    // permission to call this compositor, which nothing else can give it.
-    // A task's own destination bit is the one an Endpoint may always add.
+    // this compositor's capability to the nameserver, so it can find anything
+    // else, and one to this compositor, which any task may mint to itself.
     let _ = syscall::sys_cap_grant(info.tid, syscall::SLOT_ENDPOINT, syscall::SLOT_ENDPOINT);
-    let me = syscall::sys_getpid() as u64;
+    let me = syscall::sys_getpid();
     let slot = syscall::SLOT_ENDPOINT_EXTRA;
-    if syscall::sys_cap_mint(slot, syscall::CAP_TYPE_ENDPOINT_SET, 1u64 << me, 0).is_ok() {
+    if syscall::sys_cap_mint(slot, syscall::CAP_TYPE_ENDPOINT, me, 0).is_ok() {
         let _ = syscall::sys_cap_grant(info.tid, slot, slot);
         let _ = syscall::sys_cap_delete(slot);
     }

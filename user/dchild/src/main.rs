@@ -9,11 +9,13 @@
 //!
 //! Given `quit` it only exits, for counting how many programs a parent can
 //! run; given `orphan` it leaves a dead thread behind for the parent to check
-//! on; given `serve` it answers one call with 42.
+//! on; given `serve` it answers one call with 42, and given `register NAME` it
+//! does that under a name. `lookup NAME` calls whatever has that name and exits
+//! with the answer.
 
 use quark_rt::ipc::{Message, TID_ANY};
 use quark_rt::manifest::CapReq;
-use quark_rt::{println, sync, syscall, thread};
+use quark_rt::{nameserver, println, sync, syscall, thread};
 
 quark_rt::manifest!([CapReq::phys_alloc(16)]);
 
@@ -60,12 +62,27 @@ pub extern "C" fn _start() -> ! {
     // Answer one call, whoever makes it, with 42: something for the parent to
     // reach, or to fail to reach.
     if quark_rt::args::argv(1) == Some(&b"serve"[..]) {
-        let mut msg = Message::empty();
-        if syscall::sys_recv(TID_ANY, &mut msg).is_err() {
-            syscall::sys_exit_code(1);
+        serve_once();
+    }
+    if quark_rt::args::argv(1) == Some(&b"register"[..]) {
+        let name = quark_rt::args::argv(2).unwrap_or(b"");
+        if nameserver::register(name).is_err() {
+            syscall::sys_exit_code(2);
         }
-        let _ = syscall::sys_reply(msg.sender, &Message { sender: 0, tag: 42, data: [0; 6] });
-        syscall::sys_exit_code(0);
+        serve_once();
+    }
+    // Reach a service by name alone: nothing but the lookup gives this the
+    // right to call it.
+    if quark_rt::args::argv(1) == Some(&b"lookup"[..]) {
+        let name = quark_rt::args::argv(2).unwrap_or(b"");
+        let Some(tid) = nameserver::lookup(name) else {
+            syscall::sys_exit_code(2);
+        };
+        let mut reply = Message::empty();
+        match syscall::sys_call_timeout(tid, &Message::empty(), &mut reply, 100) {
+            syscall::CallOutcome::Replied => syscall::sys_exit_code(reply.tag as i32),
+            _ => syscall::sys_exit_code(3),
+        }
     }
 
     // Wait for the parent's byte before answering, so this proves the stream
@@ -92,15 +109,14 @@ pub extern "C" fn _start() -> ! {
     // It holds no TaskMgmt at all — its manifest asks for phys_alloc and
     // nothing else — and its parent is not calling it, so the answer must be
     // no. A grant can never *raise* anyone's authority, since it only ever
-    // adds; what it can do is fill sixteen slots, and a service that can no
+    // adds; what it can do is fill every slot, and a service that can no
     // longer be handed a capability can no longer be handed the display.
     //
-    // An Endpoint naming only the caller is the one capability anybody may
-    // always mint, which is what makes this test about the grant rather than
-    // about the mint.
+    // An Endpoint to itself is a capability any task may mint, which is what
+    // makes this test about the grant rather than about the mint.
     let me = syscall::sys_getpid() as usize;
     let parent = syscall::sys_task_info(me).map(|(_, p, _)| p).unwrap_or(0);
-    let minted = syscall::sys_cap_mint(SCRATCH, syscall::CAP_TYPE_ENDPOINT_SET, 1u64 << me, 0).is_ok();
+    let minted = syscall::sys_cap_mint(SCRATCH, syscall::CAP_TYPE_ENDPOINT, me as u64, 0).is_ok();
     let refused = syscall::sys_cap_grant(parent, SCRATCH, VICTIM_SLOT).is_err();
     unsafe {
         core::ptr::write_volatile(VERDICT as *mut u64, (minted && refused) as u64);
@@ -121,6 +137,17 @@ pub extern "C" fn _start() -> ! {
         *held += 1;
     }
     println!("[dchild] sent, and took the shared lock");
+    syscall::sys_exit_code(0);
+}
+
+/// Answer one call, from anybody, with 42, and exit. Waits five seconds at
+/// most, so a parent whose caller never came is not left waiting for good.
+fn serve_once() -> ! {
+    let mut msg = Message::empty();
+    if syscall::sys_recv_timeout(TID_ANY, &mut msg, 500).is_err() {
+        syscall::sys_exit_code(1);
+    }
+    let _ = syscall::sys_reply(msg.sender, &Message { sender: 0, tag: 42, data: [0; 6] });
     syscall::sys_exit_code(0);
 }
 

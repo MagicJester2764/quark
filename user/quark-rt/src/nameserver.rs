@@ -36,6 +36,10 @@ fn pack_name(name: &[u8]) -> [u64; 6] {
 }
 
 /// The TID registered under `name`, or `None` if nothing has registered it.
+///
+/// The answer comes with the right to call that task: the nameserver grants a
+/// capability to it, into a slot from 16 up, before it replies. A program is
+/// never introduced to a service any other way.
 pub fn lookup(name: &[u8]) -> Option<usize> {
     let msg = Message { sender: 0, tag: TAG_NS_LOOKUP, data: pack_name(name) };
     let mut reply = Message::empty();
@@ -67,10 +71,14 @@ pub fn lookup_retry(name: &[u8], attempts: usize) -> Option<usize> {
 }
 
 /// Register the calling task under `name`.
+///
+/// The call offers the nameserver a capability to this task, which is what it
+/// hands a copy of to everybody who looks the name up; it refuses a
+/// registration without one. It also refuses a name another live task holds.
 pub fn register(name: &[u8]) -> Result<(), ()> {
     let msg = Message { sender: 0, tag: TAG_NS_REGISTER, data: pack_name(name) };
     let mut reply = Message::empty();
-    match syscall::sys_call(NAMESERVER_TID, &msg, &mut reply) {
+    match syscall::sys_call_offer_self(NAMESERVER_TID, &msg, &mut reply) {
         Ok(()) if reply.tag != u64::MAX => Ok(()),
         _ => Err(()),
     }

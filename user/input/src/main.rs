@@ -457,6 +457,8 @@ fn pack_read_reply(buf: &[u8], len: usize) -> Message {
     }
 }
 
+/// Ask the keyboard to say when Ctrl-C is pressed, which it does by calling
+/// here — so the request carries the right to.
 fn register_sigint(kbd_tid: usize) {
     let msg = Message {
         sender: 0,
@@ -464,7 +466,7 @@ fn register_sigint(kbd_tid: usize) {
         data: [0; 6],
     };
     let mut reply = Message::empty();
-    let _ = syscall::sys_call(kbd_tid, &msg, &mut reply);
+    let _ = syscall::sys_call_offer_self(kbd_tid, &msg, &mut reply);
 }
 
 fn handle_ctrl_c(foreground_tid: &mut usize, line_len: &mut usize) {

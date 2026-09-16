@@ -719,40 +719,40 @@ Task 1's pass). The `runtests` suites and `wm` behave as before.
 - Consumes: Task 7.
 - Produces: the nameserver protocol — `TAG_REGISTER` must offer a capability naming the registrant (else refused; a name held by a live task is refused too); `TAG_LOOKUP` grants the caller a copy into any slot before replying with the TID (and `TAG_NOT_FOUND` if the grant fails); registrants are watched and dropped when they die.
 
-- [ ] **Step 1: The failing test** — dchild `register NAME` registers and
+- [x] **Step 1: The failing test** — dchild `register NAME` registers and
 serves one call; `lookup NAME` looks up and exits with the reply tag. dtest
 starts `register dchild-svc`, waits until its own lookup succeeds (up to a
 second), starts `lookup dchild-svc`, and checks the exit status is 42 — a
 program reaching a service it was never introduced to. Against Task 7's tree it
 fails: nothing grants the capability.
 
-- [ ] **Step 2: The nameserver** — as in the interfaces; `sys_cap_take_any`,
+- [x] **Step 2: The nameserver** — as in the interfaces; `sys_cap_take_any`,
 `sys_cap_grant_any`, `sys_task_watch`, and `TAG_TASK_DIED` removes the entry and
 `sys_cap_delete`s its slot. The nameserver's own entry has no slot.
 
-- [ ] **Step 3: Registering** — `nameserver::register` mints a capability naming
+- [x] **Step 3: Registering** — `nameserver::register` mints a capability naming
 the caller into `SLOT_SCRATCH`, offers it with the call, and deletes it.
 
-- [ ] **Step 4: init** — `SERVICE_MASK`, `add_service`, `service_mask`, the
+- [x] **Step 4: init** — `SERVICE_MASK`, `add_service`, `service_mask`, the
 final top-up loop and `SLOT_ENDPOINT_EXTRA` use go. `grant_endpoints(tid,
 slot)` mints a capability to the nameserver (init created it) and grants it;
 every program gets that one in `SLOT_ENDPOINT`. init mints its own to the
 nameserver and to `fb` before calling either.
 
-- [ ] **Step 5: Calling back** — qtty and wm claim the display with
+- [x] **Step 5: Calling back** — qtty and wm claim the display with
 `sys_call_offer` of a capability naming themselves; fb takes it into any slot,
 keeps the slot for `OWNER` and `PREVIOUS`, and deletes a slot when its task is
 neither any more. input registers for Ctrl-C with an offer; the keyboard takes
 it and keeps the slot. wm mints its own `Endpoint` (type 8) for its clients.
 
-- [ ] **Step 6: dchild's CSpace test and dtest's lending thread** use type 8.
+- [x] **Step 6: dchild's CSpace test and dtest's lending thread** use type 8.
 
-- [ ] **Step 7: Verify** — boot, `dtest` (all pass, including the runtime
+- [x] **Step 7: Verify** — boot, `dtest` (all pass, including the runtime
 service), the three suites, `wm weston-simple-shm wlcairo` (then close it so
 `fb` hands the display back to qtty — the call-back path), Ctrl-C at a running
 `cat` of a large file, `ipcping`, `ps`. Serial shows no `[cap] ... denied`.
 
-- [ ] **Step 8: Commit** — "Services hand out the right to call them".
+- [x] **Step 8: Commit** — "Services hand out the right to call them".
 
 ---
 
