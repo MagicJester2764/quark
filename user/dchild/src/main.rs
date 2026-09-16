@@ -6,9 +6,13 @@
 //! Started by `dtest` with one end of a socketpair already at descriptor 3.
 //! Allocates memory, writes a witness into it, and sends the descriptor back —
 //! which is what a Wayland client does with `wl_shm`, minus the drawing.
+//!
+//! Given `quit` it only exits, for counting how many programs a parent can
+//! run; given `orphan` it leaves a dead thread behind for the parent to check
+//! on.
 
 use quark_rt::manifest::CapReq;
-use quark_rt::{println, sync, syscall};
+use quark_rt::{println, sync, syscall, thread};
 
 quark_rt::manifest!([CapReq::phys_alloc(16)]);
 
@@ -24,10 +28,34 @@ const VERDICT: usize = MINE + 128;
 const SCRATCH: usize = 8;
 /// A slot in somebody else's CSpace to try to fill.
 const VICTIM_SLOT: usize = 14;
+/// `sys_task_info`'s state for a task that has exited.
+const DEAD: u8 = 3;
+
+extern "C" fn quit() -> ! {
+    syscall::sys_exit_code(0);
+}
 
 #[unsafe(no_mangle)]
 #[link_section = ".text.entry"]
 pub extern "C" fn _start() -> ! {
+    // Asked only to run: the parent is counting how many programs it can
+    // start, not talking to this one.
+    if quark_rt::args::argv(1) == Some(&b"quit"[..]) {
+        syscall::sys_exit_code(0);
+    }
+    // Leave a thread behind, dead but never collected, and say which one: the
+    // parent checks that collecting this program takes the thread with it.
+    if quark_rt::args::argv(1) == Some(&b"orphan"[..]) {
+        let Ok(t) = thread::spawn_with_stack(quit, 1) else {
+            syscall::sys_exit_code(-1);
+        };
+        // sys_wait would reap it, so watch for it to die instead.
+        while syscall::sys_task_info(t.tid()).map(|(state, _, _)| state) != Ok(DEAD) {
+            syscall::sleep_ticks(1);
+        }
+        syscall::sys_exit_code(t.tid() as i32);
+    }
+
     // Wait for the parent's byte before answering, so this proves the stream
     // carries data in both directions between address spaces.
     let mut buf = [0u8; 8];

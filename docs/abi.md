@@ -1,6 +1,6 @@
 # Quark syscall ABI
 
-**Version 1.10.** Query the running kernel with `SYS_ABI_VERSION` (240), which
+**Version 1.11.** Query the running kernel with `SYS_ABI_VERSION` (240), which
 returns `(major << 16) | minor`.
 
 This document is the contract between the Quark kernel and everything above it.
@@ -96,6 +96,7 @@ so it is built from calls that already existed.
 | 1.8 | `SYS_FD_RECV` (74) learns to choose: `at = u64::MAX - 1` asks for any free descriptor and the call returns which one it took. A caller translating `recvmsg` cannot name a slot — Linux picks the number — and probing for a free one would mean reading, which is the thing a receive must do exactly once. Both it and `SYS_FD_SEND` (73) also take flags in arg4, where bit 0 is `MSG_DONTWAIT`: return `0xFFFF_FFFE` rather than park. A reader that loops until a read finds nothing — libwayland does — hangs for ever without it, because the last turn of every such loop is the empty one. |
 | 1.9 | `SYS_MEMFD_TRUNCATE` (54) — `ftruncate` on memory named by a descriptor, which is how every Wayland client makes its buffer pool: `memfd_create`, `ftruncate`, `mmap`. Only while nobody has the region mapped and no descriptor for it is travelling, because growing it otherwise changes what is behind somebody else's live mapping. `SYS_MMAP_FD` (42) also returns the size it mapped instead of 0: a task that received a descriptor has no other way to learn how big the memory is, and the sender's word for it is the one thing it must not take. |
 | 1.10 | `SYS_FD_DUP` (68) and `SYS_PIPE_FD_SET` (70) no longer need `TaskMgmt` when the target is the caller, and both accept `u64::MAX - 1` for "any free descriptor" and return the number they took. Putting a descriptor into somebody else's table hands them something they never asked for; putting one into your own is `dup` and `pipe`, which every C library calls and which confer nothing. Also: `sys_cap_grant` (81) requires `TaskMgmt` over the destination, or the destination's consent — either a `sys_call` to the granter in progress, or a standing `Endpoint` naming it. Unrestricted, any task could fill any other's sixteen CSpace slots and leave it unable to be handed a display again. |
+| 1.11 | `SYS_ADDRSPACE_GIVE` (43) — move pages of the caller's own memory into an address space it made, which owns them from then on and frees them with itself. `SYS_ADDRSPACE_MAP` (37) is deprecated in its favour: every program a spawner loaded with it stayed allocated until the spawner exited. Also: `SYS_WAIT` (4) reaps the child it returns, so its memory is free, and its TID may be reused, by the time the call returns. A child used to be reaped only when the machine next went idle, which a parent running programs back to back never let it do. |
 
 A capability may only be minted from one the caller already holds, and only
 narrowed — with one exception. **An `Endpoint` naming only the caller may
@@ -118,6 +119,10 @@ Five calls are **deprecated as of 1.0** — the `CAP_*` object-capability calls
 
 New code must not call these. See `CLAUDE.md` for why granting `CAP_MAP_PHYS`
 in particular undoes an otherwise careful capability grant.
+
+`SYS_ADDRSPACE_MAP` (37) is **deprecated as of 1.11**, replaced by
+`SYS_ADDRSPACE_GIVE` (43). The frames it maps into a child stay the spawner's,
+which is wrong both ways: they outlive the child, and die with the spawner.
 
 ## Capabilities
 
@@ -204,7 +209,8 @@ call to a task that never reaches `SYS_RECV` blocks forever.
 | 34 | `SYS_PHYS_ALLOC` | arg0 = pages | physical address / `u64::MAX` | `PhysAlloc` |
 | 35 | `SYS_PHYS_FREE` | arg0 = phys, arg1 = count | 0 / `u64::MAX` | `PhysAlloc` + frame ownership |
 | 36 | `SYS_ADDRSPACE_CREATE` | — | CR3 / `u64::MAX` | `TaskMgmt` |
-| 37 | `SYS_ADDRSPACE_MAP` | arg0 = cr3, arg1 = virt, arg2 = phys, arg3 = pages, arg4 = flags | 0 / `u64::MAX` | `TaskMgmt` + frame ownership or `PhysRange` |
+| 37 | `SYS_ADDRSPACE_MAP` | arg0 = cr3, arg1 = virt, arg2 = phys, arg3 = pages, arg4 = flags | 0 / `u64::MAX` | `TaskMgmt` + frame ownership or `PhysRange` — **deprecated** |
+| 43 | `SYS_ADDRSPACE_GIVE` | arg0 = cr3, arg1 = virt there, arg2 = virt here, arg3 = pages (at most 256), arg4 = flags (bit 0: writable) | 0 / `u64::MAX` | `TaskMgmt` + the pages are the caller's own |
 | 38 | `SYS_MAP_PHYS` | arg0 = phys, arg1 = virt, arg2 = pages | 0 / `u64::MAX` | frame ownership or `PhysRange` |
 | 39 | `SYS_SET_MEM_LIMIT` | arg0 = tid, arg1 = pages (0 = unlimited) | 0 / `u64::MAX` | `TaskMgmt` |
 | 40 | `SYS_SET_PAGER` | arg0 = tid, arg1 = pager tid | 0 / `u64::MAX` | `TaskMgmt` |
@@ -218,6 +224,20 @@ owned (device MMIO, the framebuffer) and for pages another task allocated.
 **All user mappings must be at or above `USER_MIN_ADDR` (0x80_0000_0000).**
 Lower addresses are rejected: address spaces share the page directories beneath
 PML4[0], so a low mapping would write into tables every address space shares.
+
+**Giving memory moves it.** `SYS_ADDRSPACE_GIVE` takes pages the caller got
+from `SYS_MMAP` and moves them into an address space the caller created. They
+leave the caller and belong to the target, which frees them when it is
+destroyed; the caller is no longer charged for them. Anything else is refused —
+device memory, shared memory, a frame from `SYS_PHYS_ALLOC` — and so is a page
+already mapped at the far end, or the caller's own address space as the target.
+Everything is checked before anything moves, but a failure part way (for want
+of a page table) leaves the pages before it moved. This is how a spawner loads
+a program.
+
+`SYS_ADDRSPACE_MAP` lends frames instead. They stay the caller's, so they are
+freed when the *caller* exits, even under a child still running on them, and
+never when the child does.
 
 Physical addresses are page aligned; a request that is not is rejected.
 

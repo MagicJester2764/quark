@@ -9,7 +9,7 @@
 
 use quark_rt::manifest::CapReq;
 use quark_rt::wl::wire;
-use quark_rt::{nameserver, println, spawn, sync, syscall, thread, vfs};
+use quark_rt::{nameserver, println, spawn, sync, syscall, thread};
 
 quark_rt::manifest!([CapReq::task_mgmt(0), CapReq::phys_alloc(64)]);
 
@@ -587,7 +587,7 @@ static SPAWN_SCRATCH: spawn::Scratch = spawn::Scratch {
 /// Read `/usr/bin/dchild` and load it. Modelled on how `wm` starts a session
 /// program: the image comes through the VFS, `spawn::load` builds the address
 /// space, and the manifest decides what it is granted.
-fn load_child() -> Option<spawn::Spawned> {
+fn load_child(args: &[&[u8]]) -> Option<spawn::Spawned> {
     let vfs_tid = nameserver::lookup_retry(b"vfs", 20)?;
     // Lowercase for ext2, uppercase with .ELF for FAT32 — the two spellings
     // the shell already tries.
@@ -599,6 +599,9 @@ fn load_child() -> Option<spawn::Spawned> {
             spawn::load_path(vfs_tid, b"/usr/bin/DCHILD.ELF", CHILD_IMAGE, &SPAWN_SCRATCH, grant)
         })
         .ok()?;
+    // Every program is started with an argument page; reading one that was
+    // never mapped faults.
+    spawn::set_args(&info, args, &SPAWN_SCRATCH).ok()?;
     // It needs to be able to reach the nameserver, and somewhere to print.
     let _ = syscall::sys_cap_grant(info.tid, syscall::SLOT_ENDPOINT, syscall::SLOT_ENDPOINT);
     let _ = syscall::sys_fd_dup(info.tid, 1, 1);
@@ -612,7 +615,7 @@ fn test_across_address_spaces() {
         Ok(p) => p,
         Err(()) => { check("a pair", false); return; }
     };
-    let Some(info) = load_child() else {
+    let Some(info) = load_child(&[b"dchild"]) else {
         check("load /usr/bin/dchild", false);
         return;
     };
@@ -706,6 +709,116 @@ fn test_across_address_spaces() {
     let _ = syscall::sys_fd_close(25);
     let _ = syscall::sys_fd_close(set);
     let _ = syscall::sys_fd_close(mine);
+}
+
+/// Pages this task gives away, clear of everything else here.
+const GIFT: usize = 0x9D_0000_0000;
+/// Somewhere the child has nothing.
+const CHILD_SPARE: usize = 0x90_0000_0000;
+
+/// True if nothing is mapped at `at`. sys_mmap refuses to map over a page that
+/// is present, which is what makes this a question a program can ask.
+fn nothing_at(at: usize) -> bool {
+    let free = syscall::sys_mmap(at, 1).is_ok();
+    if free {
+        let _ = syscall::sys_munmap(at, 1);
+    }
+    free
+}
+
+/// Wait for one particular child, collecting any other on the way.
+fn wait_for(tid: usize) -> Option<i32> {
+    loop {
+        match syscall::sys_wait() {
+            Ok((t, code)) if t == tid => return Some(code),
+            Ok(_) => continue,
+            Err(()) => return None,
+        }
+    }
+}
+
+fn test_spawned_memory() {
+    println!("a program's memory is its own:");
+    let Some(info) = load_child(&[b"dchild", b"quit"]) else {
+        check("load /usr/bin/dchild", false);
+        return;
+    };
+    // The loader builds a program in this task's memory and moves it across.
+    // None of it may stay mapped here: a spawner still holding a page could
+    // read whatever the frame held next, once the child was gone.
+    check("its stack is not left mapped in the parent", nothing_at(SPAWN_SCRATCH.stack));
+    check("nor its code", nothing_at(SPAWN_SCRATCH.elf));
+    check("nor its arguments", nothing_at(SPAWN_SCRATCH.args));
+
+    // Only memory a task owns can be given. A frame from sys_phys_alloc is
+    // mapped without the mapping owning it, and whoever allocated it still
+    // answers for it.
+    let frame = syscall::sys_phys_alloc(1);
+    let lent = frame.is_ok_and(|f| syscall::sys_map_phys(f, GIFT, 1).is_ok());
+    check(
+        "a frame mapped from elsewhere cannot be given",
+        lent && syscall::sys_addrspace_give(info.cr3, CHILD_SPARE, GIFT, 1, 1).is_err(),
+    );
+    let _ = syscall::sys_munmap(GIFT, 1);
+    if let Ok(f) = frame {
+        let _ = syscall::sys_phys_free(f, 1);
+    }
+
+    let made = syscall::sys_mmap(GIFT, 1).is_ok();
+    check(
+        "a gift cannot replace a page the child has",
+        made && syscall::sys_addrspace_give(
+            info.cr3,
+            spawn::STACK_TOP - spawn::PAGE_SIZE,
+            GIFT,
+            1,
+            1,
+        )
+        .is_err(),
+    );
+    let me = syscall::sys_addrspace_self().unwrap_or(0);
+    check(
+        "nor go to the address space it came from",
+        syscall::sys_addrspace_give(me, CHILD_SPARE, GIFT, 1, 1).is_err(),
+    );
+    check("a refused gift stays with the giver", syscall::sys_munmap(GIFT, 1) == Ok(1));
+
+    let made = syscall::sys_mmap(GIFT, 1).is_ok();
+    check(
+        "memory of one's own can be given",
+        made && syscall::sys_addrspace_give(info.cr3, CHILD_SPARE, GIFT, 1, 1).is_ok(),
+    );
+    check("and it leaves the giver", nothing_at(GIFT));
+
+    check("the child runs with its gift", info.start().is_ok() && wait_for(info.tid) == Some(0));
+
+    // A program whose thread exited before it did. Collecting the program
+    // orphans the thread, and a dead orphan goes with it: left behind, it
+    // named a parent that was gone, whatever took that slot next adopted it,
+    // and the address space the two shared stayed allocated until then.
+    let orphan = load_child(&[b"dchild", b"orphan"])
+        .filter(|child| child.start().is_ok())
+        .and_then(|child| wait_for(child.tid))
+        .filter(|&tid| tid > 0);
+    check("a program leaves a dead thread behind", orphan.is_some());
+    check(
+        "which is reaped when the program is collected",
+        orphan.is_some_and(|tid| syscall::sys_task_info(tid as usize).is_err()),
+    );
+
+    // Each run costs a megabyte of stack and the program. A parent that went
+    // on holding what it gave its children — or a machine that only reaped
+    // them when it next went idle, which a parent doing this never lets it
+    // do — is out of memory long before this loop is.
+    let mut runs = 0;
+    for _ in 0..160 {
+        let Some(child) = load_child(&[b"dchild", b"quit"]) else { break };
+        if child.start().is_err() || wait_for(child.tid) != Some(0) {
+            break;
+        }
+        runs += 1;
+    }
+    check("run a program 160 times over", runs == 160);
 }
 
 static LOCK: sync::Mutex<u32> = sync::Mutex::new(0);
@@ -976,6 +1089,7 @@ pub extern "C" fn _start() -> ! {
     test_poll();
     test_environment();
     test_across_address_spaces();
+    test_spawned_memory();
     test_sync();
     test_fpu();
     test_wire();

@@ -665,13 +665,15 @@ pub fn sys_wait() -> u64 {
     unsafe {
         // Check if any child is already dead (zombie) and not yet reaped
         for i in 1..MAX_TASKS {
-            if let Some(ref task) = TASKS[i] {
-                if task.parent_tid == parent && task.state == TaskState::Dead && !REAPED[i] {
-                    REAPED[i] = true;
-                    let code = child_exit_code(i);
-                    irq_restore(flags);
-                    return (i as u64) | ((code as u32 as u64) << 32);
-                }
+            let collectable = TASKS[i].as_ref().is_some_and(|t| {
+                t.parent_tid == parent && t.state == TaskState::Dead && !REAPED[i]
+            });
+            if collectable {
+                REAPED[i] = true;
+                let code = child_exit_code(i);
+                reap(i);
+                irq_restore(flags);
+                return (i as u64) | ((code as u32 as u64) << 32);
             }
         }
 
@@ -694,14 +696,22 @@ pub fn sys_wait() -> u64 {
         yield_now();
 
         // Woken up — WAIT_RESULT has the dead child's TID
+        let flags = irq_save();
         let child_tid = WAIT_RESULT[parent];
         WAIT_RESULT[parent] = 0;
-        if child_tid != 0 {
+        let result = if child_tid != 0 {
             let code = WAIT_CODE[parent];
+            // Reaped now rather than whenever the machine next goes idle.
+            // A dead task keeps all its memory until it is reaped, and a
+            // parent running programs one after another never lets the
+            // machine idle: a test suite held every program it had run.
+            reap(child_tid);
             (child_tid as u64) | ((code as u32 as u64) << 32)
         } else {
             u64::MAX
-        }
+        };
+        irq_restore(flags);
+        result
     }
 }
 
@@ -825,9 +835,6 @@ pub fn task_info(tid: usize) -> Option<(TaskState, u32, u32, usize)> {
     }
 }
 
-/// Reap dead tasks (clean up IPC, IRQs, address space, and free stacks).
-/// Only reaps tasks that have been collected by sys_wait, have no parent,
-/// or whose parent is already gone.
 /// The current task's kernel stack, as (base, top). Both zero for the boot
 /// task, which runs on the stack the bootloader left.
 ///
@@ -846,57 +853,108 @@ pub fn current_kernel_stack() -> (usize, usize) {
     }
 }
 
+/// Reap every dead task that nobody still has a claim on.
+///
+/// Run from the idle loop, which picks up tasks nobody collects: those with no
+/// parent, or whose parent is gone. A task its parent waits for is reaped by
+/// the wait itself.
 pub fn reap_dead() {
-    unsafe {
-        for i in 1..MAX_TASKS {
-            if let Some(ref mut task) = TASKS[i] {
-                if task.state == TaskState::Dead {
-                    let parent = task.parent_tid;
-                    // Only reap if: already collected, no parent, or parent is gone
-                    let can_reap = REAPED[i]
-                        || parent == 0
-                        || TASKS[parent].is_none();
-                    if !can_reap {
-                        continue;
-                    }
-                    // Clean up pipe refcounts and wake blocked tasks
-                    crate::pipe::cleanup_task_fds(&task.fds, i);
-                    // Reclaim pipes it created but never attached to an fd
-                    crate::pipe::cleanup_orphans(i);
-                    // Clean up IPC state and unblock tasks waiting on this one
-                    crate::ipc::cleanup_task_ipc(i);
-                    // Unregister any IRQ handlers
-                    crate::irq_dispatch::unregister_task_irqs(i);
-                    // Clean up futex waiters
-                    crate::futex::cleanup_task(i);
-                    // Clean up shared memory regions created by this task
-                    crate::shmem::cleanup_task(i);
-                    // Reclaim sys_phys_alloc reservations it never released
-                    crate::pmm::release_task_frames(i);
-                    // Withdraw everyone's permission to send to this TID before
-                    // the slot can be handed to a different task.
-                    crate::cap::revoke_endpoints_to(i);
-                    // Destroy the address space only once the last task using
-                    // it is gone. Threads share one; tearing it down when the
-                    // first exits would pull it out from under the others.
-                    let cr3 = task.cr3;
-                    if cr3 != 0 && cr3 != crate::paging::kernel_cr3()
-                        && crate::userspace::addrspace_unref(cr3)
-                    {
-                        crate::paging::destroy_address_space(cr3);
-                        crate::userspace::unregister_address_space(cr3);
-                    }
-                    task.free_stack();
-                    REAPED[i] = false;
-                    // Clean up wait state if this task was a parent
-                    WAIT_BLOCKED[i] = false;
-                    WAIT_RESULT[i] = 0;
-                    TASKS[i] = None;
+    for i in 1..MAX_TASKS {
+        // One task at a time with interrupts off, so a parent reaping the
+        // child it just collected can never find it half torn down.
+        let flags = irq_save();
+        unsafe { reap(i) };
+        irq_restore(flags);
+    }
+}
+
+/// Tear down task `i`, if it is dead and nobody still has a claim on it, and
+/// with it any of its children that are dead too — see [`reap_one`]. Does
+/// nothing otherwise.
+///
+/// Must run with interrupts off. Nothing in here yields.
+unsafe fn reap(i: usize) { unsafe {
+    const _: () = assert!(MAX_TASKS <= 64, "the orphan set is a u64");
+    let mut pending: u64 = 1 << i;
+    while pending != 0 {
+        let t = pending.trailing_zeros() as usize;
+        pending &= pending - 1;
+        pending |= reap_one(t);
+    }
+}}
+
+/// Tear down task `i` — its descriptors, IPC, IRQs, memory and kernel stack —
+/// and free its slot, if it is dead and nobody still has a claim on it: its
+/// parent collected it with sys_wait, or it has no parent, or the parent is
+/// gone.
+///
+/// Its children are orphaned, and the ones already dead are returned, since
+/// nothing will collect them now. A thread is a child of the thread that made
+/// it, so a program's exited threads are exactly these, and the address space
+/// they share goes only when the last of them does.
+unsafe fn reap_one(i: usize) -> u64 { unsafe {
+    let Some(ref mut task) = TASKS[i] else {
+        return 0;
+    };
+    if task.state != TaskState::Dead {
+        return 0;
+    }
+    let parent = task.parent_tid;
+    let can_reap = REAPED[i] || parent == 0 || TASKS[parent].is_none();
+    if !can_reap {
+        return 0;
+    }
+    // Clean up pipe refcounts and wake blocked tasks
+    crate::pipe::cleanup_task_fds(&task.fds, i);
+    // Reclaim pipes it created but never attached to an fd
+    crate::pipe::cleanup_orphans(i);
+    // Clean up IPC state and unblock tasks waiting on this one
+    crate::ipc::cleanup_task_ipc(i);
+    // Unregister any IRQ handlers
+    crate::irq_dispatch::unregister_task_irqs(i);
+    // Clean up futex waiters
+    crate::futex::cleanup_task(i);
+    // Clean up shared memory regions created by this task
+    crate::shmem::cleanup_task(i);
+    // Reclaim sys_phys_alloc reservations it never released
+    crate::pmm::release_task_frames(i);
+    // Withdraw everyone's permission to send to this TID before
+    // the slot can be handed to a different task.
+    crate::cap::revoke_endpoints_to(i);
+    // Destroy the address space only once the last task using
+    // it is gone. Threads share one; tearing it down when the
+    // first exits would pull it out from under the others.
+    let cr3 = task.cr3;
+    if cr3 != 0 && cr3 != crate::paging::kernel_cr3()
+        && crate::userspace::addrspace_unref(cr3)
+    {
+        crate::paging::destroy_address_space(cr3);
+        crate::userspace::unregister_address_space(cr3);
+    }
+    task.free_stack();
+    REAPED[i] = false;
+    // Clean up wait state if this task was a parent
+    WAIT_BLOCKED[i] = false;
+    WAIT_RESULT[i] = 0;
+    TASKS[i] = None;
+
+    // Left naming this TID, its children would wait on a parent that is gone,
+    // and whatever took the slot next would find them its own — collected by
+    // its sys_wait, counted as its threads, and startable by it with whatever
+    // user ID they were made with.
+    let mut dead = 0u64;
+    for j in 1..MAX_TASKS {
+        if let Some(ref mut child) = TASKS[j] {
+            if child.parent_tid == i {
+                child.parent_tid = 0;
+                if child.state == TaskState::Dead {
+                    dead |= 1 << j;
                 }
             }
         }
     }
-}
+    dead
+}}
 
 /// Get the current task's CR3 (address space).
 pub fn current_task_cr3() -> usize {

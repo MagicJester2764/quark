@@ -23,11 +23,15 @@ pub const NO_EXECUTE: u64 = 1 << 63;
 /// responsible for returning it to the PMM when the page is unmapped or the
 /// address space is destroyed.
 ///
-/// Set for anonymous memory (`sys_mmap`, ELF segments, stacks, boot info).
-/// Deliberately NOT set for device MMIO (`sys_map_phys`), shared memory
-/// (`shmem::map`), or frames supplied by another task (`sys_addrspace_map`) —
-/// freeing those would hand device addresses or still-shared frames back to
-/// the frame allocator.
+/// Set for anonymous memory (`sys_mmap`, ELF segments, stacks, boot info), and
+/// for pages another task moved here with `sys_addrspace_give`, which leave
+/// the giver as they arrive. Deliberately NOT set for device MMIO
+/// (`sys_map_phys`), shared memory (`shmem::map`), or frames another task
+/// still holds (`sys_addrspace_map`) — freeing those would hand device
+/// addresses or still-shared frames back to the frame allocator.
+///
+/// An owned frame is mapped in exactly one place. Everything that sets this
+/// bit keeps that true, and it is what makes freeing on unmap safe.
 pub const OWNED: u64 = 1 << 9;
 
 /// Highest canonical user address (exclusive). Everything at or above this is
@@ -330,6 +334,37 @@ fn synth_flags(user: bool, writable: bool) -> u64 {
         | if user { USER } else { 0 }
         | if writable { WRITABLE } else { 0 }
 }
+
+/// The raw flags of the 4 KiB page mapped at `virt`, or `None` if there is no
+/// such page — including when `virt` falls inside a huge page.
+///
+/// Unlike [`walk_flags`] this reports the leaf entry itself, so it carries
+/// `OWNED`, which is what decides whether the page is the address space's to
+/// give away.
+///
+/// # Safety
+/// `pml4_phys` must point to a valid, identity-mapped PML4 table.
+pub unsafe fn leaf_flags(pml4_phys: usize, virt: usize) -> Option<u64> { unsafe {
+    let (pml4i, pdpti, pdi, pti) = table_indices(virt);
+
+    let e = table_at(pml4_phys).entries[pml4i];
+    if !e.is_present() {
+        return None;
+    }
+    let e = table_at(e.frame_address()).entries[pdpti];
+    if !e.is_present() || e.is_huge() {
+        return None;
+    }
+    let e = table_at(e.frame_address()).entries[pdi];
+    if !e.is_present() || e.is_huge() {
+        return None;
+    }
+    let e = table_at(e.frame_address()).entries[pti];
+    if !e.is_present() {
+        return None;
+    }
+    Some(e.flags())
+}}
 
 /// Resolve `virt` to its backing physical address in `pml4_phys`.
 ///

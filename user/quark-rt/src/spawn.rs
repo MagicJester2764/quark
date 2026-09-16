@@ -1,8 +1,8 @@
 //! Loading an ELF and starting it as a new task.
 //!
 //! There is no fork or exec: a parent creates a task and an address space,
-//! stages the program's pages through its own address space, maps them into the
-//! child, and starts it. That is a hundred lines of fiddly page arithmetic, and
+//! builds the program's pages in its own memory, moves them into the child,
+//! and starts it. That is a hundred lines of fiddly page arithmetic, and
 //! it was written out three times — in `init`, `shell` and `login` — with the
 //! shell's and login's copies byte-identical and init's differing only in
 //! comments and hardcoded scratch addresses. Drift between them was a matter of
@@ -51,13 +51,26 @@ pub const STACK_TOP: usize = 0x7FFF_FFFF_F000;
 /// megabytes.
 pub const STACK_PAGES: usize = 256;
 
-/// Scratch virtual addresses in the caller's own address space, used to stage
-/// pages before they are mapped into the child.
+/// The most address space a program may span, from its first loaded page to
+/// its last: a gigabyte. The image is built laid out as the child will see it,
+/// so this is what a spawner must leave free at `Scratch::elf`.
+pub const MAX_IMAGE_SPAN: usize = 1 << 30;
+
+/// Loadable segments a program may have. A program built here has three or
+/// four.
+const MAX_SEGMENTS: usize = MAX_PHDRS;
+
+/// The most pages `sys_mmap`, `sys_munmap` and `sys_addrspace_give` take at
+/// once.
+const CHUNK: usize = 256;
+
+/// Scratch virtual addresses in the caller's own address space, where a
+/// program is built before it is moved into the child.
 ///
-/// Each caller needs its own: they are mapped and remapped repeatedly, so two
-/// spawners sharing a region would overwrite each other. A range of at least
-/// `STACK_PAGES` pages is needed at `stack`, and as many pages as the largest
-/// program segment at `elf`.
+/// Each caller needs its own, since two spawners building at the same address
+/// would collide. A range of `STACK_PAGES` pages must be free at `stack`, one
+/// page at `args`, and [`MAX_IMAGE_SPAN`] at `elf`. All three are empty again
+/// when a load returns, whether or not it succeeded.
 #[derive(Clone, Copy)]
 pub struct Scratch {
     pub elf: usize,
@@ -123,13 +136,48 @@ struct Elf64Phdr {
     p_align: u64,
 }
 
+/// A loadable segment, checked.
+#[derive(Clone, Copy)]
+struct Segment {
+    /// The pages it occupies in the child, `[first, end)`.
+    first: usize,
+    end: usize,
+    vaddr: usize,
+    /// Where its initialised bytes end in the child.
+    vend: usize,
+    offset: usize,
+    filesz: usize,
+    writable: bool,
+}
+
+impl Segment {
+    const EMPTY: Segment = Segment {
+        first: 0,
+        end: 0,
+        vaddr: 0,
+        vend: 0,
+        offset: 0,
+        filesz: 0,
+        writable: false,
+    };
+}
+
 /// Create a task and load `elf` into a fresh address space for it.
 ///
 /// The returned task is not running; call [`Spawned::start`].
 ///
-/// On failure the task and address space created so far are left behind. That
-/// matches what the three copies did, and cleaning it up properly wants a
-/// teardown syscall that does not exist yet.
+/// The image is built in the caller's own memory, laid out as the child will
+/// see it, and then moved into the child with `sys_addrspace_give`. Moved
+/// pages are the child's: they are freed when it is gone, and the caller keeps
+/// no way to reach them. Every spawner used to lend the child frames it had
+/// allocated itself, which kept them for as long as the *spawner* lived — a
+/// megabyte and a half for every program the shell ran, until nothing more
+/// could be loaded.
+///
+/// On failure the task and address space created so far are left behind.
+/// That matches what the three copies did, and cleaning it up properly wants a
+/// teardown syscall that does not exist yet. The caller's scratch ranges are
+/// always emptied.
 pub fn load(elf: &[u8], scratch: &Scratch) -> Result<Spawned, ()> {
     if elf.len() < EHDR_SIZE || elf[0..4] != ELF_MAGIC {
         return Err(());
@@ -164,102 +212,178 @@ pub fn load(elf: &[u8], scratch: &Scratch) -> Result<Spawned, ()> {
         kept = phnum;
     }
 
+    let mut segs = [Segment::EMPTY; MAX_SEGMENTS];
+    let n = segments(elf, phoff, phentsize, phnum, &mut segs).ok_or(())?;
+    let segs = &segs[..n];
+    let base = segs[0].first;
+
     let cr3 = syscall::sys_addrspace_create()?;
     let tid = syscall::sys_task_create()?;
 
-    // Adjacent segments can share a page: a read-only one ending part way
-    // through it and the next beginning in the same one. Allocating a fresh
-    // frame per page per segment then maps the second over the first, losing
-    // whatever the first had written — the GOT, in the case that found this,
-    // leaving every call through it going to zero.
-    //
-    // Only neighbours can overlap, since segments are laid out in address
-    // order, so remembering the last page of the previous one is enough.
-    let mut prev_page: usize = usize::MAX;
-    let mut prev_frame: usize = 0;
-
-    for i in 0..phnum {
-        let offset = match phoff.checked_add(i * phentsize) {
-            Some(o) => o,
-            None => break,
-        };
-        if offset + phentsize > elf.len() {
-            break;
+    let loaded = build(elf, segs, base, scratch.elf)
+        .and_then(|()| give_image(cr3, segs, base, scratch.elf))
+        .and_then(|()| give_stack(cr3, scratch.stack));
+    if loaded.is_err() {
+        // What was not given is still ours. Left mapped it would be in the
+        // way of the next load, which never maps over anything.
+        for s in segs {
+            release(scratch.elf + (s.first - base), (s.end - s.first) / PAGE_SIZE);
         }
-        let phdr = unsafe { &*(elf.as_ptr().add(offset) as *const Elf64Phdr) };
-        if phdr.p_type != PT_LOAD {
-            continue;
-        }
-
-        let vaddr = phdr.p_vaddr as usize;
-        let filesz = phdr.p_filesz as usize;
-        let memsz = phdr.p_memsz as usize;
-        let file_offset = phdr.p_offset as usize;
-        let writable = phdr.p_flags & 2 != 0;
-
-        let vaddr_page_start = vaddr & !0xFFF;
-        let vaddr_end = vaddr + memsz;
-        let pages = (vaddr_end - vaddr_page_start + PAGE_SIZE - 1) / PAGE_SIZE;
-
-        let file_start = vaddr;
-        let file_end = vaddr + filesz;
-
-        for p in 0..pages {
-            let page_vaddr = vaddr_page_start + p * PAGE_SIZE;
-
-            let reused = page_vaddr == prev_page;
-            let frame = if reused {
-                prev_frame
-            } else {
-                syscall::sys_phys_alloc(1)?
-            };
-            let temp_page = scratch.elf + p * PAGE_SIZE;
-            syscall::sys_map_phys(frame, temp_page, 1)?;
-
-            // Zero first: the tail of the last page of a segment is .bss, and
-            // a fresh frame is not guaranteed to be clear. A reused page
-            // already holds the previous segment's bytes, which must survive.
-            if !reused {
-                unsafe { core::ptr::write_bytes(temp_page as *mut u8, 0, PAGE_SIZE) };
-            }
-
-            let page_end = page_vaddr + PAGE_SIZE;
-            if file_start < page_end && file_end > page_vaddr {
-                let copy_vstart = file_start.max(page_vaddr);
-                let copy_vend = file_end.min(page_end);
-                let copy_len = copy_vend - copy_vstart;
-                let dst_offset = copy_vstart - page_vaddr;
-                let src_offset = file_offset + (copy_vstart - vaddr);
-
-                if src_offset + copy_len <= elf.len() {
-                    unsafe {
-                        core::ptr::copy_nonoverlapping(
-                            elf.as_ptr().add(src_offset),
-                            (temp_page + dst_offset) as *mut u8,
-                            copy_len,
-                        );
-                    }
-                }
-            }
-
-            let flags: u64 = if writable { 1 } else { 0 };
-            syscall::sys_addrspace_map(cr3, page_vaddr, frame, 1, flags)?;
-
-            prev_page = page_vaddr;
-            prev_frame = frame;
-        }
-    }
-
-    let stack_bottom = STACK_TOP - STACK_PAGES * PAGE_SIZE;
-    for p in 0..STACK_PAGES {
-        let frame = syscall::sys_phys_alloc(1)?;
-        let temp_page = scratch.stack + p * PAGE_SIZE;
-        syscall::sys_map_phys(frame, temp_page, 1)?;
-        unsafe { core::ptr::write_bytes(temp_page as *mut u8, 0, PAGE_SIZE) };
-        syscall::sys_addrspace_map(cr3, stack_bottom + p * PAGE_SIZE, frame, 1, 1)?;
+        release(scratch.stack, STACK_PAGES);
+        return Err(());
     }
 
     Ok(Spawned { tid, entry, stack_top: STACK_TOP as u64, cr3, phdrs, phnum: kept })
+}
+
+/// Read and check the loadable segments into `out`, returning how many there
+/// are. `None` if there are none, or too many, or any is malformed: out of
+/// address order, overlapping, claiming bytes past the end of the file, or
+/// making the image wider than [`MAX_IMAGE_SPAN`].
+fn segments(
+    elf: &[u8],
+    phoff: usize,
+    phentsize: usize,
+    phnum: usize,
+    out: &mut [Segment; MAX_SEGMENTS],
+) -> Option<usize> {
+    let mut n = 0;
+    for i in 0..phnum {
+        let at = phoff.checked_add(i.checked_mul(phentsize)?)?;
+        if at.checked_add(phentsize)? > elf.len() {
+            return None;
+        }
+        let ph = unsafe { &*(elf.as_ptr().add(at) as *const Elf64Phdr) };
+        if ph.p_type != PT_LOAD || ph.p_memsz == 0 {
+            continue;
+        }
+        let vaddr = ph.p_vaddr as usize;
+        let memsz = ph.p_memsz as usize;
+        let filesz = ph.p_filesz as usize;
+        let offset = ph.p_offset as usize;
+        if filesz > memsz || offset.checked_add(filesz)? > elf.len() {
+            return None;
+        }
+        let vend = vaddr.checked_add(memsz)?;
+        let seg = Segment {
+            first: vaddr & !(PAGE_SIZE - 1),
+            end: vend.checked_add(PAGE_SIZE - 1)? & !(PAGE_SIZE - 1),
+            vaddr,
+            vend,
+            offset,
+            filesz,
+            writable: ph.p_flags & 2 != 0,
+        };
+        // In address order and apart, which the format requires. Two can
+        // still share a page — one ending part way through it and the next
+        // beginning there — and building the image as one piece is what makes
+        // that work: both write into the same page.
+        if n > 0 && seg.vaddr < out[n - 1].vend {
+            return None;
+        }
+        let base = if n == 0 { seg.first } else { out[0].first };
+        if n == MAX_SEGMENTS || seg.end - base > MAX_IMAGE_SPAN {
+            return None;
+        }
+        out[n] = seg;
+        n += 1;
+    }
+    if n == 0 { None } else { Some(n) }
+}
+
+/// Lay the segments out at `at`, as the child will see them from `base`.
+fn build(elf: &[u8], segs: &[Segment], base: usize, at: usize) -> Result<(), ()> {
+    let mut mapped = base;
+    for s in segs {
+        // A page shared with the segment before is already there, holding
+        // that segment's bytes, which must survive.
+        let start = s.first.max(mapped);
+        if start < s.end {
+            map_fresh(at + (start - base), (s.end - start) / PAGE_SIZE)?;
+        }
+        mapped = s.end;
+        // Fresh memory is zeroed, so the .bss after the file bytes needs
+        // nothing more.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                elf.as_ptr().add(s.offset),
+                (at + (s.vaddr - base)) as *mut u8,
+                s.filesz,
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Move the image built at `at` into the child.
+fn give_image(cr3: usize, segs: &[Segment], base: usize, at: usize) -> Result<(), ()> {
+    let mut given = base;
+    for (i, s) in segs.iter().enumerate() {
+        let start = s.first.max(given);
+        if start >= s.end {
+            continue;
+        }
+        // A last page that the next segment begins in has to suit both of
+        // them, so it goes on its own, writable if any segment in it is.
+        let shared = segs.get(i + 1).is_some_and(|next| next.first < s.end);
+        let whole = if shared { s.end - PAGE_SIZE } else { s.end };
+        give(cr3, start, at + (start - base), (whole - start) / PAGE_SIZE, s.writable)?;
+        if shared {
+            let last = s.end - PAGE_SIZE;
+            let writable = segs.iter().any(|t| t.writable && t.first <= last && last < t.end);
+            give(cr3, last, at + (last - base), 1, writable)?;
+        }
+        given = s.end;
+    }
+    Ok(())
+}
+
+/// Build the stack at `at` and move it into the child. Fresh memory is
+/// zeroed, which is all a stack needs.
+fn give_stack(cr3: usize, at: usize) -> Result<(), ()> {
+    map_fresh(at, STACK_PAGES)?;
+    give(cr3, STACK_TOP - STACK_PAGES * PAGE_SIZE, at, STACK_PAGES, true)
+}
+
+/// Map `pages` of fresh, zeroed memory at `at`, or nothing.
+fn map_fresh(at: usize, pages: usize) -> Result<(), ()> {
+    let mut done = 0;
+    while done < pages {
+        let n = (pages - done).min(CHUNK);
+        if syscall::sys_mmap(at + done * PAGE_SIZE, n).is_err() {
+            release(at, done);
+            return Err(());
+        }
+        done += n;
+    }
+    Ok(())
+}
+
+/// Move `pages` pages at `from` in the caller to `virt` in `cr3`.
+fn give(cr3: usize, virt: usize, from: usize, pages: usize, writable: bool) -> Result<(), ()> {
+    let mut done = 0;
+    while done < pages {
+        let n = (pages - done).min(CHUNK);
+        syscall::sys_addrspace_give(
+            cr3,
+            virt + done * PAGE_SIZE,
+            from + done * PAGE_SIZE,
+            n,
+            writable as u64,
+        )?;
+        done += n;
+    }
+    Ok(())
+}
+
+/// Unmap and free whatever is still mapped of `pages` pages at `at`.
+fn release(at: usize, pages: usize) {
+    let mut done = 0;
+    while done < pages {
+        let n = (pages - done).min(CHUNK);
+        let _ = syscall::sys_munmap(at + done * PAGE_SIZE, n);
+        done += n;
+    }
 }
 
 /// The largest program [`load_path`] will read: four megabytes.
@@ -350,13 +474,10 @@ pub fn set_args_env(
     env: &[&[u8]],
     scratch: &Scratch,
 ) -> Result<(), ()> {
-    let frame = syscall::sys_phys_alloc(1)?;
-    syscall::sys_map_phys(frame, scratch.args, 1)?;
+    syscall::sys_mmap(scratch.args, 1)?;
 
     let base = scratch.args as *mut u8;
     unsafe {
-        core::ptr::write_bytes(base, 0, PAGE_SIZE);
-
         let mut offset = 0usize;
         for section in [args, env] {
             let count_at = offset;
@@ -380,8 +501,11 @@ pub fn set_args_env(
         write_phdrs(base, info);
     }
 
-    syscall::sys_addrspace_map(info.cr3, ARGS_PAGE_ADDR, frame, 1, 0)?;
-    Ok(())
+    let given = syscall::sys_addrspace_give(info.cr3, ARGS_PAGE_ADDR, scratch.args, 1, 0);
+    if given.is_err() {
+        release(scratch.args, 1);
+    }
+    given
 }
 
 /// Put the program header table at the end of the argument page.

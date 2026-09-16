@@ -104,8 +104,19 @@ These were established deliberately. Breaking one silently re-opens a hole.
   Validate with `paging::user_range_ok`.
 - **`paging::OWNED` (PTE bit 9) decides what may be freed.** Only frames the
   address space owns go back to the allocator. Device MMIO, shared memory and
-  frames supplied by another task are mapped *without* it. Adding a new mapping
-  path means deciding this deliberately.
+  frames another task still holds are mapped *without* it. An owned frame is
+  mapped in exactly one place — that is what makes freeing it on unmap safe —
+  so a new mapping path either leaves the bit off or moves the page, as
+  `sys_addrspace_give` does, rather than copying the mapping.
+- **A spawner gives a program its pages; it does not lend them.** The loader
+  builds the image in its own `sys_mmap` memory and moves it across, so the
+  child owns its code and stack and frees them when it goes. Lending frames
+  with `sys_addrspace_map` kept them the spawner's: a shell leaked every program
+  it ran, and a spawner that exited first freed them under its children.
+- **A dead task holds all its memory until it is reaped.** `sys_wait` reaps the
+  child it returns; the idle loop reaps the rest. Anything that collects a
+  child some other way must reap it too, or a parent running programs back to
+  back — which never lets the machine idle — runs out of memory.
 - **Capabilities are the authority.** There is no UID 0 bypass; `uid == 0` no
   longer short-circuits `cap::task_has_*`. A service that cannot do something
   is missing a capability, not a privilege level.
@@ -117,13 +128,14 @@ These were established deliberately. Breaking one silently re-opens a hole.
   The kernel runs on the caller's CR3; an in-range but unmapped address faults
   *inside* the kernel, sometimes with a lock held and interrupts off.
 - **Mapping authority is ownership first, `PhysRange` second.** `sys_map_phys`
-  and `sys_addrspace_map` accept frames the caller owns (`pmm::owns_range`), so
-  a task that allocated a frame may map it holding no capability at all. That is
-  what almost every mapper does. A `PhysRange` grant is for frames the allocator
-  never owned — the framebuffer, device MMIO — and for a page another task
-  allocated and passed over IPC. Never grant `CAP_MAP_PHYS` to narrow it:
-  `populate_from_bitmask` expands that bit into a full-range `PhysRange`, which
-  silently reopens everything the explicit grants closed.
+  and the deprecated `sys_addrspace_map` accept frames the caller owns
+  (`pmm::owns_range`), so a task that allocated a frame may map it holding no
+  capability at all. That is what almost every mapper does. A `PhysRange` grant
+  is for frames the allocator never owned — the framebuffer, device MMIO — and
+  for a page another task allocated and passed over IPC. Never grant
+  `CAP_MAP_PHYS` to narrow it: `populate_from_bitmask` expands that bit into a
+  full-range `PhysRange`, which silently reopens everything the explicit grants
+  closed.
 - **A program declares what it needs; a spawner grants from that.** Capabilities
   come from a `quark_rt::manifest!` block compiled into the image, found by
   scanning for its magic, not from a table of names in `init`. A spawner mints

@@ -69,6 +69,9 @@ pub const SYS_SET_PAGER: u64 = 40;
 /// address space they are already running in; it grants nothing, since the
 /// caller is executing there either way.
 pub const SYS_ADDRSPACE_SELF: u64 = 41;
+/// Move pages of the caller's own memory into an address space it made. They
+/// become that address space's, and go when it does.
+pub const SYS_ADDRSPACE_GIVE: u64 = 43;
 
 // --- 0x30  shared memory ---
 pub const SYS_MMAP_FD: u64 = 42;
@@ -184,7 +187,7 @@ pub const SYS_ABI_VERSION: u64 = 240;
 /// minor when calls are added. User space can refuse to run against a major it
 /// does not know, which is the point of exposing it at all.
 pub const ABI_VERSION_MAJOR: u64 = 1;
-pub const ABI_VERSION_MINOR: u64 = 10;
+pub const ABI_VERSION_MINOR: u64 = 11;
 
 /// Threads a task may make with no capability at all.
 ///
@@ -861,6 +864,73 @@ extern "C" fn syscall_dispatch(
                 }
             }
             0
+        }
+        SYS_ADDRSPACE_GIVE => {
+            // arg0=cr3, arg1=virt there, arg2=virt here, arg3=pages, arg4=flags
+            //
+            // Moves memory rather than lending it. SYS_ADDRSPACE_MAP leaves
+            // the frames the caller's, so a spawner's program was freed when
+            // the *spawner* exited — under the child, if it was still running
+            // — and never when the child did: every program a shell ran cost
+            // its image and a megabyte of stack for as long as the shell
+            // lived. A moved page is the target's, OWNED there, and goes with
+            // the address space that uses it.
+            //
+            // Moving, rather than handing over a frame named by its address,
+            // is what keeps that sound. The caller cannot keep a mapping of
+            // what it gave, so nothing is left pointing at the frame once the
+            // child is gone and the allocator has handed it to someone else.
+            let caller = scheduler::current_tid();
+            if !crate::cap::task_has_task_mgmt(caller, 0) {
+                return u64::MAX;
+            }
+            let cr3 = arg0 as usize;
+            let virt = arg1 as usize;
+            let from = arg2 as usize;
+            let pages = arg3 as usize;
+            if pages > 256
+                || !paging::user_range_ok(virt, pages)
+                || !paging::user_range_ok(from, pages)
+            {
+                return u64::MAX;
+            }
+            let own = paging::read_cr3();
+            if cr3 == own || !crate::userspace::may_use_address_space(caller, cr3) {
+                return u64::MAX;
+            }
+            // All of it is checked before any of it moves. Only memory the
+            // caller owns may go — not a device, not shared memory, not a
+            // frame somebody lent it — and nothing already mapped at the far
+            // end is replaced.
+            for i in 0..pages {
+                let ours = unsafe { paging::leaf_flags(own, from + i * 4096) }
+                    .is_some_and(|f| f & (paging::OWNED | paging::USER) == paging::OWNED | paging::USER);
+                if !ours || unsafe { paging::translate(cr3, virt + i * 4096) }.is_some() {
+                    return u64::MAX;
+                }
+            }
+            let pte_flags = paging::PRESENT | paging::USER | paging::OWNED
+                | if arg4 & 1 != 0 { paging::WRITABLE } else { 0 };
+            let mut moved = 0;
+            for i in 0..pages {
+                let here = from + i * 4096;
+                let Some(frame) = (unsafe { paging::translate(own, here) }) else {
+                    break;
+                };
+                // Mapping can fail, for want of a page table, so it goes
+                // first, while the page is still the caller's. Whatever moved
+                // before a failure stays moved: it is the target's, and is
+                // freed with it.
+                if unsafe { paging::map_page(cr3, virt + i * 4096, frame, pte_flags) }.is_err() {
+                    break;
+                }
+                let _ = unsafe { paging::unmap_page(own, here) };
+                moved += 1;
+            }
+            // No longer in the caller's address space, so no longer on its
+            // account — as for SYS_MUNMAP.
+            scheduler::current_task_uncharge_mem(moved);
+            if moved == pages { 0 } else { u64::MAX }
         }
         SYS_TASK_START | SYS_TASK_START_ARG => {
             // arg0=tid, arg1=rip, arg2=rsp, arg3=cr3

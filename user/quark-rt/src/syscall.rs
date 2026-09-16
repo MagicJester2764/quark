@@ -36,6 +36,7 @@ pub const SYS_MAP_PHYS: u64 = 38;
 pub const SYS_SET_MEM_LIMIT: u64 = 39;
 pub const SYS_SET_PAGER: u64 = 40;
 pub const SYS_ADDRSPACE_SELF: u64 = 41;
+pub const SYS_ADDRSPACE_GIVE: u64 = 43;
 
 // --- 0x30  shared memory ---
 pub const SYS_MMAP_FD: u64 = 42;
@@ -429,6 +430,27 @@ pub fn sys_addrspace_map(cr3: usize, virt: usize, phys: usize, pages: usize, fla
             cr3 as u64,
             virt as u64,
             phys as u64,
+            pages as u64,
+            flags,
+        )
+    };
+    if ret == u64::MAX { Err(()) } else { Ok(()) }
+}
+
+/// Move `pages` pages of the caller's own memory, starting at `from`, into
+/// address space `cr3` at `virt`. They leave the caller and belong to `cr3`
+/// from then on, which frees them when it is destroyed. `flags` bit 0 makes
+/// them writable there.
+///
+/// Only memory the caller got from [`sys_mmap`] can be given, at most 256
+/// pages a call, and only to an unoccupied range.
+pub fn sys_addrspace_give(cr3: usize, virt: usize, from: usize, pages: usize, flags: u64) -> Result<(), ()> {
+    let ret = unsafe {
+        syscall5(
+            SYS_ADDRSPACE_GIVE,
+            cr3 as u64,
+            virt as u64,
+            from as u64,
             pages as u64,
             flags,
         )

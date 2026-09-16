@@ -16,7 +16,10 @@
 /// Virtual address where the argument page is mapped.
 pub const ARGS_PAGE_ADDR: usize = 0x80_8000_0000;
 
-/// Return the number of arguments, or 0 if no args page was set up.
+/// Return the number of arguments.
+///
+/// Every spawner maps an argument page, even for a program given no
+/// arguments. Reading one that was never mapped faults.
 pub fn argc() -> usize {
     let base = ARGS_PAGE_ADDR as *const u64;
     unsafe { *base as usize }
