@@ -16,9 +16,52 @@ SECTIONS {
         KEEP(*(.quark.manifest))
     }
 
-    .got : ALIGN(4K) {
+    /* The start of everything writable, on a page of its own. The counter is
+     * advanced here rather than the section aligned, for the reason given at
+     * .tdata below: a program with no GOT has an empty .got, the linker drops
+     * it and its alignment with it, and .init_array then lands in the last
+     * page of .rodata. The linker merges the two into one segment, and the
+     * program is loaded read-write-execute from end to end.
+     */
+    . = ALIGN(4K);
+
+    .got : {
         *(.got .got.plt)
     }
+
+    /* Constructors and destructors, the way musl runs them: an array of
+     * function pointers between two symbols it declares weak. A weak symbol
+     * nobody defines is zero, so a script that forgets these gets no error —
+     * it gets a C library that runs nothing between two equal addresses. That
+     * was this script, and no constructor in any C program here ever ran.
+     */
+    .init_array : {
+        PROVIDE_HIDDEN(__init_array_start = .);
+        KEEP(*(SORT_BY_INIT_PRIORITY(.init_array.*)))
+        KEEP(*(.init_array))
+        PROVIDE_HIDDEN(__init_array_end = .);
+    }
+
+    .fini_array : {
+        PROVIDE_HIDDEN(__fini_array_start = .);
+        KEEP(*(SORT_BY_INIT_PRIORITY(.fini_array.*)))
+        KEEP(*(.fini_array))
+        PROVIDE_HIDDEN(__fini_array_end = .);
+    }
+
+    /* The older mechanism, which only crtbegin.o and crtend.o run, and nothing
+     * here links them. A compiler configured without --enable-initfini-array
+     * puts constructors here, and they were silently never called. Collected
+     * only so that the link can refuse: a constructor that will not run is a
+     * bug to report at build time, not a mystery to find at run time.
+     */
+    .ctors : {
+        __legacy_ctors_start = .;
+        KEEP(*(.ctors .ctors.* .dtors .dtors.*))
+        __legacy_ctors_end = .;
+    }
+    ASSERT(__legacy_ctors_end == __legacy_ctors_start,
+           "object has .ctors/.dtors: rebuild it with a compiler configured --enable-initfini-array")
 
     .data : ALIGN(4K) {
         *(.data .data.* .ldata .ldata.*)

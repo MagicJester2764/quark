@@ -64,11 +64,26 @@ static int build_argv(void) {
     return argc;
 }
 
+/* The program's constructors, which the link script collects between these two
+ * symbols. Weak, like musl's, so that a program linked without them runs; but
+ * the link script defines them for every program, so in practice they are
+ * always there — and a constructor in a program built against this library
+ * will run, which until this existed it silently did not. */
+extern void (*const __init_array_start[])(void) __attribute__((weak));
+extern void (*const __init_array_end[])(void) __attribute__((weak));
+
+static void run_constructors(void) {
+    for (void (*const *f)(void) = __init_array_start; f < __init_array_end; f++) {
+        (*f)();
+    }
+}
+
 /* The ELF entry point.
  *
  * Nothing returns here: `main` returning means exiting with its value, and
  * there is no caller to go back to. */
 __attribute__((noreturn, used)) void _start(void) {
     int argc = build_argv();
+    run_constructors();
     exit(main(argc, argv_slots));
 }
