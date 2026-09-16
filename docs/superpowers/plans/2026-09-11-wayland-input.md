@@ -61,7 +61,7 @@ set-1 scancodes the two are the same number — `KEY_ESC` is 1 and set-1 escape 
 0x01, all the way to `KEY_F12` at 88 and 0x58. So there is no translation table,
 which is worth a comment because it looks like a missing one.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Extend `wlprobe` to bind the seat, take a keyboard, and report what arrives:
 
@@ -119,14 +119,14 @@ and, after the first commit is configured,
     wl_keyboard_add_listener(keyboard, &kb_listener, NULL);
 ```
 
-- [ ] **Step 2: Run it to verify it fails**
+- [x] **Step 2: Run it to verify it fails**
 
 `$SP/cycle.sh $SP/t8b.keys /tmp/claude-1000/t8b.ppm` with a key script that
 logs in, runs `wm wlprobe`, types `abc`, waits, presses Escape and screendumps.
 
 Expected: `globals: 4` and no `wl_seat` among them; `seat: NULL`.
 
-- [ ] **Step 3: Write the implementation**
+- [x] **Step 3: Write the implementation**
 
 `protocol.rs` gains the fifth global and the opcodes:
 
@@ -216,7 +216,7 @@ two in step.
 `main.rs` routes: `dispatch_key` also calls `seat::key(...)`, and
 `cycle_focus`/`raise`/`destroy_window` call `seat::focus_changed(...)`.
 
-- [ ] **Step 4: Run it to verify it passes**
+- [x] **Step 4: Run it to verify it passes**
 
 Same invocation. Expected on screen:
 
@@ -233,7 +233,7 @@ key: serial N code 30 up
 and Escape must produce none of them — the compositor's own bindings are never
 passed on.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add -A && git commit   # message written at the time
@@ -267,7 +267,7 @@ currently blocked calling the granter.** The second needs no new system call and
 no new state, because being blocked in `sys_call` *is* the invitation: a task
 that calls a server has asked it for an answer, and a capability is one.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 In `user/dtest`, a case that does not need a second task, because the child in
 `dtest` is spawned and would pass under the first half of the rule:
@@ -282,12 +282,12 @@ check(
 );
 ```
 
-- [ ] **Step 2: Run it to verify it fails**
+- [x] **Step 2: Run it to verify it fails**
 
 `$SP/boot.sh $SP/dt.keys /tmp/claude-1000/dt.ppm`. Expected: that one case
 reported failed, everything else passing.
 
-- [ ] **Step 3: Write the implementation**
+- [x] **Step 3: Write the implementation**
 
 In `src/ipc.rs`:
 
@@ -329,13 +329,13 @@ if !crate::cap::task_has_task_mgmt(caller, dest_tid)
 }
 ```
 
-- [ ] **Step 4: Run it to verify it passes**
+- [x] **Step 4: Run it to verify it passes**
 
 `dtest` green, and — because this rule is load-bearing in both directions —
 `wm weston-simple-shm` must still draw. The framebuffer lease is the second case
 and a regression here takes the display with it.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ---
 
@@ -356,7 +356,7 @@ The keymap text is generated once from the host and checked in, with the command
 that produced it in the comment — hand-writing XKB is how you get a keymap that
 xkbcommon rejects at run time, a long way from here.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 `wlprobe` reads the descriptor instead of closing it, and prints what it got:
 
@@ -380,12 +380,12 @@ static void kb_keymap(void *d, struct wl_keyboard *k, uint32_t format,
 }
 ```
 
-- [ ] **Step 2: Run it to verify it fails**
+- [x] **Step 2: Run it to verify it fails**
 
 Expected: `keymap: format 0 size 0`, and no first line, because there is
 nothing in the descriptor.
 
-- [ ] **Step 3: Write the implementation**
+- [x] **Step 3: Write the implementation**
 
 Generate on the host:
 
@@ -400,11 +400,11 @@ terminating NUL, which is what xkbcommon expects.
 The descriptor is made once and duplicated per client with `sys_fd_dup_self`,
 because a client may close it and the next client still needs one.
 
-- [ ] **Step 4: Run it to verify it passes**
+- [x] **Step 4: Run it to verify it passes**
 
 Expected: `keymap: format 1 size N` and a first line of `xkb_keymap {`.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ---
 
@@ -431,18 +431,18 @@ auxiliary device through the controller, and routes each byte by status bit 5.
 It keeps its name and its nameserver registration, because everything that talks
 to it talks about keys; what changes is that it also answers a pointer poll.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 `wlprobe` takes a pointer from the seat and prints enter, motion and button.
 QEMU's `-display none` still delivers mouse input over QMP `input-send-event`,
 so the key script can move and click without a window to look at.
 
-- [ ] **Step 2: Run it to verify it fails**
+- [x] **Step 2: Run it to verify it fails**
 
 Expected: `capabilities` reports keyboard only, so `wl_seat_get_pointer` returns
 an object that never hears anything.
 
-- [ ] **Step 3: Write the implementation**
+- [x] **Step 3: Write the implementation**
 
 Controller first, protocol second, and verify the controller alone before adding
 any protocol on top of it — a mouse that wedges the keyboard must not look like
@@ -462,13 +462,13 @@ a `wl_pointer` bug.
 5. `wl_pointer` at version 4: enter, leave, motion, button, axis, and the
    `release` request. Version 5's `frame` is deliberately out.
 
-- [ ] **Step 4: Run it to verify it passes**
+- [x] **Step 4: Run it to verify it passes**
 
 Move and click over `weston-simple-shm`; expected: enter with a surface,
 motion with coordinates in surface-local fixed point, button with a serial, and
 the keyboard still typing throughout.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ---
 
@@ -514,7 +514,7 @@ rename touches the boot image (`init` loads by name), ExplOSion's staging, and
 both `CLAUDE.md` files; a rename that leaves one of those behind produces a
 machine that boots to no console at all.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Two clients, because a clipboard with one participant proves nothing: extend
 `wlprobe` with a `--copy <text>` mode that takes the selection and a `--paste`
@@ -524,23 +524,23 @@ mode that reads it, then run `wm wlprobe --copy hello` and, in the same session,
 For decoration, `wlprobe` binds the manager, asks for a decoration on its
 toplevel and prints the mode it is configured with.
 
-- [ ] **Step 2: Run it to verify it fails**
+- [x] **Step 2: Run it to verify it fails**
 
 Expected: no `wl_data_device_manager` and no `zxdg_decoration_manager_v1` among
 the globals; `--paste` prints nothing.
 
-- [ ] **Step 3: Write the implementation**
+- [x] **Step 3: Write the implementation**
 
 The renames first and on their own, because a boot failure from a rename must
 not be mistaken for a clipboard bug. Then decoration, which is one event. Then
 the clipboard.
 
-- [ ] **Step 4: Run it to verify it passes**
+- [x] **Step 4: Run it to verify it passes**
 
 Expected: `paste: hello`, `decoration: server_side`, and the machine still boots
 to a console with a shell on it.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ---
 
