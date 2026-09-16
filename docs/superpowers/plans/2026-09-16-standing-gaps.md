@@ -551,7 +551,7 @@ both network tests pass; dtest's broad-range check names only init.
 - Modify: `src/userspace.rs` (`spawn_init`), `src/cap.rs` (`populate_from_bitmask`, `task_has_phys_range`)
 - Modify: `CLAUDE.md` (the `CAP_MAP_PHYS` warning)
 
-- [ ] **Step 1: Kernel** — `spawn_init` gives init `CAP_ALL & !CAP_MAP_PHYS` in
+- [x] **Step 1: Kernel** — `spawn_init` gives init `CAP_ALL & !CAP_MAP_PHYS` in
 both `task.caps` and its CSpace, then one kernel-rooted `PhysRange` for the
 framebuffer (page-aligned `fb.addr .. fb.addr + pitch × height`) and one per
 boot module (page-aligned). `populate_from_bitmask` no longer turns
@@ -559,11 +559,11 @@ boot module (page-aligned). `populate_from_bitmask` no longer turns
 per-UID bit: a legacy bit that means "all of memory" is how `SYS_CAP_TRANSFER`
 and `SYS_SET_USER_CAPS` could still have handed it out.
 
-- [ ] **Step 2: Verify** — boot (fb still gets the screen, init still reads
+- [x] **Step 2: Verify** — boot (fb still gets the screen, init still reads
 `boot.img`), `dtest`. Expected: `no task may map more than one device's memory`
 and `no task may map the kernel` pass, and the whole dtest run is clean.
 
-- [ ] **Step 3: Commit** — "init holds the framebuffer and its modules, not all
+- [x] **Step 3: Commit** — "init holds the framebuffer and its modules, not all
 of memory"; CLAUDE.md's `CAP_MAP_PHYS` bullet says the bit now confers nothing,
 and the `PhysRange` known gap is gone.
 

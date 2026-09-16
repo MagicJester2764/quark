@@ -162,9 +162,11 @@ pub fn task_has_irq(tid: usize, irq: u8) -> bool {
 }
 
 /// Check if a task has PhysRange capability covering [phys, phys + pages*4096).
+///
+/// Only a capability counts. The per-UID `CAP_MAP_PHYS` bit used to as well,
+/// and meant all of memory to every task of that user.
 pub fn task_has_phys_range(tid: usize, phys: usize, pages: usize) -> bool {
     if tid >= MAX_TASKS { return false; }
-    if user_has_cap_bit(tid, crate::task::CAP_MAP_PHYS) { return true; }
     // Checked: a wrapped `phys_end` would compare below `cap.param1` and let
     // an arbitrary physical range through.
     let phys_end = match pages
@@ -355,18 +357,10 @@ pub fn populate_from_bitmask(cspace: &mut CSpace, caps: u32) {
             };
         }
     }
-    if caps & crate::task::CAP_MAP_PHYS != 0 {
-        if let Some(slot) = find_empty_slot(cspace) {
-            cspace[slot] = CapSlot {
-                cap_type: CapType::PhysRange,
-                generation: 0,
-                root_slot: 0,
-                root_tid: KERNEL_ROOT_TID,
-                param0: 0,
-                param1: 0x1_0000_0000, // 4 GiB
-            };
-        }
-    }
+    // `CAP_MAP_PHYS` expands to nothing. It used to be a PhysRange over all
+    // four gigabytes, which is how a bit handed over with SYS_GRANT_CAP or
+    // SYS_CAP_TRANSFER undid every narrow grant made alongside it. Physical
+    // memory is granted as the range it is; see `insert_kernel_range`.
     if caps & crate::task::CAP_IRQ != 0 {
         if let Some(slot) = find_empty_slot(cspace) {
             cspace[slot] = CapSlot {
@@ -426,6 +420,27 @@ pub fn populate_from_bitmask(cspace: &mut CSpace, caps: u32) {
                 param1: 0,
             };
         }
+    }
+}
+
+/// Give `cspace` an unrevocable capability over the pages covering
+/// `[base, base + len)`, in its first free slot. False if none is free.
+pub fn insert_kernel_range(cspace: &mut CSpace, base: usize, len: usize) -> bool {
+    let start = base & !0xFFF;
+    let end = (base + len + 0xFFF) & !0xFFF;
+    match find_empty_slot(cspace) {
+        Some(slot) => {
+            cspace[slot] = CapSlot {
+                cap_type: CapType::PhysRange,
+                generation: 0,
+                root_slot: 0,
+                root_tid: KERNEL_ROOT_TID,
+                param0: start as u64,
+                param1: end as u64,
+            };
+            true
+        }
+        None => false,
     }
 }
 

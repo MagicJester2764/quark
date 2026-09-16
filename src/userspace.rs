@@ -307,10 +307,25 @@ pub fn spawn_init(elf_data: &[u8], fb: Option<crate::multiboot2::FramebufferInfo
         // the only spawner that can put a driver in the driver band, since a
         // spawner may never grant a better band than it is in. It steps down
         // to an ordinary one once it has finished starting things.
+        //
+        // Every capability but one kind: physical memory, of which it holds
+        // exactly what it maps — the framebuffer, to lend to `fb`, and its
+        // boot modules, to read them. It used to hold all four gigabytes, and
+        // so could map the kernel.
         task.priority = scheduler::PRIO_DRIVER;
         task.cr3 = pml4;
-        task.caps = crate::task::CAP_ALL;
-        crate::cap::populate_from_bitmask(&mut task.cspace, crate::task::CAP_ALL);
+        let caps = crate::task::CAP_ALL & !crate::task::CAP_MAP_PHYS;
+        task.caps = caps;
+        crate::cap::populate_from_bitmask(&mut task.cspace, caps);
+        if let Some(ref fbi) = fb {
+            let len = fbi.pitch as usize * fbi.height as usize;
+            crate::cap::insert_kernel_range(&mut task.cspace, fbi.addr as usize, len);
+        }
+        for i in 0..crate::modules::count() {
+            if let Some(m) = crate::modules::get(i) {
+                crate::cap::insert_kernel_range(&mut task.cspace, m.start, m.end - m.start);
+            }
+        }
         task.context.rip = enter_user_trampoline as *const () as u64;
         task.context.r12 = entry;
         task.context.r13 = stack_top;

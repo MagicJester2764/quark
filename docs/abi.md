@@ -97,7 +97,7 @@ so it is built from calls that already existed.
 | 1.9 | `SYS_MEMFD_TRUNCATE` (54) — `ftruncate` on memory named by a descriptor, which is how every Wayland client makes its buffer pool: `memfd_create`, `ftruncate`, `mmap`. Only while nobody has the region mapped and no descriptor for it is travelling, because growing it otherwise changes what is behind somebody else's live mapping. `SYS_MMAP_FD` (42) also returns the size it mapped instead of 0: a task that received a descriptor has no other way to learn how big the memory is, and the sender's word for it is the one thing it must not take. |
 | 1.10 | `SYS_FD_DUP` (68) and `SYS_PIPE_FD_SET` (70) no longer need `TaskMgmt` when the target is the caller, and both accept `u64::MAX - 1` for "any free descriptor" and return the number they took. Putting a descriptor into somebody else's table hands them something they never asked for; putting one into your own is `dup` and `pipe`, which every C library calls and which confer nothing. Also: `sys_cap_grant` (81) requires `TaskMgmt` over the destination, or the destination's consent — either a `sys_call` to the granter in progress, or a standing `Endpoint` naming it. Unrestricted, any task could fill any other's sixteen CSpace slots and leave it unable to be handed a display again. |
 | 1.11 | `SYS_ADDRSPACE_GIVE` (43) — move pages of the caller's own memory into an address space it made, which owns them from then on and frees them with itself. `SYS_ADDRSPACE_MAP` (37) is deprecated in its favour: every program a spawner loaded with it stayed allocated until the spawner exited. Also: `SYS_WAIT` (4) reaps the child it returns, so its memory is free, and its TID may be reused, by the time the call returns. A child used to be reaped only when the machine next went idle, which a parent running programs back to back never let it do. |
-| 1.12 | `SYS_CALL_LEND` (23), `SYS_LENT_READ` (25), `SYS_LENT_WRITE` (26) — a call can lend the task it calls a buffer, which that task copies into and out of through the kernel until it replies. `SYS_CAP_READ` (92) — read one slot of a task's CSpace whole, for any task the caller manages. |
+| 1.12 | `SYS_CALL_LEND` (23), `SYS_LENT_READ` (25), `SYS_LENT_WRITE` (26) — a call can lend the task it calls a buffer, which that task copies into and out of through the kernel until it replies. `SYS_CAP_READ` (92) — read one slot of a task's CSpace whole, for any task the caller manages. Also: the `CAP_MAP_PHYS` bit, per task or per user, confers nothing, and init starts with `PhysRange` capabilities over the framebuffer and its boot modules instead of all of memory. |
 
 A capability may only be minted from one the caller already holds, and only
 narrowed — with one exception. **An `Endpoint` naming only the caller may
@@ -112,14 +112,15 @@ Five calls are **deprecated as of 1.0** — the `CAP_*` object-capability calls
 
 | Call | Number | Why | Replacement |
 |---|---|---|---|
-| `SYS_GRANT_CAP` | 86 | Expands a bitmask bit into a *wildcard* capability, e.g. `CAP_MAP_PHYS` becomes `PhysRange(0, 4 GiB)`, silently widening any narrow grant made alongside it | `SYS_CAP_MINT` + `SYS_CAP_GRANT` |
+| `SYS_GRANT_CAP` | 86 | Expands a bitmask bit into a *wildcard* capability, e.g. `CAP_IOPORT` becomes every port, silently widening any narrow grant made alongside it. (`CAP_MAP_PHYS` expands to nothing as of 1.12.) | `SYS_CAP_MINT` + `SYS_CAP_GRANT` |
 | `SYS_GRANT_IOPORT` | 87 | Same, for the full port range | `SYS_CAP_MINT` with `IoPort(start, end)` |
 | `SYS_GRANT_IRQ` | 88 | Same shape | `SYS_CAP_MINT` with `Irq(n)` |
 | `SYS_SET_USER_CAPS` | 89 | Per-UID authority predates capabilities and is not consulted by anything that grants correctly | per-task CSpace |
 | `SYS_GET_USER_CAPS` | 90 | as above | per-task CSpace |
 
-New code must not call these. See `CLAUDE.md` for why granting `CAP_MAP_PHYS`
-in particular undoes an otherwise careful capability grant.
+New code must not call these. Each turns a bit into the widest capability of
+its kind, which undoes any narrow grant made alongside it; `CAP_MAP_PHYS`, the
+worst of them, has conferred nothing since 1.12.
 
 `SYS_ADDRSPACE_MAP` (37) is **deprecated as of 1.11**, replaced by
 `SYS_ADDRSPACE_GIVE` (43). The frames it maps into a child stay the spawner's,
@@ -238,7 +239,9 @@ call to a task that never reaches `SYS_RECV` blocks forever.
 frames it owns — `SYS_PHYS_ALLOC` records the caller as owner — with no
 capability at all, since handing back memory the allocator just gave you conveys
 no new authority. `PhysRange` is required only for frames the allocator never
-owned (device MMIO, the framebuffer) and for pages another task allocated.
+owned (device MMIO, the framebuffer, a boot module). Data a server reads or
+writes for a client is lent with the call, not mapped (see `SYS_CALL_LEND`), so
+no server needs a range for that — and none is given one.
 
 **All user mappings must be at or above `USER_MIN_ADDR` (0x80_0000_0000).**
 Lower addresses are rejected: address spaces share the page directories beneath

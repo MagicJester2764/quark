@@ -150,11 +150,21 @@ These were established deliberately. Breaking one silently re-opens a hole.
   and the deprecated `sys_addrspace_map` accept frames the caller owns
   (`pmm::owns_range`), so a task that allocated a frame may map it holding no
   capability at all. That is what almost every mapper does. A `PhysRange` grant
-  is for frames the allocator never owned — the framebuffer, device MMIO — and
-  for a page another task allocated and passed over IPC. Never grant
-  `CAP_MAP_PHYS` to narrow it: `populate_from_bitmask` expands that bit into a
-  full-range `PhysRange`, which silently reopens everything the explicit grants
-  closed.
+  is for memory the allocator never owned — the framebuffer, device MMIO, a
+  boot module — and covers exactly that. The legacy `CAP_MAP_PHYS` bit confers
+  nothing: it used to expand into a range over all of memory, which a bit
+  passed with `SYS_GRANT_CAP` or `SYS_CAP_TRANSFER` could hand anybody.
+- **A server copies what a client lent; it never maps a client's page.** Data
+  travels with the call (`SYS_CALL_LEND`, then `SYS_LENT_READ` and
+  `SYS_LENT_WRITE`), so no server needs authority over physical memory to serve
+  anyone. A protocol that names a physical address makes its server a deputy
+  that will read or write any page in the machine — that is why the disk, VFS
+  and NET servers once held all of it. A shared-memory handle is no better
+  when the request names it: handles are global numbers.
+- **No task holds a `PhysRange` wider than one device.** init is started with
+  the framebuffer and its boot modules, `fb` holds the framebuffer and lends it
+  on, and no driver holds any. `dtest physical` walks every CSpace and fails
+  otherwise.
 - **A program declares what it needs; a spawner grants from that.** Capabilities
   come from a `quark_rt::manifest!` block compiled into the image, found by
   scanning for its magic, not from a table of names in `init`. A spawner mints
@@ -261,12 +271,6 @@ Three things follow from that, and breaking any of them is quiet:
 
 ## Known gaps
 
-- `PhysRange` is narrow where it can be: `fb` holds exactly the framebuffer,
-  and login, the shell and everything they spawn hold none at all. DISK, VFS and
-  NET still hold `PhysRange(0, 4 GiB)`, because each maps a DMA page the
-  *client* allocated and named over IPC, which has no static extent to grant.
-  Closing that needs the frames handed over explicitly — shared memory, or an
-  ownership transfer on the IPC — rather than a range grant.
 - Endpoint sets are TID bitmasks, not true endpoint objects. A service and its
   clients are named by slot number, not identity.
 - Nothing is demand-paged: memory is backed when it is mapped, not when it is
