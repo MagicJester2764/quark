@@ -22,10 +22,16 @@ pub const XDG_WM_BASE: Interface = Interface { name: b"xdg_wm_base", version: 1 
 /// there is deliberate: version 5 adds `wl_pointer.frame` and the axis detail
 /// that goes with it, and a client binding 5 would be right to expect them.
 pub const SEAT: Interface = Interface { name: b"wl_seat", version: 4 };
+/// Server-side decorations, which is the only answer this compositor has: it
+/// draws a title bar whether or not anybody asks. The value of saying so is
+/// that a toolkit stops drawing its own on top of it.
+pub const DECORATION: Interface =
+    Interface { name: b"zxdg_decoration_manager_v1", version: 1 };
 
 /// What the registry advertises, and the order it advertises them in. The
 /// index is the `name` a client binds by.
-pub const GLOBALS: [&Interface; 5] = [&COMPOSITOR, &SHM, &OUTPUT, &XDG_WM_BASE, &SEAT];
+pub const GLOBALS: [&Interface; 6] =
+    [&COMPOSITOR, &SHM, &OUTPUT, &XDG_WM_BASE, &SEAT, &DECORATION];
 
 // wl_display requests.
 pub const DISPLAY_SYNC: u16 = 0;
@@ -171,6 +177,22 @@ pub const KEYMAP_FORMAT_XKB_V1: u32 = 1;
 /// `wl_keyboard.key_state`.
 pub const KEY_RELEASED: u32 = 0;
 pub const KEY_PRESSED: u32 = 1;
+
+// zxdg_decoration_manager_v1 requests.
+pub const DECORATION_DESTROY: u16 = 0;
+pub const DECORATION_GET_TOPLEVEL: u16 = 1;
+
+// zxdg_toplevel_decoration_v1 requests and events.
+pub const TOPLEVEL_DECORATION_DESTROY: u16 = 0;
+pub const TOPLEVEL_DECORATION_SET_MODE: u16 = 1;
+pub const TOPLEVEL_DECORATION_UNSET_MODE: u16 = 2;
+pub const TOPLEVEL_DECORATION_CONFIGURE: u16 = 0;
+/// `zxdg_toplevel_decoration_v1.mode`. A client may ask for either and is told
+/// which it gets; this compositor always answers `SERVER_SIDE`, because the
+/// frame is drawn before the client's pixels are and there is no way for it to
+/// not be drawn.
+pub const DECORATION_MODE_CLIENT_SIDE: u32 = 1;
+pub const DECORATION_MODE_SERVER_SIDE: u32 = 2;
 
 /// The object id of `wl_display`, which exists before anything is asked for.
 pub const DISPLAY_ID: u32 = 1;

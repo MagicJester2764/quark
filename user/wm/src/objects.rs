@@ -31,6 +31,8 @@ pub enum Kind {
     Seat,
     Keyboard,
     Pointer,
+    Decoration,
+    ToplevelDecoration,
     XdgWmBase,
     XdgSurface { surface: usize },
     XdgToplevel { surface: usize },

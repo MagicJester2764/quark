@@ -401,8 +401,57 @@ impl Client {
                 }
                 true
             }
+            Kind::Decoration => {
+                match h.opcode {
+                    proto::DECORATION_GET_TOPLEVEL => {
+                        // get_toplevel_decoration(new_id, toplevel)
+                        let (Some(id), Some(_toplevel)) = (
+                            wire::get_u32(&self.rbuf, body),
+                            wire::get_u32(&self.rbuf, body + 4),
+                        ) else {
+                            return false;
+                        };
+                        if !self.objects.insert(id, Kind::ToplevelDecoration) {
+                            return false;
+                        }
+                        self.decoration_configure(id);
+                        true
+                    }
+                    proto::DECORATION_DESTROY => {
+                        self.objects.remove(h.object);
+                        true
+                    }
+                    _ => true,
+                }
+            }
+            Kind::ToplevelDecoration => {
+                match h.opcode {
+                    // A client may ask for either mode and is told which it
+                    // gets. The answer does not depend on the question: the
+                    // frame is drawn before the client's pixels are, and there
+                    // is no arrangement here in which it is not drawn.
+                    proto::TOPLEVEL_DECORATION_SET_MODE
+                    | proto::TOPLEVEL_DECORATION_UNSET_MODE => {
+                        self.decoration_configure(h.object);
+                        true
+                    }
+                    proto::TOPLEVEL_DECORATION_DESTROY => {
+                        self.objects.remove(h.object);
+                        true
+                    }
+                    _ => true,
+                }
+            }
             Kind::Output | Kind::Callback | Kind::None => true,
         }
+    }
+
+    fn decoration_configure(&mut self, id: u32) {
+        if let Some(a) = self.begin(id, proto::TOPLEVEL_DECORATION_CONFIGURE) {
+            self.arg_u32(proto::DECORATION_MODE_SERVER_SIDE);
+            self.end(a);
+        }
+        self.flush();
     }
 
     /// The keyboard object this client asked for, if it did.
@@ -1139,6 +1188,7 @@ impl Client {
             3 => Kind::Output,
             4 => Kind::XdgWmBase,
             5 => Kind::Seat,
+            6 => Kind::Decoration,
             _ => return false,
         };
         // Clamped to what was advertised. A client asking for more than it was
