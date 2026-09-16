@@ -100,6 +100,10 @@ typedef unsigned long size_t;
 #define LX_renameat2       316
 #define LX_AT_REMOVEDIR  0x200
 #define LX_getdents64      217
+#define LX_dup              32
+#define LX_dup2             33
+#define LX_dup3            292
+#define LX_O_CLOEXEC  02000000
 #define LX_readlink         89
 #define LX_readlinkat      267
 #define LX_statfs          137
@@ -556,6 +560,23 @@ long __quark_syscall(long n, long a1, long a2, long a3, long a4, long a5, long a
 
     case LX_fcntl:
         return __quark_fcntl(a1, a2, a3);
+    case LX_dup:
+        return __quark_dup(a1, -1);
+    case LX_dup2:
+        if (a2 < 0) {
+            return -LX_EBADF;
+        }
+        return __quark_dup(a1, a2);
+    /* dup3 differs in refusing a copy onto itself, and in the one flag it
+       takes, which means nothing here: nothing execs. */
+    case LX_dup3:
+        if (a1 == a2 || (a3 & ~LX_O_CLOEXEC)) {
+            return -LX_EINVAL;
+        }
+        if (a2 < 0) {
+            return -LX_EBADF;
+        }
+        return __quark_dup(a1, a2);
 
     /* The mode is the server's to choose: it makes every directory 0755 for
        the caller, which is what a umask of 022 would leave of most requests. */

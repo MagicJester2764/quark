@@ -957,7 +957,7 @@ long __quark_getdents(long fd, void *buf, unsigned long count) {
 **Interfaces:**
 - Produces: `libz.a`, `zlib.pc` in the musl prefix; `gperf` in `$HOSTDEPS/bin`; `teach-config-sub.sh <config.sub>`; the suite `/tmp/claude-1000/suite-zlib` (`example`, `minigzip`).
 
-- [ ] **Step 1: The failing test.** `ztest.c`:
+- [x] **Step 1: The failing test.** `ztest.c`:
 
 ```c
 // LINK: -lz
@@ -1009,7 +1009,9 @@ static int verify(void) {
     }
     int ok = n == LEN && !memcmp(want, got, LEN);
     printf("ztest: %s after minigzip and back\n", ok ? "identical" : "DIFFERENT");
-    return ok ? 0 : 1;
+    free(want);
+    free(got);
+    return ok && remove(DATA) == 0 ? 0 : 1;
 }
 
 int main(int argc, char **argv) {
@@ -1059,16 +1061,17 @@ int main(int argc, char **argv) {
 ```
 # zlib: ours, then zlib's own. Expected: all passed.
 ztest
-example
+# example leaves the gzip file it names; minigzip overwrites and removes it.
+example /tmp/zdata.gz
 ztest prepare
 minigzip /tmp/zdata
 minigzip -d /tmp/zdata.gz
 ztest verify
 ```
 
-- [ ] **Step 2: Run it.** `sh toolchain/build-tests.sh /tmp/claude-1000/suite-c` → `ztest skipped, not built yet: z`.
+- [x] **Step 2: Run it.** `sh toolchain/build-tests.sh /tmp/claude-1000/suite-c` → `ztest skipped, not built yet: z`.
 
-- [ ] **Step 3: The wrapper.** `build-musl.sh` writes the wrapper the machine already has (the rotating loop, no `eval`) plus:
+- [x] **Step 3: The wrapper.** `build-musl.sh` writes the wrapper the machine already has (the rotating loop, no `eval`) plus:
 
 ```sh
 # -fPIC, -fpic, -fPIE, -fpie and -pie are dropped too. Nothing here is a
@@ -1084,7 +1087,7 @@ ztest verify
 
 and the installed `~/opt/cross/bin/x86_64-quark-musl-gcc` is regenerated from it (the heredoc section only). Check: `x86_64-quark-musl-gcc -fPIC -O2 -c` of a file with a global's address, then `objdump -dr` shows no `GOTPCREL`.
 
-- [ ] **Step 4: `teach-config-sub.sh`.** The hunk `build-libffi.sh` carries, as a script both use:
+- [x] **Step 4: `teach-config-sub.sh`.** The hunk `build-libffi.sh` carries, as a script both use:
 
 ```sh
 #!/bin/sh
@@ -1108,7 +1111,7 @@ PY
 echo "==> $F knows quark"
 ```
 
-- [ ] **Step 5: `bootstrap-fonts.sh`.** Same shape as `bootstrap-wayland.sh`: fetch into `$QUARK_SRC` (default `~/opt/src`), check each tarball against a pinned SHA-256, unpack if absent; build `gperf` into `$QUARK_HOSTDEPS` if `$QUARK_HOSTDEPS/bin/gperf` is missing. URLs and sums:
+- [x] **Step 5: `bootstrap-fonts.sh`.** Same shape as `bootstrap-wayland.sh`: fetch into `$QUARK_SRC` (default `~/opt/src`), check each tarball against a pinned SHA-256, unpack if absent; build `gperf` into `$QUARK_HOSTDEPS` if `$QUARK_HOSTDEPS/bin/gperf` is missing. URLs and sums:
 
 ```
 zlib-1.3.2.tar.xz               https://zlib.net/                                   d7a0654783a4da529d1bb793b7ad9c3318020af77667bcae35f95d0e42a792f3
@@ -1121,7 +1124,7 @@ gperf-3.3.tar.gz                https://ftp.gnu.org/gnu/gperf/                  
 
 (libxkbcommon unpacks as `libxkbcommon-xkbcommon-1.13.2`.) Run it: everything reports "already unpacked", and gperf builds once.
 
-- [ ] **Step 6: `build-zlib.sh`.**
+- [x] **Step 6: `build-zlib.sh`.**
 
 ```sh
 #!/bin/sh
@@ -1145,9 +1148,9 @@ cp example minigzip "$OUT"/
 echo "zlib installed into $PREFIX; its tests are in $OUT"
 ```
 
-- [ ] **Step 7: Verify.** `build-zlib.sh ~/opt/src/zlib-1.3.2 /tmp/claude-1000/suite-zlib`, `build-tests.sh /tmp/claude-1000/suite-c`, image with `TEST_SUITES` + `suite-zlib`, boot, `runtests /etc/zlib.tests` (6 passed), `runtests /etc/libc.tests`, `ls /tmp` shows no leftovers; `tools/check-rootfs.sh` clean.
+- [x] **Step 7: Verify.** `build-zlib.sh ~/opt/src/zlib-1.3.2 /tmp/claude-1000/suite-zlib`, `build-tests.sh /tmp/claude-1000/suite-c`, image with `TEST_SUITES` + `suite-zlib`, boot, `runtests /etc/zlib.tests` (6 passed), `runtests /etc/libc.tests`, `ls /tmp` shows no leftovers; `tools/check-rootfs.sh` clean.
 
-- [ ] **Step 8: Commit.** explosion: "zlib, and the tools the font stack needs".
+- [x] **Step 8: Commit.** explosion: "zlib, and the tools the font stack needs".
 
 ---
 ### Task 5: FreeType, and fonts on the disk
@@ -1161,10 +1164,10 @@ echo "zlib installed into $PREFIX; its tests are in $OUT"
 - Consumes: Task 4's zlib; Task 3's directories (nothing here lists them yet, but `populate-ext.sh` makes nested ones).
 - Produces: `libfreetype.a`, `freetype2.pc`; host FreeType in `$SRC/build-host/root`; overlay `usr/share/fonts/dejavu/{DejaVuSans,DejaVuSans-Bold,DejaVuSansMono,DejaVuSansMono-Bold}.ttf` + `LICENSE`; `make … ROOT_OVERLAYS="dir …"`.
 
-- [ ] **Step 1: The failing test.** `fttest.c`:
+- [x] **Step 1: The failing test.** `fttest.c`:
 
 ```c
-// LINK: -lfreetype -lz
+// PKG: freetype2
 /* FreeType renders glyphs from a font on disk, exactly as it does on the
    host. The checksum covers every bitmap and metric, so a difference in the
    rasteriser, the hinter or the file shows. */
@@ -1229,13 +1232,13 @@ int main(int argc, char **argv) {
 
 `fonts.tests`: `fttest`. `EXPECTED`/`GLYPHS` are placeholders until Step 4 prints the host's values.
 
-- [ ] **Step 2: Run it.** `fttest skipped, not built yet: freetype`.
+- [x] **Step 2: Run it.** `fttest skipped, not built yet: freetype`. *(With `// PKG: freetype2` — FreeType's headers need a `-I`, which `build-tests.sh` now asks pkg-config for — it says `freetype2`.)*
 
-- [ ] **Step 3: `build-freetype.sh`.** For Quark: the cross file as `build-cairo.sh` makes it; `OPTIONS="--buildtype=debugoptimized -Ddefault_library=static -Db_staticpic=false --wrap-mode=nofallback -Dmmap=disabled -Dpng=disabled -Dbrotli=disabled -Dbzip2=disabled -Dharfbuzz=disabled -Dtests=disabled"` plus `-Dzlib=system`; setup `build-quark`, build, install. For the host: the same options with `-Dzlib=internal`, prefix `$SRC/build-host/root`, `--libdir=lib`, install; compile `tests/fttest.c` against it with `pkg-config --cflags --libs --static freetype2` and run it on `${DEJAVU:-$HOME/opt/src/dejavu-fonts-ttf-2.37/ttf}/DejaVuSans.ttf`, printing "on the host, which is what tests/fttest.c's EXPECTED and GLYPHS should say". The header comment records the decision (read, don't map) and why.
+- [x] **Step 3: `build-freetype.sh`.** For Quark: the cross file as `build-cairo.sh` makes it; `OPTIONS="--buildtype=debugoptimized -Ddefault_library=static -Db_staticpic=false --wrap-mode=nofallback -Dmmap=disabled -Dpng=disabled -Dbrotli=disabled -Dbzip2=disabled -Dharfbuzz=disabled -Dtests=disabled"` plus `-Dzlib=system`; setup `build-quark`, build, install. For the host: the same options with `-Dzlib=internal`, prefix `$SRC/build-host/root`, `--libdir=lib`, install; compile `tests/fttest.c` against it with `pkg-config --cflags --libs --static freetype2` and run it on `${DEJAVU:-$HOME/opt/src/dejavu-fonts-ttf-2.37/ttf}/DejaVuSans.ttf`, printing "on the host, which is what tests/fttest.c's EXPECTED and GLYPHS should say". The header comment records the decision (read, don't map) and why.
 
-- [ ] **Step 4: Expected values.** Run the script; put the host's checksum and glyph count into `fttest.c`.
+- [x] **Step 4: Expected values.** Run the script; put the host's checksum and glyph count into `fttest.c`.
 
-- [ ] **Step 5: Fonts as an overlay.** `stage-fonts.sh <dejavu-dir> <overlay>` copies the four faces and `LICENSE` into `<overlay>/usr/share/fonts/dejavu/`, with a comment on the licence's one condition (the notice travels with the fonts). `tools/stage-overlays.sh <stage> [overlay…]`:
+- [x] **Step 5: Fonts as an overlay.** `stage-fonts.sh <dejavu-dir> <overlay>` copies the four faces and `LICENSE` into `<overlay>/usr/share/fonts/dejavu/`, with a comment on the licence's one condition (the notice travels with the fonts). `tools/stage-overlays.sh <stage> [overlay…]`:
 
 ```sh
 #!/bin/sh
@@ -1246,26 +1249,37 @@ int main(int argc, char **argv) {
 # Fonts and configuration are built by scripts in toolchain/ that need the
 # cross toolchain, the same arrangement as COREUTILS. What was staged is
 # recorded, so a later stage without an overlay takes its files back out, and
-# directories left empty by that go too.
+# the directories that leaves empty go too.
 set -e
 STAGE=${1:?usage: stage-overlays.sh <stage-dir> [overlay...]}
 shift
+# Outside usr, etc and var, so the image rules do not install the bookkeeping.
 LIST=$STAGE/.overlays
+# One path per line, whatever is in it.
+set -f
+IFS='
+'
 if [ -f "$LIST" ]; then
     while read -r path; do
-        [ -n "$path" ] && rm -f "$STAGE/$path"
+        if [ -n "$path" ]; then
+            rm -f "$STAGE/$path"
+        fi
     done < "$LIST"
     rm -f "$LIST"
     for top in usr etc var; do
-        [ -d "$STAGE/$top" ] && find "$STAGE/$top" -mindepth 1 -depth -type d -empty -delete
+        if [ -d "$STAGE/$top" ]; then
+            find "$STAGE/$top" -mindepth 1 -depth -type d -empty -delete
+        fi
     done
+    # Quark's install fills usr and etc; nothing but an overlay makes var.
+    rmdir "$STAGE/var" 2>/dev/null || true
 fi
 for dir in "$@"; do
     if [ ! -d "$dir" ]; then
         echo "overlay: $dir is not a directory" >&2
         exit 1
     fi
-    (cd "$dir" && find . -mindepth 1 -type d) | while read -r d; do
+    for d in $(cd "$dir" && find . -mindepth 1 -type d | sed 's|^\./||'); do
         mkdir -p "$STAGE/$d"
     done
     n=0
@@ -1278,7 +1292,7 @@ for dir in "$@"; do
 done
 ```
 
-- [ ] **Step 6: The image from the stage.** `tools/populate-ext.sh <image> <stage>` replaces the per-file `debugfs` loop in `ROOTFS_RULE`:
+- [x] **Step 6: The image from the stage.** `tools/populate-ext.sh <image> <stage>` replaces the per-file `debugfs` loop in `ROOTFS_RULE`:
 
 ```sh
 #!/bin/sh
@@ -1286,26 +1300,40 @@ done
 #
 #     tools/populate-ext.sh <image> <stage-dir>
 #
-# Every staged directory is made, and every file written. Quark's own install
-# names files the way FAT wants them — HELLO.ELF, PASSWD — and ext2 gets the
-# names the shell and init look for; a name with a lowercase letter in it was
-# chosen on purpose and is kept. debugfs reports failure on stderr and exits 0,
-# so every file is looked for afterwards.
+# Every staged directory under usr, etc and var is made, and every file in
+# them written. Quark's own install names its files the way FAT wants them,
+# HELLO.ELF and PASSWD, in usr/bin and etc; there the image gets the names the
+# shell and init look for, hello and passwd. Everywhere else, and for any name
+# with a lowercase letter in it, the staged name was chosen on purpose and is
+# kept: DejaVuSans.ttf, and the LICENSE beside it.
+#
+# debugfs exits 0 whatever happened, so its complaints are read instead, and
+# every file is looked for afterwards. Neither is enough alone: a write that
+# runs out of room leaves the file's name and size behind with no blocks, so
+# it is found, reads as zeros, and e2fsck calls the image clean.
 set -e
+if [ $# -ne 2 ]; then
+    echo "usage: populate-ext.sh <image> <stage-dir>" >&2
+    exit 2
+fi
 IMG=$(cd "$(dirname "$1")" && pwd)/$(basename "$1")
-STAGE=${2:?usage: populate-ext.sh <image> <stage-dir>}
-cd "$STAGE"
+cd "$2"
+
 target() {
+    dir=$(dirname "$1")
     base=$(basename "$1")
-    case "$base" in
-    *[a-z]*) ;;
-    *) base=$(printf '%s' "$base" | tr '[:upper:]' '[:lower:]' | sed 's/\.elf$//') ;;
+    case "$dir:$base" in
+    usr/bin:*[a-z]* | etc:*[a-z]*) ;;
+    usr/bin:* | etc:*)
+        base=$(printf '%s' "$base" | tr '[:upper:]' '[:lower:]' | sed 's/\.elf$//') ;;
     esac
-    printf '%s/%s\n' "$(dirname "$1")" "$base"
+    printf '%s/%s\n' "$dir" "$base"
 }
+
 CMDS=$(mktemp)
 OUT=$(mktemp)
-trap 'rm -f "$CMDS" "$OUT"' EXIT
+ERR=$(mktemp)
+trap 'rm -f "$CMDS" "$OUT" "$ERR"' EXIT
 {
     printf 'mkdir home\nmkdir home/root\nmkdir tmp\n'
     find usr etc var -type d 2>/dev/null | sort | sed 's/^/mkdir /'
@@ -1313,22 +1341,31 @@ trap 'rm -f "$CMDS" "$OUT"' EXIT
         printf 'write %s %s\n' "$f" "$(target "$f")"
     done
 } > "$CMDS"
-debugfs -w -f "$CMDS" "$IMG" >/dev/null 2>&1
+debugfs -w -f "$CMDS" "$IMG" >/dev/null 2>"$ERR"
+# After its banner, a run where everything worked says nothing on stderr.
+if grep -v '^debugfs [0-9]' "$ERR" >&2; then
+    echo "$IMG: debugfs could not write everything" >&2
+    exit 1
+fi
+
 find usr etc var -type f 2>/dev/null | sort | while read -r f; do
     printf 'stat %s\n' "$(target "$f")"
 done > "$CMDS"
 debugfs -f "$CMDS" "$IMG" > "$OUT" 2>&1 || true
+# The error names the path. The command echo that precedes it on stdout is
+# buffered, so the two do not reliably arrive in order.
 if grep -q 'File not found' "$OUT"; then
-    grep -B1 'File not found' "$OUT" | grep '^debugfs: stat' | sed 's/^debugfs: stat /  MISSING from image: /' >&2
+    grep 'File not found' "$OUT" | sed 's/: File not found.*//; s/^/  MISSING from the image: /' >&2
+    echo "$IMG is incomplete" >&2
     exit 1
 fi
 ```
 
 `ROOTFS_RULE` becomes `dd`, `mkfs`, `./tools/populate-ext.sh $(1) $(STAGE)`. The `stage` target runs `./tools/stage-overlays.sh $(STAGE) $(ROOT_OVERLAYS)` after the test suites. `ROOTFS_SIZE_KB := 65536` (fonts, the font tools and the new tests would leave the old 33 MiB root nearly full).
 
-- [ ] **Step 7: Verify.** `build-freetype.sh ~/opt/src/freetype-2.14.3`; `stage-fonts.sh ~/opt/src/dejavu-fonts-ttf-2.37/ttf /tmp/claude-1000/overlay-fonts`; `build-tests.sh`; `make hd … ROOT_OVERLAYS=/tmp/claude-1000/overlay-fonts`; `debugfs -R 'ls -l /usr/share/fonts/dejavu' rootfs-ext2.img` shows the four mixed-case names; boot; `runtests /etc/fonts.tests` passes with the host's numbers; `ls /usr/share/fonts/dejavu`; `runtests /etc/libc.tests`; `dtest`; `wm weston-simple-shm wlcairo`; `check-rootfs.sh` clean. `make hd` without `ROOT_OVERLAYS` afterwards leaves no fonts in the stage.
+- [x] **Step 7: Verify.** `build-freetype.sh ~/opt/src/freetype-2.14.3`; `stage-fonts.sh ~/opt/src/dejavu-fonts-ttf-2.37/ttf /tmp/claude-1000/overlay-fonts`; `build-tests.sh`; `make hd … ROOT_OVERLAYS=/tmp/claude-1000/overlay-fonts`; `debugfs -R 'ls -l /usr/share/fonts/dejavu' rootfs-ext2.img` shows the four mixed-case names; boot; `runtests /etc/fonts.tests` passes with the host's numbers; `ls /usr/share/fonts/dejavu`; `runtests /etc/libc.tests`; `dtest`; `wm weston-simple-shm wlcairo`; `check-rootfs.sh` clean. `make hd` without `ROOT_OVERLAYS` afterwards leaves no fonts in the stage.
 
-- [ ] **Step 8: Commit.** explosion: "FreeType, and fonts on the disk".
+- [x] **Step 8: Commit.** explosion: "FreeType, and fonts on the disk".
 
 ---
 ### Task 6: expat
@@ -1340,7 +1377,7 @@ fi
 - Consumes: `teach-config-sub.sh`.
 - Produces: `libexpat.a`, `expat.pc` in the musl prefix.
 
-- [ ] **Step 1: The failing test.** `xmltest.c`:
+- [x] **Step 1: The failing test.** `xmltest.c`:
 
 ```c
 // LINK: -lexpat
@@ -1424,7 +1461,7 @@ int main(void) {
     ok &= XML_Parse(p, "", 0, 1) == XML_STATUS_OK;
     s.text[s.len] = 0;
     check("a fontconfig document parses in pieces", ok);
-    check("with every element", s.elements == 7);
+    check("with all six elements", s.elements == 6);
     check("and both directories", s.dirs == 2 && !strcmp(s.text, "/usr/share/fonts|fonts|"));
     check("and their attributes", s.prefixed == 1);
     XML_ParserFree(p);
@@ -1441,13 +1478,13 @@ int main(void) {
 
 `xml.tests`: `xmltest`.
 
-- [ ] **Step 2: Run it.** `xmltest skipped, not built yet: expat`.
+- [x] **Step 2: Run it.** `xmltest skipped, not built yet: expat`. *(Run on the host against bootstrap-wayland's expat first, which caught the element count: the document has six, not seven.)*
 
-- [ ] **Step 3: `build-expat.sh <expat tarball>`.** Unpacks a private tree (`$QUARK_SRC/expat-2.6.4-quark`, removed first) because the host's copy is configured in place and autoconf refuses a second configure against it; `teach-config-sub.sh conftools/config.sub`; `./configure --host=x86_64-quark CC=x86_64-quark-musl-gcc CFLAGS=-O2 --prefix="$PREFIX" --disable-shared --enable-static --without-docbook --without-tests --without-examples --without-xmlwf`; `make`; `make install`.
+- [x] **Step 3: `build-expat.sh <expat tarball>`.** Unpacks a private tree (`$QUARK_SRC/expat-2.6.4-quark`, removed first) because the host's copy is configured in place and autoconf refuses a second configure against it; `teach-config-sub.sh conftools/config.sub`; `./configure --host=x86_64-quark CC=x86_64-quark-musl-gcc CFLAGS=-O2 --prefix="$PREFIX" --disable-shared --enable-static --without-docbook --without-tests --without-examples --without-xmlwf`; `make`; `make install`.
 
-- [ ] **Step 4: Verify.** Build, `build-tests.sh`, image, boot: `runtests /etc/xml.tests` passes; the earlier suites still pass.
+- [x] **Step 4: Verify.** Build, `build-tests.sh`, image, boot: `runtests /etc/xml.tests` passes; the earlier suites still pass.
 
-- [ ] **Step 5: Commit.** explosion: "expat, cross-built".
+- [x] **Step 5: Commit.** explosion: "expat, cross-built".
 
 ---
 
@@ -1461,7 +1498,7 @@ int main(void) {
 - Consumes: FreeType, expat, zlib; `gperf`; Tasks 1–3 (everything the cache writer does); the fonts overlay.
 - Produces: `libfontconfig.a`, `fontconfig.pc`; the suite `/tmp/claude-1000/suite-fc` (`fc-cache fc-cat fc-conflist fc-list fc-match fc-pattern fc-query fc-scan fc-validate`); in the overlay, `etc/fonts/fonts.conf`, `etc/fonts/conf.d/*.conf` (real files), and an empty `var/cache/fontconfig`.
 
-- [ ] **Step 1: The failing test.** `fctest.c`:
+- [x] **Step 1: The failing test.** `fctest.c`:
 
 ```c
 // LINK: -lfontconfig -lfreetype -lexpat -lz -lm
@@ -1547,15 +1584,23 @@ fc-list
 fc-match monospace
 ```
 
-- [ ] **Step 2: Run it.** `fctest skipped, not built yet: fontconfig`.
+- [x] **Step 2: Run it.** `fctest skipped, not built yet: fontconfig`.
 
-- [ ] **Step 3: The patch.** `patches/fontconfig-2.18.3-quark.patch` is the one hunk in `src/fcstat.c` (`defined(__quark__)` beside `defined(__linux__)` where `f_type` is read), with a header line saying why: Quark's C library is musl, whose `struct statfs` is Linux's.
+- [x] **Step 3: The patch.** `patches/fontconfig-2.18.3-quark.patch` is the one hunk in `src/fcstat.c` (`defined(__quark__)` beside `defined(__linux__)` where `f_type` is read), with a header line saying why: Quark's C library is musl, whose `struct statfs` is Linux's.
 
-- [ ] **Step 4: `build-fontconfig.sh <src> <suite-out> <overlay-out>`.** Puts `$QUARK_HOSTDEPS/bin` on `PATH` and fails early without `gperf`; applies the patch unless `src/fcstat.c` already mentions `__quark__`; `meson setup build-quark --cross-file … --prefix="$PREFIX" --sysconfdir=/etc --localstatedir=/var --buildtype=debugoptimized -Ddefault_library=static -Db_staticpic=false --wrap-mode=nofallback -Dxml-backend=expat -Ddoc=disabled -Dnls=disabled -Dtests=disabled -Dcache-build=disabled -Dtools=enabled -Diconv=disabled -Dfontations=disabled`; build; `DESTDIR=$tmp meson install --no-rebuild`; copy `$tmp$PREFIX/lib` and `include` into `$PREFIX`; the `fc-*` programs and `fontconfig.tests` into the suite; `fonts.conf`, every `conf.d/*.conf` dereferenced (they are links into a `conf.avail` the image does not carry), and an empty `var/cache/fontconfig` into the overlay. The header says why it installs through `DESTDIR` (its configuration belongs in the target's `/etc`, not the host's).
+- [x] **Step 4: `build-fontconfig.sh <src> <suite-out> <overlay-out>`.** Puts `$QUARK_HOSTDEPS/bin` on `PATH` and fails early without `gperf`; applies the patch unless `src/fcstat.c` already mentions `__quark__`; `meson setup build-quark --cross-file … --prefix="$PREFIX" --sysconfdir=/etc --localstatedir=/var --buildtype=debugoptimized -Ddefault_library=static -Db_staticpic=false --wrap-mode=nofallback -Dxml-backend=expat -Ddoc=disabled -Dnls=disabled -Dtests=disabled -Dcache-build=disabled -Dtools=enabled -Diconv=disabled -Dfontations=disabled`; build; `DESTDIR=$tmp meson install --no-rebuild`; copy `$tmp$PREFIX/lib` and `include` into `$PREFIX`; the `fc-*` programs and `fontconfig.tests` into the suite; `fonts.conf`, every `conf.d/*.conf` dereferenced (they are links into a `conf.avail` the image does not carry), and an empty `var/cache/fontconfig` into the overlay. The header says why it installs through `DESTDIR` (its configuration belongs in the target's `/etc`, not the host's).
 
-- [ ] **Step 5: Verify.** Build it; `build-tests.sh`; image with `suite-fc` and the overlay; boot: `runtests /etc/fontconfig.tests` (4 passed — `fc-cache -v` wrote the caches, `fctest` loaded one), `ls /var/cache/fontconfig` (cache files, `CACHEDIR.TAG`, no `.LCK` or `.TMP-` leftovers), `fc-match sans-serif:bold`, run the suite a second time (the cache is reused: `fc-cache -v` says "skipping"), then `check-rootfs.sh` — clean after fontconfig's lock, rename and unlink dance. The same on `make hd-ext4`.
+- [x] **Step 5: Verify.** Build it; `build-tests.sh`; image with `suite-fc` and the overlay; boot: `runtests /etc/fontconfig.tests` (4 passed — `fc-cache -v` wrote the caches, `fctest` loaded one), `ls /var/cache/fontconfig` (cache files, `CACHEDIR.TAG`, no `.LCK` or `.TMP-` leftovers), `fc-match sans-serif:bold`, run the suite a second time (the cache is reused: `fc-cache -v` says "skipping"), then `check-rootfs.sh` — clean after fontconfig's lock, rename and unlink dance. The same on `make hd-ext4`.
 
-- [ ] **Step 6: Commit.** explosion: "fontconfig, with a cache it writes".
+- [x] **Step 6: Commit.** explosion: "fontconfig, with a cache it writes".
+
+**What Task 7 found** (recorded after the fact):
+
+- fontconfig's configure looks for `mkostemp` without `_GNU_SOURCE`, which musl (like glibc) needs, so it makes its lock file with `mkstemp` and `fcntl(F_DUPFD_CLOEXEC)` — the ordinary Linux path. The Linux layer refused to duplicate a VFS file descriptor, so every cache write failed and left a `.TMP-` file behind. Fixed in the layer: descriptors name a shared open file, reference counted, and `dup`, `dup2` and `dup3` are answered (`filetest` "second descriptors"). quark: "A file can have more than one descriptor".
+- With the caches failing, fontconfig scanned every font twice per run, and about one run in two hung for good. A task dump from the idle loop showed the VFS runnable and never run: a call's hand-over reopened interrupts between marking the callee runnable (unqueued) and switching to it. Fixed in the kernel, with `dtest calls` as the test (three million timed calls in three seconds; it hung on its first run before). quark: "A call's hand-over no longer strands the task called".
+- fontconfig 2.18 writes the caches while it loads its configuration, before `fc-cache` looks, so even the first `fc-cache -v` on a fresh image says "skipping, existing cache is valid". The image's `/var/cache/fontconfig` is empty before boot and holds the two caches and `CACHEDIR.TAG` after.
+- It builds ten tools (`fc-genconf` is new), and `-Dadditional-fonts-dirs=no` keeps the build machine's X11 font directories out of `fonts.conf`.
+- `tools/drive-qemu.py` gained `hmp <command>`: `hmp info registers` said the CPU was halted in the kernel, which is what made this a deadlock rather than slow work.
 
 ---
 ### Task 8: cairo draws text

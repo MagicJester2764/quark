@@ -37,8 +37,13 @@
 #define FIRST_FD  LX_FIRST_FILE_FD
 #define MAX_FILES 16
 
+/* An open file, as `open` made it. A descriptor names one, and `dup` gives it
+ * another name: the two share its position, as they do on Linux, and the VFS
+ * handle is closed with the last of them. The server never hears about the
+ * copies. A handle belongs to this process, so this is the only place that
+ * needs to count them. */
 struct openfile {
-    int used;
+    int refs;             /* descriptors naming it; 0 is a free entry */
     unsigned long handle; /* what the VFS calls it */
     unsigned long offset; /* the VFS has no seek, so the position is ours */
     unsigned long size;
@@ -49,6 +54,10 @@ struct openfile {
 };
 
 static struct openfile files[MAX_FILES];
+
+/* Which open file each of this layer's descriptors names: an index into
+   `files` plus one, so that zero is a free descriptor. */
+static unsigned char fdmap[MAX_FILES];
 
 /* Linux's open flags, which are what musl passes. */
 #define LX_O_ACCMODE   3
@@ -100,22 +109,35 @@ static struct openfile *slot(long fd) {
     if (fd < FIRST_FD || fd >= FIRST_FD + MAX_FILES) {
         return 0;
     }
-    struct openfile *f = &files[fd - FIRST_FD];
-    return f->used ? f : 0;
+    unsigned idx = fdmap[fd - FIRST_FD];
+    return idx ? &files[idx - 1] : 0;
+}
+
+/* The lowest free descriptor at or above `lowest`, or -1. */
+static long free_fd(long lowest) {
+    for (long fd = lowest < FIRST_FD ? FIRST_FD : lowest; fd < FIRST_FD + MAX_FILES; fd++) {
+        if (!fdmap[fd - FIRST_FD]) {
+            return fd;
+        }
+    }
+    return -1;
 }
 
 long __quark_open(const char *path, long flags) {
     if (!path || !*path) {
         return -LX_ENOENT;
     }
-    long fd = -1;
+    /* Every open file has a descriptor, so a free descriptor means a free
+       entry too; both are looked for anyway. */
+    long fd = free_fd(FIRST_FD);
+    int k = -1;
     for (int i = 0; i < MAX_FILES; i++) {
-        if (!files[i].used) {
-            fd = FIRST_FD + i;
+        if (!files[i].refs) {
+            k = i;
             break;
         }
     }
-    if (fd < 0) {
+    if (fd < 0 || k < 0) {
         return -LX_EMFILE;
     }
 
@@ -146,19 +168,18 @@ long __quark_open(const char *path, long flags) {
         }
     }
 
-    struct openfile *f = &files[fd - FIRST_FD];
-    f->used = 1;
+    struct openfile *f = &files[k];
+    f->refs = 1;
     f->handle = info.handle;
     f->size = info.size;
     f->is_dir = info.is_dir;
     f->mode = info.mode;
-    /* Appending starts at the end; everything else starts at the beginning.
-       There is no O_TRUNC here because the VFS has no truncate — a caller
-       asking for one gets a file it can overwrite but not shorten, which is
-       worth knowing about rather than pretending away. */
+    /* Appending starts at the end; everything else starts at the beginning,
+       and O_TRUNC was the server's to do. */
     f->offset = (flags & LX_O_APPEND) ? info.size : 0;
     f->dir_next = 0;
     f->dir_end = 0;
+    fdmap[fd - FIRST_FD] = (unsigned char)(k + 1);
     return fd;
 }
 
@@ -186,9 +207,71 @@ long __quark_close(long fd) {
         }
         return -LX_EBADF;
     }
-    quark_vfs_close(f->handle);
-    f->used = 0;
+    fdmap[fd - FIRST_FD] = 0;
+    if (--f->refs == 0) {
+        quark_vfs_close(f->handle);
+    }
     return 0;
+}
+
+/* Another descriptor for the open file `fd` names: the lowest free one at or
+   above `lowest`, or `exact` if that is not negative, closing whatever it
+   named first. */
+static long file_dup(long fd, long lowest, long exact) {
+    struct openfile *f = slot(fd);
+    if (!f) {
+        return -LX_EBADF;
+    }
+    long to = exact;
+    if (exact >= 0) {
+        if (exact == fd) {
+            return fd;
+        }
+        if (exact < FIRST_FD || exact >= FIRST_FD + MAX_FILES) {
+            /* The kernel's numbers name the kernel's objects, and a VFS file
+               is not one: it cannot be put where a program's stdout is. */
+            return -LX_EBADF;
+        }
+        if (slot(exact)) {
+            __quark_close(exact);
+        }
+    } else {
+        to = free_fd(lowest);
+        if (to < 0) {
+            return -LX_EMFILE;
+        }
+    }
+    f->refs++;
+    fdmap[to - FIRST_FD] = (unsigned char)(f - files + 1);
+    return to;
+}
+
+/* dup, dup2 and dup3. A copy of a kernel descriptor is the kernel's to make,
+   and one of a file is this layer's; neither can become the other. */
+long __quark_dup(long fd, long to) {
+    if (fd >= FIRST_FD) {
+        return file_dup(fd, FIRST_FD, to);
+    }
+    if (fd < 0 || to >= FIRST_FD) {
+        return -LX_EBADF;
+    }
+    unsigned long me = __syscall0(SYS_GETPID);
+    unsigned long copy = __syscall4(SYS_FD_DUP, me, QUARK_ANY_FD, (unsigned long)fd, 0);
+    if (copy == QUARK_ERR) {
+        return -LX_EBADF;
+    }
+    if (to < 0 || (long)copy == to || fd == to) {
+        if (fd == to) {
+            __syscall1(SYS_FD_CLOSE, copy);
+        }
+        return fd == to ? to : (long)copy;
+    }
+    /* The kernel fills a slot without emptying it, so whatever `to` named is
+       closed first -- a pipe end left behind would keep its reader waiting. */
+    __syscall1(SYS_FD_CLOSE, (unsigned long)to);
+    unsigned long r = __syscall4(SYS_FD_DUP, me, (unsigned long)to, copy, 0);
+    __syscall1(SYS_FD_CLOSE, copy);
+    return r == QUARK_ERR ? -LX_EBADF : to;
 }
 
 long __quark_file_read(long fd, void *buf, unsigned long n) {
@@ -636,17 +719,19 @@ int __quark_fd_is_nonblock(long fd) {
 }
 
 long __quark_fcntl(long fd, long cmd, long arg) {
+    if (fd >= FIRST_FD && !slot(fd)) {
+        return -LX_EBADF;
+    }
     switch (cmd) {
     case LX_F_DUPFD:
     case LX_F_DUPFD_CLOEXEC: {
         /* Close-on-exec is not a distinction here: nothing execs, so a
            duplicate is a duplicate. */
-        if (fd < 0 || fd >= FIRST_FD) {
-            /* A VFS file has a handle this layer holds one reference to, and
-               a second descriptor for it would need that refcounted -- which
-               the VFS protocol does not offer. Saying so beats inventing an
-               alias whose close destroys the original. */
-            return -LX_ENOSYS;
+        if (fd >= FIRST_FD) {
+            return file_dup(fd, arg, -1);
+        }
+        if (fd < 0) {
+            return -LX_EBADF;
         }
         unsigned long r = __syscall4(SYS_FD_DUP, __syscall0(SYS_GETPID),
                                      QUARK_ANY_FD, (unsigned long)fd,
