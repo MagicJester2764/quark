@@ -148,16 +148,34 @@ INPUT's pass once granted nothing at all, which the UID bypass hid.
 `user/fb` is the framebuffer device: it owns the hardware the way `/dev/fb0`
 does, knows the mode, and decides who draws. It has no opinion about windows.
 
-Everything else is a client of it. The text console claims the display at boot
-and draws fullscreen — that is what the machine boots into, a plain TTY.
-`user/wm` is a compositor you *run*: `wm <program>` takes the display, starts
-that program, composites its windows, and gives the display back when it exits.
+Everything else is a client of it. `user/qtty` is the text console: it claims
+the display at boot and draws fullscreen — that is what the machine boots into,
+a plain TTY. `user/wm` is a compositor you *run*: `wm <program>` takes the
+display, starts that program, composites its windows, and gives the display back
+when it exits.
 
-The keyboard goes with it. `user/input` has the same claim protocol: while a
-program holds it, raw key events go to that program and line readers wait. The
-compositor claims the keyboard when it claims the display and hands each key to
-the focused window — whoever owns the screen owns the keyboard, the way
-switching virtual terminals has always worked.
+`wm` speaks **Wayland**, not a protocol shaped like it. It hands each program a
+socketpair end as descriptor 3 and `WAYLAND_SOCKET=3`, which is what
+`wl_display_connect` looks at first — so upstream libwayland runs unpatched.
+`user/wm/src` is one module per part of that: `client` (a connection and its
+buffered bytes), `objects` (one id table per client, which is what makes "a
+client cannot name another client's objects" true by construction), `surface`,
+`shell`, `shm`, `seat`, `clipboard`, `cursor`, `keymap`, `protocol`, `draw`.
+`user/wmdemo` and the older six-tag window protocol still work alongside it.
+
+The keyboard goes with it, and so does the pointer. `user/input` has the same
+claim protocol: while a program holds it, raw key and pointer events go to that
+program and line readers wait. The compositor claims input when it claims the
+display and hands each event to the focused window — whoever owns the screen
+owns the keyboard, the way switching virtual terminals has always worked.
+
+Both come from one driver. A PS/2 mouse is not a second device: it is the same
+i8042 answering on the same data port 0x60, with IRQ 12 instead of 1 and bit 5
+of the status port saying which device a byte came from. `user/keyboard` holds
+both lines and routes on that bit — never on which interrupt fired, because a
+byte for one device can be waiting when the other's interrupt arrives. Two
+drivers sharing port 0x60 would take each other's bytes, and the symptom of
+losing that race is a keyboard that types rubbish or stops.
 
 Three things to know before changing any of it:
 
@@ -220,8 +238,10 @@ Three things follow from that, and breaking any of them is quiet:
   ownership transfer on the IPC — rather than a range grant.
 - Endpoint sets are TID bitmasks, not true endpoint objects. A service and its
   clients are named by slot number, not identity.
-- Focus is a single stack with no policy: Tab cycles, a new window takes it,
-  and there is no click-to-focus because there is no pointer driver.
+- Focus is a single stack with little policy: Tab cycles, a new window takes it,
+  and a click raises the one under the pointer. Keyboard focus and pointer focus
+  are tracked separately, as Wayland requires, but there is no follow-mouse, no
+  focus stealing prevention, and no way to move or resize a window.
 - The rust fork is one commit on `upstream/main`. Rebasing it means re-checking
   the PAL against std's internals, which move: the allocator PAL shape, the
   futex module location, `RawOsError`'s home and `BorrowedCursor`'s parameters
