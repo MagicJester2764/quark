@@ -53,7 +53,7 @@
 use quark_rt::ipc::{Message, TAG_TASK_DIED, TID_ANY};
 use quark_rt::spawn::{self, Scratch};
 use quark_rt::wm as proto;
-use quark_rt::{args, nameserver, println, syscall, vfs};
+use quark_rt::{args, nameserver, println, syscall};
 
 // The back buffer is ordinary memory, so this needs to allocate pages. The
 // right to map the framebuffer is not asked for here: it is lent by the
@@ -92,8 +92,6 @@ static SPAWN_SCRATCH: Scratch =
     Scratch { elf: 0x8A_0000_0000, stack: 0x8B_0000_0000, args: 0x8C_0000_0000 };
 /// Where a session program's image is read before it is loaded.
 const FILE_BUF: usize = 0x8D_0000_0000;
-
-const PAGE_SIZE: usize = 4096;
 
 /// Talking to the framebuffer device.
 const TAG_FB_CLAIM: u64 = 2;
@@ -1328,41 +1326,14 @@ fn start_session(name: &[u8], index: usize) -> Option<usize> {
     upper[up..up + 4].copy_from_slice(b".ELF");
     up += 4;
 
-    let (handle, size, _) = match vfs::open(vfs_tid, &lower[..lp]) {
-        Ok(h) => h,
-        Err(_) => match vfs::open(vfs_tid, &upper[..up]) {
-            Ok(h) => h,
-            Err(_) => {
-                println!("wm: cannot find that program");
-                return None;
-            }
-        },
-    };
-
-    let size = size as usize;
-    let pages = (size + PAGE_SIZE - 1) / PAGE_SIZE;
-    let mut ok = true;
-    for p in 0..pages {
-        let Ok(frame) = syscall::sys_phys_alloc(1) else { ok = false; break };
-        if syscall::sys_map_phys(frame, FILE_BUF + p * PAGE_SIZE, 1).is_err() {
-            ok = false;
-            break;
-        }
-        let want = PAGE_SIZE.min(size - p * PAGE_SIZE) as u32;
-        if vfs::read(vfs_tid, handle, frame, (p * PAGE_SIZE) as u32, want).is_err() {
-            ok = false;
-            break;
-        }
-    }
-    let _ = vfs::close(vfs_tid, handle);
-    if !ok {
-        println!("wm: could not read that program");
-        return None;
-    }
-
-    let image = unsafe { core::slice::from_raw_parts(FILE_BUF as *const u8, size) };
-    let Ok(info) = spawn::load(image, &SPAWN_SCRATCH) else {
-        println!("wm: could not load that program");
+    // Read, loaded, and the memory it was read into given back. This used to
+    // stage the image itself and keep the frames, so every client the
+    // compositor started cost its size in memory until the compositor exited.
+    let grant = |_: &[u8], _: usize| {};
+    let loaded = spawn::load_path(vfs_tid, &lower[..lp], FILE_BUF, &SPAWN_SCRATCH, grant)
+        .or_else(|()| spawn::load_path(vfs_tid, &upper[..up], FILE_BUF, &SPAWN_SCRATCH, grant));
+    let Ok(info) = loaded else {
+        println!("wm: cannot run that program");
         return None;
     };
     // A client needs no authority over anything — the memory it draws into is
