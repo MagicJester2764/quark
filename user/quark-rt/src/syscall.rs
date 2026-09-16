@@ -117,6 +117,7 @@ pub const SYS_FUTEX_WAIT_TIMEOUT: u64 = 130;
 
 // --- 0x90  time ---
 pub const SYS_TICKS: u64 = 144;
+pub const SYS_BOOT_TIME: u64 = 145;
 
 // --- 0xB0  sockets ---
 pub const SYS_SOCK_FD: u64 = 176;
@@ -746,6 +747,17 @@ pub fn sys_recv_timeout(from: usize, msg: &mut crate::ipc::Message, timeout_tick
 }
 
 /// Read the kernel PIT tick counter (100 Hz, 10 ms per tick).
+/// Seconds since 1970 when tick 0 was counted, or 0 if the machine has no
+/// clock. Add `sys_ticks() / 100` for the time now.
+pub fn sys_boot_time() -> u64 {
+    unsafe { syscall0(SYS_BOOT_TIME) }
+}
+
+/// Seconds since 1970, or since boot on a machine with no clock.
+pub fn unix_time() -> u64 {
+    sys_boot_time() + sys_ticks() / 100
+}
+
 pub fn sys_ticks() -> u64 {
     unsafe { syscall0(SYS_TICKS) }
 }

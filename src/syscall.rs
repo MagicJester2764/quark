@@ -175,6 +175,9 @@ pub const SYS_FUTEX_WAIT_TIMEOUT: u64 = 130;
 
 // --- 0x90  time ---
 pub const SYS_TICKS: u64 = 144;
+/// Seconds since 1970 when tick 0 was counted, from the CMOS clock; 0 if the
+/// machine has none. The time now is this plus `SYS_TICKS / 100`.
+pub const SYS_BOOT_TIME: u64 = 145;
 
 // --- 0xB0  sockets ---
 /// Bind a net-server connection handle to a file descriptor.
@@ -206,7 +209,7 @@ pub const SYS_ABI_VERSION: u64 = 240;
 /// minor when calls are added. User space can refuse to run against a major it
 /// does not know, which is the point of exposing it at all.
 pub const ABI_VERSION_MAJOR: u64 = 2;
-pub const ABI_VERSION_MINOR: u64 = 0;
+pub const ABI_VERSION_MINOR: u64 = 1;
 
 /// Threads a task may make with no capability at all.
 ///
@@ -2041,6 +2044,7 @@ extern "C" fn syscall_dispatch(
         SYS_TICKS => {
             crate::pit::ticks()
         }
+        SYS_BOOT_TIME => crate::rtc::boot_time(),
         SYS_WAIT => {
             // Block until a child task exits. Returns child TID or u64::MAX.
             scheduler::sys_wait()

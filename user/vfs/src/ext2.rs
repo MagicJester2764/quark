@@ -35,14 +35,12 @@ pub const FT_SYMLINK: u8 = 7;
 /// A directory whose blocks carry an htree index as well as entries.
 pub const EXT2_INDEX_FL: u32 = 0x1000;
 
-/// Now, in seconds since this machine booted.
+/// Now, in seconds since 1970, from the date the kernel read at boot.
 ///
-/// There is no clock to read. The C library's `time()` counts from boot too,
-/// so a file written here is dated on the same scale as anything a program
-/// compares it with; a file from the machine that built the image keeps that
-/// machine's date.
+/// ext2's times are 32-bit; read as unsigned, this lasts until 2106. A machine
+/// with no clock gets seconds since boot instead.
 pub fn now() -> u32 {
-    (quark_rt::syscall::sys_ticks() / 100) as u32
+    quark_rt::syscall::unix_time() as u32
 }
 
 // ---------------------------------------------------------------------------
@@ -402,6 +400,14 @@ impl Ext2State {
 
         for i in 0..count {
             let lba = start_abs_lba + i as u32;
+            // What the disk holds for a sector the open transaction has written
+            // is the old contents. Cached, it would be read back as current,
+            // and a second change to the block in the same transaction would
+            // be made to the old one — which is how a rename lost the name it
+            // had just added. Left uncached, a read goes through the journal.
+            if crate::journal::holds(crate::journal_ref(), self, lba) {
+                continue;
+            }
             if cache.lookup(lba).is_none() {
                 cache.insert(lba, DISK_IO_BUF + i * 512);
             }
@@ -1005,24 +1011,22 @@ pub fn write_file_data(
 
     let bs = ext2.block_size;
 
-    // Extend file if needed
+    // Every block the write lands in must exist: past the end of the file,
+    // and in any hole a truncate that lengthened it left.
     let end_offset = offset + to_write;
     let blocks_needed = (end_offset + bs - 1) / bs;
-    let current_blocks = (inode.i_size + bs - 1) / bs;
-
-    if blocks_needed > current_blocks {
-        // Allocate blocks for extension
-        for logical in current_blocks..blocks_needed {
-            let existing = block_map(ext2, inode, logical)?;
-            if existing == 0 {
-                let new_block = crate::ext2_alloc::alloc_block(ext2).map_err(|_| ERR_IO)?;
-                // Zero the new block
-                zero_block(ext2, new_block)?;
-                set_block_ptr(ext2, inode, logical, new_block)?;
-                // Update i_blocks (in 512-byte units)
-                inode.i_blocks += ext2.block_size / 512;
-            }
+    for logical in offset / bs..blocks_needed {
+        if block_map(ext2, inode, logical)? != 0 {
+            continue;
         }
+        let new_block = crate::ext2_alloc::alloc_block(ext2).map_err(|_| ERR_IO)?;
+        zero_block(ext2, new_block)?;
+        if let Err(code) = set_block_ptr(ext2, inode, logical, new_block) {
+            // Nothing refers to it; leaving it allocated would leak it.
+            let _ = crate::ext2_alloc::free_block(ext2, new_block);
+            return Err(code);
+        }
+        inode.i_blocks += ext2.block_size / 512;
     }
 
     let mut written = 0u32;

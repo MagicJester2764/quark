@@ -165,6 +165,12 @@ pub mod futex {
 // ---- Time ----
 
 /// Returns the kernel PIT tick count (100 Hz, 10 ms per tick).
+/// Ticks (10 ms each) since 1970, from the clock the kernel read at boot, or
+/// since boot on a machine without one.
+pub fn unix_ticks() -> u64 {
+    syscall::sys_boot_time() * 100 + syscall::sys_ticks()
+}
+
 pub fn ticks() -> u64 {
     syscall::sys_ticks()
 }

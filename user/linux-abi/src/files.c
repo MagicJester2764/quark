@@ -34,7 +34,7 @@
  * MAX_FDS: any lower and a descriptor the kernel installs on our behalf --
  * `recvmsg` asks it to choose one -- can land on a number this layer has
  * already given to an open file, and the two are invisible to each other. */
-#define FIRST_FD  32 /* == the kernel's MAX_FDS */
+#define FIRST_FD  LX_FIRST_FILE_FD
 #define MAX_FILES 16
 
 struct openfile {
@@ -126,6 +126,9 @@ long __quark_open(const char *path, long flags) {
     }
     if (flags & LX_O_DIRECTORY) {
         how |= QUARK_VFS_OPEN_DIRECTORY;
+    }
+    if ((flags & LX_O_TRUNC) && (flags & LX_O_ACCMODE) != 0) {
+        how |= QUARK_VFS_OPEN_TRUNCATE;
     }
     struct quark_vfs_file info;
     int err = quark_vfs_open(path, how, &info);
@@ -366,6 +369,57 @@ long __quark_stat(const char *path, void *statbuf) {
 
 long __quark_mkdir(const char *path) {
     int err = quark_vfs_mkdir(path);
+    return err ? vfs_errno(err) : 0;
+}
+
+long __quark_unlink(const char *path) {
+    int err = quark_vfs_unlink(path);
+    return err ? vfs_errno(err) : 0;
+}
+
+long __quark_rmdir(const char *path) {
+    int err = quark_vfs_rmdir(path);
+    return err ? vfs_errno(err) : 0;
+}
+
+long __quark_rename(const char *from, const char *to) {
+    int err = quark_vfs_rename(from, to);
+    return err ? vfs_errno(err) : 0;
+}
+
+/* ftruncate on one of this layer's descriptors. The kernel's own, below
+   FIRST_FD, are memory, and net.c answers for those. */
+long __quark_file_truncate(long fd, long length) {
+    struct openfile *f = slot(fd);
+    if (!f) {
+        return -LX_EBADF;
+    }
+    if (length < 0) {
+        return -LX_EINVAL;
+    }
+    int err = quark_vfs_truncate(f->handle, (unsigned long)length);
+    if (err) {
+        return vfs_errno(err);
+    }
+    f->size = (unsigned long)length;
+    return 0;
+}
+
+long __quark_truncate(const char *path, long length) {
+    if (length < 0) {
+        return -LX_EINVAL;
+    }
+    struct quark_vfs_file info;
+    int err = quark_vfs_open(path, 0, &info);
+    if (err) {
+        return vfs_errno(err);
+    }
+    if (info.is_dir) {
+        quark_vfs_close(info.handle);
+        return -LX_EISDIR;
+    }
+    err = quark_vfs_truncate(info.handle, (unsigned long)length);
+    quark_vfs_close(info.handle);
     return err ? vfs_errno(err) : 0;
 }
 

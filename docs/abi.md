@@ -1,6 +1,6 @@
 # Quark syscall ABI
 
-**Version 2.0.** Query the running kernel with `SYS_ABI_VERSION` (240), which
+**Version 2.1.** Query the running kernel with `SYS_ABI_VERSION` (240), which
 returns `(major << 16) | minor`.
 
 This document is the contract between the Quark kernel and everything above it.
@@ -124,6 +124,12 @@ have kept authority named by task ID in the kernel — the sweep, the special
 case, and a capability that outlived the task it named — and removing those is
 the reason for the change. Nothing outside this tree was built against 1.x. The
 rule still holds for everything else.
+
+### What each minor of 2 added
+
+| Version | Added |
+|---|---|
+| 2.1 | `SYS_BOOT_TIME` (145) — the date, read from the machine's clock at boot. Before it nothing here knew what day it was, and files were dated from 1970. |
 
 ### Deprecated
 
@@ -530,9 +536,11 @@ it as a resource limit rather than as a bad argument.
 | # | Name | Arguments | Returns | Cap |
 |---|---|---|---|---|
 | 144 | `SYS_TICKS` | — | ticks since boot | — |
+| 145 | `SYS_BOOT_TIME` | — | seconds since 1970 when tick 0 was counted; 0 if the machine has no clock | — |
 
 The PIT runs at 100 Hz, so one tick is 10 ms. Every timeout argument in this
-ABI is in ticks.
+ABI is in ticks. The time of day is `SYS_BOOT_TIME + SYS_TICKS / 100`: the
+kernel reads the PC's battery-backed clock once, at boot, and never again.
 
 ### Sockets (0xB0)
 

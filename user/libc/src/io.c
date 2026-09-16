@@ -85,6 +85,9 @@ int open(const char *path, int flags, ...) {
     if (flags & O_DIRECTORY) {
         how |= QUARK_VFS_OPEN_DIRECTORY;
     }
+    if ((flags & O_TRUNC) && (flags & O_ACCMODE) != O_RDONLY) {
+        how |= QUARK_VFS_OPEN_TRUNCATE;
+    }
     int err = quark_vfs_open(path, how, &info);
     if (err) {
         errno = vfs_errno(err);
@@ -229,7 +232,7 @@ long readfile(const char *path, char *buf, long size) {
 }
 
 time_t time(time_t *t) {
-    time_t now = (time_t)(__syscall0(SYS_TICKS) / 100);
+    time_t now = (time_t)(__syscall0(SYS_BOOT_TIME) + __syscall0(SYS_TICKS) / 100);
     if (t) {
         *t = now;
     }

@@ -27,6 +27,10 @@
 #define LX_ENOTEMPTY 39
 #define LX_EOPNOTSUPP 95
 
+/* Descriptors from here up are files.c's VFS files; below, the kernel's.
+   The split sits at the kernel's MAX_FDS — see files.c. */
+#define LX_FIRST_FILE_FD 32
+
 /* There is no working directory anywhere in this system, so this is the only
    value the *at calls accept for one. */
 #define LX_AT_FDCWD (-100)
@@ -48,6 +52,11 @@ long __quark_fstat(long fd, void *statbuf);
 long __quark_stat(const char *path, void *statbuf);
 long __quark_access(const char *path, long mode);
 long __quark_mkdir(const char *path);
+long __quark_unlink(const char *path);
+long __quark_rmdir(const char *path);
+long __quark_rename(const char *from, const char *to);
+long __quark_truncate(const char *path, long length);
+long __quark_file_truncate(long fd, long length);
 
 /* Streams, descriptor passing and waiting, in net.c. */
 long __quark_memfd(const char *name, long flags);

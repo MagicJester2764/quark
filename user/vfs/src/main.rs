@@ -1363,6 +1363,10 @@ pub extern "C" fn _start() -> ! {
             TAG_STAT => handle_stat(sender, &msg),
             TAG_WRITE => transacted(|| handle_write(&disk, sender, &msg)),
             TAG_MKDIR => transacted(|| handle_mkdir(&disk, sender, &msg)),
+            TAG_UNLINK | TAG_RMDIR | TAG_RENAME => {
+                transacted(|| handle_namespace(sender, &msg))
+            }
+            TAG_TRUNCATE => transacted(|| handle_truncate(sender, &msg)),
             // From the kernel, which is not waiting for an answer.
             quark_rt::ipc::TAG_TASK_DIED => client_died(msg.data[0] as usize),
             TAG_READDIR_BULK => handle_readdir_bulk(&disk, sender, &msg),
@@ -1436,6 +1440,16 @@ fn open_ext2(sender: usize, path: &[u8], flags: u64) {
         return error_reply(sender, ERR_PERMISSION);
     }
     let writable = !ext2_state().read_only && ext2::check_permission(&inode, uid, gid, 2);
+    let mut size = inode.size64();
+    if flags & OPEN_TRUNCATE != 0 && inode.is_regular() {
+        if !writable {
+            return error_reply(sender, ERR_PERMISSION);
+        }
+        if let Err(code) = ext2_ops::truncate(ext2_state_mut(), ino, 0) {
+            return error_reply(sender, code);
+        }
+        size = 0;
+    }
     let file = OpenFile {
         in_use: true,
         owner_tid: sender,
@@ -1448,7 +1462,7 @@ fn open_ext2(sender: usize, path: &[u8], flags: u64) {
     match handles::alloc(file) {
         Some(handle) => reply_opened(sender, [
             handle as u64,
-            inode.size64(),
+            size,
             inode.is_dir() as u64,
             inode.i_mode as u64,
             access_bits(&inode, uid, gid),
@@ -1600,7 +1614,10 @@ fn handle_read(disk: &DiskState, sender: usize, msg: &Message) {
 fn handle_close(sender: usize, msg: &Message) {
     let handle = msg.data[0] as usize;
     match handles::close(handle, sender) {
-        Some(_) => reply_opened(sender, [0; 6]),
+        Some(ino) => {
+            reply_opened(sender, [0; 6]);
+            settle(&[ino]);
+        }
         None => error_reply(sender, ERR_INVALID_HANDLE),
     }
 }
@@ -1608,7 +1625,70 @@ fn handle_close(sender: usize, msg: &Message) {
 /// A task the server gave handles to has died: they are closed for it.
 fn client_died(dead: usize) {
     let mut closed = [0u32; handles::MAX_OPEN_FILES];
-    let _ = handles::close_all(dead, &mut closed);
+    let n = handles::close_all(dead, &mut closed);
+    settle(&closed[..n]);
+}
+
+/// Free any of these inodes that lost their last name while open and have
+/// now lost their last handle.
+fn settle(inodes: &[u32]) {
+    for &ino in inodes {
+        if !handles::is_orphan(ino) || handles::inode_is_open(ino) {
+            continue;
+        }
+        handles::forget_orphan(ino);
+        transacted(|| {
+            if let Err(code) = ext2_ops::release(ext2_state_mut(), ino) {
+                println!("[vfs] could not free inode {} ({})", ino, code);
+            }
+        });
+    }
+}
+
+/// TAG_UNLINK and TAG_RMDIR lend a path, `data[0]` long; TAG_RENAME lends two,
+/// end to end, `data[0]` and `data[1]` long.
+fn handle_namespace(sender: usize, msg: &Message) {
+    if unsafe { FS_TYPE } != FsType::Ext2 {
+        return error_reply(sender, ERR_NOT_SUPPORTED);
+    }
+    if ext2_state().read_only {
+        return error_reply(sender, ERR_READ_ONLY);
+    }
+    let first = match protocol::lent_path(sender, 0, msg.data[0] as usize, 0) {
+        Ok(p) => p,
+        Err(code) => return error_reply(sender, code),
+    };
+    let (uid, gid) = get_sender_uid_gid(sender);
+    let e2 = ext2_state_mut();
+    let done = match msg.tag {
+        TAG_UNLINK => ext2_ops::unlink(e2, first, uid, gid),
+        TAG_RMDIR => ext2_ops::rmdir(e2, first, uid, gid),
+        _ => match protocol::lent_path(sender, msg.data[0] as usize, msg.data[1] as usize, 4096) {
+            Ok(second) => ext2_ops::rename(e2, first, second, uid, gid),
+            Err(code) => Err(code),
+        },
+    };
+    match done {
+        Ok(()) => reply_opened(sender, [0; 6]),
+        Err(code) => error_reply(sender, code),
+    }
+}
+
+/// TAG_TRUNCATE: data[0] = handle, data[1] = the new size.
+fn handle_truncate(sender: usize, msg: &Message) {
+    let Some(file) = get_handle(msg.data[0] as usize, sender) else {
+        return error_reply(sender, ERR_INVALID_HANDLE);
+    };
+    if unsafe { FS_TYPE } != FsType::Ext2 {
+        return error_reply(sender, ERR_NOT_SUPPORTED);
+    }
+    if !file.writable {
+        return error_reply(sender, ERR_PERMISSION);
+    }
+    match ext2_ops::truncate(ext2_state_mut(), file.inode_num(), msg.data[1]) {
+        Ok(()) => reply_opened(sender, [0; 6]),
+        Err(code) => error_reply(sender, code),
+    }
 }
 /// TAG_READDIR: data[0]=handle (must be a directory), data[1]=entry_index
 /// Reply: tag=TAG_OK, data[0..1]=name (11 bytes), data[2]=size, data[3]=flags, data[4]=cluster

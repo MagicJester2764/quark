@@ -17,6 +17,12 @@ pub const TAG_WRITE: u64 = 6;
 // OPEN_CREATE and TAG_MKDIR replace it; the number stays taken.
 pub const TAG_READDIR_BULK: u64 = 8;
 pub const TAG_MKDIR: u64 = 9;
+/// Remove a name; the file goes with its last one.
+pub const TAG_UNLINK: u64 = 10;
+pub const TAG_RMDIR: u64 = 11;
+/// Two paths, lent end to end.
+pub const TAG_RENAME: u64 = 12;
+pub const TAG_TRUNCATE: u64 = 13;
 pub const TAG_OK: u64 = 0;
 pub const TAG_ERROR: u64 = u64::MAX;
 

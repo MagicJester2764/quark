@@ -1219,6 +1219,38 @@ fn test_files() {
         "a name past 255 bytes is refused",
         vfs::open_with(vfs_tid, &long, vfs::OPEN_CREATE).err() == Some(vfs::ERR_NAME_TOO_LONG),
     );
+    // Removing, renaming and shortening, and the directory made above goes.
+    let moved: &[u8] = b"/tmp/dtest-a-directory-whose-name-alone-is-past-the-old-limit/renamed";
+    let _ = vfs::unlink(vfs_tid, moved);
+    check("rename a file", vfs::rename(vfs_tid, file, moved).is_ok());
+    check("the old name is gone", vfs::open(vfs_tid, file).err() == Some(vfs::ERR_NOT_FOUND));
+    if let Ok(o) = vfs::open_with(vfs_tid, moved, 0) {
+        check(
+            "shorten it through a handle",
+            vfs::truncate(vfs_tid, o.handle, 4).is_ok()
+                && vfs::stat_full(vfs_tid, o.handle).is_ok_and(|s| s.size == 4),
+        );
+        let _ = vfs::close(vfs_tid, o.handle);
+    }
+    if let Ok(o) = vfs::open_with(vfs_tid, file, vfs::OPEN_CREATE) {
+        let _ = vfs::close(vfs_tid, o.handle);
+    }
+    let replaced = vfs::rename(vfs_tid, moved, file).is_ok()
+        && vfs::open_with(vfs_tid, file, 0).is_ok_and(|o| {
+            let _ = vfs::close(vfs_tid, o.handle);
+            o.size == 4
+        });
+    check("rename onto a name replaces what had it", replaced);
+    check(
+        "a directory with something in it stays",
+        vfs::rmdir(vfs_tid, dir).err() == Some(vfs::ERR_NOT_EMPTY),
+    );
+    check("unlink a file", vfs::unlink(vfs_tid, file).is_ok());
+    check(
+        "then the directory can go",
+        vfs::rmdir(vfs_tid, dir).is_ok() && vfs::open(vfs_tid, dir).err() == Some(vfs::ERR_NOT_FOUND),
+    );
+
     // A program that exits holding files gives them back. Two of these hold
     // more handles between them than the table has room for.
     for _ in 0..2 {

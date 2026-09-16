@@ -318,6 +318,131 @@ pub fn create_dir_entry(
     Ok(())
 }
 
+/// Remove the entry called `name` from a directory.
+///
+/// An entry that follows another is folded into it; the first in a block
+/// keeps its length and loses its inode, which is how ext2 marks one unused.
+pub fn remove_entry(
+    ext2: &Ext2State,
+    dir_ino: u32,
+    dir_inode: &mut Ext2Inode,
+    name: &[u8],
+) -> Result<(), u64> {
+    drop_index(ext2, dir_ino, dir_inode)?;
+    let bs = ext2.block_size;
+    let usable = crate::csum::dir_usable_len(ext2, bs);
+    let blocks = (dir_inode.i_size + bs - 1) / bs;
+    for logical in 0..blocks {
+        let phys = block_map(ext2, dir_inode, logical)?;
+        if phys == 0 {
+            continue;
+        }
+        read_block_buf_mut(ext2, phys)?;
+        let buf = unsafe { &mut DIR_BLOCK_BUF };
+        let mut pos = 0u32;
+        let mut prev: Option<usize> = None;
+        while pos < usable {
+            let off = pos as usize;
+            let ino = read_u32(buf, off);
+            let rec_len = read_u16(buf, off + 4) as u32;
+            let len = buf[off + 6] as usize;
+            if rec_len == 0 {
+                break;
+            }
+            if ino != 0 && len == name.len() && &buf[off + 8..off + 8 + len] == name {
+                match prev {
+                    Some(p) => {
+                        let prev_len = read_u16(buf, p + 4) as u32;
+                        write_u16(buf, p + 4, (prev_len + rec_len) as u16);
+                    }
+                    None => write_u32(buf, off, 0),
+                }
+                return write_dir_block(ext2, phys, dir_ino, dir_inode, buf);
+            }
+            prev = Some(off);
+            pos += rec_len;
+        }
+    }
+    Err(ERR_NOT_FOUND)
+}
+
+/// Whether a directory holds nothing but `.` and `..`.
+pub fn is_empty(ext2: &Ext2State, dir_inode: &Ext2Inode) -> Result<bool, u64> {
+    let mut empty = true;
+    for_each_entry(ext2, dir_inode, |_, _, _, name| {
+        if name != b"." && name != b".." {
+            empty = false;
+        }
+        empty
+    })?;
+    Ok(empty)
+}
+
+/// Call `f` with each in-use entry of a directory, in order: its index, inode,
+/// file type and name. Stops when `f` returns false.
+pub fn for_each_entry(
+    ext2: &Ext2State,
+    dir_inode: &Ext2Inode,
+    mut f: impl FnMut(u32, u32, u8, &[u8]) -> bool,
+) -> Result<(), u64> {
+    let bs = ext2.block_size;
+    let blocks = (dir_inode.i_size + bs - 1) / bs;
+    let mut index = 0u32;
+    for logical in 0..blocks {
+        let phys = block_map(ext2, dir_inode, logical)?;
+        if phys == 0 {
+            continue;
+        }
+        // A copy: `f` may read other blocks, and DIR_BLOCK_BUF is shared.
+        let mut block = [0u8; 4096];
+        block[..bs as usize].copy_from_slice(read_block_buf(ext2, phys)?);
+        let mut pos = 0u32;
+        while pos < bs {
+            let off = pos as usize;
+            let ino = read_u32(&block, off);
+            let rec_len = read_u16(&block, off + 4) as u32;
+            let len = block[off + 6] as usize;
+            let kind = block[off + 7];
+            if rec_len == 0 {
+                break;
+            }
+            if ino != 0 {
+                if !f(index, ino, kind, &block[off + 8..off + 8 + len]) {
+                    return Ok(());
+                }
+                index += 1;
+            }
+            pos += rec_len;
+        }
+    }
+    Ok(())
+}
+
+/// Point a directory's `..` at `parent`.
+pub fn set_dotdot(ext2: &Ext2State, dir_ino: u32, dir_inode: &Ext2Inode, parent: u32) -> Result<(), u64> {
+    let bs = ext2.block_size;
+    let phys = block_map(ext2, dir_inode, 0)?;
+    if phys == 0 {
+        return Err(ERR_IO);
+    }
+    read_block_buf_mut(ext2, phys)?;
+    let buf = unsafe { &mut DIR_BLOCK_BUF };
+    let mut pos = 0u32;
+    while pos < bs {
+        let off = pos as usize;
+        let rec_len = read_u16(buf, off + 4) as u32;
+        if rec_len == 0 {
+            break;
+        }
+        if read_u32(buf, off) != 0 && buf[off + 6] == 2 && &buf[off + 8..off + 10] == b".." {
+            write_u32(buf, off, parent);
+            return write_dir_block(ext2, phys, dir_ino, dir_inode, buf);
+        }
+        pos += rec_len;
+    }
+    Err(ERR_IO)
+}
+
 /// Initialize a new directory block with `.` and `..` entries.
 pub fn init_dir_block(
     ext2: &mut Ext2State,

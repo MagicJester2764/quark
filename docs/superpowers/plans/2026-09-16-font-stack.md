@@ -507,7 +507,7 @@ Expected: every check passes; `e2fsck` reports no problems.
 - Produces (C): `quark_vfs_unlink(path)`, `quark_vfs_rmdir(path)`, `quark_vfs_rename(from, to)`, `quark_vfs_truncate(handle, size)`; linux-abi answers `unlink`(87), `unlinkat`(263, `AT_REMOVEDIR` → rmdir), `rmdir`(84), `rename`(82), `renameat`(264), `renameat2`(316, flags 0 only), `link`(86)/`linkat`(265) → `EPERM`, `truncate`(76), `ftruncate`(77) on a file, `O_TRUNC`.
 - Produces (server): `ext2_ops::{unlink, rmdir, rename, truncate, release}`, `ext2_ops::free_blocks_from`, `ext2_dir::{remove_entry, set_dotdot, is_empty}`, `ext4::{free_tree, truncate_root}`, `handles::{add_orphan, is_orphan, forget_orphan}`.
 
-- [ ] **Step 1: The failing tests.** `filetest.c` gains, before its summary line:
+- [x] **Step 1: The failing tests.** `filetest.c` gains, before its summary line:
 
 ```c
     printf("removing, renaming, shortening:\n");
@@ -558,7 +558,7 @@ Expected: every check passes; `e2fsck` reports no problems.
     put(SUB "/inner", O_WRONLY | O_CREAT, "x");
     check("rmdir refuses a directory with something in it", rmdir(SUB) == -1 && errno == ENOTEMPTY);
     check("rename a directory", rename(SUB, SUB2) == 0 && stat(SUB2 "/inner", &f) == 0);
-    check("not into itself", rename(SUB2, SUB2 "/inner/deeper") == -1 && errno == EINVAL);
+    check("not into itself", rename(SUB2, SUB2 "/itself") == -1 && errno == EINVAL);
     check("empty it", unlink(SUB2 "/inner") == 0);
     check("then rmdir removes it", rmdir(SUB2) == 0 && stat(SUB2, &f) == -1 && errno == ENOENT);
 
@@ -567,9 +567,9 @@ Expected: every check passes; `e2fsck` reports no problems.
 
 (`filetest` from here on starts from nothing and leaves nothing.) dtest `files` gains the same four operations through quark-rt, ending with the directory removed, and checks `vfs::truncate` on a handle and `vfs::rename` onto an existing name.
 
-- [ ] **Step 2: Run them.** Expected: `truncate`, `unlink`, `rename`, `rmdir` all `ENOSYS`; dtest does not build.
+- [x] **Step 2: Run them.** Expected: `truncate`, `unlink`, `rename`, `rmdir` all `ENOSYS`; dtest does not build.
 
-- [ ] **Step 3: Entries.** In `ext2_dir.rs`:
+- [x] **Step 3: Entries.** In `ext2_dir.rs`:
 
 ```rust
 /// Remove the entry called `name` from a directory. An entry that follows
@@ -616,7 +616,7 @@ pub fn remove_entry(ext2: &Ext2State, dir_ino: u32, dir_inode: &Ext2Inode, name:
 
 `is_empty(ext2, dir) -> Result<bool, u64>`: every in-use entry is `.` or `..`. `set_dotdot(ext2, dir_ino, dir, parent)`: rewrite the `..` entry's inode in the directory's first block and write it back checksummed. `remove_entry` and `create_dir_entry` clear `EXT2_INDEX_FL` as in Task 1.
 
-- [ ] **Step 4: Freeing blocks.** In `ext2_ops.rs`:
+- [x] **Step 4: Freeing blocks.** In `ext2_ops.rs`:
 
 ```rust
 /// Free every block of `inode` from logical block `first` on, and whatever
@@ -704,7 +704,7 @@ fn free_indirect(e2: &mut Ext2State, block: u32, level: u32, first: u64) -> Resu
 
 (`read_block_ptr` becomes `pub`.) In `ext4.rs`, `free_tree(ext2, inode) -> Result<u32, u64>` walks every entry of the root recursively — a leaf frees its run (the uninitialised length encoding included), an index frees its child's entries and then the child block, with the existing depth guard — and leaves `init_extent_root`'s empty root. `truncate_root(ext2, inode, first) -> Result<u32, u64>` handles a depth-0 root: extents starting at or past `first` are freed and dropped, one straddling it is cut to `first - ee_block` (keeping the uninitialised flag), the rest are kept and packed; a deeper tree is `ERR_NOT_SUPPORTED`, because shortening one means rewriting leaf blocks nothing here writes. `extent_insert` puts a new extent in logical order instead of at the end, so a block written into a hole keeps the root sorted; `write_file_data` allocates any unmapped block in the range it writes, not just the ones past the old end.
 
-- [ ] **Step 5: Operations.** In `ext2_ops.rs`, all taking `(e2, …, uid, gid)` and checking write+search permission on every directory they change:
+- [x] **Step 5: Operations.** In `ext2_ops.rs`, all taking `(e2, …, uid, gid)` and checking write+search permission on every directory they change:
   - `unlink(path)`: split, resolve the parent, find the entry, refuse a directory (`ERR_IS_DIR`), `remove_entry`, stamp the parent, then `drop_link`.
   - `drop_link(ino, inode, t)`: one link fewer, `i_ctime = t`; with links left, write it; with none and a handle open (`handles::inode_is_open`), `handles::add_orphan` and write it; otherwise `release_inode`.
   - `release_inode(ino, inode, t)`: `free_blocks_from(.., 0)`, size 0, `i_dtime = t`, write, `ext2_alloc::free_inode`. `release(ino)` re-reads it and does this only if it still has no links.
@@ -712,13 +712,21 @@ fn free_indirect(e2: &mut Ext2State, block: u32, level: u32, first: u64) -> Resu
   - `rename(from, to)`: resolve both parents; the source must exist; a directory may not move under itself (walk `..` from the destination parent up to the root, guard 256 steps, `ERR_INVALID_PATH`); an existing destination that is the same inode is success with nothing done, a directory replacing a directory needs it empty, a file may not replace a directory (`ERR_IS_DIR`) nor a directory a file (`ERR_NOT_DIR`); a replaced name is removed and its inode dropped. Then `create_dir_entry` in the destination (first, so a failure leaves two names rather than none), write that parent, **re-read** the source parent (it may be the same inode, just changed), `remove_entry`, and for a directory changing parents, `set_dotdot` and move one link from the old parent to the new, each parent re-read before it is changed. Both parents and the inode are stamped.
   - `truncate(ino, size)`: regular files only; sizes above `u32::MAX` are `ERR_NOT_SUPPORTED`; shrinking frees from `ceil(size / bs)` and zeroes the kept block's tail (`zero_block_tail(e2, block, from)`, a sector read-modify-write); growing only moves the size; `i_mtime`/`i_ctime` stamped.
 
-- [ ] **Step 6: Dispatch, orphans, flags.** `TAG_UNLINK`, `TAG_RMDIR`, `TAG_RENAME` (the second path read at offset `data[0]` into `PATH_BUF + 4096`), `TAG_TRUNCATE` (the handle must be writable) run `transacted`; FAT32 answers `ERR_NOT_SUPPORTED`. `OPEN_TRUNCATE` in `open_ext2` truncates a regular file to 0 after the permission check, and needs `writable`. `handles` keeps `ORPHANS: [u32; MAX_OPEN_FILES]`; after `TAG_CLOSE` and after a death closes a task's handles, every inode they named that is an orphan and no longer open is released in a transaction and forgotten.
+- [x] **Step 6: Dispatch, orphans, flags.** `TAG_UNLINK`, `TAG_RMDIR`, `TAG_RENAME` (the second path read at offset `data[0]` into `PATH_BUF + 4096`), `TAG_TRUNCATE` (the handle must be writable) run `transacted`; FAT32 answers `ERR_NOT_SUPPORTED`. `OPEN_TRUNCATE` in `open_ext2` truncates a regular file to 0 after the permission check, and needs `writable`. `handles` keeps `ORPHANS: [u32; MAX_OPEN_FILES]`; after `TAG_CLOSE` and after a death closes a task's handles, every inode they named that is an orphan and no longer open is released in a transaction and forgotten.
 
-- [ ] **Step 7: Clients.** quark-rt and C as in Interfaces (the two-path call lends one buffer built on the stack: `from` then `to`, at most `2 * MAX_PATH`). linux-abi: the calls listed; `LX_O_TRUNC` with write access sets `OPEN_TRUNCATE`; `ftruncate` on a descriptor from 32 up is the file's truncate and updates the cached size, below 32 it stays memfd's; `truncate(path)` opens, truncates, closes. New errno numbers in `abi.h`: `EEXIST 17`, `ENOTEMPTY 39`, `ENAMETOOLONG 36`, `EOPNOTSUPP 95`, `EXDEV 18`.
+- [x] **Step 7: Clients.** quark-rt and C as in Interfaces (the two-path call lends one buffer built on the stack: `from` then `to`, at most `2 * MAX_PATH`). linux-abi: the calls listed; `LX_O_TRUNC` with write access sets `OPEN_TRUNCATE`; `ftruncate` on a descriptor from 32 up is the file's truncate and updates the cached size, below 32 it stays memfd's; `truncate(path)` opens, truncates, closes. New errno numbers in `abi.h`: `EEXIST 17`, `ENOTEMPTY 39`, `ENAMETOOLONG 36`, `EOPNOTSUPP 95`, `EXDEV 18`.
 
-- [ ] **Step 8: Verify, ext2 then ext4.** `make hd …` → boot → `runtests /etc/libc.tests`, `dtest files`, `dtest`, then quit and `sh tools/check-rootfs.sh`. The same with `make hd-ext4 …` (the recipe keeps the same image name). Expected: every check passes and `e2fsck -fn` is clean on both. A second boot on each image runs `filetest` again and still passes (it cleans up after itself).
+- [x] **Step 8: Verify, ext2 then ext4.** `make hd …` → boot → `runtests /etc/libc.tests`, `dtest files`, `dtest`, then quit and `sh tools/check-rootfs.sh`. The same with `make hd-ext4 …` (the recipe keeps the same image name). Expected: every check passes and `e2fsck -fn` is clean on both. A second boot on each image runs `filetest` again and still passes (it cleans up after itself).
 
-- [ ] **Step 9: Commit.** quark: "Files can be removed, renamed and shortened"; explosion: "filetest removes what it makes".
+**Found while doing it.** Two things fsck turned up. Freed inodes were dated
+seconds after boot, and a deletion time below the inode count is how ext4's
+orphan list links inodes — so the kernel now reads the CMOS clock at boot
+(`SYS_BOOT_TIME`, ABI 2.1) and everything that tells the time uses the date.
+And on ext4 a rename lost the name it had just added: the sector prefetch read
+the disk around the open transaction and cached the old block, so the second
+change to it in one transaction was made to the old contents.
+
+- [x] **Step 9: Commit.** quark: "Files can be removed, renamed and shortened"; explosion: "filetest removes what it makes".
 
 ---
 ### Task 3: Directories a C program can read

@@ -22,6 +22,7 @@ pub mod paging;
 mod pic;
 mod pit;
 mod pmm;
+mod rtc;
 pub mod scheduler;
 pub mod sync;
 pub mod syscall;
@@ -79,6 +80,7 @@ pub extern "C" fn kernel_main(multiboot_info: usize) -> ! {
         core::arch::asm!("sti", options(nostack, nomem));
     }
     console::puts(b"Interrupts enabled.\n");
+    rtc::init();
 
     // Initialize FAT32 driver (receives kernel services)
     fat32::init();

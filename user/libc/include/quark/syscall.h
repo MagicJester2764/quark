@@ -69,6 +69,7 @@
 
 /* 0x90  time */
 #define SYS_TICKS           144
+#define SYS_BOOT_TIME       145
 
 /* 0xA0  kernel console */
 #define SYS_WRITE           160

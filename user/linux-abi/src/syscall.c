@@ -89,6 +89,20 @@ typedef unsigned long size_t;
 #define LX_faccessat2      439
 #define LX_mkdir            83
 #define LX_mkdirat         258
+#define LX_truncate         76
+#define LX_rename           82
+#define LX_rmdir            84
+#define LX_link             86
+#define LX_unlink           87
+#define LX_unlinkat        263
+#define LX_renameat        264
+#define LX_linkat          265
+#define LX_renameat2       316
+#define LX_AT_REMOVEDIR  0x200
+
+#define LX_CLOCK_REALTIME        0
+#define LX_CLOCK_REALTIME_COARSE 5
+#define LX_CLOCK_TAI             11
 
 #define ARCH_SET_FS 0x1002
 #define ARCH_GET_FS 0x1003
@@ -388,11 +402,15 @@ long __quark_syscall(long n, long a1, long a2, long a3, long a4, long a5, long a
         if (!ts) {
             return -LX_EFAULT;
         }
-        /* A 100 Hz tick counter and no real-time clock, so this counts from
-           boot. See <time.h> in the C library: an obviously small number is
-           better than a confident wrong date. */
+        /* A 100 Hz tick counter, and the date the kernel read at boot. The
+           real-time clocks add that date; every other clock counts from boot,
+           which is what a monotonic clock is for. */
         unsigned long ticks = __syscall0(SYS_TICKS);
-        ts->tv_sec = (long)(ticks / 100);
+        long base = 0;
+        if (a1 == LX_CLOCK_REALTIME || a1 == LX_CLOCK_REALTIME_COARSE || a1 == LX_CLOCK_TAI) {
+            base = (long)__syscall0(SYS_BOOT_TIME);
+        }
+        ts->tv_sec = base + (long)(ticks / 100);
         ts->tv_nsec = (long)((ticks % 100) * 10000000L);
         return 0;
     }
@@ -472,11 +490,45 @@ long __quark_syscall(long n, long a1, long a2, long a3, long a4, long a5, long a
         }
         return __quark_mkdir((const char *)a2);
 
+    case LX_unlink:
+        return __quark_unlink((const char *)a1);
+    case LX_rmdir:
+        return __quark_rmdir((const char *)a1);
+    case LX_unlinkat:
+        if (a1 != LX_AT_FDCWD) {
+            return -LX_ENOSYS;
+        }
+        return (a3 & LX_AT_REMOVEDIR) ? __quark_rmdir((const char *)a2)
+                                       : __quark_unlink((const char *)a2);
+    case LX_rename:
+        return __quark_rename((const char *)a1, (const char *)a2);
+    case LX_renameat:
+    case LX_renameat2:
+        if (a1 != LX_AT_FDCWD || a3 != LX_AT_FDCWD) {
+            return -LX_ENOSYS;
+        }
+        /* renameat2's flags (no-replace, exchange) are not offered. */
+        if (n == LX_renameat2 && a5 != 0) {
+            return -LX_EINVAL;
+        }
+        return __quark_rename((const char *)a2, (const char *)a4);
+    /* A second name for a file is something this filesystem server does not
+       make. EPERM is Linux's answer for a filesystem without hard links, and
+       the one callers such as fontconfig's lock know to fall back from. */
+    case LX_link:
+    case LX_linkat:
+        return -LX_EPERM;
+    case LX_truncate:
+        return __quark_truncate((const char *)a1, a2);
+
     /* Streams, descriptors in flight, and waiting. Each is the same operation
        Quark has with Linux's packaging around it. */
     case LX_memfd_create:
         return __quark_memfd((const char *)a1, a2);
     case LX_ftruncate:
+        if (a1 >= LX_FIRST_FILE_FD) {
+            return __quark_file_truncate(a1, a2);
+        }
         return __quark_ftruncate(a1, a2);
     case LX_fallocate:
         /* posix_fallocate(fd, offset, len) is what musl uses when it has it,

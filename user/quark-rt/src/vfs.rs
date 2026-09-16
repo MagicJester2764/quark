@@ -15,6 +15,10 @@ const TAG_STAT: u64 = 5;
 const TAG_WRITE: u64 = 6;
 const TAG_READDIR_BULK: u64 = 8;
 const TAG_MKDIR: u64 = 9;
+const TAG_UNLINK: u64 = 10;
+const TAG_RMDIR: u64 = 11;
+const TAG_RENAME: u64 = 12;
+const TAG_TRUNCATE: u64 = 13;
 const TAG_ERROR: u64 = u64::MAX;
 
 /// The most one read or write carries.
@@ -288,6 +292,56 @@ pub fn write(vfs_tid: usize, handle: usize, buf: &[u8], offset: u32) -> Result<u
         return Err(reply.data[0]);
     }
     Ok(reply.data[0] as u32)
+}
+
+/// Remove a file's name; the file goes with its last one.
+pub fn unlink(vfs_tid: usize, path: &[u8]) -> Result<(), u64> {
+    call_with_path(vfs_tid, TAG_UNLINK, path, [0; 6]).map(|_| ())
+}
+
+/// Remove an empty directory.
+pub fn rmdir(vfs_tid: usize, path: &[u8]) -> Result<(), u64> {
+    call_with_path(vfs_tid, TAG_RMDIR, path, [0; 6]).map(|_| ())
+}
+
+/// Give the file at `from` the name `to`, replacing whatever had it.
+pub fn rename(vfs_tid: usize, from: &[u8], to: &[u8]) -> Result<(), u64> {
+    if from.is_empty() || to.is_empty() {
+        return Err(ERR_INVALID_PATH);
+    }
+    if from.len() > MAX_PATH || to.len() > MAX_PATH {
+        return Err(ERR_NAME_TOO_LONG);
+    }
+    // Both lent in one buffer, one after the other.
+    let mut both = [0u8; 2 * MAX_PATH];
+    both[..from.len()].copy_from_slice(from);
+    both[from.len()..from.len() + to.len()].copy_from_slice(to);
+    let msg = Message {
+        sender: 0,
+        tag: TAG_RENAME,
+        data: [from.len() as u64, to.len() as u64, 0, 0, 0, 0],
+    };
+    let mut reply = Message::empty();
+    if syscall::sys_call_lend(vfs_tid, &msg, &mut reply, &both[..from.len() + to.len()]).is_err() {
+        return Err(ERR_IO);
+    }
+    if reply.tag == TAG_ERROR {
+        return Err(reply.data[0]);
+    }
+    Ok(())
+}
+
+/// Make an open file `size` bytes long.
+pub fn truncate(vfs_tid: usize, handle: usize, size: u64) -> Result<(), u64> {
+    let msg = Message { sender: 0, tag: TAG_TRUNCATE, data: [handle as u64, size, 0, 0, 0, 0] };
+    let mut reply = Message::empty();
+    if syscall::sys_call(vfs_tid, &msg, &mut reply).is_err() {
+        return Err(ERR_IO);
+    }
+    if reply.tag == TAG_ERROR {
+        return Err(reply.data[0]);
+    }
+    Ok(())
 }
 
 /// Create a new file or directory, which must not exist, and open it.

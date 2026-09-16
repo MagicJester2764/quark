@@ -613,6 +613,18 @@ pub fn capture_write(j: &mut Journal, ext2: &Ext2State, abs_lba: u32) -> bool {
 /// Without this a read-modify-write inside a transaction would read what is on
 /// the disk — which is what the transaction is deliberately not writing yet —
 /// and put back a block missing every change made so far.
+/// Whether the open transaction has written the sector at `abs_lba`, so that
+/// the disk's copy of it is out of date.
+pub fn holds(j: &Journal, ext2: &Ext2State, abs_lba: u32) -> bool {
+    if !j.txn.open {
+        return false;
+    }
+    match locate(ext2, abs_lba) {
+        Some((fs_block, _)) => slot_of(j, fs_block).is_some(),
+        None => false,
+    }
+}
+
 pub fn peek_read(j: &Journal, ext2: &Ext2State, abs_lba: u32, out: &mut [u8]) -> bool {
     if !j.txn.open {
         return false;

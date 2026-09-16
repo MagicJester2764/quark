@@ -1,10 +1,9 @@
-/* Time, such as there is.
+/* Time.
  *
- * Quark has a 100 Hz timer and no real-time clock, so there is no wall clock
- * to report: `time` counts from boot rather than from 1970. Saying so is
- * better than returning a confident wrong epoch — code that measures an
- * interval works, and code that wants a date gets an obviously small number
- * rather than a plausible lie.
+ * Quark has a 100 Hz timer, and a date the kernel read from the machine's
+ * clock at boot: `time` is that date plus the ticks since, in seconds since
+ * 1970. A machine with no clock reports seconds since boot instead — an
+ * obviously small number rather than a plausible lie.
  */
 #ifndef _TIME_H
 #define _TIME_H

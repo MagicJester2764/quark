@@ -21,6 +21,10 @@
 #define QUARK_VFS_TAG_STAT    5
 #define QUARK_VFS_TAG_WRITE   6
 #define QUARK_VFS_TAG_MKDIR   9
+#define QUARK_VFS_TAG_UNLINK  10
+#define QUARK_VFS_TAG_RMDIR   11
+#define QUARK_VFS_TAG_RENAME  12
+#define QUARK_VFS_TAG_TRUNCATE 13
 
 /* What `quark_vfs_open` may be asked to do besides open. */
 #define QUARK_VFS_OPEN_CREATE    1UL  /* make the file if the name is free */
@@ -92,6 +96,10 @@ struct quark_vfs_stat {
 int quark_vfs_open(const char *path, unsigned long flags, struct quark_vfs_file *out);
 int quark_vfs_stat(unsigned long handle, struct quark_vfs_stat *out);
 int quark_vfs_mkdir(const char *path);
+int quark_vfs_unlink(const char *path);
+int quark_vfs_rmdir(const char *path);
+int quark_vfs_rename(const char *from, const char *to);
+int quark_vfs_truncate(unsigned long handle, unsigned long size);
 /* A read or write carries at most QUARK_VFS_MAX_IO bytes, which the VFS is
    lent for the call: it fills `buf` or copies out of it, and never maps it. */
 #define QUARK_VFS_MAX_IO 4096UL

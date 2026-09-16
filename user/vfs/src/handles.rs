@@ -120,3 +120,30 @@ pub fn close_all(tid: usize, closed: &mut [u32; MAX_OPEN_FILES]) -> usize {
 pub fn inode_is_open(ino: u32) -> bool {
     ino != 0 && table().iter().any(|f| f.in_use && f.inode_num() == ino)
 }
+
+/// Inodes whose last name went while a handle still named them. Each has a
+/// handle, so there can never be more than the table holds.
+static mut ORPHANS: [u32; MAX_OPEN_FILES] = [0; MAX_OPEN_FILES];
+
+fn orphans() -> &'static mut [u32; MAX_OPEN_FILES] {
+    unsafe { &mut *core::ptr::addr_of_mut!(ORPHANS) }
+}
+
+pub fn add_orphan(ino: u32) {
+    if is_orphan(ino) {
+        return;
+    }
+    if let Some(slot) = orphans().iter_mut().find(|o| **o == 0) {
+        *slot = ino;
+    }
+}
+
+pub fn is_orphan(ino: u32) -> bool {
+    ino != 0 && orphans().contains(&ino)
+}
+
+pub fn forget_orphan(ino: u32) {
+    for o in orphans().iter_mut().filter(|o| **o == ino) {
+        *o = 0;
+    }
+}

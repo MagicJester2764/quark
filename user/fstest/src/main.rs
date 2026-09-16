@@ -50,10 +50,11 @@ pub extern "C" fn _start() -> ! {
             let mut path = *b"/home/root/loop00.txt";
             path[15] = b'0' + ((n / 10) % 10) as u8;
             path[16] = b'0' + (n % 10) as u8;
-            match vfs::create(vfs_tid, &path, false) {
-                Ok((h, _, _)) => {
-                    let _ = vfs::write(vfs_tid, h, CONTENT, 0);
-                    let _ = vfs::close(vfs_tid, h);
+            // Emptied and rewritten each lap, so the loop runs until killed.
+            match vfs::open_with(vfs_tid, &path, vfs::OPEN_CREATE | vfs::OPEN_TRUNCATE) {
+                Ok(o) => {
+                    let _ = vfs::write(vfs_tid, o.handle, CONTENT, 0);
+                    let _ = vfs::close(vfs_tid, o.handle);
                     println!("wrote {}", Str(&path));
                 }
                 Err(e) => {
