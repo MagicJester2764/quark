@@ -174,6 +174,11 @@ struct quark_msg {
 /* Send and wait for the reply. Returns 0, or -1 if the call could not be made. */
 int quark_call(size_t dest, const struct quark_msg *msg, struct quark_msg *reply);
 
+/* As quark_call, lending `dest` the `len` bytes at `buf` until it replies:
+   QUARK_LEND_READ lets it read them, QUARK_LEND_WRITE lets it fill them. */
+int quark_call_lend(size_t dest, const struct quark_msg *msg, struct quark_msg *reply,
+                    void *buf, unsigned long len, unsigned long access);
+
 /* Find a service by name. Returns its task ID, or 0 if there is none. */
 size_t quark_lookup(const char *name);
 

@@ -14,8 +14,8 @@ const TAG_CREATE: u64 = 7;
 const TAG_READDIR_BULK: u64 = 8;
 const TAG_ERROR: u64 = u64::MAX;
 
-/// Virtual address used by readdir_bulk for its shmem mapping.
-const READDIR_SHMEM_ADDR: usize = 0x88_0000_0000;
+/// The most one read or write carries.
+pub const MAX_IO: usize = 4096;
 
 // Error codes (match VFS server)
 pub const ERR_NOT_FOUND: u64 = 1;
@@ -74,23 +74,17 @@ pub fn open(vfs_tid: usize, path: &[u8]) -> Result<(usize, u32, bool), u64> {
     Ok((reply.data[0] as usize, reply.data[1] as u32, reply.data[2] != 0))
 }
 
-/// Read file data into a client-owned physical page.
-/// `phys_addr` must be a physical address the VFS can map.
-/// Returns bytes actually read.
-pub fn read(
-    vfs_tid: usize,
-    handle: usize,
-    phys_addr: usize,
-    offset: u32,
-    max_bytes: u32,
-) -> Result<u32, u64> {
+/// Read from `offset` into `buf`, at most [`MAX_IO`] bytes of it, which the
+/// VFS is lent for the call. Returns bytes actually read.
+pub fn read(vfs_tid: usize, handle: usize, buf: &mut [u8], offset: u32) -> Result<u32, u64> {
+    let len = buf.len().min(MAX_IO);
     let msg = Message {
         sender: 0,
         tag: TAG_READ,
-        data: [handle as u64, phys_addr as u64, offset as u64, max_bytes as u64, 0, 0],
+        data: [handle as u64, 0, offset as u64, len as u64, 0, 0],
     };
     let mut reply = Message::empty();
-    if syscall::sys_call(vfs_tid, &msg, &mut reply).is_err() {
+    if syscall::sys_call_lend_mut(vfs_tid, &msg, &mut reply, &mut buf[..len]).is_err() {
         return Err(ERR_IO);
     }
     if reply.tag == TAG_ERROR {
@@ -158,21 +152,17 @@ pub fn readdir(vfs_tid: usize, handle: usize, index: u32) -> Result<Option<DirEn
     Ok(Some(DirEntry { name, name_len, size, is_dir, cluster, attr }))
 }
 
-/// Read all directory entries in one IPC call using shared memory.
+/// Read a directory's entries — as many as fit a page — in one call.
 /// Returns the number of entries written into `out`.
 pub fn readdir_bulk(vfs_tid: usize, handle: usize, out: &mut [DirEntry]) -> Result<usize, u64> {
-    // Create shared memory (1 page = 4096 bytes)
-    let shmem = syscall::sys_shmem_create(1).map_err(|_| ERR_IO)?;
-    syscall::sys_shmem_grant(shmem, vfs_tid).map_err(|_| ERR_IO)?;
-    syscall::sys_shmem_map(shmem, READDIR_SHMEM_ADDR).map_err(|_| ERR_IO)?;
-
+    let mut buf = [0u8; 4096];
     let msg = Message {
         sender: 0,
         tag: TAG_READDIR_BULK,
-        data: [handle as u64, shmem as u64, 0, 0, 0, 0],
+        data: [handle as u64, 0, 0, 0, 0, 0],
     };
     let mut reply = Message::empty();
-    if syscall::sys_call(vfs_tid, &msg, &mut reply).is_err() {
+    if syscall::sys_call_lend_mut(vfs_tid, &msg, &mut reply, &mut buf).is_err() {
         return Err(ERR_IO);
     }
     if reply.tag == TAG_ERROR {
@@ -182,7 +172,6 @@ pub fn readdir_bulk(vfs_tid: usize, handle: usize, out: &mut [DirEntry]) -> Resu
     // Entry layout: 64 bytes each (48 name + 1 name_len + 1 attr + 2 pad + 4 size + 4 cluster + 4 pad)
     let max_per_page = 4096 / 64; // 64
     let count = (reply.data[0] as usize).min(out.len()).min(max_per_page);
-    let buf = unsafe { core::slice::from_raw_parts(READDIR_SHMEM_ADDR as *const u8, 4096) };
 
     for i in 0..count {
         let base = i * 64;
@@ -196,30 +185,20 @@ pub fn readdir_bulk(vfs_tid: usize, handle: usize, out: &mut [DirEntry]) -> Resu
         out[i] = DirEntry { name, name_len, size, is_dir, cluster, attr };
     }
 
-    // Clean up shared memory to avoid leaking handles
-    let _ = syscall::sys_shmem_unmap(shmem, READDIR_SHMEM_ADDR);
-    let _ = syscall::sys_shmem_destroy(shmem);
-
     Ok(count)
 }
 
-/// Write data from a client-owned physical page into a file.
-/// `phys_addr` must be a physical address the VFS can map.
-/// Returns bytes actually written.
-pub fn write(
-    vfs_tid: usize,
-    handle: usize,
-    phys_addr: usize,
-    offset: u32,
-    len: u32,
-) -> Result<u32, u64> {
+/// Write at most [`MAX_IO`] bytes of `buf` at `offset`, lending them to the
+/// VFS for the call. Returns bytes actually written.
+pub fn write(vfs_tid: usize, handle: usize, buf: &[u8], offset: u32) -> Result<u32, u64> {
+    let len = buf.len().min(MAX_IO);
     let msg = Message {
         sender: 0,
         tag: TAG_WRITE,
-        data: [handle as u64, phys_addr as u64, offset as u64, len as u64, 0, 0],
+        data: [handle as u64, 0, offset as u64, len as u64, 0, 0],
     };
     let mut reply = Message::empty();
-    if syscall::sys_call(vfs_tid, &msg, &mut reply).is_err() {
+    if syscall::sys_call_lend(vfs_tid, &msg, &mut reply, &buf[..len]).is_err() {
         return Err(ERR_IO);
     }
     if reply.tag == TAG_ERROR {

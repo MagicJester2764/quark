@@ -32,7 +32,8 @@ const SPAWN_SCRATCH: Scratch = Scratch {
     stack: STACK_TEMP,
     args: ARGS_TEMP_PAGE,
 };
-const PASSWD_BUF: usize = 0x98_0000_0000;
+/// Where `/etc/passwd` is read to, a page at most. Read again at every prompt.
+static mut PASSWD: [u8; PAGE_SIZE] = [0; PAGE_SIZE];
 
 // ---------------------------------------------------------------------------
 // ELF loader
@@ -42,25 +43,10 @@ const PASSWD_BUF: usize = 0x98_0000_0000;
 // Program arguments
 // ---------------------------------------------------------------------------
 
-// ---------------------------------------------------------------------------
-// Load and read a file from VFS into FILE_BUF_BASE
-// ---------------------------------------------------------------------------
-
-fn load_file(vfs_tid: usize, path: &[u8]) -> Result<&'static [u8], ()> {
-    let (handle, file_size, _) = vfs::open(vfs_tid, path).map_err(|_| ())?;
-    let size = file_size as usize;
-    let pages_needed = (size + PAGE_SIZE - 1) / PAGE_SIZE;
-
-    for p in 0..pages_needed {
-        let frame = syscall::sys_phys_alloc(1)?;
-        syscall::sys_map_phys(frame, FILE_BUF_BASE + p * PAGE_SIZE, 1)?;
-        let offset = (p * PAGE_SIZE) as u32;
-        let to_read = PAGE_SIZE.min(size - p * PAGE_SIZE) as u32;
-        vfs::read(vfs_tid, handle, frame, offset, to_read).map_err(|_| ())?;
-    }
-    let _ = vfs::close(vfs_tid, handle);
-
-    Ok(unsafe { core::slice::from_raw_parts(FILE_BUF_BASE as *const u8, size) })
+/// Load the program at `path`, staged at `FILE_BUF_BASE` and released again.
+/// login grants the shell its capabilities itself, so the manifest is not read.
+fn load_program(vfs_tid: usize, path: &[u8]) -> Result<spawn::Spawned, ()> {
+    spawn::load_path(vfs_tid, path, FILE_BUF_BASE, &SPAWN_SCRATCH, |_, _| {})
 }
 
 // ---------------------------------------------------------------------------
@@ -128,8 +114,8 @@ pub extern "C" fn _start() -> ! {
 
         // Load the user's shell — try as-is, then lowercase without extension
         let shell_path = entry.shell();
-        let elf_data = match load_file(vfs_tid, shell_path) {
-            Ok(data) => data,
+        let info = match load_program(vfs_tid, shell_path) {
+            Ok(info) => info,
             Err(()) => {
                 // Try lowercase path without .ELF extension (ext2 format)
                 let mut alt = [0u8; 64];
@@ -144,8 +130,8 @@ pub extern "C" fn _start() -> ! {
                 if alt_len >= 4 && &alt[alt_len - 4..alt_len] == b".elf" {
                     alt_len -= 4;
                 }
-                match load_file(vfs_tid, &alt[..alt_len]) {
-                    Ok(data) => data,
+                match load_program(vfs_tid, &alt[..alt_len]) {
+                    Ok(info) => info,
                     Err(()) => {
                         if let Ok(s) = core::str::from_utf8(shell_path) {
                             println!("login: cannot load shell: {}", s);
@@ -153,14 +139,6 @@ pub extern "C" fn _start() -> ! {
                         continue;
                     }
                 }
-            }
-        };
-
-        let info = match spawn::load(elf_data, &SPAWN_SCRATCH) {
-            Ok(i) => i,
-            Err(()) => {
-                println!("login: failed to load shell ELF");
-                continue;
             }
         };
 
@@ -234,12 +212,13 @@ fn load_passwd_file(vfs_tid: usize) -> Option<&'static [u8]> {
         return None;
     }
 
-    let frame = syscall::sys_phys_alloc(1).ok()?;
-    syscall::sys_map_phys(frame, PASSWD_BUF, 1).ok()?;
-    vfs::read(vfs_tid, handle, frame, 0, size as u32).ok()?;
+    let buf = unsafe { &mut *core::ptr::addr_of_mut!(PASSWD) };
+    let got = vfs::read(vfs_tid, handle, &mut buf[..size], 0);
     let _ = vfs::close(vfs_tid, handle);
-
-    Some(unsafe { core::slice::from_raw_parts(PASSWD_BUF as *const u8, size) })
+    match got {
+        Ok(n) if n as usize == size => Some(&buf[..size]),
+        _ => None,
+    }
 }
 
 #[panic_handler]

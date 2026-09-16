@@ -1,16 +1,13 @@
-/* What a hosted C program needs in order to be one.
+/* What a hosted C program needs in order to be one: nothing.
  *
- * File data moves through a page this program owns and the VFS maps, so a
- * program that opens a file needs a page it can allocate. The program does not
- * know that — it called `fopen` — and cannot be expected to declare it. The
- * library that does know declares it here, and the spawner grants it the same
- * way it grants everything else.
+ * File data used to move through a page the program allocated and the VFS
+ * mapped, so every program that might open a file asked for the capability to
+ * allocate one — declared here, because the program only called `fopen` and
+ * could not be expected to know. File data is lent to the VFS with each call
+ * now, and nothing else this layer does takes a capability either.
  *
- * This is a separate object rather than a member of the library because
- * nothing references it: it is linked for its section, not for its symbols,
- * so it goes on the link line beside the entry point.
+ * The object stays because the toolchain's specs file names it on every link
+ * line. A program that does need a capability declares its own manifest.
  */
 
 #include <quark/manifest.h>
-
-QUARK_MANIFEST(QUARK_CAP_PHYS_ALLOC_N(8));

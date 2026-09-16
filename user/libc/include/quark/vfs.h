@@ -64,9 +64,12 @@ struct quark_vfs_file {
    never confused with a small error number. */
 int quark_vfs_open(const char *path, int create, struct quark_vfs_file *out);
 int quark_vfs_stat(unsigned long handle, struct quark_vfs_file *out);
-int quark_vfs_read(unsigned long handle, unsigned long phys, unsigned long offset,
+/* A read or write carries at most QUARK_VFS_MAX_IO bytes, which the VFS is
+   lent for the call: it fills `buf` or copies out of it, and never maps it. */
+#define QUARK_VFS_MAX_IO 4096UL
+int quark_vfs_read(unsigned long handle, void *buf, unsigned long offset,
                    unsigned long len, unsigned long *got);
-int quark_vfs_write(unsigned long handle, unsigned long phys, unsigned long offset,
+int quark_vfs_write(unsigned long handle, const void *buf, unsigned long offset,
                     unsigned long len, unsigned long *put);
 int quark_vfs_close(unsigned long handle);
 

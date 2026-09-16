@@ -55,18 +55,11 @@ use quark_rt::spawn::{self, Scratch};
 use quark_rt::wm as proto;
 use quark_rt::{args, nameserver, println, syscall};
 
-// The back buffer is ordinary memory, so this needs to allocate pages. The
-// right to map the framebuffer is not asked for here: it is lent by the
-// framebuffer device when the display is claimed, and taken away again when it
-// is released.
-// The back buffer is ordinary memory, and running a session means creating a
-// task for it and giving that task pages. The right to map the framebuffer is
-// not asked for here: it is lent by the framebuffer device when the display is
-// claimed, and taken away again when it is released.
-// 64 pages, not "unlimited": a capability may only be narrowed, and the shell
-// that launches this holds 64. Asking for more than the spawner has is not
-// refused loudly — the mint simply fails and the capability is absent, which
-// then looks like an unrelated failure much later.
+// Running a session means creating tasks, which is all this asks for. The back
+// buffer and every program it loads are ordinary memory, which takes no
+// capability. The right to map the framebuffer is not asked for here either:
+// it is lent by the framebuffer device when the display is claimed, and taken
+// away again when it is released.
 mod client;
 mod clipboard;
 mod cursor;
@@ -81,10 +74,7 @@ mod surface;
 
 use draw::{draw_text, fill_rect, pack_colour, present, Rect, Screen, CLIP, GLYPH_H, SCREEN};
 
-quark_rt::manifest!([
-    quark_rt::manifest::CapReq::phys_alloc(64),
-    quark_rt::manifest::CapReq::task_mgmt(0),
-]);
+quark_rt::manifest!([quark_rt::manifest::CapReq::task_mgmt(0)]);
 
 /// Scratch addresses for staging a session program's pages into its new
 /// address space. Each spawner needs its own; these are the compositor's.

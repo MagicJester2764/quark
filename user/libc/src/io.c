@@ -22,9 +22,6 @@
 #include <quark/vfs.h>
 
 #define PAGE_SIZE 4096
-/* The shared transfer page: above everything the loader places, and clear of
-   the stack and the heap. */
-#define XFER_VADDR QUARK_XFER_PAGE
 
 #define FIRST_FD 3
 #define MAX_FILES 16
@@ -37,30 +34,6 @@ struct openfile {
 };
 
 static struct openfile files[MAX_FILES];
-static unsigned long xfer_phys;
-static int xfer_ready;
-
-/* Map the page the VFS reads from and writes into. Done on first use rather
-   than at startup: a program that never touches a file should not need the
-   capability to allocate one. */
-static int xfer_page(void) {
-    if (xfer_ready) {
-        return 0;
-    }
-    unsigned long phys = __syscall1(SYS_PHYS_ALLOC, 1);
-    if (phys == QUARK_ERR) {
-        errno = ENOMEM;
-        return -1;
-    }
-    if (__syscall3(SYS_MAP_PHYS, phys, XFER_VADDR, 1) == QUARK_ERR) {
-        errno = ENOMEM;
-        return -1;
-    }
-    xfer_phys = phys;
-    xfer_ready = 1;
-    return 0;
-}
-
 /* The server's codes are its own; this is where they become ours. */
 static int vfs_errno(int code) {
     switch (code) {
@@ -140,10 +113,6 @@ ssize_t read(int fd, void *buf, size_t n) {
         errno = EBADF;
         return -1;
     }
-    if (xfer_page() != 0) {
-        return -1;
-    }
-
     size_t done = 0;
     unsigned char *out = buf;
     /* One page per message, so anything larger is a loop. */
@@ -153,7 +122,8 @@ ssize_t read(int fd, void *buf, size_t n) {
             want = PAGE_SIZE;
         }
         unsigned long got = 0;
-        int err = quark_vfs_read(f->handle, xfer_phys, f->offset, want, &got);
+        /* The caller's own buffer, lent to the VFS to fill. */
+        int err = quark_vfs_read(f->handle, out + done, f->offset, want, &got);
         if (err) {
             errno = vfs_errno(err);
             return done ? (ssize_t)done : -1;
@@ -161,7 +131,6 @@ ssize_t read(int fd, void *buf, size_t n) {
         if (got == 0) {
             break; /* end of file */
         }
-        memcpy(out + done, (const void *)XFER_VADDR, got);
         done += got;
         f->offset += got;
         /* A short read means the end, not a hiccup: the VFS answers from a
@@ -188,10 +157,6 @@ ssize_t write(int fd, const void *buf, size_t n) {
         errno = EBADF;
         return -1;
     }
-    if (xfer_page() != 0) {
-        return -1;
-    }
-
     size_t done = 0;
     const unsigned char *in = buf;
     while (done < n) {
@@ -199,10 +164,8 @@ ssize_t write(int fd, const void *buf, size_t n) {
         if (want > PAGE_SIZE) {
             want = PAGE_SIZE;
         }
-        memcpy((void *)XFER_VADDR, in + done, want);
-
         unsigned long put = 0;
-        int err = quark_vfs_write(f->handle, xfer_phys, f->offset, want, &put);
+        int err = quark_vfs_write(f->handle, in + done, f->offset, want, &put);
         if (err) {
             errno = vfs_errno(err);
             return done ? (ssize_t)done : -1;

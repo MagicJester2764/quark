@@ -25,8 +25,6 @@
 #define QUARK_MAX_PHDRS 16
 #define QUARK_PHDR_SIZE 56
 #define QUARK_PHDRS_AT (4096 - 16 - QUARK_MAX_PHDRS * QUARK_PHDR_SIZE)
-/* The page file data moves through, shared with the VFS. */
-#define QUARK_XFER_PAGE 0x8900000000UL
 /* Where malloc looks for pages. Deliberately not the Rust runtime's
    0x90_0000_0000: a program links one or the other, and picking the same
    address would turn a mistake into a confusing failure. */
@@ -34,7 +32,6 @@
 #define QUARK_HEAP_LIMIT 0xA000000000UL
 
 _Static_assert(QUARK_ARGS_PAGE >= QUARK_USER_MIN, "args page is below PML4[1]");
-_Static_assert(QUARK_XFER_PAGE >= QUARK_USER_MIN, "transfer page is below PML4[1]");
 _Static_assert(QUARK_HEAP_START >= QUARK_USER_MIN, "heap is below PML4[1]");
 _Static_assert(QUARK_HEAP_LIMIT > QUARK_HEAP_START, "heap limit is below its start");
 _Static_assert(QUARK_PHDRS_AT == 3184, "program header offset disagrees with quark_rt::spawn");

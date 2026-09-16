@@ -10,6 +10,10 @@ const PAGE_SIZE: usize = 4096;
 const BOOT_INFO_ADDR: usize = 0x80_4000_0000;
 const FILE_BUF_BASE: usize = 0x82_0000_0000;
 const BOOT_IMG_BASE: usize = 0x85_0000_0000;
+/// Where a program read through the VFS is staged, `MAX_IMAGE_PAGES` long.
+/// Not `FILE_BUF_BASE`: the boot image path leaves its last program mapped
+/// there, and staging never maps over anything.
+const VFS_IMAGE_BASE: usize = 0x89_0000_0000;
 const NAMESERVER_TID: usize = 2;
 
 // ---------------------------------------------------------------------------
@@ -791,47 +795,11 @@ fn load_from_vfs(vfs_tid: usize, console_pipe: usize, input_tid: usize) -> Defer
     path[prefix.len()..prefix.len() + namelen].copy_from_slice(&namebuf[..namelen]);
     let path_len = prefix.len() + namelen;
 
-    // Open file via VFS
-    let (file_handle, file_size, _) = match vfs::open(vfs_tid, &path[..path_len]) {
-        Ok(h) => h,
-        Err(_) => {
-            println!("[init]   FAILED to open via VFS");
-            return deferred;
-        }
-    };
-
-    let size = file_size as usize;
-    let pages_needed = (size + PAGE_SIZE - 1) / PAGE_SIZE;
-
-    // Allocate pages and read file content via VFS directly into them
-    let mut success = true;
-    for p in 0..pages_needed {
-        let frame = match syscall::sys_phys_alloc(1) {
-            Ok(f) => f,
-            Err(()) => { success = false; break; }
-        };
-        if syscall::sys_map_phys(frame, FILE_BUF_BASE + p * PAGE_SIZE, 1).is_err() {
-            success = false; break;
-        }
-        let offset = (p * PAGE_SIZE) as u32;
-        let to_read = PAGE_SIZE.min(size - p * PAGE_SIZE) as u32;
-        if vfs::read(vfs_tid, file_handle, frame, offset, to_read).is_err() {
-            success = false; break;
-        }
-    }
-
-    let _ = vfs::close(vfs_tid, file_handle);
-
-    if !success {
-        println!("[init]   FAILED to read from VFS");
-        return deferred;
-    }
-
-    let data = unsafe { core::slice::from_raw_parts(FILE_BUF_BASE as *const u8, size) };
-    match spawn::load(data, &SPAWN_SCRATCH) {
+    // Read it through the VFS into memory of this task's, and load it.
+    let grant = |image: &[u8], tid: usize| grant_caps_from_manifest(image, tid);
+    match spawn::load_path(vfs_tid, &path[..path_len], VFS_IMAGE_BASE, &SPAWN_SCRATCH, grant) {
         Ok(info) => {
             let tid = info.tid;
-            grant_caps_from_manifest(data, tid);
             if console_pipe != 0 {
                 let _ = syscall::sys_pipe_fd_set(tid, 1, console_pipe, true);
                 let _ = syscall::sys_pipe_fd_set(tid, 2, console_pipe, true);

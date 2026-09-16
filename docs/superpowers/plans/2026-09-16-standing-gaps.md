@@ -462,7 +462,7 @@ dtest's broad-range check now names init, vfs and net but not disk.
 - Produces (quark-rt): `vfs::read(vfs_tid, handle, buf: &mut [u8], offset: u32) -> Result<u32, u64>` (reads at most `min(buf.len(), 4096)`); `vfs::write(vfs_tid, handle, buf: &[u8], offset: u32) -> Result<u32, u64>` (at most 4096); `readdir_bulk` unchanged in signature, now lending a page.
 - Produces (C): `int quark_vfs_read(unsigned long handle, void *buf, unsigned long offset, unsigned long len, unsigned long *got)` and `int quark_vfs_write(unsigned long handle, const void *buf, unsigned long offset, unsigned long len, unsigned long *put)`.
 
-- [ ] **Step 1: The server** — `CLIENT_BUF` becomes a page of the VFS's own.
+- [x] **Step 1: The server** — `CLIENT_BUF` becomes a page of the VFS's own.
 `TAG_READ` fills it exactly as today, then `sys_lent_write(sender, 0,
 &page[..n])`; `TAG_WRITE` first `sys_lent_read(sender, 0, &mut page[..len])`,
 then writes from it as today. `read_file_data`/`write_file_data` (ext2 and
@@ -471,34 +471,34 @@ entries into a lent 4096-byte buffer rather than a shared-memory handle the
 request names — a handle is a global number, so any client could have named
 another's. Manifest: no `phys_range`, no `phys_alloc`.
 
-- [ ] **Step 2: quark-rt** — `vfs::read`/`write` as above; `readdir_bulk` lends
+- [x] **Step 2: quark-rt** — `vfs::read`/`write` as above; `readdir_bulk` lends
 a stack page. `spawn::load_path` stages the image in `sys_mmap` memory and
 reads each page straight into it; the frame bookkeeping goes.
 
-- [ ] **Step 3: Rust callers** — init (`FILE_BUF_BASE` pages from `sys_mmap`),
+- [x] **Step 3: Rust callers** — init (`FILE_BUF_BASE` pages from `sys_mmap`),
 cat, disktest, fstest, login (both reads), runtests (the list) lend ordinary
 buffers.
 
-- [ ] **Step 4: C callers** — `quark.c` lends through a new
+- [x] **Step 4: C callers** — `quark.c` lends through a new
 `quark_call_lend(dest, msg, reply, buf, len, access)`; `io.c` and `files.c`
 read and write the caller's buffer a page at a time with no transfer page,
 `xfer_phys`/`xfer_page` and `XFER_VADDR` removed. `manifest.c`'s
 `phys_alloc(8)` existed only for that page: check `clone.c` allocates nothing,
 then leave the manifest empty with a comment saying why the object stays.
 
-- [ ] **Step 5: Manifests** — `grep sys_phys_alloc` each program and the quark-rt
+- [x] **Step 5: Manifests** — `grep sys_phys_alloc` each program and the quark-rt
 modules it uses; drop `phys_alloc` from those with no caller left (cat, fstest,
 disktest, login, runtests, qsh are the candidates; dtest and threadtest keep it
 for thread stacks; dchild keeps it for its orphan mode's thread).
 
-- [ ] **Step 6: Verify** — rebuild the C tests and pixman
+- [x] **Step 6: Verify** — rebuild the C tests and pixman
 (`build-tests.sh`, `build-pixman.sh`, `build-cairo.sh`'s objects link the new
 `liblinux-abi.a`), boot, and run: `dtest`, `cat` on a file, `ls /usr/bin`,
 `fstest` (it writes), `runtests /etc/libc.tests`, `/etc/cairo.tests`,
 `/etc/pixman.tests`, and `wm weston-simple-shm wlcairo`. Expected: all pass;
 dtest's broad-range check names init and net only.
 
-- [ ] **Step 7: Commit** — "The VFS copies what it was lent".
+- [x] **Step 7: Commit** — "The VFS copies what it was lent".
 
 ---
 

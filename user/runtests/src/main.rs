@@ -27,8 +27,6 @@ quark_rt::manifest!([CapReq::task_mgmt(0), CapReq::phys_alloc(64)]);
 
 /// Where a program's image is read to before it is loaded. Freed each time.
 const IMAGE_AT: usize = 0x9A_0000_0000;
-/// Where the list is read to.
-const LIST_AT: usize = 0x99_0000_0000;
 const LIST_MAX: usize = 4096;
 
 static SCRATCH: Scratch = Scratch {
@@ -118,19 +116,8 @@ fn report(name: &[u8], o: Outcome) {
 fn read_list(vfs_tid: usize, path: &[u8], buf: &mut [u8; LIST_MAX]) -> Option<usize> {
     let (handle, size, _) = vfs::open(vfs_tid, path).ok()?;
     let size = (size as usize).min(LIST_MAX);
-    let frame = syscall::sys_phys_alloc(1).ok()?;
-    let got = syscall::sys_map_phys(frame, LIST_AT, 1)
-        .ok()
-        .and_then(|()| vfs::read(vfs_tid, handle, frame, 0, size as u32).ok());
+    let got = vfs::read(vfs_tid, handle, &mut buf[..size], 0).ok();
     let _ = vfs::close(vfs_tid, handle);
-    if let Some(n) = got {
-        let n = (n as usize).min(size);
-        unsafe {
-            core::ptr::copy_nonoverlapping(LIST_AT as *const u8, buf.as_mut_ptr(), n);
-        }
-    }
-    let _ = syscall::sys_munmap(LIST_AT, 1);
-    let _ = syscall::sys_phys_free(frame, 1);
     got.map(|n| (n as usize).min(size))
 }
 

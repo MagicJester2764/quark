@@ -17,12 +17,12 @@ use quark_rt::{println, syscall};
 
 use quark_rt::manifest::CapReq;
 
-// Broad physical range for the same reason as the disk driver: VFS maps
-// client-allocated pages. Its own sector cache is covered by frame ownership.
+// A server, and nothing else. It used to hold all of physical memory in order
+// to map the page each client named for its data, and frames of its own for
+// its buffers; clients lend their buffers with the call now, and the buffers
+// here are ordinary memory.
 quark_rt::manifest!([
     CapReq::priority(quark_rt::syscall::PRIO_SERVER),
-    CapReq::phys_alloc(256),
-    CapReq::phys_range(0, 0x1_0000_0000),
 ]);
 
 pub const PAGE_SIZE: usize = 4096;
@@ -99,13 +99,15 @@ fn ext2_state_mut() -> &'static mut ext2::Ext2State {
     unsafe { &mut *core::ptr::addr_of_mut!(EXT2_STATE) }
 }
 
-// Virtual addresses for temp mappings
+// Where this server keeps its buffers.
 pub const DISK_IO_BUF: usize = 0x86_0000_0000;
+/// A page of this server's own that file data passes through on its way to or
+/// from the buffer a client lent: filled and then copied out for a read,
+/// copied in and then written for a write.
 pub const CLIENT_BUF: usize = 0x87_0000_0000;
 pub const CACHE_BUF_BASE: usize = 0x8A_0000_0000;
 /// Pages behind the sector cache: 256 sectors of 512 bytes.
 const CACHE_PAGES: usize = 32;
-pub const SHMEM_BUF: usize = 0x8B_0000_0000;
 
 // ---------------------------------------------------------------------------
 // Sector cache
@@ -823,15 +825,14 @@ fn find_entry(
 }
 
 // ---------------------------------------------------------------------------
-// Read file data into client's physical page
+// Read file data into CLIENT_BUF
 // ---------------------------------------------------------------------------
 
-/// Read up to `max_bytes` from a file at `offset` into the client's physical page.
-/// Returns bytes actually read.
+/// Read up to `max_bytes` (at most a page) from a file at `offset` into
+/// `CLIENT_BUF`. Returns bytes actually read.
 fn read_file_data(
     disk: &DiskState,
     file: &mut OpenFile,
-    client_phys: usize,
     offset: u32,
     max_bytes: u32,
 ) -> Result<u32, u64> {
@@ -852,11 +853,6 @@ fn read_file_data(
     let to_read = max_bytes.min(available).min(PAGE_SIZE as u32);
     if to_read == 0 {
         return Ok(0);
-    }
-
-    // Map client's physical page
-    if syscall::sys_map_phys(client_phys, CLIENT_BUF, 1).is_err() {
-        return Err(ERR_IO);
     }
 
     let cluster_bytes = disk.bpb.sectors_per_cluster * disk.bpb.bytes_per_sector;
@@ -1172,15 +1168,14 @@ fn update_dir_entry_size(
 }
 
 // ---------------------------------------------------------------------------
-// Write file data from client's physical page
+// Write file data from CLIENT_BUF
 // ---------------------------------------------------------------------------
 
-/// Write up to `len` bytes to a file at `offset` from the client's physical page.
-/// Returns bytes actually written.
+/// Write up to `len` bytes (at most a page) from `CLIENT_BUF` to a file at
+/// `offset`. Returns bytes actually written.
 fn write_file_data(
     disk: &DiskState,
     file: &mut OpenFile,
-    client_phys: usize,
     offset: u32,
     len: u32,
 ) -> Result<u32, u64> {
@@ -1196,11 +1191,6 @@ fn write_file_data(
     let to_write = len.min(PAGE_SIZE as u32);
     if to_write == 0 {
         return Ok(0);
-    }
-
-    // Map client's physical page
-    if syscall::sys_map_phys(client_phys, CLIENT_BUF, 1).is_err() {
-        return Err(ERR_IO);
     }
 
     let cluster_bytes = disk.bpb.sectors_per_cluster * disk.bpb.bytes_per_sector;
@@ -1355,6 +1345,7 @@ pub extern "C" fn _start() -> ! {
     // 256 sectors). Ordinary memory: the disk driver is lent the one and
     // never sees the other.
     if syscall::sys_mmap(DISK_IO_BUF, 1).is_err()
+        || syscall::sys_mmap(CLIENT_BUF, 1).is_err()
         || syscall::sys_mmap(CACHE_BUF_BASE, CACHE_PAGES).is_err()
     {
         println!("[vfs] No memory for disk buffers.");
@@ -1558,7 +1549,33 @@ fn handle_open(disk: &DiskState, sender: usize, msg: &Message) {
     }
 }
 
-/// TAG_READ: data[0]=handle, data[1]=phys_addr, data[2]=offset, data[3]=max_bytes
+/// Copy the first `n` bytes of `CLIENT_BUF` into what `sender` lent.
+fn lend_out(sender: usize, n: usize) -> bool {
+    let data = unsafe { core::slice::from_raw_parts(CLIENT_BUF as *const u8, n) };
+    n == 0 || syscall::sys_lent_write(sender, 0, data) == Ok(n)
+}
+
+/// Copy `n` bytes of what `sender` lent into `CLIENT_BUF`.
+fn lend_in(sender: usize, n: usize) -> bool {
+    let buf = unsafe { core::slice::from_raw_parts_mut(CLIENT_BUF as *mut u8, n) };
+    n == 0 || syscall::sys_lent_read(sender, 0, buf) == Ok(n)
+}
+
+/// Reply to a read: the bytes go into what the caller lent, and the count into
+/// the reply. A caller that lent too little gets an error, not a short read.
+fn reply_read(sender: usize, result: Result<u32, u64>) {
+    match result {
+        Ok(n) if lend_out(sender, n as usize) => {
+            let reply = Message { sender: 0, tag: TAG_OK, data: [n as u64, 0, 0, 0, 0, 0] };
+            let _ = syscall::sys_reply(sender, &reply);
+        }
+        Ok(_) => error_reply(sender, ERR_IO),
+        Err(code) => error_reply(sender, code),
+    }
+}
+
+/// TAG_READ: data[0]=handle, data[2]=offset, data[3]=max_bytes (at most a
+/// page), with a buffer that long lent for writing.
 /// Reply: tag=TAG_OK, data[0]=bytes_read  OR  tag=TAG_ERROR, data[0]=error_code
 fn handle_read(disk: &DiskState, sender: usize, msg: &Message) {
     if unsafe { FS_TYPE } == FsType::Ext2 {
@@ -1567,24 +1584,11 @@ fn handle_read(disk: &DiskState, sender: usize, msg: &Message) {
     }
 
     let handle = msg.data[0] as usize;
-    let phys_addr = msg.data[1] as usize;
     let offset = msg.data[2] as u32;
     let max_bytes = msg.data[3] as u32;
 
     match get_handle(handle, sender) {
-        Some(file) => {
-            match read_file_data(disk, file, phys_addr, offset, max_bytes) {
-                Ok(bytes_read) => {
-                    let reply = Message {
-                        sender: 0,
-                        tag: TAG_OK,
-                        data: [bytes_read as u64, 0, 0, 0, 0, 0],
-                    };
-                    let _ = syscall::sys_reply(sender, &reply);
-                }
-                Err(code) => error_reply(sender, code),
-            }
-        }
+        Some(file) => reply_read(sender, read_file_data(disk, file, offset, max_bytes)),
         None => error_reply(sender, ERR_INVALID_HANDLE),
     }
 }
@@ -1696,7 +1700,8 @@ fn handle_stat(sender: usize, msg: &Message) {
     }
 }
 
-/// TAG_WRITE: data[0]=handle, data[1]=phys_addr, data[2]=offset, data[3]=len
+/// TAG_WRITE: data[0]=handle, data[2]=offset, data[3]=len (at most a page),
+/// with a buffer that long lent for reading.
 /// Reply: tag=TAG_OK, data[0]=bytes_written  OR  tag=TAG_ERROR, data[0]=error_code
 fn handle_write(disk: &DiskState, sender: usize, msg: &Message) {
     if unsafe { FS_TYPE } == FsType::Ext2 {
@@ -1705,9 +1710,12 @@ fn handle_write(disk: &DiskState, sender: usize, msg: &Message) {
     }
 
     let handle = msg.data[0] as usize;
-    let phys_addr = msg.data[1] as usize;
     let offset = msg.data[2] as u32;
-    let len = msg.data[3] as u32;
+    let len = (msg.data[3] as u32).min(PAGE_SIZE as u32);
+    if !lend_in(sender, len as usize) {
+        error_reply(sender, ERR_IO);
+        return;
+    }
 
     match get_handle(handle, sender) {
         Some(file) => {
@@ -1715,7 +1723,7 @@ fn handle_write(disk: &DiskState, sender: usize, msg: &Message) {
                 FsFileData::Fat32 { dir_cluster, fat_name, .. } => (*dir_cluster, *fat_name),
                 _ => { error_reply(sender, ERR_IO); return; }
             };
-            match write_file_data(disk, file, phys_addr, offset, len) {
+            match write_file_data(disk, file, offset, len) {
                 Ok(bytes_written) => {
                     // Update directory entry with new size
                     let new_size = file.file_size;
@@ -1810,9 +1818,14 @@ fn handle_create(disk: &DiskState, sender: usize, msg: &Message) {
     }
 }
 
-/// TAG_READDIR_BULK: data[0]=handle, data[1]=shmem_handle
-/// VFS maps shmem, fills with packed 24-byte entries, replies with count.
-/// Entry format: [0..11] name, [11] attr, [12..16] size LE, [16..20] cluster LE, [20..24] pad
+/// TAG_READDIR_BULK: data[0]=handle, with a page lent for writing.
+/// The page is filled with packed 64-byte entries and the reply carries the
+/// count. Entry format: [0..48] name, [48] name length, [49] attr, [52..56]
+/// size LE, [56..60] cluster or inode LE.
+///
+/// This used to take a shared-memory handle and map it. Handles are global
+/// numbers, so a client could name a region another client had shared with
+/// this server and have a directory listing written over it.
 fn handle_readdir_bulk(disk: &DiskState, sender: usize, msg: &Message) {
     if unsafe { FS_TYPE } == FsType::Ext2 {
         handle_readdir_bulk_ext2(sender, msg);
@@ -1820,7 +1833,6 @@ fn handle_readdir_bulk(disk: &DiskState, sender: usize, msg: &Message) {
     }
 
     let handle = msg.data[0] as usize;
-    let shmem_handle = msg.data[1] as usize;
 
     let dir_cluster = match get_handle(handle, sender) {
         Some(file) => {
@@ -1839,13 +1851,7 @@ fn handle_readdir_bulk(disk: &DiskState, sender: usize, msg: &Message) {
         }
     };
 
-    // Map the shared memory page
-    if syscall::sys_shmem_map(shmem_handle, SHMEM_BUF).is_err() {
-        error_reply(sender, ERR_IO);
-        return;
-    }
-
-    let buf = unsafe { core::slice::from_raw_parts_mut(SHMEM_BUF as *mut u8, 4096) };
+    let buf = unsafe { core::slice::from_raw_parts_mut(CLIENT_BUF as *mut u8, 4096) };
     let max_entries = 4096 / 64; // 64
     let mut count: u32 = 0;
 
@@ -1906,14 +1912,17 @@ fn handle_readdir_bulk(disk: &DiskState, sender: usize, msg: &Message) {
         }
     }
 
-    // Unmap the shared memory before replying — client will destroy the region
-    let _ = syscall::sys_shmem_unmap(shmem_handle, SHMEM_BUF);
+    reply_entries(sender, count);
+}
 
-    let reply = Message {
-        sender: 0,
-        tag: TAG_OK,
-        data: [count as u64, 0, 0, 0, 0, 0],
-    };
+/// Reply to a bulk readdir: `count` 64-byte entries from `CLIENT_BUF` into
+/// what the caller lent, and the count into the reply.
+fn reply_entries(sender: usize, count: u32) {
+    if !lend_out(sender, count as usize * 64) {
+        error_reply(sender, ERR_IO);
+        return;
+    }
+    let reply = Message { sender: 0, tag: TAG_OK, data: [count as u64, 0, 0, 0, 0, 0] };
     let _ = syscall::sys_reply(sender, &reply);
 }
 
@@ -1973,7 +1982,6 @@ fn handle_open_ext2(sender: usize, msg: &Message) {
 
 fn handle_read_ext2(sender: usize, msg: &Message) {
     let handle = msg.data[0] as usize;
-    let phys_addr = msg.data[1] as usize;
     let offset = msg.data[2] as u32;
     let max_bytes = msg.data[3] as u32;
 
@@ -1983,18 +1991,7 @@ fn handle_read_ext2(sender: usize, msg: &Message) {
                 FsFileData::Ext2 { inode, .. } => *inode,
                 _ => { error_reply(sender, ERR_IO); return; }
             };
-            let e2 = ext2_state();
-            match ext2::read_file_data(e2, &inode, phys_addr, offset, max_bytes) {
-                Ok(bytes_read) => {
-                    let reply = Message {
-                        sender: 0,
-                        tag: TAG_OK,
-                        data: [bytes_read as u64, 0, 0, 0, 0, 0],
-                    };
-                    let _ = syscall::sys_reply(sender, &reply);
-                }
-                Err(code) => error_reply(sender, code),
-            }
+            reply_read(sender, ext2::read_file_data(ext2_state(), &inode, offset, max_bytes));
         }
         None => error_reply(sender, ERR_INVALID_HANDLE),
     }
@@ -2027,9 +2024,8 @@ fn handle_write_ext2(sender: usize, msg: &Message) {
         return;
     }
     let handle = msg.data[0] as usize;
-    let phys_addr = msg.data[1] as usize;
     let offset = msg.data[2] as u32;
-    let len = msg.data[3] as u32;
+    let len = (msg.data[3] as u32).min(PAGE_SIZE as u32);
 
     match get_handle(handle, sender) {
         Some(file) => {
@@ -2042,8 +2038,12 @@ fn handle_write_ext2(sender: usize, msg: &Message) {
                     (*inode_num, *inode, *parent_inode),
                 _ => { error_reply(sender, ERR_IO); return; }
             };
+            if !lend_in(sender, len as usize) {
+                error_reply(sender, ERR_IO);
+                return;
+            }
             let e2 = ext2_state_mut();
-            match ext2::write_file_data(e2, &mut inode, inode_num, phys_addr, offset, len) {
+            match ext2::write_file_data(e2, &mut inode, inode_num, offset, len) {
                 Ok(bytes_written) => {
                     // Update cached inode and file size in handle
                     file.file_size = inode.i_size;
@@ -2116,7 +2116,6 @@ fn handle_readdir_ext2(sender: usize, msg: &Message) {
 
 fn handle_readdir_bulk_ext2(sender: usize, msg: &Message) {
     let handle = msg.data[0] as usize;
-    let shmem_handle = msg.data[1] as usize;
 
     let dir_inode = match get_handle(handle, sender) {
         Some(file) => {
@@ -2135,13 +2134,7 @@ fn handle_readdir_bulk_ext2(sender: usize, msg: &Message) {
         }
     };
 
-    // Map the shared memory page
-    if syscall::sys_shmem_map(shmem_handle, SHMEM_BUF).is_err() {
-        error_reply(sender, ERR_IO);
-        return;
-    }
-
-    let buf = unsafe { core::slice::from_raw_parts_mut(SHMEM_BUF as *mut u8, 4096) };
+    let buf = unsafe { core::slice::from_raw_parts_mut(CLIENT_BUF as *mut u8, 4096) };
     let max_entries = 4096 / 64; // 64
     let mut count: u32 = 0;
     let e2 = ext2_state();
@@ -2175,14 +2168,7 @@ fn handle_readdir_bulk_ext2(sender: usize, msg: &Message) {
         }
     }
 
-    let _ = syscall::sys_shmem_unmap(shmem_handle, SHMEM_BUF);
-
-    let reply = Message {
-        sender: 0,
-        tag: TAG_OK,
-        data: [count as u64, 0, 0, 0, 0, 0],
-    };
-    let _ = syscall::sys_reply(sender, &reply);
+    reply_entries(sender, count);
 }
 
 fn handle_create_ext2(sender: usize, msg: &Message) {

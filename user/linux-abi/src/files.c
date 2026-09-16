@@ -20,10 +20,6 @@
 
 #define PAGE_SIZE 4096UL
 
-/* The page file data moves through. One is enough: a read is a round trip, so
-   there is never a second one in flight. */
-#define XFER_VADDR QUARK_XFER_PAGE
-
 /* Where this layer's own descriptors live.
  *
  * There are two descriptor allocators and one number space. The kernel hands
@@ -51,8 +47,6 @@ struct openfile {
 };
 
 static struct openfile files[MAX_FILES];
-static unsigned long xfer_phys;
-static int xfer_ready;
 
 /* Linux's open flags, which are what musl passes. */
 #define LX_O_WRONLY 1
@@ -83,35 +77,6 @@ static long vfs_errno(int code) {
     case QUARK_VFS_READ_ONLY:      return -LX_EROFS;
     case QUARK_VFS_UNREACHABLE:    return -LX_EIO;
     default:                       return -LX_EIO;
-    }
-}
-
-/* Map the page the VFS reads from and writes into.
- *
- * Done on first use rather than at startup: a program that never opens a file
- * should not need the capability to allocate a page, and asking for one it
- * does not have would fail at a moment that has nothing to do with files. */
-static long xfer_page(void) {
-    if (xfer_ready) {
-        return 0;
-    }
-    unsigned long phys = __syscall1(SYS_PHYS_ALLOC, 1);
-    if (phys == QUARK_ERR) {
-        return -LX_ENOMEM;
-    }
-    if (__syscall3(SYS_MAP_PHYS, phys, XFER_VADDR, 1) == QUARK_ERR) {
-        return -LX_ENOMEM;
-    }
-    xfer_phys = phys;
-    xfer_ready = 1;
-    return 0;
-}
-
-static void bytes_copy(void *dst, const void *src, unsigned long n) {
-    unsigned char *d = dst;
-    const unsigned char *s = src;
-    while (n--) {
-        *d++ = *s++;
     }
 }
 
@@ -205,10 +170,6 @@ long __quark_file_read(long fd, void *buf, unsigned long n) {
     if (n == 0) {
         return 0;
     }
-    long err = xfer_page();
-    if (err) {
-        return err;
-    }
 
     unsigned long done = 0;
     unsigned char *out = buf;
@@ -219,14 +180,14 @@ long __quark_file_read(long fd, void *buf, unsigned long n) {
             want = PAGE_SIZE;
         }
         unsigned long got = 0;
-        int e = quark_vfs_read(f->handle, xfer_phys, f->offset, want, &got);
+        /* The caller's own buffer, lent to the VFS to fill. */
+        int e = quark_vfs_read(f->handle, out + done, f->offset, want, &got);
         if (e) {
             return done ? (long)done : vfs_errno(e);
         }
         if (got == 0) {
             break; /* end of file */
         }
-        bytes_copy(out + done, (const void *)XFER_VADDR, got);
         done += got;
         f->offset += got;
         /* A short read means the end, not a hiccup: the server answers from a
@@ -246,10 +207,6 @@ long __quark_file_write(long fd, const void *buf, unsigned long n) {
     if (n == 0) {
         return 0;
     }
-    long err = xfer_page();
-    if (err) {
-        return err;
-    }
 
     unsigned long done = 0;
     const unsigned char *in = buf;
@@ -258,9 +215,8 @@ long __quark_file_write(long fd, const void *buf, unsigned long n) {
         if (want > PAGE_SIZE) {
             want = PAGE_SIZE;
         }
-        bytes_copy((void *)XFER_VADDR, in + done, want);
         unsigned long put = 0;
-        int e = quark_vfs_write(f->handle, xfer_phys, f->offset, want, &put);
+        int e = quark_vfs_write(f->handle, in + done, f->offset, want, &put);
         if (e) {
             return done ? (long)done : vfs_errno(e);
         }
@@ -430,7 +386,6 @@ long __quark_write(long fd, const void *buf, unsigned long n) {
 #define LX_F_GETFL          3
 #define LX_F_SETFL          4
 #define LX_F_DUPFD_CLOEXEC  1030
-
 
 /* Which descriptors a program has asked to be non-blocking. One bit per
    kernel descriptor; this layer's own file numbers are always blocking,

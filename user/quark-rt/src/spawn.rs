@@ -397,6 +397,10 @@ pub const MAX_IMAGE_PAGES: usize = 1024;
 /// one. That went unnoticed while programs were a few pages; a test suite of
 /// thirty half-megabyte binaries would not have survived it.
 ///
+/// The image is read into ordinary memory, a page per call, each page lent to
+/// the VFS to fill. It needs no capability to allocate frames, and nothing
+/// here ever knows where the image is in physical memory.
+///
 /// `image_at` is a free range of `MAX_IMAGE_PAGES` pages in the caller.
 /// `grant` sees the image before it is released, which is when a spawner reads
 /// the program's manifest; it is called only if loading succeeded.
@@ -410,33 +414,18 @@ pub fn load_path(
     let (handle, size, _) = crate::vfs::open(vfs_tid, path).map_err(|_| ())?;
     let size = size as usize;
     let pages = size.div_ceil(PAGE_SIZE);
-    if pages == 0 || pages > MAX_IMAGE_PAGES {
+    if pages == 0 || pages > MAX_IMAGE_PAGES || map_fresh(image_at, pages).is_err() {
         let _ = crate::vfs::close(vfs_tid, handle);
         return Err(());
     }
 
-    let mut frames = [0usize; MAX_IMAGE_PAGES];
-    let mut held = 0;
-    let mut ok = true;
-    for p in 0..pages {
-        let Ok(frame) = syscall::sys_phys_alloc(1) else {
-            ok = false;
-            break;
-        };
-        frames[p] = frame;
-        held = p + 1;
-        let want = PAGE_SIZE.min(size - p * PAGE_SIZE) as u32;
-        if syscall::sys_map_phys(frame, image_at + p * PAGE_SIZE, 1).is_err()
-            || crate::vfs::read(vfs_tid, handle, frame, (p * PAGE_SIZE) as u32, want).is_err()
-        {
-            ok = false;
-            break;
-        }
-    }
+    let image = unsafe { core::slice::from_raw_parts_mut(image_at as *mut u8, size) };
+    let read_whole = image.chunks_mut(PAGE_SIZE).enumerate().all(|(p, page)| {
+        crate::vfs::read(vfs_tid, handle, page, (p * PAGE_SIZE) as u32) == Ok(page.len() as u32)
+    });
     let _ = crate::vfs::close(vfs_tid, handle);
 
-    let result = if ok {
-        let image = unsafe { core::slice::from_raw_parts(image_at as *const u8, size) };
+    let result = if read_whole {
         let loaded = load(image, scratch);
         if let Ok(info) = loaded {
             grant(image, info.tid);
@@ -446,13 +435,8 @@ pub fn load_path(
         Err(())
     };
 
-    // The child has its own frames now; these were only ever a copy. Unmapped
-    // first — a frame mapped with sys_map_phys is not owned by the mapping, so
-    // unmapping leaves it allocated — and then handed back.
-    for p in 0..held {
-        let _ = syscall::sys_munmap(image_at + p * PAGE_SIZE, 1);
-        let _ = syscall::sys_phys_free(frames[p], 1);
-    }
+    // The child has pages of its own now; this was only ever a copy.
+    release(image_at, pages);
     result
 }
 

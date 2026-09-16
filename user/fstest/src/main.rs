@@ -9,14 +9,10 @@
 //! the least-tested half of the filesystem, which is the wrong half to leave
 //! untested when adding a second on-disk format.
 
-use quark_rt::manifest::CapReq;
 use quark_rt::{nameserver, println, syscall, vfs};
 
-// A page to hand the VFS for file data, and nothing else: the server owns the
-// disk and the buffers behind it.
-quark_rt::manifest!([CapReq::phys_alloc(4)]);
+// No manifest: file data travels in buffers lent to the VFS with each call.
 
-const BUF: usize = 0x88_0000_0000;
 const CONTENT: &[u8] = b"ext4 write path: extents, allocation and directory entries.\n";
 
 static mut PASSED: u32 = 0;
@@ -45,19 +41,6 @@ pub extern "C" fn _start() -> ! {
         }
     };
 
-    // A page the VFS reads from and writes into.
-    let phys = match syscall::sys_phys_alloc(1) {
-        Ok(p) => p,
-        Err(()) => {
-            println!("fstest: no memory");
-            syscall::sys_exit_code(1);
-        }
-    };
-    if syscall::sys_map_phys(phys, BUF, 1).is_err() {
-        println!("fstest: cannot map buffer");
-        syscall::sys_exit_code(1);
-    }
-
     // `fstest loop` writes files until it is killed, which is how the journal
     // gets tested: stop the machine at an arbitrary moment and see whether
     // what comes back up is consistent.
@@ -69,14 +52,7 @@ pub extern "C" fn _start() -> ! {
             path[16] = b'0' + (n % 10) as u8;
             match vfs::create(vfs_tid, &path, false) {
                 Ok((h, _, _)) => {
-                    unsafe {
-                        core::ptr::copy_nonoverlapping(
-                            CONTENT.as_ptr(),
-                            BUF as *mut u8,
-                            CONTENT.len(),
-                        );
-                    }
-                    let _ = vfs::write(vfs_tid, h, phys, 0, CONTENT.len() as u32);
+                    let _ = vfs::write(vfs_tid, h, CONTENT, 0);
                     let _ = vfs::close(vfs_tid, h);
                     println!("wrote {}", Str(&path));
                 }
@@ -115,10 +91,7 @@ pub extern "C" fn _start() -> ! {
     };
 
     // Write.
-    unsafe {
-        core::ptr::copy_nonoverlapping(CONTENT.as_ptr(), BUF as *mut u8, CONTENT.len());
-    }
-    let written = vfs::write(vfs_tid, handle, phys, 0, CONTENT.len() as u32);
+    let written = vfs::write(vfs_tid, handle, CONTENT, 0);
     check("write", written == Ok(CONTENT.len() as u32));
     if let Err(e) = written {
         println!("        error {}", e);
@@ -127,7 +100,7 @@ pub extern "C" fn _start() -> ! {
 
     // Read it back through a fresh open, so the bytes come off the disk rather
     // than out of whatever the write left in memory.
-    unsafe { core::ptr::write_bytes(BUF as *mut u8, 0, 4096) };
+    let mut buf = [0u8; 4096];
     match vfs::open(vfs_tid, path) {
         Ok((h, size, _)) => {
             check("reopen", true);
@@ -135,11 +108,9 @@ pub extern "C" fn _start() -> ! {
             if size != CONTENT.len() as u32 {
                 println!("        got {} want {}", size, CONTENT.len());
             }
-            match vfs::read(vfs_tid, h, phys, 0, CONTENT.len() as u32) {
+            match vfs::read(vfs_tid, h, &mut buf[..CONTENT.len()], 0) {
                 Ok(n) => {
-                    let got = unsafe {
-                        core::slice::from_raw_parts(BUF as *const u8, n as usize)
-                    };
+                    let got = &buf[..n as usize];
                     check("read length", n == CONTENT.len() as u32);
                     check("read content", got == CONTENT);
                     if got != CONTENT {

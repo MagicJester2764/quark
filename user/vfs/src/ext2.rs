@@ -14,7 +14,6 @@ use crate::{
     ERR_NOT_FOUND, PAGE_SIZE, SECTOR_CACHE,
 };
 use quark_rt::println;
-use quark_rt::syscall;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -892,11 +891,10 @@ fn read_block_ptr(ext2: &Ext2State, block: u32, index: u32) -> Result<u32, u64> 
 // File data read
 // ---------------------------------------------------------------------------
 
-/// Read file data into a client's physical page.
+/// Read file data (at most a page) into `CLIENT_BUF`.
 pub fn read_file_data(
     ext2: &Ext2State,
     inode: &Ext2Inode,
-    client_phys: usize,
     offset: u32,
     max_bytes: u32,
 ) -> Result<u32, u64> {
@@ -911,11 +909,6 @@ pub fn read_file_data(
     let to_read = max_bytes.min(available).min(PAGE_SIZE as u32);
     if to_read == 0 {
         return Ok(0);
-    }
-
-    // Map client's physical page
-    if syscall::sys_map_phys(client_phys, CLIENT_BUF, 1).is_err() {
-        return Err(ERR_IO);
     }
 
     let bs = ext2.block_size;
@@ -978,13 +971,12 @@ pub fn read_file_data(
 // File data write
 // ---------------------------------------------------------------------------
 
-/// Write data from client's physical page into a file.
+/// Write data (at most a page) from `CLIENT_BUF` into a file.
 /// May extend the file if offset + len > current size.
 pub fn write_file_data(
     ext2: &mut Ext2State,
     inode: &mut Ext2Inode,
     inode_num: u32,
-    client_phys: usize,
     offset: u32,
     len: u32,
 ) -> Result<u32, u64> {
@@ -995,11 +987,6 @@ pub fn write_file_data(
     let to_write = len.min(PAGE_SIZE as u32);
     if to_write == 0 {
         return Ok(0);
-    }
-
-    // Map client's physical page
-    if syscall::sys_map_phys(client_phys, CLIENT_BUF, 1).is_err() {
-        return Err(ERR_IO);
     }
 
     let bs = ext2.block_size;

@@ -4,12 +4,9 @@
 use quark_rt::nameserver;
 use quark_rt::{args, print, println, syscall, vfs};
 
-use quark_rt::manifest::CapReq;
-
-quark_rt::manifest!([CapReq::phys_alloc(64)]);
+// No manifest: reading a file takes nothing but a buffer to lend the VFS.
 
 const PAGE_SIZE: usize = 4096;
-const BUF_VADDR: usize = 0x90_0000_0000;
 
 #[unsafe(no_mangle)]
 #[link_section = ".text.entry"]
@@ -49,18 +46,7 @@ pub extern "C" fn _start() -> ! {
         }
     };
 
-    // Allocate a physical page for VFS reads
-    let phys = match syscall::sys_phys_alloc(1) {
-        Ok(addr) => addr,
-        Err(()) => {
-            println!("cat: failed to allocate buffer");
-            syscall::sys_exit_code(1);
-        }
-    };
-    if syscall::sys_map_phys(phys, BUF_VADDR, 1).is_err() {
-        println!("cat: failed to map buffer");
-        syscall::sys_exit_code(1);
-    }
+    let mut page = [0u8; PAGE_SIZE];
 
     for i in 1..argc {
         let path = match args::argv(i) {
@@ -92,14 +78,12 @@ pub extern "C" fn _start() -> ! {
         let mut offset = 0u32;
         while offset < size {
             let to_read = PAGE_SIZE.min((size - offset) as usize) as u32;
-            match vfs::read(vfs_tid, handle, phys, offset, to_read) {
+            match vfs::read(vfs_tid, handle, &mut page[..to_read as usize], offset) {
                 Ok(bytes_read) => {
                     if bytes_read == 0 {
                         break;
                     }
-                    let data = unsafe {
-                        core::slice::from_raw_parts(BUF_VADDR as *const u8, bytes_read as usize)
-                    };
+                    let data = &page[..bytes_read as usize];
                     // Print as text
                     if let Ok(s) = core::str::from_utf8(data) {
                         print!("{}", s);

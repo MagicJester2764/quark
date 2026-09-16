@@ -4,14 +4,7 @@
 use quark_rt::nameserver;
 use quark_rt::{println, syscall, vfs};
 
-use quark_rt::manifest::CapReq;
-
-quark_rt::manifest!([CapReq::phys_alloc(64)]);
-
 const PAGE_SIZE: usize = 4096;
-
-// Address where we map our shared buffer page
-const BUF_VADDR: usize = 0x87_0000_0000;
 
 #[unsafe(no_mangle)]
 #[link_section = ".text.entry"]
@@ -35,18 +28,7 @@ pub extern "C" fn _start() -> ! {
         }
     };
 
-    // Allocate a physical page for VFS reads
-    let phys = match syscall::sys_phys_alloc(1) {
-        Ok(addr) => addr,
-        Err(()) => {
-            println!("[disktest] Failed to allocate physical page!");
-            syscall::sys_exit();
-        }
-    };
-    if syscall::sys_map_phys(phys, BUF_VADDR, 1).is_err() {
-        println!("[disktest] Failed to map buffer page!");
-        syscall::sys_exit();
-    }
+    let mut page = [0u8; PAGE_SIZE];
 
     // List root directory
     println!("[disktest] Listing /:");
@@ -82,13 +64,11 @@ pub extern "C" fn _start() -> ! {
             println!("[disktest] Opened (size={}).", size);
 
             // Read first page
-            match vfs::read(vfs_tid, handle, phys, 0, PAGE_SIZE as u32) {
+            match vfs::read(vfs_tid, handle, &mut page, 0) {
                 Ok(bytes_read) => {
                     println!("[disktest] Read {} bytes.", bytes_read);
                     let dump_len = 64.min(bytes_read as usize);
-                    let data = unsafe {
-                        core::slice::from_raw_parts(BUF_VADDR as *const u8, dump_len)
-                    };
+                    let data = &page[..dump_len];
                     for row in 0..(dump_len / 16) {
                         let off = row * 16;
                         let mut line = [0u8; 80];

@@ -90,14 +90,25 @@ size_t quark_vfs(void) {
 /* The VFS, as a client.                                                     */
 /* ------------------------------------------------------------------------ */
 
+int quark_call_lend(size_t dest, const struct quark_msg *msg, struct quark_msg *reply,
+                    void *buf, unsigned long len, unsigned long access) {
+    unsigned long r = __syscall5(SYS_CALL_LEND, (unsigned long)dest, (unsigned long)msg,
+                                 (unsigned long)reply, (unsigned long)buf, len | access);
+    return r == QUARK_ERR ? -1 : 0;
+}
+
 /* Ask the VFS one question and get its answer, translating "the call did not
-   happen" and "the server said no" into the same small integers. */
-static int vfs_call(struct quark_msg *msg, struct quark_msg *reply) {
+   happen" and "the server said no" into the same small integers. `buf`, if
+   there is one, is lent to the VFS for the call with `access`. */
+static int vfs_call_lend(struct quark_msg *msg, struct quark_msg *reply,
+                         void *buf, unsigned long len, unsigned long access) {
     size_t vfs = quark_vfs();
     if (vfs == 0) {
         return QUARK_VFS_UNREACHABLE;
     }
-    if (quark_call(vfs, msg, reply) != 0) {
+    int r = buf ? quark_call_lend(vfs, msg, reply, buf, len, access)
+                : quark_call(vfs, msg, reply);
+    if (r != 0) {
         return QUARK_VFS_UNREACHABLE;
     }
     if (reply->tag == QUARK_ERR) {
@@ -107,6 +118,10 @@ static int vfs_call(struct quark_msg *msg, struct quark_msg *reply) {
         return code ? (int)code : QUARK_VFS_IO;
     }
     return 0;
+}
+
+static int vfs_call(struct quark_msg *msg, struct quark_msg *reply) {
+    return vfs_call_lend(msg, reply, 0, 0, 0);
 }
 
 int quark_vfs_open(const char *path, int create, struct quark_vfs_file *out) {
@@ -163,19 +178,27 @@ int quark_vfs_stat(unsigned long handle, struct quark_vfs_file *out) {
     return 0;
 }
 
-int quark_vfs_read(unsigned long handle, unsigned long phys, unsigned long offset,
+int quark_vfs_read(unsigned long handle, void *buf, unsigned long offset,
                    unsigned long len, unsigned long *got) {
     struct quark_msg msg;
     struct quark_msg reply;
 
+    if (len > QUARK_VFS_MAX_IO) {
+        len = QUARK_VFS_MAX_IO;
+    }
+    if (len == 0) {
+        if (got) {
+            *got = 0;
+        }
+        return 0;
+    }
     zero(&msg, sizeof msg);
     msg.tag = QUARK_VFS_TAG_READ;
     msg.data[0] = handle;
-    msg.data[1] = phys;
     msg.data[2] = offset;
     msg.data[3] = len;
 
-    int err = vfs_call(&msg, &reply);
+    int err = vfs_call_lend(&msg, &reply, buf, len, QUARK_LEND_WRITE);
     if (err) {
         return err;
     }
@@ -185,19 +208,28 @@ int quark_vfs_read(unsigned long handle, unsigned long phys, unsigned long offse
     return 0;
 }
 
-int quark_vfs_write(unsigned long handle, unsigned long phys, unsigned long offset,
+int quark_vfs_write(unsigned long handle, const void *buf, unsigned long offset,
                     unsigned long len, unsigned long *put) {
     struct quark_msg msg;
     struct quark_msg reply;
 
+    if (len > QUARK_VFS_MAX_IO) {
+        len = QUARK_VFS_MAX_IO;
+    }
+    if (len == 0) {
+        if (put) {
+            *put = 0;
+        }
+        return 0;
+    }
     zero(&msg, sizeof msg);
     msg.tag = QUARK_VFS_TAG_WRITE;
     msg.data[0] = handle;
-    msg.data[1] = phys;
     msg.data[2] = offset;
     msg.data[3] = len;
 
-    int err = vfs_call(&msg, &reply);
+    /* Lent for reading only; the cast drops a const the kernel keeps. */
+    int err = vfs_call_lend(&msg, &reply, (void *)buf, len, QUARK_LEND_READ);
     if (err) {
         return err;
     }
