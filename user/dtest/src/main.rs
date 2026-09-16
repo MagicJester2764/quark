@@ -591,23 +591,14 @@ fn load_child() -> Option<spawn::Spawned> {
     let vfs_tid = nameserver::lookup_retry(b"vfs", 20)?;
     // Lowercase for ext2, uppercase with .ELF for FAT32 — the two spellings
     // the shell already tries.
-    let (handle, size, _) = match vfs::open(vfs_tid, b"/usr/bin/dchild") {
-        Ok(h) => h,
-        Err(_) => vfs::open(vfs_tid, b"/usr/bin/DCHILD.ELF").ok()?,
+    let grant = |image: &[u8], tid: usize| {
+        quark_rt::manifest::grant_image(tid, image, 12);
     };
-    let size = size as usize;
-    let pages = (size + 4095) / 4096;
-    for p in 0..pages {
-        let frame = syscall::sys_phys_alloc(1).ok()?;
-        syscall::sys_map_phys(frame, CHILD_IMAGE + p * 4096, 1).ok()?;
-        let want = 4096.min(size - p * 4096) as u32;
-        vfs::read(vfs_tid, handle, frame, (p * 4096) as u32, want).ok()?;
-    }
-    let _ = vfs::close(vfs_tid, handle);
-
-    let image = unsafe { core::slice::from_raw_parts(CHILD_IMAGE as *const u8, size) };
-    let info = spawn::load(image, &SPAWN_SCRATCH).ok()?;
-    quark_rt::manifest::grant_image(info.tid, image, 12);
+    let info = spawn::load_path(vfs_tid, b"/usr/bin/dchild", CHILD_IMAGE, &SPAWN_SCRATCH, grant)
+        .or_else(|()| {
+            spawn::load_path(vfs_tid, b"/usr/bin/DCHILD.ELF", CHILD_IMAGE, &SPAWN_SCRATCH, grant)
+        })
+        .ok()?;
     // It needs to be able to reach the nameserver, and somewhere to print.
     let _ = syscall::sys_cap_grant(info.tid, syscall::SLOT_ENDPOINT, syscall::SLOT_ENDPOINT);
     let _ = syscall::sys_fd_dup(info.tid, 1, 1);
@@ -626,6 +617,14 @@ fn test_across_address_spaces() {
         return;
     };
     check("load /usr/bin/dchild", true);
+    // The pages the program was read into are a copy the child no longer
+    // needs. sys_mmap refuses to map over a page that is still mapped, which
+    // makes "was it given back" something a test can ask.
+    check(
+        "loading a program gives its staging memory back",
+        syscall::sys_mmap(CHILD_IMAGE, 1).is_ok(),
+    );
+    let _ = syscall::sys_munmap(CHILD_IMAGE, 1);
 
     // Hand the child its end, then drop ours. If an end were a flag rather
     // than a count, this would tell the child's peer the end had gone.

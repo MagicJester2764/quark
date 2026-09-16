@@ -262,6 +262,76 @@ pub fn load(elf: &[u8], scratch: &Scratch) -> Result<Spawned, ()> {
     Ok(Spawned { tid, entry, stack_top: STACK_TOP as u64, cr3, phdrs, phnum: kept })
 }
 
+/// The largest program [`load_path`] will read: four megabytes.
+pub const MAX_IMAGE_PAGES: usize = 1024;
+
+/// Read a program from the filesystem, load it, and give back the memory it
+/// was read into.
+///
+/// Every spawner used to stage a program at one fixed address and never free
+/// the frames: the shell leaked a program's size in memory every time it ran
+/// one. That went unnoticed while programs were a few pages; a test suite of
+/// thirty half-megabyte binaries would not have survived it.
+///
+/// `image_at` is a free range of `MAX_IMAGE_PAGES` pages in the caller.
+/// `grant` sees the image before it is released, which is when a spawner reads
+/// the program's manifest; it is called only if loading succeeded.
+pub fn load_path(
+    vfs_tid: usize,
+    path: &[u8],
+    image_at: usize,
+    scratch: &Scratch,
+    grant: impl FnOnce(&[u8], usize),
+) -> Result<Spawned, ()> {
+    let (handle, size, _) = crate::vfs::open(vfs_tid, path).map_err(|_| ())?;
+    let size = size as usize;
+    let pages = size.div_ceil(PAGE_SIZE);
+    if pages == 0 || pages > MAX_IMAGE_PAGES {
+        let _ = crate::vfs::close(vfs_tid, handle);
+        return Err(());
+    }
+
+    let mut frames = [0usize; MAX_IMAGE_PAGES];
+    let mut held = 0;
+    let mut ok = true;
+    for p in 0..pages {
+        let Ok(frame) = syscall::sys_phys_alloc(1) else {
+            ok = false;
+            break;
+        };
+        frames[p] = frame;
+        held = p + 1;
+        let want = PAGE_SIZE.min(size - p * PAGE_SIZE) as u32;
+        if syscall::sys_map_phys(frame, image_at + p * PAGE_SIZE, 1).is_err()
+            || crate::vfs::read(vfs_tid, handle, frame, (p * PAGE_SIZE) as u32, want).is_err()
+        {
+            ok = false;
+            break;
+        }
+    }
+    let _ = crate::vfs::close(vfs_tid, handle);
+
+    let result = if ok {
+        let image = unsafe { core::slice::from_raw_parts(image_at as *const u8, size) };
+        let loaded = load(image, scratch);
+        if let Ok(info) = loaded {
+            grant(image, info.tid);
+        }
+        loaded
+    } else {
+        Err(())
+    };
+
+    // The child has its own frames now; these were only ever a copy. Unmapped
+    // first — a frame mapped with sys_map_phys is not owned by the mapping, so
+    // unmapping leaves it allocated — and then handed back.
+    for p in 0..held {
+        let _ = syscall::sys_munmap(image_at + p * PAGE_SIZE, 1);
+        let _ = syscall::sys_phys_free(frames[p], 1);
+    }
+    result
+}
+
 /// Write `args` and `env` into the child's argument page, read back by
 /// `quark_rt::args`.
 ///

@@ -19,7 +19,6 @@ quark_rt::manifest!([
     CapReq::ioport(0xB004, 0xB004),
 ]);
 
-const PAGE_SIZE: usize = 4096;
 const TAG_SET_FOREGROUND: u64 = 2;
 
 // Shell temp address ranges (non-overlapping with init's 0x82-0x88)
@@ -142,6 +141,51 @@ fn set_foreground(input_tid: usize, child_tid: usize) {
 /// Separated from running so a pipeline can create every stage, wire the pipes
 /// between them, and only then start them — a stage started before its reader
 /// exists would write into a pipe with no reader.
+/// Find which spelling of a command exists: the path as given, then — for a
+/// bare name — the uppercase `.ELF` a FAT32 root uses, or — for a path — the
+/// same path with `.ELF` added. Returns the length written to `out`.
+fn resolve_program(cmd: &[u8], vfs_tid: usize, out: &mut [u8; 64]) -> Option<usize> {
+    let exists = |p: &[u8]| match vfs::open(vfs_tid, p) {
+        Ok((h, _, _)) => {
+            let _ = vfs::close(vfs_tid, h);
+            true
+        }
+        Err(_) => false,
+    };
+
+    let pos = build_path(cmd, out);
+    if exists(&out[..pos]) {
+        return Some(pos);
+    }
+
+    let has_slash = cmd.iter().any(|&b| b == b'/');
+    if !has_slash {
+        // Tried lowercase (ext2); now uppercase with .ELF (FAT32).
+        let prefix = b"/usr/bin/";
+        let suffix = b".ELF";
+        let cmd_len = cmd.len().min(64 - prefix.len() - suffix.len());
+        let mut fat = [0u8; 64];
+        fat[..prefix.len()].copy_from_slice(prefix);
+        let mut p = prefix.len();
+        for &c in &cmd[..cmd_len] {
+            fat[p] = c.to_ascii_uppercase();
+            p += 1;
+        }
+        fat[p..p + suffix.len()].copy_from_slice(suffix);
+        p += suffix.len();
+        if exists(&fat[..p]) {
+            *out = fat;
+            return Some(p);
+        }
+    } else if !ends_with_elf(&out[..pos]) && pos + 4 <= 64 {
+        out[pos..pos + 4].copy_from_slice(b".ELF");
+        if exists(&out[..pos + 4]) {
+            return Some(pos + 4);
+        }
+    }
+    None
+}
+
 fn cmd_spawn(
     cmd: &[u8],
     args_str: &[u8],
@@ -150,92 +194,21 @@ fn cmd_spawn(
     inherit_stdout: bool,
 ) -> Option<Spawned> {
     let mut path = [0u8; 64];
-    let pos = build_path(cmd, &mut path);
-    let has_slash = cmd.iter().any(|&b| b == b'/');
-
-    // Open ELF file via VFS — try exact path first, then fallbacks
-    let (file_handle, file_size, _) = match vfs::open(vfs_tid, &path[..pos]) {
-        Ok(h) => h,
-        Err(_) => {
-            if !has_slash {
-                // Bare command: tried lowercase (ext2), now try uppercase .ELF (FAT32)
-                let mut fat_path = [0u8; 64];
-                let prefix = b"/usr/bin/";
-                let suffix = b".ELF";
-                let cmd_len = cmd.len().min(64 - prefix.len() - suffix.len());
-                fat_path[..prefix.len()].copy_from_slice(prefix);
-                let mut p = prefix.len();
-                for i in 0..cmd_len {
-                    fat_path[p] = if cmd[i] >= b'a' && cmd[i] <= b'z' {
-                        cmd[i] - 32
-                    } else {
-                        cmd[i]
-                    };
-                    p += 1;
-                }
-                fat_path[p..p + suffix.len()].copy_from_slice(suffix);
-                p += suffix.len();
-                match vfs::open(vfs_tid, &fat_path[..p]) {
-                    Ok(h) => h,
-                    Err(_) => {
-                        if let Ok(s) = core::str::from_utf8(cmd) {
-                            println!("{}: not found", s);
-                        }
-                        return None;
-                    }
-                }
-            } else if !ends_with_elf(&path[..pos]) && pos + 4 <= 64 {
-                // Slash path without .ELF: retry with .ELF appended
-                let suffix = b".ELF";
-                path[pos..pos + 4].copy_from_slice(suffix);
-                match vfs::open(vfs_tid, &path[..pos + 4]) {
-                    Ok(h) => h,
-                    Err(_) => {
-                        if let Ok(s) = core::str::from_utf8(cmd) {
-                            println!("{}: not found", s);
-                        }
-                        return None;
-                    }
-                }
-            } else {
-                if let Ok(s) = core::str::from_utf8(cmd) {
-                    println!("{}: not found", s);
-                }
-                return None;
-            }
+    let Some(len) = resolve_program(cmd, vfs_tid, &mut path) else {
+        if let Ok(s) = core::str::from_utf8(cmd) {
+            println!("{}: not found", s);
         }
+        return None;
     };
 
-    let size = file_size as usize;
-    let pages_needed = (size + PAGE_SIZE - 1) / PAGE_SIZE;
-
-    // Allocate pages and read file content into FILE_BUF_BASE
-    let mut success = true;
-    for p in 0..pages_needed {
-        let frame = match syscall::sys_phys_alloc(1) {
-            Ok(f) => f,
-            Err(()) => { success = false; break; }
-        };
-        if syscall::sys_map_phys(frame, FILE_BUF_BASE + p * PAGE_SIZE, 1).is_err() {
-            success = false; break;
-        }
-        let offset = (p * PAGE_SIZE) as u32;
-        let to_read = PAGE_SIZE.min(size - p * PAGE_SIZE) as u32;
-        if vfs::read(vfs_tid, file_handle, frame, offset, to_read).is_err() {
-            success = false; break;
-        }
-    }
-    let _ = vfs::close(vfs_tid, file_handle);
-
-    if !success {
-        println!("shell: failed to read ELF");
-        return None;
-    }
-
-    let elf_data = unsafe { core::slice::from_raw_parts(FILE_BUF_BASE as *const u8, size) };
-
-    // Load ELF
-    let info = match spawn::load(elf_data, &SPAWN_SCRATCH) {
+    // Read, load, grant from the manifest, and give the staging memory back.
+    let info = match spawn::load_path(
+        vfs_tid,
+        &path[..len],
+        FILE_BUF_BASE,
+        &SPAWN_SCRATCH,
+        grant_caps_from_manifest,
+    ) {
         Ok(i) => i,
         Err(()) => {
             println!("shell: failed to load ELF");
@@ -244,9 +217,6 @@ fn cmd_spawn(
     };
 
     let tid = info.tid;
-
-    // Grant capabilities based on command basename (strip path and .ELF extension)
-    grant_caps_from_manifest(elf_data, tid);
 
     // Wire file descriptors — duplicate the shell's own fds to the child.
     //
@@ -314,21 +284,36 @@ fn split_cmd(stage: &[u8]) -> (&[u8], &[u8]) {
     }
 }
 
+/// The status of a command the shell could not run at all — not found, or not
+/// loadable, or not startable. POSIX's "command not found" number.
+///
+/// Not -1, which is what this was: a negative status now means a task the
+/// kernel killed, and the shell reporting its own failure to launch as one
+/// printed "killed (1)" underneath "not found". The reason has always already
+/// been printed by the time this is returned, so nothing prints it again.
+const NOT_RUN: i32 = 127;
+
 /// Run one command to completion. Returns its exit status.
 fn cmd_exec(cmd: &[u8], args_str: &[u8], vfs_tid: usize, input_tid: usize) -> i32 {
     let info = match cmd_spawn(cmd, args_str, vfs_tid, true, true) {
         Some(i) => i,
-        None => return -1,
+        None => return NOT_RUN,
     };
     if info.start().is_err() {
         println!("shell: failed to start task");
-        return -1;
+        return NOT_RUN;
     }
 
     if input_tid != 0 {
         set_foreground(input_tid, info.tid);
     }
-    let status = syscall::sys_wait().map(|(_, code)| code).unwrap_or(-1);
+    let status = match syscall::sys_wait() {
+        Ok((_, code)) => code,
+        Err(()) => {
+            println!("shell: lost track of the task it started");
+            NOT_RUN
+        }
+    };
     if input_tid != 0 {
         set_foreground(input_tid, 0);
     }
@@ -348,7 +333,7 @@ fn cmd_pipeline(stages: &[&[u8]], vfs_tid: usize, input_tid: usize) -> i32 {
     let n = stages.len();
     if n > MAX_STAGES {
         println!("shell: pipeline too long (max {} stages)", MAX_STAGES);
-        return -1;
+        return NOT_RUN;
     }
 
     let mut pipes = [0usize; MAX_STAGES - 1];
@@ -358,7 +343,7 @@ fn cmd_pipeline(stages: &[&[u8]], vfs_tid: usize, input_tid: usize) -> i32 {
             Ok(h) => { pipes[i] = h; npipes += 1; }
             Err(()) => {
                 println!("shell: out of pipes");
-                return -1;
+                return NOT_RUN;
             }
         }
     }
@@ -406,7 +391,7 @@ fn cmd_pipeline(stages: &[&[u8]], vfs_tid: usize, input_tid: usize) -> i32 {
         for i in 0..spawned {
             let _ = syscall::sys_task_kill(infos[i].tid);
         }
-        return -1;
+        return NOT_RUN;
     }
 
     for i in 0..n {
@@ -415,7 +400,7 @@ fn cmd_pipeline(stages: &[&[u8]], vfs_tid: usize, input_tid: usize) -> i32 {
             for j in 0..n {
                 let _ = syscall::sys_task_kill(infos[j].tid);
             }
-            return -1;
+            return NOT_RUN;
         }
     }
 
@@ -425,7 +410,7 @@ fn cmd_pipeline(stages: &[&[u8]], vfs_tid: usize, input_tid: usize) -> i32 {
     }
 
     // Reap every stage; the pipeline's status is the last stage's.
-    let mut status = -1;
+    let mut status = NOT_RUN;
     for _ in 0..n {
         match syscall::sys_wait() {
             Ok((tid, code)) => {
@@ -458,7 +443,7 @@ static mut LAST_STATUS: i32 = 0;
 /// last one either way.
 fn set_status(name: &[u8], code: i32) {
     unsafe { LAST_STATUS = code; }
-    if code == 0 {
+    if code == 0 || code == NOT_RUN {
         return;
     }
     let Ok(s) = core::str::from_utf8(name) else { return };
