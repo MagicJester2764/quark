@@ -7,13 +7,11 @@
 //! connection, and hands back a descriptor that reads and writes through the
 //! ordinary fd calls — the same ones a console or a pipe uses.
 
-use quark_rt::manifest::CapReq;
 use quark_rt::socket::TcpStream;
 use quark_rt::{args, println, syscall};
 
-// Talking to the net server is all this needs; the descriptor comes from the
-// kernel, and the pages the connection uses belong to the server.
-quark_rt::manifest!([CapReq::phys_alloc(4)]);
+// No manifest: the descriptor comes from the kernel, and the pages the
+// connection uses belong to the server.
 
 #[unsafe(no_mangle)]
 #[link_section = ".text.entry"]

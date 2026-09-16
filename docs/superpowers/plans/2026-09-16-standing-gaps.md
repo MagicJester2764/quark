@@ -513,19 +513,19 @@ dtest's broad-range check names init and net only.
 **Interfaces:**
 - Produces (quark-rt): `udp_send(net_tid, ip, port, src_port, data: &[u8])`, `udp_recv(net_tid, port, buf: &mut [u8]) -> Result<(usize, [u8; 4], u16), u64>`, `tcp_send(net_tid, handle, data: &[u8]) -> Result<usize, u64>`, `tcp_recv(net_tid, handle, buf: &mut [u8]) -> Result<usize, u64>` — each lending instead of passing a frame.
 
-- [ ] **Step 1: The test harness** — `echo-server.py` echoes on UDP and TCP port
+- [x] **Step 1: The test harness** — `echo-server.py` echoes on UDP and TCP port
 7007 of 127.0.0.1, which QEMU's user network presents to the guest as
 10.0.2.2. `boot-test.sh` adds `-device rtl8139,netdev=n -netdev user,id=n` and
 starts the echo server for the run, killing it by pid on exit.
 
-- [ ] **Step 2: The failing test** — `nettest`: UDP-send `"quark-udp"` to
+- [x] **Step 2: The failing test** — `nettest`: UDP-send `"quark-udp"` to
 10.0.2.2:7007 and `udp_recv` the echo; `tcp_connect` there, `tcp_send`
 `"quark-tcp"`, `tcp_recv` the echo, close. One `ok`/`FAIL` line each, exit 0
 only if all pass, manifest empty. Run it with today's net: it passes, because
 the old page protocol works — so first change `net.rs` to lend (Step 4) and
 watch it fail against the old server.
 
-- [ ] **Step 3: The server** — `CLIENT_BUF` becomes a page of NET's own.
+- [x] **Step 3: The server** — `CLIENT_BUF` becomes a page of NET's own.
 `TAG_UDP_SEND` and `TAG_TCP_SEND` `sys_lent_read` what they send; immediate
 `TAG_TCP_RECV` replies `sys_lent_write` what they deliver; the deferred ones
 keep only `pending_tid` and the length, and copy with `sys_lent_write` when the
@@ -533,14 +533,14 @@ data arrives — the client is still blocked in the call, so its buffer is still
 lent. `pending_phys` and `UdpReader::phys_addr` go. Manifest: drop
 `phys_range`; `phys_alloc` stays for the card's own DMA buffers.
 
-- [ ] **Step 4: quark-rt `net.rs`** — the four calls lend.
+- [x] **Step 4: quark-rt `net.rs`** — the four calls lend.
 
-- [ ] **Step 5: Verify** — boot with the NIC, `nettest`, `socktest 10.0.2.2
+- [x] **Step 5: Verify** — boot with the NIC, `nettest`, `socktest 10.0.2.2
 7007` (the fd path; the echo server echoes its request), `dtest`. Expected:
 both network tests pass; dtest's broad-range check names only init.
 `socktest` drops `phys_alloc`.
 
-- [ ] **Step 6: Commit** — quark "NET copies what it was lent"; explosion
+- [x] **Step 6: Commit** — quark "NET copies what it was lent"; explosion
 "Boot tests have a network card and something to talk to".
 
 ---

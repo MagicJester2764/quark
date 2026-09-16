@@ -17,50 +17,55 @@ const TAG_TCP_RECV: u64 = 14;
 const TAG_TCP_CLOSE: u64 = 15;
 const TAG_ERROR: u64 = u64::MAX;
 
-/// Send a UDP datagram. `phys_addr` must point to a page with the payload.
-/// `dst_ip` is packed big-endian (e.g., 10.0.2.2 = 0x0A000202).
+/// The most a datagram carries.
+pub const MAX_DATAGRAM: usize = 1472;
+/// The most one [`tcp_send`] or [`tcp_recv`] carries.
+pub const MAX_SEGMENT_IO: usize = 4096;
+
+/// Send `payload` (at most [`MAX_DATAGRAM`] bytes) as a UDP datagram, lending
+/// it to the server for the call. `dst_ip` is packed big-endian (e.g., 10.0.2.2
+/// = 0x0A000202).
 pub fn udp_send(
     net_tid: usize,
-    phys_addr: usize,
-    len: usize,
+    payload: &[u8],
     dst_ip: u32,
     dst_port: u16,
     src_port: u16,
 ) -> Result<(), u64> {
+    let payload = &payload[..payload.len().min(MAX_DATAGRAM)];
     let msg = Message {
         sender: 0,
         tag: TAG_UDP_SEND,
         data: [
-            phys_addr as u64,
-            len as u64,
+            0,
+            payload.len() as u64,
             dst_ip as u64,
             ((dst_port as u64) << 16) | (src_port as u64),
             0, 0,
         ],
     };
     let mut reply = Message::empty();
-    if syscall::sys_call(net_tid, &msg, &mut reply).is_err() {
+    if syscall::sys_call_lend(net_tid, &msg, &mut reply, payload).is_err() {
         return Err(1);
     }
     if reply.tag == TAG_ERROR { Err(reply.data[0]) } else { Ok(()) }
 }
 
-/// Receive a UDP datagram. Blocks until data arrives on `listen_port` (0 = any).
-/// `phys_addr` must point to a page for the received payload.
+/// Receive a UDP datagram into `buf`, which the server is lent until one
+/// arrives on `listen_port` (0 = any). Blocks until then.
 /// Returns (bytes_read, src_ip, src_port, dst_port).
 pub fn udp_recv(
     net_tid: usize,
-    phys_addr: usize,
-    max_len: usize,
+    buf: &mut [u8],
     listen_port: u16,
 ) -> Result<(usize, u32, u16, u16), u64> {
     let msg = Message {
         sender: 0,
         tag: TAG_UDP_RECV,
-        data: [phys_addr as u64, max_len as u64, listen_port as u64, 0, 0, 0],
+        data: [0, buf.len() as u64, listen_port as u64, 0, 0, 0],
     };
     let mut reply = Message::empty();
-    if syscall::sys_call(net_tid, &msg, &mut reply).is_err() {
+    if syscall::sys_call_lend_mut(net_tid, &msg, &mut reply, buf).is_err() {
         return Err(1);
     }
     if reply.tag == TAG_ERROR {
@@ -210,41 +215,34 @@ pub fn tcp_listen(
     Ok((reply.data[0] as usize, reply.data[1] as u32, reply.data[2] as u16))
 }
 
-/// Send data over a TCP connection. `phys_addr` points to a page with the payload.
-/// Returns the number of bytes actually queued.
-pub fn tcp_send(
-    net_tid: usize,
-    handle: usize,
-    phys_addr: usize,
-    len: usize,
-) -> Result<usize, u64> {
+/// Send up to [`MAX_SEGMENT_IO`] bytes of `data` over a TCP connection,
+/// lending them to the server for the call. Returns how many were queued.
+pub fn tcp_send(net_tid: usize, handle: usize, data: &[u8]) -> Result<usize, u64> {
+    let data = &data[..data.len().min(MAX_SEGMENT_IO)];
     let msg = Message {
         sender: 0,
         tag: TAG_TCP_SEND,
-        data: [handle as u64, phys_addr as u64, len as u64, 0, 0, 0],
+        data: [handle as u64, 0, data.len() as u64, 0, 0, 0],
     };
     let mut reply = Message::empty();
-    if syscall::sys_call(net_tid, &msg, &mut reply).is_err() {
+    if syscall::sys_call_lend(net_tid, &msg, &mut reply, data).is_err() {
         return Err(1);
     }
     if reply.tag == TAG_ERROR { Err(reply.data[0]) } else { Ok(reply.data[0] as usize) }
 }
 
-/// Receive data from a TCP connection. Blocks until data is available.
-/// `phys_addr` points to a page for the received data. Returns bytes read (0 = EOF).
-pub fn tcp_recv(
-    net_tid: usize,
-    handle: usize,
-    phys_addr: usize,
-    max_len: usize,
-) -> Result<usize, u64> {
+/// Receive into `buf` (at most [`MAX_SEGMENT_IO`] bytes of it) from a TCP
+/// connection, lending it to the server until data arrives. Blocks until then.
+/// Returns bytes read (0 = the other end closed).
+pub fn tcp_recv(net_tid: usize, handle: usize, buf: &mut [u8]) -> Result<usize, u64> {
+    let len = buf.len().min(MAX_SEGMENT_IO);
     let msg = Message {
         sender: 0,
         tag: TAG_TCP_RECV,
-        data: [handle as u64, phys_addr as u64, max_len as u64, 0, 0, 0],
+        data: [handle as u64, 0, len as u64, 0, 0, 0],
     };
     let mut reply = Message::empty();
-    if syscall::sys_call(net_tid, &msg, &mut reply).is_err() {
+    if syscall::sys_call_lend_mut(net_tid, &msg, &mut reply, &mut buf[..len]).is_err() {
         return Err(1);
     }
     if reply.tag == TAG_ERROR { Err(reply.data[0]) } else { Ok(reply.data[0] as usize) }

@@ -9,13 +9,15 @@ use quark_rt::{println, syscall};
 use quark_rt::manifest::CapReq;
 
 // The RTL8139's I/O window is assigned by PCI, so the port range cannot be
-// narrowed here; likewise its interrupt line.
+// narrowed here; likewise its interrupt line. Frames for the card's own
+// receive and transmit buffers, which it reaches by DMA — but no physical
+// range: a client lends its data with the call rather than naming a page for
+// this driver to map, which it once could do anywhere in memory.
 quark_rt::manifest!([
     CapReq::priority(quark_rt::syscall::PRIO_DRIVER),
     CapReq::ioport(0, 0xFFFF),
     CapReq::irq(0xFF),
     CapReq::phys_alloc(64),
-    CapReq::phys_range(0, 0x1_0000_0000),
 ]);
 
 // ---------------------------------------------------------------------------
@@ -152,7 +154,6 @@ const MAX_PKT: usize = 1536;
 
 const RX_BUF_VADDR: usize = 0x89_0000_0000;
 const TX_BUF_VADDR: usize = 0x89_0010_0000;
-const CLIENT_BUF: usize = 0x8A_0000_0000;
 
 // ---------------------------------------------------------------------------
 // Protocol constants
@@ -225,9 +226,9 @@ struct ArpEntry {
     valid: bool,
 }
 
+/// A task waiting for a datagram, with the buffer it lent for one.
 struct UdpReader {
     tid: usize,
-    phys_addr: usize,
     max_len: usize,
     port: u16,
 }
@@ -281,7 +282,8 @@ struct TcpConn {
     timewait_tick: u64,
     pending_tid: usize,
     pending_op: u8,
-    pending_phys: usize,
+    /// How much the waiting reader lent. It is still blocked in the call, so
+    /// the buffer is still lent when the data turns up.
     pending_max: usize,
     in_use: bool,
     fin_received: bool,
@@ -361,7 +363,7 @@ static mut NET: NetState = NetState {
             snd_una: 0, snd_nxt: 0, rcv_nxt: 0, snd_wnd: 0,
             recv_len: 0, send_len: 0, retransmit_tick: 0, timewait_tick: 0,
             pending_tid: 0, pending_op: TCP_PENDING_NONE,
-            pending_phys: 0, pending_max: 0, in_use: false, fin_received: false,
+            pending_max: 0, in_use: false, fin_received: false,
             owner_tid: 0, pending_inline: false,
             pending_data: [0; SOCK_CHUNK], pending_len: 0,
         };
@@ -841,13 +843,9 @@ fn handle_udp(data: &[u8], src_ip: &[u8; 4]) {
             if reader.port == dst_port || reader.port == 0 {
                 let copy_len = payload.len().min(reader.max_len);
 
-                if syscall::sys_map_phys(reader.phys_addr, CLIENT_BUF, 1).is_ok() {
-                    core::ptr::copy_nonoverlapping(
-                        payload.as_ptr(),
-                        CLIENT_BUF as *mut u8,
-                        copy_len,
-                    );
-
+                // Into what the reader lent, which it has lent since it asked.
+                // A reader whose buffer cannot take it gets nothing, and waits on.
+                if syscall::sys_lent_write(reader.tid, 0, &payload[..copy_len]).is_ok() {
                     let ip_packed = u32::from_be_bytes(*src_ip) as u64;
                     let reply = Message {
                         sender: 0,
@@ -1227,30 +1225,23 @@ fn tcp_deliver_recv(idx: usize) {
         let old_recv_len = c.recv_len;
         let rv = tcp_recv_buf_vaddr(idx);
 
-        // Two ways out: inline in the reply for a socket fd, or through the
-        // page the client mapped for the older phys-address protocol.
-        let data = if c.pending_inline {
-            let out = sock_pack(core::slice::from_raw_parts(rv as *const u8, n));
-            if n < c.recv_len {
-                core::ptr::copy((rv + n) as *const u8, rv as *mut u8, c.recv_len - n);
-            }
-            out
+        // Two ways out: inline in the reply for a socket fd, or into the
+        // buffer the reader lent with its call. Nothing is taken off the
+        // queue if the buffer cannot take it.
+        let received = core::slice::from_raw_parts(rv as *const u8, n);
+        let (tag, data, n) = if c.pending_inline {
+            (TAG_OK, sock_pack(received), n)
+        } else if n == 0 || syscall::sys_lent_write(c.pending_tid, 0, received).is_ok() {
+            (TAG_OK, [n as u64, 0, 0, 0, 0, 0], n)
         } else {
-            if n > 0 && syscall::sys_map_phys(c.pending_phys, CLIENT_BUF, 1).is_ok() {
-                core::ptr::copy_nonoverlapping(rv as *const u8, CLIENT_BUF as *mut u8, n);
-                // Compact
-                if n < c.recv_len {
-                    core::ptr::copy((rv + n) as *const u8, rv as *mut u8, c.recv_len - n);
-                }
-            }
-            [n as u64, 0, 0, 0, 0, 0]
+            // Not "zero bytes", which the reader would take for the end.
+            (TAG_ERROR, [3, 0, 0, 0, 0, 0], 0)
         };
+        if n > 0 && n < c.recv_len {
+            core::ptr::copy((rv + n) as *const u8, rv as *mut u8, c.recv_len - n);
+        }
 
-        let reply = Message {
-            sender: 0,
-            tag: TAG_OK,
-            data,
-        };
+        let reply = Message { sender: 0, tag, data };
         let _ = syscall::sys_reply(c.pending_tid, &reply);
         NET.tcp_conns[idx].recv_len -= n;
         NET.tcp_conns[idx].pending_op = TCP_PENDING_NONE;
@@ -1358,7 +1349,6 @@ fn accept_tcp_syn(listener_idx: usize, remote_ip: &[u8; 4], remote_port: u16, se
             timewait_tick: 0,
             pending_tid,
             pending_op,
-            pending_phys: 0,
             pending_max: 0,
             in_use: true,
             fin_received: false,
@@ -2221,21 +2211,17 @@ pub extern "C" fn _start() -> ! {
         let sock_handle = (msg.tag >> SOCK_HANDLE_SHIFT) as usize;
         match msg.tag & SOCK_TAG_MASK {
             TAG_UDP_SEND => {
-                let phys_addr = msg.data[0] as usize;
-                let len = msg.data[1] as usize;
+                // The payload is lent with the call; data[0] is not read.
+                let len = (msg.data[1] as usize).min(1472);
                 let dst_ip = (msg.data[2] as u32).to_be_bytes();
                 let ports = msg.data[3];
                 let dst_port = (ports >> 16) as u16;
                 let src_port = (ports & 0xFFFF) as u16;
 
-                let ok = if len > 0 && syscall::sys_map_phys(phys_addr, CLIENT_BUF, 1).is_ok() {
-                    let payload = unsafe {
-                        core::slice::from_raw_parts(CLIENT_BUF as *const u8, len.min(1472))
-                    };
-                    send_udp_packet(&dst_ip, src_port, dst_port, payload)
-                } else {
-                    false
-                };
+                let mut payload = [0u8; 1472];
+                let ok = len > 0
+                    && syscall::sys_lent_read(msg.sender, 0, &mut payload[..len]) == Ok(len)
+                    && send_udp_packet(&dst_ip, src_port, dst_port, &payload[..len]);
 
                 let reply = if ok {
                     Message { sender: 0, tag: TAG_OK, data: [0; 6] }
@@ -2245,12 +2231,12 @@ pub extern "C" fn _start() -> ! {
                 let _ = syscall::sys_reply(msg.sender, &reply);
             }
             TAG_UDP_RECV => {
-                // Store pending reader — reply deferred until UDP data arrives
-                let phys_addr = msg.data[0] as usize;
+                // Store pending reader — reply deferred until UDP data
+                // arrives, into the buffer it lent. data[0] is not read.
                 let max_len = msg.data[1] as usize;
                 let port = msg.data[2] as u16;
                 unsafe {
-                    NET.pending_udp = Some(UdpReader { tid: msg.sender, phys_addr, max_len, port });
+                    NET.pending_udp = Some(UdpReader { tid: msg.sender, max_len, port });
                 }
             }
             TAG_NET_CONFIG => {
@@ -2426,7 +2412,6 @@ pub extern "C" fn _start() -> ! {
                         timewait_tick: 0,
                         pending_tid: msg.sender,
                         pending_op: TCP_PENDING_CONNECT,
-                        pending_phys: 0,
                         pending_max: 0,
                         in_use: true,
                         fin_received: false,
@@ -2493,7 +2478,7 @@ pub extern "C" fn _start() -> ! {
                         retransmit_tick: 0, timewait_tick: 0,
                         pending_tid: msg.sender,
                         pending_op: TCP_PENDING_ACCEPT,
-                        pending_phys: 0, pending_max: 0,
+                        pending_max: 0,
                         in_use: true, fin_received: false,
                         owner_tid: msg.sender,
                         pending_inline: false,
@@ -2504,8 +2489,8 @@ pub extern "C" fn _start() -> ! {
                 // Deferred reply — will reply when connection established
             }
             TAG_TCP_SEND => {
+                // The bytes are lent with the call; data[1] is not read.
                 let handle = msg.data[0] as usize;
-                let phys_addr = msg.data[1] as usize;
                 let len = msg.data[2] as usize;
 
                 if !conn_owned_by(handle, msg.sender) {
@@ -2523,20 +2508,22 @@ pub extern "C" fn _start() -> ! {
                 }
 
                 let mut total_sent = 0usize;
-                if len > 0 && syscall::sys_map_phys(phys_addr, CLIENT_BUF, 1).is_ok() {
+                if len > 0 {
                     let send_len = len.min(4096);
                     let sv = tcp_send_buf_vaddr(handle);
                     let free = TCP_BUF_SIZE - unsafe { NET.tcp_conns[handle].send_len };
                     let to_queue = send_len.min(free);
+                    let cur_len = unsafe { NET.tcp_conns[handle].send_len };
+                    // Straight from what was lent onto the end of the queue.
+                    let queued = to_queue > 0 && {
+                        let tail = unsafe {
+                            core::slice::from_raw_parts_mut((sv + cur_len) as *mut u8, to_queue)
+                        };
+                        syscall::sys_lent_read(msg.sender, 0, tail) == Ok(to_queue)
+                    };
 
-                    if to_queue > 0 {
-                        let cur_len = unsafe { NET.tcp_conns[handle].send_len };
+                    if queued {
                         unsafe {
-                            core::ptr::copy_nonoverlapping(
-                                CLIENT_BUF as *const u8,
-                                (sv + cur_len) as *mut u8,
-                                to_queue,
-                            );
                             NET.tcp_conns[handle].send_len += to_queue;
                         }
 
@@ -2578,8 +2565,8 @@ pub extern "C" fn _start() -> ! {
                 let _ = syscall::sys_reply(msg.sender, &reply);
             }
             TAG_TCP_RECV => {
+                // The buffer is lent with the call; data[1] is not read.
                 let handle = msg.data[0] as usize;
-                let phys_addr = msg.data[1] as usize;
                 let max_len = msg.data[2] as usize;
 
                 if !conn_owned_by(handle, msg.sender) {
@@ -2599,14 +2586,17 @@ pub extern "C" fn _start() -> ! {
                 if c.recv_len > 0 || c.fin_received {
                     let n = c.recv_len.min(max_len);
                     let old_recv_len = c.recv_len;
-                    if n > 0 && syscall::sys_map_phys(phys_addr, CLIENT_BUF, 1).is_ok() {
-                        let rv = tcp_recv_buf_vaddr(handle);
+                    let rv = tcp_recv_buf_vaddr(handle);
+                    let received = unsafe { core::slice::from_raw_parts(rv as *const u8, n) };
+                    // Into what the caller lent. If that fails, nothing is
+                    // taken off the queue and the caller is told so.
+                    if n > 0 && syscall::sys_lent_write(msg.sender, 0, received).is_err() {
+                        let reply = Message { sender: 0, tag: TAG_ERROR, data: [3, 0, 0, 0, 0, 0] };
+                        let _ = syscall::sys_reply(msg.sender, &reply);
+                        continue;
+                    }
+                    if n > 0 {
                         unsafe {
-                            core::ptr::copy_nonoverlapping(
-                                rv as *const u8,
-                                CLIENT_BUF as *mut u8,
-                                n,
-                            );
                             if n < c.recv_len {
                                 core::ptr::copy(
                                     (rv + n) as *const u8,
@@ -2639,7 +2629,6 @@ pub extern "C" fn _start() -> ! {
                     unsafe {
                         NET.tcp_conns[handle].pending_tid = msg.sender;
                         NET.tcp_conns[handle].pending_op = TCP_PENDING_RECV;
-                        NET.tcp_conns[handle].pending_phys = phys_addr;
                         NET.tcp_conns[handle].pending_max = max_len;
                     }
                 }
@@ -2692,7 +2681,6 @@ pub extern "C" fn _start() -> ! {
                     NET.tcp_conns[sock_handle].pending_tid = msg.sender;
                     NET.tcp_conns[sock_handle].pending_op = TCP_PENDING_RECV;
                     NET.tcp_conns[sock_handle].pending_inline = true;
-                    NET.tcp_conns[sock_handle].pending_phys = 0;
                     NET.tcp_conns[sock_handle].pending_max = max_len;
                 }
                 // Replies now if there is data or a FIN, and otherwise leaves
