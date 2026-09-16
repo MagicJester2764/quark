@@ -963,6 +963,8 @@ const NEXT_CHILD_SLOT: usize = 43;
 const THREAD_SLOT: usize = 44;
 /// Never filled, so there is nothing in it to offer.
 const EMPTY_SLOT: usize = 45;
+/// For the child `test_call_storm` calls.
+const STORM_SLOT: usize = 46;
 /// A task nothing here made or holds a capability to. Not the nameserver:
 /// every program is handed one to that.
 const INIT_TID: usize = 1;
@@ -1609,6 +1611,56 @@ fn test_wire() {
     check("padding rounds up to four", wire::pad4(7) == 8 && wire::pad4(8) == 8);
 }
 
+/// Call after call for three seconds, each one handing the processor straight
+/// to the task called.
+///
+/// The hand-over marks the callee runnable without queueing it, since it is
+/// about to run, and then switches to it. Interrupts were back on in between,
+/// and a tick there that preempted the caller -- already blocked on the callee
+/// -- switched to something else and left the callee in no queue, runnable and
+/// never run, with its caller waiting on it for ever. Any task busy with calls
+/// could hit it; fontconfig scanning fonts did, once a minute or so. Every call
+/// here has a deadline, so that shows up as a failure rather than a hang.
+fn test_call_storm() {
+    use quark_rt::ipc::Message;
+    println!("calls:");
+    let Some(child) = load_child(&[b"dchild", b"echo"]) else {
+        check("start a child to call", false);
+        return;
+    };
+    if child.start().is_err() || !mint_endpoint(STORM_SLOT, child.tid) {
+        check("start a child to call", false);
+        let _ = syscall::sys_task_kill(child.tid);
+        let _ = wait_for(child.tid);
+        return;
+    }
+    let start = syscall::sys_ticks();
+    let mut calls = 0u64;
+    let mut answered = true;
+    let mut reply = Message::empty();
+    while syscall::sys_ticks() - start < 300 {
+        calls += 1;
+        let ask = Message { sender: 0, tag: calls, data: [0; 6] };
+        let outcome = syscall::sys_call_timeout(child.tid, &ask, &mut reply, 100);
+        if !matches!(outcome, syscall::CallOutcome::Replied) || reply.tag != calls + 1 {
+            answered = false;
+            break;
+        }
+    }
+    println!("        {} calls in {} ticks", calls, syscall::sys_ticks() - start);
+    check("every call is answered, however many", answered && calls >= 1000);
+    let stop = Message::empty();
+    let stopped = matches!(
+        syscall::sys_call_timeout(child.tid, &stop, &mut reply, 100),
+        syscall::CallOutcome::Replied
+    );
+    if !stopped {
+        let _ = syscall::sys_task_kill(child.tid);
+    }
+    check("and the child is still there to stop", stopped && wait_for(child.tid) == Some(0));
+    let _ = syscall::sys_cap_delete(STORM_SLOT);
+}
+
 #[unsafe(no_mangle)]
 #[link_section = ".text.entry"]
 pub extern "C" fn _start() -> ! {
@@ -1631,6 +1683,7 @@ pub extern "C" fn _start() -> ! {
         ("spawn", test_spawned_memory),
         ("lend", test_lent_buffers),
         ("endpoints", test_endpoint_objects),
+        ("calls", test_call_storm),
         ("service", test_runtime_service),
         ("files", test_files),
         ("sync", test_sync),

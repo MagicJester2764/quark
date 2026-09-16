@@ -457,7 +457,9 @@ pub fn refresh_priority(tid: usize) {
 /// Make a blocked task runnable without putting it in the ready queue.
 ///
 /// For the task that is about to be switched to directly. Queueing it as well
-/// would leave an entry behind for a task that is already running.
+/// would leave an entry behind for a task that is already running. Until that
+/// switch it is runnable and in no queue, so interrupts must stay off from
+/// here to [`donate_to`].
 pub fn make_ready(tid: usize) {
     if tid >= MAX_TASKS {
         return;
@@ -482,13 +484,20 @@ pub fn make_ready(tid: usize) {
 /// a hundred times a second is most of a CPU handed out for free.
 ///
 /// Falls back to ordinary scheduling if the target cannot take over.
-pub fn donate_to(tid: usize) {
-    if !INITIALIZED.load(Ordering::SeqCst) {
-        return;
-    }
+///
+/// Interrupts must already be off, and `flags` is what they were before. The
+/// caller turned them off to block itself and to [`make_ready`] the target,
+/// and they stay off until the switch: in between, the target is runnable but
+/// in no queue. A tick there used to preempt the caller -- already blocked --
+/// and run something else, and nothing ever ran the target again. When the
+/// caller's deadline woke it, it resumed straight into this switch and was
+/// left marked running, in no queue either.
+pub fn donate_to(tid: usize, flags: u64) {
     unsafe {
-        let flags: u64;
-        core::arch::asm!("pushfq; pop {}; cli", out(reg) flags, options(nostack));
+        if !INITIALIZED.load(Ordering::SeqCst) {
+            restore_flags(flags);
+            return;
+        }
         let current_tid = CURRENT_TID.load(Ordering::SeqCst);
 
         let mut takeable = tid < MAX_TASKS

@@ -787,13 +787,18 @@ fn call_inner(
             crate::pit::ticks() + timeout_ticks
         };
     }
-    irq_restore(flags);
     match hand_over_to {
-        // Straight across, on what is left of this task's slice.
-        Some(dest) => scheduler::donate_to(dest),
+        // Straight across, on what is left of this task's slice, with
+        // interrupts still off. `dest` is runnable but in no queue, so a tick
+        // that preempted this task first would run something else, and then
+        // nothing would ever run `dest` -- which this task is blocked on.
+        Some(dest) => scheduler::donate_to(dest, flags),
         // Nobody was waiting; the message is queued and somebody will come
         // for it. Ordinary scheduling.
-        None => scheduler::yield_now(),
+        None => {
+            irq_restore(flags);
+            scheduler::yield_now();
+        }
     }
 
     // Reply arrived

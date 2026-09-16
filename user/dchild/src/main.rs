@@ -12,7 +12,8 @@
 //! on; given `serve` it answers one call with 42, and given `register NAME` it
 //! does that under a name. `lookup NAME` calls whatever has that name and exits
 //! with the answer. `hold N` opens a file N times and exits without closing
-//! any of them, saying how many it got.
+//! any of them, saying how many it got. `echo` answers every call with its
+//! tag plus one, until a call whose tag is 0.
 
 use quark_rt::ipc::{Message, TID_ANY};
 use quark_rt::manifest::CapReq;
@@ -86,6 +87,20 @@ pub extern "C" fn _start() -> ! {
             }
         }
         syscall::sys_exit_code(held);
+    }
+    // Answer call after call, for a parent making a great many of them.
+    if quark_rt::args::argv(1) == Some(&b"echo"[..]) {
+        loop {
+            let mut msg = Message::empty();
+            if syscall::sys_recv_timeout(TID_ANY, &mut msg, 500).is_err() {
+                syscall::sys_exit_code(1);
+            }
+            let answer = Message { sender: 0, tag: msg.tag.wrapping_add(1), data: [0; 6] };
+            let _ = syscall::sys_reply(msg.sender, &answer);
+            if msg.tag == 0 {
+                syscall::sys_exit_code(0);
+            }
+        }
     }
     // Reach a service by name alone: nothing but the lookup gives this the
     // right to call it.

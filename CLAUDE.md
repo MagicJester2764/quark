@@ -273,6 +273,13 @@ Three things follow from that, and breaking any of them is quiet:
   nothing to contribute until the reply, so the callee is switched to directly
   and runs on what is left of the caller's slice rather than a fresh one. A
   server does not earn a quantum every time it is called.
+- **A hand-over keeps interrupts off from waking the callee to switching to
+  it.** `make_ready` leaves the callee runnable but in no queue, since it is
+  about to run, so `donate_to` takes the flags `call_inner` saved instead of
+  saving its own. With a gap between the two, a tick preempted the caller,
+  already blocked, and nothing ever ran either task again: fontconfig hung
+  about once a minute scanning fonts. `dtest calls` makes three million calls
+  in three seconds and caught it on its first run.
 - **A task runs at the band of whoever is waiting on it**, for as long as that
   is true. Without it a server called by something urgent is preempted by
   anything in between. It is also what lets the direct switch stay safe: the
