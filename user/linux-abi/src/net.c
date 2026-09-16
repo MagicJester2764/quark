@@ -108,6 +108,47 @@ long __quark_ftruncate(long fd, long length) {
     return r == QUARK_ERR ? -LX_EINVAL : 0;
 }
 
+/* An ordinary pipe.
+ *
+ * Quark makes the pipe and then names its ends separately, so this is three
+ * calls where Linux has one. Both ends go into this task's own table, which
+ * needs no authority: `pipe` is something every C library does on its own
+ * behalf and confers nothing on anybody else.
+ *
+ * The clipboard is what needed this. A client pasting creates a pipe, hands
+ * the write end to the compositor, and reads the read end until end of file --
+ * which is the whole reason the compositor never sees the data. */
+long __quark_pipe(int *fds, long flags) {
+    /* O_CLOEXEC is meaningless without exec. O_NONBLOCK is not honoured on a
+       pipe here, and saying so is better than pretending: a caller that needs
+       it would otherwise block in a read it was told would return. */
+    if (flags & LX_O_NONBLOCK) {
+        return -LX_ENOSYS;
+    }
+    if (!fds) {
+        return -LX_EFAULT;
+    }
+    unsigned long handle = __syscall0(SYS_PIPE_CREATE);
+    if (handle == QUARK_ERR) {
+        return -LX_EMFILE;
+    }
+    unsigned long me = __syscall0(SYS_GETPID);
+    unsigned long r = __syscall4(SYS_PIPE_FD_SET, me, QUARK_ANY_FD, handle, 0);
+    if (r == QUARK_ERR) {
+        return -LX_EMFILE;
+    }
+    unsigned long w = __syscall4(SYS_PIPE_FD_SET, me, QUARK_ANY_FD, handle, 1);
+    if (w == QUARK_ERR) {
+        /* Give the read end back rather than leaving a half-made pipe in the
+           table, which the caller has no way to find or close. */
+        __syscall1(SYS_FD_CLOSE, r);
+        return -LX_EMFILE;
+    }
+    fds[0] = (int)r;
+    fds[1] = (int)w;
+    return 0;
+}
+
 long __quark_socketpair(long domain, long type, long protocol, int *sv) {
     /* Only a local stream, which is what a Wayland connection is. */
     if (domain != AF_UNIX || (type & 0xF) != SOCK_STREAM || protocol != 0) {

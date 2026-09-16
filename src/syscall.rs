@@ -184,7 +184,7 @@ pub const SYS_ABI_VERSION: u64 = 240;
 /// minor when calls are added. User space can refuse to run against a major it
 /// does not know, which is the point of exposing it at all.
 pub const ABI_VERSION_MAJOR: u64 = 1;
-pub const ABI_VERSION_MINOR: u64 = 9;
+pub const ABI_VERSION_MINOR: u64 = 10;
 
 /// Threads a task may make with no capability at all.
 ///
@@ -1150,13 +1150,27 @@ extern "C" fn syscall_dispatch(
             }
         }
         SYS_PIPE_FD_SET => {
-            // arg0 = target tid, arg1 = fd index, arg2 = pipe handle, arg3 = is_write (0=read, 1=write)
-            // Requires CAP_TASK_MGMT
-            if !crate::cap::task_has_task_mgmt(scheduler::current_tid(), 0) {
+            // arg0 = target tid, arg1 = fd index or ANY_FD, arg2 = pipe handle,
+            // arg3 = is_write (0 = read, 1 = write)
+            //
+            // Putting a pipe end into *another* task's table hands it something
+            // it never asked for, and needs `TaskMgmt`. Putting one into your
+            // own is `pipe(2)`, which is an ordinary thing for any program to
+            // do and needs nothing — the same rule, and for the same reason, as
+            // duplicating one of your own descriptors.
+            let me = scheduler::current_tid();
+            let tid = arg0 as usize;
+            if tid != me && !crate::cap::task_has_task_mgmt(me, tid) {
                 return u64::MAX;
             }
-            let tid = arg0 as usize;
-            let fd = arg1 as usize;
+            let fd = if arg1 == ANY_FD {
+                match scheduler::free_fd_at_or_above(tid, 3) {
+                    Some(f) => f,
+                    None => return u64::MAX,
+                }
+            } else {
+                arg1 as usize
+            };
             let handle = arg2 as usize;
             let is_write = arg3 != 0;
             if crate::pipe::add_ref(handle, is_write).is_err() {
@@ -1168,8 +1182,12 @@ extern "C" fn syscall_dispatch(
                 crate::task::FdKind::PipeRead(handle)
             };
             match scheduler::set_fd(tid, fd, kind) {
-                Ok(()) => 0,
-                Err(()) => u64::MAX,
+                // The number, since the caller may have let us choose it.
+                Ok(()) => fd as u64,
+                Err(()) => {
+                    crate::pipe::release_fd(&kind, tid);
+                    u64::MAX
+                }
             }
         }
         SYS_SOCK_FD => {

@@ -59,6 +59,16 @@ struct ShmemRegion {
     creator: usize,
     /// Bitmask of TIDs with access (bit N = TID N can map).
     access: u64,
+    /// How many descriptors each task holds for this region.
+    ///
+    /// `access` is permission and cannot double as a reference count: it is one
+    /// bit per task, so a task holding two descriptors for one region — which
+    /// is what `dup` makes, and what every Wayland client does when libwayland
+    /// duplicates a descriptor before sending it — sets the same bit twice and
+    /// clears it on the first close. The region then went away while its owner
+    /// still held a descriptor and a mapping, and the next thing to touch it
+    /// failed a long way from here.
+    refs: [u8; MAX_TASKS],
     /// Bitmask of TIDs that currently have the region mapped.
     mapped: u64,
     /// Set when destroy was requested while the region was still mapped.
@@ -84,6 +94,7 @@ impl ShmemRegion {
             page_count: 0,
             creator: 0,
             access: 0,
+            refs: [0; MAX_TASKS],
             mapped: 0,
             pending_destroy: false,
             in_flight: 0,
@@ -200,6 +211,10 @@ pub fn create(pages: usize) -> u64 {
         region.in_use = true;
         region.creator = tid;
         region.access = 1u64 << tid;
+        // Creating one hands back exactly one descriptor — a memfd — or, for
+        // the older handle-only interface, one right to map that `destroy`
+        // ends. Either way the creator holds one reference.
+        region.refs[tid] = 1;
         region.page_count = pages;
     }
     irq_restore(flags);
@@ -405,6 +420,7 @@ pub fn add_access(handle: usize, tid: usize) -> bool {
         let r = &mut regions()[handle];
         if r.in_use && !r.pending_destroy {
             r.access |= 1u64 << tid;
+            r.refs[tid] = r.refs[tid].saturating_add(1);
             true
         } else {
             false
@@ -427,7 +443,11 @@ pub fn close_ref(handle: usize, tid: usize) {
     unsafe {
         let r = &mut regions()[handle];
         if r.in_use {
-            r.access &= !(1u64 << tid);
+            // Only the task's *last* descriptor gives up its permission.
+            r.refs[tid] = r.refs[tid].saturating_sub(1);
+            if r.refs[tid] == 0 {
+                r.access &= !(1u64 << tid);
+            }
             if r.access == 0 && r.in_flight == 0 {
                 if r.mapped == 0 {
                     release(r);
@@ -609,6 +629,7 @@ pub fn cleanup_task(tid: usize) {
             }
             region.mapped &= !(1u64 << tid);
             region.access &= !(1u64 << tid);
+            region.refs[tid] = 0;
 
             if region.creator == tid {
                 region.pending_destroy = true;

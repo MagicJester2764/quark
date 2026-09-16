@@ -83,6 +83,17 @@ pub fn focus() -> usize {
     unsafe { FOCUS }
 }
 
+/// The client slot with keyboard focus, if any.
+pub fn focused_client() -> Option<usize> {
+    surface::get(unsafe { FOCUS }).map(|s| s.client)
+}
+
+/// Is this client the focused one? Asked by a client setting something up that
+/// only the focused client hears about.
+pub fn focus_is_mine(slot: usize) -> bool {
+    focused_client() == Some(slot)
+}
+
 /// The modifiers held right now, as an XKB mask.
 pub fn mods() -> u32 {
     xkb_mods(unsafe { MODS })

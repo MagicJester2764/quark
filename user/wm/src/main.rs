@@ -68,6 +68,7 @@ use quark_rt::{args, nameserver, println, syscall, vfs};
 // refused loudly — the mint simply fails and the capability is absent, which
 // then looks like an unrelated failure much later.
 mod client;
+mod clipboard;
 mod cursor;
 mod draw;
 mod keymap;
@@ -358,6 +359,42 @@ fn raise(idx: usize) {
     announce_focus();
 }
 
+/// Tell whoever has keyboard focus what is on the clipboard.
+///
+/// The selection follows keyboard focus, which is the rule that makes a
+/// clipboard on a compositor safe to have: a client that never has focus can
+/// never read it.
+pub fn announce_selection_to_focus() {
+    unsafe {
+        let Some(slot) = seat::focused_client() else { return };
+        if slot < client::MAX_CLIENTS && CLIENTS[slot].used {
+            CLIENTS[slot].announce_selection();
+        }
+    }
+}
+
+/// Hand a receiver's pipe to whoever owns the selection.
+pub fn send_to_source(slot: usize, source: u32, mime: &[u8], fd: usize) {
+    unsafe {
+        if slot < client::MAX_CLIENTS && CLIENTS[slot].used {
+            CLIENTS[slot].source_send(source, mime, fd);
+        } else {
+            // The owner has gone. Closing the pipe is what stops the receiver
+            // waiting for bytes that will never come.
+            let _ = syscall::sys_fd_close(fd);
+        }
+    }
+}
+
+/// Tell a client its source has been displaced.
+pub fn cancel_source(slot: usize, source: u32) {
+    unsafe {
+        if slot < client::MAX_CLIENTS && CLIENTS[slot].used {
+            CLIENTS[slot].source_cancelled(source);
+        }
+    }
+}
+
 /// Tell whoever has keyboard focus that it has it, and whoever had it that it
 /// does not. Called wherever `FOCUS` moves — and, for a window being adopted,
 /// once the surface behind it can be found from it.
@@ -366,6 +403,8 @@ pub fn announce_focus() {
         let ptr = &raw mut CLIENTS;
         seat::focus_changed(&mut *ptr, FOCUS);
     }
+    // The clipboard follows the keyboard, so it moves with it.
+    announce_selection_to_focus();
 }
 
 /// End the session.

@@ -168,12 +168,24 @@ long __quark_open(const char *path, long flags) {
 long __quark_close(long fd) {
     struct openfile *f = slot(fd);
     if (!f) {
-        /* 0, 1 and 2 belong to whoever spawned this task, and go when the
-           task does. A program closing them is finished with them, which is
-           the same outcome — and reporting EBADF instead makes every tool
-           that tidies up after itself print an error it cannot act on. */
-        if (fd >= 0 && fd < FIRST_FD) {
+        /* 0, 1 and 2 belong to whoever spawned this task, and go when the task
+           does. A program closing them is finished with them, which is the same
+           outcome — and reporting EBADF instead makes every tool that tidies up
+           after itself print an error it cannot act on. */
+        if (fd >= 0 && fd < 3) {
             return 0;
+        }
+        /* Everything else below FIRST_FD is the kernel's: a stream end, a pipe
+           end, memory, a descriptor set. These used to be answered the same way
+           — success, and nothing done — which is wrong in a way that only shows
+           up somewhere else. A pipe ends when its last writer closes, so a
+           `close` that does not happen is a reader that waits for ever; the
+           clipboard was the first thing here whose correctness depended on
+           another task observing a close. */
+        if (fd >= 0 && fd < FIRST_FD) {
+            return __syscall1(SYS_FD_CLOSE, (unsigned long)fd) == QUARK_ERR
+                       ? -LX_EBADF
+                       : 0;
         }
         return -LX_EBADF;
     }
@@ -419,8 +431,6 @@ long __quark_write(long fd, const void *buf, unsigned long n) {
 #define LX_F_SETFL          4
 #define LX_F_DUPFD_CLOEXEC  1030
 
-#define LX_O_NONBLOCK  04000
-#define LX_O_RDWR      2
 
 /* Which descriptors a program has asked to be non-blocking. One bit per
    kernel descriptor; this layer's own file numbers are always blocking,

@@ -27,11 +27,23 @@ pub const SEAT: Interface = Interface { name: b"wl_seat", version: 4 };
 /// that a toolkit stops drawing its own on top of it.
 pub const DECORATION: Interface =
     Interface { name: b"zxdg_decoration_manager_v1", version: 1 };
+/// The clipboard. Version 1 on purpose: that is exactly the selection, and
+/// versions 2 and 3 are drag and drop, which needs pointer grabs and a drag
+/// icon surface and is a larger thing than copying text.
+pub const DATA_DEVICE_MANAGER: Interface =
+    Interface { name: b"wl_data_device_manager", version: 1 };
 
 /// What the registry advertises, and the order it advertises them in. The
 /// index is the `name` a client binds by.
-pub const GLOBALS: [&Interface; 6] =
-    [&COMPOSITOR, &SHM, &OUTPUT, &XDG_WM_BASE, &SEAT, &DECORATION];
+pub const GLOBALS: [&Interface; 7] = [
+    &COMPOSITOR,
+    &SHM,
+    &OUTPUT,
+    &XDG_WM_BASE,
+    &SEAT,
+    &DECORATION,
+    &DATA_DEVICE_MANAGER,
+];
 
 // wl_display requests.
 pub const DISPLAY_SYNC: u16 = 0;
@@ -193,6 +205,29 @@ pub const TOPLEVEL_DECORATION_CONFIGURE: u16 = 0;
 /// not be drawn.
 pub const DECORATION_MODE_CLIENT_SIDE: u32 = 1;
 pub const DECORATION_MODE_SERVER_SIDE: u32 = 2;
+
+// wl_data_device_manager requests.
+pub const DDM_CREATE_DATA_SOURCE: u16 = 0;
+pub const DDM_GET_DATA_DEVICE: u16 = 1;
+
+// wl_data_source requests and events.
+pub const DATA_SOURCE_OFFER: u16 = 0;
+pub const DATA_SOURCE_DESTROY: u16 = 1;
+pub const DATA_SOURCE_TARGET: u16 = 0;
+pub const DATA_SOURCE_SEND: u16 = 1;
+pub const DATA_SOURCE_CANCELLED: u16 = 2;
+
+// wl_data_device requests and events.
+pub const DATA_DEVICE_START_DRAG: u16 = 0;
+pub const DATA_DEVICE_SET_SELECTION: u16 = 1;
+pub const DATA_DEVICE_DATA_OFFER: u16 = 0;
+pub const DATA_DEVICE_SELECTION: u16 = 5;
+
+// wl_data_offer requests and events.
+pub const DATA_OFFER_ACCEPT: u16 = 0;
+pub const DATA_OFFER_RECEIVE: u16 = 1;
+pub const DATA_OFFER_DESTROY: u16 = 2;
+pub const DATA_OFFER_OFFER: u16 = 0;
 
 /// The object id of `wl_display`, which exists before anything is asked for.
 pub const DISPLAY_ID: u32 = 1;

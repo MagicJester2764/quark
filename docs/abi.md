@@ -1,6 +1,6 @@
 # Quark syscall ABI
 
-**Version 1.9.** Query the running kernel with `SYS_ABI_VERSION` (240), which
+**Version 1.10.** Query the running kernel with `SYS_ABI_VERSION` (240), which
 returns `(major << 16) | minor`.
 
 This document is the contract between the Quark kernel and everything above it.
@@ -95,6 +95,7 @@ so it is built from calls that already existed.
 | 1.7 | `SYS_SET_CLEAR_TID` (106) — a word to clear and wake when a task exits. Also: making a task in your own address space no longer needs `TaskMgmt`, because a thread is not a new principal. |
 | 1.8 | `SYS_FD_RECV` (74) learns to choose: `at = u64::MAX - 1` asks for any free descriptor and the call returns which one it took. A caller translating `recvmsg` cannot name a slot — Linux picks the number — and probing for a free one would mean reading, which is the thing a receive must do exactly once. Both it and `SYS_FD_SEND` (73) also take flags in arg4, where bit 0 is `MSG_DONTWAIT`: return `0xFFFF_FFFE` rather than park. A reader that loops until a read finds nothing — libwayland does — hangs for ever without it, because the last turn of every such loop is the empty one. |
 | 1.9 | `SYS_MEMFD_TRUNCATE` (54) — `ftruncate` on memory named by a descriptor, which is how every Wayland client makes its buffer pool: `memfd_create`, `ftruncate`, `mmap`. Only while nobody has the region mapped and no descriptor for it is travelling, because growing it otherwise changes what is behind somebody else's live mapping. `SYS_MMAP_FD` (42) also returns the size it mapped instead of 0: a task that received a descriptor has no other way to learn how big the memory is, and the sender's word for it is the one thing it must not take. |
+| 1.10 | `SYS_FD_DUP` (68) and `SYS_PIPE_FD_SET` (70) no longer need `TaskMgmt` when the target is the caller, and both accept `u64::MAX - 1` for "any free descriptor" and return the number they took. Putting a descriptor into somebody else's table hands them something they never asked for; putting one into your own is `dup` and `pipe`, which every C library calls and which confer nothing. Also: `sys_cap_grant` (81) requires `TaskMgmt` over the destination, or the destination's consent — either a `sys_call` to the granter in progress, or a standing `Endpoint` naming it. Unrestricted, any task could fill any other's sixteen CSpace slots and leave it unable to be handed a display again. |
 
 A capability may only be minted from one the caller already holds, and only
 narrowed — with one exception. **An `Endpoint` naming only the caller may
@@ -255,9 +256,9 @@ frees the object, and is what makes a pipe's reader see end-of-file.
 | 65 | `SYS_FD_WRITE` | arg0 = fd, arg1 = buf, arg2 = len | bytes written / `u64::MAX` | — |
 | 66 | `SYS_FD_READ_NB` | arg0 = fd, arg1 = buf, arg2 = max len | bytes, `0` = EOF, **`0xFFFF_FFFE` = would block**, `u64::MAX` = error | — |
 | 67 | `SYS_FD_SET` | arg0 = target tid, arg1 = fd, arg2 = service tid, arg3 = tag | 0 / `u64::MAX` | `TaskMgmt` |
-| 68 | `SYS_FD_DUP` | arg0 = target tid, arg1 = target fd, arg2 = source fd | 0 / `u64::MAX` | `TaskMgmt` |
+| 68 | `SYS_FD_DUP` | arg0 = target tid, arg1 = target fd or `u64::MAX - 1` for any free one, arg2 = source fd, arg3 = lowest acceptable fd when arg1 asks for any | the fd it took / `u64::MAX` | `TaskMgmt` over the target, unless the target is the caller |
 | 69 | `SYS_PIPE_CREATE` | — | handle / `u64::MAX` | — (bounded per task) |
-| 70 | `SYS_PIPE_FD_SET` | arg0 = target tid, arg1 = fd, arg2 = pipe handle, arg3 = 1 for write end | 0 / `u64::MAX` | `TaskMgmt` |
+| 70 | `SYS_PIPE_FD_SET` | arg0 = target tid, arg1 = fd or `u64::MAX - 1` for any free one, arg2 = pipe handle, arg3 = 1 for write end | the fd it took / `u64::MAX` | `TaskMgmt` over the target, unless the target is the caller |
 | 71 | `SYS_FD_CLOSE` | arg0 = fd | 0 / `u64::MAX` | — |
 | 72 | `SYS_SOCKETPAIR` | — | `(fd0 << 32) \| fd1`, both in the caller's table / `u64::MAX` | — |
 | 73 | `SYS_FD_SEND` | arg0 = stream fd, arg1 = buf, arg2 = len, arg3 = fd to pass or `u64::MAX`, arg4 = flags (1 = do not wait) | bytes written, `0xFFFF_FFFE` if it would have blocked / `u64::MAX` | — |

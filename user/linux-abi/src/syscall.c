@@ -52,6 +52,8 @@ typedef unsigned long size_t;
 #define LX_madvise          28
 #define LX_sendmsg          46
 #define LX_recvmsg          47
+#define LX_pipe              22
+#define LX_pipe2           293
 #define LX_socketpair       53
 #define LX_fadvise64       221
 #define LX_getpid           39
@@ -461,6 +463,10 @@ long __quark_syscall(long n, long a1, long a2, long a3, long a4, long a5, long a
            There is nothing to preallocate here -- a region's frames are taken
            when it is sized -- so the size is all of it. */
         return __quark_ftruncate(a1, a3 + a4);
+    case LX_pipe:
+        return __quark_pipe((int *)a1, 0);
+    case LX_pipe2:
+        return __quark_pipe((int *)a1, a2);
     case LX_socketpair:
         return __quark_socketpair(a1, a2, a3, (int *)a4);
     case LX_sendmsg:

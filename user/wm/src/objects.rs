@@ -5,9 +5,10 @@
 //! sends is only ever looked up in its own.
 //!
 //! Ids below `CLIENT_ID_MAX` are the client's to allocate and this only
-//! validates them. Ids at or above are the compositor's; nothing here allocates
-//! one yet, because the only interface that needs the compositor to name an
-//! object is the clipboard.
+//! validates them. Ids at or above are the compositor's, handed out by
+//! [`Table::allocate`] — `wl_data_device.data_offer` is the one event whose
+//! argument is an object the *compositor* names, because a client being offered
+//! a clipboard did not ask for it and has nothing to name it with.
 
 pub const MAX_OBJECTS: usize = 64;
 pub const CLIENT_ID_MAX: u32 = 0xFF00_0000;
@@ -33,6 +34,10 @@ pub enum Kind {
     Pointer,
     Decoration,
     ToplevelDecoration,
+    DataDeviceManager,
+    DataDevice,
+    DataSource,
+    DataOffer,
     XdgWmBase,
     XdgSurface { surface: usize },
     XdgToplevel { surface: usize },
@@ -106,6 +111,28 @@ impl Table {
             if self.ids[i] == id && self.ids[i] != 0 {
                 return Some(self.kinds[i]);
             }
+        }
+        None
+    }
+
+    /// Take an id from the compositor's half of the space and record it.
+    ///
+    /// Wayland splits the id space so that both ends can name new objects
+    /// without asking: below `CLIENT_ID_MAX` is the client's, at or above is
+    /// the server's. Walking up from the bottom of the server's half and
+    /// skipping what is in use is enough — a client holds at most `MAX_OBJECTS`
+    /// objects here, so if there is a free slot there is a free id for it.
+    pub fn allocate(&mut self, kind: Kind) -> Option<u32> {
+        let free = (0..MAX_OBJECTS).find(|&i| self.ids[i] == 0)?;
+        for n in 0..=MAX_OBJECTS as u32 {
+            let id = CLIENT_ID_MAX + n;
+            if self.get(id).is_some() {
+                continue;
+            }
+            self.ids[free] = id;
+            self.kinds[free] = kind;
+            self.versions[free] = 1;
+            return Some(id);
         }
         None
     }

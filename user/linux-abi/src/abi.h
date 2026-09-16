@@ -26,6 +26,11 @@
    value the *at calls accept for one. */
 #define LX_AT_FDCWD (-100)
 
+/* Open flags this layer acts on. Shared because `pipe2` and `fcntl` have to
+   agree about what O_NONBLOCK means. */
+#define LX_O_NONBLOCK  04000
+#define LX_O_RDWR      2
+
 /* Files, implemented in files.c. Each returns a Linux-style result: a count
    or a value on success, and a negated errno on failure. */
 long __quark_open(const char *path, long flags);
@@ -43,6 +48,7 @@ long __quark_memfd(const char *name, long flags);
 long __quark_ftruncate(long fd, long length);
 long __quark_fcntl(long fd, long cmd, long arg);
 int __quark_fd_is_nonblock(long fd);
+long __quark_pipe(int *fds, long flags);
 long __quark_socketpair(long domain, long type, long protocol, int *sv);
 long __quark_sendmsg(long fd, const void *msg, long flags);
 long __quark_recvmsg(long fd, void *msg, long flags);

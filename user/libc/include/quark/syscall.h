@@ -34,6 +34,8 @@
 #define SYS_FD_READ         64
 #define SYS_FD_WRITE        65
 #define SYS_FD_DUP          68
+#define SYS_PIPE_CREATE     69
+#define SYS_PIPE_FD_SET     70
 #define SYS_FD_CLOSE        71
 #define SYS_SOCKETPAIR      72
 #define SYS_FD_SEND         73
