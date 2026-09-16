@@ -203,7 +203,7 @@ that dtest's new checks fail on purpose until the phase is done.
 - Produces (quark-rt): `LEND_READ = 1 << 62`, `LEND_WRITE = 1 << 63`; `sys_call_lend(dest, &Message, &mut Message, &[u8]) -> Result<(), ()>` (lends for reading); `sys_call_lend_mut(dest, &Message, &mut Message, &mut [u8]) -> Result<(), ()>` (lends for writing); `sys_call_lend_rw(dest, &Message, &mut Message, &mut [u8]) -> Result<(), ()>` (both); `sys_lent_read(client, offset, &mut [u8]) -> Result<usize, ()>`; `sys_lent_write(client, offset, &[u8]) -> Result<usize, ()>`.
 - Produces (C): `SYS_CALL_LEND`, `SYS_LENT_READ`, `SYS_LENT_WRITE`, `QUARK_LEND_READ`, `QUARK_LEND_WRITE` in `quark/syscall.h`.
 
-- [ ] **Step 1: The failing test** — a thread lends dtest's main task a buffer
+- [x] **Step 1: The failing test** — a thread lends dtest's main task a buffer
 three ways, and main plays server:
 
 ```rust
@@ -265,9 +265,9 @@ check("nothing is lent to a task nobody is calling", results & 8 != 0);
 The "nothing is lent once answered" check holds whatever the thread does next:
 its second call cannot be further than `CallSendBlocked` until main receives it.
 
-- [ ] **Step 2: Run it** — it does not build: none of the calls exist.
+- [x] **Step 2: Run it** — it does not build: none of the calls exist.
 
-- [ ] **Step 3: `src/lend.rs`**
+- [x] **Step 3: `src/lend.rs`**
 
 ```rust
 //! Memory lent with a call.
@@ -331,7 +331,7 @@ pub unsafe fn copy(cr3: usize, at: usize, local: usize, len: usize, into_lent: b
 }
 ```
 
-- [ ] **Step 4: The call's state** — in `ipc.rs`:
+- [x] **Step 4: The call's state** — in `ipc.rs`:
 
 ```rust
 /// A buffer lent with a call, for the task called to use until it replies.
@@ -372,7 +372,7 @@ pub fn lent_to(client: usize, server: usize) -> Option<(Lent, usize)> {
 }
 ```
 
-- [ ] **Step 5: The calls** — in `syscall.rs`, `SYS_CALL_LEND` is `SYS_CALL`
+- [x] **Step 5: The calls** — in `syscall.rs`, `SYS_CALL_LEND` is `SYS_CALL`
 plus: split `arg4` into `access = arg4 & (LEND_READ | LEND_WRITE)` and
 `len = arg4 & LEND_LEN_MASK`; refuse `access == 0`, `len == 0` or
 `len > LEND_MAX`; refuse unless `validate_user_range(arg3, len, access has
@@ -387,14 +387,14 @@ require `LEND_WRITE` or `LEND_READ` accordingly; require
 `offset.checked_add(len) <= lent.len`; then `lend::copy(cr3, lent.addr +
 offset, local, len, into_lent)` → `len` or `u64::MAX`.
 
-- [ ] **Step 6: Wrappers** — quark-rt constants and the five functions above
+- [x] **Step 6: Wrappers** — quark-rt constants and the five functions above
 (`sys_call_lend_rw` included); `syscall5` carries `len | access`. C header: the
 three numbers and two bits. `tools/check-abi.sh` agrees.
 
-- [ ] **Step 7: Run it** — boot, `dtest`. Expected: every lending check passes;
+- [x] **Step 7: Run it** — boot, `dtest`. Expected: every lending check passes;
 Task 1's two checks still fail.
 
-- [ ] **Step 8: Document and commit** — `docs/abi.md`: rows 23, 25, 26 and a
+- [x] **Step 8: Document and commit** — `docs/abi.md`: rows 23, 25, 26 and a
 section:
 
 > **Lending memory with a call.** `SYS_CALL_LEND` is `SYS_CALL` with a buffer

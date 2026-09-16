@@ -24,6 +24,9 @@ pub const SYS_REPLY: u64 = 19;
 pub const SYS_CALL_TIMEOUT: u64 = 20;
 pub const SYS_RECV_TIMEOUT: u64 = 21;
 pub const SYS_NOTIFY: u64 = 22;
+pub const SYS_CALL_LEND: u64 = 23;
+pub const SYS_LENT_READ: u64 = 25;
+pub const SYS_LENT_WRITE: u64 = 26;
 
 // --- 0x20  memory ---
 pub const SYS_MMAP: u64 = 32;
@@ -369,6 +372,92 @@ pub fn sys_call(dest: usize, msg: &crate::ipc::Message, reply: &mut crate::ipc::
         syscall3(SYS_CALL, dest as u64, msg as *const _ as u64, reply as *mut _ as u64)
     };
     if ret == u64::MAX { Err(()) } else { Ok(()) }
+}
+
+/// The task called may read what [`sys_call_lend`] and friends lend it.
+pub const LEND_READ: u64 = 1 << 62;
+/// The task called may write into it.
+pub const LEND_WRITE: u64 = 1 << 63;
+
+fn call_lend(
+    dest: usize,
+    msg: &crate::ipc::Message,
+    reply: &mut crate::ipc::Message,
+    buf: *const u8,
+    len: usize,
+    access: u64,
+) -> Result<(), ()> {
+    let ret = unsafe {
+        syscall5(
+            SYS_CALL_LEND,
+            dest as u64,
+            msg as *const _ as u64,
+            reply as *mut _ as u64,
+            buf as u64,
+            len as u64 | access,
+        )
+    };
+    if ret == u64::MAX { Err(()) } else { Ok(()) }
+}
+
+/// [`sys_call`], lending `dest` a buffer to read until it replies. `dest`
+/// copies out of it with [`sys_lent_read`]; it never learns where it is.
+pub fn sys_call_lend(
+    dest: usize,
+    msg: &crate::ipc::Message,
+    reply: &mut crate::ipc::Message,
+    buf: &[u8],
+) -> Result<(), ()> {
+    call_lend(dest, msg, reply, buf.as_ptr(), buf.len(), LEND_READ)
+}
+
+/// [`sys_call`], lending `dest` a buffer to fill with [`sys_lent_write`].
+pub fn sys_call_lend_mut(
+    dest: usize,
+    msg: &crate::ipc::Message,
+    reply: &mut crate::ipc::Message,
+    buf: &mut [u8],
+) -> Result<(), ()> {
+    call_lend(dest, msg, reply, buf.as_ptr(), buf.len(), LEND_WRITE)
+}
+
+/// [`sys_call`], lending `dest` a buffer to read and write.
+pub fn sys_call_lend_rw(
+    dest: usize,
+    msg: &crate::ipc::Message,
+    reply: &mut crate::ipc::Message,
+    buf: &mut [u8],
+) -> Result<(), ()> {
+    call_lend(dest, msg, reply, buf.as_ptr(), buf.len(), LEND_READ | LEND_WRITE)
+}
+
+/// Copy out of what `client` lent with the call being served, from `offset`.
+/// Only between receiving that call and answering it.
+pub fn sys_lent_read(client: usize, offset: usize, dst: &mut [u8]) -> Result<usize, ()> {
+    let ret = unsafe {
+        syscall4(
+            SYS_LENT_READ,
+            client as u64,
+            offset as u64,
+            dst.as_mut_ptr() as u64,
+            dst.len() as u64,
+        )
+    };
+    if ret == u64::MAX { Err(()) } else { Ok(ret as usize) }
+}
+
+/// Copy into what `client` lent with the call being served, at `offset`.
+pub fn sys_lent_write(client: usize, offset: usize, src: &[u8]) -> Result<usize, ()> {
+    let ret = unsafe {
+        syscall4(
+            SYS_LENT_WRITE,
+            client as u64,
+            offset as u64,
+            src.as_ptr() as u64,
+            src.len() as u64,
+        )
+    };
+    if ret == u64::MAX { Err(()) } else { Ok(ret as usize) }
 }
 
 /// Outcome of a call that carries a deadline.

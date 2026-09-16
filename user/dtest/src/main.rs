@@ -858,6 +858,102 @@ fn test_spawned_memory() {
     check("run a program 160 times over", runs == 160);
 }
 
+static mut LEND_BUF: [u8; 64] = [0; 64];
+static LEND_SERVER: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+static LEND_GO: sync::Semaphore = sync::Semaphore::new(0);
+/// What the lending thread saw. Bit 0: its first call was answered. 1: its
+/// second was. 2: an unwritable buffer could not be lent for writing. 3:
+/// nothing was lent to it while nobody was calling it.
+static LEND_RESULTS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// The client half of `test_lent_buffers`: lends this task's main thread a
+/// buffer three ways.
+extern "C" fn lender() -> ! {
+    use quark_rt::ipc::Message;
+    // Not until main has given this thread the right to call it.
+    LEND_GO.acquire();
+    let server = LEND_SERVER.load(core::sync::atomic::Ordering::SeqCst);
+    let ask = |tag| Message { sender: 0, tag, data: [0; 6] };
+    let mut reply = Message::empty();
+    let mut results = 0;
+    let buf = unsafe { &mut *core::ptr::addr_of_mut!(LEND_BUF) };
+    buf[..8].copy_from_slice(b"lent-buf");
+    if syscall::sys_call_lend_rw(server, &ask(1), &mut reply, buf).is_ok() {
+        results |= 1;
+    }
+    if syscall::sys_call_lend(server, &ask(2), &mut reply, &buf[..]).is_ok() {
+        results |= 2;
+    }
+    // The argument page is mapped read-only.
+    let args = unsafe {
+        core::slice::from_raw_parts_mut(quark_rt::args::ARGS_PAGE_ADDR as *mut u8, 16)
+    };
+    if syscall::sys_call_lend_mut(server, &ask(3), &mut reply, args).is_err() {
+        results |= 4;
+    }
+    let mut probe = [0u8; 1];
+    if syscall::sys_lent_read(server, 0, &mut probe).is_err() {
+        results |= 8;
+    }
+    LEND_RESULTS.store(results, core::sync::atomic::Ordering::SeqCst);
+    syscall::sys_exit_code(0);
+}
+
+fn test_lent_buffers() {
+    use quark_rt::ipc::Message;
+    println!("lent buffers:");
+    let me = syscall::sys_getpid() as usize;
+    LEND_SERVER.store(me, core::sync::atomic::Ordering::SeqCst);
+    let Ok(t) = thread::spawn_with_stack(lender, 8) else {
+        check("start a thread to lend us a buffer", false);
+        return;
+    };
+    let t = t.tid();
+    // The thread may call this task: an Endpoint naming it, from its creator.
+    let granted = syscall::sys_cap_mint(syscall::SLOT_SCRATCH, syscall::CAP_TYPE_ENDPOINT, 1u64 << me, 0)
+        .is_ok()
+        && syscall::sys_cap_grant(t, syscall::SLOT_SCRATCH, syscall::SLOT_ENDPOINT).is_ok();
+    let _ = syscall::sys_cap_delete(syscall::SLOT_SCRATCH);
+    check("let the thread call us", granted);
+    LEND_GO.release();
+
+    let mut msg = Message::empty();
+    let mut got = [0u8; 8];
+    check("the lending call arrives", syscall::sys_recv(t, &mut msg).is_ok() && msg.tag == 1);
+    check(
+        "read what was lent",
+        syscall::sys_lent_read(t, 0, &mut got) == Ok(8) && &got == b"lent-buf",
+    );
+    check("write into what was lent", syscall::sys_lent_write(t, 4, b"XY") == Ok(2));
+    check("not past its end", syscall::sys_lent_read(t, 60, &mut got).is_err());
+    check(
+        "not at an offset that wraps",
+        syscall::sys_lent_read(t, usize::MAX, &mut got[..1]).is_err(),
+    );
+    let _ = syscall::sys_reply(t, &Message::empty());
+    check(
+        "the write landed where it was aimed",
+        unsafe { (&*core::ptr::addr_of!(LEND_BUF))[..8] == *b"lentXYuf" },
+    );
+    // Whatever the thread does next, its second call cannot be further along
+    // than waiting to be received.
+    check(
+        "nothing is lent once the call is answered",
+        syscall::sys_lent_read(t, 0, &mut got).is_err(),
+    );
+
+    check("a read-only lend arrives", syscall::sys_recv(t, &mut msg).is_ok() && msg.tag == 2);
+    check("it can be read", syscall::sys_lent_read(t, 0, &mut got) == Ok(8));
+    check("but not written", syscall::sys_lent_write(t, 0, b"Z").is_err());
+    let _ = syscall::sys_reply(t, &Message::empty());
+
+    let _ = wait_for(t);
+    let results = LEND_RESULTS.load(core::sync::atomic::Ordering::SeqCst);
+    check("both lending calls were answered", results & 3 == 3);
+    check("an unwritable buffer cannot be lent for writing", results & 4 != 0);
+    check("nothing is lent to a task nobody is calling", results & 8 != 0);
+}
+
 static LOCK: sync::Mutex<u32> = sync::Mutex::new(0);
 static COND: sync::Condvar = sync::Condvar::new();
 static ONCE: sync::Once = sync::Once::new();
@@ -1130,6 +1226,7 @@ pub extern "C" fn _start() -> ! {
         ("environment", test_environment),
         ("spaces", test_across_address_spaces),
         ("spawn", test_spawned_memory),
+        ("lend", test_lent_buffers),
         ("sync", test_sync),
         ("fpu", test_fpu),
         ("wire", test_wire),

@@ -1050,6 +1050,14 @@ fn read_cr3_of(tid: usize) -> usize {
     unsafe { TASKS[tid].as_ref().map_or(0, |t| t.cr3) }
 }
 
+/// The address space `tid` runs in, or 0 if there is no such task.
+pub fn task_cr3(tid: usize) -> usize {
+    if tid >= MAX_TASKS {
+        return 0;
+    }
+    read_cr3_of(tid)
+}
+
 /// How many live tasks `tid` has created.
 ///
 /// The bound on making threads without any authority: a task may make itself

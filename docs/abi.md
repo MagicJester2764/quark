@@ -97,7 +97,7 @@ so it is built from calls that already existed.
 | 1.9 | `SYS_MEMFD_TRUNCATE` (54) — `ftruncate` on memory named by a descriptor, which is how every Wayland client makes its buffer pool: `memfd_create`, `ftruncate`, `mmap`. Only while nobody has the region mapped and no descriptor for it is travelling, because growing it otherwise changes what is behind somebody else's live mapping. `SYS_MMAP_FD` (42) also returns the size it mapped instead of 0: a task that received a descriptor has no other way to learn how big the memory is, and the sender's word for it is the one thing it must not take. |
 | 1.10 | `SYS_FD_DUP` (68) and `SYS_PIPE_FD_SET` (70) no longer need `TaskMgmt` when the target is the caller, and both accept `u64::MAX - 1` for "any free descriptor" and return the number they took. Putting a descriptor into somebody else's table hands them something they never asked for; putting one into your own is `dup` and `pipe`, which every C library calls and which confer nothing. Also: `sys_cap_grant` (81) requires `TaskMgmt` over the destination, or the destination's consent — either a `sys_call` to the granter in progress, or a standing `Endpoint` naming it. Unrestricted, any task could fill any other's sixteen CSpace slots and leave it unable to be handed a display again. |
 | 1.11 | `SYS_ADDRSPACE_GIVE` (43) — move pages of the caller's own memory into an address space it made, which owns them from then on and frees them with itself. `SYS_ADDRSPACE_MAP` (37) is deprecated in its favour: every program a spawner loaded with it stayed allocated until the spawner exited. Also: `SYS_WAIT` (4) reaps the child it returns, so its memory is free, and its TID may be reused, by the time the call returns. A child used to be reaped only when the machine next went idle, which a parent running programs back to back never let it do. |
-| 1.12 | `SYS_CAP_READ` (92) — read one slot of a task's CSpace whole, for any task the caller manages. |
+| 1.12 | `SYS_CALL_LEND` (23), `SYS_LENT_READ` (25), `SYS_LENT_WRITE` (26) — a call can lend the task it calls a buffer, which that task copies into and out of through the kernel until it replies. `SYS_CAP_READ` (92) — read one slot of a task's CSpace whole, for any task the caller manages. |
 
 A capability may only be minted from one the caller already holds, and only
 narrowed — with one exception. **An `Endpoint` naming only the caller may
@@ -187,6 +187,9 @@ Messages are fixed size: sender TID, a `u64` tag, and six `u64` payload words.
 | 20 | `SYS_CALL_TIMEOUT` | arg0 = dest, arg1 = msg, arg2 = reply out, arg3 = ticks | **0 = replied, 1 = timed out**, `u64::MAX` = failed. **Blocks** up to the deadline. | `Endpoint` for dest |
 | 21 | `SYS_RECV_TIMEOUT` | arg0 = from, arg1 = msg out, arg2 = ticks | 0 / `u64::MAX`. **Blocks** up to the deadline. | — |
 | 22 | `SYS_NOTIFY` | arg0 = dest, arg1 = badge | 0 / `u64::MAX` | `Endpoint` for dest |
+| 23 | `SYS_CALL_LEND` | arg0 = dest, arg1 = msg, arg2 = reply out, arg3 = buffer, arg4 = length \| access bits | as `SYS_CALL` | `Endpoint` for dest |
+| 25 | `SYS_LENT_READ` | arg0 = caller, arg1 = offset, arg2 = buffer out, arg3 = length | bytes copied / `u64::MAX` | the caller's call is being served |
+| 26 | `SYS_LENT_WRITE` | arg0 = caller, arg1 = offset, arg2 = buffer, arg3 = length | bytes copied / `u64::MAX` | as above |
 
 The `Endpoint` check applies to calls where the sender names its own
 destination. IPC the kernel performs on a task's behalf through an installed
@@ -195,6 +198,21 @@ and only a `TaskMgmt` holder can install one.
 
 `SYS_NOTIFY` rejects the reserved signal bits; those may only be raised through
 `SYS_SIGNAL`, which checks the caller's authority over the target.
+
+**Lending memory with a call.** `SYS_CALL_LEND` is `SYS_CALL` with a buffer the
+task called may use until it replies: read it with `SYS_LENT_READ`, write it
+with `SYS_LENT_WRITE`. Bit 62 of arg4 lends it for reading, bit 63 for writing,
+and the bits below them are the length, at most 16 MiB. A read or write names
+the caller whose call it is serving and an offset inside what was lent, copies
+at most 1 MiB, and works only between receiving that call and answering it —
+before, the call has not been accepted; after, it is over. The kernel does the
+copying, so the server never learns where the memory is: the buffer is checked
+when the call is made and again, page by page, as it is copied, since a thread
+sharing the caller's address space may have changed it in between.
+
+This is how a server fills or reads a client's buffer without mapping it, and
+so without any authority over physical memory. It replaces requests that named
+a physical page for the server to map.
 
 Prefer `SYS_CALL_TIMEOUT` over `SYS_CALL` for any destination not known to be a
 running server. A TID is not a promise that anything is listening, and a plain

@@ -54,6 +54,11 @@ pub const SYS_REPLY: u64 = 19;
 pub const SYS_CALL_TIMEOUT: u64 = 20;
 pub const SYS_RECV_TIMEOUT: u64 = 21;
 pub const SYS_NOTIFY: u64 = 22;
+/// `SYS_CALL`, lending the task called a buffer until it replies.
+pub const SYS_CALL_LEND: u64 = 23;
+/// Copy out of, or into, a buffer a caller lent with the call being served.
+pub const SYS_LENT_READ: u64 = 25;
+pub const SYS_LENT_WRITE: u64 = 26;
 
 // --- 0x20  memory ---
 pub const SYS_MMAP: u64 = 32;
@@ -673,6 +678,87 @@ extern "C" fn syscall_dispatch(
                     0
                 }
                 Err(_) => u64::MAX,
+            }
+        }
+        SYS_CALL_LEND => {
+            // arg0 = dest, arg1 = msg, arg2 = reply out, arg3 = buffer,
+            // arg4 = length | LEND_READ | LEND_WRITE
+            let caller = scheduler::current_tid();
+            let dest = arg0 as usize;
+            if !crate::cap::task_has_endpoint(caller, dest) {
+                return deny_ipc(caller, dest, b"call");
+            }
+            let access = arg4 & (crate::lend::LEND_READ | crate::lend::LEND_WRITE);
+            let len = (arg4 & crate::lend::LEND_LEN_MASK) as usize;
+            if access == 0 || len == 0 || len > crate::lend::LEND_MAX {
+                return u64::MAX;
+            }
+            // Checked now, so that a buffer the caller cannot lend is the
+            // caller's error and never reaches the server.
+            if !validate_user_range(arg3, len as u64, access & crate::lend::LEND_WRITE != 0) {
+                return u64::MAX;
+            }
+            let msg_ptr = arg1 as *const crate::ipc::Message;
+            let reply_ptr = arg2 as *mut crate::ipc::Message;
+            let msg_size = core::mem::size_of::<crate::ipc::Message>() as u64;
+            if !validate_user_ptr(arg1, msg_size) || !validate_user_ptr_mut(arg2, msg_size) {
+                return u64::MAX;
+            }
+            let msg = {
+                let _ua = crate::cpu::UserAccess::begin();
+                unsafe { *msg_ptr }
+            };
+            let lent = crate::ipc::Lent { addr: arg3 as usize, len, access };
+            match crate::ipc::sys_call_lend(dest, &msg, lent) {
+                Ok(reply) => {
+                    let _ua = crate::cpu::UserAccess::begin();
+                    unsafe { *reply_ptr = reply };
+                    0
+                }
+                Err(_) => u64::MAX,
+            }
+        }
+        SYS_LENT_READ | SYS_LENT_WRITE => {
+            // arg0 = the caller that lent it, arg1 = offset into what it lent,
+            // arg2 = this task's buffer, arg3 = length
+            let me = scheduler::current_tid();
+            let client = arg0 as usize;
+            let offset = arg1 as usize;
+            let local = arg2;
+            let len = arg3 as usize;
+            let into_lent = nr == SYS_LENT_WRITE;
+            if len == 0 {
+                return 0;
+            }
+            if len > crate::lend::COPY_MAX {
+                return u64::MAX;
+            }
+            // Read from when writing into the lent buffer, written to when
+            // reading out of it.
+            let local_ok = if into_lent {
+                validate_user_ptr(local, len as u64)
+            } else {
+                validate_user_ptr_mut(local, len as u64)
+            };
+            if !local_ok {
+                return u64::MAX;
+            }
+            let Some((lent, cr3)) = crate::ipc::lent_to(client, me) else {
+                return u64::MAX;
+            };
+            let need = if into_lent { crate::lend::LEND_WRITE } else { crate::lend::LEND_READ };
+            if lent.access & need == 0 {
+                return u64::MAX;
+            }
+            match offset.checked_add(len) {
+                Some(end) if end <= lent.len => {}
+                _ => return u64::MAX,
+            }
+            // Syscalls run with interrupts off, and nothing here blocks.
+            if unsafe { crate::lend::copy(cr3, lent.addr + offset, local as usize, len, into_lent) } {
+                len as u64
+            } else {
+                u64::MAX
             }
         }
         SYS_REPLY => {

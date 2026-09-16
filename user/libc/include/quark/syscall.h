@@ -21,6 +21,14 @@
 #define SYS_RECV            17
 #define SYS_CALL            18
 #define SYS_REPLY           19
+#define SYS_CALL_LEND       23
+#define SYS_LENT_READ       25
+#define SYS_LENT_WRITE      26
+
+/* SYS_CALL_LEND's last argument is the length with these above it: what the
+   task called may do with the buffer until it replies. */
+#define QUARK_LEND_READ     (1UL << 62)
+#define QUARK_LEND_WRITE    (1UL << 63)
 
 /* 0x20  memory */
 #define SYS_MMAP            32

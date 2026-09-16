@@ -81,10 +81,21 @@ pub fn is_calling(tid: usize, dest: usize) -> bool {
     out
 }
 
+/// A buffer lent with a call, for the task called to use until it replies.
+#[derive(Debug, Clone, Copy)]
+pub struct Lent {
+    pub addr: usize,
+    pub len: usize,
+    /// `lend::LEND_READ`, `lend::LEND_WRITE`, or both.
+    pub access: u64,
+}
+
 /// IPC state and pending message for each task.
 struct TaskIpc {
     state: IpcState,
     pending_msg: Option<Message>,
+    /// What the task lent with the call it is making, while it is making it.
+    lent: Option<Lent>,
 }
 
 const MAX_TASKS: usize = 64;
@@ -92,9 +103,34 @@ static mut TASK_IPC: [TaskIpc; MAX_TASKS] = {
     const INIT: TaskIpc = TaskIpc {
         state: IpcState::None,
         pending_msg: None,
+        lent: None,
     };
     [INIT; MAX_TASKS]
 };
+
+/// What `client` lent with the call it is blocked in to `server`, and the
+/// address space it lives in.
+///
+/// Nothing unless `server` has received that call and not yet answered it: a
+/// call still waiting to be picked up has not been accepted, and one that has
+/// been answered is over.
+pub fn lent_to(client: usize, server: usize) -> Option<(Lent, usize)> {
+    if client >= MAX_TASKS {
+        return None;
+    }
+    let flags = irq_save();
+    let out = unsafe {
+        match (TASK_IPC[client].state, TASK_IPC[client].lent) {
+            (IpcState::CallBlocked(s), Some(lent)) if s == server => {
+                let cr3 = scheduler::task_cr3(client);
+                if cr3 != 0 { Some((lent, cr3)) } else { None }
+            }
+            _ => None,
+        }
+    };
+    irq_restore(flags);
+    out
+}
 
 /// Per-task timeout deadline (PIT tick count). 0 = no timeout.
 static mut TASK_TIMEOUT: [u64; MAX_TASKS] = [0; MAX_TASKS];
@@ -622,7 +658,12 @@ pub fn sys_recv(from: usize) -> Result<Message, IpcError> {
 
 /// Synchronous RPC: send a message and wait for a reply.
 pub fn sys_call(dest: usize, msg: &Message) -> Result<Message, IpcError> {
-    call_inner(dest, msg, 0)
+    call_inner(dest, msg, 0, None)
+}
+
+/// A call that lends `dest` a buffer until it replies.
+pub fn sys_call_lend(dest: usize, msg: &Message, lent: Lent) -> Result<Message, IpcError> {
+    call_inner(dest, msg, 0, Some(lent))
 }
 
 /// Synchronous call that gives up after `timeout_ticks`.
@@ -640,11 +681,16 @@ pub fn sys_call_timeout(
     msg: &Message,
     timeout_ticks: u64,
 ) -> Result<Message, IpcError> {
-    call_inner(dest, msg, timeout_ticks)
+    call_inner(dest, msg, timeout_ticks, None)
 }
 
 /// `timeout_ticks` of 0 means block indefinitely.
-fn call_inner(dest: usize, msg: &Message, timeout_ticks: u64) -> Result<Message, IpcError> {
+fn call_inner(
+    dest: usize,
+    msg: &Message,
+    timeout_ticks: u64,
+    lent: Option<Lent>,
+) -> Result<Message, IpcError> {
     if dest >= MAX_TASKS {
         return Err(IpcError::InvalidTid);
     }
@@ -660,6 +706,9 @@ fn call_inner(dest: usize, msg: &Message, timeout_ticks: u64) -> Result<Message,
     unsafe {
         let mut to_send = *msg;
         to_send.sender = caller;
+        // Lent before either path can hand the message over: a server woken
+        // by it may look for the buffer before this task runs again.
+        TASK_IPC[caller].lent = lent;
 
         // Check if dest is recv-blocked
         let dest_state = TASK_IPC[dest].state;
@@ -711,6 +760,8 @@ fn call_inner(dest: usize, msg: &Message, timeout_ticks: u64) -> Result<Message,
     let flags = irq_save();
     let result = unsafe {
         TASK_TIMEOUT[caller] = 0;
+        // However the call ended, nothing is lent any more.
+        TASK_IPC[caller].lent = None;
         let reply = match TASK_IPC[caller].pending_msg.take() {
             Some(m) => m,
             None => {
@@ -1003,6 +1054,7 @@ pub fn cleanup_task_ipc(dead_tid: usize) {
         // Clear the dead task's own IPC state, timeout, notifications, and signal deadline
         TASK_IPC[dead_tid].state = IpcState::None;
         TASK_IPC[dead_tid].pending_msg = None;
+        TASK_IPC[dead_tid].lent = None;
         TASK_TIMEOUT[dead_tid] = 0;
         TASK_TIMED_OUT[dead_tid] = false;
         TASK_NOTIFY[dead_tid] = 0;
