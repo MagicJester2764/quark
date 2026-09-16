@@ -32,7 +32,7 @@ pub fn alloc_block(ext2: &mut Ext2State) -> Result<u32, u64> {
         // Scan bitmap sectors
         for s in 0..ext2.sectors_per_block {
             let abs_lba = ext2.block_to_lba(bitmap_block) + s;
-            raw_read_sector(ext2.disk_tid, ext2.buf_phys, abs_lba).map_err(|_| ERR_IO)?;
+            raw_read_sector(ext2.disk_tid, abs_lba).map_err(|_| ERR_IO)?;
             let buf = unsafe { core::slice::from_raw_parts_mut(DISK_IO_BUF as *mut u8, 512) };
 
             for byte_idx in 0..512usize {
@@ -89,7 +89,7 @@ pub fn free_block(ext2: &mut Ext2State, block: u32) -> Result<(), u64> {
     let byte_in_sector = byte_idx % 512;
 
     let abs_lba = ext2.block_to_lba(bitmap_block) + sector_in_bitmap;
-    raw_read_sector(ext2.disk_tid, ext2.buf_phys, abs_lba).map_err(|_| ERR_IO)?;
+    raw_read_sector(ext2.disk_tid, abs_lba).map_err(|_| ERR_IO)?;
     let buf = unsafe { core::slice::from_raw_parts_mut(DISK_IO_BUF as *mut u8, 512) };
 
     buf[byte_in_sector] &= !(1 << bit);
@@ -124,7 +124,7 @@ pub fn alloc_inode(ext2: &mut Ext2State) -> Result<u32, u64> {
 
         for s in 0..ext2.sectors_per_block {
             let abs_lba = ext2.block_to_lba(bitmap_block) + s;
-            raw_read_sector(ext2.disk_tid, ext2.buf_phys, abs_lba).map_err(|_| ERR_IO)?;
+            raw_read_sector(ext2.disk_tid, abs_lba).map_err(|_| ERR_IO)?;
             let buf = unsafe { core::slice::from_raw_parts_mut(DISK_IO_BUF as *mut u8, 512) };
 
             for byte_idx in 0..512usize {
@@ -190,7 +190,7 @@ pub fn free_inode(ext2: &mut Ext2State, inode_num: u32) -> Result<(), u64> {
     let byte_in_sector = byte_idx % 512;
 
     let abs_lba = ext2.block_to_lba(bitmap_block) + sector_in_bitmap;
-    raw_read_sector(ext2.disk_tid, ext2.buf_phys, abs_lba).map_err(|_| ERR_IO)?;
+    raw_read_sector(ext2.disk_tid, abs_lba).map_err(|_| ERR_IO)?;
     let buf = unsafe { core::slice::from_raw_parts_mut(DISK_IO_BUF as *mut u8, 512) };
 
     buf[byte_in_sector] &= !(1 << bit);

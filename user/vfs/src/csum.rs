@@ -190,7 +190,7 @@ fn read_bitmap(ext2: &Ext2State, block: u32, bytes: usize) -> Result<&'static [u
     let sectors = bytes.div_ceil(512);
     for s in 0..sectors {
         let abs_lba = ext2.block_to_lba(block) + s as u32;
-        raw_read_sector(ext2.disk_tid, ext2.buf_phys, abs_lba).map_err(|_| ERR_IO)?;
+        raw_read_sector(ext2.disk_tid, abs_lba).map_err(|_| ERR_IO)?;
         let disk = unsafe { core::slice::from_raw_parts(DISK_IO_BUF as *const u8, 512) };
         let take = (bytes - s * 512).min(512);
         buf[s * 512..s * 512 + take].copy_from_slice(&disk[..take]);

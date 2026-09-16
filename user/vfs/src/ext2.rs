@@ -11,11 +11,9 @@ use crate::csum;
 use crate::ext4;
 use crate::{
     read_u16, read_u32, CACHE_BUF_BASE, CLIENT_BUF, DISK_IO_BUF, ERR_IO, ERR_IS_DIR,
-    ERR_NOT_FOUND, PAGE_SIZE, SECTOR_CACHE, TAG_DISK_OK, TAG_READ_SECTOR,
-    TAG_READ_SECTORS, TAG_WRITE_SECTOR,
+    ERR_NOT_FOUND, PAGE_SIZE, SECTOR_CACHE,
 };
 use quark_rt::println;
-use quark_rt::ipc::Message;
 use quark_rt::syscall;
 
 // ---------------------------------------------------------------------------
@@ -233,7 +231,6 @@ const MAX_BLOCK_GROUPS: usize = 128;
 
 pub struct Ext2State {
     pub disk_tid: usize,
-    pub buf_phys: usize,
     pub part_lba: u32,
     pub block_size: u32,
     pub sectors_per_block: u32,
@@ -276,7 +273,6 @@ impl Ext2State {
     pub const fn empty() -> Self {
         Self {
             disk_tid: 0,
-            buf_phys: 0,
             part_lba: 0,
             block_size: 1024,
             sectors_per_block: 2,
@@ -326,7 +322,7 @@ impl Ext2State {
         let idx = if let Some(i) = cache.lookup(abs_lba) {
             i
         } else {
-            raw_read_sector(self.disk_tid, self.buf_phys, abs_lba)?;
+            raw_read_sector(self.disk_tid, abs_lba)?;
             cache.insert(abs_lba, DISK_IO_BUF)
         };
         Ok(unsafe { core::slice::from_raw_parts((CACHE_BUF_BASE + idx * 512) as *const u8, 512) })
@@ -359,19 +355,7 @@ impl Ext2State {
 
     /// Write a sector straight to the disk, transaction or not.
     pub fn write_sector_raw(&self, abs_lba: u32) -> Result<(), ()> {
-        let msg = Message {
-            sender: 0,
-            tag: TAG_WRITE_SECTOR,
-            data: [abs_lba as u64, self.buf_phys as u64, 0, 0, 0, 0],
-        };
-        let mut reply = Message::empty();
-        if syscall::sys_call(self.disk_tid, &msg, &mut reply).is_err() {
-            return Err(());
-        }
-        if reply.tag != TAG_DISK_OK {
-            return Err(());
-        }
-        // Invalidate cache for this sector
+        crate::disk::write(self.disk_tid, abs_lba)?;
         unsafe { SECTOR_CACHE.invalidate(abs_lba) };
         Ok(())
     }
@@ -399,7 +383,7 @@ impl Ext2State {
             return;
         }
 
-        if raw_read_sectors(self.disk_tid, self.buf_phys, start_abs_lba, count as u32).is_err() {
+        if raw_read_sectors(self.disk_tid, start_abs_lba, count as u32).is_err() {
             return;
         }
 
@@ -426,7 +410,7 @@ impl Ext2State {
 // Raw disk I/O helpers (standalone, for init before Ext2State exists)
 // ---------------------------------------------------------------------------
 
-pub fn raw_read_sector(disk_tid: usize, buf_phys: usize, lba: u32) -> Result<(), ()> {
+pub fn raw_read_sector(disk_tid: usize, lba: u32) -> Result<(), ()> {
     // A read-modify-write inside a transaction must see the transaction's own
     // earlier writes. Going to the disk would read what is deliberately not
     // written yet and put back a block missing every change made so far.
@@ -436,7 +420,7 @@ pub fn raw_read_sector(disk_tid: usize, buf_phys: usize, lba: u32) -> Result<(),
             return Ok(());
         }
     }
-    read_sector_bypass(disk_tid, buf_phys, lba)
+    read_sector_bypass(disk_tid, lba)
 }
 
 /// Read a sector from the disk, ignoring any open transaction.
@@ -444,41 +428,12 @@ pub fn raw_read_sector(disk_tid: usize, buf_phys: usize, lba: u32) -> Result<(),
 /// The journal's own bookkeeping needs what is actually on the disk: writing
 /// the transaction's version of a block out from under it would put half a
 /// transaction where the journal had promised none.
-pub fn read_sector_bypass(disk_tid: usize, buf_phys: usize, lba: u32) -> Result<(), ()> {
-    let msg = Message {
-        sender: 0,
-        tag: TAG_READ_SECTOR,
-        data: [lba as u64, buf_phys as u64, 0, 0, 0, 0],
-    };
-    let mut reply = Message::empty();
-    if syscall::sys_call(disk_tid, &msg, &mut reply).is_err() {
-        return Err(());
-    }
-    if reply.tag != TAG_DISK_OK {
-        return Err(());
-    }
-    Ok(())
+pub fn read_sector_bypass(disk_tid: usize, lba: u32) -> Result<(), ()> {
+    crate::disk::read(disk_tid, lba, 1)
 }
 
-pub fn raw_read_sectors(
-    disk_tid: usize,
-    buf_phys: usize,
-    start_lba: u32,
-    count: u32,
-) -> Result<(), ()> {
-    let msg = Message {
-        sender: 0,
-        tag: TAG_READ_SECTORS,
-        data: [start_lba as u64, buf_phys as u64, count as u64, 0, 0, 0],
-    };
-    let mut reply = Message::empty();
-    if syscall::sys_call(disk_tid, &msg, &mut reply).is_err() {
-        return Err(());
-    }
-    if reply.tag != TAG_DISK_OK {
-        return Err(());
-    }
-    Ok(())
+pub fn raw_read_sectors(disk_tid: usize, start_lba: u32, count: u32) -> Result<(), ()> {
+    crate::disk::read(disk_tid, start_lba, count)
 }
 
 // ---------------------------------------------------------------------------
@@ -512,20 +467,15 @@ pub fn write_u32(data: &mut [u8], off: usize, val: u32) {
 /// stack to copy it out overflowed the server's four-page stack the moment
 /// 64-bit descriptors made each entry wider. It lives in .bss now and is
 /// filled where it sits.
-pub fn init_ext2(
-    ext2: &mut Ext2State,
-    disk_tid: usize,
-    buf_phys: usize,
-    part_lba: u32,
-) -> Result<(), ()> {
+pub fn init_ext2(ext2: &mut Ext2State, disk_tid: usize, part_lba: u32) -> Result<(), ()> {
     // Read superblock — it's at byte offset 1024, which is sector 2 (512*2=1024).
-    raw_read_sector(disk_tid, buf_phys, part_lba + 2)?;
+    raw_read_sector(disk_tid, part_lba + 2)?;
     let sb0 = unsafe { core::slice::from_raw_parts(DISK_IO_BUF as *const u8, 512) };
     let mut sb_buf = [0u8; 1024];
     sb_buf[0..512].copy_from_slice(sb0);
 
     // Read second half of superblock (sector 3)
-    raw_read_sector(disk_tid, buf_phys, part_lba + 3)?;
+    raw_read_sector(disk_tid, part_lba + 3)?;
     let sb1 = unsafe { core::slice::from_raw_parts(DISK_IO_BUF as *const u8, 512) };
     sb_buf[512..1024].copy_from_slice(sb1);
 
@@ -605,7 +555,6 @@ pub fn init_ext2(
         (s_blocks_count + s_blocks_per_group - 1) / s_blocks_per_group;
 
     ext2.disk_tid = disk_tid;
-    ext2.buf_phys = buf_phys;
     ext2.part_lba = part_lba;
     ext2.block_size = block_size;
     ext2.sectors_per_block = sectors_per_block;
@@ -690,7 +639,7 @@ pub fn zero_inode(ext2: &Ext2State, inode_num: u32) -> Result<(), u64> {
     csum::set_inode(ext2, inode_num, &mut raw[..size]);
 
     for i in 0..sectors {
-        raw_read_sector(ext2.disk_tid, ext2.buf_phys, abs_lba + i as u32).map_err(|_| ERR_IO)?;
+        raw_read_sector(ext2.disk_tid, abs_lba + i as u32).map_err(|_| ERR_IO)?;
         let buf = unsafe { core::slice::from_raw_parts_mut(DISK_IO_BUF as *mut u8, 512) };
         let start = if i == 0 { offset_in_sector } else { 0 };
         let take = (size - (i * 512).saturating_sub(offset_in_sector)).min(512 - start);
@@ -803,7 +752,7 @@ pub fn write_inode(ext2: &Ext2State, inode_num: u32, inode: &Ext2Inode) -> Resul
 
     let raw = unsafe { &mut *core::ptr::addr_of_mut!(INODE_BUF) };
     for i in 0..sectors {
-        raw_read_sector(ext2.disk_tid, ext2.buf_phys, abs_lba + i as u32).map_err(|_| ERR_IO)?;
+        raw_read_sector(ext2.disk_tid, abs_lba + i as u32).map_err(|_| ERR_IO)?;
         let buf = unsafe { core::slice::from_raw_parts(DISK_IO_BUF as *const u8, 512) };
         let start = if i == 0 { offset_in_sector } else { 0 };
         let take = (size - (i * 512).saturating_sub(offset_in_sector)).min(512 - start);
@@ -818,7 +767,7 @@ pub fn write_inode(ext2: &Ext2State, inode_num: u32, inode: &Ext2Inode) -> Resul
     csum::set_inode(ext2, inode_num, &mut raw[..size]);
 
     for i in 0..sectors {
-        raw_read_sector(ext2.disk_tid, ext2.buf_phys, abs_lba + i as u32).map_err(|_| ERR_IO)?;
+        raw_read_sector(ext2.disk_tid, abs_lba + i as u32).map_err(|_| ERR_IO)?;
         let buf = unsafe { core::slice::from_raw_parts_mut(DISK_IO_BUF as *mut u8, 512) };
         let start = if i == 0 { offset_in_sector } else { 0 };
         let take = (size - (i * 512).saturating_sub(offset_in_sector)).min(512 - start);
@@ -1098,7 +1047,7 @@ pub fn write_file_data(
             let abs_lba = ext2.block_to_lba(phys_block) + sec;
 
             // Read-modify-write
-            raw_read_sector(ext2.disk_tid, ext2.buf_phys, abs_lba).map_err(|_| ERR_IO)?;
+            raw_read_sector(ext2.disk_tid, abs_lba).map_err(|_| ERR_IO)?;
             let buf =
                 unsafe { core::slice::from_raw_parts_mut(DISK_IO_BUF as *mut u8, 512) };
 
@@ -1206,7 +1155,7 @@ pub fn write_block_ptr(ext2: &Ext2State, block: u32, index: u32, value: u32) -> 
     let abs_lba = ext2.block_to_lba(block) + sector_in_block;
 
     // Read-modify-write
-    raw_read_sector(ext2.disk_tid, ext2.buf_phys, abs_lba).map_err(|_| ERR_IO)?;
+    raw_read_sector(ext2.disk_tid, abs_lba).map_err(|_| ERR_IO)?;
     let buf = unsafe { core::slice::from_raw_parts_mut(DISK_IO_BUF as *mut u8, 512) };
     let bytes = value.to_le_bytes();
     buf[offset_in_sector..offset_in_sector + 4].copy_from_slice(&bytes);
@@ -1254,7 +1203,7 @@ pub fn set_needs_recovery(ext2: &Ext2State, on: bool) -> Result<(), u64> {
     let abs_lba = ext2.part_lba + 2;
     let sb = unsafe { &mut *core::ptr::addr_of_mut!(SB_BUF) };
     for s in 0..2usize {
-        read_sector_bypass(ext2.disk_tid, ext2.buf_phys, abs_lba + s as u32)
+        read_sector_bypass(ext2.disk_tid, abs_lba + s as u32)
             .map_err(|_| ERR_IO)?;
         let disk = unsafe { core::slice::from_raw_parts(DISK_IO_BUF as *const u8, 512) };
         sb[s * 512..(s + 1) * 512].copy_from_slice(disk);
@@ -1295,7 +1244,7 @@ pub fn flush_superblock(ext2: &Ext2State) -> Result<(), u64> {
     let abs_lba = ext2.part_lba + 2;
     let sb = unsafe { &mut *core::ptr::addr_of_mut!(SB_BUF) };
     for s in 0..2usize {
-        raw_read_sector(ext2.disk_tid, ext2.buf_phys, abs_lba + s as u32).map_err(|_| ERR_IO)?;
+        raw_read_sector(ext2.disk_tid, abs_lba + s as u32).map_err(|_| ERR_IO)?;
         let disk = unsafe { core::slice::from_raw_parts(DISK_IO_BUF as *const u8, 512) };
         sb[s * 512..(s + 1) * 512].copy_from_slice(disk);
     }
@@ -1332,7 +1281,7 @@ pub fn flush_bgd(ext2: &mut Ext2State, group: u32) -> Result<(), u64> {
     let abs_lba = ext2.block_to_lba(bgd_block) + bgd_sector;
 
     // Read-modify-write.
-    raw_read_sector(ext2.disk_tid, ext2.buf_phys, abs_lba).map_err(|_| ERR_IO)?;
+    raw_read_sector(ext2.disk_tid, abs_lba).map_err(|_| ERR_IO)?;
     let buf = unsafe { core::slice::from_raw_parts_mut(DISK_IO_BUF as *mut u8, 512) };
     ext2.bgd_table[group as usize].write_to_bytes(buf, bgd_offset_in_sector, ext2.desc_size);
 
@@ -1347,7 +1296,7 @@ pub fn flush_bgd(ext2: &mut Ext2State, group: u32) -> Result<(), u64> {
     csum::refresh_bitmaps(ext2, group, &mut desc[..size])?;
     csum::set_group_desc(ext2, group, &mut desc[..size]);
 
-    raw_read_sector(ext2.disk_tid, ext2.buf_phys, abs_lba).map_err(|_| ERR_IO)?;
+    raw_read_sector(ext2.disk_tid, abs_lba).map_err(|_| ERR_IO)?;
     let buf = unsafe { core::slice::from_raw_parts_mut(DISK_IO_BUF as *mut u8, 512) };
     buf[bgd_offset_in_sector..bgd_offset_in_sector + size].copy_from_slice(&desc[..size]);
     ext2.write_sector_abs(abs_lba).map_err(|_| ERR_IO)?;

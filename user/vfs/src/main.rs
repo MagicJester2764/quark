@@ -8,6 +8,7 @@ pub mod ext2_alloc;
 pub mod ext2_dir;
 pub mod ext4;
 pub mod csum;
+pub mod disk;
 pub mod journal;
 
 use quark_rt::ipc::{Message, TID_ANY};
@@ -102,6 +103,8 @@ fn ext2_state_mut() -> &'static mut ext2::Ext2State {
 pub const DISK_IO_BUF: usize = 0x86_0000_0000;
 pub const CLIENT_BUF: usize = 0x87_0000_0000;
 pub const CACHE_BUF_BASE: usize = 0x8A_0000_0000;
+/// Pages behind the sector cache: 256 sectors of 512 bytes.
+const CACHE_PAGES: usize = 32;
 pub const SHMEM_BUF: usize = 0x8B_0000_0000;
 
 // ---------------------------------------------------------------------------
@@ -285,30 +288,17 @@ pub fn read_u32(data: &[u8], off: usize) -> u32 {
 
 struct DiskState {
     disk_tid: usize,
-    buf_phys: usize,
     part_lba: u32,
     bpb: Bpb,
 }
 
 impl DiskState {
-    fn raw_read_sector(disk_tid: usize, buf_phys: usize, lba: u32) -> Result<(), ()> {
-        let msg = Message {
-            sender: 0,
-            tag: TAG_READ_SECTOR,
-            data: [lba as u64, buf_phys as u64, 0, 0, 0, 0],
-        };
-        let mut reply = Message::empty();
-        if syscall::sys_call(disk_tid, &msg, &mut reply).is_err() {
-            return Err(());
-        }
-        if reply.tag != TAG_DISK_OK {
-            return Err(());
-        }
-        Ok(())
+    fn raw_read_sector(disk_tid: usize, lba: u32) -> Result<(), ()> {
+        disk::read(disk_tid, lba, 1)
     }
 
     fn read_sector(&self, lba: u32) -> Result<(), ()> {
-        Self::raw_read_sector(self.disk_tid, self.buf_phys, self.part_lba + lba)
+        Self::raw_read_sector(self.disk_tid, self.part_lba + lba)
     }
 
     /// Read a sector through the cache. Returns a slice to cached data.
@@ -319,27 +309,15 @@ impl DiskState {
             i
         } else {
             // Cache miss — read from disk into DISK_IO_BUF, then insert into cache
-            Self::raw_read_sector(self.disk_tid, self.buf_phys, abs_lba)?;
+            Self::raw_read_sector(self.disk_tid, abs_lba)?;
             cache.insert(abs_lba, DISK_IO_BUF)
         };
         Ok(unsafe { core::slice::from_raw_parts((CACHE_BUF_BASE + idx * 512) as *const u8, 512) })
     }
 
     /// Read multiple consecutive sectors into DISK_IO_BUF (up to 8, fitting one 4K page).
-    fn raw_read_sectors(disk_tid: usize, buf_phys: usize, start_lba: u32, count: u32) -> Result<(), ()> {
-        let msg = Message {
-            sender: 0,
-            tag: TAG_READ_SECTORS,
-            data: [start_lba as u64, buf_phys as u64, count as u64, 0, 0, 0],
-        };
-        let mut reply = Message::empty();
-        if syscall::sys_call(disk_tid, &msg, &mut reply).is_err() {
-            return Err(());
-        }
-        if reply.tag != TAG_DISK_OK {
-            return Err(());
-        }
-        Ok(())
+    fn raw_read_sectors(disk_tid: usize, start_lba: u32, count: u32) -> Result<(), ()> {
+        disk::read(disk_tid, start_lba, count)
     }
 
     /// Prefetch consecutive sectors into the cache using a single multi-sector IPC call.
@@ -362,7 +340,7 @@ impl DiskState {
 
         // Read all sectors in one IPC call
         let abs_start = self.part_lba + start_lba;
-        if Self::raw_read_sectors(self.disk_tid, self.buf_phys, abs_start, count as u32).is_err() {
+        if Self::raw_read_sectors(self.disk_tid, abs_start, count as u32).is_err() {
             return;
         }
 
@@ -395,23 +373,7 @@ impl DiskState {
     }
 
     fn write_sector(&self, lba: u32) -> Result<(), ()> {
-        let msg = Message {
-            sender: 0,
-            tag: TAG_WRITE_SECTOR,
-            data: [
-                (self.part_lba + lba) as u64,
-                self.buf_phys as u64,
-                0, 0, 0, 0,
-            ],
-        };
-        let mut reply = Message::empty();
-        if syscall::sys_call(self.disk_tid, &msg, &mut reply).is_err() {
-            return Err(());
-        }
-        if reply.tag != TAG_DISK_OK {
-            return Err(());
-        }
-        Ok(())
+        disk::write(self.disk_tid, self.part_lba + lba)
     }
 
     fn sector_data_mut(&self) -> &mut [u8] {
@@ -495,8 +457,8 @@ impl DiskState {
         Ok(())
     }
 
-    fn find_rootfs_partition(disk_tid: usize, buf_phys: usize) -> Result<u32, ()> {
-        Self::raw_read_sector(disk_tid, buf_phys, 0)?;
+    fn find_rootfs_partition(disk_tid: usize) -> Result<u32, ()> {
+        Self::raw_read_sector(disk_tid, 0)?;
         let sec0 = unsafe { core::slice::from_raw_parts(DISK_IO_BUF as *const u8, 512) };
 
         let has_mbr = sec0[510] == 0x55 && sec0[511] == 0xAA;
@@ -508,12 +470,12 @@ impl DiskState {
         }
 
         // Read GPT header (LBA 1)
-        Self::raw_read_sector(disk_tid, buf_phys, 1)?;
+        Self::raw_read_sector(disk_tid, 1)?;
         let hdr = unsafe { core::slice::from_raw_parts(DISK_IO_BUF as *const u8, 512) };
 
         if &hdr[0..8] != b"EFI PART" {
             // Try MBR partition 1
-            Self::raw_read_sector(disk_tid, buf_phys, 0)?;
+            Self::raw_read_sector(disk_tid, 0)?;
             let mbr = unsafe { core::slice::from_raw_parts(DISK_IO_BUF as *const u8, 512) };
             let p1_lba = read_u32(mbr, 446 + 8);
             if p1_lba != 0 {
@@ -529,7 +491,7 @@ impl DiskState {
         }
 
         // Read partition entries, find partition 2 (index 1)
-        Self::raw_read_sector(disk_tid, buf_phys, entry_start_lba)?;
+        Self::raw_read_sector(disk_tid, entry_start_lba)?;
         let entries = unsafe { core::slice::from_raw_parts(DISK_IO_BUF as *const u8, 512) };
         let entries_per_sector = 512 / entry_size as usize;
         let part_idx = 1;
@@ -537,7 +499,7 @@ impl DiskState {
         let offset_in_sector = (part_idx % entries_per_sector) * entry_size as usize;
 
         if sector_of_entry > 0 {
-            Self::raw_read_sector(disk_tid, buf_phys, entry_start_lba + sector_of_entry as u32)?;
+            Self::raw_read_sector(disk_tid, entry_start_lba + sector_of_entry as u32)?;
         }
 
         let data = if sector_of_entry > 0 {
@@ -1389,38 +1351,18 @@ pub extern "C" fn _start() -> ! {
     };
     println!("[vfs] Found disk at TID {}", disk_tid);
 
-    // Allocate I/O buffer
-    let buf_phys = match syscall::sys_phys_alloc(1) {
-        Ok(p) => p,
-        Err(()) => {
-            println!("[vfs] Failed to alloc phys page.");
-            syscall::sys_exit();
-        }
-    };
-    if syscall::sys_map_phys(buf_phys, DISK_IO_BUF, 1).is_err() {
-        println!("[vfs] Failed to map I/O buffer.");
+    // The page every sector passes through, and the sector cache (32 pages,
+    // 256 sectors). Ordinary memory: the disk driver is lent the one and
+    // never sees the other.
+    if syscall::sys_mmap(DISK_IO_BUF, 1).is_err()
+        || syscall::sys_mmap(CACHE_BUF_BASE, CACHE_PAGES).is_err()
+    {
+        println!("[vfs] No memory for disk buffers.");
         syscall::sys_exit();
     }
 
-    // Allocate sector cache buffer (32 pages = 128 KiB for 256 x 512-byte entries)
-    // Allocate one page at a time since phys_alloc doesn't guarantee contiguity.
-    let cache_pages = 32;
-    for i in 0..cache_pages {
-        let phys = match syscall::sys_phys_alloc(1) {
-            Ok(p) => p,
-            Err(()) => {
-                println!("[vfs] Failed to alloc cache page.");
-                syscall::sys_exit();
-            }
-        };
-        if syscall::sys_map_phys(phys, CACHE_BUF_BASE + i * PAGE_SIZE, 1).is_err() {
-            println!("[vfs] Failed to map cache buffer.");
-            syscall::sys_exit();
-        }
-    }
-
     // Find rootfs partition
-    let part_lba = match DiskState::find_rootfs_partition(disk_tid, buf_phys) {
+    let part_lba = match DiskState::find_rootfs_partition(disk_tid) {
         Ok(lba) => lba,
         Err(()) => {
             println!("[vfs] Failed to find rootfs partition.");
@@ -1430,11 +1372,11 @@ pub extern "C" fn _start() -> ! {
     println!("[vfs] Rootfs partition at LBA {}", part_lba);
 
     // Detect filesystem type: check for ext2 magic at partition offset 1024 (sector 2)
-    if DiskState::raw_read_sector(disk_tid, buf_phys, part_lba + 2).is_ok() {
+    if DiskState::raw_read_sector(disk_tid, part_lba + 2).is_ok() {
         let sb_data = unsafe { core::slice::from_raw_parts(DISK_IO_BUF as *const u8, 512) };
         let magic = read_u16(sb_data, 56);
         if magic == ext2::EXT2_MAGIC {
-            match ext2::init_ext2(ext2_state_mut(), disk_tid, buf_phys, part_lba) {
+            match ext2::init_ext2(ext2_state_mut(), disk_tid, part_lba) {
                 Ok(()) => {
                     let state = ext2_state();
                     println!(
@@ -1493,7 +1435,7 @@ pub extern "C" fn _start() -> ! {
     let disk = if unsafe { FS_TYPE } == FsType::Fat32 {
         // Read BPB
         if part_lba > 0 {
-            if DiskState::raw_read_sector(disk_tid, buf_phys, part_lba).is_err() {
+            if DiskState::raw_read_sector(disk_tid, part_lba).is_err() {
                 println!("[vfs] Failed to read BPB.");
                 syscall::sys_exit();
             }
@@ -1506,14 +1448,13 @@ pub extern "C" fn _start() -> ! {
             bpb.reserved_sectors, bpb.root_cluster
         );
 
-        let d = DiskState { disk_tid, buf_phys, part_lba, bpb };
+        let d = DiskState { disk_tid, part_lba, bpb };
         warm_cache(&d);
         d
     } else {
         // Dummy — won't be used for ext2 path
         DiskState {
             disk_tid,
-            buf_phys,
             part_lba,
             bpb: Bpb {
                 bytes_per_sector: 512,

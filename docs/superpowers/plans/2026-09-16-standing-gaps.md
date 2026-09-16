@@ -422,14 +422,14 @@ Commit: "A call can lend a buffer".
 - Consumes: Task 2's lending calls.
 - Produces: the disk protocol — `TAG_READ_SECTOR (lba)` and `TAG_READ_SECTORS (lba, count ≤ 8)` lend a buffer of `512 × count` to be written; `TAG_WRITE_SECTOR (lba)` lends 512 bytes to be read. `data[1]` is no longer read.
 
-- [ ] **Step 1: The driver** — replace `TEMP_MAP_ADDR` with a page of its own,
+- [x] **Step 1: The driver** — replace `TEMP_MAP_ADDR` with a page of its own,
 `sys_mmap(DRIVE_BUF, 1)` at start. Reads: `ata_read_sector(lba, DRIVE_BUF)`
 (or `ata_read_sectors`), then `sys_lent_write(msg.sender, 0, &buf[..512 *
 count])`, error `1` if that fails. Write: `sys_lent_read(msg.sender, 0, &mut
 buf[..512])` first, error `1` if it fails, then `ata_write_sector`. Manifest:
 drop `phys_range`, and replace the comment with why the driver needs none.
 
-- [ ] **Step 2: The VFS as a disk client** — `DISK_IO_BUF`, the cache pages and
+- [x] **Step 2: The VFS as a disk client** — `DISK_IO_BUF`, the cache pages and
 the journal buffers come from `sys_mmap`; `raw_read_sector(disk_tid, lba)`,
 `raw_read_sectors(disk_tid, lba, count)`, `read_sector_bypass(disk_tid, lba)`
 and both write paths lend `DISK_IO_BUF` (`sys_call_lend_mut` for reads, sized
@@ -437,14 +437,15 @@ and both write paths lend `DISK_IO_BUF` (`sys_call_lend_mut` for reads, sized
 `DiskState`, `Ext2State`, `init_ext2` and every call site —
 `grep -rn buf_phys user/vfs` must come back empty.
 
-- [ ] **Step 3: disktest** — its sector-0 read lends a `[u8; 512]`.
+- [x] **Step 3: disktest** — nothing to do: it only ever talks to the VFS, so
+it moves in Task 4.
 
-- [ ] **Step 4: Verify** — boot to the shell (the VFS mounts through the new
+- [x] **Step 4: Verify** — boot to the shell (the VFS mounts through the new
 path, so a working login is the first check), `dtest`, `disktest`,
 `runtests /etc/pixman.tests` (thirty programs read off the disk). Expected:
 dtest's broad-range check now names init, vfs and net but not disk.
 
-- [ ] **Step 5: Commit** — "The disk driver copies what it was lent".
+- [x] **Step 5: Commit** — "The disk driver copies what it was lent".
 
 ---
 

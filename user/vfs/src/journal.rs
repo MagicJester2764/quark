@@ -160,7 +160,7 @@ impl Journal {
 fn read_fs_block(ext2: &Ext2State, fs_block: u32, vaddr: usize) -> Result<(), u64> {
     let base = ext2.block_to_lba(fs_block);
     for s in 0..ext2.sectors_per_block {
-        read_sector_bypass(ext2.disk_tid, ext2.buf_phys, base + s).map_err(|_| ERR_IO)?;
+        read_sector_bypass(ext2.disk_tid, base + s).map_err(|_| ERR_IO)?;
         let disk = unsafe { core::slice::from_raw_parts(DISK_IO_BUF as *const u8, 512) };
         let dst = unsafe {
             core::slice::from_raw_parts_mut((vaddr + (s * 512) as usize) as *mut u8, 512)
@@ -199,13 +199,12 @@ fn txn_slot(i: usize) -> usize {
 /// Map the buffers the journal needs. Called once, before [`load`].
 pub fn map_buffers() -> Result<(), ()> {
     for i in 0..JBLOCK_PAGES + MAX_TXN_BLOCKS {
-        let phys = quark_rt::syscall::sys_phys_alloc(1)?;
         let vaddr = if i < JBLOCK_PAGES {
             JBLOCK_BUF + i * 4096
         } else {
             txn_slot(i - JBLOCK_PAGES)
         };
-        quark_rt::syscall::sys_map_phys(phys, vaddr, 1)?;
+        quark_rt::syscall::sys_mmap(vaddr, 1)?;
     }
     Ok(())
 }
