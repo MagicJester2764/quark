@@ -107,6 +107,23 @@ static unsigned long mmap_next = MMAP_BASE;
 /* What sys_mmap will take in one call. */
 #define MAP_CHUNK 256UL
 
+static void unmap_pages(unsigned long at, unsigned long pages) {
+    unsigned long done = 0;
+    while (done < pages) {
+        unsigned long n = pages - done;
+        if (n > MAP_CHUNK) {
+            n = MAP_CHUNK;
+        }
+        __syscall2(SYS_MUNMAP, at + done * PAGE_SIZE, n);
+        done += n;
+    }
+}
+
+/* All of it or none of it. The kernel backs a mapping as it makes it, so a
+   request for more than the machine has gets part way before it is refused —
+   and what it got on the way has to go back. Kept, it was memory nobody could
+   free, sitting exactly where the next mapping would be put; the kernel never
+   maps over anything, so every request after the first refusal failed too. */
 static long map_pages(unsigned long at, unsigned long pages) {
     unsigned long done = 0;
     while (done < pages) {
@@ -115,6 +132,7 @@ static long map_pages(unsigned long at, unsigned long pages) {
             n = MAP_CHUNK;
         }
         if (__syscall2(SYS_MMAP, at + done * PAGE_SIZE, n) == QUARK_ERR) {
+            unmap_pages(at, done);
             return -1;
         }
         done += n;
@@ -191,16 +209,7 @@ static long do_mmap_fd(long fd, unsigned long len) {
 }
 
 static long do_munmap(unsigned long at, unsigned long len) {
-    unsigned long pages = (len + PAGE_SIZE - 1) / PAGE_SIZE;
-    unsigned long done = 0;
-    while (done < pages) {
-        unsigned long n = pages - done;
-        if (n > MAP_CHUNK) {
-            n = MAP_CHUNK;
-        }
-        __syscall2(SYS_MUNMAP, at + done * PAGE_SIZE, n);
-        done += n;
-    }
+    unmap_pages(at, (len + PAGE_SIZE - 1) / PAGE_SIZE);
     return 0;
 }
 

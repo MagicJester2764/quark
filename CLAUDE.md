@@ -250,6 +250,12 @@ Three things follow from that, and breaking any of them is quiet:
   ownership transfer on the IPC — rather than a range grant.
 - Endpoint sets are TID bitmasks, not true endpoint objects. A service and its
   clients are named by slot number, not identity.
+- Nothing is demand-paged: memory is backed when it is mapped, not when it is
+  first touched. A program that maps far more than it uses — pixman's stress
+  test asks for a 2.7 GB mask and draws into a corner — is refused where Linux
+  would say yes, and a request bigger than free memory takes all of it for a
+  moment before it is. The C library's `mmap` gives back a partial mapping, so
+  the refusal is clean; the program has to check for it.
 - Focus is a single stack with little policy: Tab cycles, a new window takes it,
   and a click raises the one under the pointer. Keyboard focus and pointer focus
   are tracked separately, as Wayland requires, but there is no follow-mouse, no
