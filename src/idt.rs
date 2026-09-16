@@ -344,6 +344,25 @@ const PF_INSN_FETCH: u64 = 1 << 4;
 /// IPC tag for page fault messages sent to pager tasks.
 pub const TAG_PAGE_FAULT: u64 = 0xFFFF_0001;
 
+/// Linux's signal numbers for the exceptions a task can cause, which is what a
+/// C library and a shell know how to report.
+const SIGILL: i32 = 4;
+const SIGTRAP: i32 = 5;
+const SIGBUS: i32 = 7;
+const SIGFPE: i32 = 8;
+const SIGSEGV: i32 = 11;
+
+/// The signal Linux sends for an exception taken in user mode.
+fn signal_for(vec: usize) -> i32 {
+    match vec {
+        0 | 16 | 19 => SIGFPE,  // divide error, x87 fault, SIMD exception
+        1 | 3 => SIGTRAP,       // debug, breakpoint
+        6 => SIGILL,            // invalid opcode
+        17 => SIGBUS,           // alignment check
+        _ => SIGSEGV,           // general protection, stack, page, and the rest
+    }
+}
+
 #[unsafe(no_mangle)]
 extern "C" fn exception_handler(frame: &InterruptFrame) {
     let vec = frame.vector as usize;
@@ -398,11 +417,46 @@ extern "C" fn exception_handler(frame: &InterruptFrame) {
         console::puts(b") - no pager, killing task.\n");
 
         unsafe { core::arch::asm!("sti", options(nostack, nomem)) };
-        scheduler::exit();
-        // exit() never returns
+        // Not exit(), which reports success: a parent waiting on a task that
+        // died of a fault must not be told it finished.
+        scheduler::exit_with(-SIGSEGV);
     }
 
-    // All other exceptions (or kernel page faults): fatal
+    // Any other exception taken in ring 3 is the task's, not the kernel's.
+    //
+    // This used to fall through to the fatal path below and halt the machine,
+    // so one program executing a bad instruction stopped everything else —
+    // and musl's `abort()` executes a bad instruction on purpose, a privileged
+    // `hlt`, which made every failed assert in every C program a system halt.
+    // In a microkernel of all things. The task is killed with the signal Linux
+    // would have sent, negated, which is what a waiting parent sees.
+    if from_user {
+        let tid = scheduler::current_tid();
+        let sig = signal_for(vec);
+        crate::serial::puts(b"[UFAULT vec=");
+        crate::serial::put_usize(vec);
+        crate::serial::puts(b" tid=");
+        crate::serial::put_usize(tid);
+        crate::serial::puts(b" rip=0x");
+        crate::serial::put_hex_usize(frame.rip as usize);
+        crate::serial::puts(b" sig=");
+        crate::serial::put_usize(sig as usize);
+        crate::serial::puts(b"]\n");
+        console::puts(b"\n[kernel] ");
+        if vec < 32 {
+            console::puts(EXCEPTION_NAMES[vec]);
+        }
+        console::puts(b" in task ");
+        print_dec(tid);
+        console::puts(b" at RIP=");
+        print_hex(frame.rip);
+        console::puts(b" - killing task.\n");
+
+        unsafe { core::arch::asm!("sti", options(nostack, nomem)) };
+        scheduler::exit_with(-sig);
+    }
+
+    // Kernel faults: fatal
     // DEBUG: serial trace for kernel exceptions
     crate::serial::puts(b"[KFAULT vec=");
     crate::serial::put_usize(vec);

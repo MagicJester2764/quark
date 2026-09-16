@@ -458,10 +458,22 @@ static mut LAST_STATUS: i32 = 0;
 /// last one either way.
 fn set_status(name: &[u8], code: i32) {
     unsafe { LAST_STATUS = code; }
-    if code != 0 {
-        if let Ok(s) = core::str::from_utf8(name) {
-            println!("{}: exit {}", s, code);
-        }
+    if code == 0 {
+        return;
+    }
+    let Ok(s) = core::str::from_utf8(name) else { return };
+    // A negative status is a task the kernel killed, and the magnitude is the
+    // signal Linux would have sent. Naming it is the difference between "it
+    // failed" and "it executed an instruction it was not allowed to".
+    match code {
+        -4 => println!("{}: illegal instruction", s),
+        -5 => println!("{}: trace trap", s),
+        -7 => println!("{}: bus error", s),
+        -8 => println!("{}: floating-point exception", s),
+        -9 => println!("{}: killed", s),
+        -11 => println!("{}: segmentation fault", s),
+        c if c < 0 => println!("{}: killed ({})", s, -c),
+        c => println!("{}: exit {}", s, c),
     }
 }
 

@@ -775,14 +775,16 @@ pub fn kill_task(tid: usize) -> Result<(), ()> {
     // then let it sysret back to user space, where it kept running until the
     // next preemption dropped it — on an address space reaping was free to
     // tear down underneath it.
+    // -9, SIGKILL's number: every status for a task the kernel ended is the
+    // negated Linux signal, so a parent can tell a kill from a crash.
     if tid == current_tid() {
-        exit_with(-1);
+        exit_with(-9);
     }
     unsafe {
         match TASKS[tid].as_mut() {
             Some(task) if task.state != TaskState::Dead => {
                 task.state = TaskState::Dead;
-                task.exit_code = -1; // killed
+                task.exit_code = -9; // killed, as SIGKILL
                 crate::ipc::clear_signal_deadline(tid);
                 crate::ipc::notify_watchers(tid);
                 let parent = task.parent_tid;

@@ -160,6 +160,14 @@ everything else returns promptly.
 `syscall0` leaves RDI undefined, so the original call could not grow an
 argument.
 
+**A negative exit code means the kernel killed the task.** Its magnitude is the
+signal Linux sends for the exception that did it: 4 for an invalid opcode, 5
+for a debug trap or breakpoint, 7 for an alignment check, 8 for a divide error
+or floating-point exception, and 11 for everything else — a page fault with no
+pager, a general protection fault, a stack fault. `SYS_WAIT` reports it as it
+reports any other status. A killed task never halts the machine: only a fault
+taken in ring 0 does that. `SYS_TASK_KILL` reports -9, as SIGKILL would.
+
 ### IPC (0x10)
 
 Messages are fixed size: sender TID, a `u64` tag, and six `u64` payload words.
