@@ -500,6 +500,32 @@ memory only inside a narrow guard that sets RFLAGS.AC, and never holds that
 guard across a blocking operation, so a syscall that blocks mid-copy cannot
 leave the window open for whatever runs next.
 
+## How a program starts
+
+A spawner creates a task and an address space, maps the program's segments and
+a stack, and starts it at its entry point with nothing in its registers. What a
+program is told about itself is on one read-only page at `0x80_8000_0000`,
+which the spawner fills in three parts:
+
+| Offset | Contents |
+|---|---|
+| 0 | argument count `n`; then `n` entries, each a `u64` length and that many bytes |
+| after the arguments | environment count `m`; then `m` entries in the same form |
+| 3184 | program header entry size (56); entry count `k`; then `k` ELF64 program headers |
+
+The arguments and the environment stop before offset 3184 whatever their
+length, so the header table cannot be crowded out. It is a verbatim copy of the
+program's own table, at most sixteen entries, with any `PT_PHDR` entry's
+address rewritten to the copy's so that a loader computing a base from the two
+gets zero.
+
+It exists because a program's headers are not in any segment it loads, and a C
+library needs them: musl finds a static program's thread-local template through
+`AT_PHDR`, and without it every thread-local landed outside its block. A C
+runtime passes `AT_PHDR` = `0x80_8000_0000 + 3184 + 16`, `AT_PHENT` and
+`AT_PHNUM` from this table. A spawner older than the table leaves the count
+zero; a program older than it never reads that far.
+
 ## Notes for implementers
 
 **TID reuse.** Reaping returns a task slot to the pool, so TIDs are recycled.
@@ -507,12 +533,14 @@ Anything that names a task by number must cope with the name changing meaning:
 the kernel clears a dead TID's bit from every `Endpoint` capability for exactly
 this reason. Do not cache a TID across the lifetime of the task it named.
 
-**No threads yet.** `x86_64-unknown-quark` sets `singlethread: true`. A libc or
-runtime port should expect a single thread of execution per address space until
-the ABI gains a thread block.
+**Threads are tasks.** A thread is a task created in its creator's own address
+space (`SYS_TASK_CREATE` then `SYS_TASK_START_ARG`), with its own FS base
+(`SYS_SET_FS_BASE`) for thread-locals and a word the kernel clears when it
+exits (`SYS_SET_CLEAR_TID`). Each task has its own floating-point and SSE state,
+saved on every switch.
 
 **Services are found by name.** The nameserver is at a well-known TID and maps
 names to TIDs (`TAG_LOOKUP`), and back (`TAG_LOOKUP_TID`). Every IPC server also
 answers `TAG_PING` with an empty reply, which is the portable way to ask whether
-one is alive. Note that not every service is an IPC server — the console is
-driven by a pipe and does not answer.
+one is alive. Note that not every service is an IPC server — the text console,
+`qtty`, is driven by a pipe and does not answer.

@@ -18,6 +18,13 @@
 /* Where the spawner maps the argument page, by convention with
    quark_rt::spawn. */
 #define QUARK_ARGS_PAGE 0x8080000000UL
+/* The program's own header table, at the end of the argument page: the entry
+   size, the entry count, then the entries. Mirrors quark_rt::spawn::PHDRS_AT,
+   and exists because a program's headers are not in any segment it loads —
+   a C library finds its thread-local template through them. */
+#define QUARK_MAX_PHDRS 16
+#define QUARK_PHDR_SIZE 56
+#define QUARK_PHDRS_AT (4096 - 16 - QUARK_MAX_PHDRS * QUARK_PHDR_SIZE)
 /* The page file data moves through, shared with the VFS. */
 #define QUARK_XFER_PAGE 0x8900000000UL
 /* Where malloc looks for pages. Deliberately not the Rust runtime's
@@ -30,5 +37,6 @@ _Static_assert(QUARK_ARGS_PAGE >= QUARK_USER_MIN, "args page is below PML4[1]");
 _Static_assert(QUARK_XFER_PAGE >= QUARK_USER_MIN, "transfer page is below PML4[1]");
 _Static_assert(QUARK_HEAP_START >= QUARK_USER_MIN, "heap is below PML4[1]");
 _Static_assert(QUARK_HEAP_LIMIT > QUARK_HEAP_START, "heap limit is below its start");
+_Static_assert(QUARK_PHDRS_AT == 3184, "program header offset disagrees with quark_rt::spawn");
 
 #endif

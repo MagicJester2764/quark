@@ -22,16 +22,19 @@
 #define ENV_BYTES  1024
 
 /* argc, the argv pointers and their terminator, the environment pointers and
-   theirs, and two auxiliary entries.
+   theirs, and five auxiliary entries.
  *
  * A static, which is what makes it writable — and musl needs that. Its
  * `unsetenv` shuffles this array in place. It never writes through the
  * pointers, so the strings themselves may stay wherever they are. */
-static unsigned long start_block[1 + MAX_ARGS + 1 + MAX_ENV + 1 + 4];
+static unsigned long start_block[1 + MAX_ARGS + 1 + MAX_ENV + 1 + 10];
 static char argv_bytes[ARGS_BYTES];
 static char env_bytes[ENV_BYTES];
 
 #define AT_NULL   0
+#define AT_PHDR   3
+#define AT_PHENT  4
+#define AT_PHNUM  5
 #define AT_PAGESZ 6
 
 unsigned long *__quark_start_args(void);
@@ -104,10 +107,35 @@ unsigned long *__quark_start_args(void) {
         start_block[i++] = env_ptrs[e];
     }
     start_block[i++] = 0;          /* end of the environment */
-    /* One auxiliary entry, because musl takes the page size from here and a
-       zero page size makes its allocator do arithmetic on nothing. */
+    /* The page size, because musl takes it from here and a zero page size
+       makes its allocator do arithmetic on nothing. */
     start_block[i++] = AT_PAGESZ;
     start_block[i++] = 4096;
+
+    /* Where the program headers are, which is how musl finds the thread-local
+       template of a static program. Without them it gave every thread a TLS
+       block with no room for the program's own thread-locals — and on x86-64
+       those sit *below* the thread pointer, so every write to one landed on
+       whatever came before the block. musl itself never noticed, keeping
+       errno and the rest in its thread structure; pixman did, because its
+       composite cache is a thread-local, and every lookup in it came back as
+       some other operator's function.
+     *
+     * The spawner copies the table to the end of this page, since a program's
+       own headers are not in any segment it loads. A spawner older than that
+       leaves the count zero, and the program starts as it always did. */
+    const unsigned long *phdrs = (const unsigned long *)(page + QUARK_PHDRS_AT);
+    unsigned long phent = phdrs[0];
+    unsigned long phnum = phdrs[1];
+    if (phnum != 0 && phnum <= QUARK_MAX_PHDRS && phent == QUARK_PHDR_SIZE) {
+        start_block[i++] = AT_PHDR;
+        start_block[i++] = ARGS_PAGE + QUARK_PHDRS_AT + 2 * sizeof(unsigned long);
+        start_block[i++] = AT_PHENT;
+        start_block[i++] = phent;
+        start_block[i++] = AT_PHNUM;
+        start_block[i++] = phnum;
+    }
+
     start_block[i++] = AT_NULL;
     start_block[i++] = 0;
 

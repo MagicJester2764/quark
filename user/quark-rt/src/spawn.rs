@@ -24,6 +24,25 @@ const PHDR_SIZE: usize = 56;
 /// with `quark_rt::args`.
 pub const ARGS_PAGE_ADDR: usize = 0x80_8000_0000;
 
+/// Program headers carried to the child, at most.
+///
+/// A static binary built here has four or five; a Linux one with everything
+/// the toolchain adds has about a dozen.
+pub const MAX_PHDRS: usize = 16;
+
+/// Where on the argument page the program header table goes: a fixed place at
+/// the end, so that a long command line can never crowd it out.
+///
+/// Layout from this offset: the entry size, the entry count, then the table.
+/// It is what a C library's `AT_PHDR` points into, and it has to exist because
+/// a program's own headers are not in any segment it loads — musl finds its
+/// thread-local template through them, and without them every thread-local in
+/// a C program landed outside its thread's block. Mirrored as
+/// `QUARK_PHDRS_AT` in `quark/layout.h`.
+pub const PHDRS_AT: usize = PAGE_SIZE - 16 - MAX_PHDRS * PHDR_SIZE;
+
+const PT_PHDR: u32 = 6;
+
 /// Top of the user stack, in the child. Stacks grow down from here.
 pub const STACK_TOP: usize = 0x7FFF_FFFF_F000;
 /// 1 MiB, matching the kernel's own `USER_STACK_PAGES`. A spawner maps this
@@ -53,9 +72,23 @@ pub struct Spawned {
     pub entry: u64,
     pub stack_top: u64,
     pub cr3: usize,
+    /// The program's own header table, verbatim, for the argument page.
+    phdrs: [u8; MAX_PHDRS * PHDR_SIZE],
+    phnum: usize,
 }
 
 impl Spawned {
+    /// A placeholder for an array of spawned tasks not yet filled in. It names
+    /// no task; starting it fails.
+    pub const EMPTY: Spawned = Spawned {
+        tid: 0,
+        entry: 0,
+        stack_top: 0,
+        cr3: 0,
+        phdrs: [0; MAX_PHDRS * PHDR_SIZE],
+        phnum: 0,
+    };
+
     /// Run it. Nothing happens until this is called, which is what lets a
     /// caller wire capabilities, file descriptors and pipes first.
     pub fn start(&self) -> Result<(), ()> {
@@ -112,6 +145,23 @@ pub fn load(elf: &[u8], scratch: &Scratch) -> Result<Spawned, ()> {
     // entry into whatever follows.
     if phentsize < PHDR_SIZE {
         return Err(());
+    }
+
+    // The table, for the child to be told about. All of it or none: a
+    // partial table is a program being told it has fewer segments than it
+    // does, and the one it is looking for may be past the cut.
+    let mut phdrs = [0u8; MAX_PHDRS * PHDR_SIZE];
+    let mut kept = 0usize;
+    let table_end = phoff
+        .checked_add(phnum.saturating_mul(phentsize))
+        .unwrap_or(usize::MAX);
+    if phnum <= MAX_PHDRS && table_end <= elf.len() {
+        for i in 0..phnum {
+            let from = phoff + i * phentsize;
+            phdrs[i * PHDR_SIZE..(i + 1) * PHDR_SIZE]
+                .copy_from_slice(&elf[from..from + PHDR_SIZE]);
+        }
+        kept = phnum;
     }
 
     let cr3 = syscall::sys_addrspace_create()?;
@@ -209,7 +259,7 @@ pub fn load(elf: &[u8], scratch: &Scratch) -> Result<Spawned, ()> {
         syscall::sys_addrspace_map(cr3, stack_bottom + p * PAGE_SIZE, frame, 1, 1)?;
     }
 
-    Ok(Spawned { tid, entry, stack_top: STACK_TOP as u64, cr3 })
+    Ok(Spawned { tid, entry, stack_top: STACK_TOP as u64, cr3, phdrs, phnum: kept })
 }
 
 /// Write `args` and `env` into the child's argument page, read back by
@@ -243,7 +293,9 @@ pub fn set_args_env(
             offset += 8;
             let mut written = 0u64;
             for item in section {
-                if offset + 8 + item.len() > PAGE_SIZE {
+                // Stop short of the program headers, which own the end of the
+                // page whatever the arguments are.
+                if offset + 8 + item.len() > PHDRS_AT {
                     break;
                 }
                 *(base.add(offset) as *mut u64) = item.len() as u64;
@@ -254,10 +306,42 @@ pub fn set_args_env(
             }
             *(base.add(count_at) as *mut u64) = written;
         }
+
+        write_phdrs(base, info);
     }
 
     syscall::sys_addrspace_map(info.cr3, ARGS_PAGE_ADDR, frame, 1, 0)?;
     Ok(())
+}
+
+/// Put the program header table at the end of the argument page.
+///
+/// A `PT_PHDR` entry is rewritten to say the table is where this copy is. A C
+/// library takes the difference between `AT_PHDR` and that entry's address as
+/// the load base, and for a program that is not relocated the base has to come
+/// out as zero; left as it was, every address derived from the headers —
+/// the thread-local template among them — would be off by the distance to
+/// this page.
+unsafe fn write_phdrs(base: *mut u8, info: &Spawned) {
+    let at = PHDRS_AT;
+    let table = ARGS_PAGE_ADDR + at + 16;
+    unsafe {
+        *(base.add(at) as *mut u64) = PHDR_SIZE as u64;
+        *(base.add(at + 8) as *mut u64) = info.phnum as u64;
+        for i in 0..info.phnum {
+            let dst = base.add(at + 16 + i * PHDR_SIZE);
+            core::ptr::copy_nonoverlapping(
+                info.phdrs.as_ptr().add(i * PHDR_SIZE),
+                dst,
+                PHDR_SIZE,
+            );
+            let ph = &mut *(dst as *mut Elf64Phdr);
+            if ph.p_type == PT_PHDR {
+                ph.p_vaddr = table as u64;
+                ph.p_paddr = table as u64;
+            }
+        }
+    }
 }
 
 /// As [`set_args_env`], with no environment.

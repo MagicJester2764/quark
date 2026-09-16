@@ -364,7 +364,7 @@ fn cmd_pipeline(stages: &[&[u8]], vfs_tid: usize, input_tid: usize) -> i32 {
     }
     let _ = npipes;
 
-    let mut infos = [Spawned { tid: 0, entry: 0, stack_top: 0, cr3: 0 }; MAX_STAGES];
+    let mut infos = [Spawned::EMPTY; MAX_STAGES];
     let mut spawned = 0;
 
     for i in 0..n {
