@@ -84,6 +84,7 @@ pub const SYS_GRANT_IOPORT: u64 = 87;
 pub const SYS_GRANT_IRQ: u64 = 88;
 pub const SYS_SET_USER_CAPS: u64 = 89;
 pub const SYS_GET_USER_CAPS: u64 = 90;
+pub const SYS_CAP_READ: u64 = 92;
 
 // --- 0x60  task lifecycle and identity ---
 pub const SYS_TASK_CREATE: u64 = 96;
@@ -1064,6 +1065,28 @@ pub const SLOT_SCRATCH: usize = 14;
 pub fn sys_cap_mint(slot: usize, cap_type: u64, param0: u64, param1: u64) -> Result<(), ()> {
     let ret = unsafe { syscall4(SYS_CAP_MINT, slot as u64, cap_type, param0, param1) };
     if ret == u64::MAX { Err(()) } else { Ok(()) }
+}
+
+/// One capability slot, as [`sys_cap_read`] reports it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CapInfo {
+    /// One of the `CAP_TYPE_*` numbers, or 0 for an empty slot.
+    pub cap_type: u64,
+    pub param0: u64,
+    pub param1: u64,
+    /// False once the capability it was derived from has been revoked.
+    pub valid: bool,
+}
+
+/// Read slot `slot` of `tid`'s CSpace. A task may read its own; another's
+/// needs `TaskMgmt` over it. Fails past the last slot.
+pub fn sys_cap_read(tid: usize, slot: usize) -> Result<CapInfo, ()> {
+    let mut out = [0u64; 4];
+    let ret = unsafe { syscall3(SYS_CAP_READ, tid as u64, slot as u64, out.as_mut_ptr() as u64) };
+    if ret == u64::MAX {
+        return Err(());
+    }
+    Ok(CapInfo { cap_type: out[0], param0: out[1], param1: out[2], valid: out[3] != 0 })
 }
 
 /// Delegate a capability from src_slot to dest_tid's dest_slot.

@@ -115,6 +115,10 @@ pub const SYS_GRANT_IOPORT: u64 = 87;
 pub const SYS_GRANT_IRQ: u64 = 88;
 pub const SYS_SET_USER_CAPS: u64 = 89;
 pub const SYS_GET_USER_CAPS: u64 = 90;
+/// One slot of a task's CSpace, whole: type, both parameters, and whether it
+/// is still valid. `SYS_CAP_INSPECT` truncates the parameters to sixteen bits
+/// and reads only the caller's own.
+pub const SYS_CAP_READ: u64 = 92;
 
 // --- 0x60  task lifecycle and identity ---
 pub const SYS_TASK_CREATE: u64 = 96;
@@ -187,7 +191,7 @@ pub const SYS_ABI_VERSION: u64 = 240;
 /// minor when calls are added. User space can refuse to run against a major it
 /// does not know, which is the point of exposing it at all.
 pub const ABI_VERSION_MAJOR: u64 = 1;
-pub const ABI_VERSION_MINOR: u64 = 11;
+pub const ABI_VERSION_MINOR: u64 = 12;
 
 /// Threads a task may make with no capability at all.
 ///
@@ -2245,6 +2249,35 @@ extern "C" fn syscall_dispatch(
                 // Pack: [7:0]=type, [23:8]=param0 low 16, [39:24]=param1 low 16
                 cap_type | ((cap.param0 & 0xFFFF) << 8) | ((cap.param1 & 0xFFFF) << 24)
             }
+        }
+        SYS_CAP_READ => {
+            // arg0 = tid, arg1 = slot, arg2 = out: type, param0, param1, valid
+            //
+            // Anybody may read their own; reading another task's takes the
+            // authority to manage it, which already covers far more than
+            // knowing what it may do.
+            let caller = scheduler::current_tid();
+            let tid = arg0 as usize;
+            let slot = arg1 as usize;
+            if slot >= crate::cap::MAX_CAPS || !validate_user_ptr_mut(arg2, 32) {
+                return u64::MAX;
+            }
+            if tid != caller && !crate::cap::task_has_task_mgmt(caller, tid) {
+                return u64::MAX;
+            }
+            let cap = match unsafe { scheduler::get_task_mut(tid) } {
+                Some(t) => t.cspace[slot],
+                None => return u64::MAX,
+            };
+            let out = [
+                cap.cap_type as u64,
+                cap.param0,
+                cap.param1,
+                crate::cap::slot_is_valid(&cap) as u64,
+            ];
+            let _ua = crate::cpu::UserAccess::begin();
+            unsafe { core::ptr::copy_nonoverlapping(out.as_ptr(), arg2 as *mut u64, 4) };
+            0
         }
         SYS_CAP_DELETE => {
             // arg0 = slot

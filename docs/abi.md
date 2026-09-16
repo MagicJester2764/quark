@@ -1,6 +1,6 @@
 # Quark syscall ABI
 
-**Version 1.11.** Query the running kernel with `SYS_ABI_VERSION` (240), which
+**Version 1.12.** Query the running kernel with `SYS_ABI_VERSION` (240), which
 returns `(major << 16) | minor`.
 
 This document is the contract between the Quark kernel and everything above it.
@@ -97,6 +97,7 @@ so it is built from calls that already existed.
 | 1.9 | `SYS_MEMFD_TRUNCATE` (54) — `ftruncate` on memory named by a descriptor, which is how every Wayland client makes its buffer pool: `memfd_create`, `ftruncate`, `mmap`. Only while nobody has the region mapped and no descriptor for it is travelling, because growing it otherwise changes what is behind somebody else's live mapping. `SYS_MMAP_FD` (42) also returns the size it mapped instead of 0: a task that received a descriptor has no other way to learn how big the memory is, and the sender's word for it is the one thing it must not take. |
 | 1.10 | `SYS_FD_DUP` (68) and `SYS_PIPE_FD_SET` (70) no longer need `TaskMgmt` when the target is the caller, and both accept `u64::MAX - 1` for "any free descriptor" and return the number they took. Putting a descriptor into somebody else's table hands them something they never asked for; putting one into your own is `dup` and `pipe`, which every C library calls and which confer nothing. Also: `sys_cap_grant` (81) requires `TaskMgmt` over the destination, or the destination's consent — either a `sys_call` to the granter in progress, or a standing `Endpoint` naming it. Unrestricted, any task could fill any other's sixteen CSpace slots and leave it unable to be handed a display again. |
 | 1.11 | `SYS_ADDRSPACE_GIVE` (43) — move pages of the caller's own memory into an address space it made, which owns them from then on and frees them with itself. `SYS_ADDRSPACE_MAP` (37) is deprecated in its favour: every program a spawner loaded with it stayed allocated until the spawner exited. Also: `SYS_WAIT` (4) reaps the child it returns, so its memory is free, and its TID may be reused, by the time the call returns. A child used to be reaped only when the machine next went idle, which a parent running programs back to back never let it do. |
+| 1.12 | `SYS_CAP_READ` (92) — read one slot of a task's CSpace whole, for any task the caller manages. |
 
 A capability may only be minted from one the caller already holds, and only
 narrowed — with one exception. **An `Endpoint` naming only the caller may
@@ -334,11 +335,17 @@ inherited, or the previous endpoint's reference is stranded.
 | 83 | `SYS_CAP_INSPECT` | arg0 = slot | packed descriptor | — |
 | 84 | `SYS_CAP_DELETE` | arg0 = slot | 0 / `u64::MAX` | — |
 | 85 | `SYS_CAP_TRANSFER` | arg0 = dest tid, arg1 = bits | 0 / `u64::MAX` | — |
+| 92 | `SYS_CAP_READ` | arg0 = tid, arg1 = slot, arg2 = out: four `u64`s — type, param0, param1, valid (1/0) | 0 / `u64::MAX` past the last slot | `TaskMgmt` over tid, unless tid is the caller |
 | 86–90 | *deprecated* | see the deprecation table above | | |
 
 `SYS_CAP_INSPECT` truncates parameters and cannot report a 64-bit destination
 set, so an `Endpoint` capability must be **delegated** with `SYS_CAP_GRANT`
 rather than read back and re-minted.
+
+`SYS_CAP_READ` reports a slot whole, and for any task the caller manages. It
+exists so that "no task may map more than its device" is something a test can
+check rather than something to believe: `SYS_CAP_INSPECT` can show neither a
+physical range nor anybody else's CSpace. An empty slot reads as type 0.
 
 Revocation is generation-based; a capability minted into a slot carries that
 slot's generation, and revoking bumps it. The counter is 32 bits, so wraparound

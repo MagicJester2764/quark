@@ -1,11 +1,12 @@
 #![no_std]
 #![no_main]
 
-//! Phase 10 acceptance: descriptors, streams, waiting and the environment.
+//! Acceptance checks for the kernel and the runtime, from Phase 10 on:
+//! descriptors, streams, waiting, the environment, memory and authority.
 //!
 //! There is no test framework here, so this is one: a program that asserts and
-//! exits non-zero. Run it from the shell, or read its output on the serial
-//! line. Each section corresponds to one task of the Phase 10 plan.
+//! exits non-zero. Run it from the shell; `dtest NAME` runs one section, named
+//! in the table in `_start`.
 
 use quark_rt::manifest::CapReq;
 use quark_rt::wl::wire;
@@ -36,6 +37,42 @@ fn own_pipe(read_fd: usize, write_fd: usize) -> Result<(), ()> {
     syscall::sys_pipe_fd_set(me, read_fd, h, false)?;
     syscall::sys_pipe_fd_set(me, write_fd, h, true)?;
     Ok(())
+}
+
+/// A capability over more physical memory than this is not one device's: a
+/// framebuffer is a few megabytes, a boot module one. The grants Phase 12
+/// removes were four gigabytes.
+const DEVICE_SPAN: u64 = 64 << 20;
+/// Where the kernel is loaded, which no task may map.
+const KERNEL_IMAGE: u64 = 0x10_0000;
+
+fn test_physical_authority() {
+    println!("physical memory authority:");
+    let mut seen = 0;
+    let mut broad = 0;
+    let mut kernel = 0;
+    for tid in 1..64 {
+        if syscall::sys_task_info(tid).is_err() {
+            continue;
+        }
+        for slot in 0.. {
+            let Ok(cap) = syscall::sys_cap_read(tid, slot) else { break };
+            if cap.cap_type != syscall::CAP_TYPE_PHYS_RANGE || !cap.valid {
+                continue;
+            }
+            seen += 1;
+            if cap.param1.saturating_sub(cap.param0) > DEVICE_SPAN {
+                println!("    tid {} may map {:#x}..{:#x}", tid, cap.param0, cap.param1);
+                broad += 1;
+            }
+            if cap.param0 <= KERNEL_IMAGE && KERNEL_IMAGE < cap.param1 {
+                kernel += 1;
+            }
+        }
+    }
+    check("another task's capabilities can be read", seen > 0);
+    check("no task may map more than one device's memory", broad == 0);
+    check("no task may map the kernel", kernel == 0);
 }
 
 fn test_close() {
@@ -1076,23 +1113,34 @@ fn test_wire() {
 #[unsafe(no_mangle)]
 #[link_section = ".text.entry"]
 pub extern "C" fn _start() -> ! {
-    println!("[dtest] Phase 10 acceptance");
-    test_close();
-    test_fd_table();
-    test_big_region();
-    test_memfd();
-    test_socketpair();
-    test_fd_passing();
-    test_no_leak();
-    test_pollset();
-    test_wake_latency();
-    test_poll();
-    test_environment();
-    test_across_address_spaces();
-    test_spawned_memory();
-    test_sync();
-    test_fpu();
-    test_wire();
+    // Every section by default; `dtest NAME` runs just that one, whose output
+    // then fits on a screen.
+    const SECTIONS: &[(&str, fn())] = &[
+        ("physical", test_physical_authority),
+        ("close", test_close),
+        ("fds", test_fd_table),
+        ("region", test_big_region),
+        ("memfd", test_memfd),
+        ("socketpair", test_socketpair),
+        ("passing", test_fd_passing),
+        ("leak", test_no_leak),
+        ("pollset", test_pollset),
+        ("wake", test_wake_latency),
+        ("poll", test_poll),
+        ("environment", test_environment),
+        ("spaces", test_across_address_spaces),
+        ("spawn", test_spawned_memory),
+        ("sync", test_sync),
+        ("fpu", test_fpu),
+        ("wire", test_wire),
+    ];
+    println!("[dtest] kernel and runtime checks");
+    let only = quark_rt::args::argv(1);
+    for (name, section) in SECTIONS {
+        if only.is_none_or(|o| o == name.as_bytes()) {
+            section();
+        }
+    }
 
     unsafe {
         println!("[dtest] {} passed, {} failed", PASSED, FAILED);
