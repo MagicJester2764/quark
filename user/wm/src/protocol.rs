@@ -138,6 +138,24 @@ pub const SEAT_NAME: u16 = 1;
 pub const SEAT_CAP_POINTER: u32 = 1;
 pub const SEAT_CAP_KEYBOARD: u32 = 2;
 
+// wl_pointer requests and events. Version 4 is version 1's events plus the
+// `release` destructor; version 5's `frame` and axis detail are out, and the
+// seat is advertised at 4 so that no client expects them.
+pub const POINTER_RELEASE: u16 = 0;
+pub const POINTER_ENTER: u16 = 0;
+pub const POINTER_LEAVE: u16 = 1;
+pub const POINTER_MOTION: u16 = 2;
+pub const POINTER_BUTTON: u16 = 3;
+pub const POINTER_AXIS: u16 = 4;
+/// `wl_pointer.button_state`.
+pub const BUTTON_RELEASED: u32 = 0;
+pub const BUTTON_PRESSED: u32 = 1;
+/// Linux evdev button codes, which is what `wl_pointer.button` carries — the
+/// same numbering as the key codes, from the same header.
+pub const BTN_LEFT: u32 = 0x110;
+pub const BTN_RIGHT: u32 = 0x111;
+pub const BTN_MIDDLE: u32 = 0x112;
+
 // wl_keyboard requests and events.
 pub const KEYBOARD_RELEASE: u16 = 0;
 pub const KEYBOARD_KEYMAP: u16 = 0;

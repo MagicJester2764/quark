@@ -68,6 +68,7 @@ use quark_rt::{args, nameserver, println, syscall, vfs};
 // refused loudly — the mint simply fails and the capability is absent, which
 // then looks like an unrelated failure much later.
 mod client;
+mod cursor;
 mod draw;
 mod keymap;
 mod objects;
@@ -108,6 +109,12 @@ const TAG_INPUT_CLAIM: u64 = 0x200;
 const TAG_INPUT_RELEASE: u64 = 0x201;
 const TAG_INPUT_POLL: u64 = 0x202;
 const TAG_INPUT_KEY: u64 = 0x203;
+/// Has the pointer moved? Behind the same claim as the keys: whoever owns the
+/// screen owns the input, and a pointer delivered elsewhere would be clicking
+/// on windows it cannot see.
+const TAG_INPUT_POLL_MOUSE: u64 = 0x205;
+/// `data[0] = dx`, `data[1] = dy` signed, `data[2] = buttons`.
+const TAG_INPUT_MOUSE: u64 = 0x206;
 
 // The window protocol itself lives in `quark_rt::wm`, with the client half
 // that speaks it. Two copies of a wire format drift; this one is the server.
@@ -197,6 +204,9 @@ static mut WINDOWS: [Window; MAX_WINDOWS] = [NO_WINDOW; MAX_WINDOWS];
 /// Bottom to top. A window's place here is its place on the screen.
 static mut STACK: [usize; MAX_WINDOWS] = [usize::MAX; MAX_WINDOWS];
 static mut STACK_LEN: usize = 0;
+/// Which buttons were held last time the pointer was looked at, so that a
+/// press can be told from a hold.
+static mut LAST_BUTTONS: u8 = 0;
 /// Which window input would go to, and which gets the lit title bar.
 static mut FOCUS: usize = usize::MAX;
 /// The framebuffer device that lent us the display.
@@ -311,6 +321,8 @@ fn refresh(region: Rect) {
             draw_window(STACK[i]);
         }
     }
+    // Last, because a pointer behind a window is not a pointer.
+    cursor::draw();
     present(region);
 }
 
@@ -476,6 +488,143 @@ fn pump_input() {
             reply.data[3] as u8,
         );
     }
+}
+
+/// Collect whatever the pointer has done since the last look.
+///
+/// Motion is applied to the logical position packet by packet — a click at the
+/// end of a fast movement must be reported where the pointer actually was —
+/// but the screen is repainted once at the end. A mouse reports about a hundred
+/// times a second, and repainting per packet would spend the compositor's whole
+/// slice moving an arrow eight pixels.
+fn pump_mouse() {
+    let input = unsafe { INPUT_TID };
+    if input == 0 {
+        return;
+    }
+    let before = cursor::rect();
+    let was_visible = cursor::visible();
+    let mut moved = false;
+
+    for _ in 0..EVENT_QUEUE {
+        let msg = Message { sender: 0, tag: TAG_INPUT_POLL_MOUSE, data: [0; 6] };
+        let mut reply = Message::empty();
+        match syscall::sys_call_timeout(input, &msg, &mut reply, INPUT_CALL_TICKS) {
+            syscall::CallOutcome::Replied => {}
+            syscall::CallOutcome::TimedOut | syscall::CallOutcome::Failed => break,
+        }
+        if reply.tag != TAG_INPUT_MOUSE {
+            break;
+        }
+        let dx = reply.data[0] as i64 as i32;
+        let dy = reply.data[1] as i64 as i32;
+        let buttons = reply.data[2] as u8;
+        if dx != 0 || dy != 0 || !cursor::visible() {
+            cursor::move_by(dx, dy);
+            moved = true;
+        }
+        dispatch_pointer(buttons);
+    }
+
+    if !moved {
+        return;
+    }
+    // Where the arrow was and where it is. Repainted as one region when they
+    // touch and as two when they do not: a pointer crossing the screen would
+    // otherwise repaint everything between its ends.
+    let after = cursor::rect();
+    if !was_visible {
+        refresh(after);
+        return;
+    }
+    if overlapping(before, after) {
+        refresh(Rect {
+            x0: before.x0.min(after.x0),
+            y0: before.y0.min(after.y0),
+            x1: before.x1.max(after.x1),
+            y1: before.y1.max(after.y1),
+        });
+    } else {
+        refresh(before);
+        refresh(after);
+    }
+}
+
+fn overlapping(a: Rect, b: Rect) -> bool {
+    !a.clip_to(&b).is_empty()
+}
+
+/// Tell whoever is under the pointer where it is and what it is doing.
+fn dispatch_pointer(buttons: u8) {
+    let (x, y) = cursor::position();
+
+    // Click to focus, on a press and only when the window is not already
+    // focused. Tested against the *framed* rectangle rather than the contents,
+    // because clicking a title bar to raise a window is the oldest gesture
+    // there is.
+    let pressed = unsafe { buttons & !LAST_BUTTONS != 0 };
+    if pressed {
+        if let Some(idx) = framed_window_at(x, y) {
+            if unsafe { FOCUS } != idx {
+                raise(idx);
+                composite();
+            }
+        }
+    }
+    unsafe { LAST_BUTTONS = buttons };
+
+    // After the raise, not before: raising changes which window is topmost, so
+    // a click on one window's border that overlaps another's contents would
+    // otherwise report the pointer as being over the window it just covered.
+    let over = window_at(x, y);
+
+    unsafe {
+        let ptr = &raw mut CLIENTS;
+        match over {
+            Some((idx, sx, sy)) => seat::motion(&mut *ptr, idx, sx, sy),
+            // Over the backdrop or the compositor's own chrome, which is not
+            // any client's surface. The leave that follows is the point: a
+            // client must stop believing the pointer is over it.
+            None => seat::motion(&mut *ptr, usize::MAX, 0, 0),
+        }
+        seat::button(&mut *ptr, buttons);
+    }
+}
+
+/// The topmost window whose *contents* are under a point, and where in them.
+fn window_at(x: usize, y: usize) -> Option<(usize, i32, i32)> {
+    unsafe {
+        for i in (0..STACK_LEN).rev() {
+            let idx = STACK[i];
+            let win = &WINDOWS[idx];
+            if !win.used {
+                continue;
+            }
+            let ox = win.x + BORDER;
+            let oy = win.y + TITLE_H + BORDER;
+            if x >= ox && x < ox + win.w && y >= oy && y < oy + win.h {
+                return Some((idx, (x - ox) as i32, (y - oy) as i32));
+            }
+        }
+    }
+    None
+}
+
+/// The topmost window under a point, frame included.
+fn framed_window_at(x: usize, y: usize) -> Option<usize> {
+    unsafe {
+        for i in (0..STACK_LEN).rev() {
+            let idx = STACK[i];
+            if !WINDOWS[idx].used {
+                continue;
+            }
+            let r = framed_rect(idx);
+            if x >= r.x0 && x < r.x1 && y >= r.y0 && y < r.y1 {
+                return Some(idx);
+            }
+        }
+    }
+    None
 }
 
 /// Decide where a key goes.
@@ -825,6 +974,9 @@ pub extern "C" fn _start() -> ! {
     // failure here leaves a compositor that draws rather than one that has
     // taken the keyboard away from a console it never displaced.
     claim_input();
+    // In the middle rather than a corner: a pointer that has never moved reads
+    // as stuck when it is in a corner and as present when it is in the middle.
+    cursor::centre();
     composite();
 
     // What this session is for. Without one there is nothing to composite and
@@ -866,6 +1018,7 @@ pub extern "C" fn _start() -> ! {
         if now != last_pump {
             last_pump = now;
             pump_input();
+            pump_mouse();
         }
 
         // A client's requests arrive on a stream rather than as IPC, and the

@@ -34,6 +34,25 @@ static mut FOCUS: usize = surface::NONE;
 /// The modifier state as the driver last reported it.
 static mut MODS: u8 = 0;
 
+/// The surface the pointer is over, or `surface::NONE`.
+///
+/// Kept apart from `FOCUS` because Wayland keeps them apart: typing goes to the
+/// window you last chose, and clicking goes to the window under the pointer,
+/// and a compositor that conflates them is one where moving the mouse steals
+/// what you were typing into.
+static mut POINTER_FOCUS: usize = surface::NONE;
+/// Which buttons are held, in the driver's bit order.
+static mut BUTTONS: u8 = 0;
+
+/// A coordinate as the protocol carries it: 24.8 fixed point.
+///
+/// Wayland's `fixed` is not a convenience — a surface can be scaled, and a
+/// pointer position that could only be a whole pixel would be unable to say
+/// where it is inside one.
+pub fn fixed(v: i32) -> u32 {
+    ((v as i64) << 8) as u32
+}
+
 /// The driver's modifier byte as an XKB modifier mask.
 ///
 /// The indices are XKB's conventional ones — Shift 0, Lock 1, Control 2, Mod1
@@ -124,7 +143,89 @@ pub fn surface_gone(idx: usize) {
         if FOCUS == idx {
             FOCUS = surface::NONE;
         }
+        if POINTER_FOCUS == idx {
+            POINTER_FOCUS = surface::NONE;
+        }
     }
+}
+
+/// The pointer moved to a screen position, and may be over a different window
+/// than it was.
+///
+/// `surface_x`/`surface_y` are relative to the surface, which is what the
+/// protocol carries: a client knows where its own pixels are and nothing about
+/// where the compositor put them.
+pub fn motion(
+    clients: &mut [Client; MAX_CLIENTS],
+    window: usize,
+    surface_x: i32,
+    surface_y: i32,
+) {
+    let next = surface::by_window(window).unwrap_or(surface::NONE);
+    let prev = unsafe { POINTER_FOCUS };
+
+    if prev != next {
+        unsafe { POINTER_FOCUS = next };
+        if prev != surface::NONE {
+            if let Some((slot, id)) = locate_pointer(clients, prev) {
+                clients[slot].pointer_leave(id, prev);
+            }
+        }
+        if next != surface::NONE {
+            if let Some((slot, id)) = locate_pointer(clients, next) {
+                clients[slot].pointer_enter(id, next, surface_x, surface_y);
+            }
+        }
+        return; // the enter carries the position; a motion after it says nothing new
+    }
+    if next == surface::NONE {
+        return;
+    }
+    if let Some((slot, id)) = locate_pointer(clients, next) {
+        clients[slot].pointer_motion(id, surface_x, surface_y);
+    }
+}
+
+/// A button changed. `buttons` is the driver's bit order: left, right, middle.
+pub fn button(clients: &mut [Client; MAX_CLIENTS], buttons: u8) {
+    let was = unsafe { BUTTONS };
+    unsafe { BUTTONS = buttons };
+    let changed = was ^ buttons;
+    if changed == 0 {
+        return;
+    }
+    let focus = unsafe { POINTER_FOCUS };
+    if focus == surface::NONE {
+        return;
+    }
+    let Some((slot, id)) = locate_pointer(clients, focus) else {
+        return;
+    };
+    for (bit, code) in [
+        (0u8, crate::protocol::BTN_LEFT),
+        (1, crate::protocol::BTN_RIGHT),
+        (2, crate::protocol::BTN_MIDDLE),
+    ] {
+        let mask = 1u8 << bit;
+        if changed & mask != 0 {
+            clients[slot].pointer_button(id, code, buttons & mask != 0);
+        }
+    }
+}
+
+/// The surface the pointer is over.
+pub fn pointer_focus() -> usize {
+    unsafe { POINTER_FOCUS }
+}
+
+fn locate_pointer(clients: &[Client; MAX_CLIENTS], surface_idx: usize) -> Option<(usize, u32)> {
+    let s = surface::get(surface_idx)?;
+    let slot = s.client;
+    if slot >= MAX_CLIENTS || !clients[slot].used {
+        return None;
+    }
+    let id = clients[slot].pointer_id()?;
+    Some((slot, id))
 }
 
 /// The client holding a surface, and the keyboard object it asked for.

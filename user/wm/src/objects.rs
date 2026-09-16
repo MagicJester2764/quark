@@ -30,6 +30,7 @@ pub enum Kind {
     Callback,
     Seat,
     Keyboard,
+    Pointer,
     XdgWmBase,
     XdgSurface { surface: usize },
     XdgToplevel { surface: usize },

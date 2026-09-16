@@ -70,6 +70,8 @@ pub struct Client {
     /// The `wl_keyboard` this client asked for, if it did. Events go to
     /// objects, and a client that never took a keyboard has none to send to.
     keyboard: u32,
+    /// The `wl_pointer`, likewise.
+    pointer: u32,
     /// A descriptor to attach to the next flush.
     ///
     /// `wl_keyboard.keymap` carries one, and the kernel queues a descriptor
@@ -104,6 +106,7 @@ pub const NO_CLIENT: Client = Client {
     ndue: 0,
     fired_at: 0,
     keyboard: 0,
+    pointer: 0,
     pending_fd: usize::MAX,
     wfail: false,
 };
@@ -119,6 +122,7 @@ impl Client {
         self.wlen = 0;
         self.nfds = 0;
         self.keyboard = 0;
+        self.pointer = 0;
         self.pending_fd = usize::MAX;
         // wl_display is object 1 and exists before anything is asked for.
         self.objects.insert(proto::DISPLAY_ID, Kind::Display);
@@ -143,6 +147,7 @@ impl Client {
             self.pending_fd = usize::MAX;
         }
         self.keyboard = 0;
+        self.pointer = 0;
         self.used = false;
         self.fd = 0;
         self.tid = 0;
@@ -387,6 +392,15 @@ impl Client {
                 }
                 true
             }
+            Kind::Pointer => {
+                if h.opcode == proto::POINTER_RELEASE {
+                    self.objects.remove(h.object);
+                    if self.pointer == h.object {
+                        self.pointer = 0;
+                    }
+                }
+                true
+            }
             Kind::Output | Kind::Callback | Kind::None => true,
         }
     }
@@ -394,6 +408,60 @@ impl Client {
     /// The keyboard object this client asked for, if it did.
     pub fn keyboard_id(&self) -> Option<u32> {
         if self.keyboard == 0 { None } else { Some(self.keyboard) }
+    }
+
+    /// The pointer object this client asked for, if it did.
+    pub fn pointer_id(&self) -> Option<u32> {
+        if self.pointer == 0 { None } else { Some(self.pointer) }
+    }
+
+    pub fn pointer_enter(&mut self, id: u32, surface_idx: usize, x: i32, y: i32) {
+        let Some(surface_id) = self.surface_id(surface_idx) else {
+            return;
+        };
+        if let Some(a) = self.begin(id, proto::POINTER_ENTER) {
+            self.arg_u32(proto::next_serial());
+            self.arg_u32(surface_id);
+            self.arg_u32(crate::seat::fixed(x));
+            self.arg_u32(crate::seat::fixed(y));
+            self.end(a);
+        }
+        self.flush();
+    }
+
+    /// As with the keyboard, the surface is passed rather than read back: by
+    /// the time a leave is sent the pointer is already somewhere else.
+    pub fn pointer_leave(&mut self, id: u32, surface_idx: usize) {
+        let Some(surface_id) = self.surface_id(surface_idx) else {
+            return;
+        };
+        if let Some(a) = self.begin(id, proto::POINTER_LEAVE) {
+            self.arg_u32(proto::next_serial());
+            self.arg_u32(surface_id);
+            self.end(a);
+        }
+        self.flush();
+    }
+
+    pub fn pointer_motion(&mut self, id: u32, x: i32, y: i32) {
+        if let Some(a) = self.begin(id, proto::POINTER_MOTION) {
+            self.arg_u32(crate::now_ms());
+            self.arg_u32(crate::seat::fixed(x));
+            self.arg_u32(crate::seat::fixed(y));
+            self.end(a);
+        }
+        self.flush();
+    }
+
+    pub fn pointer_button(&mut self, id: u32, code: u32, press: bool) {
+        if let Some(a) = self.begin(id, proto::POINTER_BUTTON) {
+            self.arg_u32(proto::next_serial());
+            self.arg_u32(crate::now_ms());
+            self.arg_u32(code);
+            self.arg_u32(if press { proto::BUTTON_PRESSED } else { proto::BUTTON_RELEASED });
+            self.end(a);
+        }
+        self.flush();
     }
 
     fn seat_request(&mut self, object: u32, opcode: u16, body: usize) -> bool {
@@ -431,11 +499,31 @@ impl Client {
                 self.flush();
                 true
             }
-            // A pointer and a touch are not among the advertised capabilities,
-            // so asking for one is a client ignoring what it was told. The
-            // object is recorded so that destroying it does not look like a
-            // reference to nothing; it simply never hears anything.
-            proto::SEAT_GET_POINTER | proto::SEAT_GET_TOUCH => {
+            proto::SEAT_GET_POINTER => {
+                let Some(id) = wire::get_u32(&self.rbuf, body) else {
+                    return false;
+                };
+                let version = self.objects.version_of(object);
+                if !self.objects.insert_at(id, Kind::Pointer, version) {
+                    return false;
+                }
+                self.pointer = id;
+                // A pointer already over this client's surface would otherwise
+                // hear nothing until it left and came back.
+                let focus = crate::seat::pointer_focus();
+                if let Some(s) = surface::get(focus) {
+                    if s.client == self.slot {
+                        self.pointer_enter(id, focus, 0, 0);
+                    }
+                }
+                self.flush();
+                true
+            }
+            // Touch is not among the advertised capabilities, so asking for one
+            // is a client ignoring what it was told. The object is recorded so
+            // that destroying it does not look like a reference to nothing; it
+            // simply never hears anything.
+            proto::SEAT_GET_TOUCH => {
                 match wire::get_u32(&self.rbuf, body) {
                     Some(id) => self.objects.insert(id, Kind::None),
                     None => false,
@@ -1066,7 +1154,7 @@ impl Client {
             // What this seat has. A client reads it to decide what to ask for,
             // so a capability advertised is a request that must be answered.
             if let Some(a) = self.begin(id, proto::SEAT_CAPABILITIES) {
-                self.arg_u32(proto::SEAT_CAP_KEYBOARD);
+                self.arg_u32(proto::SEAT_CAP_KEYBOARD | proto::SEAT_CAP_POINTER);
                 self.end(a);
             }
             if version >= 2 {
