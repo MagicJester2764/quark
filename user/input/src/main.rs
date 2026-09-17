@@ -90,6 +90,58 @@ const LINE_BUF_SIZE: usize = 256;
 /// rest is so that a second reader waits its turn rather than being stranded.
 const MAX_DEFERRED: usize = 4;
 
+/// A line that was finished but not yet all handed over.
+///
+/// A read gets at most forty bytes, one message's worth, and the rest waits
+/// here for the next read, which is how a terminal hands a long line to a
+/// short read. Before this, whatever did not fit in the first forty bytes was
+/// thrown away: an eighty-character command ran as its first forty.
+struct Pending {
+    buf: [u8; LINE_BUF_SIZE],
+    len: usize,
+    at: usize,
+}
+
+impl Pending {
+    const fn new() -> Self {
+        Pending { buf: [0; LINE_BUF_SIZE], len: 0, at: 0 }
+    }
+
+    /// The next piece of the line, if any is left.
+    fn take(&mut self, max: usize) -> Option<Message> {
+        if self.at >= self.len {
+            return None;
+        }
+        let n = (self.len - self.at).min(max);
+        let reply = pack_read_reply(&self.buf[self.at..], n);
+        self.at += n;
+        Some(reply)
+    }
+
+    fn clear(&mut self) {
+        self.len = 0;
+        self.at = 0;
+    }
+}
+
+/// Answer a reader: from what is left of the last line, or with a new one.
+fn answer_reader(
+    kbd_tid: usize,
+    reader_tid: usize,
+    max_bytes: usize,
+    pending: &mut Pending,
+    line_buf: &mut [u8; LINE_BUF_SIZE],
+    line_len: &mut usize,
+    foreground_tid: &mut usize,
+) {
+    match pending.take(max_bytes) {
+        Some(reply) => {
+            let _ = syscall::sys_reply(reader_tid, &reply);
+        }
+        None => serve_read(kbd_tid, reader_tid, max_bytes, pending, line_buf, line_len, foreground_tid),
+    }
+}
+
 #[derive(Clone, Copy)]
 struct KeyEvent {
     press: bool,
@@ -126,6 +178,7 @@ pub extern "C" fn _start() -> ! {
     let mut line_buf = [0u8; LINE_BUF_SIZE];
     let mut line_len: usize = 0;
     let mut foreground_tid: usize = 0;
+    let mut pending = Pending::new();
 
     // Who holds the keyboard raw, if anyone.
     let mut raw_owner: usize = 0;
@@ -154,6 +207,7 @@ pub extern "C" fn _start() -> ! {
                 // display.
                 if raw_owner == 0 {
                     handle_ctrl_c(&mut foreground_tid, &mut line_len);
+                    pending.clear();
                 }
             }
 
@@ -189,10 +243,11 @@ pub extern "C" fn _start() -> ! {
 
                     for i in 0..deferred_len {
                         let (tid, max) = deferred[i];
-                        serve_read(
+                        answer_reader(
                             kbd_tid,
                             tid,
                             max,
+                            &mut pending,
                             &mut line_buf,
                             &mut line_len,
                             &mut foreground_tid,
@@ -210,10 +265,11 @@ pub extern "C" fn _start() -> ! {
                     raw_owner = 0;
                     for i in 0..deferred_len {
                         let (tid, max) = deferred[i];
-                        serve_read(
+                        answer_reader(
                             kbd_tid,
                             tid,
                             max,
+                            &mut pending,
                             &mut line_buf,
                             &mut line_len,
                             &mut foreground_tid,
@@ -278,10 +334,11 @@ pub extern "C" fn _start() -> ! {
                         let _ = syscall::sys_reply(sender, &pack_read_reply(&line_buf, 0));
                     }
                 } else {
-                    serve_read(
+                    answer_reader(
                         kbd_tid,
                         sender,
                         max_bytes,
+                        &mut pending,
                         &mut line_buf,
                         &mut line_len,
                         &mut foreground_tid,
@@ -324,6 +381,7 @@ fn serve_read(
     kbd_tid: usize,
     reader_tid: usize,
     max_bytes: usize,
+    pending: &mut Pending,
     line_buf: &mut [u8; LINE_BUF_SIZE],
     line_len: &mut usize,
     foreground_tid: &mut usize,
@@ -344,6 +402,7 @@ fn serve_read(
                     *foreground_tid = 0;
                 }
                 // Reply with 0 bytes to unblock the reader
+                pending.clear();
                 let reply = pack_read_reply(line_buf, 0);
                 let _ = syscall::sys_reply(reader_tid, &reply);
                 return;
@@ -355,10 +414,15 @@ fn serve_read(
                     line_buf[*line_len] = b'\n';
                     *line_len += 1;
                 }
-                let deliver_len = (*line_len).min(max_bytes);
-                let reply = pack_read_reply(line_buf, deliver_len);
-                let _ = syscall::sys_reply(reader_tid, &reply);
+                // The whole line waits in `pending`; this read gets its first
+                // piece and later reads the rest.
+                pending.buf[..*line_len].copy_from_slice(&line_buf[..*line_len]);
+                pending.len = *line_len;
+                pending.at = 0;
                 *line_len = 0;
+                if let Some(reply) = pending.take(max_bytes) {
+                    let _ = syscall::sys_reply(reader_tid, &reply);
+                }
                 return;
             }
             8 | 127 => {

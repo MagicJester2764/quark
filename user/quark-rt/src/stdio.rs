@@ -69,9 +69,28 @@ pub fn read_line(buf: &mut [u8]) -> usize {
 /// descriptor on stdin spins printing prompts at a pipe nobody is reading.
 /// `Err` means the descriptor is not connected, which is not a pause — it is
 /// the end.
+///
+/// A line arrives in as many reads as it takes: a read over IPC carries forty
+/// bytes, and the input server keeps the rest of a longer line for the next.
+/// This reads until the newline, the end of `buf`, or a read that returns
+/// nothing after something was read.
 pub fn read_line_result(buf: &mut [u8]) -> Result<usize, ()> {
-    let ret = syscall::sys_fd_read(0, buf);
-    if ret == u64::MAX { Err(()) } else { Ok(ret as usize) }
+    let mut got = 0;
+    while got < buf.len() {
+        let ret = syscall::sys_fd_read(0, &mut buf[got..]);
+        if ret == u64::MAX {
+            return if got == 0 { Err(()) } else { Ok(got) };
+        }
+        let n = ret as usize;
+        if n == 0 {
+            break;
+        }
+        got += n;
+        if buf[got - 1] == b'\n' {
+            break;
+        }
+    }
+    Ok(got)
 }
 
 #[macro_export]

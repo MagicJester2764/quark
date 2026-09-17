@@ -66,9 +66,9 @@ Part B's first fix, done first because every later boot test types commands long
 **Interfaces:**
 - Produces: `quark_rt::stdio::read_line_result(buf) -> Result<usize, ()>` returns a whole line (up to `buf.len()`), however many reads it takes. A C program's `read(0, …)` returns what is left of the line on the next call, as a terminal does.
 
-- [ ] **Step 1: The failing check.** Boot the current image and type `echo 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 end`. Expected today: `0123456789 0123456789 0123456789 01`.
+- [x] **Step 1: The failing check.** Boot the current image and type `echo 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 end`. Expected today: `0123456789 0123456789 0123456789 01`.
 
-- [ ] **Step 2: Keep the rest of the line.** In `user/input/src/main.rs`, a completed line is kept with a read position; `TAG_READ` answers from it before reading more keys:
+- [x] **Step 2: Keep the rest of the line.** In `user/input/src/main.rs`, a completed line is kept with a read position; `TAG_READ` answers from it before reading more keys:
 
 ```rust
 /// A line that was finished but not yet all handed over. A read gets at most
@@ -95,7 +95,7 @@ impl Pending {
 
 `serve_read` copies the finished line (with its `\n`) into `Pending` and replies with `pending.take(max_bytes)`; the `TAG_READ` arm first tries `pending.take(max_bytes)` and replies with it if there is one, before deferring or reading keys. Ctrl-C clears `pending`. A claim (`TAG_INPUT_CLAIM`) leaves `pending` alone: what was typed before the claim still belongs to the reader.
 
-- [ ] **Step 3: Read to the newline.** `read_line_result` in quark-rt reads until a `\n` arrives, the buffer is full, or a read returns 0 after something was read:
+- [x] **Step 3: Read to the newline.** `read_line_result` in quark-rt reads until a `\n` arrives, the buffer is full, or a read returns 0 after something was read:
 
 ```rust
 pub fn read_line_result(buf: &mut [u8]) -> Result<usize, ()> {
@@ -118,9 +118,9 @@ pub fn read_line_result(buf: &mut [u8]) -> Result<usize, ()> {
 }
 ```
 
-- [ ] **Step 4: Verify.** `make`; image; boot: the long `echo` prints all eight groups and `end`; `wm weston-simple-shm weston-simple-shm weston-simple-shm` shows three windows (Esc); `runtests /etc/libc.tests` passes; `login` still works (it reads lines too).
+- [x] **Step 4: Verify.** `make`; image; boot: the long `echo` prints all eight groups and `end`; `wm weston-simple-shm weston-simple-shm weston-simple-shm` shows three windows (Esc); `runtests /etc/libc.tests` passes; `login` still works (it reads lines too).
 
-- [ ] **Step 5: Commit.** quark: "A typed line arrives whole, however long".
+- [x] **Step 5: Commit.** quark: "A typed line arrives whole, however long".
 
 ---
 
