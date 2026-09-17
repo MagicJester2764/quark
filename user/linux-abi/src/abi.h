@@ -29,6 +29,7 @@
 #define LX_ERANGE   34
 #define LX_ENOSPC   28
 #define LX_EMLINK   31
+#define LX_ELOOP    40
 
 /* Descriptors from here up are files.c's VFS files; below, the kernel's.
    The split sits at the kernel's MAX_FDS — see files.c. */
@@ -38,6 +39,8 @@
    value the *at calls accept for one. */
 #define LX_AT_FDCWD (-100)
 #define LX_AT_SYMLINK_FOLLOW 0x400
+#define LX_AT_SYMLINK_NOFOLLOW 0x100
+#define LX_AT_EMPTY_PATH 0x1000
 
 /* Open flags this layer acts on. Shared because `pipe2` and `fcntl` have to
    agree about what O_NONBLOCK means. */
@@ -53,13 +56,14 @@ long __quark_read(long fd, void *buf, unsigned long n);
 long __quark_write(long fd, const void *buf, unsigned long n);
 long __quark_lseek(long fd, long offset, long whence);
 long __quark_fstat(long fd, void *statbuf);
-long __quark_stat(const char *path, void *statbuf);
+long __quark_stat(const char *path, void *statbuf, int follow);
 long __quark_access(const char *path, long mode);
 long __quark_mkdir(const char *path);
 long __quark_unlink(const char *path);
 long __quark_rmdir(const char *path);
 long __quark_rename(const char *from, const char *to);
-long __quark_link(const char *from, const char *to);
+long __quark_link(const char *from, const char *to, int follow);
+long __quark_symlink(const char *target, const char *path);
 long __quark_truncate(const char *path, long length);
 long __quark_file_truncate(long fd, long length);
 long __quark_getdents(long fd, void *buf, unsigned long count);

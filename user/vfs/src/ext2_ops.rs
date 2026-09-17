@@ -51,13 +51,7 @@ pub fn create(
     is_dir: bool,
 ) -> Result<(u32, Ext2Inode), u64> {
     let (parent_path, name) = split_path(path)?;
-    let (parent_ino, mut parent, _) = ext2_dir::resolve_path(e2, parent_path, uid, gid)?;
-    if !parent.is_dir() {
-        return Err(ERR_NOT_DIR);
-    }
-    if !ext2::check_permission(&parent, uid, gid, 3) {
-        return Err(ERR_PERMISSION);
-    }
+    let (parent_ino, mut parent) = writable_dir(e2, parent_path, uid, gid)?;
     if ext2_dir::find_entry(e2, &parent, name)?.is_some() {
         return Err(ERR_EXISTS);
     }
@@ -110,13 +104,14 @@ pub fn create(
 }
 
 /// A directory the caller may change: it exists, is a directory, and the
-/// caller may write and search it.
+/// caller may write and search it. `/dev` is never one: its names are the
+/// server's devices, and a name made there on the disk would be hidden.
 fn writable_dir(e2: &Ext2State, path: &[u8], uid: u32, gid: u32) -> Result<(u32, Ext2Inode), u64> {
-    let (ino, dir, _) = ext2_dir::resolve_path(e2, path, uid, gid)?;
+    let (ino, dir, _) = ext2_dir::resolve_inode(e2, ext2::EXT2_ROOT_INO, path, uid, gid, true)?;
     if !dir.is_dir() {
         return Err(ERR_NOT_DIR);
     }
-    if !ext2::check_permission(&dir, uid, gid, 3) {
+    if ino == ext2_dir::dev_dir() || !ext2::check_permission(&dir, uid, gid, 3) {
         return Err(ERR_PERMISSION);
     }
     Ok((ino, dir))
@@ -236,8 +231,16 @@ pub fn rename(e2: &mut Ext2State, from: &[u8], to: &[u8], uid: u32, gid: u32) ->
 ///
 /// Directories have exactly one name, so they are refused. The new name's
 /// directory must be one the caller may change, as for `create`.
-pub fn link(e2: &mut Ext2State, from: &[u8], to: &[u8], uid: u32, gid: u32) -> Result<(), u64> {
-    let (ino, mut inode, _) = ext2_dir::resolve_path(e2, from, uid, gid)?;
+pub fn link(
+    e2: &mut Ext2State,
+    from: &[u8],
+    to: &[u8],
+    uid: u32,
+    gid: u32,
+    follow: bool,
+) -> Result<(), u64> {
+    let (ino, mut inode, _) =
+        ext2_dir::resolve_inode(e2, ext2::EXT2_ROOT_INO, from, uid, gid, follow)?;
     if inode.is_dir() {
         return Err(ERR_IS_DIR);
     }
@@ -261,6 +264,114 @@ pub fn link(e2: &mut Ext2State, from: &[u8], to: &[u8], uid: u32, gid: u32) -> R
     tp.i_mtime = t;
     tp.i_ctime = t;
     ext2::write_inode(e2, tpi, &tp)
+}
+
+/// Where [`read_link`] leaves a link's target.
+static mut LINK_BUF: [u8; 4096] = [0; 4096];
+
+/// The target [`read_link`] just read, `len` bytes long.
+pub fn link_target(len: usize) -> &'static [u8] {
+    let buf: &'static [u8; 4096] = unsafe { &*core::ptr::addr_of!(LINK_BUF) };
+    &buf[..len.min(4096)]
+}
+
+/// Read symbolic link `inode`'s target into [`link_target`], and say how long
+/// it is.
+pub fn read_link(e2: &Ext2State, inode: &Ext2Inode) -> Result<usize, u64> {
+    if !inode.is_symlink() {
+        return Err(ERR_INVALID_PATH);
+    }
+    let buf = unsafe { &mut *core::ptr::addr_of_mut!(LINK_BUF) };
+    let len = inode.i_size as usize;
+    if inode.is_fast_symlink() {
+        for (j, word) in inode.i_block.iter().enumerate() {
+            buf[j * 4..j * 4 + 4].copy_from_slice(&word.to_le_bytes());
+        }
+        return Ok(len);
+    }
+    // A slow link is one block, with the target and a NUL: e2fsck holds a
+    // target that fills its block to be broken, and so does this.
+    let bs = e2.block_size as usize;
+    if len >= bs {
+        return Err(ERR_IO);
+    }
+    let phys = ext2::block_map(e2, inode, 0)?;
+    if phys == 0 {
+        return Err(ERR_IO);
+    }
+    let mut done = 0;
+    for s in 0..e2.sectors_per_block {
+        if done >= len {
+            break;
+        }
+        let data = e2.cached_read_sector(e2.block_to_lba(phys) + s).map_err(|_| ERR_IO)?;
+        let n = (len - done).min(512);
+        buf[done..done + n].copy_from_slice(&data[..n]);
+        done += n;
+    }
+    Ok(len)
+}
+
+/// Make `path` a symbolic link to `target`, which is stored as given.
+///
+/// A target shorter than 60 bytes is kept in the inode (a fast link, with no
+/// extent root even on ext4); a longer one takes a block, written the way a
+/// file's data is, and must leave room in it for a NUL.
+pub fn symlink(e2: &mut Ext2State, target: &[u8], path: &[u8], uid: u32, gid: u32) -> Result<(), u64> {
+    if target.is_empty() {
+        return Err(ERR_NOT_FOUND);
+    }
+    if target.len() >= e2.block_size as usize {
+        return Err(ERR_NAME_TOO_LONG);
+    }
+    let (parent_path, name) = split_path(path)?;
+    let (parent_ino, mut parent) = writable_dir(e2, parent_path, uid, gid)?;
+    if ext2_dir::find_entry(e2, &parent, name)?.is_some() {
+        return Err(ERR_EXISTS);
+    }
+
+    let ino = ext2_alloc::alloc_inode(e2)?;
+    ext2::zero_inode(e2, ino)?;
+    let t = ext2::now();
+    let mut inode = Ext2Inode::empty();
+    inode.i_mode = ext2::S_IFLNK | 0o777;
+    inode.i_uid = uid as u16;
+    inode.i_gid = gid as u16;
+    inode.i_links_count = 1;
+    inode.i_atime = t;
+    inode.i_ctime = t;
+    inode.i_mtime = t;
+
+    let made = if target.len() < 60 {
+        let mut raw = [0u8; 60];
+        raw[..target.len()].copy_from_slice(target);
+        for (j, word) in inode.i_block.iter_mut().enumerate() {
+            *word = u32::from_le_bytes([raw[j * 4], raw[j * 4 + 1], raw[j * 4 + 2], raw[j * 4 + 3]]);
+        }
+        inode.i_size = target.len() as u32;
+        ext2::write_inode(e2, ino, &inode)
+    } else {
+        if e2.is_ext4() {
+            ext4::init_extent_root(&mut inode);
+        }
+        let data = unsafe {
+            core::slice::from_raw_parts_mut(crate::CLIENT_BUF as *mut u8, target.len())
+        };
+        data.copy_from_slice(target);
+        ext2::write_inode(e2, ino, &inode)
+            .and_then(|()| ext2::write_file_data(e2, &mut inode, ino, 0, target.len() as u32))
+            .map(|_| ())
+    }
+    .and_then(|()| ext2_dir::create_dir_entry(e2, parent_ino, &mut parent, name, ino, ext2::FT_SYMLINK));
+    if let Err(code) = made {
+        // Nothing names it: give back what it took.
+        inode.i_links_count = 0;
+        let _ = release_inode(e2, ino, &mut inode, t);
+        return Err(code);
+    }
+    parent.i_mtime = t;
+    parent.i_ctime = t;
+    ext2::write_inode(e2, parent_ino, &parent)
 }
 
 /// Whether directory `dir` is `ancestor` or somewhere beneath it.
@@ -368,7 +479,12 @@ pub fn release(e2: &mut Ext2State, ino: u32) -> Result<(), u64> {
 
 /// Free everything `ino` holds, and `ino`.
 fn release_inode(e2: &mut Ext2State, ino: u32, inode: &mut Ext2Inode, t: u32) -> Result<(), u64> {
-    free_blocks_from(e2, inode, 0)?;
+    if inode.is_fast_symlink() {
+        // Its i_block is the target's text, not a map of blocks.
+        inode.i_block = [0; 15];
+    } else {
+        free_blocks_from(e2, inode, 0)?;
+    }
     inode.i_size = 0;
     inode.i_size_high = 0;
     // A deletion time below the inode count is how ext4's orphan list links

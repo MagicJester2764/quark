@@ -197,7 +197,8 @@ int quark_vfs_rmdir(const char *path) {
 }
 
 /* A request naming two paths, lent in one buffer, one after the other. */
-static int vfs_two_paths(unsigned long tag, const char *from, const char *to) {
+static int vfs_two_paths(unsigned long tag, const char *from, const char *to,
+                         unsigned long extra) {
     struct quark_msg msg;
     struct quark_msg reply;
     char both[2 * QUARK_VFS_MAX_PATH];
@@ -216,15 +217,48 @@ static int vfs_two_paths(unsigned long tag, const char *from, const char *to) {
     msg.tag = tag;
     msg.data[0] = a;
     msg.data[1] = b;
+    msg.data[2] = extra;
     return vfs_call_lend(&msg, &reply, both, a + b, QUARK_LEND_READ);
 }
 
 int quark_vfs_rename(const char *from, const char *to) {
-    return vfs_two_paths(QUARK_VFS_TAG_RENAME, from, to);
+    return vfs_two_paths(QUARK_VFS_TAG_RENAME, from, to, 0);
 }
 
-int quark_vfs_link(const char *from, const char *to) {
-    return vfs_two_paths(QUARK_VFS_TAG_LINK, from, to);
+int quark_vfs_link(const char *from, const char *to, int follow) {
+    return vfs_two_paths(QUARK_VFS_TAG_LINK, from, to, follow ? 1 : 0);
+}
+
+int quark_vfs_symlink(const char *target, const char *path) {
+    return vfs_two_paths(QUARK_VFS_TAG_SYMLINK, target, path, 0);
+}
+
+long quark_vfs_readlink(const char *path, char *out, unsigned long len) {
+    struct quark_msg msg;
+    struct quark_msg reply;
+    /* The path, then the room for the answer, lent as one buffer. */
+    char both[QUARK_VFS_MAX_PATH + 4096];
+
+    unsigned long a = length(path);
+    if (a == 0) {
+        return -QUARK_VFS_INVALID_PATH;
+    }
+    if (a > QUARK_VFS_MAX_PATH) {
+        return -QUARK_VFS_NAME_TOO_LONG;
+    }
+    unsigned long room = len < 4096 ? len : 4096;
+    copy(both, path, a);
+    zero(&msg, sizeof msg);
+    msg.tag = QUARK_VFS_TAG_READLINK;
+    msg.data[0] = a;
+    msg.data[1] = room;
+    int err = vfs_call_lend(&msg, &reply, both, a + room, QUARK_LEND_READ | QUARK_LEND_WRITE);
+    if (err) {
+        return -err;
+    }
+    unsigned long target = reply.data[0];
+    copy(out, both + a, target < room ? target : room);
+    return (long)target;
 }
 
 int quark_vfs_truncate(unsigned long handle, unsigned long size) {

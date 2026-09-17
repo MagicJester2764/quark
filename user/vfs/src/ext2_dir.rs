@@ -9,9 +9,13 @@ use crate::ext2::{
     Ext2Inode, Ext2State,
     EXT2_ROOT_INO, FT_DIR,
 };
+use crate::devices::{self, Device};
+use crate::protocol::{MAX_NAME, MAX_PATH};
 use crate::{
-    read_u16, read_u32, DISK_IO_BUF, ERR_IO, ERR_NOT_DIR, ERR_NOT_FOUND, ERR_PERMISSION,
+    read_u16, read_u32, DISK_IO_BUF, ERR_IO, ERR_LOOP, ERR_NAME_TOO_LONG, ERR_NOT_DIR,
+    ERR_NOT_FOUND, ERR_PERMISSION,
 };
+use core::sync::atomic::{AtomicU32, Ordering};
 use crate::ext2::{write_u16, write_u32};
 
 // ---------------------------------------------------------------------------
@@ -67,74 +71,162 @@ pub fn find_entry(
 // Path resolution
 // ---------------------------------------------------------------------------
 
-/// Resolve a path from the root directory, checking execute permission on each
-/// intermediate directory.
-/// Returns (inode_num, inode, parent_inode_num).
-pub fn resolve_path(
+/// Symbolic links one lookup may follow before it is taken for a loop, as
+/// Linux counts them.
+const MAX_LINKS: usize = 40;
+
+/// The root's `dev` directory, whose names are the server's devices rather
+/// than anything on the disk. 0 if the filesystem has none.
+static DEV_DIR: AtomicU32 = AtomicU32::new(0);
+
+/// Find the root's `dev` directory. Called once the filesystem is mounted.
+pub fn note_dev_dir(ext2: &Ext2State) {
+    let found = read_inode(ext2, EXT2_ROOT_INO)
+        .and_then(|root| find_entry(ext2, &root, b"dev"))
+        .ok()
+        .flatten()
+        .and_then(|(ino, _)| match read_inode(ext2, ino) {
+            Ok(inode) if inode.is_dir() => Some(ino),
+            _ => None,
+        });
+    DEV_DIR.store(found.unwrap_or(0), Ordering::Relaxed);
+}
+
+/// The inode of the root's `dev` directory, or 0.
+pub fn dev_dir() -> u32 {
+    DEV_DIR.load(Ordering::Relaxed)
+}
+
+/// What a lookup found.
+pub enum Found {
+    /// An inode: its number, itself, and the directory that holds it.
+    Inode(u32, Ext2Inode, u32),
+    /// One of the server's devices, reached through the root's `dev`.
+    Device(Device),
+}
+
+/// The path being walked, rewritten in place as links expand. The server
+/// serves one request at a time, so one is enough.
+static mut WALK: [u8; MAX_PATH + 1] = [0; MAX_PATH + 1];
+
+/// Look `path` up from directory `base` (a path starting with `/` from the
+/// root), checking search permission on every directory it passes through.
+///
+/// A symbolic link met on the way is followed: its target replaces the part
+/// of the path that named it, from the root if the target is absolute and
+/// from the directory holding the link if not. The last component is
+/// followed only if `follow_last` says so, or if a slash comes after it. More
+/// than [`MAX_LINKS`] links in one lookup is `ERR_LOOP`.
+pub fn resolve(
     ext2: &Ext2State,
+    base: u32,
     path: &[u8],
-    caller_uid: u32,
-    caller_gid: u32,
-) -> Result<(u32, Ext2Inode, u32), u64> {
-    let path = if !path.is_empty() && path[0] == b'/' {
-        &path[1..]
-    } else {
-        path
-    };
-
-    let root_inode = read_inode(ext2, EXT2_ROOT_INO)?;
-
-    if path.is_empty() {
-        return Ok((EXT2_ROOT_INO, root_inode, 0));
+    uid: u32,
+    gid: u32,
+    follow_last: bool,
+) -> Result<Found, u64> {
+    if path.len() > MAX_PATH {
+        return Err(ERR_NAME_TOO_LONG);
     }
+    let walk = unsafe { &mut *core::ptr::addr_of_mut!(WALK) };
+    walk[..path.len()].copy_from_slice(path);
+    let mut len = path.len();
+    let mut pos = 0usize;
+    let mut links = 0usize;
+    let mut cur_ino = if path.first() == Some(&b'/') { EXT2_ROOT_INO } else { base };
+    let mut cur = read_inode(ext2, cur_ino)?;
+    let mut holder = 0u32;
 
-    let mut current_ino = EXT2_ROOT_INO;
-    let mut current_inode = root_inode;
-    let mut parent_ino = 0u32;
-
-    let mut remaining = path;
     loop {
-        // Check execute permission on current directory for traversal
-        if !check_permission(&current_inode, caller_uid, caller_gid, 1) {
+        while pos < len && walk[pos] == b'/' {
+            pos += 1;
+        }
+        if pos == len {
+            return Ok(Found::Inode(cur_ino, cur, holder));
+        }
+        if !cur.is_dir() {
+            return Err(ERR_NOT_DIR);
+        }
+        if !check_permission(&cur, uid, gid, 1) {
             return Err(ERR_PERMISSION);
         }
+        let start = pos;
+        while pos < len && walk[pos] != b'/' {
+            pos += 1;
+        }
+        let name_len = pos - start;
+        if name_len > MAX_NAME {
+            return Err(ERR_NAME_TOO_LONG);
+        }
+        let last = walk[pos..len].iter().all(|&b| b == b'/');
+        let slash_after = pos < len;
 
-        // Find next component
-        let (component, rest) = match remaining.iter().position(|&b| b == b'/') {
-            Some(pos) => (&remaining[..pos], &remaining[pos + 1..]),
-            None => (remaining, &[] as &[u8]),
-        };
+        let dev = dev_dir();
+        let is_dot = matches!(&walk[start..pos], b"." | b"..");
+        if dev != 0 && cur_ino == dev && !is_dot {
+            // The devices are the whole of /dev, whatever the disk holds.
+            return match devices::by_name(&walk[start..pos]) {
+                Some(d) if last && !slash_after => Ok(Found::Device(d)),
+                Some(_) => Err(ERR_NOT_DIR),
+                None => Err(ERR_NOT_FOUND),
+            };
+        }
 
-        if component.is_empty() {
-            remaining = rest;
-            if remaining.is_empty() {
-                return Ok((current_ino, current_inode, parent_ino));
+        let (child_ino, _) = find_entry(ext2, &cur, &walk[start..pos])?.ok_or(ERR_NOT_FOUND)?;
+        let child = read_inode(ext2, child_ino)?;
+
+        if child.is_symlink() && (!last || follow_last || slash_after) {
+            links += 1;
+            if links > MAX_LINKS {
+                return Err(ERR_LOOP);
+            }
+            let target_len = crate::ext2_ops::read_link(ext2, &child)?;
+            let target = crate::ext2_ops::link_target(target_len);
+            if target.is_empty() {
+                return Err(ERR_NOT_FOUND);
+            }
+            // The target takes the place of what named the link; what came
+            // after it follows.
+            let rest = len - pos;
+            if target_len + rest > MAX_PATH {
+                return Err(ERR_NAME_TOO_LONG);
+            }
+            walk.copy_within(pos..len, target_len);
+            walk[..target_len].copy_from_slice(target);
+            len = target_len + rest;
+            pos = 0;
+            if walk[0] == b'/' {
+                cur_ino = EXT2_ROOT_INO;
+                cur = read_inode(ext2, cur_ino)?;
+                holder = 0;
             }
             continue;
         }
 
-        if component.len() > crate::protocol::MAX_NAME {
-            return Err(crate::ERR_NAME_TOO_LONG);
+        if last {
+            // A trailing slash on something that is not a directory is the
+            // caller's to refuse; it knows whether it wanted one.
+            return Ok(Found::Inode(child_ino, child, cur_ino));
         }
-        let is_last = rest.is_empty();
+        holder = cur_ino;
+        cur_ino = child_ino;
+        cur = child;
+    }
+}
 
-        match find_entry(ext2, &current_inode, component)? {
-            Some((child_ino, _file_type)) => {
-                let child_inode = read_inode(ext2, child_ino)?;
-                if is_last {
-                    return Ok((child_ino, child_inode, current_ino));
-                }
-                // Intermediate component must be a directory
-                if !child_inode.is_dir() {
-                    return Err(ERR_NOT_DIR);
-                }
-                parent_ino = current_ino;
-                current_ino = child_ino;
-                current_inode = child_inode;
-                remaining = rest;
-            }
-            None => return Err(ERR_NOT_FOUND),
-        }
+/// [`resolve`] for a caller that wants an inode: a device is not one it may
+/// change.
+pub fn resolve_inode(
+    ext2: &Ext2State,
+    base: u32,
+    path: &[u8],
+    uid: u32,
+    gid: u32,
+    follow_last: bool,
+) -> Result<(u32, Ext2Inode, u32), u64> {
+    match resolve(ext2, base, path, uid, gid, follow_last)? {
+        Found::Inode(ino, inode, holder) => Ok((ino, inode, holder)),
+        Found::Device(_) => Err(ERR_PERMISSION),
     }
 }
 

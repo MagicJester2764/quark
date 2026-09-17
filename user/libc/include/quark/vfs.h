@@ -27,6 +27,8 @@
 #define QUARK_VFS_TAG_READDIR  8   /* the bulk read; 4 is retired */
 #define QUARK_VFS_TAG_STATFS  14
 #define QUARK_VFS_TAG_LINK    15
+#define QUARK_VFS_TAG_SYMLINK 16
+#define QUARK_VFS_TAG_READLINK 17
 
 /* A directory record, as QUARK_VFS_TAG_READDIR fills a buffer with them:
    `id`, `next` and `size` (8 bytes each), `reclen` (2), `type` (1) and
@@ -39,6 +41,7 @@
 #define QUARK_VFS_OPEN_EXCLUSIVE 2UL  /* with CREATE: the name must be free */
 #define QUARK_VFS_OPEN_TRUNCATE  4UL  /* empty a regular file */
 #define QUARK_VFS_OPEN_DIRECTORY 8UL  /* it must be a directory */
+#define QUARK_VFS_OPEN_NOFOLLOW 16UL  /* a link at the end is opened itself */
 
 /* What the server reports. Its own small integers, not anybody's errno —
    each library maps them to whatever it calls those conditions. */
@@ -56,6 +59,7 @@
 #define QUARK_VFS_NOT_SUPPORTED 12
 #define QUARK_VFS_NAME_TOO_LONG 13
 #define QUARK_VFS_NO_SPACE      14
+#define QUARK_VFS_LOOP          15
 #define QUARK_VFS_TOO_MANY_LINKS 18
 
 /* The server's devices have ids from here up, in the order null, zero, full,
@@ -113,7 +117,12 @@ int quark_vfs_mkdir(const char *path);
 int quark_vfs_unlink(const char *path);
 int quark_vfs_rmdir(const char *path);
 int quark_vfs_rename(const char *from, const char *to);
-int quark_vfs_link(const char *from, const char *to);
+/* A second name; `follow` follows a symbolic link at `from`. */
+int quark_vfs_link(const char *from, const char *to, int follow);
+int quark_vfs_symlink(const char *target, const char *path);
+/* What the link at `path` says: up to `len` bytes into `out`, no NUL. The
+   answer is the target's whole length, or a negated error. */
+long quark_vfs_readlink(const char *path, char *out, unsigned long len);
 int quark_vfs_truncate(unsigned long handle, unsigned long size);
 
 /* Fill `buf` (at most a page) with the records of a directory from entry

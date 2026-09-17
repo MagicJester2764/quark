@@ -45,6 +45,9 @@ pub struct OpenFile {
     pub file_size: u32,
     pub is_dir: bool,
     pub writable: bool,
+    /// A symbolic link opened as itself: it can be asked about, and nothing
+    /// else.
+    pub link: bool,
     pub read_offset: u32,
     pub fs: FsFileData,
 }
@@ -57,6 +60,7 @@ impl OpenFile {
             file_size: 0,
             is_dir: false,
             writable: false,
+            link: false,
             read_offset: 0,
             fs: FsFileData::None,
         }

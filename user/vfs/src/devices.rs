@@ -85,6 +85,11 @@ pub fn lookup(path: &[u8]) -> Lookup {
     }
 }
 
+/// The device called `name` in `/dev`.
+pub fn by_name(name: &[u8]) -> Option<Device> {
+    NAMES.iter().find(|(n, _)| *n == name).map(|(_, d)| *d)
+}
+
 fn index_of(dev: Device) -> usize {
     NAMES.iter().position(|(_, d)| *d == dev).unwrap_or(0)
 }
@@ -114,6 +119,7 @@ pub fn open(sender: usize, path: &[u8], found: Lookup, flags: u64) {
         file_size: 0,
         is_dir,
         writable: !is_dir,
+        link: false,
         read_offset: 0,
         fs,
     };

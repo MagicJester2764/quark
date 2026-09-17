@@ -107,6 +107,8 @@ typedef unsigned long size_t;
 #define LX_dup3            292
 #define LX_O_CLOEXEC  02000000
 #define LX_readlink         89
+#define LX_symlink          88
+#define LX_symlinkat       266
 #define LX_readlinkat      267
 #define LX_statfs          137
 #define LX_fstatfs         138
@@ -557,15 +559,21 @@ long __quark_syscall(long n, long a1, long a2, long a3, long a4, long a5, long a
     case LX_fstat:
         return __quark_fstat(a1, (void *)a2);
     case LX_stat:
+        return __quark_stat((const char *)a1, (void *)a2, 1);
     case LX_lstat:
-        /* No symbolic links on either filesystem here, so following one and
-           not following it are the same question. */
-        return __quark_stat((const char *)a1, (void *)a2);
+        return __quark_stat((const char *)a1, (void *)a2, 0);
     case LX_newfstatat:
+        /* AT_NO_AUTOMOUNT (0x800) asks for nothing here: nothing mounts. */
+        if (a4 & ~(LX_AT_SYMLINK_NOFOLLOW | LX_AT_EMPTY_PATH | 0x800)) {
+            return -LX_EINVAL;
+        }
         if (!a2 || !*(const char *)a2) {
+            if (!(a4 & LX_AT_EMPTY_PATH)) {
+                return -LX_ENOENT;
+            }
             return __quark_fstat(a1, (void *)a3);
         }
-        return __quark_stat((const char *)a2, (void *)a3);
+        return __quark_stat((const char *)a2, (void *)a3, !(a4 & LX_AT_SYMLINK_NOFOLLOW));
 
     /* access(2). gnulib's euidaccess tries faccessat2 first, then faccessat,
        and reports whatever the last one said — so refusing these is not a
@@ -638,17 +646,23 @@ long __quark_syscall(long n, long a1, long a2, long a3, long a4, long a5, long a
         }
         return __quark_rename((const char *)a2, (const char *)a4);
     case LX_link:
-        return __quark_link((const char *)a1, (const char *)a2);
+        return __quark_link((const char *)a1, (const char *)a2, 0);
     case LX_linkat:
         if (a1 != LX_AT_FDCWD || a3 != LX_AT_FDCWD) {
             return -LX_ENOSYS;
         }
-        /* Following a symbolic link at the source is accepted; naming the
-           source by descriptor is not offered. */
+        /* Naming the source by descriptor (AT_EMPTY_PATH) is not offered. */
         if (a5 & ~LX_AT_SYMLINK_FOLLOW) {
             return -LX_EINVAL;
         }
-        return __quark_link((const char *)a2, (const char *)a4);
+        return __quark_link((const char *)a2, (const char *)a4, (a5 & LX_AT_SYMLINK_FOLLOW) != 0);
+    case LX_symlink:
+        return __quark_symlink((const char *)a1, (const char *)a2);
+    case LX_symlinkat:
+        if (a2 != LX_AT_FDCWD) {
+            return -LX_ENOSYS;
+        }
+        return __quark_symlink((const char *)a1, (const char *)a3);
     case LX_truncate:
         return __quark_truncate((const char *)a1, a2);
 

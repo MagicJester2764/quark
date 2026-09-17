@@ -27,6 +27,11 @@ pub const TAG_TRUNCATE: u64 = 13;
 pub const TAG_STATFS: u64 = 14;
 /// A second name for a file: two paths, lent end to end as RENAME lends them.
 pub const TAG_LINK: u64 = 15;
+/// A symbolic link: the target, then the new path, lent end to end.
+pub const TAG_SYMLINK: u64 = 16;
+/// What a symbolic link says: the path, then room for the answer, in one
+/// buffer lent for reading and writing.
+pub const TAG_READLINK: u64 = 17;
 pub const TAG_OK: u64 = 0;
 pub const TAG_ERROR: u64 = u64::MAX;
 
@@ -38,6 +43,11 @@ pub const OPEN_EXCLUSIVE: u64 = 2;
 pub const OPEN_TRUNCATE: u64 = 4;
 /// The path must name a directory.
 pub const OPEN_DIRECTORY: u64 = 8;
+/// A symbolic link at the end of the path is opened itself, not followed.
+pub const OPEN_NOFOLLOW: u64 = 16;
+
+/// LINK: follow a symbolic link at the end of the source path.
+pub const LINK_FOLLOW: u64 = 1;
 
 // Error codes, in an error reply's first word.
 pub const ERR_NOT_FOUND: u64 = 1;
@@ -59,6 +69,8 @@ pub const ERR_NOT_SUPPORTED: u64 = 12;
 pub const ERR_NAME_TOO_LONG: u64 = 13;
 /// Nowhere to put what was written.
 pub const ERR_NO_SPACE: u64 = 14;
+/// A lookup followed more symbolic links than it may.
+pub const ERR_LOOP: u64 = 15;
 /// The file has as many names as the filesystem allows.
 pub const ERR_TOO_MANY_LINKS: u64 = 18;
 

@@ -7,20 +7,9 @@ use quark_rt::{args, println, syscall, vfs};
 #[unsafe(no_mangle)]
 #[link_section = ".text.entry"]
 pub extern "C" fn _start() -> ! {
-    // Discover VFS
-    let mut attempts = 0;
-    let vfs_tid = loop {
-        if let Some(tid) = nameserver::lookup(b"vfs") {
-            break tid;
-        }
-        attempts += 1;
-        if attempts >= 20 {
-            println!("ls: vfs not found");
-            syscall::sys_exit_code(1);
-        }
-        for _ in 0..100 {
-            syscall::sys_yield();
-        }
+    let Some(vfs_tid) = nameserver::lookup_retry(b"vfs", 20) else {
+        println!("ls: vfs not found");
+        syscall::sys_exit_code(1);
     };
 
     // Get path from argv[1], default to /
@@ -72,6 +61,8 @@ pub extern "C" fn _start() -> ! {
             if let Ok(s) = core::str::from_utf8(entry.name_bytes()) {
                 if entry.is_dir {
                     println!("{}/ ", s);
+                } else if entry.kind == vfs::DT_LNK {
+                    print_link(vfs_tid, path, entry.name_bytes(), s);
                 } else {
                     println!("{}  {}", s, entry.size);
                 }
@@ -85,6 +76,31 @@ pub extern "C" fn _start() -> ! {
 
     let _ = vfs::close(vfs_tid, handle);
     syscall::sys_exit();
+}
+
+/// `name -> target` for the link `name` in directory `dir`.
+fn print_link(vfs_tid: usize, dir: &[u8], name: &[u8], shown: &str) {
+    let mut full = [0u8; vfs::MAX_PATH + 1];
+    let slash = !dir.ends_with(b"/");
+    let len = dir.len() + slash as usize + name.len();
+    let mut target = [0u8; 4096];
+    let answer = if len > vfs::MAX_PATH {
+        Err(vfs::ERR_NAME_TOO_LONG)
+    } else {
+        full[..dir.len()].copy_from_slice(dir);
+        if slash {
+            full[dir.len()] = b'/';
+        }
+        full[len - name.len()..len].copy_from_slice(name);
+        vfs::readlink(vfs_tid, &full[..len], &mut target)
+    };
+    match answer {
+        Ok(n) => match core::str::from_utf8(&target[..n.min(target.len())]) {
+            Ok(t) => println!("{} -> {}", shown, t),
+            Err(_) => println!("{} -> (not text)", shown),
+        },
+        Err(e) => println!("{} -> (error {})", shown, e),
+    }
 }
 
 #[panic_handler]

@@ -471,7 +471,7 @@ e2fsck clean on both.
 
 On disk: a target shorter than 60 bytes is a *fast* link, kept in `i_block` with `i_blocks = 0` and no `EXTENTS_FL`, even on ext4; a longer one is a *slow* link, one data block written through the ordinary write path (an extent on ext4). `e2fsck` checks both, which is the point of making both.
 
-- [ ] **Step 1: The failing test.** `linktest.c` (runs on Linux as it is):
+- [x] **Step 1: The failing test.** `linktest.c` (runs on Linux as it is):
 
 ```c
 /* Symbolic links: made, read, followed where they should be, and not where
@@ -590,21 +590,38 @@ int main(int argc, char **argv) {
 
 `libc.tests` gains `linktest`. `dirtest.c`'s `readlink of a file is EINVAL` stays; nothing in it expected links to be refused.
 
-- [ ] **Step 2: Run it.** Host: all ok. Quark: the first check fails (`symlink` is `ENOSYS`).
+- [x] **Step 2: Run it.** Host: all ok. Quark: the first check fails (`symlink` is `ENOSYS`).
 
-- [ ] **Step 3: Resolution.** `ext2_dir::resolve` walks a working copy of the path in a 4096-byte buffer. At each component it looks the name up; if the entry is a link and it is not the last component (or it is, and `follow_last`), it reads the target (`ext2_ops::read_link`), counts one expansion (the 41st is `ERR_LOOP`), and replaces the consumed part with `target` + `/` + the rest (`ERR_NAME_TOO_LONG` if that exceeds 4095 bytes). An absolute target restarts from the root; a relative one continues from the directory holding the link. `..` is the directory's own `..` entry, as before. `split_path` resolves the parent with `follow_last = true` and never follows the final name.
+- [x] **Step 3: Resolution.** `ext2_dir::resolve` walks a working copy of the path in a 4096-byte buffer. At each component it looks the name up; if the entry is a link and it is not the last component (or it is, and `follow_last`), it reads the target (`ext2_ops::read_link`), counts one expansion (the 41st is `ERR_LOOP`), and replaces the consumed part with `target` + `/` + the rest (`ERR_NAME_TOO_LONG` if that exceeds 4095 bytes). An absolute target restarts from the root; a relative one continues from the directory holding the link. `..` is the directory's own `..` entry, as before. `split_path` resolves the parent with `follow_last = true` and never follows the final name.
 
-- [ ] **Step 4: Making and reading links.** `ext2_ops::symlink(e2, target, path, uid, gid)` allocates an inode (`S_IFLNK | 0o777`, owner the caller, one link), writes a fast link into `i_block` or a slow one through `ext2::write_file_data` (which gives an ext4 file its extent root), and enters it with `FT_SYMLINK`. `read_link(e2, &inode) -> Result<(usize, [u8; 4096]), u64>` reads `i_block`'s bytes for a fast link (`ext2::is_fast_symlink`: `i_size < 60 && i_blocks == 0`) and the file's data otherwise. ext4's `create` path must not call `init_extent_root` for a fast link. `TAG_SYMLINK` and `TAG_READLINK` go through `handle_namespace` (`TAG_SYMLINK` transacted). `OPEN_NOFOLLOW` resolves with `follow_last = false`; a link found there gets a handle with `FsFileData::Ext2 { inode_num }`, `is_dir = false` and `link = true`, and `READ`, `WRITE`, `TRUNCATE` and `READDIR_BULK` answer it `NOT_SUPPORTED`.
+- [x] **Step 4: Making and reading links.** `ext2_ops::symlink(e2, target, path, uid, gid)` allocates an inode (`S_IFLNK | 0o777`, owner the caller, one link), writes a fast link into `i_block` or a slow one through `ext2::write_file_data` (which gives an ext4 file its extent root), and enters it with `FT_SYMLINK`. `read_link(e2, &inode) -> Result<(usize, [u8; 4096]), u64>` reads `i_block`'s bytes for a fast link (`ext2::is_fast_symlink`: `i_size < 60 && i_blocks == 0`) and the file's data otherwise. ext4's `create` path must not call `init_extent_root` for a fast link. `TAG_SYMLINK` and `TAG_READLINK` go through `handle_namespace` (`TAG_SYMLINK` transacted). `OPEN_NOFOLLOW` resolves with `follow_last = false`; a link found there gets a handle with `FsFileData::Ext2 { inode_num }`, `is_dir = false` and `link = true`, and `READ`, `WRITE`, `TRUNCATE` and `READDIR_BULK` answer it `NOT_SUPPORTED`.
 
-- [ ] **Step 5: Clients.** quark-rt's three functions; `quark_vfs_symlink`, `quark_vfs_readlink`; in the layer: `symlink`/`symlinkat`, `readlink`/`readlinkat` (copy at most `bufsiz`, no terminating NUL, `EINVAL` for a non-link), `lstat` and `newfstatat(…, AT_SYMLINK_NOFOLLOW)` open with `OPEN_NOFOLLOW`, stat and close; `open` with `O_NOFOLLOW` whose result is a link closes it and answers `-ELOOP`; `vfs_errno` maps `QUARK_VFS_LOOP` to `-LX_ELOOP` (40). `ls` prints `name -> target` for an entry of type `DT_LNK`.
+- [x] **Step 5: Clients.** quark-rt's three functions; `quark_vfs_symlink`, `quark_vfs_readlink`; in the layer: `symlink`/`symlinkat`, `readlink`/`readlinkat` (copy at most `bufsiz`, no terminating NUL, `EINVAL` for a non-link), `lstat` and `newfstatat(…, AT_SYMLINK_NOFOLLOW)` open with `OPEN_NOFOLLOW`, stat and close; `open` with `O_NOFOLLOW` whose result is a link closes it and answers `-ELOOP`; `vfs_errno` maps `QUARK_VFS_LOOP` to `-LX_ELOOP` (40). `ls` prints `name -> target` for an entry of type `DT_LNK`.
 
-- [ ] **Step 6: Links in the image.** `populate-ext.sh` writes `symlink <path> <target>` for every staged symbolic link (`find usr etc var -type l`, target from `readlink`) after the directories and before the files, and its checking pass looks for them too. The FAT32 rule leaves links out (`find -type f` never matched them).
+- [x] **Step 6: Links in the image.** `populate-ext.sh` writes `symlink <path> <target>` for every staged symbolic link (`find usr etc var -type l`, target from `readlink`) after the directories and before the files, and its checking pass looks for them too. The FAT32 rule leaves links out (`find -type f` never matched them).
 
-- [ ] **Step 7: Verify.** Build, layer, suites, image; boot `runtests /etc/libc.tests`, `linktest keep`, `ls -l`-style `ls /tmp/linktest-kept`, `dtest files`; `check-rootfs.sh` (the kept links are checked); the same on `make hd-ext4`; then boot once more and run `linktest` (without `keep`) so nothing is left.
+- [x] **Step 7: Verify.** Build, layer, suites, image; boot `runtests /etc/libc.tests`, `linktest keep`, `ls -l`-style `ls /tmp/linktest-kept`, `dtest files`; `check-rootfs.sh` (the kept links are checked); the same on `make hd-ext4`; then boot once more and run `linktest` (without `keep`) so nothing is left.
 
-- [ ] **Step 8: Commit.** quark: "Symbolic links"; explosion: "linktest; links in the image".
+- [x] **Step 8: Commit.** quark: "Symbolic links"; explosion: "linktest; links in the image".
+
+**Done**, with these differences from the steps above. `READLINK` is
+`[path_len, room]`: a server cannot ask the kernel how much was lent. `LINK`
+takes `data[2]` bit 0 to follow a link at its source, which is what `linkat`'s
+`AT_SYMLINK_FOLLOW` asks for. A target must fit its block with a NUL (1023
+bytes on this image), since e2fsck holds a longer one broken. `resolve`
+returns `Found::Inode` or `Found::Device`: the lookup answers for the root's
+`dev` directory itself, so a link into `/dev` reaches a device (linktest has a
+check for it), and `writable_dir` refuses `/dev`, so nothing is made there
+through a link either; the lexical match stays for FAT32 and roots with no
+`/dev`. `release_inode` must not free a fast link's `i_block`, which is text.
+`ls` finds the VFS with `lookup_retry` instead of spinning on `sys_yield`.
+Step 2's failure was not re-run (the layer answered `symlink` with ENOSYS).
+Kept links checked with debugfs on both filesystems (ext4: the fast one has no
+extents flag, the slow one one extent); libc.tests 8/8, `dtest files` 25/0 and
+e2fsck clean on ext2 and ext4.
 
 ---
+
 ### Task 6: Working directories
 
 **Files:**

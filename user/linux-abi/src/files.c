@@ -68,6 +68,7 @@ static unsigned char fdmap[MAX_FILES];
 #define LX_O_TRUNC     01000
 #define LX_O_APPEND    02000
 #define LX_O_DIRECTORY 0200000
+#define LX_O_NOFOLLOW  0400000
 
 #define LX_SEEK_SET 0
 #define LX_SEEK_CUR 1
@@ -96,6 +97,7 @@ static long vfs_errno(int code) {
     case QUARK_VFS_NAME_TOO_LONG:  return -LX_ENAMETOOLONG;
     case QUARK_VFS_NO_SPACE:       return -LX_ENOSPC;
     case QUARK_VFS_TOO_MANY_LINKS: return -LX_EMLINK;
+    case QUARK_VFS_LOOP:           return -LX_ELOOP;
     default:                       return -LX_EIO;
     }
 }
@@ -156,10 +158,18 @@ long __quark_open(const char *path, long flags) {
     if ((flags & LX_O_TRUNC) && (flags & LX_O_ACCMODE) != 0) {
         how |= QUARK_VFS_OPEN_TRUNCATE;
     }
+    if (flags & LX_O_NOFOLLOW) {
+        how |= QUARK_VFS_OPEN_NOFOLLOW;
+    }
     struct quark_vfs_file info;
     int err = quark_vfs_open(path, how, &info);
     if (err) {
         return vfs_errno(err);
+    }
+    /* What O_NOFOLLOW found a link at is not opened: that is its point. */
+    if ((info.mode & 0170000) == 0120000) {
+        quark_vfs_close(info.handle);
+        return -LX_ELOOP;
     }
     /* Asked of the server rather than worked out here: whether this caller may
        write it, and whether it is something that can be written at all. */
@@ -488,9 +498,9 @@ long __quark_fstat(long fd, void *statbuf) {
     return 0;
 }
 
-long __quark_stat(const char *path, void *statbuf) {
+long __quark_stat(const char *path, void *statbuf, int follow) {
     struct quark_vfs_file info;
-    int err = quark_vfs_open(path, 0, &info);
+    int err = quark_vfs_open(path, follow ? 0 : QUARK_VFS_OPEN_NOFOLLOW, &info);
     if (err) {
         return vfs_errno(err);
     }
@@ -579,19 +589,31 @@ long __quark_getdents(long fd, void *buf, unsigned long count) {
     return (long)put;
 }
 
-/* readlink. Nothing here makes links, and the server does not follow or read
-   them, so the honest answers are "that is not a link" and, for a link made
-   elsewhere, "not something this can do". */
+/* readlink: at most `size` bytes of the target, and no NUL. */
 long __quark_readlink(const char *path, char *buf, unsigned long size) {
-    (void)buf;
-    (void)size;
-    struct quark_vfs_file info;
-    int err = quark_vfs_open(path, 0, &info);
-    if (err) {
-        return vfs_errno(err);
+    if ((long)size <= 0) {
+        return -LX_EINVAL;
     }
-    quark_vfs_close(info.handle);
-    return ((info.mode & 0170000) == 0120000) ? -LX_EOPNOTSUPP : -LX_EINVAL;
+    if (!path || !*path) {
+        return -LX_ENOENT;
+    }
+    long len = quark_vfs_readlink(path, buf, size);
+    if (len < 0) {
+        return vfs_errno((int)-len);
+    }
+    return (unsigned long)len < size ? len : (long)size;
+}
+
+long __quark_symlink(const char *target, const char *path) {
+    if (!target || !*target || !path || !*path) {
+        return -LX_ENOENT;
+    }
+    int err = quark_vfs_symlink(target, path);
+    /* FAT32 has no links: Linux says EPERM for a filesystem without them. */
+    if (err == QUARK_VFS_NOT_SUPPORTED) {
+        return -LX_EPERM;
+    }
+    return err ? vfs_errno(err) : 0;
 }
 
 /* Linux's struct statfs for x86-64: seven words, a two-int fsid, four more
@@ -653,8 +675,8 @@ long __quark_rename(const char *from, const char *to) {
     return err ? vfs_errno(err) : 0;
 }
 
-long __quark_link(const char *from, const char *to) {
-    int err = quark_vfs_link(from, to);
+long __quark_link(const char *from, const char *to, int follow) {
+    int err = quark_vfs_link(from, to, follow);
     /* A directory, and a filesystem with no hard links, are both EPERM on
        Linux, and EPERM is what fontconfig's lock knows to fall back from. */
     if (err == QUARK_VFS_IS_DIR || err == QUARK_VFS_NOT_SUPPORTED) {

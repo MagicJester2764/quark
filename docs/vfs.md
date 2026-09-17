@@ -33,6 +33,7 @@ code in `data[0]`:
 | 12 | `NOT_SUPPORTED` | This filesystem cannot do that |
 | 13 | `NAME_TOO_LONG` | A path over 4095 bytes, or a name over 255 |
 | 14 | `NO_SPACE` | Nowhere to put what was written |
+| 15 | `LOOP` | A lookup followed more than 40 symbolic links |
 | 18 | `TOO_MANY_LINKS` | The file has as many names as it can |
 
 Permission is checked against the caller's user and group, which the server
@@ -46,6 +47,15 @@ A request that names a path lends it for reading, with its length in
 is refused with `NAME_TOO_LONG` rather than shortened. Paths are absolute;
 there is no working directory. A trailing `/` means the path must name a
 directory.
+
+A symbolic link met on the way is followed: its target takes the place of the
+part of the path that named it, from the root if the target starts with `/`
+and from the directory holding the link if not. The last component is
+followed too, unless the request says otherwise (`OPEN_NOFOLLOW`, and every
+request that changes a name: `UNLINK`, `RENAME` and `LINK` act on a link
+itself). A path that follows more than 40 links is `LOOP`. `..` is the
+directory's own `..` entry, so it goes up from where a link led, not from
+where the link was.
 
 ## Requests
 
@@ -63,7 +73,9 @@ directory.
 | 12 | `RENAME` | `[from_len, to_len]` | both paths, end to end | — |
 | 13 | `TRUNCATE` | `[handle, size]` | — | — |
 | 14 | `STATFS` | — | 64 bytes to fill | `[64]` |
-| 15 | `LINK` | `[from_len, to_len]` | both paths, end to end | — |
+| 15 | `LINK` | `[from_len, to_len, follow]` | both paths, end to end | — |
+| 16 | `SYMLINK` | `[target_len, path_len]` | the target, then the path | — |
+| 17 | `READLINK` | `[path_len, room]` | the path, then `room` bytes to fill | `[target_len]` |
 
 Numbers are never reused. 4 was `READDIR`, which returned one entry per call
 and cut its name to 32 bytes. 7 was `CREATE`, which carried its path in the
@@ -79,11 +91,17 @@ message and cut it to 40 bytes.
 | 2 | `EXCLUSIVE` | With `CREATE`: fail with `EXISTS` if it is not |
 | 4 | `TRUNCATE` | Empty a regular file the caller may write |
 | 8 | `DIRECTORY` | Fail with `NOT_DIR` unless it is a directory |
+| 16 | `NOFOLLOW` | A symbolic link at the end is opened itself |
 
 A file made by `CREATE` is a regular file, mode 0644, owned by the caller.
 The reply's `mode` includes the file-type bits (`0o170000`), `access` is what
 this caller may do (4 read, 2 write, 1 execute), and `id` is the inode number
 (FAT32: the first cluster), stable for as long as the file exists.
+
+A symbolic link opened with `NOFOLLOW` answers `STAT` (mode `0120777`, its
+size the target's length) and `CLOSE`, and `NOT_SUPPORTED` to everything else.
+`CREATE` through a link whose target does not exist says `EXISTS`; Linux would
+make the target.
 
 A handle belongs to the program that opened it — every thread of it may use
 it — and the server closes a program's handles when its last task dies. It
@@ -130,11 +148,25 @@ kind — a file for a file, an empty directory for a directory — and refuses t
 move a directory inside itself (`INVALID_PATH`).
 
 `LINK` lends its two paths the same way and gives the file at the first a
-second name at the second. A directory is refused (`IS_DIR`), and so is a name
+second name at the second. A link at the first path gets the name itself,
+unless `data[2]` has bit 0 set, which follows it. A directory is refused (`IS_DIR`), and so is a name
 that is taken (`EXISTS`) and a file with as many names as the filesystem
 allows (`TOO_MANY_LINKS`: 32000 on ext2, 65000 on ext4). The new name's
-directory needs write permission, as for `UNLINK`. FAT32 answers all four with
-`NOT_SUPPORTED`.
+directory needs write permission, as for `UNLINK`. FAT32 answers all five
+name-changing requests with `NOT_SUPPORTED`.
+
+### SYMLINK and READLINK
+
+`SYMLINK` lends the target followed by the new path, and makes the path a
+symbolic link, mode `0777`, owned by the caller. The target is kept as given:
+it is not resolved and need not exist, but it must not be empty (`NOT_FOUND`)
+and must fit a block with room for a NUL (`NAME_TOO_LONG` past 1023 bytes on a
+1 KiB-block filesystem). One shorter than 60 bytes is kept in the inode; a
+longer one takes a block.
+
+`READLINK` lends one buffer for reading and writing: the path, then `room`
+bytes. The link's target is written into those bytes, as much as fits, and the
+reply is its whole length. A path that is not a link is `INVALID_PATH`.
 
 ### TRUNCATE
 
@@ -168,9 +200,10 @@ seen twice, as with any `readdir`.
 
 ### Devices
 
-`/dev` is the server's own, whatever the root filesystem holds there, and a
-path is checked against it before any filesystem sees it — spelled any way,
-`/tmp/../dev/null` included. It holds five character devices, mode `0666`,
+`/dev` is the server's own, whatever the root filesystem holds there: the
+lookup answers for its names itself, so a path reaches the devices however it
+is spelled and whatever links it passes through. (A root with no `/dev`
+directory, and FAT32, match the path as written instead.) It holds five character devices, mode `0666`,
 with ids from `0xFFFF_FF00` in this order:
 
 | Name | Read | Write |

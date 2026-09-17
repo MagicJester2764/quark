@@ -113,6 +113,17 @@ impl Ext2Inode {
         self.i_mode & S_IFMT == S_IFREG
     }
 
+    pub fn is_symlink(&self) -> bool {
+        self.i_mode & S_IFMT == S_IFLNK
+    }
+
+    /// A symbolic link whose target lives in `i_block` itself: shorter than
+    /// its 60 bytes, and holding no blocks. Its `i_block` is text, not a map,
+    /// and nothing may free or follow it as one.
+    pub fn is_fast_symlink(&self) -> bool {
+        self.is_symlink() && self.i_size < 60 && self.i_blocks == 0
+    }
+
     /// Parse a 128-byte inode from raw bytes.
     pub fn from_bytes(data: &[u8]) -> Self {
         let mut i_block = [0u32; 15];
