@@ -1,7 +1,7 @@
 #![no_std]
 #![no_main]
 
-use quark_rt::ipc::{Message, TID_ANY};
+use quark_rt::ipc::{death_notice, Message, TID_ANY};
 use quark_rt::nameserver;
 use quark_rt::{println, syscall};
 
@@ -17,7 +17,17 @@ quark_rt::manifest!([
 const TAG_GET_KEY: u64 = 1;
 const TAG_KEY_EVENT: u64 = 2;
 const TAG_NO_KEY: u64 = 3;
-const TAG_REGISTER_SIGINT: u64 = 4;
+/// Take the keyboard, with the right to notify the claimant on offer. From
+/// then on nobody else is answered, until the claimant dies: keys are for the
+/// input server to hand out, and a program reading them here would be reading
+/// whatever anybody types.
+const TAG_KBD_CLAIM: u64 = 4;
+/// What anybody but the claimant is answered with, in `data[0]` of an error.
+const ERR_NOT_CLAIMANT: u64 = 5;
+const TAG_ERROR: u64 = u64::MAX;
+/// What the claimant is notified of: a key arrived, and it was Ctrl-C.
+const NOTIFY_KEY: u64 = 2;
+const NOTIFY_CTRL_C: u64 = 1;
 /// Take a key if one is waiting, but do not wait for one.
 ///
 /// [`TAG_GET_KEY`] parks the caller until something is typed, which is right
@@ -364,9 +374,9 @@ pub extern "C" fn _start() -> ! {
     let mut modifiers: u8 = 0;
     let mut extended = false;
     let mut waiting_client: Option<usize> = None;
-    let mut sigint_tid: usize = 0;
-    // Where the capability to notify it is.
-    let mut sigint_slot: usize = 0;
+    // Who holds the keyboard, and where the capability to notify it is.
+    let mut claimant: usize = 0;
+    let mut claimant_slot: usize = 0;
 
     let mut mousebuf = MouseBuffer::new();
     let mut mouse = MouseDecoder::new();
@@ -380,6 +390,17 @@ pub extern "C" fn _start() -> ! {
     loop {
         let mut msg = Message::empty();
         if syscall::sys_recv(TID_ANY, &mut msg).is_err() {
+            continue;
+        }
+
+        if let Some(dead) = death_notice(&msg) {
+            if dead == claimant {
+                println!("[keyboard] claimant tid {} has gone", dead);
+                let _ = syscall::sys_cap_delete(claimant_slot);
+                claimant = 0;
+                claimant_slot = 0;
+                waiting_client = None;
+            }
             continue;
         }
 
@@ -422,7 +443,7 @@ pub extern "C" fn _start() -> ! {
                         &mut extended,
                         &mut modifiers,
                         &mut keybuf,
-                        sigint_tid,
+                        claimant,
                         &mut waiting_client,
                     );
                 }
@@ -439,8 +460,42 @@ pub extern "C" fn _start() -> ! {
             if have_mouse {
                 syscall::sys_irq_ack(12);
             }
+        } else if msg.tag == quark_rt::ipc::TAG_PING {
+            // Whether it is alive is anybody's business.
+            let reply = Message { sender: 0, tag: quark_rt::ipc::TAG_PING, data: [0; 6] };
+            let _ = syscall::sys_reply(msg.sender, &reply);
+        } else if msg.tag == TAG_KBD_CLAIM {
+            // Only with the right to tell it things: the claim offers one,
+            // and without it there is nobody this could notify.
+            let taken = if claimant == 0 || claimant == msg.sender {
+                syscall::sys_cap_take_any(msg.sender).ok()
+            } else {
+                None
+            };
+            let reply = match taken {
+                Some(slot) => {
+                    if claimant_slot != 0 {
+                        let _ = syscall::sys_cap_delete(claimant_slot);
+                    }
+                    claimant = msg.sender;
+                    claimant_slot = slot;
+                    let _ = syscall::sys_task_watch(claimant);
+                    println!("[keyboard] claimed by tid {}", claimant);
+                    Message { sender: 0, tag: 0, data: [0; 6] }
+                }
+                None => Message { sender: 0, tag: TAG_ERROR, data: [ERR_NOT_CLAIMANT, 0, 0, 0, 0, 0] },
+            };
+            let _ = syscall::sys_reply(msg.sender, &reply);
+        } else if msg.sender != claimant {
+            let reply = Message { sender: 0, tag: TAG_ERROR, data: [ERR_NOT_CLAIMANT, 0, 0, 0, 0, 0] };
+            let _ = syscall::sys_reply(msg.sender, &reply);
         } else {
-            // Client IPC request
+            // The claimant's requests. One that asks anything has stopped
+            // waiting for a key it asked for before: a task is in one call
+            // at a time.
+            if waiting_client == Some(msg.sender) {
+                waiting_client = None;
+            }
             match msg.tag {
                 TAG_GET_KEY => {
                     if let Some(ev) = keybuf.pop() {
@@ -476,32 +531,6 @@ pub extern "C" fn _start() -> ! {
                     };
                     let _ = syscall::sys_reply(msg.sender, &reply);
                 }
-                TAG_REGISTER_SIGINT => {
-                    // Only with the right to tell it: the registration offers
-                    // one, and without it there is nobody this could notify.
-                    let tag = match syscall::sys_cap_take_any(msg.sender) {
-                        Ok(slot) => {
-                            if sigint_slot != 0 && sigint_slot != slot {
-                                let _ = syscall::sys_cap_delete(sigint_slot);
-                            }
-                            sigint_tid = msg.sender;
-                            sigint_slot = slot;
-                            0
-                        }
-                        Err(()) => u64::MAX,
-                    };
-                    let reply = Message { sender: 0, tag, data: [0; 6] };
-                    let _ = syscall::sys_reply(msg.sender, &reply);
-                }
-                quark_rt::ipc::TAG_PING => {
-                    // Liveness probe: reply immediately, do nothing else.
-                    let reply = Message {
-                        sender: 0,
-                        tag: quark_rt::ipc::TAG_PING,
-                        data: [0; 6],
-                    };
-                    let _ = syscall::sys_reply(msg.sender, &reply);
-                }
                 _ => {
                     let reply = Message {
                         sender: 0,
@@ -521,7 +550,7 @@ fn handle_scancode(
     extended: &mut bool,
     modifiers: &mut u8,
     keybuf: &mut KeyBuffer,
-    sigint_tid: usize,
+    claimant: usize,
     waiting_client: &mut Option<usize>,
 ) {
     if raw == 0xE0 {
@@ -581,11 +610,6 @@ fn handle_scancode(
         ascii &= 0x1F;
     }
 
-    // Notify input server on Ctrl+C key press
-    if press && ascii == 0x03 && sigint_tid != 0 {
-        let _ = syscall::sys_notify(sigint_tid, 1);
-    }
-
     let ev = KeyEvent { press, ascii, scancode, modifiers: *modifiers };
 
     // If a client is blocked waiting, reply immediately
@@ -598,6 +622,12 @@ fn handle_scancode(
     }
 
     keybuf.push(ev);
+
+    // Told after the key is there to take: the claimant wakes and asks.
+    if claimant != 0 {
+        let ctrl_c = if press && ascii == 0x03 { NOTIFY_CTRL_C } else { 0 };
+        let _ = syscall::sys_notify(claimant, NOTIFY_KEY | ctrl_c);
+    }
 }
 
 fn make_key_reply(ev: &KeyEvent) -> Message {

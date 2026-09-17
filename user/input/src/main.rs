@@ -16,7 +16,7 @@
 //!     wm ---- CLAIM ----->  input        line readers wait
 //!     wm ---- POLL ------>  input ---->  keyboard (non-blocking)
 //!        <--- key -------
-//!     wm ---- RELEASE --->  input        deferred readers are served
+//!     wm ---- RELEASE --->  input        waiting readers are served
 //! ```
 //!
 //! A claimant polls rather than being pushed to, because pushing needs an
@@ -26,14 +26,20 @@
 //! that works.
 //!
 //! Claims stack, as the display's do: a compositor started inside another
-//! takes the keys, and they go back to the outer one when it lets go. Line
-//! readers are served when nobody at all holds the keyboard.
+//! takes the keys, and they go back to the outer one when it lets go.
+//!
+//! Nobody holding the keyboard, keys are cooked as they are typed: the driver
+//! says when one arrives, this takes everything waiting, echoes it and edits
+//! the line, and a finished line waits here until somebody reads it. A reader
+//! is answered when there is a line for it, and until then this server goes
+//! on answering everybody else. It used to read the keyboard in a loop until
+//! Enter, and every request in the meantime — a compositor's claim included —
+//! waited for somebody to type.
 
-use quark_rt::ipc::{death_notice, Message, TAG_NOTIFICATION, TID_ANY};
+use quark_rt::ipc::{death_notice, Message, TAG_NOTIFICATION, TAG_PING, TID_ANY};
+use quark_rt::manifest::CapReq;
 use quark_rt::nameserver;
 use quark_rt::{print, println, syscall};
-
-use quark_rt::manifest::CapReq;
 
 // Sets the foreground task so Ctrl-C reaches the right one.
 quark_rt::manifest!([
@@ -42,19 +48,20 @@ quark_rt::manifest!([
 ]);
 
 // Keyboard protocol (client side)
-const TAG_GET_KEY: u64 = 1;
 const TAG_KEY_EVENT: u64 = 2;
+/// Take the keyboard driver, offering it the right to say when keys arrive.
+/// Nobody else is answered by it afterwards.
+const TAG_KBD_CLAIM: u64 = 4;
 const TAG_GET_KEY_NB: u64 = 5;
-
-// Input server protocol (serving readers)
-const TAG_READ: u64 = 1;
-const TAG_SET_FOREGROUND: u64 = 2;
-
-// Keyboard registration
-const TAG_REGISTER_SIGINT: u64 = 4;
 /// The keyboard driver's own tags for the pointer half of its controller.
 const TAG_GET_MOUSE_NB: u64 = 6;
 const TAG_MOUSE_EVENT: u64 = 7;
+
+// Input server protocol (serving readers)
+const TAG_READ: u64 = 1;
+/// `data[0]`: the task Ctrl-C interrupts — the caller or one of its
+/// children — or 0 for none.
+const TAG_SET_FOREGROUND: u64 = 2;
 
 /// Take the keyboard: raw key events, no line discipline, until released.
 ///
@@ -86,68 +93,50 @@ const TAG_ERROR: u64 = u64::MAX;
 
 const KEY_PRESS: u64 = 1;
 
+/// The longest line that can be typed, newline included.
 const LINE_BUF_SIZE: usize = 256;
-
-/// How many line readers can be waiting on the keyboard coming back.
-///
-/// One is the number that occurs: there is a console and a shell on it. The
-/// rest is so that a second reader waits its turn rather than being stranded.
-const MAX_DEFERRED: usize = 4;
-
-/// A line that was finished but not yet all handed over.
-///
-/// A read gets at most forty bytes, one message's worth, and the rest waits
-/// here for the next read, which is how a terminal hands a long line to a
-/// short read. Before this, whatever did not fit in the first forty bytes was
-/// thrown away: an eighty-character command ran as its first forty.
-struct Pending {
-    buf: [u8; LINE_BUF_SIZE],
-    len: usize,
-    at: usize,
-}
-
-impl Pending {
-    const fn new() -> Self {
-        Pending { buf: [0; LINE_BUF_SIZE], len: 0, at: 0 }
-    }
-
-    /// The next piece of the line, if any is left.
-    fn take(&mut self, max: usize) -> Option<Message> {
-        if self.at >= self.len {
-            return None;
-        }
-        let n = (self.len - self.at).min(max);
-        let reply = pack_read_reply(&self.buf[self.at..], n);
-        self.at += n;
-        Some(reply)
-    }
-
-    fn clear(&mut self) {
-        self.len = 0;
-        self.at = 0;
-    }
-}
-
-/// Answer a reader: from what is left of the last line, or with a new one.
-fn answer_reader(
-    kbd_tid: usize,
-    reader_tid: usize,
-    max_bytes: usize,
-    pending: &mut Pending,
-    line_buf: &mut [u8; LINE_BUF_SIZE],
-    line_len: &mut usize,
-    foreground_tid: &mut usize,
-) {
-    match pending.take(max_bytes) {
-        Some(reply) => {
-            let _ = syscall::sys_reply(reader_tid, &reply);
-        }
-        None => serve_read(kbd_tid, reader_tid, max_bytes, pending, line_buf, line_len, foreground_tid),
-    }
-}
-
+/// Finished lines waiting to be read.
+const COOKED_SIZE: usize = 1024;
+/// A read gets at most one message's worth.
+const READ_MAX: usize = 40;
+/// Readers waiting: one per task at most, so as many as there can be tasks.
+const MAX_READERS: usize = 64;
 /// How many programs can hold the keyboard, one above another.
 const MAX_CLAIMANTS: usize = 8;
+/// Keys taken from the driver in one go. More are taken on the next notice.
+const DRAIN_MAX: usize = 1024;
+
+/// Finished lines, oldest first: what a terminal calls its input queue. A
+/// read takes at most one line of it, and a long line in as many reads as it
+/// takes — before this, whatever did not fit in the first forty bytes was
+/// thrown away, and an eighty-character command ran as its first forty.
+struct Cooked {
+    buf: [u8; COOKED_SIZE],
+    len: usize,
+}
+
+impl Cooked {
+    fn push(&mut self, line: &[u8]) -> bool {
+        if self.len + line.len() > COOKED_SIZE {
+            return false;
+        }
+        self.buf[self.len..self.len + line.len()].copy_from_slice(line);
+        self.len += line.len();
+        true
+    }
+
+    /// How much a read of at most `max` bytes takes: up to the end of the
+    /// first line.
+    fn next_read(&self, max: usize) -> usize {
+        let line = self.buf[..self.len].iter().position(|&b| b == b'\n').map_or(self.len, |i| i + 1);
+        line.min(max)
+    }
+
+    fn consume(&mut self, n: usize) {
+        self.buf.copy_within(n..self.len, 0);
+        self.len -= n;
+    }
+}
 
 /// Who holds the keyboard raw: oldest first, and the last one gets the keys.
 struct Claims {
@@ -191,6 +180,178 @@ struct KeyEvent {
     modifiers: u8,
 }
 
+struct Server {
+    kbd: usize,
+    /// The line being typed.
+    line: [u8; LINE_BUF_SIZE],
+    line_len: usize,
+    cooked: Cooked,
+    /// Readers waiting for a line, oldest first, with how much each wants.
+    readers: [(usize, usize); MAX_READERS],
+    nreaders: usize,
+    claims: Claims,
+    /// Who Ctrl-C interrupts, and who said so.
+    foreground: usize,
+    foreground_setter: usize,
+}
+
+impl Server {
+    /// A task is in one call at a time, so one that sends anything is no
+    /// longer waiting for a line it asked for earlier.
+    fn forget_reader(&mut self, tid: usize) {
+        if let Some(i) = self.readers[..self.nreaders].iter().position(|r| r.0 == tid) {
+            self.readers.copy_within(i + 1..self.nreaders, i);
+            self.nreaders -= 1;
+        }
+    }
+
+    fn pop_reader(&mut self) -> Option<(usize, usize)> {
+        if self.nreaders == 0 {
+            return None;
+        }
+        let first = self.readers[0];
+        self.readers.copy_within(1..self.nreaders, 0);
+        self.nreaders -= 1;
+        Some(first)
+    }
+
+    /// Answer waiting readers from the finished lines, oldest first. A reader
+    /// that has stopped waiting cannot be answered, and what it would have
+    /// taken goes to the next.
+    fn serve_readers(&mut self) {
+        while self.claims.top() == 0 && self.cooked.len > 0 {
+            let Some((tid, max)) = self.pop_reader() else { break };
+            let n = self.cooked.next_read(max);
+            if syscall::sys_reply(tid, &pack_read_reply(&self.cooked.buf[..n])).is_ok() {
+                self.cooked.consume(n);
+            }
+        }
+    }
+
+    /// Take the keys the driver has and cook them, unless somebody holds the
+    /// keyboard raw and takes them itself.
+    fn keys_waiting(&mut self) {
+        if self.claims.top() != 0 {
+            return;
+        }
+        for _ in 0..DRAIN_MAX {
+            let Some(ev) = get_key_nb(self.kbd) else { break };
+            if ev.press {
+                self.typed(ev.ascii);
+            }
+        }
+        self.serve_readers();
+    }
+
+    /// The line discipline: one key typed.
+    fn typed(&mut self, c: u8) {
+        match c {
+            0x03 => self.interrupt(),
+            b'\n' | b'\r' => {
+                print!("\n");
+                self.line[self.line_len] = b'\n';
+                // A full queue loses the line, as a full terminal does.
+                let _ = self.cooked.push(&self.line[..self.line_len + 1]);
+                self.line_len = 0;
+            }
+            8 | 127 => {
+                if self.line_len > 0 {
+                    self.line_len -= 1;
+                    print!("\x08 \x08");
+                }
+            }
+            c if c >= 0x20 => {
+                // One byte short of the buffer: the newline needs room.
+                if self.line_len < LINE_BUF_SIZE - 1 {
+                    self.line[self.line_len] = c;
+                    self.line_len += 1;
+                    if let Ok(s) = core::str::from_utf8(&[c]) {
+                        print!("{}", s);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Ctrl-C: the foreground task is interrupted, what was typed goes, and
+    /// whoever is reading is answered with nothing and asks again.
+    fn interrupt(&mut self) {
+        print!("^C\n");
+        self.line_len = 0;
+        self.cooked.len = 0;
+        if self.foreground != 0 {
+            let _ = syscall::sys_signal(self.foreground, syscall::SIG_INT);
+            self.foreground = 0;
+        }
+        if let Some((tid, _)) = self.pop_reader() {
+            let _ = syscall::sys_reply(tid, &pack_read_reply(&[]));
+        }
+    }
+
+    fn claim(&mut self, sender: usize) -> Message {
+        if self.claims.top() == sender {
+            return ok(); // already theirs
+        }
+        if !self.claims.push(sender) {
+            return error();
+        }
+        // A claimant that dies without releasing would otherwise keep the
+        // keys from everybody below it, down to a console nobody can type at.
+        let _ = syscall::sys_task_watch(sender);
+        // Whatever the driver still has was typed at something else. Throw it
+        // away rather than delivering it to a compositor.
+        flush(self.kbd);
+        ok()
+    }
+
+    /// The keyboard has gone back down the stack. What the driver has was
+    /// typed at the program that let go: a claimant below does not get it,
+    /// and with nobody left it is cooked for the line readers, which is where
+    /// typing goes when no program has the keys.
+    fn handed_down(&mut self) {
+        match self.claims.top() {
+            0 => self.keys_waiting(),
+            _ => flush(self.kbd),
+        }
+    }
+
+    fn task_died(&mut self, dead: usize) {
+        if dead == self.foreground {
+            self.foreground = 0;
+        }
+        self.forget_reader(dead);
+        if let Some(top) = self.claims.remove(dead) {
+            if top {
+                println!("[input] tid {} died holding the keyboard", dead);
+                self.handed_down();
+            }
+        }
+    }
+
+    /// Only a task's own children, or itself, can be put in the foreground,
+    /// and only whoever put a task there, or the task itself, takes it out.
+    /// Anything more would let any program aim Ctrl-C at any other.
+    fn set_foreground(&mut self, sender: usize, tid: usize) -> Message {
+        let allowed = if tid == 0 {
+            self.foreground == 0 || self.foreground == sender || self.foreground_setter == sender
+        } else {
+            tid == sender
+                || syscall::sys_task_info(tid)
+                    .is_ok_and(|(state, parent, _)| parent == sender && state != 3)
+        };
+        if !allowed {
+            return error();
+        }
+        self.foreground = tid;
+        self.foreground_setter = sender;
+        if tid != 0 {
+            let _ = syscall::sys_task_watch(tid);
+        }
+        ok()
+    }
+}
+
 #[unsafe(no_mangle)]
 #[link_section = ".text.entry"]
 pub extern "C" fn _start() -> ! {
@@ -211,19 +372,25 @@ pub extern "C" fn _start() -> ! {
         println!("[input] Registered with nameserver.");
     }
 
-    // Register with keyboard driver for Ctrl+C notifications
-    register_sigint(kbd_tid);
+    if !claim_keyboard(kbd_tid) {
+        println!("[input] The keyboard belongs to somebody else.");
+    }
 
     println!("[input] Ready.");
 
-    let mut line_buf = [0u8; LINE_BUF_SIZE];
-    let mut line_len: usize = 0;
-    let mut foreground_tid: usize = 0;
-    let mut pending = Pending::new();
-
-    let mut claims = Claims { tids: [0; MAX_CLAIMANTS], depth: 0 };
-    let mut deferred: [(usize, usize); MAX_DEFERRED] = [(0, 0); MAX_DEFERRED];
-    let mut deferred_len: usize = 0;
+    let mut s = Server {
+        kbd: kbd_tid,
+        line: [0; LINE_BUF_SIZE],
+        line_len: 0,
+        cooked: Cooked { buf: [0; COOKED_SIZE], len: 0 },
+        readers: [(0, 0); MAX_READERS],
+        nreaders: 0,
+        claims: Claims { tids: [0; MAX_CLAIMANTS], depth: 0 },
+        foreground: 0,
+        foreground_setter: 0,
+    };
+    // Whatever was typed before this server was listening.
+    s.keys_waiting();
 
     loop {
         let mut msg = Message::empty();
@@ -232,197 +399,83 @@ pub extern "C" fn _start() -> ! {
         }
         let sender = msg.sender;
 
-        // A claimant has died: out of the stack, and if nobody is left
-        // holding the keyboard, the readers waiting on it are served. The
-        // kernel is not waiting for an answer; the same tag from anybody else
-        // is an unknown request.
+        // From the kernel: a task this server watches has died, or the
+        // driver has keys. Nobody is waiting for an answer. The same tags
+        // from anybody else are unknown requests.
         if let Some(dead) = death_notice(&msg) {
-            if let Some(top) = claims.remove(dead) {
-                if top {
-                    println!("[input] tid {} died holding the keyboard", dead);
-                    handed_down(kbd_tid, claims.top());
-                }
-                if claims.top() == 0 {
-                    for &(tid, max) in &deferred[..deferred_len] {
-                        answer_reader(
-                            kbd_tid,
-                            tid,
-                            max,
-                            &mut pending,
-                            &mut line_buf,
-                            &mut line_len,
-                            &mut foreground_tid,
-                        );
-                    }
-                    deferred_len = 0;
-                }
+            s.task_died(dead);
+            continue;
+        }
+        if sender == 0 {
+            if msg.tag == TAG_NOTIFICATION {
+                // Ctrl-C comes with the keys, so there is only one thing to
+                // do. While the keyboard belongs to somebody else, ^C is
+                // theirs to interpret: acting on it here would interrupt the
+                // compositor, which is the foreground task.
+                s.keys_waiting();
             }
             continue;
         }
+        s.forget_reader(sender);
 
-        match msg.tag {
-            TAG_SET_FOREGROUND => {
-                foreground_tid = msg.data[0] as usize;
-                let _ = syscall::sys_reply(sender, &ok());
-            }
-            TAG_NOTIFICATION if sender == 0 => {
-                // Ctrl+C from the keyboard driver, which sends it whether or
-                // not anyone is reading. While the keyboard belongs to someone
-                // else, ^C is theirs to interpret — it is sitting in the
-                // driver's buffer and will be handed over with everything
-                // else. Acting on it here would kill the compositor, which is
-                // the foreground task, and it would die still holding the
-                // display.
-                if claims.top() == 0 {
-                    handle_ctrl_c(&mut foreground_tid, &mut line_len);
-                    pending.clear();
-                }
-            }
-
-            TAG_INPUT_CLAIM => {
-                let reply = if claims.top() == sender {
-                    ok() // already theirs
-                } else if claims.push(sender) {
-                    // A claimant that dies without releasing would otherwise
-                    // keep the keys from everybody below it, down to a
-                    // console nobody can type at.
-                    let _ = syscall::sys_task_watch(sender);
-                    // Whatever was typed before the claim was typed at
-                    // something else. Throw it away rather than delivering a
-                    // shell command's tail to a compositor.
-                    while get_key_nb(kbd_tid).is_some() {}
-                    println!("[input] keyboard claimed by tid {}", sender);
-                    ok()
+        let reply = match msg.tag {
+            TAG_READ => {
+                let max = (msg.data[0] as usize).min(READ_MAX);
+                // One entry per task never fills a table as long as the
+                // kernel's; the check is for a kernel with more.
+                if max == 0 || s.nreaders == MAX_READERS {
+                    pack_read_reply(&[])
                 } else {
-                    error()
-                };
-                let _ = syscall::sys_reply(sender, &reply);
-            }
-
-            TAG_INPUT_RELEASE => match claims.remove(sender) {
-                None => {
-                    let _ = syscall::sys_reply(sender, &error());
+                    // Held until there is a line, or answered from one now.
+                    s.readers[s.nreaders] = (sender, max);
+                    s.nreaders += 1;
+                    s.keys_waiting();
+                    continue;
                 }
+            }
+            TAG_SET_FOREGROUND => s.set_foreground(sender, msg.data[0] as usize),
+            TAG_INPUT_CLAIM => s.claim(sender),
+            TAG_INPUT_RELEASE => match s.claims.remove(sender) {
+                None => error(),
                 Some(top) => {
-                    // Answer the releaser first: serving a deferred reader
-                    // blocks in here until a whole line is typed, and the
-                    // program giving the keyboard back is usually on its way
-                    // out.
+                    // Answer the releaser first: it is usually on its way out.
                     let _ = syscall::sys_reply(sender, &ok());
-                    println!("[input] keyboard released by tid {}", sender);
                     if top {
-                        handed_down(kbd_tid, claims.top());
+                        s.handed_down();
                     }
-                    if claims.top() == 0 {
-                        for &(tid, max) in &deferred[..deferred_len] {
-                            answer_reader(
-                                kbd_tid,
-                                tid,
-                                max,
-                                &mut pending,
-                                &mut line_buf,
-                                &mut line_len,
-                                &mut foreground_tid,
-                            );
-                        }
-                        deferred_len = 0;
-                    }
+                    continue;
                 }
             },
-
-            TAG_INPUT_POLL => {
-                let reply = if claims.top() != sender {
-                    error()
-                } else {
-                    match get_key_nb(kbd_tid) {
-                        Some(ev) => Message {
-                            sender: 0,
-                            tag: TAG_INPUT_KEY,
-                            data: [
-                                if ev.press { 1 } else { 0 },
-                                ev.ascii as u64,
-                                ev.scancode as u64,
-                                ev.modifiers as u64,
-                                0,
-                                0,
-                            ],
-                        },
-                        None => Message { sender: 0, tag: TAG_INPUT_NONE, data: [0; 6] },
+            TAG_INPUT_POLL if s.claims.top() == sender => match get_key_nb(kbd_tid) {
+                Some(ev) => Message {
+                    sender: 0,
+                    tag: TAG_INPUT_KEY,
+                    data: [
+                        ev.press as u64,
+                        ev.ascii as u64,
+                        ev.scancode as u64,
+                        ev.modifiers as u64,
+                        0,
+                        0,
+                    ],
+                },
+                None => Message { sender: 0, tag: TAG_INPUT_NONE, data: [0; 6] },
+            },
+            TAG_INPUT_POLL_MOUSE if s.claims.top() == sender => {
+                let ask = Message { sender: 0, tag: TAG_GET_MOUSE_NB, data: [0; 6] };
+                let mut got = Message::empty();
+                match syscall::sys_call_timeout(kbd_tid, &ask, &mut got, 20) {
+                    syscall::CallOutcome::Replied if got.tag == TAG_MOUSE_EVENT => {
+                        Message { sender: 0, tag: TAG_INPUT_MOUSE, data: got.data }
                     }
-                };
-                let _ = syscall::sys_reply(sender, &reply);
-            }
-
-            TAG_INPUT_POLL_MOUSE => {
-                let reply = if claims.top() != sender {
-                    error()
-                } else {
-                    let ask = Message { sender: 0, tag: TAG_GET_MOUSE_NB, data: [0; 6] };
-                    let mut got = Message::empty();
-                    match syscall::sys_call(kbd_tid, &ask, &mut got) {
-                        Ok(()) if got.tag == TAG_MOUSE_EVENT => Message {
-                            sender: 0,
-                            tag: TAG_INPUT_MOUSE,
-                            data: got.data,
-                        },
-                        _ => Message { sender: 0, tag: TAG_INPUT_NONE, data: [0; 6] },
-                    }
-                };
-                let _ = syscall::sys_reply(sender, &reply);
-            }
-
-            TAG_READ => {
-                let max_bytes = (msg.data[0] as usize).min(40);
-                if claims.top() != 0 {
-                    // Someone else has the keyboard. Hold the reader instead
-                    // of answering it: reading here would take keys out of the
-                    // owner's hands, and an empty answer would only bring the
-                    // reader straight back.
-                    if deferred_len < MAX_DEFERRED {
-                        deferred[deferred_len] = (sender, max_bytes);
-                        deferred_len += 1;
-                    } else {
-                        let _ = syscall::sys_reply(sender, &pack_read_reply(&line_buf, 0));
-                    }
-                } else {
-                    answer_reader(
-                        kbd_tid,
-                        sender,
-                        max_bytes,
-                        &mut pending,
-                        &mut line_buf,
-                        &mut line_len,
-                        &mut foreground_tid,
-                    );
+                    _ => Message { sender: 0, tag: TAG_INPUT_NONE, data: [0; 6] },
                 }
             }
-
-            quark_rt::ipc::TAG_PING => {
-                // Liveness probe: reply immediately, do nothing else. Without
-                // this arm the default drops the message and the caller waits
-                // out its timeout against a perfectly healthy service.
-                let reply = Message {
-                    sender: 0,
-                    tag: quark_rt::ipc::TAG_PING,
-                    data: [0; 6],
-                };
-                let _ = syscall::sys_reply(sender, &reply);
-            }
-            _ => {
-                let _ = syscall::sys_reply(sender, &error());
-            }
-        }
-    }
-}
-
-/// The keyboard has gone back down the stack, to `tid`. What was typed before
-/// now was typed at the program that let go, and is thrown away as a claim
-/// throws away what was typed before it. Nothing to do for the line readers:
-/// a line in progress is theirs.
-fn handed_down(kbd_tid: usize, tid: usize) {
-    if tid != 0 {
-        while get_key_nb(kbd_tid).is_some() {}
-        println!("[input] keyboard back with tid {}", tid);
+            // Liveness probe: answered at once, doing nothing else.
+            TAG_PING => Message { sender: 0, tag: TAG_PING, data: [0; 6] },
+            _ => error(),
+        };
+        let _ = syscall::sys_reply(sender, &reply);
     }
 }
 
@@ -432,106 +485,6 @@ fn ok() -> Message {
 
 fn error() -> Message {
     Message { sender: 0, tag: TAG_ERROR, data: [0; 6] }
-}
-
-/// Read a line for `reader_tid` and reply with it.
-///
-/// This blocks until Enter, so nothing else is served while it runs — a claim
-/// arriving mid-line waits for the line to finish. That is the same
-/// unresponsiveness the server has always had while reading, and the case it
-/// matters for (a compositor launched from a shell prompt) cannot occur: the
-/// shell's read has already been answered by the time it spawns anything.
-fn serve_read(
-    kbd_tid: usize,
-    reader_tid: usize,
-    max_bytes: usize,
-    pending: &mut Pending,
-    line_buf: &mut [u8; LINE_BUF_SIZE],
-    line_len: &mut usize,
-    foreground_tid: &mut usize,
-) {
-    loop {
-        let ascii = get_key_blocking(kbd_tid);
-        if ascii == 0 {
-            continue;
-        }
-
-        match ascii {
-            0x03 => {
-                // Ctrl+C while reading
-                print!("^C\n");
-                *line_len = 0;
-                if *foreground_tid != 0 {
-                    let _ = syscall::sys_signal(*foreground_tid, syscall::SIG_INT);
-                    *foreground_tid = 0;
-                }
-                // Reply with 0 bytes to unblock the reader
-                pending.clear();
-                let reply = pack_read_reply(line_buf, 0);
-                let _ = syscall::sys_reply(reader_tid, &reply);
-                return;
-            }
-            b'\n' | 13 => {
-                // Newline — echo and deliver
-                print!("\n");
-                if *line_len < LINE_BUF_SIZE {
-                    line_buf[*line_len] = b'\n';
-                    *line_len += 1;
-                }
-                // The whole line waits in `pending`; this read gets its first
-                // piece and later reads the rest.
-                pending.buf[..*line_len].copy_from_slice(&line_buf[..*line_len]);
-                pending.len = *line_len;
-                pending.at = 0;
-                *line_len = 0;
-                if let Some(reply) = pending.take(max_bytes) {
-                    let _ = syscall::sys_reply(reader_tid, &reply);
-                }
-                return;
-            }
-            8 | 127 => {
-                // Backspace
-                if *line_len > 0 {
-                    *line_len -= 1;
-                    print!("\x08 \x08");
-                }
-            }
-            c if c >= 0x20 => {
-                // Printable character
-                if *line_len < LINE_BUF_SIZE - 1 {
-                    line_buf[*line_len] = c;
-                    *line_len += 1;
-                    let ch = [c];
-                    if let Ok(s) = core::str::from_utf8(&ch) {
-                        print!("{}", s);
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-}
-
-/// Get one key press from the keyboard driver (blocking).
-/// Returns ASCII code, or 0 for non-printable/release events.
-fn get_key_blocking(kbd_tid: usize) -> u8 {
-    let msg = Message {
-        sender: 0,
-        tag: TAG_GET_KEY,
-        data: [0; 6],
-    };
-    let mut reply = Message::empty();
-    if syscall::sys_call(kbd_tid, &msg, &mut reply).is_err() {
-        return 0;
-    }
-    if reply.tag != TAG_KEY_EVENT {
-        return 0;
-    }
-    // Only handle key presses
-    if reply.data[0] != KEY_PRESS {
-        return 0;
-    }
-    reply.data[1] as u8
 }
 
 /// Take a key from the driver if one is waiting, without blocking.
@@ -564,46 +517,32 @@ fn get_key_nb(kbd_tid: usize) -> Option<KeyEvent> {
     })
 }
 
-/// Pack a read reply: data[0] = byte count, data[1..6] = bytes
-fn pack_read_reply(buf: &[u8], len: usize) -> Message {
-    let mut data = [0u64; 6];
-    data[0] = len as u64;
-    for i in 0..5 {
-        let base = i * 8;
-        let mut w = [0u8; 8];
-        for j in 0..8 {
-            if base + j < len {
-                w[j] = buf[base + j];
-            }
+/// Throw away whatever the driver has.
+fn flush(kbd_tid: usize) {
+    for _ in 0..DRAIN_MAX {
+        if get_key_nb(kbd_tid).is_none() {
+            break;
         }
+    }
+}
+
+/// A read's answer: `data[0]` the byte count, `data[1..6]` the bytes.
+fn pack_read_reply(bytes: &[u8]) -> Message {
+    let mut data = [0u64; 6];
+    data[0] = bytes.len() as u64;
+    for (i, chunk) in bytes.chunks(8).take(5).enumerate() {
+        let mut w = [0u8; 8];
+        w[..chunk.len()].copy_from_slice(chunk);
         data[i + 1] = u64::from_le_bytes(w);
     }
-    Message {
-        sender: 0,
-        tag: TAG_READ,
-        data,
-    }
+    Message { sender: 0, tag: TAG_READ, data }
 }
 
-/// Ask the keyboard to say when Ctrl-C is pressed, which it does by calling
-/// here — so the request carries the right to.
-fn register_sigint(kbd_tid: usize) {
-    let msg = Message {
-        sender: 0,
-        tag: TAG_REGISTER_SIGINT,
-        data: [0; 6],
-    };
+/// Take the keyboard driver, offering it the right to say when keys arrive.
+fn claim_keyboard(kbd_tid: usize) -> bool {
+    let msg = Message { sender: 0, tag: TAG_KBD_CLAIM, data: [0; 6] };
     let mut reply = Message::empty();
-    let _ = syscall::sys_call_offer_self(kbd_tid, &msg, &mut reply);
-}
-
-fn handle_ctrl_c(foreground_tid: &mut usize, line_len: &mut usize) {
-    print!("^C\n");
-    *line_len = 0;
-    if *foreground_tid != 0 {
-        let _ = syscall::sys_signal(*foreground_tid, syscall::SIG_INT);
-        *foreground_tid = 0;
-    }
+    syscall::sys_call_offer_self(kbd_tid, &msg, &mut reply).is_ok() && reply.tag == TAG_OK
 }
 
 #[panic_handler]

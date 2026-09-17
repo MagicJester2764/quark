@@ -30,6 +30,8 @@ const TAG_OK: u64 = 0;
 const TAG_NOT_FOUND: u64 = u64::MAX;
 
 const MAX_SERVICES: usize = 32;
+/// Names one task may hold, so that one task cannot fill the table.
+const MAX_NAMES_PER_TASK: usize = 4;
 const NAME_LEN: usize = 24; // 3 x u64
 /// Where a capability is minted only to be compared, and deleted at once.
 const CHECK_SLOT: usize = syscall::SLOT_SCRATCH;
@@ -108,7 +110,9 @@ fn register(services: &mut Services, sender: usize, name: [u8; NAME_LEN], len: u
         services[i] = None;
         release(services, held.slot);
     }
-    let Some(free) = services.iter().position(|s| s.is_none()) else {
+    let held = services.iter().flatten().filter(|e| e.tid == sender).count();
+    let free = services.iter().position(|s| s.is_none());
+    let Some(free) = free.filter(|_| held < MAX_NAMES_PER_TASK) else {
         release(services, slot);
         return false;
     };

@@ -2,7 +2,7 @@
 #![no_main]
 #![allow(dead_code)]
 
-use quark_rt::ipc::{Message, TID_ANY};
+use quark_rt::ipc::{death_notice, Message, TID_ANY};
 use quark_rt::nameserver;
 use quark_rt::{println, syscall};
 
@@ -25,6 +25,12 @@ const TAG_READ_SECTOR: u64 = 1;
 const TAG_WRITE_SECTOR: u64 = 2;
 const TAG_DISK_INFO: u64 = 3;
 const TAG_READ_SECTORS: u64 = 4;
+/// Take the disk. From then on nobody else is answered, until the claimant
+/// dies: the filesystem server claims it before its first read, and a program
+/// that could write a sector could write anything on the disk.
+const TAG_DISK_CLAIM: u64 = 5;
+/// What anybody but the claimant is answered with.
+const ERR_NOT_CLAIMANT: u64 = 5;
 const TAG_OK: u64 = 0;
 const TAG_ERROR: u64 = u64::MAX;
 
@@ -281,11 +287,42 @@ pub extern "C" fn _start() -> ! {
         println!("[disk] Failed to register with nameserver.");
     }
 
+    let mut claimant: usize = 0;
+
     // Service loop
     loop {
         let mut msg = Message::empty();
         if syscall::sys_recv(TID_ANY, &mut msg).is_err() {
             continue;
+        }
+
+        if let Some(dead) = death_notice(&msg) {
+            if dead == claimant {
+                println!("[disk] claimant tid {} has gone", dead);
+                claimant = 0;
+            }
+            continue;
+        }
+        match msg.tag {
+            // Whether it is alive is anybody's business.
+            quark_rt::ipc::TAG_PING => {}
+            TAG_DISK_CLAIM => {
+                let reply = if claimant == 0 || claimant == msg.sender {
+                    claimant = msg.sender;
+                    let _ = syscall::sys_task_watch(claimant);
+                    println!("[disk] claimed by tid {}", claimant);
+                    status(TAG_OK, 0)
+                } else {
+                    status(TAG_ERROR, ERR_NOT_CLAIMANT)
+                };
+                let _ = syscall::sys_reply(msg.sender, &reply);
+                continue;
+            }
+            _ if msg.sender != claimant => {
+                let _ = syscall::sys_reply(msg.sender, &status(TAG_ERROR, ERR_NOT_CLAIMANT));
+                continue;
+            }
+            _ => {}
         }
 
         match msg.tag {

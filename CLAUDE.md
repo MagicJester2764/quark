@@ -199,6 +199,11 @@ These were established deliberately. Breaking one silently re-opens a hole.
   `sys_call_offer` puts one on a call and `sys_cap_take` accepts it; nothing
   else can fill a server's CSpace, and a claim or registration made without
   one is refused.
+- **A driver answers only the server that claimed it.** The disk driver
+  serves the VFS and the keyboard driver serves `input`, each from the first
+  claim until that claimant dies, and refuses everybody else (error 5). A
+  program that could reach the disk driver could write any sector, and one
+  that could reach the keyboard's would read whatever anybody typed.
 - **Only the kernel reports a death.** Any program that can call a server can
   send `TAG_TASK_DIED`; what it cannot do is send as sender 0. A server
   believes a notice through `quark_rt::ipc::death_notice` (or
@@ -236,6 +241,10 @@ claim protocol: while a program holds it, raw key and pointer events go to that
 program and line readers wait. The compositor claims input when it claims the
 display and hands each event to the focused window — whoever owns the screen
 owns the keyboard, the way switching virtual terminals has always worked.
+With nobody holding it, `input` cooks keys as they are typed: the driver
+notifies it of each one, and a finished line waits for a reader. It never
+waits on the keyboard itself, so a reader waiting for a line holds up nobody
+else's request.
 
 Both come from one driver. A PS/2 mouse is not a second device: it is the same
 i8042 answering on the same data port 0x60, with IRQ 12 instead of 1 and bit 5
@@ -394,7 +403,8 @@ change here: it has found what reading the code did not.
   descriptors, poll sets and sockets excepted — not a share of it: what either
   is given or closes afterwards, the other does not see. A pipe end that was
   open when a thread started stays open until that thread closes it or exits.
-- A C program has 16 open files; the VFS has 128 handles for everybody.
+- A C program has 16 open files; the VFS has 512 handles for everybody, and
+  128 for any one program.
 - The rust fork is one commit on `upstream/main`. Rebasing it means re-checking
   the PAL against std's internals, which move: the allocator PAL shape, the
   futex module location, `RawOsError`'s home and `BorrowedCursor`'s parameters

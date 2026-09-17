@@ -14,8 +14,21 @@ use quark_rt::syscall;
 
 use crate::{DISK_IO_BUF, TAG_DISK_OK, TAG_READ_SECTOR, TAG_READ_SECTORS, TAG_WRITE_SECTOR};
 
+const TAG_DISK_CLAIM: u64 = 5;
+
 /// Sectors one request may carry: as many as fill `DISK_IO_BUF`.
 pub const MAX_SECTORS: u32 = 8;
+
+/// Take the disk driver for this server alone. It answers nobody else from
+/// then on.
+pub fn claim(disk_tid: usize) -> Result<(), ()> {
+    let msg = Message { sender: 0, tag: TAG_DISK_CLAIM, data: [0; 6] };
+    let mut reply = Message::empty();
+    match syscall::sys_call(disk_tid, &msg, &mut reply) {
+        Ok(()) if reply.tag == TAG_DISK_OK => Ok(()),
+        _ => Err(()),
+    }
+}
 
 /// Read `count` sectors (at most [`MAX_SECTORS`]) from the absolute `lba` into
 /// `DISK_IO_BUF`.

@@ -5,10 +5,8 @@ use crate::syscall;
 
 const TAG_UDP_SEND: u64 = 1;
 const TAG_UDP_RECV: u64 = 2;
-const TAG_NET_CONFIG: u64 = 3;
 const TAG_NET_INFO: u64 = 4;
 const TAG_ICMP_PING: u64 = 5;
-const TAG_NET_DHCP: u64 = 6;
 const TAG_DNS_RESOLVE: u64 = 7;
 const TAG_TCP_CONNECT: u64 = 10;
 const TAG_TCP_LISTEN: u64 = 11;
@@ -111,20 +109,6 @@ pub fn icmp_ping(net_tid: usize, dst_ip: u32, id: u16, seq: u16) -> Result<(u64,
     Ok((rtt, ttl, size))
 }
 
-/// Configure IP address, netmask, and gateway (all packed big-endian u32).
-pub fn configure(net_tid: usize, ip: u32, netmask: u32, gateway: u32) -> Result<(), u64> {
-    let msg = Message {
-        sender: 0,
-        tag: TAG_NET_CONFIG,
-        data: [ip as u64, netmask as u64, gateway as u64, 0, 0, 0],
-    };
-    let mut reply = Message::empty();
-    if syscall::sys_call(net_tid, &msg, &mut reply).is_err() {
-        return Err(1);
-    }
-    if reply.tag == TAG_ERROR { Err(reply.data[0]) } else { Ok(()) }
-}
-
 /// Resolve a hostname to an IPv4 address via DNS.
 /// Returns the IP as a packed big-endian u32 on success.
 /// Hostname must be <= 48 bytes.
@@ -153,22 +137,6 @@ pub fn dns_resolve(net_tid: usize, hostname: &[u8]) -> Result<u32, u64> {
     if reply.tag == TAG_ERROR { return Err(reply.data[0]); }
     Ok(reply.data[0] as u32)
 }
-
-/// Trigger DHCP renewal. Returns the new IP address (packed big-endian) on success.
-pub fn dhcp_renew(net_tid: usize) -> Result<[u8; 4], u64> {
-    let msg = Message { sender: 0, tag: TAG_NET_DHCP, data: [0; 6] };
-    let mut reply = Message::empty();
-    if syscall::sys_call(net_tid, &msg, &mut reply).is_err() {
-        return Err(1);
-    }
-    if reply.tag == TAG_ERROR { return Err(reply.data[0]); }
-    let ip_packed = reply.data[0] as u32;
-    Ok(ip_packed.to_be_bytes())
-}
-
-// ---------------------------------------------------------------------------
-// TCP
-// ---------------------------------------------------------------------------
 
 /// Open a TCP connection to `dst_ip:dst_port`. Blocks until established or timeout.
 /// `src_port` of 0 uses an ephemeral port. Returns connection handle on success.

@@ -398,10 +398,13 @@ fn dispatch_csi(cmd: u8) {
                         CELL_CH[i] = 0;
                         CELL_FG[i] = 0;
                     }
-                    // Clear framebuffer directly
-                    let buf = FB as *mut u8;
-                    let total = HEIGHT * PITCH;
-                    for i in 0..total { buf.add(i).write_volatile(0); }
+                    // Clear framebuffer directly, if it is still ours: a
+                    // console without the display has nothing mapped there.
+                    if HAVE_DISPLAY {
+                        let buf = FB as *mut u8;
+                        let total = HEIGHT * PITCH;
+                        for i in 0..total { buf.add(i).write_volatile(0); }
+                    }
                     ROW = 0; COL = 0;
                     DIRTY_MIN = usize::MAX;
                     DIRTY_MAX = 0;

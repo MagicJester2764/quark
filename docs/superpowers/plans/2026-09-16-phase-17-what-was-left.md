@@ -1453,17 +1453,48 @@ told the display is changing hands, rather than waiting for ever. dtest
 
 A line reader in `input` is deferred like any other waiter: the server keeps serving requests, takes keys with `get_key_nb` whenever its receive times out (every tick), and answers the reader when its line is finished. A program asking for a line used to stop the whole server — the display's compositor included — until somebody pressed Enter.
 
-- [ ] **Step 1: The fuzzer and a first run.** Write `qfuzz` (a `Rng` — xorshift64* — seeded from the argument or `sys_getrandom`), build, image with `fuzz.tests` in a suite, boot and run `runtests /etc/fuzz.tests`. Expected on today's services: `disk` and `keyboard` answer the fuzzer; `input` stops answering after the first `TAG_READ`; whatever else the fuzzer finds.
+- [x] **Step 1: The fuzzer and a first run.** Write `qfuzz` (a `Rng` — xorshift64* — seeded from the argument or `sys_getrandom`), build, image with `fuzz.tests` in a suite, boot and run `runtests /etc/fuzz.tests`. Expected on today's services: `disk` and `keyboard` answer the fuzzer; `input` stops answering after the first `TAG_READ`; whatever else the fuzzer finds.
 
-- [ ] **Step 2: Drivers answer only their server.** The disk driver's first request must be `TAG_DISK_CLAIM` with an endpoint on offer (`sys_call_offer_self`); it takes it, watches the claimant, and from then on answers that TID alone (`TAG_ERROR` code 5 for anyone else) until the claimant dies. The VFS claims before its first read. The keyboard driver and the input server the same way.
+- [x] **Step 2: Drivers answer only their server.** The disk driver's first request must be `TAG_DISK_CLAIM` with an endpoint on offer (`sys_call_offer_self`); it takes it, watches the claimant, and from then on answers that TID alone (`TAG_ERROR` code 5 for anyone else) until the claimant dies. The VFS claims before its first read. The keyboard driver and the input server the same way.
 
-- [ ] **Step 3: Input without blocking.** Replace `serve_read`'s key loop with a pending reader (`reader: Option<(usize, usize)>`) completed from the tick-driven key pump; `TAG_READ` while a reader is pending is deferred behind it, as a read during a claim is.
+- [x] **Step 3: Input without blocking.** Replace `serve_read`'s key loop with a pending reader (`reader: Option<(usize, usize)>`) completed from the tick-driven key pump; `TAG_READ` while a reader is pending is deferred behind it, as a read during a claim is.
 
-- [ ] **Step 4: Fix what the fuzzer finds.** Every crash, hang or wrong answer is fixed in the server that has it, the seed that found it goes in the commit message, and `fuzz.tests` gains that seed if it is not one of the three. The fuzzer runs until `runtests /etc/fuzz.tests` passes three times in a row with three fresh seeds (from `sys_getrandom`, printed) as well.
+- [x] **Step 4: Fix what the fuzzer finds.** Every crash, hang or wrong answer is fixed in the server that has it, the seed that found it goes in the commit message, and `fuzz.tests` gains that seed if it is not one of the three. The fuzzer runs until `runtests /etc/fuzz.tests` passes three times in a row with three fresh seeds (from `sys_getrandom`, printed) as well.
 
-- [ ] **Step 5: Verify.** Boot: `runtests /etc/fuzz.tests` passes; afterwards `dtest`, `runtests /etc/libc.tests`, `ls /`, typing a line at the prompt, `wm weston-simple-shm` all behave; serial has no `PANIC`, `UFAULT` or `KFAULT`; `check-rootfs.sh` is clean (the fuzzer's `/tmp/qfuzz` garbage is in a consistent filesystem); the same on `make hd-ext4`.
+- [x] **Step 5: Verify.** Boot: `runtests /etc/fuzz.tests` passes; afterwards `dtest`, `runtests /etc/libc.tests`, `ls /`, typing a line at the prompt, `wm weston-simple-shm` all behave; serial has no `PANIC`, `UFAULT` or `KFAULT`; `check-rootfs.sh` is clean (the fuzzer's `/tmp/qfuzz` garbage is in a consistent filesystem); the same on `make hd-ext4`.
 
-- [ ] **Step 6: Commit.** quark: "Services survive a fuzzer" (plus one commit per fix that deserves its own); explosion: "fuzz.tests".
+- [x] **Step 6: Commit.** quark: "Services survive a fuzzer" (plus one commit per fix that deserves its own); explosion: "fuzz.tests".
+
+**Done.** The fuzzer found what was expected and a little more. `input` stopped
+answering after its first `TAG_READ`, because it read the keyboard in a loop
+until Enter; it now takes keys as the driver says they have arrived
+(`sys_notify` from the keyboard, a bit for a key and a bit for Ctrl-C), cooks
+them as they are typed, and answers a reader when there is a line for it — so a
+program waiting for one holds up nothing else, and typed-ahead lines wait in a
+queue rather than in the driver. The disk and keyboard drivers answered
+anybody: each now takes a claimant (the VFS and `input`), watches it, and
+answers `TAG_ERROR` code 5 to everyone else. `net` let any program change the
+machine's address or make it spend five seconds on a DHCP renewal — both
+requests are gone, nothing used them — and it now frees a dead client's
+connections, gives up on a SYN nobody answers, refuses a second ICMP or UDP
+reader instead of stranding the first, and answers `TAG_PING` before the
+socket handle is taken out of the tag.
+
+Other holes the reading found while writing it: `qtty` cleared the framebuffer
+on `ESC [ 2 J` without checking it still had the display (a program that took
+the display could fault the console); the nameserver let one task hold every
+name and the VFS let one program hold every handle (four names and a quarter
+of the table now); a lock a program asked for and gave up on stayed in the
+VFS's waiting list.
+
+`SYS_CALL_WITH` (ABI 2.8) is a call with any of a buffer lent, a capability
+offered and a deadline, which is what a fuzzer needs: every request it makes
+has half a second to be answered.
+
+Verification: `runtests /etc/fuzz.tests` (seeds 1, 2, 3) passes on ext2 and on
+ext4 with `e2fsck` clean afterwards, as do fresh seeds from `sys_getrandom`;
+`dtest`, `runtests /etc/libc.tests`, `ls /`, typing at the prompt and
+`wm weston-simple-shm` all behave afterwards.
 
 ---
 

@@ -1225,6 +1225,10 @@ pub extern "C" fn _start() -> ! {
         }
     };
     println!("[vfs] Found disk at TID {}", disk_tid);
+    if disk::claim(disk_tid).is_err() {
+        println!("[vfs] The disk belongs to somebody else. Exiting.");
+        syscall::sys_exit();
+    }
 
     // The page every sector passes through, and the sector cache (32 pages,
     // 256 sectors). Ordinary memory: the disk driver is lent the one and
@@ -1381,6 +1385,10 @@ pub extern "C" fn _start() -> ! {
             locks::drop_task(tid);
             continue;
         }
+        // A task in a call is not waiting in an earlier one: a lock it asked
+        // for and gave up on is not a request any more, and granting it later
+        // would hand a lock to a program that had stopped asking.
+        locks::drop_task(sender);
 
         match msg.tag {
             TAG_READ | TAG_WRITE | TAG_STAT | TAG_READDIR_BULK | TAG_TRUNCATE

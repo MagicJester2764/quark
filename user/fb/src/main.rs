@@ -200,7 +200,6 @@ fn hand_back() {
     while owner() != 0 {
         let tid = owner();
         if lease_to(tid) {
-            println!("[fb] display returned to tid {}", tid);
             let msg = mode_reply();
             call_claimant(tid, &Message { sender: 0, tag: TAG_FB_GAINED, data: msg.data });
             return;
@@ -238,7 +237,6 @@ fn claim(sender: usize) -> Message {
     // for good: revocation stops it mapping the framebuffer again, but
     // nothing gives the screen back to whoever is next in line.
     let _ = syscall::sys_task_watch(sender);
-    println!("[fb] display claimed by tid {}", sender);
     mode_reply()
 }
 

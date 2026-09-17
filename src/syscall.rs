@@ -63,6 +63,23 @@ pub const SYS_CALL_OFFER: u64 = 24;
 /// Copy out of, or into, a buffer a caller lent with the call being served.
 pub const SYS_LENT_READ: u64 = 25;
 pub const SYS_LENT_WRITE: u64 = 26;
+/// `SYS_CALL` with any of a buffer lent, a capability offered and a deadline,
+/// described by a [`CallWith`] the caller points at.
+pub const SYS_CALL_WITH: u64 = 27;
+
+/// What goes with a `SYS_CALL_WITH`, as the caller lays it out.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct CallWith {
+    /// A buffer to lend and its length with the `LEND_*` access bits, as
+    /// `SYS_CALL_LEND` takes them; `len_access` 0 lends nothing.
+    buf: u64,
+    len_access: u64,
+    /// The slot to offer, or `u64::MAX` for none.
+    offer: u64,
+    /// Ticks to wait for the reply; 0 waits for ever.
+    ticks: u64,
+}
 
 // --- 0x20  memory ---
 pub const SYS_MMAP: u64 = 32;
@@ -245,7 +262,7 @@ pub const SYS_ABI_VERSION: u64 = 240;
 /// minor when calls are added. User space can refuse to run against a major it
 /// does not know, which is the point of exposing it at all.
 pub const ABI_VERSION_MAJOR: u64 = 2;
-pub const ABI_VERSION_MINOR: u64 = 7;
+pub const ABI_VERSION_MINOR: u64 = 8;
 
 /// Threads a task may make with no capability at all.
 ///
@@ -818,6 +835,62 @@ extern "C" fn syscall_dispatch(
                     unsafe { *reply_ptr = reply };
                     0
                 }
+                Err(_) => u64::MAX,
+            }
+        }
+        SYS_CALL_WITH => {
+            // arg0 = dest, arg1 = msg, arg2 = reply out, arg3 = CallWith.
+            // Each part is checked as the call that has only that part checks
+            // it, and the result is SYS_CALL_TIMEOUT's.
+            let caller = scheduler::current_tid();
+            let dest = arg0 as usize;
+            if !crate::cap::task_has_endpoint(caller, dest) {
+                return deny_ipc(caller, dest, b"call");
+            }
+            let msg_size = core::mem::size_of::<crate::ipc::Message>() as u64;
+            let with_size = core::mem::size_of::<CallWith>() as u64;
+            if !validate_user_ptr(arg1, msg_size)
+                || !validate_user_ptr_mut(arg2, msg_size)
+                || !validate_user_ptr(arg3, with_size)
+            {
+                return u64::MAX;
+            }
+            let (msg, with) = {
+                let _ua = crate::cpu::UserAccess::begin();
+                unsafe { (*(arg1 as *const crate::ipc::Message), *(arg3 as *const CallWith)) }
+            };
+            let lent = if with.len_access == 0 {
+                None
+            } else {
+                let access = with.len_access & (crate::lend::LEND_READ | crate::lend::LEND_WRITE);
+                let len = (with.len_access & crate::lend::LEND_LEN_MASK) as usize;
+                if access == 0 || len == 0 || len > crate::lend::LEND_MAX {
+                    return u64::MAX;
+                }
+                if !validate_user_range(with.buf, len as u64, access & crate::lend::LEND_WRITE != 0) {
+                    return u64::MAX;
+                }
+                Some(crate::ipc::Lent { addr: with.buf as usize, len, access, frame: false })
+            };
+            let offer = if with.offer == u64::MAX {
+                None
+            } else {
+                let slot = with.offer as usize;
+                let valid = slot < crate::cap::MAX_CAPS
+                    && unsafe { scheduler::get_task_mut(caller) }
+                        .is_some_and(|t| crate::cap::slot_is_valid(&t.cspace[slot]));
+                if !valid {
+                    return u64::MAX;
+                }
+                Some(slot)
+            };
+            match crate::ipc::sys_call_with(dest, &msg, with.ticks, lent, offer) {
+                Ok(reply) => {
+                    let _ua = crate::cpu::UserAccess::begin();
+                    unsafe { *(arg2 as *mut crate::ipc::Message) = reply };
+                    0
+                }
+                Err(crate::ipc::IpcError::Timeout) => 1,
                 Err(_) => u64::MAX,
             }
         }

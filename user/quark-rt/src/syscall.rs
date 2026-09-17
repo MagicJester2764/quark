@@ -26,6 +26,7 @@ pub const SYS_RECV_TIMEOUT: u64 = 21;
 pub const SYS_NOTIFY: u64 = 22;
 pub const SYS_CALL_LEND: u64 = 23;
 pub const SYS_CALL_OFFER: u64 = 24;
+pub const SYS_CALL_WITH: u64 = 27;
 pub const SYS_LENT_READ: u64 = 25;
 pub const SYS_LENT_WRITE: u64 = 26;
 
@@ -516,6 +517,51 @@ pub fn sys_call_offer_self(
     let called = sys_call_offer(dest, msg, reply, SLOT_SCRATCH);
     let _ = sys_cap_delete(SLOT_SCRATCH);
     called
+}
+
+/// What goes with a [`sys_call_with`]: any of a buffer lent, a capability
+/// offered and a deadline.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct CallWith {
+    /// The buffer lent, and its length with [`LEND_READ`] and [`LEND_WRITE`]
+    /// as access; a `len_access` of 0 lends nothing.
+    pub buf: u64,
+    pub len_access: u64,
+    /// The slot offered, or `u64::MAX` for none.
+    pub offer: u64,
+    /// Ticks to wait for the reply; 0 waits for ever.
+    pub ticks: u64,
+}
+
+impl CallWith {
+    /// Nothing lent, nothing offered, no deadline: a plain call.
+    pub const PLAIN: CallWith = CallWith { buf: 0, len_access: 0, offer: u64::MAX, ticks: 0 };
+}
+
+/// A call carrying whatever `with` describes. Answers as
+/// [`sys_call_timeout`] does; a part the kernel refuses (a buffer the caller
+/// cannot lend, an empty slot) fails the call before it is made.
+pub fn sys_call_with(
+    dest: usize,
+    msg: &crate::ipc::Message,
+    reply: &mut crate::ipc::Message,
+    with: &CallWith,
+) -> CallOutcome {
+    let ret = unsafe {
+        syscall4(
+            SYS_CALL_WITH,
+            dest as u64,
+            msg as *const _ as u64,
+            reply as *mut _ as u64,
+            with as *const _ as u64,
+        )
+    };
+    match ret {
+        0 => CallOutcome::Replied,
+        1 => CallOutcome::TimedOut,
+        _ => CallOutcome::Failed,
+    }
 }
 
 /// Copy out of what `client` lent with the call being served, from `offset`.

@@ -1,6 +1,6 @@
 # Quark syscall ABI
 
-**Version 2.7.** Query the running kernel with `SYS_ABI_VERSION` (240), which
+**Version 2.8.** Query the running kernel with `SYS_ABI_VERSION` (240), which
 returns `(major << 16) | minor`.
 
 This document is the contract between the Quark kernel and everything above it.
@@ -137,6 +137,7 @@ rule still holds for everything else.
 | 2.5 | Block 0xC0 opens. `SYS_MAP_ANON` (192) — memory reserved and given its frames when first touched, up to 512 GiB at once; `SYS_MEM_INFO` (193) — free frames, and what the caller is charged. Also: a user page fault on a reserved page is served rather than fatal, and one that cannot be served ends the task with SIGBUS. |
 | 2.6 | `SYS_OBJECT_CREATE` (194), `SYS_OBJECT_MAP` (195), `SYS_OBJECT_CTL` (196) and capability type 9, `MemObject` — memory objects whose pages a user-space pager provides as they are touched, which is how a file is mapped. Also: a task's page fault can call a pager (`TAG_PAGE_IN`, sender marked with bit 62), a pager hears when nothing maps an object (`TAG_OBJECT_IDLE`), and notices from the kernel are received before calls waiting behind them. |
 | 2.7 | `SYS_OBJECT_SYNC` (197) — what was written through shared mappings reaches the files (`TAG_OBJECT_SYNC` to each pager). Also: `SYS_OBJECT_CTL` op 3 takes a starting page, and leaves a page dirty while it is mapped writable. |
+| 2.8 | `SYS_CALL_WITH` (27) — a call with any of a buffer lent, a capability offered and a deadline. |
 
 ### Deprecated
 
@@ -244,6 +245,7 @@ Messages are fixed size: sender TID, a `u64` tag, and six `u64` payload words.
 | 24 | `SYS_CALL_OFFER` | arg0 = dest, arg1 = msg, arg2 = reply out, arg3 = slot | as `SYS_CALL`; `u64::MAX` without calling if the slot holds no valid capability | `Endpoint` for dest |
 | 25 | `SYS_LENT_READ` | arg0 = caller, arg1 = offset, arg2 = buffer out, arg3 = length | bytes copied / `u64::MAX` | the caller's call is being served |
 | 26 | `SYS_LENT_WRITE` | arg0 = caller, arg1 = offset, arg2 = buffer, arg3 = length | bytes copied / `u64::MAX` | as above |
+| 27 | `SYS_CALL_WITH` | arg0 = dest, arg1 = msg, arg2 = reply out, arg3 = `CallWith` | as `SYS_CALL_TIMEOUT`; `u64::MAX` without calling if a part is refused | `Endpoint` for dest |
 
 The `Endpoint` check applies to calls where the sender names its own
 destination. IPC the kernel performs on a task's behalf through an installed
@@ -275,6 +277,14 @@ not, nothing happens. This is how a client hands a server the right to call it
 back — a registration, a claim on the display — without the server's CSpace
 being open to anybody who wants to fill it. The copy is derived as a grant
 would derive it, so revoking the original revokes it too.
+
+**All of them at once.** `SYS_CALL_WITH` takes a pointer to four words:
+the buffer's address, its length with the lending bits as `SYS_CALL_LEND`'s
+arg4 has them (0 lends nothing), the slot to offer (`u64::MAX` for none), and
+the ticks to wait for the reply (0 for ever). Each part is checked as the call
+with only that part checks it, and the result is `SYS_CALL_TIMEOUT`'s. It is
+what a caller that cannot trust the task it calls uses to lend or offer with a
+deadline.
 
 Prefer `SYS_CALL_TIMEOUT` over `SYS_CALL` for any destination not known to be a
 running server. A TID is not a promise that anything is listening, and a plain

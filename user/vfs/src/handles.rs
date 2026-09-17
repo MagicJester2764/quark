@@ -16,7 +16,12 @@
 use quark_rt::syscall;
 
 /// Handles for the whole system.
-pub const MAX_OPEN_FILES: usize = 128;
+pub const MAX_OPEN_FILES: usize = 512;
+/// Handles one program may hold: a quarter, so that one program opening files
+/// in a loop cannot stop every other program opening any. Comfortably above
+/// the hundred `dtest files` opens at once, which is the most anything here
+/// asks for.
+pub const MAX_PER_PROGRAM: usize = MAX_OPEN_FILES / 4;
 
 pub enum FsFileData {
     Fat32 {
@@ -91,6 +96,9 @@ pub fn alloc(file: OpenFile) -> Option<usize> {
         return None;
     }
     let t = table();
+    if t.iter().filter(|f| f.in_use && f.owner == owner).count() >= MAX_PER_PROGRAM {
+        return None;
+    }
     let i = t.iter().position(|f| !f.in_use)?;
     t[i] = file;
     t[i].in_use = true;

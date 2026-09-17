@@ -22,7 +22,7 @@ code in `data[0]`:
 | 1 | `NOT_FOUND` | No such file or directory |
 | 2 | `INVALID_HANDLE` | Not a handle this client holds |
 | 3 | `IO` | The disk failed, or the filesystem is damaged |
-| 4 | `TOO_MANY_OPEN` | The server's handle table is full |
+| 4 | `TOO_MANY_OPEN` | The server's handle table is full, or the caller holds a quarter of it |
 | 5 | `INVALID_PATH` | Empty, not NUL-free, or names `.` or `..` where a new name is needed |
 | 6 | `NOT_DIR` | A directory was required |
 | 7 | `IS_DIR` | A directory was not allowed |

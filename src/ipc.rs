@@ -876,6 +876,17 @@ pub fn sys_call_timeout(
     call_inner(dest, msg, timeout_ticks, None, None)
 }
 
+/// A call with any of a buffer lent, a capability offered and a deadline.
+pub fn sys_call_with(
+    dest: usize,
+    msg: &Message,
+    timeout_ticks: u64,
+    lent: Option<Lent>,
+    offer: Option<usize>,
+) -> Result<Message, IpcError> {
+    call_inner(dest, msg, timeout_ticks, lent, offer)
+}
+
 /// `timeout_ticks` of 0 means block indefinitely.
 fn call_inner(
     dest: usize,

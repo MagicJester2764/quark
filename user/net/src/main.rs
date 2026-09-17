@@ -2,7 +2,7 @@
 #![no_main]
 #![allow(dead_code)]
 
-use quark_rt::ipc::{Message, TID_ANY};
+use quark_rt::ipc::{death_notice, Message, TID_ANY};
 use quark_rt::nameserver;
 use quark_rt::{println, syscall};
 
@@ -26,10 +26,11 @@ quark_rt::manifest!([
 
 const TAG_UDP_SEND: u64 = 1;
 const TAG_UDP_RECV: u64 = 2;
-const TAG_NET_CONFIG: u64 = 3;
+// 3 and 6 were a new address and a DHCP renewal, for anybody who asked. No
+// program did, and a program that could would move the machine off its
+// network, or stop this server for five seconds a time.
 const TAG_NET_INFO: u64 = 4;
 const TAG_ICMP_PING: u64 = 5;
-const TAG_NET_DHCP: u64 = 6;
 const TAG_DNS_RESOLVE: u64 = 7;
 const TAG_TCP_CONNECT: u64 = 10;
 const TAG_TCP_LISTEN: u64 = 11;
@@ -190,6 +191,14 @@ const TCP_ACK: u8 = 0x10;
 const TCP_RETRANSMIT_TICKS: u64 = 300;
 const TCP_TIMEWAIT_TICKS: u64 = 100;
 const MAX_TCP_CONNS: usize = 8;
+/// SYNs sent before a connection nobody answers is given up.
+const TCP_SYN_RETRIES: u8 = 5;
+/// Connections one task may hold: half, so one program cannot take them all.
+const MAX_CONNS_PER_TASK: usize = MAX_TCP_CONNS / 2;
+/// How long a UDP reader waits before it is told nothing came.
+const UDP_WAIT_TICKS: u64 = 1000;
+/// The error for a request that has to wait behind another task's.
+const ERR_BUSY: u64 = 4;
 const TCP_BUF_SIZE: usize = 4096;
 const TCP_RECV_BUF_BASE: usize = 0x8B_0000_0000;
 const TCP_SEND_BUF_BASE: usize = 0x8B_0010_0000;
@@ -231,6 +240,7 @@ struct UdpReader {
     tid: usize,
     max_len: usize,
     port: u16,
+    since: u64,
 }
 
 struct PendingIcmp {
@@ -297,6 +307,8 @@ struct TcpConn {
     /// Bytes a deferred write is still trying to queue.
     pending_data: [u8; SOCK_CHUNK],
     pending_len: usize,
+    /// Times the opening segment has been sent again.
+    retries: u8,
 }
 
 struct DnsCacheEntry {
@@ -365,7 +377,7 @@ static mut NET: NetState = NetState {
             pending_tid: 0, pending_op: TCP_PENDING_NONE,
             pending_max: 0, in_use: false, fin_received: false,
             owner_tid: 0, pending_inline: false,
-            pending_data: [0; SOCK_CHUNK], pending_len: 0,
+            pending_data: [0; SOCK_CHUNK], pending_len: 0, retries: 0,
         };
         [EMPTY; MAX_TCP_CONNS]
     },
@@ -844,8 +856,13 @@ fn handle_udp(data: &[u8], src_ip: &[u8; 4]) {
                 let copy_len = payload.len().min(reader.max_len);
 
                 // Into what the reader lent, which it has lent since it asked.
-                // A reader whose buffer cannot take it gets nothing, and waits on.
-                if syscall::sys_lent_write(reader.tid, 0, &payload[..copy_len]).is_ok() {
+                // A reader whose buffer cannot take it is not waiting any more
+                // — it gave up, or asked with nothing lent — and is let go.
+                if syscall::sys_lent_write(reader.tid, 0, &payload[..copy_len]).is_err() {
+                    let reply = Message { sender: 0, tag: TAG_ERROR, data: [2, 0, 0, 0, 0, 0] };
+                    let _ = syscall::sys_reply(reader.tid, &reply);
+                    NET.pending_udp = None;
+                } else {
                     let ip_packed = u32::from_be_bytes(*src_ip) as u64;
                     let reply = Message {
                         sender: 0,
@@ -945,6 +962,71 @@ fn alloc_tcp_conn() -> Option<usize> {
         }
     }
     None
+}
+
+/// The server's state, for code not already holding a reference into it.
+fn net() -> &'static mut NetState {
+    unsafe { &mut *core::ptr::addr_of_mut!(NET) }
+}
+
+/// A free connection for `tid`, which is watched from now on, unless it has
+/// as many as one task may.
+fn alloc_tcp_conn_for(tid: usize) -> Option<usize> {
+    let held = net().tcp_conns.iter().filter(|c| c.in_use && c.owner_tid == tid).count();
+    if held >= MAX_CONNS_PER_TASK {
+        return None;
+    }
+    let idx = alloc_tcp_conn()?;
+    let _ = syscall::sys_task_watch(tid);
+    Some(idx)
+}
+
+/// `tid` has died: its connections are reset and freed, and nothing it was
+/// waiting for is answered.
+fn client_gone(tid: usize) {
+    for i in 0..MAX_TCP_CONNS {
+        let c = &net().tcp_conns[i];
+        if !c.in_use || c.owner_tid != tid {
+            continue;
+        }
+        if matches!(c.state, TcpState::Established | TcpState::CloseWait | TcpState::SynReceived) {
+            tcp_conn_send_segment(i, TCP_RST | TCP_ACK, &[]);
+        }
+        free_tcp_conn(i);
+    }
+    abandon(tid);
+    let n = net();
+    if n.dns_pending_active && n.dns_pending_tid == tid {
+        n.dns_pending_tid = 0;
+    }
+}
+
+/// `tid` is not waiting for anything it asked for before.
+fn abandon(tid: usize) {
+    let n = net();
+    if n.pending_udp.as_ref().is_some_and(|r| r.tid == tid) {
+        n.pending_udp = None;
+    }
+    if n.pending_icmp.as_ref().is_some_and(|p| p.tid == tid) {
+        n.pending_icmp = None;
+    }
+    for c in n.tcp_conns.iter_mut() {
+        if c.in_use && c.pending_tid == tid && c.pending_op != TCP_PENDING_NONE {
+            c.pending_op = TCP_PENDING_NONE;
+            c.pending_len = 0;
+        }
+    }
+}
+
+/// A UDP reader that has waited long enough is told nothing came.
+fn expire_udp_reader() {
+    let n = net();
+    let Some(reader) = n.pending_udp.as_ref() else { return };
+    if syscall::sys_ticks() - reader.since > UDP_WAIT_TICKS {
+        let reply = Message { sender: 0, tag: TAG_ERROR, data: [3, 0, 0, 0, 0, 0] };
+        let _ = syscall::sys_reply(reader.tid, &reply);
+        n.pending_udp = None;
+    }
 }
 
 fn init_tcp_buffers(idx: usize) -> bool {
@@ -1356,6 +1438,7 @@ fn accept_tcp_syn(listener_idx: usize, remote_ip: &[u8; 4], remote_port: u16, se
             pending_inline,
             pending_data: [0; SOCK_CHUNK],
             pending_len: 0,
+            retries: 0,
         };
         // Clear the listener's pending (it's been moved to the new conn)
         NET.tcp_conns[listener_idx].pending_op = TCP_PENDING_NONE;
@@ -1621,7 +1704,19 @@ fn tcp_check_timers() {
                 }
             }
             TcpState::SynSent => {
-                if c.retransmit_tick != 0 && now - c.retransmit_tick > TCP_RETRANSMIT_TICKS {
+                if c.retransmit_tick != 0
+                    && now - c.retransmit_tick > TCP_RETRANSMIT_TICKS
+                    && c.retries >= TCP_SYN_RETRIES
+                {
+                    // Nobody is there. The task connecting is told so, rather
+                    // than waiting for ever.
+                    if c.pending_op == TCP_PENDING_CONNECT {
+                        let reply = Message { sender: 0, tag: TAG_ERROR, data: [3, 0, 0, 0, 0, 0] };
+                        let _ = syscall::sys_reply(c.pending_tid, &reply);
+                    }
+                    free_tcp_conn(i);
+                } else if c.retransmit_tick != 0 && now - c.retransmit_tick > TCP_RETRANSMIT_TICKS {
+                    unsafe { NET.tcp_conns[i].retries += 1 };
                     // Retransmit SYN (ARP may now be cached)
                     let c = unsafe { &NET.tcp_conns[i] };
                     send_tcp_segment(
@@ -2155,8 +2250,17 @@ pub extern "C" fn _start() -> ! {
                 // Timeout — check for pending RX and TCP timers
                 process_rx();
                 tcp_check_timers();
+                expire_udp_reader();
                 continue;
             }
+        }
+
+        // A client has died: its connections go, and anything it was
+        // waiting for. Nobody is waiting for an answer to this; the same tag
+        // from anybody else is an unknown request.
+        if let Some(dead) = death_notice(&msg) {
+            client_gone(dead);
+            continue;
         }
 
         if msg.sender == 0 {
@@ -2199,7 +2303,20 @@ pub extern "C" fn _start() -> ! {
             }
             // Check TCP timers
             tcp_check_timers();
+            expire_udp_reader();
             syscall::sys_irq_ack(irq);
+            continue;
+        }
+
+        // A task is in one call at a time: one asking anything now is not
+        // waiting for what it asked before.
+        abandon(msg.sender);
+
+        // Before the operation is taken out of the tag, which would make a
+        // ping look like something else.
+        if msg.tag == quark_rt::ipc::TAG_PING {
+            let reply = Message { sender: 0, tag: quark_rt::ipc::TAG_PING, data: [0; 6] };
+            let _ = syscall::sys_reply(msg.sender, &reply);
             continue;
         }
 
@@ -2232,27 +2349,27 @@ pub extern "C" fn _start() -> ! {
             }
             TAG_UDP_RECV => {
                 // Store pending reader — reply deferred until UDP data
-                // arrives, into the buffer it lent. data[0] is not read.
+                // arrives, into the buffer it lent. data[0] is not read. One
+                // at a time: a second waits its turn by asking again.
                 let max_len = msg.data[1] as usize;
                 let port = msg.data[2] as u16;
-                unsafe {
-                    NET.pending_udp = Some(UdpReader { tid: msg.sender, max_len, port });
+                if net().pending_udp.is_some() {
+                    let reply = Message { sender: 0, tag: TAG_ERROR, data: [ERR_BUSY, 0, 0, 0, 0, 0] };
+                    let _ = syscall::sys_reply(msg.sender, &reply);
+                    continue;
                 }
-            }
-            TAG_NET_CONFIG => {
-                let new_ip = (msg.data[0] as u32).to_be_bytes();
-                let new_mask = (msg.data[1] as u32).to_be_bytes();
-                let new_gw = (msg.data[2] as u32).to_be_bytes();
+                let _ = syscall::sys_task_watch(msg.sender);
+                let since = syscall::sys_ticks();
                 unsafe {
-                    NET.ip = new_ip;
-                    NET.netmask = new_mask;
-                    NET.gateway = new_gw;
+                    NET.pending_udp = Some(UdpReader { tid: msg.sender, max_len, port, since });
                 }
-                println!("[net] Config: {}.{}.{}.{}", new_ip[0], new_ip[1], new_ip[2], new_ip[3]);
-                let reply = Message { sender: 0, tag: TAG_OK, data: [0; 6] };
-                let _ = syscall::sys_reply(msg.sender, &reply);
             }
             TAG_ICMP_PING => {
+                if net().pending_icmp.is_some() {
+                    let reply = Message { sender: 0, tag: TAG_ERROR, data: [ERR_BUSY, 0, 0, 0, 0, 0] };
+                    let _ = syscall::sys_reply(msg.sender, &reply);
+                    continue;
+                }
                 let dst_ip = (msg.data[0] as u32).to_be_bytes();
                 let id = msg.data[1] as u16;
                 let seq = msg.data[2] as u16;
@@ -2320,26 +2437,6 @@ pub extern "C" fn _start() -> ! {
                 };
                 let _ = syscall::sys_reply(msg.sender, &reply);
             }
-            TAG_NET_DHCP => {
-                // Trigger DHCP renewal
-                dhcp_discover();
-                let dhcp_start = syscall::sys_ticks();
-                while unsafe { NET.dhcp_state } != 3 {
-                    if syscall::sys_ticks() - dhcp_start > 500 {
-                        let reply = Message { sender: 0, tag: TAG_ERROR, data: [1, 0, 0, 0, 0, 0] };
-                        let _ = syscall::sys_reply(msg.sender, &reply);
-                        break;
-                    }
-                    poll_nic_once();
-                    syscall::sys_yield();
-                }
-                if unsafe { NET.dhcp_state } == 3 {
-                    let ip = unsafe { NET.ip };
-                    let ip_packed = u32::from_be_bytes(ip) as u64;
-                    let reply = Message { sender: 0, tag: TAG_OK, data: [ip_packed, 0, 0, 0, 0, 0] };
-                    let _ = syscall::sys_reply(msg.sender, &reply);
-                }
-            }
             TAG_DNS_RESOLVE => {
                 // Unpack hostname from IPC data (48 bytes, null-terminated)
                 let mut name = [0u8; 48];
@@ -2380,7 +2477,7 @@ pub extern "C" fn _start() -> ! {
                 let mut src_port = (ports & 0xFFFF) as u16;
                 if src_port == 0 { src_port = alloc_ephemeral_port(); }
 
-                let idx = match alloc_tcp_conn() {
+                let idx = match alloc_tcp_conn_for(msg.sender) {
                     Some(i) => i,
                     None => {
                         let reply = Message { sender: 0, tag: TAG_ERROR, data: [1, 0, 0, 0, 0, 0] };
@@ -2419,6 +2516,7 @@ pub extern "C" fn _start() -> ! {
                         pending_inline: false,
                         pending_data: [0; SOCK_CHUNK],
                         pending_len: 0,
+                        retries: 0,
                     };
                 }
 
@@ -2457,7 +2555,7 @@ pub extern "C" fn _start() -> ! {
             TAG_TCP_LISTEN => {
                 let port = msg.data[0] as u16;
 
-                let idx = match alloc_tcp_conn() {
+                let idx = match alloc_tcp_conn_for(msg.sender) {
                     Some(i) => i,
                     None => {
                         let reply = Message { sender: 0, tag: TAG_ERROR, data: [1, 0, 0, 0, 0, 0] };
@@ -2484,6 +2582,7 @@ pub extern "C" fn _start() -> ! {
                         pending_inline: false,
                         pending_data: [0; SOCK_CHUNK],
                         pending_len: 0,
+                        retries: 0,
                     };
                 }
                 // Deferred reply — will reply when connection established
@@ -2728,15 +2827,6 @@ pub extern "C" fn _start() -> ! {
                 }
 
                 let reply = Message { sender: 0, tag: TAG_OK, data: [0; 6] };
-                let _ = syscall::sys_reply(msg.sender, &reply);
-            }
-            quark_rt::ipc::TAG_PING => {
-                // Liveness probe: reply immediately, do nothing else.
-                let reply = Message {
-                    sender: 0,
-                    tag: quark_rt::ipc::TAG_PING,
-                    data: [0; 6],
-                };
                 let _ = syscall::sys_reply(msg.sender, &reply);
             }
             _ => {
