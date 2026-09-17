@@ -270,6 +270,23 @@ int quark_vfs_lock(unsigned long handle, unsigned long kind, unsigned long start
     return err;
 }
 
+int quark_vfs_map(unsigned long handle, int write_shared, unsigned long *slot,
+                  unsigned long *size) {
+    struct quark_msg msg;
+    struct quark_msg reply;
+
+    zero(&msg, sizeof msg);
+    msg.tag = QUARK_VFS_TAG_MAP;
+    msg.data[0] = handle;
+    msg.data[1] = write_shared ? 1 : 0;
+    int err = vfs_call(&msg, &reply);
+    if (!err) {
+        *slot = reply.data[0];
+        *size = reply.data[1];
+    }
+    return err;
+}
+
 int quark_vfs_give_cwd(unsigned long child) {
     struct quark_msg msg;
     struct quark_msg reply;

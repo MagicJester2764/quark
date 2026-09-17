@@ -221,6 +221,18 @@ const MAP_ANON_POPULATE: u64 = 1;
 /// SYS_MAP_ANON: refuse a reservation bigger than the machine's memory, as
 /// Linux's overcommit heuristic refuses one without MAP_NORESERVE.
 const MAP_ANON_ACCOUNT: u64 = 2;
+/// Make a memory object and become its pager.
+pub const SYS_OBJECT_CREATE: u64 = 194;
+/// Map pages of a memory object a capability names.
+pub const SYS_OBJECT_MAP: u64 = 195;
+/// A pager's operations on its object.
+pub const SYS_OBJECT_CTL: u64 = 196;
+/// SYS_OBJECT_MAP's flags.
+const OBJECT_MAP_WRITE: u64 = 1;
+const OBJECT_MAP_SHARED: u64 = 2;
+const OBJECT_MAP_EXEC: u64 = 4;
+/// Objects one pager may have at once, so that no one task fills the table.
+const OBJECTS_PER_PAGER: usize = 128;
 
 // --- 0xF0  ABI introspection ---
 pub const SYS_ABI_VERSION: u64 = 240;
@@ -231,7 +243,7 @@ pub const SYS_ABI_VERSION: u64 = 240;
 /// minor when calls are added. User space can refuse to run against a major it
 /// does not know, which is the point of exposing it at all.
 pub const ABI_VERSION_MAJOR: u64 = 2;
-pub const ABI_VERSION_MINOR: u64 = 5;
+pub const ABI_VERSION_MINOR: u64 = 6;
 
 /// Threads a task may make with no capability at all.
 ///
@@ -761,7 +773,7 @@ extern "C" fn syscall_dispatch(
                 let _ua = crate::cpu::UserAccess::begin();
                 unsafe { *msg_ptr }
             };
-            let lent = crate::ipc::Lent { addr: arg3 as usize, len, access };
+            let lent = crate::ipc::Lent { addr: arg3 as usize, len, access, frame: false };
             match crate::ipc::sys_call_lend(dest, &msg, lent) {
                 Ok(reply) => {
                     let _ua = crate::cpu::UserAccess::begin();
@@ -811,7 +823,8 @@ extern "C" fn syscall_dispatch(
             // arg0 = the caller that lent it, arg1 = offset into what it lent,
             // arg2 = this task's buffer, arg3 = length
             let me = scheduler::current_tid();
-            let client = arg0 as usize;
+            // A pager names the task the kernel called for with the pager bit.
+            let client = (arg0 & !crate::ipc::PAGER_BIT) as usize;
             let offset = arg1 as usize;
             let local = arg2;
             let len = arg3 as usize;
@@ -844,7 +857,12 @@ extern "C" fn syscall_dispatch(
                 _ => return u64::MAX,
             }
             // Syscalls run with interrupts off, and nothing here blocks.
-            if unsafe { crate::lend::copy(cr3, lent.addr + offset, local as usize, len, into_lent) } {
+            let copied = if lent.frame {
+                unsafe { crate::lend::copy_frame(lent.addr + offset, local as usize, len, into_lent) }
+            } else {
+                unsafe { crate::lend::copy(cr3, lent.addr + offset, local as usize, len, into_lent) }
+            };
+            if copied {
                 len as u64
             } else {
                 u64::MAX
@@ -2119,6 +2137,101 @@ extern "C" fn syscall_dispatch(
             }
             0
         }
+        SYS_OBJECT_CREATE => {
+            // arg0 = cookie, arg1 = bytes, arg2 = slot for the capability.
+            let caller = scheduler::current_tid();
+            let slot = arg2 as usize;
+            if slot >= crate::cap::MAX_CAPS {
+                return u64::MAX;
+            }
+            let free = unsafe {
+                scheduler::get_task_mut(caller)
+                    .is_some_and(|t| t.cspace[slot].cap_type == crate::cap::CapType::Empty)
+            };
+            if !free || crate::memobj::objects_of(caller) >= OBJECTS_PER_PAGER {
+                return u64::MAX;
+            }
+            let Some((_, id)) = crate::memobj::create(caller, arg0, arg1) else {
+                return u64::MAX;
+            };
+            unsafe {
+                if let Some(task) = scheduler::get_task_mut(caller) {
+                    task.cspace[slot] = crate::cap::CapSlot {
+                        cap_type: crate::cap::CapType::MemObject,
+                        generation: crate::cap::current_generation(caller, slot),
+                        root_slot: slot as u8,
+                        root_tid: caller as u8,
+                        param0: id,
+                        param1: crate::cap::OBJECT_READ | crate::cap::OBJECT_WRITE,
+                    };
+                }
+            }
+            id
+        }
+        SYS_OBJECT_MAP => {
+            // arg0 = slot, arg1 = address, arg2 = pages, arg3 = first page,
+            // arg4 = flags (1 write, 2 shared, 4 exec).
+            let caller = scheduler::current_tid();
+            let (slot, vaddr, pages, first, flags) =
+                (arg0 as usize, arg1 as usize, arg2 as usize, arg3, arg4);
+            if slot >= crate::cap::MAX_CAPS
+                || flags & !(OBJECT_MAP_WRITE | OBJECT_MAP_SHARED | OBJECT_MAP_EXEC) != 0
+                || pages == 0
+                || pages > MAP_ANON_MAX
+                || !paging::user_range_ok(vaddr, pages)
+                || first.checked_add(pages as u64).is_none_or(|end| end > crate::memobj::MAX_PAGE)
+            {
+                return u64::MAX;
+            }
+            let cap = unsafe {
+                match scheduler::get_task_mut(caller) {
+                    Some(t) => t.cspace[slot],
+                    None => return u64::MAX,
+                }
+            };
+            if cap.cap_type != crate::cap::CapType::MemObject || !crate::cap::slot_is_valid(&cap) {
+                return u64::MAX;
+            }
+            let write = flags & OBJECT_MAP_WRITE != 0;
+            let shared = flags & OBJECT_MAP_SHARED != 0;
+            // Reading needs read access; writing through to the object needs
+            // write access. A private copy is the caller's own to write.
+            let needs = crate::cap::OBJECT_READ
+                | if write && shared { crate::cap::OBJECT_WRITE } else { 0 };
+            if cap.param1 & needs != needs {
+                return u64::MAX;
+            }
+            let Some(objslot) = crate::memobj::slot_of(cap.param0) else {
+                return u64::MAX;
+            };
+            let cr3 = paging::read_cr3();
+            if !unsafe { paging::range_is_free(cr3, vaddr, pages) } {
+                return u64::MAX;
+            }
+            let exec = flags & OBJECT_MAP_EXEC != 0;
+            let made = unsafe {
+                paging::reserve_object(cr3, vaddr, pages, objslot, first, write, shared, exec)
+            };
+            if made.is_err() {
+                let freed = unsafe { paging::clear_range(cr3, vaddr, pages) };
+                scheduler::current_task_uncharge_mem(freed);
+                return u64::MAX;
+            }
+            0
+        }
+        SYS_OBJECT_CTL => {
+            // arg0 = object id, arg1 = op, arg2/arg3 per op. The buffer an
+            // op copies through is a page of the caller's.
+            let op = arg1;
+            if matches!(
+                op,
+                crate::memobj::CTL_READ_PAGE | crate::memobj::CTL_WRITE_PAGE | crate::memobj::CTL_TAKE_DIRTY
+            ) && !validate_user_range(arg2, 4096, op != crate::memobj::CTL_WRITE_PAGE)
+            {
+                return u64::MAX;
+            }
+            crate::memobj::ctl(scheduler::current_tid(), arg0, op, arg2, arg3)
+        }
         SYS_MEM_INFO => {
             let free = crate::pmm::free_count() as u64;
             let charged = scheduler::current_task_mem() as u64;
@@ -2355,6 +2468,7 @@ extern "C" fn syscall_dispatch(
                 6 => crate::cap::CapType::SetUid,
                 // 7, a set of task IDs, was withdrawn at 2.0.
                 8 => crate::cap::CapType::Endpoint,
+                9 => crate::cap::CapType::MemObject,
                 _ => return u64::MAX,
             };
             let tid = scheduler::current_tid();

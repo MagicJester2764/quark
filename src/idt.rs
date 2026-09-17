@@ -377,18 +377,27 @@ extern "C" fn exception_handler(frame: &InterruptFrame) {
         unsafe { core::arch::asm!("mov {}, cr2", out(reg) cr2, options(nostack, nomem)) };
         let write = frame.error_code & PF_WRITE != 0;
         let cr3 = crate::paging::read_cr3();
-        match unsafe { crate::paging::back(cr3, cr2 as usize, write) } {
+        // A page of a mapped file may have to be asked of its pager, which
+        // blocks; only a fault from user mode may wait for it. The kernel's
+        // own copies page theirs in before they start.
+        match unsafe { crate::paging::back(cr3, cr2 as usize, write, from_user) } {
             Ok(()) => return,
-            Err(crate::paging::Fault::NoMemory) if from_user => {
+            Err(fault @ (crate::paging::Fault::NoMemory | crate::paging::Fault::Bus)) if from_user => {
                 // Promised and not there to give: Linux's overcommit bargain,
-                // and its answer.
+                // and its answer. A page of a file that cannot be had is
+                // SIGBUS too.
                 let tid = scheduler::current_tid();
-                crate::serial::puts(b"[OOM tid=");
+                let oom = matches!(fault, crate::paging::Fault::NoMemory);
+                crate::serial::puts(if oom { b"[OOM tid=" } else { b"[BUS tid=" });
                 crate::serial::put_usize(tid);
                 crate::serial::puts(b" cr2=0x");
                 crate::serial::put_hex_usize(cr2 as usize);
                 crate::serial::puts(b"]\n");
-                console::puts(b"\n[kernel] Out of memory in task ");
+                console::puts(if oom {
+                    b"\n[kernel] Out of memory in task "
+                } else {
+                    b"\n[kernel] Bus error in task "
+                });
                 print_dec(tid);
                 console::puts(b" - killing task.\n");
                 unsafe { core::arch::asm!("sti", options(nostack, nomem)) };

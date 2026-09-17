@@ -68,6 +68,7 @@ long __quark_link(long fromfd, const char *from, long tofd, const char *to, int 
 long __quark_symlink(const char *target, long dirfd, const char *path);
 long __quark_chdir(const char *path);
 long __quark_flock(long fd, long op);
+long __quark_file_map(long fd, int write_shared, unsigned long *cap);
 long __quark_fchdir(long fd);
 long __quark_getcwd(char *buf, unsigned long size);
 long __quark_truncate(const char *path, long length);

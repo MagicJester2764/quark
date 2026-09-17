@@ -994,6 +994,8 @@ unsafe fn reap_one(i: usize) -> u64 { unsafe {
     crate::pipe::cleanup_orphans(i);
     // Clean up IPC state and unblock tasks waiting on this one
     crate::ipc::cleanup_task_ipc(i);
+    // Objects it paged for have no pager now.
+    crate::memobj::task_gone(i);
     // Unregister any IRQ handlers
     crate::irq_dispatch::unregister_task_irqs(i);
     // Clean up futex waiters

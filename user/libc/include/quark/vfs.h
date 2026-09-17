@@ -34,6 +34,7 @@
 #define QUARK_VFS_TAG_GETCWD  20
 #define QUARK_VFS_TAG_GIVE_CWD 21
 #define QUARK_VFS_TAG_LOCK    22
+#define QUARK_VFS_TAG_MAP     23
 
 /* QUARK_VFS_TAG_LOCK's flags: wait to be granted; the lock belongs to the
    handle, not the program; grant nothing and say what is in the way. */
@@ -168,6 +169,12 @@ int quark_vfs_give_cwd(unsigned long child);
    program of the first lock in the way (kind 0 if none). */
 int quark_vfs_lock(unsigned long handle, unsigned long kind, unsigned long start,
                    unsigned long len, unsigned long flags, unsigned long out[4]);
+
+/* A capability to map `handle`'s file, granted into this task's CSpace:
+   `*slot` is where, `*size` the file's length. `write_shared` asks for write
+   access through a shared mapping, which needs a writable handle. */
+int quark_vfs_map(unsigned long handle, int write_shared, unsigned long *slot,
+                  unsigned long *size);
 
 /* Fill `buf` (at most a page) with the records of a directory from entry
    `start`. `*next` is where the next call should start, `*end` says there is

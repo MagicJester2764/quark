@@ -44,3 +44,11 @@ pub const TAG_TASK_DIED: u64 = 0xFFFF_0003;
 /// From the kernel (sender 0): program `data[0]` — a space id — has no task
 /// left. See `syscall::sys_space_watch`.
 pub const TAG_SPACE_DIED: u64 = 0xFFFF_0004;
+/// The kernel asks a pager for a page of an object: `data` is `[cookie,
+/// page, object id]`, with a frame lent for writing. `sender` is the faulting
+/// task with `PAGER_BIT` set; reply to it as it is.
+pub const TAG_PAGE_IN: u64 = 0xFFFF_0005;
+/// Nothing maps an object any more: `data` is `[cookie, object id]`, sender 0.
+pub const TAG_OBJECT_IDLE: u64 = 0xFFFF_0006;
+/// Set in `sender` by the kernel alone, on `TAG_PAGE_IN`.
+pub const PAGER_BIT: usize = 1 << 62;

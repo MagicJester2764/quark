@@ -115,6 +115,23 @@ pub const SYS_IOPORT_REP: u64 = 115;
 pub const SYS_GETRANDOM: u64 = 116;
 pub const SYS_MAP_ANON: u64 = 192;
 pub const SYS_MEM_INFO: u64 = 193;
+pub const SYS_OBJECT_CREATE: u64 = 194;
+pub const SYS_OBJECT_MAP: u64 = 195;
+pub const SYS_OBJECT_CTL: u64 = 196;
+
+/// `sys_object_map`'s flags.
+pub const OBJECT_MAP_WRITE: u64 = 1;
+pub const OBJECT_MAP_SHARED: u64 = 2;
+pub const OBJECT_MAP_EXEC: u64 = 4;
+/// `sys_object_ctl`'s operations.
+pub const OBJECT_RESIZE: u64 = 0;
+pub const OBJECT_READ_PAGE: u64 = 1;
+pub const OBJECT_WRITE_PAGE: u64 = 2;
+pub const OBJECT_TAKE_DIRTY: u64 = 3;
+pub const OBJECT_RELEASE: u64 = 4;
+/// A `MemObject` capability's access bits.
+pub const OBJECT_ACCESS_READ: u64 = 1;
+pub const OBJECT_ACCESS_WRITE: u64 = 2;
 
 // --- 0x80  synchronisation ---
 pub const SYS_FUTEX_WAIT: u64 = 128;
@@ -686,6 +703,30 @@ pub fn sys_map_anon_accounted(addr: usize, pages: usize) -> Result<(), ()> {
     if ret == u64::MAX { Err(()) } else { Ok(()) }
 }
 
+/// Make a memory object of `bytes` bytes, whose pages this task will provide
+/// when asked (`ipc::TAG_PAGE_IN`), and which it knows as `cookie`. A
+/// read-write `MemObject` capability goes into `slot`; the object's id is
+/// returned.
+pub fn sys_object_create(cookie: u64, bytes: u64, slot: usize) -> Result<u64, ()> {
+    let ret = unsafe { syscall3(SYS_OBJECT_CREATE, cookie, bytes, slot as u64) };
+    if ret == u64::MAX { Err(()) } else { Ok(ret) }
+}
+
+/// Map `pages` pages of the object the capability in `slot` names, from page
+/// `first`, at `addr`. Each page is fetched when first touched.
+pub fn sys_object_map(slot: usize, addr: usize, pages: usize, first: u64, flags: u64) -> Result<(), ()> {
+    let ret = unsafe {
+        syscall5(SYS_OBJECT_MAP, slot as u64, addr as u64, pages as u64, first, flags)
+    };
+    if ret == u64::MAX { Err(()) } else { Ok(()) }
+}
+
+/// A pager's operation `op` on its object `id`. What `a` and `b` are, and what
+/// comes back, depend on the operation.
+pub fn sys_object_ctl(id: u64, op: u64, a: u64, b: u64) -> u64 {
+    unsafe { syscall4(SYS_OBJECT_CTL, id, op, a, b) }
+}
+
 /// Free frames in the machine, and pages charged to this task.
 pub fn sys_mem_info() -> (usize, usize) {
     let ret = unsafe { syscall0(SYS_MEM_INFO) };
@@ -1245,6 +1286,7 @@ pub const CAP_TYPE_SET_UID: u64 = 6;
 /// by that task, its creator, or a holder of one — and recorded as the number
 /// of its endpoint, which no other task will ever have.
 pub const CAP_TYPE_ENDPOINT: u64 = 8;
+pub const CAP_TYPE_MEMOBJECT: u64 = 9;
 
 /// CSpace slot conventions shared by init, login and the shell.
 ///

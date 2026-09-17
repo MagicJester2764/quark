@@ -239,6 +239,41 @@ static long do_mmap_fd(long fd, unsigned long len) {
     return (long)at;
 }
 
+#define LX_PROT_WRITE   2
+#define LX_PROT_EXEC    4
+#define LX_MAP_SHARED   1
+
+/* A file, through the VFS: a memory object whose pages the server provides
+   as they are touched. The capability it grants is only needed to make the
+   mapping, which keeps the object; it goes straight after. */
+static long do_mmap_file(long fd, unsigned long len, long prot, long flags, long off) {
+    if (len == 0 || off < 0 || (off & (PAGE_SIZE - 1))) {
+        return -LX_EINVAL;
+    }
+    unsigned long pages = (len + PAGE_SIZE - 1) / PAGE_SIZE;
+    unsigned long at = mmap_next;
+    if (pages > (MMAP_LIMIT - at) / PAGE_SIZE) {
+        return -LX_ENOMEM;
+    }
+    int shared = (flags & LX_MAP_SHARED) != 0;
+    int write = (prot & LX_PROT_WRITE) != 0;
+    unsigned long slot;
+    long bad = __quark_file_map(fd, shared && write, &slot);
+    if (bad) {
+        return bad;
+    }
+    unsigned long how = (write ? QUARK_OBJECT_WRITE : 0) | (shared ? QUARK_OBJECT_SHARED : 0) |
+                        ((prot & LX_PROT_EXEC) ? QUARK_OBJECT_EXEC : 0);
+    unsigned long r = __syscall5(SYS_OBJECT_MAP, slot, at, pages,
+                                 (unsigned long)off / PAGE_SIZE, how);
+    __syscall1(SYS_CAP_DELETE, slot);
+    if (r == QUARK_ERR) {
+        return -LX_ENOMEM;
+    }
+    mmap_next = at + pages * PAGE_SIZE;
+    return (long)at;
+}
+
 static long do_munmap(unsigned long at, unsigned long len) {
     unmap_pages(at, (len + PAGE_SIZE - 1) / PAGE_SIZE);
     return 0;
@@ -413,9 +448,10 @@ long __quark_syscall(long n, long a1, long a2, long a3, long a4, long a5, long a
            with memfd_create and wants it visible. Quark maps at an address you
            name, so the address is chosen here from the same arena anonymous
            mappings come out of.
-           A mapping backed by a *file* is still refused — that would have to
-           be read through the VFS into pages, which is a different thing
-           wearing the same name. */
+           A mapping of a file is a memory object the VFS pages, below. */
+        if (a5 >= LX_FIRST_FILE_FD) {
+            return do_mmap_file(a5, (unsigned long)a2, a3, a4, a6);
+        }
         if (a5 != -1L) {
             return do_mmap_fd(a5, (unsigned long)a2);
         }

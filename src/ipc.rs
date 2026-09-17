@@ -88,7 +88,26 @@ pub struct Lent {
     pub len: usize,
     /// `lend::LEND_READ`, `lend::LEND_WRITE`, or both.
     pub access: u64,
+    /// `addr` is a physical frame the kernel lent, not an address in the
+    /// caller's space.
+    pub frame: bool,
 }
+
+/// Set in `sender` on a call the kernel makes to a pager for a faulting task:
+/// the TID below it is the task, and only the kernel can set it.
+pub const PAGER_BIT: u64 = 1 << 62;
+/// The kernel asks a pager for a page: `data` = `[cookie, page, object id]`,
+/// a frame lent for writing. Sender is the faulting TID with `PAGER_BIT`.
+pub const TAG_PAGE_IN: u64 = 0xFFFF_0005;
+/// Nothing maps an object any more: `data` = `[cookie, object id]`, sender 0.
+pub const TAG_OBJECT_IDLE: u64 = 0xFFFF_0006;
+
+/// Idle objects a pager has been told about and has not collected. Deeper
+/// than the death queues: a pager with many files mapped may see many go at
+/// once, and one it misses stays until it releases it some other way.
+const IDLE_QUEUE: usize = 32;
+static mut IDLES: [[(u64, u64); IDLE_QUEUE]; MAX_TASKS] = [[(0, 0); IDLE_QUEUE]; MAX_TASKS];
+static mut IDLES_LEN: [usize; MAX_TASKS] = [0; MAX_TASKS];
 
 /// IPC state and pending message for each task.
 struct TaskIpc {
@@ -411,7 +430,30 @@ unsafe fn take_death(receiver: usize) -> Option<Message> {
     }
 }
 
-/// Take one pending death notification — of a task, or of a program.
+/// Tell `pager` that nothing maps its object `id` (its `cookie`) any more.
+///
+/// Interrupts are off: this is called as page tables are cleared.
+pub fn notify_object_idle(pager: usize, cookie: u64, id: u64) {
+    if pager >= MAX_TASKS {
+        return;
+    }
+    unsafe {
+        if IDLES_LEN[pager] < IDLE_QUEUE {
+            IDLES[pager][IDLES_LEN[pager]] = (cookie, id);
+            IDLES_LEN[pager] += 1;
+        }
+        match TASK_IPC[pager].state {
+            IpcState::RecvBlocked(from) if from == 0 || from == TID_ANY => {
+                TASK_IPC[pager].state = IpcState::None;
+                scheduler::unblock_task(pager);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Take one pending notice from the kernel: a task's death, a program's, or
+/// an object gone idle.
 ///
 /// # Safety
 /// The caller holds interrupts off.
@@ -419,6 +461,14 @@ unsafe fn take_any_death(receiver: usize) -> Option<Message> {
     unsafe {
         if let Some(msg) = take_death(receiver) {
             return Some(msg);
+        }
+        if IDLES_LEN[receiver] > 0 {
+            let (cookie, id) = IDLES[receiver][0];
+            for i in 1..IDLES_LEN[receiver] {
+                IDLES[receiver][i - 1] = IDLES[receiver][i];
+            }
+            IDLES_LEN[receiver] -= 1;
+            return Some(Message { sender: 0, tag: TAG_OBJECT_IDLE, data: [cookie, id, 0, 0, 0, 0] });
         }
         if SPACE_DEATHS_LEN[receiver] == 0 {
             return None;
@@ -652,6 +702,15 @@ pub fn sys_recv(from: usize) -> Result<Message, IpcError> {
 
     let flags = irq_save();
     unsafe {
+        // Notices first. A notice was queued when its task died, before
+        // anything could take the TID again; a call waiting behind it may be
+        // from whatever did, and must not be served as the dead task's.
+        if from == 0 || from == TID_ANY {
+            if let Some(msg) = take_any_death(receiver) {
+                irq_restore(flags);
+                return Ok(msg);
+            }
+        }
         // Check if any sender is blocked waiting to send to us, starting one
         // past the last one served so that no sender can monopolise us.
         for step in 0..MAX_TASKS {
@@ -822,6 +881,25 @@ fn call_inner(
     lent: Option<Lent>,
     offer: Option<usize>,
 ) -> Result<Message, IpcError> {
+    call_as(dest, msg, timeout_ticks, lent, offer, 0)
+}
+
+/// A call from the kernel, on behalf of the current task, to the pager of an
+/// object it touched: the pager fills `frame`, lent for writing, and replies.
+/// The task's own capabilities have nothing to do with it.
+pub fn pager_call(pager: usize, msg: &Message, frame: usize) -> Result<Message, IpcError> {
+    let lent = Lent { addr: frame, len: 4096, access: crate::lend::LEND_WRITE, frame: true };
+    call_as(pager, msg, 0, Some(lent), None, PAGER_BIT)
+}
+
+fn call_as(
+    dest: usize,
+    msg: &Message,
+    timeout_ticks: u64,
+    lent: Option<Lent>,
+    offer: Option<usize>,
+    sender_bits: u64,
+) -> Result<Message, IpcError> {
     if dest >= MAX_TASKS {
         return Err(IpcError::InvalidTid);
     }
@@ -836,7 +914,7 @@ fn call_inner(
     let flags = irq_save();
     unsafe {
         let mut to_send = *msg;
-        to_send.sender = caller;
+        to_send.sender = caller | sender_bits as usize;
         // Lent and offered before either path can hand the message over: a
         // server woken by it may look for them before this task runs again.
         TASK_IPC[caller].lent = lent;
@@ -919,6 +997,8 @@ fn call_inner(
 
 /// Reply to a caller that is blocked in sys_call.
 pub fn sys_reply(dest: usize, msg: &Message) -> Result<(), IpcError> {
+    // A pager answers the task the kernel called for.
+    let dest = dest & !(PAGER_BIT as usize);
     if dest >= MAX_TASKS {
         return Err(IpcError::InvalidTid);
     }
@@ -958,6 +1038,13 @@ pub fn sys_recv_timeout(from: usize, timeout_ticks: u64) -> Result<Message, IpcE
 
     let flags = irq_save();
     unsafe {
+        // Notices first, as in `sys_recv`.
+        if from == 0 || from == TID_ANY {
+            if let Some(msg) = take_any_death(receiver) {
+                irq_restore(flags);
+                return Ok(msg);
+            }
+        }
         // Check if any sender is blocked waiting to send to us (same as
         // sys_recv, round robin included).
         for step in 0..MAX_TASKS {
@@ -1186,6 +1273,7 @@ pub fn cleanup_task_ipc(dead_tid: usize) {
         WATCHERS[dead_tid] = 0;
         DEATHS_LEN[dead_tid] = 0;
         SPACE_DEATHS_LEN[dead_tid] = 0;
+        IDLES_LEN[dead_tid] = 0;
         let bit = !(1u64 << dead_tid);
         for t in 0..MAX_TASKS {
             WATCHERS[t] &= bit;

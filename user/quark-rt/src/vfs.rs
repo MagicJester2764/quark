@@ -25,6 +25,7 @@ const TAG_FCHDIR: u64 = 19;
 const TAG_GETCWD: u64 = 20;
 const TAG_GIVE_CWD: u64 = 21;
 const TAG_LOCK: u64 = 22;
+const TAG_MAP: u64 = 23;
 const TAG_TRUNCATE: u64 = 13;
 const TAG_STATFS: u64 = 14;
 const TAG_ERROR: u64 = u64::MAX;
@@ -458,6 +459,15 @@ pub fn lock(
 ) -> Result<[u64; 4], u64> {
     let r = simple_call(vfs_tid, TAG_LOCK, [handle as u64, kind, start, len, flags, 0])?;
     Ok([r.data[0], r.data[1], r.data[2], r.data[3]])
+}
+
+/// A capability to map the file open as `handle`, granted into a slot of this
+/// task's CSpace: read access, and write access through a shared mapping if
+/// `write_shared` (the handle must be writable). Returns the slot and the
+/// file's size; `syscall::sys_object_map` maps it.
+pub fn map(vfs_tid: usize, handle: usize, write_shared: bool) -> Result<(usize, u64), u64> {
+    let r = simple_call(vfs_tid, TAG_MAP, [handle as u64, write_shared as u64, 0, 0, 0, 0])?;
+    Ok((r.data[0] as usize, r.data[1]))
 }
 
 fn simple_call(vfs_tid: usize, tag: u64, data: [u64; 6]) -> Result<Message, u64> {

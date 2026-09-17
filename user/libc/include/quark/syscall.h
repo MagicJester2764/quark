@@ -80,6 +80,11 @@
 #define SYS_MEM_INFO        193
 #define QUARK_MAP_POPULATE  1UL
 #define QUARK_MAP_ACCOUNT   2UL
+#define SYS_OBJECT_MAP      195
+#define QUARK_OBJECT_WRITE  1UL
+#define QUARK_OBJECT_SHARED 2UL
+#define QUARK_OBJECT_EXEC   4UL
+#define SYS_CAP_DELETE      84
 
 /* 0xA0  kernel console */
 #define SYS_WRITE           160

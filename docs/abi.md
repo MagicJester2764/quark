@@ -1,6 +1,6 @@
 # Quark syscall ABI
 
-**Version 2.5.** Query the running kernel with `SYS_ABI_VERSION` (240), which
+**Version 2.6.** Query the running kernel with `SYS_ABI_VERSION` (240), which
 returns `(major << 16) | minor`.
 
 This document is the contract between the Quark kernel and everything above it.
@@ -135,6 +135,7 @@ rule still holds for everything else.
 | 2.3 | `SYS_GETRANDOM` (116) — random bytes from a ChaCha20 generator seeded from RDSEED or RDRAND and the machine's timing. Before it a program had the clock, and expat salted its hash tables with it. |
 | 2.4 | `SYS_TASK_CREATE_IN` (109) — a task made for an address space the caller created belongs to that program before it runs, so a spawner can hand it things servers keep per program, such as a working directory. `SYS_TASK_SPACE` answers for it at once. |
 | 2.5 | Block 0xC0 opens. `SYS_MAP_ANON` (192) — memory reserved and given its frames when first touched, up to 512 GiB at once; `SYS_MEM_INFO` (193) — free frames, and what the caller is charged. Also: a user page fault on a reserved page is served rather than fatal, and one that cannot be served ends the task with SIGBUS. |
+| 2.6 | `SYS_OBJECT_CREATE` (194), `SYS_OBJECT_MAP` (195), `SYS_OBJECT_CTL` (196) and capability type 9, `MemObject` — memory objects whose pages a user-space pager provides as they are touched, which is how a file is mapped. Also: a task's page fault can call a pager (`TAG_PAGE_IN`, sender marked with bit 62), a pager hears when nothing maps an object (`TAG_OBJECT_IDLE`), and notices from the kernel are received before calls waiting behind them. |
 
 ### Deprecated
 
@@ -638,6 +639,9 @@ ordinary programs should use file descriptor 1.
 |---|---|---|---|---|
 | 192 | `SYS_MAP_ANON` | arg0 = address, arg1 = pages (at most 2^27), arg2 = flags (1 = back every page now, 2 = no more pages than the machine has) | 0 / `u64::MAX` | — |
 | 193 | `SYS_MEM_INFO` | — | `(free frames << 32) \| pages charged to the caller` | — |
+| 194 | `SYS_OBJECT_CREATE` | arg0 = cookie, arg1 = bytes, arg2 = slot | object id / `u64::MAX` | — |
+| 195 | `SYS_OBJECT_MAP` | arg0 = slot, arg1 = address, arg2 = pages, arg3 = first page, arg4 = flags (1 write, 2 shared, 4 exec) | 0 / `u64::MAX` | `MemObject`: read; write too for a shared writable mapping |
+| 196 | `SYS_OBJECT_CTL` | arg0 = object id, arg1 = op, arg2, arg3 | per op / `u64::MAX` | the object's pager |
 
 `SYS_MAP_ANON` reserves memory without giving it any: each page gets a zeroed
 frame, charged to the task that touches it, the first time it is read or
@@ -657,6 +661,45 @@ than the machine has frames is refused outright — Linux's overcommit
 heuristic, which the C library applies to every mapping without
 `MAP_NORESERVE`, so that a `calloc` nothing could hold returns NULL rather
 than a region that ends the program when it is read.
+
+**Memory objects.** An object is a run of pages a user-space pager provides.
+`SYS_OBJECT_CREATE` makes one of `bytes` bytes, with the caller as its pager
+and `cookie` as the pager's own name for it, and puts a read-write `MemObject`
+capability (type 9: `param0` the object id, never reused; `param1` the access,
+1 read and 2 write) in `slot`. The pager mints narrower copies with
+`SYS_CAP_MINT` — the same id, no access its own lacks — and grants them.
+
+`SYS_OBJECT_MAP` reserves `pages` pages at `address` for pages `first..` of
+the object; the range must be free. Each page is fetched when first touched:
+from the object's cache if it is there, and otherwise from the pager, which
+the touching task calls itself. The pager receives `TAG_PAGE_IN`
+(`0xFFFF_0005`) with `sender` the task's TID with bit 62 (`PAGER_BIT`) set —
+nobody else can set it — and `data` = `[cookie, page, object id]`, and a
+fresh 4096-byte frame lent for writing. It fills the frame with
+`SYS_LENT_WRITE` and replies to `sender` as given (0 to deliver the page, an
+error to make the fault SIGBUS). The page joins the object's cache. A shared
+mapping, and a read-only one, maps the cached frame itself; a private writable
+one gets a copy of its own, charged to it. A page past the object's end is
+SIGBUS, as on Linux. When the last page of an object is unmapped, its pager
+hears `TAG_OBJECT_IDLE` (`0xFFFF_0006`, sender 0, `data` = `[cookie, id]`).
+
+`SYS_OBJECT_CTL` is the pager's, on its own object:
+
+| Op | Name | arg2 | arg3 | Returns |
+|---|---|---|---|---|
+| 0 | resize | new size in bytes | — | 0 |
+| 1 | read a cached page | a page to fill | page | 1 if cached, 0 if not |
+| 2 | write a cached page | a page to copy | page | 1 if cached, 0 if not |
+| 3 | take a dirty page | a page to fill | — | the page's index, `u64::MAX` if none |
+| 4 | release | — | — | 0, or `u64::MAX` while anything maps it |
+
+The cache belongs to the object and lasts until it is released; nothing
+records where a cached frame is mapped, so a shrinking object keeps the
+frames past its new end. An object's slot is kept in bits 52–62 of every
+page-table entry that refers to it, which is what counts its mapped pages;
+the CPU ignores those bits only while protection keys are off, and the
+kernel keeps CR4.PKE clear. A pager's objects stop paging when it dies, and
+go when nothing maps them.
 
 ### ABI introspection (0xF0)
 

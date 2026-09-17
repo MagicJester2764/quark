@@ -16,6 +16,7 @@ mod io;
 pub mod ipc;
 pub mod irq_dispatch;
 mod lend;
+mod memobj;
 mod modules;
 mod multiboot2;
 pub mod paging;

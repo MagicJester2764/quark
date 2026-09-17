@@ -21,6 +21,27 @@ pub const COPY_MAX: usize = 1 << 20;
 /// Every frame the allocator hands out is below this, inside the identity map.
 const IDENTITY_END: usize = 0x1_0000_0000;
 
+/// Copy `len` bytes between `local` in the current task and `at` in a frame
+/// the kernel lent, through the identity map.
+///
+/// # Safety
+/// `at..at + len` lies inside the lent frame; `local` has been validated as
+/// for [`copy`].
+pub unsafe fn copy_frame(at: usize, local: usize, len: usize, into_lent: bool) -> bool {
+    if at.checked_add(len).is_none_or(|end| end > IDENTITY_END) {
+        return false;
+    }
+    let _ua = crate::cpu::UserAccess::begin();
+    unsafe {
+        if into_lent {
+            core::ptr::copy_nonoverlapping(local as *const u8, at as *mut u8, len);
+        } else {
+            core::ptr::copy_nonoverlapping(at as *const u8, local as *mut u8, len);
+        }
+    }
+    true
+}
+
 /// Copy `len` bytes between `local` in the current task and `at` in the
 /// address space rooted at `cr3`; `into_lent` says which way.
 ///

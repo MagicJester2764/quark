@@ -127,6 +127,12 @@ These were established deliberately. Breaking one silently re-opens a hole.
   thread-local template through it, and without it every thread-local lands
   outside its block. So every spawner calls `set_args`, even with no
   arguments; a program reading an argument page that was never mapped faults.
+- **Page-table entries that refer to a memory object carry its slot** in bits
+  52–62, present or not, and every path that clears or replaces an entry —
+  `clear_range`, `unmap_page`, `map_page`, `free_pt_leaves` — hands the
+  reference back (`memobj::unmap_ref`). Miss one and the object is never
+  released. Protection keys would give bits 59–62 a meaning, so CR4.PKE stays
+  clear.
 - **A reserved page is a non-present entry with `paging::MARKER` set**, in a
   page table or, for 2 MiB at once, a page directory. It is not empty: the
   walks that free tables and the checks that an address is free test for an
@@ -361,10 +367,12 @@ change here: it has found what reading the code did not.
   to start a relative path from.
 - A FAT32 root cannot remove, rename or shorten anything, and ext4 refuses to
   shorten a file whose extent tree has grown past the inode.
-- Files cannot be mapped: there is no pager to fill the pages. FreeType is
-  built to read its fonts instead, and fontconfig reads its caches when the map
-  fails. A file descriptor cannot be `dup2`ed onto one of the kernel's numbers
-  (a program's stdout), nor the other way round.
+- A mapped file's pages stay cached until nothing maps the file any more;
+  nothing evicts them under pressure, and the kernel's cache holds 8192 pages
+  across 256 objects, of which the VFS pages 30 at once. A private writable
+  mapping copies a page when it is first touched, read or write. A file
+  descriptor cannot be `dup2`ed onto one of the kernel's numbers (a program's
+  stdout), nor the other way round.
 - `flock` and `fcntl` locks are one kind here, so the two can keep each other
   out where Linux keeps them apart. Locks live in the server's memory, 256 at
   once.

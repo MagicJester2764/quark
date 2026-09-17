@@ -13,6 +13,9 @@ use core::sync::atomic::{AtomicBool, Ordering};
 
 const CR4_SMEP: u64 = 1 << 20;
 const CR4_SMAP: u64 = 1 << 21;
+// CR4.PKE (bit 22) must stay clear. Memory objects keep their slot in bits
+// 52–62 of page-table entries, and with protection keys on the CPU reads bits
+// 59–62 of a present entry as the page's key.
 
 /// Whether SMAP was enabled, and therefore whether `stac`/`clac` are legal.
 static SMAP_ENABLED: AtomicBool = AtomicBool::new(false);

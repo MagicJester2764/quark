@@ -41,6 +41,8 @@ pub const TAG_GETCWD: u64 = 20;
 pub const TAG_GIVE_CWD: u64 = 21;
 /// Take, drop or ask about a record lock on an open file.
 pub const TAG_LOCK: u64 = 22;
+/// A capability to map an open file.
+pub const TAG_MAP: u64 = 23;
 pub const TAG_OK: u64 = 0;
 pub const TAG_ERROR: u64 = u64::MAX;
 

@@ -161,7 +161,9 @@ pub fn lock_key(file: &OpenFile) -> Option<u32> {
 /// Whether any handle still names inode `ino`.
 pub fn inode_is_open(ino: u32) -> bool {
     ino != 0
-        && (table().iter().any(|f| f.in_use && f.inode_num() == ino) || crate::cwd::holds(ino))
+        && (table().iter().any(|f| f.in_use && f.inode_num() == ino)
+            || crate::cwd::holds(ino)
+            || crate::pager::holds(ino))
 }
 
 /// Inodes whose last name went while a handle or a working directory still

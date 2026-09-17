@@ -1097,7 +1097,7 @@ e2fsck clean.
 
 A page of a mapped file is looked for in the object's cache first; if it is not there, the faulting task — in kernel mode, on its own stack, with interrupts on — calls the pager with a fresh frame lent to it, and the frame goes into the cache when the pager answers. A read-only mapping maps the cached frame itself (not `OWNED`); a private writable one copies it into a frame of the task's own. The cache belongs to the object and lives until the object is released, after the last mapped page is gone and the pager has written back what it must. The object's table slot (1..2047) is kept in bits 52–62 of every entry that refers to it, present or not, so that unmapping and teardown can count its mapped pages without a reverse map. The CPU ignores those bits in a present entry only while protection keys are off (CR4.PKE clear), so the kernel must never turn them on; `cpu.rs` says so beside the other CR4 bits. A page past the end of the file is `SIGBUS`, as on Linux; the last partial page reads as zeroes past the end. Only the pager may call `SYS_OBJECT_CTL`, and a `TAG_PAGE_IN` without `PAGER_BIT` is a forgery and refused.
 
-- [ ] **Step 1: The failing test.** `maptest.c` (runs on Linux), private half:
+- [x] **Step 1: The failing test.** `maptest.c` (runs on Linux), private half:
 
 ```c
 /* Files mapped into memory: private mappings here; shared ones in Task 11. */
@@ -1164,9 +1164,9 @@ int main(void) {
 }
 ```
 
-- [ ] **Step 2: Run it.** Host: all ok. Quark: `maps for reading` fails (`ENODEV` today).
+- [x] **Step 2: Run it.** Host: all ok. Quark: `maps for reading` fails (`ENODEV` today).
 
-- [ ] **Step 3: The kernel.** `memobj.rs`:
+- [x] **Step 3: The kernel.** `memobj.rs`:
 
 ```rust
 pub struct Object {
@@ -1193,7 +1193,7 @@ pub fn ctl(caller: usize, id: u64, op: u64, a: u64, b: u64) -> u64
 
 `page_in` returns a cached frame, or takes a frame, lends it to the pager with `ipc::pager_call(pager, msg, Lent::Frame { phys, access: LEND_WRITE })`, and caches it on `OK`. Two tasks faulting on one uncached page may both call the pager; the second result is freed and the first kept. `paging::back` on an object marker: slot from bits 52–62, page from bits 12–51, `page_in`, then map read-only frames directly (flags without `OWNED`, slot bits kept) or copy into a new `OWNED` frame for a private writable page (charged). `clear_range` and `free_pt_leaves` call `unmap_ref` for every entry carrying slot bits. `lend.rs` gains `Lent::Frame`, copied through the identity map without a page walk. `pager_call` is `call_inner` with the lend set by the kernel and `sender` marked; `sys_reply` masks `PAGER_BIT` off `dest`. The capability rules: `SYS_OBJECT_CREATE` mints for the caller; `sys_cap_mint` may derive a `MemObject` with the same id and fewer access bits from one the minter holds; `SYS_OBJECT_MAP` looks the slot up in the caller's CSpace. `SYS_OBJECT_CTL` requires the caller to be the object's pager (TID and endpoint number).
 
-- [ ] **Step 4: The VFS as a pager.** `pager.rs`:
+- [x] **Step 4: The VFS as a pager.** `pager.rs`:
 
 ```rust
 pub struct Mapped { pub inode: u32, pub id: u64, pub slot: usize }
@@ -1209,13 +1209,35 @@ pub fn resized(inode: u32, bytes: u64)
 
 `TAG_MAP` checks the handle (a regular file, `NOT_SUPPORTED` on FAT32 and for devices), gets the object, mints a derived capability with the caller's access into a scratch slot, grants it with `sys_cap_grant_any(sender, scratch)` (the caller is in a call, which is consent), deletes the scratch slot and replies `[slot, size]`. The dispatch arm for `TAG_PAGE_IN` accepts only `sender & PAGER_BIT != 0`; `TAG_OBJECT_IDLE` only sender 0. `handle_read_ext2` reads a mapped inode's pages through `read_through` first (so a shared mapping's writes are seen), `handle_write_ext2` calls `wrote` after writing, and `truncate` calls `resized`.
 
-- [ ] **Step 5: Clients.** `mmap` with a descriptor: `PROT_WRITE` with `MAP_SHARED` asks `TAG_MAP` for write access; the address comes from the same arena as anonymous memory; `SYS_OBJECT_MAP` with the page offset (`offset` must be page-aligned, else `EINVAL`); the slot is deleted afterwards (the mapping keeps the object). `ENODEV` for a directory or a device, `EACCES` for write-shared through a read-only descriptor, `EBADF` for a bad descriptor.
+- [x] **Step 5: Clients.** `mmap` with a descriptor: `PROT_WRITE` with `MAP_SHARED` asks `TAG_MAP` for write access; the address comes from the same arena as anonymous memory; `SYS_OBJECT_MAP` with the page offset (`offset` must be page-aligned, else `EINVAL`); the slot is deleted afterwards (the mapping keeps the object). `ENODEV` for a directory or a device, `EACCES` for write-shared through a read-only descriptor, `EBADF` for a bad descriptor.
 
-- [ ] **Step 6: FreeType maps its fonts.** `build-freetype.sh` switches to `-Dmmap=enabled`, and its comment says why the decision changed: a mapping is backed page by page now, so the Unix stream costs what it touches. Rebuild FreeType, fontconfig, cairo, the tests and the clients.
+- [x] **Step 6: FreeType maps its fonts.** `build-freetype.sh` switches to `-Dmmap=enabled`, and its comment says why the decision changed: a mapping is backed page by page now, so the Unix stream costs what it touches. Rebuild FreeType, fontconfig, cairo, the tests and the clients.
 
-- [ ] **Step 7: Verify.** Build, layer, all suites, image; boot `runtests /etc/libc.tests` (maptest ok), `runtests /etc/fonts.tests` (the same checksum, now through a mapping), `runtests /etc/cairo.tests`, `runtests /etc/fontconfig.tests` (its caches over a kilobyte are mapped), `wm wlcairo` (the text as before); `check-rootfs.sh`; the same on `make hd-ext4`.
+- [x] **Step 7: Verify.** Build, layer, all suites, image; boot `runtests /etc/libc.tests` (maptest ok), `runtests /etc/fonts.tests` (the same checksum, now through a mapping), `runtests /etc/cairo.tests`, `runtests /etc/fontconfig.tests` (its caches over a kilobyte are mapped), `wm wlcairo` (the text as before); `check-rootfs.sh`; the same on `make hd-ext4`.
 
-- [ ] **Step 8: Commit.** quark: "Files can be mapped"; explosion: "maptest; FreeType maps its fonts".
+- [x] **Step 8: Commit.** quark: "Files can be mapped"; explosion: "maptest; FreeType maps its fonts".
+
+**Done**, with these differences. The cache is a fixed open-addressed table
+(8192 pages, 256 objects) rather than a `BTreeMap`: the kernel heap's lock can
+turn interrupts back on, and the cache is touched with them off. Object
+reservations are page-table entries only, since each names its own page. The
+fault handler calls `back` with interrupts still off (a pager call blocks the
+way any call from a system call does); `back` takes `may_block`, false for a
+fault in ring 0, which only serves anonymous pages. A page that cannot be had
+is `Fault::Bus` (`[BUS …]`, SIGBUS). A shared writable page is mapped writable
+and marked dirty when first touched (Task 11 refines that). The VFS keeps its
+object capabilities in CSpace slots 32–61, so thirty files can be mapped at
+once, and releases idle objects when the table is full whether or not it
+heard the notice; a mapping keeps its inode alive. The Linux layer now
+records whether a descriptor was opened for writing, for `MAP_SHARED` with
+`PROT_WRITE`. Kernel notices are received before waiting calls, so that a
+call from a task that took a dead one's TID is never served as the dead
+one's (the lock waiters of Task 7 depended on it too). This kernel answers
+EACCES, not ENODEV, for mapping a directory; maptest accepts either. A
+temporary trace showed FreeType mapping DejaVu Sans and paging in only what it
+touched, out of order. libc.tests 12/12, fonts 1/1, cairo 2/2,
+fontconfig 4/4 on ext2 and ext4; `dtest` 260/0; `wm wlcairo` draws its text;
+e2fsck clean.
 
 ---
 

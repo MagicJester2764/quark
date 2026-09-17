@@ -67,6 +67,26 @@ pub enum Fault {
     Invalid,
     /// It was promised and there is nothing to give it with.
     NoMemory,
+    /// A page of an object that cannot be had: past the end of the file, or
+    /// its pager failed or has gone. SIGBUS, as on Linux.
+    Bus,
+}
+
+/// The object slot an entry names, present or reserved; 0 for none.
+pub fn object_slot(raw: u64) -> usize {
+    let named = if raw & PRESENT != 0 { true } else { raw & MARKER != 0 && raw & MARKER_OBJECT != 0 };
+    if named { ((raw >> OBJECT_SHIFT) & 0x7FF) as usize } else { 0 }
+}
+
+/// The reservation for page `page` of the object in `slot`.
+pub fn object_marker(slot: usize, page: u64, write: bool, shared: bool, exec: bool) -> u64 {
+    MARKER
+        | MARKER_OBJECT
+        | ((slot as u64) << OBJECT_SHIFT)
+        | (page << 12)
+        | if write { WRITABLE } else { 0 }
+        | if shared { MARKER_SHARED } else { 0 }
+        | if exec { 0 } else { NO_EXECUTE }
 }
 
 /// Highest canonical user address (exclusive). Everything at or above this is
@@ -337,6 +357,10 @@ pub unsafe fn map_page(
     if old.is_present() && old.raw() & OWNED != 0 && old.frame_address() != phys_addr {
         pmm::free(pmm::PhysFrame::from_address(old.frame_address()));
     }
+    let slot = object_slot(old.raw());
+    if slot != 0 {
+        crate::memobj::unmap_ref(slot, 1);
+    }
 
     pt.entries[pti].set(phys_addr, flags);
 
@@ -384,6 +408,36 @@ pub unsafe fn reserve_range(
     Ok(())
 }}
 
+/// Reserve `pages` pages from `virt` for pages `first..` of the object in
+/// `slot`. Each page's entry names its own page, so there is no 2 MiB form.
+/// The range must be free; on failure, what was reserved is left for the
+/// caller to clear, and is counted as mapped until it is.
+///
+/// # Safety
+/// As [`reserve_range`].
+pub unsafe fn reserve_object(
+    pml4_phys: usize,
+    virt: usize,
+    pages: usize,
+    slot: usize,
+    first: u64,
+    write: bool,
+    shared: bool,
+    exec: bool,
+) -> Result<(), PagingError> { unsafe {
+    for i in 0..pages {
+        let va = virt + i * PAGE_SIZE;
+        let (_, _, _, pti) = table_indices(va);
+        let pt = walk_create(pml4_phys, va, USER)?;
+        if pt.entries[pti].raw() != 0 {
+            return Err(PagingError::AlreadyMapped);
+        }
+        pt.entries[pti] = PageTableEntry(object_marker(slot, first + i as u64, write, shared, exec));
+        crate::memobj::map_ref(slot, 1);
+    }
+    Ok(())
+}}
+
 /// The reservation covering `virt`, if the page is reserved and not backed.
 ///
 /// # Safety
@@ -416,7 +470,7 @@ pub unsafe fn marker(pml4_phys: usize, virt: usize) -> Option<u64> { unsafe {
 /// # Safety
 /// `pml4_phys` must be the current task's address space; interrupts off, so
 /// nothing else changes its tables in between.
-pub unsafe fn back(pml4_phys: usize, virt: usize, write: bool) -> Result<(), Fault> { unsafe {
+pub unsafe fn back(pml4_phys: usize, virt: usize, write: bool, may_block: bool) -> Result<(), Fault> { unsafe {
     let (pml4i, pdpti, pdi, pti) = table_indices(virt);
     if (virt as u64) < USER_MIN_ADDR || (virt as u64) >= USER_ADDR_LIMIT {
         return Err(Fault::Invalid);
@@ -447,8 +501,11 @@ pub unsafe fn back(pml4_phys: usize, virt: usize, write: bool) -> Result<(), Fau
     }
     let pt = table_at(pd.entries[pdi].frame_address());
     let raw = pt.entries[pti].raw();
-    if !is_marker(raw) || raw & MARKER_OBJECT != 0 || (write && raw & WRITABLE == 0) {
+    if !is_marker(raw) || (write && raw & WRITABLE == 0) {
         return Err(Fault::Invalid);
+    }
+    if raw & MARKER_OBJECT != 0 {
+        return back_object(pml4_phys, virt, raw, may_block);
     }
     if !crate::scheduler::current_task_check_mem(1) {
         return Err(Fault::NoMemory);
@@ -461,9 +518,66 @@ pub unsafe fn back(pml4_phys: usize, virt: usize, write: bool) -> Result<(), Fau
     Ok(())
 }}
 
+/// Give a reserved page of an object its page: the object's own cached frame
+/// for a shared or read-only mapping, a private copy for a private writable
+/// one. The object may have to ask its pager, which blocks.
+unsafe fn back_object(pml4_phys: usize, virt: usize, raw: u64, may_block: bool) -> Result<(), Fault> { unsafe {
+    let slot = object_slot(raw);
+    let page = (raw >> 12) & crate::memobj::MAX_PAGE;
+    let frame = crate::memobj::page_in(slot, page, may_block)?;
+    // Paging in may have blocked, and a thread sharing the address space may
+    // have changed the entry meanwhile. If it has, this fault is over; the
+    // instruction runs again and meets whatever is there now.
+    let (_, _, _, pti) = table_indices(virt);
+    let Some(pt) = leaf_table(pml4_phys, virt) else { return Ok(()) };
+    if pt.entries[pti].raw() != raw {
+        return Ok(());
+    }
+    let writable = raw & WRITABLE != 0;
+    let shared = raw & MARKER_SHARED != 0;
+    let keep = (raw & NO_EXECUTE) | ((slot as u64) << OBJECT_SHIFT);
+    if shared || !writable {
+        // The object's page itself, which this address space does not own.
+        if shared && writable {
+            // Anything written through it has to go back to the file.
+            crate::memobj::mark_dirty(slot, page);
+        }
+        let w = if shared && writable { WRITABLE } else { 0 };
+        pt.entries[pti].set(frame, PRESENT | USER | w | keep);
+    } else {
+        if !crate::scheduler::current_task_check_mem(1) {
+            return Err(Fault::NoMemory);
+        }
+        let copy = pmm::alloc().ok_or(Fault::NoMemory)?.address();
+        core::ptr::copy_nonoverlapping(frame as *const u8, copy as *mut u8, PAGE_SIZE);
+        crate::scheduler::current_task_charge_mem(1);
+        pt.entries[pti].set(copy, PRESENT | USER | WRITABLE | OWNED | keep);
+    }
+    invlpg(virt & !0xFFF);
+    Ok(())
+}}
+
+/// The page table holding `virt`'s entry, if there is one.
+unsafe fn leaf_table(pml4_phys: usize, virt: usize) -> Option<&'static mut PageTable> { unsafe {
+    let (pml4i, pdpti, pdi, _) = table_indices(virt);
+    let e = table_at(pml4_phys).entries[pml4i];
+    if !e.is_present() {
+        return None;
+    }
+    let e = table_at(e.frame_address()).entries[pdpti];
+    if !e.is_present() || e.is_huge() {
+        return None;
+    }
+    let e = table_at(e.frame_address()).entries[pdi];
+    if !e.is_present() || e.is_huge() {
+        return None;
+    }
+    Some(table_at(e.frame_address()))
+}}
+
 /// Back every reserved page of `[addr, addr + len)`, so that the kernel can
 /// copy to or from it. Pages that are not reserved are left for the caller's
-/// own check.
+/// own check. A page of an object may block while its pager fills it.
 ///
 /// # Safety
 /// As [`back`].
@@ -477,7 +591,7 @@ pub unsafe fn back_range(pml4_phys: usize, addr: u64, len: u64, write: bool) -> 
     let mut page = addr & !0xFFF;
     while page < end {
         if marker(pml4_phys, page as usize).is_some() {
-            back(pml4_phys, page as usize, write)?;
+            back(pml4_phys, page as usize, write, true)?;
         }
         page += PAGE_SIZE as u64;
     }
@@ -579,6 +693,7 @@ pub unsafe fn clear_range(pml4_phys: usize, virt: usize, pages: usize) -> usize 
         while va < chunk_end {
             let (_, _, _, pti) = table_indices(va);
             let e = pt.entries[pti];
+            let slot = object_slot(e.raw());
             if e.is_present() {
                 if e.raw() & OWNED != 0 {
                     pmm::free(pmm::PhysFrame::from_address(e.frame_address()));
@@ -588,6 +703,9 @@ pub unsafe fn clear_range(pml4_phys: usize, virt: usize, pages: usize) -> usize 
                 invlpg(va);
             } else if e.raw() != 0 {
                 pt.entries[pti].clear();
+            }
+            if slot != 0 {
+                crate::memobj::unmap_ref(slot, 1);
             }
             va += PAGE_SIZE;
         }
@@ -839,6 +957,11 @@ unsafe fn free_pt_leaves(pt_phys: usize) { unsafe {
             let frame_phys = pt.entries[i].frame_address();
             pmm::free(pmm::PhysFrame::from_address(frame_phys));
         }
+        // Mapped or reserved, a page of an object is one reference fewer.
+        let slot = object_slot(pt.entries[i].raw());
+        if slot != 0 {
+            crate::memobj::unmap_ref(slot, 1);
+        }
     }
     pmm::free(pmm::PhysFrame::from_address(pt_phys));
 }}
@@ -880,6 +1003,10 @@ pub unsafe fn unmap_page(
 
     let frame_addr = pt.entries[pti].frame_address();
     let flags = pt.entries[pti].flags();
+    let slot = object_slot(pt.entries[pti].raw());
+    if slot != 0 {
+        crate::memobj::unmap_ref(slot, 1);
+    }
     pt.entries[pti].clear();
 
     invlpg(virt_addr);

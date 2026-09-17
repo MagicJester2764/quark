@@ -84,7 +84,14 @@ pub enum CapType {
     /// TID. Numbers are never reused, so this names the task it was minted for
     /// and nothing that takes its slot later.
     Endpoint = 8,
+    /// Permission to map a memory object. param0 is the object's id, which is
+    /// never reused; param1 the access, 1 read and 2 write.
+    MemObject = 9,
 }
+
+/// A `MemObject`'s access bits.
+pub const OBJECT_READ: u64 = 1;
+pub const OBJECT_WRITE: u64 = 2;
 
 #[derive(Debug, Clone, Copy)]
 pub struct CapSlot {
@@ -565,6 +572,12 @@ pub fn validate_attenuation(source: &CapSlot, new_type: CapType, new_p0: u64, ne
         CapType::SetUid => true,
         // One endpoint: the same one, or nothing.
         CapType::Endpoint => new_p0 == source.param0,
+        // The same object, with no access the source lacks.
+        CapType::MemObject => {
+            new_p0 == source.param0
+                && new_p1 & !(OBJECT_READ | OBJECT_WRITE) == 0
+                && new_p1 & !source.param1 == 0
+        }
     }
 }
 

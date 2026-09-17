@@ -48,6 +48,7 @@ struct openfile {
     unsigned long offset; /* the VFS has no seek, so the position is ours */
     unsigned long size;
     int is_dir;
+    int writable;         /* opened for writing, whatever the server allows */
     unsigned int mode;    /* permission bits, as the server reports them */
     unsigned long dir_next; /* a directory's position: the next entry's index */
     int dir_end;            /* and whether the last read reached its end */
@@ -219,6 +220,7 @@ long __quark_openat(long dirfd, const char *path, long flags) {
     f->handle = info.handle;
     f->size = info.size;
     f->is_dir = info.is_dir;
+    f->writable = (flags & LX_O_ACCMODE) != 0;
     f->mode = info.mode;
     /* Appending starts at the end; everything else starts at the beginning,
        and O_TRUNC was the server's to do. */
@@ -1041,6 +1043,28 @@ static long file_lock(long fd, long cmd, struct lx_flock *fl) {
 
 /* flock: a lock on the whole file, belonging to the open file, as Linux has
    it. Unlike Linux's, it and fcntl's locks are one kind and can collide. */
+/* A capability to map the file `fd` names, for mmap: `*cap` is the CSpace
+   slot it was granted into. Writing through a shared mapping needs a
+   descriptor open for writing, as on Linux. */
+long __quark_file_map(long fd, int write_shared, unsigned long *cap) {
+    struct openfile *f = slot(fd);
+    if (!f) {
+        return -LX_EBADF;
+    }
+    if (f->is_dir) {
+        return -LX_ENODEV;
+    }
+    if (write_shared && !f->writable) {
+        return -LX_EACCES;
+    }
+    unsigned long size;
+    int err = quark_vfs_map(f->handle, write_shared, cap, &size);
+    if (err == QUARK_VFS_NOT_SUPPORTED) {
+        return -LX_ENODEV;
+    }
+    return err ? vfs_errno(err) : 0;
+}
+
 long __quark_flock(long fd, long op) {
     struct openfile *f = slot(fd);
     if (!f) {

@@ -89,6 +89,7 @@ where the link was.
 | 20 | `GETCWD` | — | 4096 bytes to fill | `[len]` |
 | 21 | `GIVE_CWD` | `[child_tid]` | — | — |
 | 22 | `LOCK` | `[handle, kind, start, len, flags]` | — | `[kind, start, len, holder]` for a query |
+| 23 | `MAP` | `[handle, flags]` | — | `[slot, size]` |
 
 Numbers are never reused. 4 was `READDIR`, which returned one entry per call
 and cut its name to 32 bytes. 7 was `CREATE`, which carried its path in the
@@ -262,6 +263,23 @@ requests they are waiting on in turn; if that leads back to the program
 asking, the answer is `DEADLOCK`. Locks live in the server's memory, 256 at
 once (`NO_SPACE` beyond), and are keyed by inode — on FAT32 by first cluster,
 or for an empty file by its directory and name.
+
+### MAP
+
+A capability to map the file open as `handle`, granted into a free slot of
+the caller's CSpace: `MemObject` access 1 (read), and 2 (write) as well if
+`flags` bit 0 asks to write through a shared mapping, which needs a writable
+handle (`PERMISSION` otherwise). The caller maps it with `SYS_OBJECT_MAP` and
+may delete the capability after: the mapping keeps the object. Directories,
+links, devices and FAT32 files are `NOT_SUPPORTED`.
+
+The server is the object's pager (`docs/abi.md`, "Memory objects"): it answers
+`TAG_PAGE_IN` with the page read from the file, zeroes past its end, and
+releases an object once the kernel says nothing maps it. A file stays in use
+while it is mapped, as while a handle names it. What `WRITE` writes into a
+mapped file is copied into any of its pages the kernel has cached, and a
+`TRUNCATE` resizes the object, so a mapping and the file agree. Thirty files
+can be mapped at once.
 
 ### Devices
 

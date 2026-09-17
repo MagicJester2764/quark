@@ -15,6 +15,7 @@ pub mod ext2_ops;
 pub mod handles;
 pub mod journal;
 pub mod locks;
+pub mod pager;
 pub mod protocol;
 
 pub use protocol::*;
@@ -1398,6 +1399,13 @@ pub extern "C" fn _start() -> ! {
             TAG_GETCWD => handle_getcwd(sender),
             TAG_GIVE_CWD => handle_give_cwd(sender, &msg),
             TAG_LOCK => handle_lock(sender, &msg),
+            TAG_MAP if unsafe { FS_TYPE } == FsType::Ext2 => pager::handle_map(sender, &msg),
+            TAG_MAP => error_reply(sender, ERR_NOT_SUPPORTED),
+            // From the kernel alone: nobody else can set the pager bit.
+            quark_rt::ipc::TAG_PAGE_IN if sender & quark_rt::ipc::PAGER_BIT != 0 => {
+                pager::page_in(sender, &msg)
+            }
+            quark_rt::ipc::TAG_OBJECT_IDLE if sender == 0 => pager::idle(msg.data[1]),
             // A task waiting for a lock has gone; nobody is left to answer.
             quark_rt::ipc::TAG_TASK_DIED if sender == 0 => locks::drop_task(msg.data[0] as usize),
             TAG_TRUNCATE => transacted(|| handle_truncate(sender, &msg)),
@@ -1559,6 +1567,7 @@ fn open_ext2(sender: usize, base: u32, path: &[u8], flags: u64) {
         if let Err(code) = ext2_ops::truncate(ext2_state_mut(), ino, 0) {
             return error_reply(sender, code);
         }
+        pager::resized(ino, 0);
         size = 0;
     }
     let file = OpenFile {
@@ -2111,8 +2120,12 @@ fn handle_truncate(sender: usize, msg: &Message) {
     if !file.writable {
         return error_reply(sender, ERR_PERMISSION);
     }
-    match ext2_ops::truncate(ext2_state_mut(), file.inode_num(), msg.data[1]) {
-        Ok(()) => reply_opened(sender, [0; 6]),
+    let ino = file.inode_num();
+    match ext2_ops::truncate(ext2_state_mut(), ino, msg.data[1]) {
+        Ok(()) => {
+            pager::resized(ino, msg.data[1]);
+            reply_opened(sender, [0; 6])
+        }
         Err(code) => error_reply(sender, code),
     }
 }
@@ -2428,6 +2441,9 @@ fn handle_write_ext2(sender: usize, msg: &Message) {
             let e2 = ext2_state_mut();
             match ext2::write_file_data(e2, &mut inode, inode_num, offset, len) {
                 Ok(bytes_written) => {
+                    // A mapping of the file sees what was written.
+                    pager::wrote(inode_num, offset as u64, bytes_written as usize);
+                    pager::resized(inode_num, inode.size64());
                     let reply = Message {
                         sender: 0,
                         tag: TAG_OK,
