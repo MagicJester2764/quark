@@ -132,14 +132,17 @@ pub fn close_all(space: u64, closed: &mut [u32; MAX_OPEN_FILES]) -> usize {
 
 /// Whether any handle still names inode `ino`.
 pub fn inode_is_open(ino: u32) -> bool {
-    ino != 0 && table().iter().any(|f| f.in_use && f.inode_num() == ino)
+    ino != 0
+        && (table().iter().any(|f| f.in_use && f.inode_num() == ino) || crate::cwd::holds(ino))
 }
 
-/// Inodes whose last name went while a handle still named them. Each has a
-/// handle, so there can never be more than the table holds.
-static mut ORPHANS: [u32; MAX_OPEN_FILES] = [0; MAX_OPEN_FILES];
+/// Inodes whose last name went while a handle or a working directory still
+/// named them. Each is held by one of those, so there can never be more than
+/// the two tables hold.
+const MAX_ORPHANS: usize = MAX_OPEN_FILES + crate::cwd::MAX_PROGRAMS;
+static mut ORPHANS: [u32; MAX_ORPHANS] = [0; MAX_ORPHANS];
 
-fn orphans() -> &'static mut [u32; MAX_OPEN_FILES] {
+fn orphans() -> &'static mut [u32; MAX_ORPHANS] {
     unsafe { &mut *core::ptr::addr_of_mut!(ORPHANS) }
 }
 

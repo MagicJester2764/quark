@@ -218,13 +218,14 @@ fn cmd_spawn(
 
     let tid = info.tid;
 
+    // The child starts where the shell is.
+    let _ = vfs::give_cwd(vfs_tid, tid);
+
     // Wire file descriptors — duplicate the shell's own fds to the child.
     //
     // A pipeline stage skips whichever end is about to be replaced by a pipe:
-    // sys_pipe_fd_set overwrites the slot without releasing what was already
-    // there, so inheriting first would strand a reference on the console pipe
-    // that nothing ever drops. stderr is never redirected, so it always comes
-    // from the shell.
+    // there is no point handing it the console only for the pipe to close it.
+    // stderr is never redirected, so it always comes from the shell.
     if inherit_stdin {
         let _ = syscall::sys_fd_dup(tid, 0, 0);
     }
@@ -365,9 +366,7 @@ fn cmd_pipeline(stages: &[&[u8]], vfs_tid: usize, input_tid: usize) -> i32 {
             break;
         }
 
-        let mut arg_buf = [0u8; 256];
-        let resolved = resolve_args(cmd, args_str, &mut arg_buf);
-        let info = match cmd_spawn(cmd, resolved, vfs_tid, i == 0, i + 1 == n) {
+        let info = match cmd_spawn(cmd, args_str, vfs_tid, i == 0, i + 1 == n) {
             Some(v) => v,
             None => break,
         };
@@ -462,24 +461,18 @@ fn set_status(name: &[u8], code: i32) {
     }
 }
 
-static mut CWD: [u8; 64] = [0; 64];
-static mut CWD_LEN: usize = 0;
 static mut HOME: [u8; 64] = [0; 64];
 static mut HOME_LEN: usize = 0;
 
-fn cwd_init() {
-    // argv[1] = home directory (set by login), fallback to /home/root
-    let home = if let Some(h) = args::argv(1) {
-        if !h.is_empty() && h[0] == b'/' { h } else { b"/home/root" as &[u8] }
-    } else {
-        b"/home/root" as &[u8]
+/// Remember the home directory: argv[1], which login passes, or /home/root.
+fn home_init() {
+    let home = match args::argv(1) {
+        Some(h) if h.first() == Some(&b'/') && h.len() <= 64 => h,
+        _ => b"/home/root" as &[u8],
     };
     unsafe {
-        let len = home.len().min(64);
-        HOME[..len].copy_from_slice(&home[..len]);
-        HOME_LEN = len;
-        CWD[..len].copy_from_slice(&home[..len]);
-        CWD_LEN = len;
+        HOME[..home.len()].copy_from_slice(home);
+        HOME_LEN = home.len();
     }
 }
 
@@ -487,119 +480,53 @@ fn home_get() -> &'static [u8] {
     unsafe { &HOME[..HOME_LEN] }
 }
 
-fn cwd_get() -> &'static [u8] {
-    unsafe { &CWD[..CWD_LEN] }
-}
-
-fn cwd_set(path: &[u8]) {
-    unsafe {
-        let len = path.len().min(64);
-        CWD[..len].copy_from_slice(&path[..len]);
-        CWD_LEN = len;
+/// Why a directory could not be entered, in words.
+fn dir_error(code: u64) -> &'static str {
+    match code {
+        vfs::ERR_NOT_FOUND => "no such directory",
+        vfs::ERR_NOT_DIR => "not a directory",
+        vfs::ERR_PERMISSION => "permission denied",
+        vfs::ERR_NAME_TOO_LONG => "name too long",
+        vfs::ERR_LOOP => "too many symbolic links",
+        _ => "cannot enter it",
     }
 }
 
-/// Resolve a path relative to cwd. Handles `.`, `..`, absolute paths.
-/// Returns the resolved path length written into `out`.
-fn resolve_path(arg: &[u8], out: &mut [u8; 128]) -> usize {
-    let trailing_slash = arg.len() > 1 && arg[arg.len() - 1] == b'/';
-    let mut pos = if arg.first() == Some(&b'/') {
-        // Absolute path — start fresh
-        out[0] = b'/';
-        resolve_components(&arg[1..], out, 1)
-    } else {
-        // Relative path — start from cwd
-        let cwd = cwd_get();
-        out[..cwd.len()].copy_from_slice(cwd);
-        let mut p = cwd.len();
-        // Ensure trailing slash for joining
-        if p > 0 && out[p - 1] != b'/' && p < 128 {
-            out[p] = b'/';
-            p += 1;
-        }
-        resolve_components(arg, out, p)
+/// The prompt: where the shell is, with the home directory as `~`.
+fn print_prompt(vfs_tid: usize) {
+    let mut buf = [0u8; vfs::MAX_PATH + 1];
+    let Ok(len) = vfs::getcwd(vfs_tid, &mut buf) else {
+        // The directory was removed from under the shell.
+        print!("?$ ");
+        return;
     };
-    // Preserve trailing slash from original arg
-    if trailing_slash && pos > 1 && pos < 128 && out[pos - 1] != b'/' {
-        out[pos] = b'/';
-        pos += 1;
+    let cwd = &buf[..len];
+    let home = home_get();
+    let (tilde, rest) = if cwd == home {
+        (true, &b""[..])
+    } else if cwd.starts_with(home) && cwd.get(home.len()) == Some(&b'/') {
+        (true, &cwd[home.len()..])
+    } else {
+        (false, cwd)
+    };
+    if tilde {
+        print!("~");
     }
-    pos
-}
-
-fn resolve_components(components: &[u8], out: &mut [u8; 128], start: usize) -> usize {
-    let mut pos = start;
-    let mut i = 0;
-    while i <= components.len() {
-        // Find next component (split by '/')
-        let comp_start = i;
-        while i < components.len() && components[i] != b'/' {
-            i += 1;
-        }
-        let comp = &components[comp_start..i];
-        i += 1; // skip '/'
-
-        if comp.is_empty() || comp == b"." {
-            continue;
-        } else if comp == b".." {
-            // Go up: remove last component
-            if pos > 1 {
-                // Remove trailing slash
-                if out[pos - 1] == b'/' {
-                    pos -= 1;
-                }
-                // Find previous slash
-                while pos > 1 && out[pos - 1] != b'/' {
-                    pos -= 1;
-                }
-            }
-        } else {
-            // Append component
-            if pos > 0 && out[pos - 1] != b'/' && pos < 128 {
-                out[pos] = b'/';
-                pos += 1;
-            }
-            let len = comp.len().min(128 - pos);
-            out[pos..pos + len].copy_from_slice(&comp[..len]);
-            pos += len;
+    if let Ok(s) = core::str::from_utf8(rest) {
+        print!("{}", s);
+        if !s.is_empty() && !s.ends_with('/') {
+            print!("/");
         }
     }
-    // Ensure at least "/"
-    if pos == 0 {
-        out[0] = b'/';
-        pos = 1;
-    }
-    pos
+    print!("$ ");
 }
 
 fn cmd_cd(args_str: &[u8], vfs_tid: usize) {
     let arg = args_str.trim_ascii();
-    if arg.is_empty() {
-        cwd_set(home_get());
-        return;
-    }
-
-    let mut resolved = [0u8; 128];
-    let len = resolve_path(arg, &mut resolved);
-    let path = &resolved[..len];
-
-    // Verify it's a valid directory via VFS
-    match vfs::open(vfs_tid, path) {
-        Ok((handle, _, is_dir)) => {
-            let _ = vfs::close(vfs_tid, handle);
-            if is_dir {
-                cwd_set(path);
-            } else {
-                if let Ok(s) = core::str::from_utf8(arg) {
-                    println!("cd: not a directory: {}", s);
-                }
-            }
-        }
-        Err(_) => {
-            if let Ok(s) = core::str::from_utf8(arg) {
-                println!("cd: no such directory: {}", s);
-            }
-        }
+    let target = if arg.is_empty() { home_get() } else { arg };
+    if let Err(code) = vfs::chdir(vfs_tid, target) {
+        let shown = core::str::from_utf8(target).unwrap_or("?");
+        println!("cd: {}: {}", shown, dir_error(code));
     }
 }
 
@@ -610,7 +537,7 @@ fn cmd_cd(args_str: &[u8], vfs_tid: usize) {
 #[unsafe(no_mangle)]
 #[link_section = ".text.entry"]
 pub extern "C" fn _start() -> ! {
-    cwd_init();
+    home_init();
 
     // Discover services
     let vfs_tid = match nameserver::lookup_retry(b"vfs", 50) {
@@ -620,31 +547,18 @@ pub extern "C" fn _start() -> ! {
             syscall::sys_exit();
         }
     };
+    // Start at home; if it is not there, wherever the shell was put.
+    if let Err(code) = vfs::chdir(vfs_tid, home_get()) {
+        let shown = core::str::from_utf8(home_get()).unwrap_or("?");
+        println!("shell: {}: {}", shown, dir_error(code));
+    }
 
     let input_tid = nameserver::lookup(b"input").unwrap_or(0);
 
     // Main loop
     let mut line_buf = [0u8; 256];
     loop {
-        let cwd = cwd_get();
-        let home = home_get();
-        if cwd == home {
-            print!("~");
-        } else if cwd.starts_with(home) && cwd.len() > home.len() && cwd[home.len()] == b'/' {
-            print!("~");
-            if let Ok(rest) = core::str::from_utf8(&cwd[home.len()..]) {
-                print!("{}", rest);
-                if !rest.ends_with('/') {
-                    print!("/");
-                }
-            }
-        } else if let Ok(s) = core::str::from_utf8(cwd) {
-            print!("{}", s);
-            if !s.ends_with('/') {
-                print!("/");
-            }
-        }
-        print!("$ ");
+        print_prompt(vfs_tid);
 
         let n = match read_line_result(&mut line_buf) {
             Ok(n) => n,
@@ -734,8 +648,10 @@ pub extern "C" fn _start() -> ! {
 
         // Builtin: pwd
         if cmd == b"pwd" {
-            if let Ok(s) = core::str::from_utf8(cwd_get()) {
-                println!("{}", s);
+            let mut buf = [0u8; vfs::MAX_PATH + 1];
+            match vfs::getcwd(vfs_tid, &mut buf) {
+                Ok(len) => println!("{}", core::str::from_utf8(&buf[..len]).unwrap_or("?")),
+                Err(_) => println!("pwd: the directory has been removed"),
             }
             continue;
         }
@@ -767,18 +683,13 @@ pub extern "C" fn _start() -> ! {
             continue;
         }
 
-        // Resolve `.` and `..` in arguments for external commands
-        let mut resolved_args_buf = [0u8; 256];
-        let resolved_args = resolve_args(cmd, args_str, &mut resolved_args_buf);
-
-        // External command
-        let code = cmd_exec(cmd, resolved_args, vfs_tid, input_tid);
+        // External command. Relative paths in its arguments are its own
+        // business: it starts in the shell's directory.
+        let code = cmd_exec(cmd, args_str, vfs_tid, input_tid);
         set_status(cmd, code);
     }
 }
 
-/// For commands that take path arguments, resolve `.` and `..` relative to cwd.
-/// For `ls` with no args, inject cwd as the argument.
 fn parse_usize(s: &[u8]) -> Option<usize> {
     if s.is_empty() { return None; }
     let mut val: usize = 0;
@@ -787,56 +698,6 @@ fn parse_usize(s: &[u8]) -> Option<usize> {
         val = val.checked_mul(10)?.checked_add((b - b'0') as usize)?;
     }
     Some(val)
-}
-
-fn resolve_args<'a>(cmd: &[u8], args_str: &[u8], buf: &'a mut [u8; 256]) -> &'a [u8] {
-    let trimmed = args_str.trim_ascii();
-
-    // ls with no args → use cwd
-    if eq_ignore_case(cmd, b"ls") && trimmed.is_empty() {
-        let cwd = cwd_get();
-        buf[..cwd.len()].copy_from_slice(cwd);
-        return &buf[..cwd.len()];
-    }
-
-    // Resolve each argument that looks like a path (contains . or ..)
-    // For simplicity, resolve each space-separated token individually
-    let mut out_pos = 0;
-    let mut i = 0;
-    let bytes = args_str;
-    while i < bytes.len() {
-        // Copy leading spaces
-        while i < bytes.len() && bytes[i] == b' ' {
-            if out_pos < 256 { buf[out_pos] = b' '; out_pos += 1; }
-            i += 1;
-        }
-        if i >= bytes.len() { break; }
-
-        // Extract token
-        let tok_start = i;
-        while i < bytes.len() && bytes[i] != b' ' {
-            i += 1;
-        }
-        let token = &bytes[tok_start..i];
-
-        // Resolve tokens that look like paths or are bare names for file commands
-        let is_file_cmd = eq_ignore_case(cmd, b"cat") || eq_ignore_case(cmd, b"ls");
-        let looks_like_path = !token.is_empty() && token[0] != b'-'
-            && (token[0] == b'.' || token.iter().any(|&b| b == b'/')
-                || is_file_cmd);
-        if looks_like_path {
-            let mut resolved = [0u8; 128];
-            let len = resolve_path(token, &mut resolved);
-            let copy_len = len.min(256 - out_pos);
-            buf[out_pos..out_pos + copy_len].copy_from_slice(&resolved[..copy_len]);
-            out_pos += copy_len;
-        } else {
-            let copy_len = token.len().min(256 - out_pos);
-            buf[out_pos..out_pos + copy_len].copy_from_slice(&token[..copy_len]);
-            out_pos += copy_len;
-        }
-    }
-    &buf[..out_pos]
 }
 
 #[panic_handler]

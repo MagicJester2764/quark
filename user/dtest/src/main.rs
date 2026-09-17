@@ -1363,6 +1363,39 @@ fn test_files() {
         vfs::rmdir(vfs_tid, dir).is_ok() && vfs::open(vfs_tid, dir).err() == Some(vfs::ERR_NOT_FOUND),
     );
 
+    // A working directory: relative names start there, and a child is given
+    // it, or starts at the root.
+    check("chdir to /etc", vfs::chdir(vfs_tid, b"/etc").is_ok());
+    check(
+        "a relative name opens from there",
+        vfs::open(vfs_tid, b"passwd").map(|(h, _, _)| vfs::close(vfs_tid, h)).is_ok(),
+    );
+    let mut here = [0u8; 64];
+    check(
+        "getcwd says /etc",
+        vfs::getcwd(vfs_tid, &mut here).is_ok_and(|n| &here[..n] == b"/etc"),
+    );
+    let given = load_child(&[b"dchild", b"cwd"]).map(|c| {
+        let _ = vfs::give_cwd(vfs_tid, c.tid);
+        let _ = c.start();
+        wait_for(c.tid)
+    });
+    check("a child given the directory starts there", given == Some(Some(0)));
+    let not_given = load_child(&[b"dchild", b"cwd"]).map(|c| {
+        let _ = c.start();
+        wait_for(c.tid)
+    });
+    check("one not given it starts at the root", not_given == Some(Some(1)));
+    check(
+        "nobody else's child can be given it",
+        vfs::give_cwd(vfs_tid, nameserver::NAMESERVER_TID).err() == Some(vfs::ERR_PERMISSION),
+    );
+    check(
+        "a file is not a directory to be in",
+        vfs::chdir(vfs_tid, b"/etc/passwd").err() == Some(vfs::ERR_NOT_DIR),
+    );
+    check("and back to /", vfs::chdir(vfs_tid, b"/").is_ok());
+
     // A directory read a page at a time, with names longer than a page's
     // fixed entries used to hold.
     const LISTING: &[u8] = b"/tmp/dtest-listing";

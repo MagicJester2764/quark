@@ -1,6 +1,6 @@
 # Quark syscall ABI
 
-**Version 2.3.** Query the running kernel with `SYS_ABI_VERSION` (240), which
+**Version 2.4.** Query the running kernel with `SYS_ABI_VERSION` (240), which
 returns `(major << 16) | minor`.
 
 This document is the contract between the Quark kernel and everything above it.
@@ -132,6 +132,7 @@ rule still holds for everything else.
 | 2.1 | `SYS_BOOT_TIME` (145) — the date, read from the machine's clock at boot. Before it nothing here knew what day it was, and files were dated from 1970. |
 | 2.2 | `SYS_TASK_SPACE` (107) and `SYS_SPACE_WATCH` (108) — a program's identity is its address space, so a server can keep what a program holds for the program rather than for the one thread that asked. Also: a thread starts holding a copy of its creator's capabilities and descriptors, and in its band. |
 | 2.3 | `SYS_GETRANDOM` (116) — random bytes from a ChaCha20 generator seeded from RDSEED or RDRAND and the machine's timing. Before it a program had the clock, and expat salted its hash tables with it. |
+| 2.4 | `SYS_TASK_CREATE_IN` (109) — a task made for an address space the caller created belongs to that program before it runs, so a spawner can hand it things servers keep per program, such as a working directory. `SYS_TASK_SPACE` answers for it at once. |
 
 ### Deprecated
 
@@ -448,6 +449,7 @@ cannot resurrect a revoked capability in practice.
 | 106 | `SYS_SET_CLEAR_TID` | arg0 = address of a `u32`, or 0 | this task's id / `u64::MAX` | — |
 | 107 | `SYS_TASK_SPACE` | arg0 = tid | that task's space id / `u64::MAX` | — |
 | 108 | `SYS_SPACE_WATCH` | arg0 = space id | 0, or `u64::MAX` if no task of it is alive | — |
+| 109 | `SYS_TASK_CREATE_IN` | arg0 = cr3 of an address space the caller created | TID / `u64::MAX` | `TaskMgmt` |
 | 105 | `SYS_TASK_PRIORITY` | arg0 = tid, arg1 = band | 0 / `u64::MAX` | `TaskMgmt` for target, and the caller's own band or worse |
 
 There is no fork or exec. A parent creates a task, builds its address space,
@@ -483,6 +485,10 @@ working directory — keeps it for the space, so any thread of the program may
 use it. `SYS_SPACE_WATCH` is `SYS_TASK_WATCH` for a program: the notice is sender
 0, tag `0xFFFF_0004`, `data[0]` the space id, and it comes once, when the last
 live task of that space dies. Failure means none is alive.
+
+A task made with `SYS_TASK_CREATE_IN` belongs to that address space's program
+from the moment it exists: `SYS_TASK_SPACE` names it, a watch on the program
+counts it, and `SYS_TASK_START` refuses to start it anywhere else.
 
 A task started with `SYS_TASK_START` in its creator's own address space is a
 thread of it, and starts with a copy of what its creator holds at that moment:

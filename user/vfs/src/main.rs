@@ -8,6 +8,7 @@ pub mod ext2_alloc;
 pub mod ext2_dir;
 pub mod ext4;
 pub mod csum;
+pub mod cwd;
 pub mod devices;
 pub mod disk;
 pub mod ext2_ops;
@@ -1389,6 +1390,9 @@ pub extern "C" fn _start() -> ! {
                 transacted(|| handle_namespace(sender, &msg))
             }
             TAG_READLINK => handle_readlink(&disk, sender, &msg),
+            TAG_CHDIR | TAG_FCHDIR => handle_chdir(&disk, sender, &msg),
+            TAG_GETCWD => handle_getcwd(sender),
+            TAG_GIVE_CWD => handle_give_cwd(sender, &msg),
             TAG_TRUNCATE => transacted(|| handle_truncate(sender, &msg)),
             TAG_STATFS => handle_statfs(sender),
             // From the kernel, which is not waiting for an answer.
@@ -1420,20 +1424,72 @@ fn handle_open(disk: &DiskState, sender: usize, msg: &Message) {
         Ok(p) => p,
         Err(code) => return error_reply(sender, code),
     };
-    // On ext2 the lookup itself finds /dev, through links and all. Where it
-    // cannot — FAT32, or a root with no /dev — the path is read as written.
-    let resolver_sees_dev = unsafe { FS_TYPE } == FsType::Ext2 && ext2_dir::dev_dir() != 0;
-    if !resolver_sees_dev {
+    if unsafe { FS_TYPE } == FsType::Ext2 {
+        let base = match base_of(sender, msg.data[5]) {
+            Ok(b) => b,
+            Err(code) => return error_reply(sender, code),
+        };
+        // The lookup itself finds /dev, through links and all, when the root
+        // has one. Without it, the path is matched as written.
+        if ext2_dir::dev_dir() == 0 {
+            let whole = match ext2_whole_path(base, path) {
+                Ok(p) => p,
+                Err(code) => return error_reply(sender, code),
+            };
+            match devices::lookup(whole) {
+                devices::Lookup::Elsewhere => {}
+                found => return devices::open(sender, whole, found, flags),
+            }
+        }
+        open_ext2(sender, base, path, flags);
+    } else {
+        let path = match fat_path(sender, msg.data[5], path) {
+            Ok(p) => p,
+            Err(code) => return error_reply(sender, code),
+        };
         match devices::lookup(path) {
             devices::Lookup::Elsewhere => {}
             found => return devices::open(sender, path, found, flags),
         }
-    }
-    if unsafe { FS_TYPE } == FsType::Ext2 {
-        open_ext2(sender, path, flags);
-    } else {
         open_fat32(disk, sender, path, flags);
     }
+}
+
+/// The ext2 directory a relative path starts from. `word` is 0 for the
+/// program's working directory, or one more than an open directory handle.
+fn base_of(sender: usize, word: u64) -> Result<u32, u64> {
+    if word == 0 {
+        return Ok(match cwd::get(space_of(sender)).0 {
+            cwd::Where::Inode(ino) => ino,
+            _ => ext2::EXT2_ROOT_INO,
+        });
+    }
+    let file = get_handle((word - 1) as usize, sender).ok_or(ERR_INVALID_HANDLE)?;
+    match file.fs {
+        FsFileData::Ext2 { inode_num } if file.is_dir => Ok(inode_num),
+        FsFileData::DevDir if ext2_dir::dev_dir() != 0 => Ok(ext2_dir::dev_dir()),
+        _ => Err(ERR_NOT_DIR),
+    }
+}
+
+/// `path` from `base` written out whole, for a root with no /dev to find.
+fn ext2_whole_path(base: u32, path: &'static [u8]) -> Result<&'static [u8], u64> {
+    if path.first() == Some(&b'/') {
+        return Ok(path);
+    }
+    let dir = ext2_dir::path_of(ext2_state(), base)?;
+    // path_of's buffer is overwritten by nothing join does.
+    cwd::join(dir, path)
+}
+
+/// A FAT32 path made absolute: FAT32 keeps a program's directory as a path,
+/// and has no handles to start from.
+fn fat_path(sender: usize, word: u64, path: &[u8]) -> Result<&'static [u8], u64> {
+    if word != 0 && path.first() != Some(&b'/') {
+        return Err(ERR_NOT_SUPPORTED);
+    }
+    let (_, dir) = cwd::get(space_of(sender));
+    cwd::join(dir, path)
 }
 
 fn reply_opened(sender: usize, words: [u64; 6]) {
@@ -1441,12 +1497,12 @@ fn reply_opened(sender: usize, words: [u64; 6]) {
     let _ = syscall::sys_reply(sender, &reply);
 }
 
-fn open_ext2(sender: usize, path: &[u8], flags: u64) {
+fn open_ext2(sender: usize, base: u32, path: &[u8], flags: u64) {
     let (uid, gid) = get_sender_uid_gid(sender);
     let trailing = path.len() > 1 && path[path.len() - 1] == b'/';
     let wants_dir = flags & OPEN_DIRECTORY != 0 || trailing;
     let follow = flags & OPEN_NOFOLLOW == 0;
-    let found = ext2_dir::resolve(ext2_state(), ext2::EXT2_ROOT_INO, path, uid, gid, follow);
+    let found = ext2_dir::resolve(ext2_state(), base, path, uid, gid, follow);
     let found = match found {
         Ok(ext2_dir::Found::Device(dev)) => {
             return devices::open(sender, path, devices::Lookup::Device(dev), flags);
@@ -1471,7 +1527,7 @@ fn open_ext2(sender: usize, path: &[u8], flags: u64) {
             if ext2_state().read_only {
                 return error_reply(sender, ERR_READ_ONLY);
             }
-            match ext2_ops::create(ext2_state_mut(), path, uid, gid, false) {
+            match ext2_ops::create(ext2_state_mut(), base, path, uid, gid, false) {
                 Ok(made) => made,
                 Err(code) => return error_reply(sender, code),
             }
@@ -1593,17 +1649,32 @@ fn handle_mkdir(disk: &DiskState, sender: usize, msg: &Message) {
         Ok(p) => p,
         Err(code) => return error_reply(sender, code),
     };
-    if devices::refuses(path) {
-        return error_reply(sender, ERR_PERMISSION);
-    }
     let made = if unsafe { FS_TYPE } == FsType::Ext2 {
         if ext2_state().read_only {
             Err(ERR_READ_ONLY)
+        } else if ext2_dir::dev_dir() == 0 && devices::refuses(path) {
+            Err(ERR_PERMISSION)
         } else {
             let (uid, gid) = get_sender_uid_gid(sender);
-            ext2_ops::create(ext2_state_mut(), path, uid, gid, true).map(|_| ())
+            base_of(sender, msg.data[5]).and_then(|base| {
+                ext2_ops::create(ext2_state_mut(), base, path, uid, gid, true).map(|_| ())
+            })
         }
     } else {
+        match fat_path(sender, msg.data[5], path) {
+            Ok(path) if devices::refuses(path) => Err(ERR_PERMISSION),
+            Ok(path) => fat32_mkdir(disk, path),
+            Err(code) => Err(code),
+        }
+    };
+    match made {
+        Ok(()) => reply_opened(sender, [0; 6]),
+        Err(code) => error_reply(sender, code),
+    }
+}
+
+fn fat32_mkdir(disk: &DiskState, path: &[u8]) -> Result<(), u64> {
+    {
         match resolve_path(disk, path) {
             Ok(_) => Err(ERR_EXISTS),
             Err(ERR_NOT_FOUND) => fat32_parent(disk, path)
@@ -1611,10 +1682,6 @@ fn handle_mkdir(disk: &DiskState, sender: usize, msg: &Message) {
                 .map(|_| ()),
             Err(code) => Err(code),
         }
-    };
-    match made {
-        Ok(()) => reply_opened(sender, [0; 6]),
-        Err(code) => error_reply(sender, code),
     }
 }
 /// Copy the first `n` bytes of `CLIENT_BUF` into what `sender` lent.
@@ -1679,6 +1746,9 @@ fn client_died(space: u64) {
     let mut closed = [0u32; handles::MAX_OPEN_FILES];
     let n = handles::close_all(space, &mut closed);
     settle(&closed[..n]);
+    if let cwd::Where::Inode(ino) = cwd::forget(space) {
+        settle(&[ino]);
+    }
 }
 
 /// Free any of these inodes that lost their last name while open and have
@@ -1712,24 +1782,35 @@ fn handle_namespace(sender: usize, msg: &Message) {
         Ok(p) => p,
         Err(code) => return error_reply(sender, code),
     };
-    // A link's target is only text, and may name a device.
-    if msg.tag != TAG_SYMLINK && devices::refuses(first) {
+    // With a /dev on the disk, the lookup keeps everything out of it. A link's
+    // target is only text, and may name a device.
+    let lexical = ext2_dir::dev_dir() == 0;
+    if lexical && msg.tag != TAG_SYMLINK && devices::refuses(first) {
         return error_reply(sender, ERR_PERMISSION);
     }
+    let base = match base_of(sender, msg.data[5]) {
+        Ok(b) => b,
+        Err(code) => return error_reply(sender, code),
+    };
     let (uid, gid) = get_sender_uid_gid(sender);
     let e2 = ext2_state_mut();
     let done = match msg.tag {
-        TAG_UNLINK => ext2_ops::unlink(e2, first, uid, gid),
-        TAG_RMDIR => ext2_ops::rmdir(e2, first, uid, gid),
+        TAG_UNLINK => ext2_ops::unlink(e2, base, first, uid, gid),
+        TAG_RMDIR => ext2_ops::rmdir(e2, base, first, uid, gid),
         tag => match protocol::lent_path(sender, msg.data[0] as usize, msg.data[1] as usize, 4096) {
-            Ok(second) if devices::refuses(second) => Err(ERR_PERMISSION),
+            Ok(second) if lexical && devices::refuses(second) => Err(ERR_PERMISSION),
             Ok(second) => match tag {
-                TAG_LINK => {
-                    let follow = msg.data[2] & LINK_FOLLOW != 0;
-                    ext2_ops::link(e2, first, second, uid, gid, follow)
-                }
-                TAG_SYMLINK => ext2_ops::symlink(e2, first, second, uid, gid),
-                _ => ext2_ops::rename(e2, first, second, uid, gid),
+                // The second path's own base; SYMLINK resolves only that path,
+                // and takes the ordinary one for it.
+                TAG_SYMLINK => ext2_ops::symlink(e2, first, base, second, uid, gid),
+                _ => match base_of(sender, msg.data[4]) {
+                    Ok(to_base) if tag == TAG_LINK => {
+                        let follow = msg.data[2] & LINK_FOLLOW != 0;
+                        ext2_ops::link(e2, base, first, to_base, second, uid, gid, follow)
+                    }
+                    Ok(to_base) => ext2_ops::rename(e2, base, first, to_base, second, uid, gid),
+                    Err(code) => Err(code),
+                },
             },
             Err(code) => Err(code),
         },
@@ -1752,14 +1833,18 @@ fn handle_readlink(disk: &DiskState, sender: usize, msg: &Message) {
     };
     if unsafe { FS_TYPE } != FsType::Ext2 {
         // No links on FAT32: whatever is there is not one.
-        return match resolve_path(disk, path) {
+        return match fat_path(sender, msg.data[5], path).and_then(|p| resolve_path(disk, p)) {
             Ok(_) => error_reply(sender, ERR_INVALID_PATH),
             Err(code) => error_reply(sender, code),
         };
     }
+    let base = match base_of(sender, msg.data[5]) {
+        Ok(b) => b,
+        Err(code) => return error_reply(sender, code),
+    };
     let (uid, gid) = get_sender_uid_gid(sender);
     let e2 = ext2_state();
-    let inode = match ext2_dir::resolve(e2, ext2::EXT2_ROOT_INO, path, uid, gid, false) {
+    let inode = match ext2_dir::resolve(e2, base, path, uid, gid, false) {
         Ok(ext2_dir::Found::Inode(_, inode, _)) => inode,
         Ok(ext2_dir::Found::Device(_)) => return error_reply(sender, ERR_INVALID_PATH),
         Err(code) => return error_reply(sender, code),
@@ -1775,6 +1860,99 @@ fn handle_readlink(disk: &DiskState, sender: usize, msg: &Message) {
         return error_reply(sender, ERR_IO);
     }
     reply_opened(sender, [len as u64, 0, 0, 0, 0, 0]);
+}
+
+/// TAG_CHDIR: `data[0]` = the path's length, lent, from `data[5]`'s base.
+/// TAG_FCHDIR: `data[0]` = an open directory handle. Either way the program
+/// is now in that directory, which it must be able to search.
+fn handle_chdir(disk: &DiskState, sender: usize, msg: &Message) {
+    let space = space_of(sender);
+    let (uid, gid) = get_sender_uid_gid(sender);
+    let to = if unsafe { FS_TYPE } == FsType::Ext2 {
+        let found = if msg.tag == TAG_FCHDIR {
+            base_of(sender, msg.data[0] + 1)
+        } else {
+            protocol::lent_path(sender, 0, msg.data[0] as usize, 0).and_then(|path| {
+                let base = base_of(sender, msg.data[5])?;
+                ext2_dir::resolve_inode(ext2_state(), base, path, uid, gid, true).map(|f| f.0)
+            })
+        };
+        found.and_then(|ino| {
+            let dir = ext2::read_inode(ext2_state(), ino)?;
+            if !dir.is_dir() {
+                Err(ERR_NOT_DIR)
+            } else if !ext2::check_permission(&dir, uid, gid, 1) {
+                Err(ERR_PERMISSION)
+            } else if ino == ext2::EXT2_ROOT_INO {
+                cwd::set(space, cwd::Where::Root, b"")
+            } else {
+                cwd::set(space, cwd::Where::Inode(ino), b"")
+            }
+        })
+    } else if msg.tag == TAG_FCHDIR {
+        Err(ERR_NOT_SUPPORTED)
+    } else {
+        protocol::lent_path(sender, 0, msg.data[0] as usize, 0)
+            .and_then(|path| fat_path(sender, msg.data[5], path))
+            .and_then(|path| match resolve_path(disk, path)? {
+                (_, _, true, _, _) if path == b"/" => cwd::set(space, cwd::Where::Root, b""),
+                (_, _, true, _, _) => cwd::set(space, cwd::Where::Path(path.len()), path),
+                _ => Err(ERR_NOT_DIR),
+            })
+    };
+    match to {
+        Ok(left) => {
+            reply_opened(sender, [0; 6]);
+            // The directory left may have been removed while the program was
+            // in it, and now nothing holds it.
+            if let cwd::Where::Inode(ino) = left {
+                settle(&[ino]);
+            }
+        }
+        Err(code) => error_reply(sender, code),
+    }
+}
+
+/// TAG_GETCWD: 4096 bytes lent for writing. Reply: the path's length.
+fn handle_getcwd(sender: usize) {
+    let path = match cwd::get(space_of(sender)) {
+        (cwd::Where::Inode(ino), _) => ext2_dir::path_of(ext2_state(), ino),
+        (_, path) => Ok(path),
+    };
+    match path {
+        Ok(p) if syscall::sys_lent_write(sender, 0, p) == Ok(p.len()) => {
+            reply_opened(sender, [p.len() as u64, 0, 0, 0, 0, 0])
+        }
+        Ok(_) => error_reply(sender, ERR_IO),
+        Err(code) => error_reply(sender, code),
+    }
+}
+
+/// TAG_GIVE_CWD: `data[0]` = a task the caller's program made for another
+/// program, not yet necessarily running. That program starts in the
+/// caller's directory.
+fn handle_give_cwd(sender: usize, msg: &Message) {
+    let me = space_of(sender);
+    let child = msg.data[0] as usize;
+    let theirs = space_of(child);
+    let parent = syscall::sys_task_info(child).map(|(_, parent, _)| parent);
+    let allowed = me != 0
+        && theirs != 0
+        && theirs != me
+        && parent.is_ok_and(|p| p != 0 && space_of(p) == me);
+    if !allowed {
+        return error_reply(sender, ERR_PERMISSION);
+    }
+    let (at, path) = cwd::get(me);
+    match cwd::set(theirs, at, path) {
+        Ok(left) => {
+            reply_opened(sender, [0; 6]);
+            if let cwd::Where::Inode(ino) = left {
+                settle(&[ino]);
+            }
+        }
+        Err(code) => error_reply(sender, code),
+    }
 }
 
 /// TAG_TRUNCATE: data[0] = handle, data[1] = the new size.

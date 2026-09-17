@@ -20,6 +20,10 @@ const TAG_RENAME: u64 = 12;
 const TAG_LINK: u64 = 15;
 const TAG_SYMLINK: u64 = 16;
 const TAG_READLINK: u64 = 17;
+const TAG_CHDIR: u64 = 18;
+const TAG_FCHDIR: u64 = 19;
+const TAG_GETCWD: u64 = 20;
+const TAG_GIVE_CWD: u64 = 21;
 const TAG_TRUNCATE: u64 = 13;
 const TAG_STATFS: u64 = 14;
 const TAG_ERROR: u64 = u64::MAX;
@@ -387,6 +391,56 @@ pub fn readlink(vfs_tid: usize, path: &[u8], out: &mut [u8]) -> Result<usize, u6
     let n = len.min(room);
     out[..n].copy_from_slice(&lent[path.len()..path.len() + n]);
     Ok(len)
+}
+
+/// Move this program into directory `path`. A relative path, here and in
+/// every other call, starts from where the program is.
+pub fn chdir(vfs_tid: usize, path: &[u8]) -> Result<(), u64> {
+    call_with_path(vfs_tid, TAG_CHDIR, path, [0; 6]).map(|_| ())
+}
+
+/// Move this program into the directory open as `handle`.
+pub fn fchdir(vfs_tid: usize, handle: usize) -> Result<(), u64> {
+    simple_call(vfs_tid, TAG_FCHDIR, [handle as u64, 0, 0, 0, 0, 0]).map(|_| ())
+}
+
+/// Where this program is, written into `out`; the length is returned.
+/// `ERR_NOT_FOUND` if the directory has been removed, and `ERR_NAME_TOO_LONG`
+/// if `out` cannot hold the path.
+pub fn getcwd(vfs_tid: usize, out: &mut [u8]) -> Result<usize, u64> {
+    let mut path = [0u8; MAX_PATH + 1];
+    let msg = Message { sender: 0, tag: TAG_GETCWD, data: [0; 6] };
+    let mut reply = Message::empty();
+    if syscall::sys_call_lend_mut(vfs_tid, &msg, &mut reply, &mut path).is_err() {
+        return Err(ERR_IO);
+    }
+    if reply.tag == TAG_ERROR {
+        return Err(reply.data[0]);
+    }
+    let len = (reply.data[0] as usize).min(path.len());
+    if len > out.len() {
+        return Err(ERR_NAME_TOO_LONG);
+    }
+    out[..len].copy_from_slice(&path[..len]);
+    Ok(len)
+}
+
+/// Start `child`, a program this one is making, in this program's directory.
+/// Call it before starting the child.
+pub fn give_cwd(vfs_tid: usize, child: usize) -> Result<(), u64> {
+    simple_call(vfs_tid, TAG_GIVE_CWD, [child as u64, 0, 0, 0, 0, 0]).map(|_| ())
+}
+
+fn simple_call(vfs_tid: usize, tag: u64, data: [u64; 6]) -> Result<Message, u64> {
+    let msg = Message { sender: 0, tag, data };
+    let mut reply = Message::empty();
+    if syscall::sys_call(vfs_tid, &msg, &mut reply).is_err() {
+        return Err(ERR_IO);
+    }
+    if reply.tag == TAG_ERROR {
+        return Err(reply.data[0]);
+    }
+    Ok(reply)
 }
 
 /// What `path` is, without following a symbolic link at its end.

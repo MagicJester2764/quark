@@ -135,9 +135,11 @@ static int vfs_call(struct quark_msg *msg, struct quark_msg *reply) {
     return vfs_call_lend(msg, reply, 0, 0, 0);
 }
 
-/* Ask the VFS something about a path, which is lent with the call. */
-static int vfs_path_call(unsigned long tag, const char *path, struct quark_msg *msg,
-                         struct quark_msg *reply) {
+/* Ask the VFS something about a path, which is lent with the call. A
+   relative path starts from `base`: 0 for the program's working directory,
+   or an open directory's handle plus one. */
+static int vfs_path_call(unsigned long tag, unsigned long base, const char *path,
+                         struct quark_msg *msg, struct quark_msg *reply) {
     unsigned long len = length(path);
     if (len == 0) {
         return QUARK_VFS_INVALID_PATH;
@@ -147,17 +149,23 @@ static int vfs_path_call(unsigned long tag, const char *path, struct quark_msg *
     }
     msg->tag = tag;
     msg->data[0] = len;
+    msg->data[5] = base;
     /* Lent for reading only; the cast drops a const the kernel keeps. */
     return vfs_call_lend(msg, reply, (void *)path, len, QUARK_LEND_READ);
 }
 
 int quark_vfs_open(const char *path, unsigned long flags, struct quark_vfs_file *out) {
+    return quark_vfs_open_at(0, path, flags, out);
+}
+
+int quark_vfs_open_at(unsigned long base, const char *path, unsigned long flags,
+                      struct quark_vfs_file *out) {
     struct quark_msg msg;
     struct quark_msg reply;
 
     zero(&msg, sizeof msg);
     msg.data[1] = flags;
-    int err = vfs_path_call(QUARK_VFS_TAG_OPEN, path, &msg, &reply);
+    int err = vfs_path_call(QUARK_VFS_TAG_OPEN, base, path, &msg, &reply);
     if (err) {
         return err;
     }
@@ -172,33 +180,88 @@ int quark_vfs_open(const char *path, unsigned long flags, struct quark_vfs_file 
     return 0;
 }
 
-int quark_vfs_mkdir(const char *path) {
+/* A request that names one path and wants nothing back. */
+static int vfs_path_only(unsigned long tag, unsigned long base, const char *path) {
     struct quark_msg msg;
     struct quark_msg reply;
 
     zero(&msg, sizeof msg);
-    return vfs_path_call(QUARK_VFS_TAG_MKDIR, path, &msg, &reply);
+    return vfs_path_call(tag, base, path, &msg, &reply);
+}
+
+int quark_vfs_mkdir(const char *path) {
+    return vfs_path_only(QUARK_VFS_TAG_MKDIR, 0, path);
+}
+
+int quark_vfs_mkdir_at(unsigned long base, const char *path) {
+    return vfs_path_only(QUARK_VFS_TAG_MKDIR, base, path);
 }
 
 int quark_vfs_unlink(const char *path) {
-    struct quark_msg msg;
-    struct quark_msg reply;
+    return vfs_path_only(QUARK_VFS_TAG_UNLINK, 0, path);
+}
 
-    zero(&msg, sizeof msg);
-    return vfs_path_call(QUARK_VFS_TAG_UNLINK, path, &msg, &reply);
+int quark_vfs_unlink_at(unsigned long base, const char *path) {
+    return vfs_path_only(QUARK_VFS_TAG_UNLINK, base, path);
 }
 
 int quark_vfs_rmdir(const char *path) {
+    return vfs_path_only(QUARK_VFS_TAG_RMDIR, 0, path);
+}
+
+int quark_vfs_rmdir_at(unsigned long base, const char *path) {
+    return vfs_path_only(QUARK_VFS_TAG_RMDIR, base, path);
+}
+
+int quark_vfs_chdir(const char *path) {
+    return vfs_path_only(QUARK_VFS_TAG_CHDIR, 0, path);
+}
+
+int quark_vfs_fchdir(unsigned long handle) {
     struct quark_msg msg;
     struct quark_msg reply;
 
     zero(&msg, sizeof msg);
-    return vfs_path_call(QUARK_VFS_TAG_RMDIR, path, &msg, &reply);
+    msg.tag = QUARK_VFS_TAG_FCHDIR;
+    msg.data[0] = handle;
+    return vfs_call(&msg, &reply);
+}
+
+long quark_vfs_getcwd(char *out, unsigned long len) {
+    struct quark_msg msg;
+    struct quark_msg reply;
+    char path[QUARK_VFS_MAX_PATH + 1];
+
+    zero(&msg, sizeof msg);
+    msg.tag = QUARK_VFS_TAG_GETCWD;
+    int err = vfs_call_lend(&msg, &reply, path, sizeof path, QUARK_LEND_WRITE);
+    if (err) {
+        return -err;
+    }
+    unsigned long n = reply.data[0];
+    if (n > sizeof path) {
+        return -QUARK_VFS_IO;
+    }
+    if (n > len) {
+        return -QUARK_VFS_NAME_TOO_LONG;
+    }
+    copy(out, path, n);
+    return (long)n;
+}
+
+int quark_vfs_give_cwd(unsigned long child) {
+    struct quark_msg msg;
+    struct quark_msg reply;
+
+    zero(&msg, sizeof msg);
+    msg.tag = QUARK_VFS_TAG_GIVE_CWD;
+    msg.data[0] = child;
+    return vfs_call(&msg, &reply);
 }
 
 /* A request naming two paths, lent in one buffer, one after the other. */
-static int vfs_two_paths(unsigned long tag, const char *from, const char *to,
-                         unsigned long extra) {
+static int vfs_two_paths(unsigned long tag, unsigned long from_base, const char *from,
+                         unsigned long to_base, const char *to, unsigned long extra) {
     struct quark_msg msg;
     struct quark_msg reply;
     char both[2 * QUARK_VFS_MAX_PATH];
@@ -218,22 +281,43 @@ static int vfs_two_paths(unsigned long tag, const char *from, const char *to,
     msg.data[0] = a;
     msg.data[1] = b;
     msg.data[2] = extra;
+    msg.data[4] = to_base;
+    msg.data[5] = from_base;
     return vfs_call_lend(&msg, &reply, both, a + b, QUARK_LEND_READ);
 }
 
 int quark_vfs_rename(const char *from, const char *to) {
-    return vfs_two_paths(QUARK_VFS_TAG_RENAME, from, to, 0);
+    return vfs_two_paths(QUARK_VFS_TAG_RENAME, 0, from, 0, to, 0);
+}
+
+int quark_vfs_rename_at(unsigned long from_base, const char *from, unsigned long to_base,
+                        const char *to) {
+    return vfs_two_paths(QUARK_VFS_TAG_RENAME, from_base, from, to_base, to, 0);
 }
 
 int quark_vfs_link(const char *from, const char *to, int follow) {
-    return vfs_two_paths(QUARK_VFS_TAG_LINK, from, to, follow ? 1 : 0);
+    return vfs_two_paths(QUARK_VFS_TAG_LINK, 0, from, 0, to, follow ? 1 : 0);
+}
+
+int quark_vfs_link_at(unsigned long from_base, const char *from, unsigned long to_base,
+                      const char *to, int follow) {
+    return vfs_two_paths(QUARK_VFS_TAG_LINK, from_base, from, to_base, to, follow ? 1 : 0);
 }
 
 int quark_vfs_symlink(const char *target, const char *path) {
-    return vfs_two_paths(QUARK_VFS_TAG_SYMLINK, target, path, 0);
+    return vfs_two_paths(QUARK_VFS_TAG_SYMLINK, 0, target, 0, path, 0);
+}
+
+/* The link's path is the one looked up, and `base` is where it starts. */
+int quark_vfs_symlink_at(const char *target, unsigned long base, const char *path) {
+    return vfs_two_paths(QUARK_VFS_TAG_SYMLINK, base, target, 0, path, 0);
 }
 
 long quark_vfs_readlink(const char *path, char *out, unsigned long len) {
+    return quark_vfs_readlink_at(0, path, out, len);
+}
+
+long quark_vfs_readlink_at(unsigned long base, const char *path, char *out, unsigned long len) {
     struct quark_msg msg;
     struct quark_msg reply;
     /* The path, then the room for the answer, lent as one buffer. */
@@ -252,6 +336,7 @@ long quark_vfs_readlink(const char *path, char *out, unsigned long len) {
     msg.tag = QUARK_VFS_TAG_READLINK;
     msg.data[0] = a;
     msg.data[1] = room;
+    msg.data[5] = base;
     int err = vfs_call_lend(&msg, &reply, both, a + room, QUARK_LEND_READ | QUARK_LEND_WRITE);
     if (err) {
         return -err;

@@ -53,7 +53,7 @@
 use quark_rt::ipc::{Message, TAG_TASK_DIED, TID_ANY};
 use quark_rt::spawn::{self, Scratch};
 use quark_rt::wm as proto;
-use quark_rt::{args, nameserver, println, syscall};
+use quark_rt::{args, nameserver, println, syscall, vfs};
 
 // Running a session means creating tasks, which is all this asks for. The back
 // buffer and every program it loads are ordinary memory, which takes no
@@ -1338,6 +1338,9 @@ fn start_session(name: &[u8], index: usize) -> Option<usize> {
         let _ = syscall::sys_cap_grant(info.tid, slot, slot);
         let _ = syscall::sys_cap_delete(slot);
     }
+
+    // A client starts where the compositor was started.
+    let _ = vfs::give_cwd(vfs_tid, info.tid);
 
     // Where a client's diagnostics go. Not stdin: a session program takes its
     // keys from this compositor, and a read on the input server would only

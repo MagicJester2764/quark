@@ -90,6 +90,10 @@ pub struct Task {
     /// The band this task was given, and the one it returns to.
     pub base_priority: u8,
     pub cr3: usize,
+    /// The program this task belongs to: its address space's id, set when the
+    /// task is made to run there (or made for it), and never changed. 0 for a
+    /// kernel task and for one not yet given an address space.
+    pub space: u64,
     pub caps: u32,
     /// Object capability space (16 slots).
     pub cspace: CSpace,
@@ -181,6 +185,7 @@ impl Task {
             priority: crate::scheduler::PRIO_NORMAL,
             base_priority: crate::scheduler::PRIO_NORMAL,
             cr3: crate::paging::read_cr3(),
+            space: 0,
             caps: 0,
             cspace: cap::empty_cspace(),
             fds: [FdKind::empty(); MAX_FDS],

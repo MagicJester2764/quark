@@ -214,6 +214,61 @@ pub fn resolve(
     }
 }
 
+/// Where [`path_of`] leaves its answer.
+static mut PATH_OUT: [u8; MAX_PATH + 1] = [0; MAX_PATH + 1];
+
+/// The absolute path of directory `ino`, walked up through each `..` to the
+/// root. A directory that has lost its name is `ERR_NOT_FOUND`: it is nowhere.
+pub fn path_of(ext2: &Ext2State, ino: u32) -> Result<&'static [u8], u64> {
+    let out = unsafe { &mut *core::ptr::addr_of_mut!(PATH_OUT) };
+    if ino == EXT2_ROOT_INO {
+        out[0] = b'/';
+        return Ok(&out[..1]);
+    }
+    // Built from the end backwards: each parent's name goes in front.
+    let mut start = out.len();
+    let mut cur = ino;
+    for _ in 0..MAX_PATH / 2 {
+        if cur == EXT2_ROOT_INO {
+            if start == out.len() {
+                start -= 1;
+                out[start] = b'/';
+            }
+            return Ok(&out[start..]);
+        }
+        let dir = read_inode(ext2, cur)?;
+        if dir.i_links_count == 0 || !dir.is_dir() {
+            return Err(ERR_NOT_FOUND);
+        }
+        let (parent_ino, _) = find_entry(ext2, &dir, b"..")?.ok_or(ERR_NOT_FOUND)?;
+        let parent = read_inode(ext2, parent_ino)?;
+        let mut found = false;
+        let mut name = [0u8; MAX_NAME];
+        let mut name_len = 0;
+        for_each_entry(ext2, &parent, |_, entry, _, n| {
+            if entry == cur && n != b"." && n != b".." {
+                name[..n.len()].copy_from_slice(n);
+                name_len = n.len();
+                found = true;
+                return false;
+            }
+            true
+        })?;
+        if !found {
+            return Err(ERR_NOT_FOUND);
+        }
+        if name_len + 1 > start {
+            return Err(ERR_NAME_TOO_LONG);
+        }
+        start -= name_len;
+        out[start..start + name_len].copy_from_slice(&name[..name_len]);
+        start -= 1;
+        out[start] = b'/';
+        cur = parent_ino;
+    }
+    Err(ERR_NAME_TOO_LONG)
+}
+
 /// [`resolve`] for a caller that wants an inode: a device is not one it may
 /// change.
 pub fn resolve_inode(

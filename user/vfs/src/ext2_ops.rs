@@ -30,7 +30,8 @@ pub fn split_path(path: &[u8]) -> Result<(&[u8], &[u8]), u64> {
     let (parent, name) = match path.iter().rposition(|&b| b == b'/') {
         Some(0) => (&path[..1], &path[1..]),
         Some(pos) => (&path[..pos], &path[pos + 1..]),
-        None => (&b"/"[..], path),
+        // A bare name is in the directory the request starts from.
+        None => (&b"."[..], path),
     };
     if name.is_empty() || name == b"." || name == b".." {
         return Err(ERR_INVALID_PATH);
@@ -45,13 +46,14 @@ pub fn split_path(path: &[u8]) -> Result<(&[u8], &[u8]), u64> {
 /// inode. The name must be free.
 pub fn create(
     e2: &mut Ext2State,
+    base: u32,
     path: &[u8],
     uid: u32,
     gid: u32,
     is_dir: bool,
 ) -> Result<(u32, Ext2Inode), u64> {
     let (parent_path, name) = split_path(path)?;
-    let (parent_ino, mut parent) = writable_dir(e2, parent_path, uid, gid)?;
+    let (parent_ino, mut parent) = writable_dir(e2, base, parent_path, uid, gid)?;
     if ext2_dir::find_entry(e2, &parent, name)?.is_some() {
         return Err(ERR_EXISTS);
     }
@@ -106,8 +108,14 @@ pub fn create(
 /// A directory the caller may change: it exists, is a directory, and the
 /// caller may write and search it. `/dev` is never one: its names are the
 /// server's devices, and a name made there on the disk would be hidden.
-fn writable_dir(e2: &Ext2State, path: &[u8], uid: u32, gid: u32) -> Result<(u32, Ext2Inode), u64> {
-    let (ino, dir, _) = ext2_dir::resolve_inode(e2, ext2::EXT2_ROOT_INO, path, uid, gid, true)?;
+fn writable_dir(
+    e2: &Ext2State,
+    base: u32,
+    path: &[u8],
+    uid: u32,
+    gid: u32,
+) -> Result<(u32, Ext2Inode), u64> {
+    let (ino, dir, _) = ext2_dir::resolve_inode(e2, base, path, uid, gid, true)?;
     if !dir.is_dir() {
         return Err(ERR_NOT_DIR);
     }
@@ -119,9 +127,9 @@ fn writable_dir(e2: &Ext2State, path: &[u8], uid: u32, gid: u32) -> Result<(u32,
 
 /// Remove `path`'s name. The file goes with its last name, unless a handle
 /// still names it.
-pub fn unlink(e2: &mut Ext2State, path: &[u8], uid: u32, gid: u32) -> Result<(), u64> {
+pub fn unlink(e2: &mut Ext2State, base: u32, path: &[u8], uid: u32, gid: u32) -> Result<(), u64> {
     let (parent_path, name) = split_path(path)?;
-    let (parent_ino, mut parent) = writable_dir(e2, parent_path, uid, gid)?;
+    let (parent_ino, mut parent) = writable_dir(e2, base, parent_path, uid, gid)?;
     let (ino, _) = ext2_dir::find_entry(e2, &parent, name)?.ok_or(ERR_NOT_FOUND)?;
     let mut inode = ext2::read_inode(e2, ino)?;
     if inode.is_dir() {
@@ -136,9 +144,9 @@ pub fn unlink(e2: &mut Ext2State, path: &[u8], uid: u32, gid: u32) -> Result<(),
 }
 
 /// Remove the empty directory `path`.
-pub fn rmdir(e2: &mut Ext2State, path: &[u8], uid: u32, gid: u32) -> Result<(), u64> {
+pub fn rmdir(e2: &mut Ext2State, base: u32, path: &[u8], uid: u32, gid: u32) -> Result<(), u64> {
     let (parent_path, name) = split_path(path)?;
-    let (parent_ino, mut parent) = writable_dir(e2, parent_path, uid, gid)?;
+    let (parent_ino, mut parent) = writable_dir(e2, base, parent_path, uid, gid)?;
     let (ino, _) = ext2_dir::find_entry(e2, &parent, name)?.ok_or(ERR_NOT_FOUND)?;
     let mut dir = ext2::read_inode(e2, ino)?;
     if !dir.is_dir() {
@@ -158,11 +166,19 @@ pub fn rmdir(e2: &mut Ext2State, path: &[u8], uid: u32, gid: u32) -> Result<(), 
 }
 
 /// Give the file at `from` the name `to`, replacing what had it.
-pub fn rename(e2: &mut Ext2State, from: &[u8], to: &[u8], uid: u32, gid: u32) -> Result<(), u64> {
+pub fn rename(
+    e2: &mut Ext2State,
+    from_base: u32,
+    from: &[u8],
+    to_base: u32,
+    to: &[u8],
+    uid: u32,
+    gid: u32,
+) -> Result<(), u64> {
     let (from_parent, from_name) = split_path(from)?;
     let (to_parent, to_name) = split_path(to)?;
-    let (fpi, fparent) = writable_dir(e2, from_parent, uid, gid)?;
-    let (tpi, tparent) = writable_dir(e2, to_parent, uid, gid)?;
+    let (fpi, fparent) = writable_dir(e2, from_base, from_parent, uid, gid)?;
+    let (tpi, tparent) = writable_dir(e2, to_base, to_parent, uid, gid)?;
     let (ino, kind) = ext2_dir::find_entry(e2, &fparent, from_name)?.ok_or(ERR_NOT_FOUND)?;
     let mut inode = ext2::read_inode(e2, ino)?;
     let is_dir = inode.is_dir();
@@ -233,14 +249,15 @@ pub fn rename(e2: &mut Ext2State, from: &[u8], to: &[u8], uid: u32, gid: u32) ->
 /// directory must be one the caller may change, as for `create`.
 pub fn link(
     e2: &mut Ext2State,
+    from_base: u32,
     from: &[u8],
+    to_base: u32,
     to: &[u8],
     uid: u32,
     gid: u32,
     follow: bool,
 ) -> Result<(), u64> {
-    let (ino, mut inode, _) =
-        ext2_dir::resolve_inode(e2, ext2::EXT2_ROOT_INO, from, uid, gid, follow)?;
+    let (ino, mut inode, _) = ext2_dir::resolve_inode(e2, from_base, from, uid, gid, follow)?;
     if inode.is_dir() {
         return Err(ERR_IS_DIR);
     }
@@ -250,7 +267,7 @@ pub fn link(
         return Err(ERR_TOO_MANY_LINKS);
     }
     let (to_parent, to_name) = split_path(to)?;
-    let (tpi, mut tp) = writable_dir(e2, to_parent, uid, gid)?;
+    let (tpi, mut tp) = writable_dir(e2, to_base, to_parent, uid, gid)?;
     if ext2_dir::find_entry(e2, &tp, to_name)?.is_some() {
         return Err(ERR_EXISTS);
     }
@@ -317,7 +334,14 @@ pub fn read_link(e2: &Ext2State, inode: &Ext2Inode) -> Result<usize, u64> {
 /// A target shorter than 60 bytes is kept in the inode (a fast link, with no
 /// extent root even on ext4); a longer one takes a block, written the way a
 /// file's data is, and must leave room in it for a NUL.
-pub fn symlink(e2: &mut Ext2State, target: &[u8], path: &[u8], uid: u32, gid: u32) -> Result<(), u64> {
+pub fn symlink(
+    e2: &mut Ext2State,
+    target: &[u8],
+    base: u32,
+    path: &[u8],
+    uid: u32,
+    gid: u32,
+) -> Result<(), u64> {
     if target.is_empty() {
         return Err(ERR_NOT_FOUND);
     }
@@ -325,7 +349,7 @@ pub fn symlink(e2: &mut Ext2State, target: &[u8], path: &[u8], uid: u32, gid: u3
         return Err(ERR_NAME_TOO_LONG);
     }
     let (parent_path, name) = split_path(path)?;
-    let (parent_ino, mut parent) = writable_dir(e2, parent_path, uid, gid)?;
+    let (parent_ino, mut parent) = writable_dir(e2, base, parent_path, uid, gid)?;
     if ext2_dir::find_entry(e2, &parent, name)?.is_some() {
         return Err(ERR_EXISTS);
     }

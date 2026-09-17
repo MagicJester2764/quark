@@ -85,6 +85,7 @@ pub fn init() {
             priority: PRIO_IDLE,
             base_priority: PRIO_IDLE,
             cr3: crate::paging::read_cr3(),
+            space: 0,
             caps: crate::task::CAP_ALL,
             // Mirror the bitmask into real capabilities: with the UID 0 bypass
             // gone, TID 0's authority has to come from its CSpace like anyone
@@ -830,9 +831,7 @@ pub fn space_of_task(tid: usize) -> u64 {
     let flags = irq_save();
     let space = unsafe {
         match TASKS[tid] {
-            Some(ref t) if t.state != TaskState::Dead && t.cr3 != crate::paging::kernel_cr3() => {
-                crate::userspace::space_of(t.cr3)
-            }
+            Some(ref t) if t.state != TaskState::Dead => t.space,
             _ => 0,
         }
     };
@@ -840,12 +839,33 @@ pub fn space_of_task(tid: usize) -> u64 {
     space
 }
 
+/// Make a task for the program in `cr3`, to be started there later. It
+/// belongs to that program from now on, so a spawner can tell servers about
+/// it before it runs.
+pub fn create_task_in(cr3: usize) -> Option<usize> {
+    let space = crate::userspace::space_of(cr3);
+    if space == 0 {
+        return None;
+    }
+    let tid = create_empty_task()?;
+    let flags = irq_save();
+    unsafe {
+        if let Some(t) = TASKS[tid].as_mut() {
+            t.space = space;
+        }
+    }
+    irq_restore(flags);
+    Some(tid)
+}
+
 /// Whether any task that has not died is running in address space `cr3`.
 ///
 /// # Safety
 /// Interrupts must be off.
-unsafe fn space_has_live_task(cr3: usize) -> bool { unsafe {
-    (*core::ptr::addr_of!(TASKS)).iter().any(|t| matches!(t, Some(t) if t.cr3 == cr3 && t.state != TaskState::Dead))
+unsafe fn space_has_live_task(space: u64) -> bool { unsafe {
+    (*core::ptr::addr_of!(TASKS))
+        .iter()
+        .any(|t| matches!(t, Some(t) if t.space == space && t.state != TaskState::Dead))
 }}
 
 /// Tell whoever watches `tid` that it has died, and whoever watches its
@@ -858,12 +878,8 @@ unsafe fn space_has_live_task(cr3: usize) -> bool { unsafe {
 unsafe fn note_death(tid: usize) { unsafe {
     crate::ipc::notify_watchers(tid);
     let Some(ref t) = TASKS[tid] else { return };
-    let cr3 = t.cr3;
-    if cr3 == 0 || cr3 == crate::paging::kernel_cr3() {
-        return;
-    }
-    let space = crate::userspace::space_of(cr3);
-    if space != 0 && !space_has_live_task(cr3) {
+    let space = t.space;
+    if space != 0 && !space_has_live_task(space) {
         crate::ipc::notify_space_watchers(space);
     }
 }}
@@ -874,13 +890,7 @@ pub fn space_is_live(space: u64) -> bool {
         return false;
     }
     let flags = irq_save();
-    let live = unsafe {
-        (*core::ptr::addr_of!(TASKS)).iter().any(|t| {
-            matches!(t, Some(t) if t.state != TaskState::Dead
-                && t.cr3 != crate::paging::kernel_cr3()
-                && crate::userspace::space_of(t.cr3) == space)
-        })
-    };
+    let live = unsafe { space_has_live_task(space) };
     irq_restore(flags);
     live
 }
@@ -1203,6 +1213,7 @@ pub fn create_empty_task() -> Option<usize> {
             priority: crate::scheduler::PRIO_NORMAL,
             base_priority: crate::scheduler::PRIO_NORMAL,
             cr3: 0,
+            space: 0,
             caps: 0,
             cspace: crate::cap::empty_cspace(),
             fds: [crate::task::FdKind::empty(); crate::task::MAX_FDS],
@@ -1300,6 +1311,14 @@ pub fn start_task(tid: usize, rip: u64, rsp: u64, cr3: usize, arg: u64) -> Resul
         if task.state != TaskState::Blocked {
             return Err(());
         }
+
+        // A task made for one program cannot be started in another: servers
+        // may already hold things for it under that program's name.
+        let space = crate::userspace::space_of(cr3);
+        if task.space != 0 && task.space != space {
+            return Err(());
+        }
+        task.space = space;
 
         // Another task is now running here. Threads share an address space, so
         // this is what stops the first one to exit destroying it.

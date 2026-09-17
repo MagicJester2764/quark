@@ -49,6 +49,10 @@ fn main() {
     let mut map = std::collections::HashMap::new();
     map.insert("quark", 1);
     println!("HashMap: {:?}", map.get("quark"));
+    match std::env::current_dir() {
+        Ok(dir) => println!("current dir: {}", dir.display()),
+        Err(e) => println!("current dir: {e}"),
+    }
 
     let handle = std::thread::spawn(|| 40u64 + 2);
     match handle.join() {

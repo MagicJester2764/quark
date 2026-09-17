@@ -160,6 +160,8 @@ pub const SYS_SET_CLEAR_TID: u64 = 106;
 pub const SYS_TASK_SPACE: u64 = 107;
 /// Be told when a program's last task has died.
 pub const SYS_SPACE_WATCH: u64 = 108;
+/// Make a task for an address space the caller created, to start later.
+pub const SYS_TASK_CREATE_IN: u64 = 109;
 
 /// Be told when a task dies, so that whatever it was lent can be taken back.
 /// Takes no capability: SYS_TASK_INFO already answers the same question by
@@ -215,7 +217,7 @@ pub const SYS_ABI_VERSION: u64 = 240;
 /// minor when calls are added. User space can refuse to run against a major it
 /// does not know, which is the point of exposing it at all.
 pub const ABI_VERSION_MAJOR: u64 = 2;
-pub const ABI_VERSION_MINOR: u64 = 3;
+pub const ABI_VERSION_MINOR: u64 = 4;
 
 /// Threads a task may make with no capability at all.
 ///
@@ -969,6 +971,22 @@ extern "C" fn syscall_dispatch(
                 return u64::MAX;
             }
             match scheduler::create_empty_task() {
+                Some(tid) => tid as u64,
+                None => u64::MAX,
+            }
+        }
+        SYS_TASK_CREATE_IN => {
+            // arg0 = an address space the caller made. The task belongs to
+            // that program before it runs, which is what lets a spawner give
+            // it things — a working directory — that servers keep per program.
+            let caller = scheduler::current_tid();
+            let cr3 = arg0 as usize;
+            if !crate::cap::task_has_task_mgmt(caller, 0)
+                || !crate::userspace::is_owned_address_space(caller, cr3)
+            {
+                return u64::MAX;
+            }
+            match scheduler::create_task_in(cr3) {
                 Some(tid) => tid as u64,
                 None => u64::MAX,
             }

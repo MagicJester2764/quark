@@ -29,6 +29,10 @@
 #define QUARK_VFS_TAG_LINK    15
 #define QUARK_VFS_TAG_SYMLINK 16
 #define QUARK_VFS_TAG_READLINK 17
+#define QUARK_VFS_TAG_CHDIR   18
+#define QUARK_VFS_TAG_FCHDIR  19
+#define QUARK_VFS_TAG_GETCWD  20
+#define QUARK_VFS_TAG_GIVE_CWD 21
 
 /* A directory record, as QUARK_VFS_TAG_READDIR fills a buffer with them:
    `id`, `next` and `size` (8 bytes each), `reclen` (2), `type` (1) and
@@ -124,6 +128,30 @@ int quark_vfs_symlink(const char *target, const char *path);
    answer is the target's whole length, or a negated error. */
 long quark_vfs_readlink(const char *path, char *out, unsigned long len);
 int quark_vfs_truncate(unsigned long handle, unsigned long size);
+
+/* The same, with a relative path starting from `base`: 0 is the program's
+   working directory, and an open directory's handle plus one is that
+   directory. The plain names above pass 0. */
+int quark_vfs_open_at(unsigned long base, const char *path, unsigned long flags,
+                      struct quark_vfs_file *out);
+int quark_vfs_mkdir_at(unsigned long base, const char *path);
+int quark_vfs_unlink_at(unsigned long base, const char *path);
+int quark_vfs_rmdir_at(unsigned long base, const char *path);
+int quark_vfs_rename_at(unsigned long from_base, const char *from, unsigned long to_base,
+                        const char *to);
+int quark_vfs_link_at(unsigned long from_base, const char *from, unsigned long to_base,
+                      const char *to, int follow);
+int quark_vfs_symlink_at(const char *target, unsigned long base, const char *path);
+long quark_vfs_readlink_at(unsigned long base, const char *path, char *out, unsigned long len);
+
+/* The program's working directory. getcwd writes the path, with no NUL, and
+   returns its length or a negated error: NOT_FOUND once the directory has
+   been removed, NAME_TOO_LONG when `len` cannot hold it. give_cwd starts a
+   program this one is making, before it runs, in this one's directory. */
+int quark_vfs_chdir(const char *path);
+int quark_vfs_fchdir(unsigned long handle);
+long quark_vfs_getcwd(char *out, unsigned long len);
+int quark_vfs_give_cwd(unsigned long child);
 
 /* Fill `buf` (at most a page) with the records of a directory from entry
    `start`. `*next` is where the next call should start, `*end` says there is

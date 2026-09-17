@@ -13,7 +13,8 @@
 //! does that under a name. `lookup NAME` calls whatever has that name and exits
 //! with the answer. `hold N` opens a file N times and exits without closing
 //! any of them, saying how many it got. `echo` answers every call with its
-//! tag plus one, until a call whose tag is 0.
+//! tag plus one, until a call whose tag is 0. `cwd` exits 0 if the relative
+//! name `passwd` opens: whoever started it gave it `/etc` as its directory.
 
 use quark_rt::ipc::{Message, TID_ANY};
 use quark_rt::manifest::CapReq;
@@ -59,6 +60,13 @@ pub extern "C" fn _start() -> ! {
             syscall::sleep_ticks(1);
         }
         syscall::sys_exit_code(t.tid() as i32);
+    }
+
+    if quark_rt::args::argv(1) == Some(&b"cwd"[..]) {
+        let found = nameserver::lookup_retry(b"vfs", 20).is_some_and(|vfs| {
+            vfs::open(vfs, b"passwd").map(|(h, _, _)| vfs::close(vfs, h)).is_ok()
+        });
+        syscall::sys_exit_code(if found { 0 } else { 1 });
     }
 
     // Answer one call, whoever makes it, with 42: something for the parent to

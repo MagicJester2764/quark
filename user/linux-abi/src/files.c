@@ -127,9 +127,39 @@ static long free_fd(long lowest) {
     return -1;
 }
 
+/* Where a relative path given with `dirfd` starts, said the way the server
+   wants it: 0 for the working directory, a directory's handle plus one. An
+   absolute path ignores the descriptor, as Linux does. */
+static long base_for(long dirfd, const char *path, unsigned long *base) {
+    *base = 0;
+    if (dirfd == LX_AT_FDCWD || (path && path[0] == '/')) {
+        return 0;
+    }
+    struct openfile *f = slot(dirfd);
+    if (!f) {
+        /* 0, 1 and 2, and the kernel's descriptors, are real but no
+           directory; anything else is no descriptor at all. */
+        return (dirfd >= 0 && dirfd < FIRST_FD) ? -LX_ENOTDIR : -LX_EBADF;
+    }
+    if (!f->is_dir) {
+        return -LX_ENOTDIR;
+    }
+    *base = f->handle + 1;
+    return 0;
+}
+
 long __quark_open(const char *path, long flags) {
+    return __quark_openat(LX_AT_FDCWD, path, flags);
+}
+
+long __quark_openat(long dirfd, const char *path, long flags) {
     if (!path || !*path) {
         return -LX_ENOENT;
+    }
+    unsigned long base;
+    long bad = base_for(dirfd, path, &base);
+    if (bad) {
+        return bad;
     }
     /* Every open file has a descriptor, so a free descriptor means a free
        entry too; both are looked for anyway. */
@@ -162,7 +192,7 @@ long __quark_open(const char *path, long flags) {
         how |= QUARK_VFS_OPEN_NOFOLLOW;
     }
     struct quark_vfs_file info;
-    int err = quark_vfs_open(path, how, &info);
+    int err = quark_vfs_open_at(base, path, how, &info);
     if (err) {
         return vfs_errno(err);
     }
@@ -498,9 +528,17 @@ long __quark_fstat(long fd, void *statbuf) {
     return 0;
 }
 
-long __quark_stat(const char *path, void *statbuf, int follow) {
+long __quark_stat(long dirfd, const char *path, void *statbuf, int follow) {
+    if (!path || !*path) {
+        return -LX_ENOENT;
+    }
+    unsigned long base;
+    long bad = base_for(dirfd, path, &base);
+    if (bad) {
+        return bad;
+    }
     struct quark_vfs_file info;
-    int err = quark_vfs_open(path, follow ? 0 : QUARK_VFS_OPEN_NOFOLLOW, &info);
+    int err = quark_vfs_open_at(base, path, follow ? 0 : QUARK_VFS_OPEN_NOFOLLOW, &info);
     if (err) {
         return vfs_errno(err);
     }
@@ -590,25 +628,35 @@ long __quark_getdents(long fd, void *buf, unsigned long count) {
 }
 
 /* readlink: at most `size` bytes of the target, and no NUL. */
-long __quark_readlink(const char *path, char *buf, unsigned long size) {
+long __quark_readlink(long dirfd, const char *path, char *buf, unsigned long size) {
     if ((long)size <= 0) {
         return -LX_EINVAL;
     }
     if (!path || !*path) {
         return -LX_ENOENT;
     }
-    long len = quark_vfs_readlink(path, buf, size);
+    unsigned long base;
+    long bad = base_for(dirfd, path, &base);
+    if (bad) {
+        return bad;
+    }
+    long len = quark_vfs_readlink_at(base, path, buf, size);
     if (len < 0) {
         return vfs_errno((int)-len);
     }
     return (unsigned long)len < size ? len : (long)size;
 }
 
-long __quark_symlink(const char *target, const char *path) {
+long __quark_symlink(const char *target, long dirfd, const char *path) {
     if (!target || !*target || !path || !*path) {
         return -LX_ENOENT;
     }
-    int err = quark_vfs_symlink(target, path);
+    unsigned long base;
+    long bad = base_for(dirfd, path, &base);
+    if (bad) {
+        return bad;
+    }
+    int err = quark_vfs_symlink_at(target, base, path);
     /* FAT32 has no links: Linux says EPERM for a filesystem without them. */
     if (err == QUARK_VFS_NOT_SUPPORTED) {
         return -LX_EPERM;
@@ -655,28 +703,100 @@ long __quark_fstatfs(long fd, void *buf) {
     return fill_statfs(buf);
 }
 
-long __quark_mkdir(const char *path) {
-    int err = quark_vfs_mkdir(path);
+static int chdir_at(unsigned long base, const char *path) {
+    (void)base; /* always the working directory's own: chdir has no dirfd */
+    return quark_vfs_chdir(path);
+}
+
+/* A path request that answers only yes or no. */
+static long path_request(long dirfd, const char *path,
+                         int (*request)(unsigned long, const char *)) {
+    if (!path || !*path) {
+        return -LX_ENOENT;
+    }
+    unsigned long base;
+    long bad = base_for(dirfd, path, &base);
+    if (bad) {
+        return bad;
+    }
+    int err = request(base, path);
     return err ? vfs_errno(err) : 0;
 }
 
-long __quark_unlink(const char *path) {
-    int err = quark_vfs_unlink(path);
+long __quark_mkdir(long dirfd, const char *path) {
+    return path_request(dirfd, path, quark_vfs_mkdir_at);
+}
+
+long __quark_unlink(long dirfd, const char *path) {
+    return path_request(dirfd, path, quark_vfs_unlink_at);
+}
+
+long __quark_rmdir(long dirfd, const char *path) {
+    return path_request(dirfd, path, quark_vfs_rmdir_at);
+}
+
+long __quark_rename(long fromfd, const char *from, long tofd, const char *to) {
+    if (!from || !*from || !to || !*to) {
+        return -LX_ENOENT;
+    }
+    unsigned long fbase, tbase;
+    long bad = base_for(fromfd, from, &fbase);
+    if (!bad) {
+        bad = base_for(tofd, to, &tbase);
+    }
+    if (bad) {
+        return bad;
+    }
+    int err = quark_vfs_rename_at(fbase, from, tbase, to);
     return err ? vfs_errno(err) : 0;
 }
 
-long __quark_rmdir(const char *path) {
-    int err = quark_vfs_rmdir(path);
+long __quark_chdir(const char *path) {
+    return path_request(LX_AT_FDCWD, path, chdir_at);
+}
+
+long __quark_fchdir(long fd) {
+    struct openfile *f = slot(fd);
+    if (!f) {
+        return (fd >= 0 && fd < FIRST_FD) ? -LX_ENOTDIR : -LX_EBADF;
+    }
+    if (!f->is_dir) {
+        return -LX_ENOTDIR;
+    }
+    int err = quark_vfs_fchdir(f->handle);
     return err ? vfs_errno(err) : 0;
 }
 
-long __quark_rename(const char *from, const char *to) {
-    int err = quark_vfs_rename(from, to);
-    return err ? vfs_errno(err) : 0;
+/* getcwd(2) returns the length with the NUL, and ERANGE when that does not
+   fit; a directory that has been removed is ENOENT, as on Linux. */
+long __quark_getcwd(char *buf, unsigned long size) {
+    if (!buf || size == 0) {
+        return -LX_ERANGE;
+    }
+    long n = quark_vfs_getcwd(buf, size - 1);
+    if (n == -QUARK_VFS_NAME_TOO_LONG) {
+        return -LX_ERANGE;
+    }
+    if (n < 0) {
+        return vfs_errno((int)-n);
+    }
+    buf[n] = 0;
+    return n + 1;
 }
 
-long __quark_link(const char *from, const char *to, int follow) {
-    int err = quark_vfs_link(from, to, follow);
+long __quark_link(long fromfd, const char *from, long tofd, const char *to, int follow) {
+    if (!from || !*from || !to || !*to) {
+        return -LX_ENOENT;
+    }
+    unsigned long fbase, tbase;
+    long bad = base_for(fromfd, from, &fbase);
+    if (!bad) {
+        bad = base_for(tofd, to, &tbase);
+    }
+    if (bad) {
+        return bad;
+    }
+    int err = quark_vfs_link_at(fbase, from, tbase, to, follow);
     /* A directory, and a filesystem with no hard links, are both EPERM on
        Linux, and EPERM is what fontconfig's lock knows to fall back from. */
     if (err == QUARK_VFS_IS_DIR || err == QUARK_VFS_NOT_SUPPORTED) {
@@ -732,9 +852,17 @@ long __quark_truncate(const char *path, long length) {
  * The one thing to know is that Quark checks nothing on execute: init and the
  * shell load a program by reading it. So a file the server calls executable is
  * one a program is allowed to try, which is what a caller asks X_OK for. */
-long __quark_access(const char *path, long mode) {
+long __quark_access(long dirfd, const char *path, long mode) {
+    if (!path || !*path) {
+        return -LX_ENOENT;
+    }
+    unsigned long base;
+    long bad = base_for(dirfd, path, &base);
+    if (bad) {
+        return bad;
+    }
     struct quark_vfs_file info;
-    int err = quark_vfs_open(path, 0, &info);
+    int err = quark_vfs_open_at(base, path, 0, &info);
     if (err) {
         return vfs_errno(err);
     }
@@ -837,9 +965,4 @@ long __quark_fcntl(long fd, long cmd, long arg) {
     }
 }
 
-long __quark_openat(long dirfd, const char *path, long flags) {
-    if (dirfd != LX_AT_FDCWD) {
-        return -LX_ENOSYS;
-    }
-    return __quark_open(path, flags);
-}
+

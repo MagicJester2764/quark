@@ -176,6 +176,9 @@ pub extern "C" fn _start() -> ! {
         let _ = syscall::sys_cap_grant(tid, SCRATCH, 3);
         let _ = syscall::sys_cap_delete(SCRATCH);
 
+        // The shell starts where login is, and moves itself home.
+        let _ = vfs::give_cwd(vfs_tid, tid);
+
         // Wire file descriptors
         let _ = syscall::sys_fd_dup(tid, 0, 0); // stdin
         let _ = syscall::sys_fd_dup(tid, 1, 1); // stdout

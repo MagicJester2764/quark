@@ -336,6 +336,7 @@ pub fn spawn_init(elf_data: &[u8], fb: Option<crate::multiboot2::FramebufferInfo
         // so could map the kernel.
         task.priority = scheduler::PRIO_DRIVER;
         task.cr3 = pml4;
+        task.space = space_of(pml4);
         let caps = crate::task::CAP_ALL & !crate::task::CAP_MAP_PHYS;
         task.caps = caps;
         crate::cap::populate_from_bitmask(&mut task.cspace, caps);

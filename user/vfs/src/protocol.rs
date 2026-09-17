@@ -32,6 +32,13 @@ pub const TAG_SYMLINK: u64 = 16;
 /// What a symbolic link says: the path, then room for the answer, in one
 /// buffer lent for reading and writing.
 pub const TAG_READLINK: u64 = 17;
+/// Move the caller's program into a directory, by path or by handle.
+pub const TAG_CHDIR: u64 = 18;
+pub const TAG_FCHDIR: u64 = 19;
+/// Where the caller's program is, as a path.
+pub const TAG_GETCWD: u64 = 20;
+/// Start a program the caller is making in the caller's directory.
+pub const TAG_GIVE_CWD: u64 = 21;
 pub const TAG_OK: u64 = 0;
 pub const TAG_ERROR: u64 = u64::MAX;
 

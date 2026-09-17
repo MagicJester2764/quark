@@ -44,9 +44,15 @@ owners or modes and checks nothing.
 
 A request that names a path lends it for reading, with its length in
 `data[0]`. It is not NUL-terminated and may be up to 4095 bytes; a longer one
-is refused with `NAME_TOO_LONG` rather than shortened. Paths are absolute;
-there is no working directory. A trailing `/` means the path must name a
-directory.
+is refused with `NAME_TOO_LONG` rather than shortened. A trailing `/` means
+the path must name a directory.
+
+A path that does not start with `/` starts from a *base*, which every request
+naming a path carries in `data[5]`: 0 is the calling program's working
+directory, and `h + 1` is the directory open as handle `h`. `RENAME` and
+`LINK` carry their second path's base in `data[4]`. A base that is not an
+open directory of the caller's program is `INVALID_HANDLE` or `NOT_DIR`; an
+absolute path ignores it.
 
 A symbolic link met on the way is followed: its target takes the place of the
 part of the path that named it, from the root if the target starts with `/`
@@ -76,6 +82,10 @@ where the link was.
 | 15 | `LINK` | `[from_len, to_len, follow]` | both paths, end to end | — |
 | 16 | `SYMLINK` | `[target_len, path_len]` | the target, then the path | — |
 | 17 | `READLINK` | `[path_len, room]` | the path, then `room` bytes to fill | `[target_len]` |
+| 18 | `CHDIR` | `[len]` | path | — |
+| 19 | `FCHDIR` | `[handle]` | — | — |
+| 20 | `GETCWD` | — | 4096 bytes to fill | `[len]` |
+| 21 | `GIVE_CWD` | `[child_tid]` | — | — |
 
 Numbers are never reused. 4 was `READDIR`, which returned one entry per call
 and cut its name to 32 bytes. 7 was `CREATE`, which carried its path in the
@@ -197,6 +207,27 @@ yields zero bytes and `end` clear. `.` and `..` are listed where the
 filesystem stores them. A position is only meaningful for the directory it
 came from, and entries made or removed between two calls may be missed or
 seen twice, as with any `readdir`.
+
+### Working directories
+
+Each program has one, kept by the server and named by the program's address
+space like its handles. A program nobody gave a directory is at `/`.
+`CHDIR` moves the caller's program to a directory it may search, following
+links; `FCHDIR` to an open directory handle's. `GETCWD` fills the lent buffer
+with the directory's path and replies with its length; it is `NOT_FOUND` once
+the directory has been removed.
+
+The server holds the directory by inode, as Linux does, so a rename above it
+changes what `GETCWD` says and nothing else, and a directory removed while a
+program is in it lasts until the program leaves or goes. FAT32, which renames
+nothing, keeps the path, and has no directory handles to start from
+(`NOT_SUPPORTED`).
+
+`GIVE_CWD` puts a program being made in the caller's directory. The child
+must be a task the caller's program made (`SYS_TASK_CREATE_IN` lets that be
+before it runs) for another program; anything else is `PERMISSION`. A
+spawner calls it before starting the child, so the child's first relative
+path already starts in the right place.
 
 ### Devices
 

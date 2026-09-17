@@ -12,12 +12,8 @@ pub extern "C" fn _start() -> ! {
         syscall::sys_exit_code(1);
     };
 
-    // Get path from argv[1], default to /
-    let path = if let Some(arg) = args::argv(1) {
-        arg
-    } else {
-        b"/" as &[u8]
-    };
+    // The directory named, or the one this program is in.
+    let path = args::argv(1).unwrap_or(b".");
 
     // Open directory
     let (handle, file_size, is_dir) = match vfs::open(vfs_tid, path) {

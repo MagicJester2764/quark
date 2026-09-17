@@ -105,6 +105,7 @@ pub const SYS_TASK_PRIORITY: u64 = 105;
 pub const SYS_SET_CLEAR_TID: u64 = 106;
 pub const SYS_TASK_SPACE: u64 = 107;
 pub const SYS_SPACE_WATCH: u64 = 108;
+pub const SYS_TASK_CREATE_IN: u64 = 109;
 
 // --- 0x70  hardware and drivers ---
 pub const SYS_IRQ_REGISTER: u64 = 112;
@@ -363,6 +364,13 @@ pub fn sys_task_space(tid: usize) -> Result<u64, ()> {
 
 /// Be sent [`crate::ipc::TAG_SPACE_DIED`] when program `space` has no task
 /// left: sender 0, `data[0]` the space id. `Err` if it has none already.
+/// Make a task for the address space `cr3`, which this task created, to be
+/// started there later. It belongs to that program from the start.
+pub fn sys_task_create_in(cr3: u64) -> Result<usize, ()> {
+    let ret = unsafe { syscall1(SYS_TASK_CREATE_IN, cr3) };
+    if ret == u64::MAX { Err(()) } else { Ok(ret as usize) }
+}
+
 pub fn sys_space_watch(space: u64) -> Result<(), ()> {
     let ret = unsafe { syscall1(SYS_SPACE_WATCH, space) };
     if ret == u64::MAX { Err(()) } else { Ok(()) }

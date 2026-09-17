@@ -182,6 +182,32 @@ pub fn sleep_ms(ms: u64) {
 
 // ---- Arguments ----
 
+// ---- The working directory ----
+
+fn vfs_error(code: u64) -> i32 {
+    match code {
+        crate::vfs::ERR_NOT_FOUND => E_NOT_FOUND,
+        crate::vfs::ERR_PERMISSION => E_PERMISSION,
+        crate::vfs::ERR_NOT_DIR => E_NOT_DIR,
+        crate::vfs::ERR_IS_DIR => E_IS_DIR,
+        crate::vfs::ERR_EXISTS => E_EXISTS,
+        crate::vfs::ERR_INVALID_PATH | crate::vfs::ERR_NAME_TOO_LONG => E_INVALID,
+        _ => E_IO,
+    }
+}
+
+/// Where this program is, written into `out` without a NUL; its length.
+pub fn getcwd(out: &mut [u8]) -> Result<usize, i32> {
+    let vfs = crate::nameserver::lookup(b"vfs").ok_or(E_IO)?;
+    crate::vfs::getcwd(vfs, out).map_err(vfs_error)
+}
+
+/// Move this program into directory `path`.
+pub fn chdir(path: &[u8]) -> Result<(), i32> {
+    let vfs = crate::nameserver::lookup(b"vfs").ok_or(E_IO)?;
+    crate::vfs::chdir(vfs, path).map_err(vfs_error)
+}
+
 pub fn argc() -> usize {
     crate::args::argc()
 }

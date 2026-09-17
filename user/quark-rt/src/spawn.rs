@@ -218,7 +218,7 @@ pub fn load(elf: &[u8], scratch: &Scratch) -> Result<Spawned, ()> {
     let base = segs[0].first;
 
     let cr3 = syscall::sys_addrspace_create()?;
-    let tid = syscall::sys_task_create()?;
+    let tid = syscall::sys_task_create_in(cr3 as u64)?;
 
     let loaded = build(elf, segs, base, scratch.elf)
         .and_then(|()| give_image(cr3, segs, base, scratch.elf))

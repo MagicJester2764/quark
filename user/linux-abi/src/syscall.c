@@ -61,6 +61,8 @@ typedef unsigned long size_t;
 #define LX_exit             60
 #define LX_uname            63
 #define LX_getcwd           79
+#define LX_chdir            80
+#define LX_fchdir           81
 #define LX_getuid          102
 #define LX_getgid          104
 #define LX_geteuid         107
@@ -520,27 +522,19 @@ long __quark_syscall(long n, long a1, long a2, long a3, long a4, long a5, long a
     case LX_uname:
         return do_uname((char *)a1);
 
-    /* Relative paths resolve from the root here, so that is the working
-       directory, and saying so is what lets realpath work. */
-    case LX_getcwd: {
-        char *buf = (char *)a1;
-        if (!buf || (unsigned long)a2 < 2) {
-            return -LX_ERANGE;
-        }
-        buf[0] = '/';
-        buf[1] = 0;
-        return 2;
-    }
+    case LX_getcwd:
+        return __quark_getcwd((char *)a1, (unsigned long)a2);
+    case LX_chdir:
+        return __quark_chdir((const char *)a1);
+    case LX_fchdir:
+        return __quark_fchdir(a1);
 
     case LX_getdents64:
         return __quark_getdents(a1, (void *)a2, (unsigned long)a3);
     case LX_readlink:
-        return __quark_readlink((const char *)a1, (char *)a2, (unsigned long)a3);
+        return __quark_readlink(LX_AT_FDCWD, (const char *)a1, (char *)a2, (unsigned long)a3);
     case LX_readlinkat:
-        if (a1 != LX_AT_FDCWD) {
-            return -LX_ENOSYS;
-        }
-        return __quark_readlink((const char *)a2, (char *)a3, (unsigned long)a4);
+        return __quark_readlink(a1, (const char *)a2, (char *)a3, (unsigned long)a4);
     case LX_statfs:
         return __quark_statfs((const char *)a1, (void *)a2);
     case LX_fstatfs:
@@ -559,9 +553,9 @@ long __quark_syscall(long n, long a1, long a2, long a3, long a4, long a5, long a
     case LX_fstat:
         return __quark_fstat(a1, (void *)a2);
     case LX_stat:
-        return __quark_stat((const char *)a1, (void *)a2, 1);
+        return __quark_stat(LX_AT_FDCWD, (const char *)a1, (void *)a2, 1);
     case LX_lstat:
-        return __quark_stat((const char *)a1, (void *)a2, 0);
+        return __quark_stat(LX_AT_FDCWD, (const char *)a1, (void *)a2, 0);
     case LX_newfstatat:
         /* AT_NO_AUTOMOUNT (0x800) asks for nothing here: nothing mounts. */
         if (a4 & ~(LX_AT_SYMLINK_NOFOLLOW | LX_AT_EMPTY_PATH | 0x800)) {
@@ -571,23 +565,24 @@ long __quark_syscall(long n, long a1, long a2, long a3, long a4, long a5, long a
             if (!(a4 & LX_AT_EMPTY_PATH)) {
                 return -LX_ENOENT;
             }
+            /* The descriptor itself, which may be the working directory. */
+            if (a1 == LX_AT_FDCWD) {
+                return __quark_stat(LX_AT_FDCWD, ".", (void *)a3, 1);
+            }
             return __quark_fstat(a1, (void *)a3);
         }
-        return __quark_stat((const char *)a2, (void *)a3, !(a4 & LX_AT_SYMLINK_NOFOLLOW));
+        return __quark_stat(a1, (const char *)a2, (void *)a3, !(a4 & LX_AT_SYMLINK_NOFOLLOW));
 
     /* access(2). gnulib's euidaccess tries faccessat2 first, then faccessat,
        and reports whatever the last one said — so refusing these is not a
        missing convenience: `sort /etc/passwd` says "cannot read" about a file
-       it can read perfectly well. All three ask the same question, and only
-       the directory this system does not have separates them. */
+       it can read perfectly well. All three ask the same question, from the
+       working directory or a directory descriptor. */
     case LX_access:
-        return __quark_access((const char *)a1, a2);
+        return __quark_access(LX_AT_FDCWD, (const char *)a1, a2);
     case LX_faccessat:
     case LX_faccessat2:
-        if (a1 != LX_AT_FDCWD) {
-            return -LX_ENOSYS;
-        }
-        return __quark_access((const char *)a2, a3);
+        return __quark_access(a1, (const char *)a2, a3);
 
     case LX_fcntl:
         return __quark_fcntl(a1, a2, a3);
@@ -616,53 +611,42 @@ long __quark_syscall(long n, long a1, long a2, long a3, long a4, long a5, long a
     /* The mode is the server's to choose: it makes every directory 0755 for
        the caller, which is what a umask of 022 would leave of most requests. */
     case LX_mkdir:
-        return __quark_mkdir((const char *)a1);
+        return __quark_mkdir(LX_AT_FDCWD, (const char *)a1);
     case LX_mkdirat:
-        if (a1 != LX_AT_FDCWD) {
-            return -LX_ENOSYS;
-        }
-        return __quark_mkdir((const char *)a2);
+        return __quark_mkdir(a1, (const char *)a2);
 
     case LX_unlink:
-        return __quark_unlink((const char *)a1);
+        return __quark_unlink(LX_AT_FDCWD, (const char *)a1);
     case LX_rmdir:
-        return __quark_rmdir((const char *)a1);
+        return __quark_rmdir(LX_AT_FDCWD, (const char *)a1);
     case LX_unlinkat:
-        if (a1 != LX_AT_FDCWD) {
-            return -LX_ENOSYS;
+        if (a3 & ~LX_AT_REMOVEDIR) {
+            return -LX_EINVAL;
         }
-        return (a3 & LX_AT_REMOVEDIR) ? __quark_rmdir((const char *)a2)
-                                       : __quark_unlink((const char *)a2);
+        return (a3 & LX_AT_REMOVEDIR) ? __quark_rmdir(a1, (const char *)a2)
+                                       : __quark_unlink(a1, (const char *)a2);
     case LX_rename:
-        return __quark_rename((const char *)a1, (const char *)a2);
+        return __quark_rename(LX_AT_FDCWD, (const char *)a1, LX_AT_FDCWD, (const char *)a2);
     case LX_renameat:
     case LX_renameat2:
-        if (a1 != LX_AT_FDCWD || a3 != LX_AT_FDCWD) {
-            return -LX_ENOSYS;
-        }
         /* renameat2's flags (no-replace, exchange) are not offered. */
         if (n == LX_renameat2 && a5 != 0) {
             return -LX_EINVAL;
         }
-        return __quark_rename((const char *)a2, (const char *)a4);
+        return __quark_rename(a1, (const char *)a2, a3, (const char *)a4);
     case LX_link:
-        return __quark_link((const char *)a1, (const char *)a2, 0);
+        return __quark_link(LX_AT_FDCWD, (const char *)a1, LX_AT_FDCWD, (const char *)a2, 0);
     case LX_linkat:
-        if (a1 != LX_AT_FDCWD || a3 != LX_AT_FDCWD) {
-            return -LX_ENOSYS;
-        }
         /* Naming the source by descriptor (AT_EMPTY_PATH) is not offered. */
         if (a5 & ~LX_AT_SYMLINK_FOLLOW) {
             return -LX_EINVAL;
         }
-        return __quark_link((const char *)a2, (const char *)a4, (a5 & LX_AT_SYMLINK_FOLLOW) != 0);
+        return __quark_link(a1, (const char *)a2, a3, (const char *)a4,
+                            (a5 & LX_AT_SYMLINK_FOLLOW) != 0);
     case LX_symlink:
-        return __quark_symlink((const char *)a1, (const char *)a2);
+        return __quark_symlink((const char *)a1, LX_AT_FDCWD, (const char *)a2);
     case LX_symlinkat:
-        if (a2 != LX_AT_FDCWD) {
-            return -LX_ENOSYS;
-        }
-        return __quark_symlink((const char *)a1, (const char *)a3);
+        return __quark_symlink((const char *)a1, a2, (const char *)a3);
     case LX_truncate:
         return __quark_truncate((const char *)a1, a2);
 

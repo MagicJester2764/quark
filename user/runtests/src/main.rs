@@ -132,6 +132,8 @@ fn run(vfs_tid: usize, name: &[u8], args: &[u8]) -> i32 {
     let Ok(info) = spawn::load_path(vfs_tid, &path[..n], IMAGE_AT, &SCRATCH, grant) else {
         return i32::MIN;
     };
+    // A test runs where runtests was started.
+    let _ = vfs::give_cwd(vfs_tid, info.tid);
     let _ = syscall::sys_fd_dup(info.tid, 1, 1);
     let _ = syscall::sys_fd_dup(info.tid, 2, 2);
     let mut argv = [&b""[..]; 16];

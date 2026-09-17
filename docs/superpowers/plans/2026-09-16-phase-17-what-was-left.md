@@ -641,7 +641,7 @@ e2fsck clean on ext2 and ext4.
 
 The server holds a program's directory by inode, as Linux does, so renaming a directory above it changes what `getcwd` says and nothing else. A program nobody gave a directory is at `/`. A current directory counts as an open reference: removing it leaves the inode until the program leaves it, and `getcwd` then answers `NOT_FOUND`. On FAT32, which cannot rename anything, the directory is kept as its path.
 
-- [ ] **Step 1: The failing tests.** `cwdtest.c` (runs on Linux):
+- [x] **Step 1: The failing tests.** `cwdtest.c` (runs on Linux):
 
 ```c
 /* A working directory: relative paths, *at calls, and inheritance. */
@@ -705,9 +705,9 @@ int main(void) {
 
 `dirtest.c`'s `the working directory is the root` check first calls `chdir("/")`. dtest `files`: `vfs::chdir(vfs, b"/etc")`, then `vfs::open(vfs, b"passwd")` succeeds, `vfs::getcwd` says `/etc`; a `dchild cwd` child (mode `cwd`: exit 0 if `vfs::open(vfs, b"passwd")` succeeds, else 1) given the directory with `vfs::give_cwd` exits 0; one not given it exits 1; `vfs::chdir(vfs, b"/")` afterwards.
 
-- [ ] **Step 2: Run them.** Host: all ok. Quark: `chdir` fails (the layer answers `ENOSYS`).
+- [x] **Step 2: Run them.** Host: all ok. Quark: `chdir` fails (the layer answers `ENOSYS`).
 
-- [ ] **Step 3: The server.** `cwd.rs`:
+- [x] **Step 3: The server.** `cwd.rs`:
 
 ```rust
 pub enum Where { Root, Inode(u32), Path([u8; MAX_PATH], usize) }
@@ -723,15 +723,30 @@ pub fn holds(ino: u32) -> bool                          // for inode_is_open
 
 A path request's starting directory is `base_ino(sender, word)`: a non-zero word must be `h + 1` for an open directory handle of the sender's program (else `INVALID_HANDLE`); zero is `cwd::get(space)`. `ext2_dir::resolve` is called with that inode. `CHDIR` resolves (following links), requires a directory the caller may search (`x`), and sets it; the previous inode is `settle`d, as a closing handle is. `GETCWD` builds the path with `ext2_dir::path_of`: from the inode, read `..`, find the entry in the parent whose inode matches, prepend its name, and repeat until the root; an inode with no links (removed) is `NOT_FOUND`. `GIVE_CWD`: `sys_task_info(child)` gives the parent; `space_of(parent) == space_of(sender)` and `space_of(child) != space_of(sender)` or `PERMISSION`.
 
-- [ ] **Step 4: quark-rt, the shell and the spawners.** The four functions. `call_with_path` puts 0 in `data[5]` (and `data[4]`). `qsh` drops `CWD`, `HOME`-as-cwd and `resolve_path`: at start it `chdir`s to its `argv[1]` (the home `login` passes, `/home/root` if missing); `cd` with no argument goes home, `cd DIR` calls `vfs::chdir` and reports `cd: DIR: <reason>` on error; `pwd` prints `vfs::getcwd`; the prompt shows `~` for home as now. `qsh`, `runtests`, `wm` and `login` call `vfs::give_cwd(vfs, info.tid)` before `info.start()`.
+- [x] **Step 4: quark-rt, the shell and the spawners.** The four functions. `call_with_path` puts 0 in `data[5]` (and `data[4]`). `qsh` drops `CWD`, `HOME`-as-cwd and `resolve_path`: at start it `chdir`s to its `argv[1]` (the home `login` passes, `/home/root` if missing); `cd` with no argument goes home, `cd DIR` calls `vfs::chdir` and reports `cd: DIR: <reason>` on error; `pwd` prints `vfs::getcwd`; the prompt shows `~` for home as now. `qsh`, `runtests`, `wm` and `login` call `vfs::give_cwd(vfs, info.tid)` before `info.start()`.
 
-- [ ] **Step 5: C clients.** `vfs_path_call` in `quark.c` takes the base word(s). The layer's `struct openfile` keeps its handle; `base_of(dirfd)` is 0 for `AT_FDCWD`, `handle + 1` for an open directory, and `-EBADF`/`-ENOTDIR` otherwise. `chdir`, `fchdir` (a directory descriptor's handle) and `getcwd` (the length including the NUL is returned, `ERANGE` when it does not fit) call the server; the `*at` calls pass their base.
+- [x] **Step 5: C clients.** `vfs_path_call` in `quark.c` takes the base word(s). The layer's `struct openfile` keeps its handle; `base_of(dirfd)` is 0 for `AT_FDCWD`, `handle + 1` for an open directory, and `-EBADF`/`-ENOTDIR` otherwise. `chdir`, `fchdir` (a directory descriptor's handle) and `getcwd` (the length including the NUL is returned, `ERANGE` when it does not fit) call the server; the `*at` calls pass their base.
 
-- [ ] **Step 6: std.** `getcwd` asks `quark_rt::vfs::getcwd` (looking the server up with `quark_rt::nameserver::lookup(b"vfs")`); `chdir` calls `quark_rt::vfs::chdir`; errors map to `io::ErrorKind::NotFound`, `NotADirectory`, `PermissionDenied`.
+- [x] **Step 6: std.** `getcwd` asks `quark_rt::vfs::getcwd` (looking the server up with `quark_rt::nameserver::lookup(b"vfs")`); `chdir` calls `quark_rt::vfs::chdir`; errors map to `io::ErrorKind::NotFound`, `NotADirectory`, `PermissionDenied`.
 
-- [ ] **Step 7: Verify.** Build, layer, suites, fork, image; boot: `runtests /etc/libc.tests` (cwdtest ok), `dtest files`, `cd /etc`, `ls` (lists `/etc`), `cat passwd`, `pwd`, `cd /nonexistent` (a message, the prompt stays), `cd` (home), `hello`; `check-rootfs.sh`; the same on `make hd-ext4`; on `make hd-fat32`, `cd /etc` and `cat passwd`.
+- [x] **Step 7: Verify.** Build, layer, suites, fork, image; boot: `runtests /etc/libc.tests` (cwdtest ok), `dtest files`, `cd /etc`, `ls` (lists `/etc`), `cat passwd`, `pwd`, `cd /nonexistent` (a message, the prompt stays), `cd` (home), `hello`; `check-rootfs.sh`; the same on `make hd-ext4`; on `make hd-fat32`, `cd /etc` and `cat passwd`.
 
-- [ ] **Step 8: Commit.** quark: "Working directories"; rust: "std: the working directory"; explosion: "cwdtest".
+- [x] **Step 8: Commit.** quark: "Working directories"; rust: "std: the working directory"; explosion: "cwdtest".
+
+**Done**, with one addition the steps missed: a spawner gives the child its
+directory before starting it, but a task had no address space, and so no
+program, until `SYS_TASK_START`. `SYS_TASK_CREATE_IN` (109, ABI 2.4) makes a
+task for an address space the caller created; the kernel now keeps a space id
+in every task, set there or at start, and counts a created task as a live
+member of its program. `spawn::load` uses it. Also: qsh's `resolve_args`,
+which rewrote path-like arguments to absolute ones, is gone, and `ls` with no
+argument lists `.`; the prompt and `pwd` ask the server; `hello` prints
+`current_dir()`; the orphan table is sized for handles and directories
+together; `newfstatat(AT_FDCWD, "", AT_EMPTY_PATH)` stats the directory.
+FAT32 answers `FCHDIR` and handle bases with `NOT_SUPPORTED`. Step 2's failure
+was not re-run (`chdir` was not answered). libc.tests 9/9 on ext2 and ext4,
+`dtest files` 33/0, the shell checks as listed, FAT32 `cd /etc`, `cat passwd`,
+`cd /dev`, `ls`; e2fsck clean on both ext images.
 
 ---
 
