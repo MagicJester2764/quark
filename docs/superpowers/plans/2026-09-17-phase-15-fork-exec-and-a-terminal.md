@@ -434,19 +434,26 @@ pub struct UserFrame {
   `sys_fd_read`, so what this needs is for it not to assume the input server's
   line discipline — a pty in canonical mode gives it whole lines, and one in
   raw mode gives it bytes.
+- Produces: a spawner needs no authority over anybody to build a child. A task
+  the caller created and has not started is its own to fill — nobody else can
+  name it, it holds nothing, and it cannot run — so `SYS_TASK_CREATE_IN`,
+  `SYS_TASK_START`, `SYS_FD_DUP`, `SYS_PIPE_FD_SET` and `SYS_CAP_GRANT` accept
+  that window without `TaskMgmt`, bounded the way threads are. It is strictly
+  less than `fork`, which hands a child every capability the caller holds and
+  asks for nothing at all.
 
-- [ ] **Step 1: The failing check.** `ptytest qsh`: fork a pty, exec
+- [x] **Step 1: The failing check.** `ptytest qsh`: fork a pty, exec
   `/bin/sh`, write "echo hello\n" to the master, read what comes back.
   Expected: exec fails, because `/bin/sh` is not a path in the image.
 
-- [ ] **Step 2: Stage it.** The image gets `/bin/sh`. Whether that is a copy or
+- [x] **Step 2: Stage it.** The image gets `/bin/sh`. Whether that is a copy or
   a symbolic link is decided by what the image's filesystem supports: ext2 and
   ext4 have links, FAT32 has none, so a copy is what works on all three.
 
-- [ ] **Step 3: Verify.** `ptytest qsh` reads the prompt, writes a command,
+- [x] **Step 3: Verify.** `ptytest qsh` reads the prompt, writes a command,
   reads its output, and sees the shell exit when the master closes.
 
-- [ ] **Step 4: Commit.** quark: "/bin/sh"; explosion: "Stage the shell where a
+- [x] **Step 4: Commit.** quark: "/bin/sh"; explosion: "Stage the shell where a
   terminal will look for it".
 
 ---

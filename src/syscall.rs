@@ -287,6 +287,33 @@ pub const ABI_VERSION_MINOR: u64 = 9;
 /// sixty-four. `TaskMgmt` lifts it, which is what a spawner holds.
 const THREADS_WITHOUT_CAP: usize = 16;
 
+/// May `caller` set `tid` up?
+///
+/// A task it created and has not started is its own to fill: nobody else can
+/// name it, it holds nothing, and it cannot run. That is the window a spawner
+/// works in — make an address space, put the program in it, wire the
+/// descriptors, hand over the capabilities, start it — and it needs authority
+/// over nobody, because until the last step there is nobody there.
+///
+/// It is also strictly less than `fork`, which hands a child every capability
+/// and every descriptor the caller holds and asks for nothing at all. A rule
+/// that let a program copy itself but not build a smaller child would be
+/// pushing programs towards the bigger hammer.
+///
+/// Once it starts, it is a task like any other and touching it needs
+/// `TaskMgmt`.
+fn may_prepare(caller: usize, tid: usize) -> bool {
+    if tid == caller {
+        return false;
+    }
+    unsafe {
+        match scheduler::get_task_mut(tid) {
+            Some(t) => t.parent_tid == caller && t.cr3 == 0,
+            None => false,
+        }
+    }
+}
+
 
 
 
@@ -1137,8 +1164,16 @@ extern "C" fn syscall_dispatch(
             // it things — a working directory — that servers keep per program.
             let caller = scheduler::current_tid();
             let cr3 = arg0 as usize;
+            if !crate::userspace::is_owned_address_space(caller, cr3) {
+                return u64::MAX;
+            }
+            // As `SYS_TASK_CREATE`: allowed without a capability and bounded
+            // instead, because a task made in an address space the caller
+            // built holds nothing until the caller puts something in it. The
+            // capability buys the unbounded form, which is what a spawner
+            // that runs many programs needs.
             if !crate::cap::task_has_task_mgmt(caller, 0)
-                || !crate::userspace::is_owned_address_space(caller, cr3)
+                && scheduler::children_of(caller) >= THREADS_WITHOUT_CAP
             {
                 return u64::MAX;
             }
@@ -1438,7 +1473,14 @@ extern "C" fn syscall_dispatch(
                 let is_child = unsafe {
                     scheduler::get_task_mut(tid).map(|t| t.parent_tid) == Some(caller)
                 };
-                if own_cr3 != Some(arg3 as usize) || !is_child {
+                // A thread of the caller's own address space, or a child it
+                // made in an address space it built and has not started yet —
+                // which is a spawn, and needs no authority over anybody for
+                // the reason `may_prepare` gives.
+                let own_space = own_cr3 == Some(arg3 as usize);
+                let built = crate::userspace::is_owned_address_space(caller, arg3 as usize)
+                    && may_prepare(caller, tid);
+                if !is_child || (!own_space && !built) {
                     return u64::MAX;
                 }
             }
@@ -1754,7 +1796,10 @@ extern "C" fn syscall_dispatch(
             // duplicating one of your own descriptors.
             let me = scheduler::current_tid();
             let tid = arg0 as usize;
-            if tid != me && !crate::cap::task_has_task_mgmt(me, tid) {
+            if tid != me
+                && !crate::cap::task_has_task_mgmt(me, tid)
+                && !may_prepare(me, tid)
+            {
                 return u64::MAX;
             }
             let fd = if arg1 == ANY_FD {
@@ -1823,7 +1868,10 @@ extern "C" fn syscall_dispatch(
             // not more authority, and `dup` is a libc's most ordinary call.
             let me = scheduler::current_tid();
             let target_tid = arg0 as usize;
-            if target_tid != me && !crate::cap::task_has_task_mgmt(me, 0) {
+            if target_tid != me
+                && !crate::cap::task_has_task_mgmt(me, 0)
+                && !may_prepare(me, target_tid)
+            {
                 return u64::MAX;
             }
             let target_fd = if arg1 == ANY_FD {
@@ -2886,9 +2934,14 @@ extern "C" fn syscall_dispatch(
             // task. Neither can be manufactured by a stranger: a service holds
             // endpoints to the things it calls, not to everything that calls
             // it, so nobody can push a capability into the nameserver.
+            // - A spawner filling in a child it has built and not yet
+            //   started, which is the same window `may_prepare` describes: the
+            //   destination cannot object because it does not yet exist to
+            //   anyone else.
             if !crate::cap::task_has_task_mgmt(caller_tid, dest_tid)
                 && !crate::ipc::is_calling(dest_tid, caller_tid)
                 && !crate::cap::task_has_endpoint(dest_tid, caller_tid)
+                && !may_prepare(caller_tid, dest_tid)
             {
                 return u64::MAX;
             }
