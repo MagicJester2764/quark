@@ -1319,6 +1319,62 @@ fn test_locks() {
     let _ = vfs::unlink(vfs_tid, FILE);
 }
 
+/// Where the memory section reserves its gigabyte.
+const LAZY: usize = 0xA0_0000_0000;
+const LAZY_PAGES: usize = 262_144;
+
+fn test_memory() {
+    println!("memory on demand:");
+    let (free0, charged0) = syscall::sys_mem_info();
+    check("a gigabyte is reserved", syscall::sys_map_anon(LAZY, LAZY_PAGES, false).is_ok());
+    let (free1, charged1) = syscall::sys_mem_info();
+    check(
+        "and costs a page table at most",
+        charged1 == charged0 && free0.saturating_sub(free1) <= 2,
+    );
+    check("reserving it again is refused", syscall::sys_map_anon(LAZY, 1, false).is_err());
+    check("and so is mapping over it", syscall::sys_mmap(LAZY + 4096, 1).is_err());
+    // Sixteen pages, far apart, each in a reservation of its own until now.
+    let page = |i: usize| LAZY + i * 16_000 * 4096;
+    for i in 0..16 {
+        unsafe { core::ptr::write_volatile(page(i) as *mut u8, i as u8 + 1) };
+    }
+    let (free2, charged2) = syscall::sys_mem_info();
+    check("touching sixteen pages charges sixteen", charged2 == charged1 + 16);
+    check("and takes at least sixteen frames", free1.saturating_sub(free2) >= 16);
+    check(
+        "each keeps what was written",
+        (0..16).all(|i| unsafe { core::ptr::read_volatile(page(i) as *const u8) } == i as u8 + 1),
+    );
+
+    // The kernel copies out of a page nothing has touched.
+    let untouched = unsafe { core::slice::from_raw_parts((LAZY + 1000 * 4096 + 7) as *const u8, 64) };
+    let written = nameserver::lookup_retry(b"vfs", 20).and_then(|vfs_tid| {
+        let o = vfs::open_with(vfs_tid, b"/dev/null", 0).ok()?;
+        let n = vfs::write(vfs_tid, o.handle, untouched, 0);
+        let _ = vfs::close(vfs_tid, o.handle);
+        n.ok()
+    });
+    check("an untouched page can be lent", written == Some(64));
+
+    for chunk in (0..LAZY_PAGES).step_by(256) {
+        let _ = syscall::sys_munmap(LAZY + chunk * 4096, 256);
+    }
+    check("unmapping gives the charge back", syscall::sys_mem_info().1 == charged0);
+    check("and the range is free again", syscall::sys_mmap(LAZY, 1).is_ok());
+    let _ = syscall::sys_munmap(LAZY, 1);
+
+    // A program that takes more than it may is stopped, and gives it all back.
+    let hog = load_child(&[b"dchild", b"hog"]).map(|c| {
+        let _ = syscall::sys_set_mem_limit(c.tid, 2048);
+        let _ = c.start();
+        wait_for(c.tid)
+    });
+    check("a program past its limit ends with SIGBUS", hog == Some(Some(-7)));
+    let (free3, _) = syscall::sys_mem_info();
+    check("and its memory comes back", free3 + 64 >= free0);
+}
+
 fn test_random() {
     println!("random numbers:");
     let mut a = [0u8; 32];
@@ -1901,6 +1957,7 @@ pub extern "C" fn _start() -> ! {
         ("service", test_runtime_service),
         ("random", test_random),
         ("locks", test_locks),
+        ("memory", test_memory),
         ("files", test_files),
         ("sync", test_sync),
         ("fpu", test_fpu),

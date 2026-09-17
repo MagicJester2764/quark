@@ -368,6 +368,36 @@ extern "C" fn exception_handler(frame: &InterruptFrame) {
     let vec = frame.vector as usize;
     let from_user = frame.cs & 3 != 0;
 
+    // A fault on a page a mapping reserved is served, not fatal: the page is
+    // given its memory and the instruction runs again. The kernel's own copies
+    // to and from user memory back what they touch first, but one that did
+    // not is served the same way rather than halting the machine.
+    if vec == 14 && frame.error_code & PF_PRESENT == 0 {
+        let cr2: u64;
+        unsafe { core::arch::asm!("mov {}, cr2", out(reg) cr2, options(nostack, nomem)) };
+        let write = frame.error_code & PF_WRITE != 0;
+        let cr3 = crate::paging::read_cr3();
+        match unsafe { crate::paging::back(cr3, cr2 as usize, write) } {
+            Ok(()) => return,
+            Err(crate::paging::Fault::NoMemory) if from_user => {
+                // Promised and not there to give: Linux's overcommit bargain,
+                // and its answer.
+                let tid = scheduler::current_tid();
+                crate::serial::puts(b"[OOM tid=");
+                crate::serial::put_usize(tid);
+                crate::serial::puts(b" cr2=0x");
+                crate::serial::put_hex_usize(cr2 as usize);
+                crate::serial::puts(b"]\n");
+                console::puts(b"\n[kernel] Out of memory in task ");
+                print_dec(tid);
+                console::puts(b" - killing task.\n");
+                unsafe { core::arch::asm!("sti", options(nostack, nomem)) };
+                scheduler::exit_with(-SIGBUS);
+            }
+            Err(_) => {}
+        }
+    }
+
     // Handle user-mode page faults: forward to pager or kill task
     if vec == 14 && from_user {
         let cr2: u64;

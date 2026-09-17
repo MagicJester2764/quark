@@ -1,6 +1,6 @@
 # Quark syscall ABI
 
-**Version 2.4.** Query the running kernel with `SYS_ABI_VERSION` (240), which
+**Version 2.5.** Query the running kernel with `SYS_ABI_VERSION` (240), which
 returns `(major << 16) | minor`.
 
 This document is the contract between the Quark kernel and everything above it.
@@ -61,9 +61,10 @@ unused slots in a block are reserved for that subsystem.
 | 0x90  | 144–159   | Time                          |
 | 0xA0  | 160–175   | Kernel debug console          |
 | 0xB0  | 176–191   | Sockets                       |
+| 0xC0  | 192–207   | Memory, continued             |
 | 0xF0  | 240–255   | ABI introspection             |
 
-Blocks 0xC0–0xE0 are unassigned and available for new subsystems. Threads
+Blocks 0xD0–0xE0 are unassigned and available for new subsystems. Threads
 never needed one: a thread is a task started with its creator's address space,
 so it is built from calls that already existed.
 
@@ -133,6 +134,7 @@ rule still holds for everything else.
 | 2.2 | `SYS_TASK_SPACE` (107) and `SYS_SPACE_WATCH` (108) — a program's identity is its address space, so a server can keep what a program holds for the program rather than for the one thread that asked. Also: a thread starts holding a copy of its creator's capabilities and descriptors, and in its band. |
 | 2.3 | `SYS_GETRANDOM` (116) — random bytes from a ChaCha20 generator seeded from RDSEED or RDRAND and the machine's timing. Before it a program had the clock, and expat salted its hash tables with it. |
 | 2.4 | `SYS_TASK_CREATE_IN` (109) — a task made for an address space the caller created belongs to that program before it runs, so a spawner can hand it things servers keep per program, such as a working directory. `SYS_TASK_SPACE` answers for it at once. |
+| 2.5 | Block 0xC0 opens. `SYS_MAP_ANON` (192) — memory reserved and given its frames when first touched, up to 512 GiB at once; `SYS_MEM_INFO` (193) — free frames, and what the caller is charged. Also: a user page fault on a reserved page is served rather than fatal, and one that cannot be served ends the task with SIGBUS. |
 
 ### Deprecated
 
@@ -629,6 +631,32 @@ These write to the kernel's own console, bypassing the user-space console
 server. They exist for bring-up and for output before a console exists.
 **Expect them to be withdrawn** once early output is handled another way;
 ordinary programs should use file descriptor 1.
+
+### Memory, continued (0xC0)
+
+| # | Name | Arguments | Returns | Cap |
+|---|---|---|---|---|
+| 192 | `SYS_MAP_ANON` | arg0 = address, arg1 = pages (at most 2^27), arg2 = flags (1 = back every page now, 2 = no more pages than the machine has) | 0 / `u64::MAX` | — |
+| 193 | `SYS_MEM_INFO` | — | `(free frames << 32) \| pages charged to the caller` | — |
+
+`SYS_MAP_ANON` reserves memory without giving it any: each page gets a zeroed
+frame, charged to the task that touches it, the first time it is read or
+written — by the task, or by the kernel copying to or from it for a call. The
+range must hold nothing, as for `SYS_MMAP`, and a reserved page counts as
+something to `SYS_MMAP` and to another `SYS_MAP_ANON`. A reservation of 2 MiB
+or more costs a page-directory entry, not a page table, until it is touched.
+`SYS_MUNMAP` removes reservations and mappings alike. `SYS_MMAP` is unchanged:
+it gives its frames at once, for the servers that count on it.
+
+A page promised and not there to give — no free frame, or the task's limit
+(`SYS_SET_MEM_LIMIT`) reached — ends the task that touched it with SIGBUS
+(`-7`), and says `[OOM tid=N]` on the serial line: Linux's overcommit bargain,
+and its answer. With arg2 bit 0 the whole range is backed before the call
+returns, and the call fails instead. With bit 1 a reservation of more pages
+than the machine has frames is refused outright — Linux's overcommit
+heuristic, which the C library applies to every mapping without
+`MAP_NORESERVE`, so that a `calloc` nothing could hold returns NULL rather
+than a region that ends the program when it is read.
 
 ### ABI introspection (0xF0)
 

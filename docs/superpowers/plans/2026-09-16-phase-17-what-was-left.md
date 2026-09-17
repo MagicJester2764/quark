@@ -995,7 +995,7 @@ file invariants and known gaps are brought up to date for Tasks 2 to 8.
 
 A reserved page is a non-present entry with `MARKER` set; its `WRITABLE` bit and `NO_EXECUTE` bit say what the page will be. The first touch — a user fault, or the kernel backing a buffer before it copies — takes a zeroed frame, charges the task and maps it `PRESENT | USER | OWNED` with those bits. An entry with `MARKER` is not empty, so the page-table walks that reclaim and destroy tables must test for an all-zero entry rather than a clear `PRESENT` bit. When no frame is left, or the task's limit is reached, the task is ended with SIGBUS (`[OOM tid=N]` on serial): the memory was promised and cannot be given, which is Linux's overcommit bargain. `SYS_MMAP` stays as it is, backed at once, for the servers that rely on it.
 
-- [ ] **Step 1: The failing tests.** `lazytest.c` (runs on Linux):
+- [x] **Step 1: The failing tests.** `lazytest.c` (runs on Linux):
 
 ```c
 /* Memory is backed when it is touched, not when it is mapped. */
@@ -1043,17 +1043,38 @@ int main(void) {
 
 dtest `memory` (new section): `sys_mem_info()` before; `sys_map_anon(0xA0_0000_0000, 262144, false)` (a GiB) succeeds and leaves the charge unchanged; writing one byte into each of 16 pages raises the charge by 16 and lowers the free count by at least 16; `sys_munmap` of the GiB in 256-page steps brings the charge back; a lent buffer in an untouched reserved page reaches the VFS (`vfs::write` from it); `dchild hog` (touches reserved pages until it is stopped) ends with exit code -7 while dtest carries on; after it, `sys_mem_info()`'s free count is within 64 pages of where it started.
 
-- [ ] **Step 2: Run them.** Expected: lazytest's first check fails (four GiB is refused today); dtest does not build (`sys_map_anon`).
+- [x] **Step 2: Run them.** Expected: lazytest's first check fails (four GiB is refused today); dtest does not build (`sys_map_anon`).
 
-- [ ] **Step 3: Paging.** Implement the constants and functions above. `reserve` walks and allocates tables as `map_page` does and writes `entry` into a zero leaf (`AlreadyMapped` otherwise). `back(pml4, virt, write)`: read the leaf; `MARKER` without `MARKER_OBJECT` → allocate, zero, charge (`scheduler::charge_or_fail`), map; a write fault on a marker whose `WRITABLE` is clear, or no marker at all, is `Fault::Invalid`. `clear_range` clears markers and present entries alike, freeing `OWNED` frames, and reclaims empty tables. `free_pt_leaves` leaves marker entries alone (they own nothing). `translate` and `walk_flags` still report a marker as not mapped.
+- [x] **Step 3: Paging.** Implement the constants and functions above. `reserve` walks and allocates tables as `map_page` does and writes `entry` into a zero leaf (`AlreadyMapped` otherwise). `back(pml4, virt, write)`: read the leaf; `MARKER` without `MARKER_OBJECT` → allocate, zero, charge (`scheduler::charge_or_fail`), map; a write fault on a marker whose `WRITABLE` is clear, or no marker at all, is `Fault::Invalid`. `clear_range` clears markers and present entries alike, freeing `OWNED` frames, and reclaims empty tables. `free_pt_leaves` leaves marker entries alone (they own nothing). `translate` and `walk_flags` still report a marker as not mapped.
 
-- [ ] **Step 4: Faults and system calls.** In `exception_handler`, a user page fault first calls `paging::back(cr3, cr2, write)` with interrupts enabled; `Ok` returns to retry the instruction; `Fault::NoMemory` ends the task with `-SIGBUS` after the `[OOM …]` line; `Fault::Invalid` goes on to today's path (pager or `SIGSEGV`). `validate_user_range` walks the range and calls `back` on every marker before `user_range_accessible`. `call_inner` backs a lent buffer before blocking. `SYS_MAP_ANON` checks `user_range_ok` and emptiness, reserves each page, and backs them all when bit 0 is set (charging, and undoing the reservation if that fails). `SYS_MUNMAP` uses `clear_range`. `SYS_MEM_INFO` reads `pmm::free_count()` and the caller's charge.
+- [x] **Step 4: Faults and system calls.** In `exception_handler`, a user page fault first calls `paging::back(cr3, cr2, write)` with interrupts enabled; `Ok` returns to retry the instruction; `Fault::NoMemory` ends the task with `-SIGBUS` after the `[OOM …]` line; `Fault::Invalid` goes on to today's path (pager or `SIGSEGV`). `validate_user_range` walks the range and calls `back` on every marker before `user_range_accessible`. `call_inner` backs a lent buffer before blocking. `SYS_MAP_ANON` checks `user_range_ok` and emptiness, reserves each page, and backs them all when bit 0 is set (charging, and undoing the reservation if that fails). `SYS_MUNMAP` uses `clear_range`. `SYS_MEM_INFO` reads `pmm::free_count()` and the caller's charge.
 
-- [ ] **Step 5: The Linux layer.** Anonymous `mmap` reserves the whole length with one `SYS_MAP_ANON` (flag set for `MAP_POPULATE`); the chunked `map_pages` path goes. `munmap` still steps in 256-page calls.
+- [x] **Step 5: The Linux layer.** Anonymous `mmap` reserves the whole length with one `SYS_MAP_ANON` (flag set for `MAP_POPULATE`); the chunked `map_pages` path goes. `munmap` still steps in 256-page calls.
 
-- [ ] **Step 6: Verify.** Build, layer, suites (pixman's `stress-test` now gets its 2.7 GiB mask and must still pass), image; boot `runtests /etc/libc.tests` (lazytest ok), `dtest memory`, `dtest`, `runtests /etc/pixman.tests`, `runtests /etc/cairo.tests`, `wm weston-simple-shm wlcairo` (Esc), `hello`. Serial: one `[OOM tid=…]` line, from the hog.
+- [x] **Step 6: Verify.** Build, layer, suites (pixman's `stress-test` now gets its 2.7 GiB mask and must still pass), image; boot `runtests /etc/libc.tests` (lazytest ok), `dtest memory`, `dtest`, `runtests /etc/pixman.tests`, `runtests /etc/cairo.tests`, `wm weston-simple-shm wlcairo` (Esc), `hello`. Serial: one `[OOM tid=…]` line, from the hog.
 
-- [ ] **Step 7: Commit.** quark: "Memory on demand"; explosion: "lazytest".
+- [x] **Step 7: Commit.** quark: "Memory on demand"; explosion: "lazytest".
+
+**Done**, with these changes to the steps. The test machine has QEMU's
+default 128 MiB, where a page table per 2 MiB reserved is real money, so a
+reservation of 2 MiB or more lives in its page-directory entry and is split
+into a page table of markers on first touch (`walk_create_pd`, `reserve_range`,
+`range_is_free` and `clear_range` step over absent tables whole). The first
+full run failed mmaptest: `calloc(64 GiB)` now succeeded, and musl then read
+the region backwards looking for zeroes, backing a page per read until the
+machine ran out. Linux never gets there, because its overcommit heuristic
+refuses a mapping bigger than RAM unless `MAP_NORESERVE` is given; `SYS_MAP_ANON`
+has that as flag 2, the C layer sets it for every mapping without
+`MAP_NORESERVE`, mmaptest's comments say so, and lazytest's `malloc` check is
+64 MiB (a gigabyte would be refused on this machine, as on Linux). The kernel
+serves a not-present fault on a reserved page in ring 0 too, as a safety net
+behind `validate_user_range`. dtest's hog runs under a 2048-page limit rather
+than exhausting the machine; the limit takes the same SIGBUS path. Reading an
+untouched page still gives it a frame (Linux maps a shared zero page). Step
+2's failure was not re-run. libc.tests 11/11, `dtest memory` 12/0, `dtest`
+260/0, pixman.tests 31/31, cairo.tests 2/2, `hello`, `wm weston-simple-shm
+wlcairo` drawn and closed with Esc; serial has the hog's one OOM line per run;
+e2fsck clean.
 
 ---
 

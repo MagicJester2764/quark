@@ -28,6 +28,7 @@ const KERNEL_CS: u64 = 0x08;
 //   0x80  128-143  synchronisation
 //   0x90  144-159  time
 //   0xA0  160-175  kernel debug console
+//   0xC0  192-207  memory, continued: reservations and memory objects
 //   0xF0  240-255  ABI introspection
 //
 // Numbers are stable within an ABI version: they are never reused, and a
@@ -208,6 +209,19 @@ const fn sock_tag(op: u64, handle: usize) -> u64 {
 pub const SYS_WRITE: u64 = 160;
 pub const SYS_CONSOLE_POS: u64 = 161;
 
+// --- 0xC0  memory, continued: reservations and memory objects ---
+/// Reserve anonymous memory, backed when first touched.
+pub const SYS_MAP_ANON: u64 = 192;
+/// Free frames in the machine, and pages charged to the caller.
+pub const SYS_MEM_INFO: u64 = 193;
+/// The most one SYS_MAP_ANON reserves: 512 GiB.
+const MAP_ANON_MAX: usize = 1 << 27;
+/// SYS_MAP_ANON: give every page its memory now.
+const MAP_ANON_POPULATE: u64 = 1;
+/// SYS_MAP_ANON: refuse a reservation bigger than the machine's memory, as
+/// Linux's overcommit heuristic refuses one without MAP_NORESERVE.
+const MAP_ANON_ACCOUNT: u64 = 2;
+
 // --- 0xF0  ABI introspection ---
 pub const SYS_ABI_VERSION: u64 = 240;
 
@@ -217,7 +231,7 @@ pub const SYS_ABI_VERSION: u64 = 240;
 /// minor when calls are added. User space can refuse to run against a major it
 /// does not know, which is the point of exposing it at all.
 pub const ABI_VERSION_MAJOR: u64 = 2;
-pub const ABI_VERSION_MINOR: u64 = 4;
+pub const ABI_VERSION_MINOR: u64 = 5;
 
 /// Threads a task may make with no capability at all.
 ///
@@ -323,7 +337,9 @@ fn validate_user_range(addr: u64, len: u64, write: bool) -> bool {
         Some(end) if end <= USER_ADDR_LIMIT => {}
         _ => return false,
     }
-    unsafe { paging::user_range_accessible(paging::read_cr3(), addr, len, write) }
+    let cr3 = paging::read_cr3();
+    // Reserved pages are given their memory before the kernel touches them.
+    unsafe { paging::back_range(cr3, addr, len, write).is_ok() && paging::user_range_accessible(cr3, addr, len, write) }
 }
 
 /// Read-only user buffer check.
@@ -2011,10 +2027,8 @@ extern "C" fn syscall_dispatch(
             // been swapped out from under it. Failing here means a caller that
             // guessed at a base address finds out, rather than corrupting the
             // task it collided with.
-            for i in 0..pages {
-                if unsafe { paging::translate(cr3, vaddr + i * 4096) }.is_some() {
-                    return u64::MAX;
-                }
+            if !unsafe { paging::range_is_free(cr3, vaddr, pages) } {
+                return u64::MAX;
             }
 
             // Charge up front so a partial failure can't leave pages mapped
@@ -2059,21 +2073,56 @@ extern "C" fn syscall_dispatch(
                 return u64::MAX;
             }
             let cr3 = paging::read_cr3();
-            let mut freed = 0usize;
-            for i in 0..pages {
-                let v = vaddr + i * 4096;
-                // Only frames this address space owns are returned to the PMM.
-                // Shared-memory pages and device MMIO are unmapped but never
-                // freed — otherwise munmap double-frees a shmem region or
-                // hands the allocator a device physical address.
-                if unsafe { paging::unmap_page_owned(cr3, v) } {
-                    freed += 1;
-                }
-            }
+            // Mappings and reservations alike. Only frames this address space
+            // owns are returned to the PMM: shared-memory pages and device
+            // MMIO are unmapped but never freed — otherwise munmap
+            // double-frees a shmem region or hands the allocator a device
+            // physical address.
+            let freed = unsafe { paging::clear_range(cr3, vaddr, pages) };
             if freed > 0 {
                 scheduler::current_task_uncharge_mem(freed);
             }
             freed as u64
+        }
+        SYS_MAP_ANON => {
+            // arg0 = vaddr, arg1 = pages, arg2 = flags (bit 0: back it now;
+            // bit 1: no bigger than the machine).
+            // Memory promised rather than given: each page gets a frame when
+            // it is first touched. No capability, as for SYS_MMAP.
+            let vaddr = arg0 as usize;
+            let pages = arg1 as usize;
+            if pages == 0 || pages > MAP_ANON_MAX || !paging::user_range_ok(vaddr, pages) {
+                return u64::MAX;
+            }
+            if arg2 & !(MAP_ANON_POPULATE | MAP_ANON_ACCOUNT) != 0 {
+                return u64::MAX;
+            }
+            if arg2 & MAP_ANON_ACCOUNT != 0 && pages > crate::pmm::total_count() {
+                return u64::MAX;
+            }
+            let cr3 = paging::read_cr3();
+            if !unsafe { paging::range_is_free(cr3, vaddr, pages) } {
+                return u64::MAX;
+            }
+            let entry = paging::marker_entry(true, false);
+            if unsafe { paging::reserve_range(cr3, vaddr, pages, entry) }.is_err() {
+                unsafe { paging::clear_range(cr3, vaddr, pages) };
+                return u64::MAX;
+            }
+            if arg2 & MAP_ANON_POPULATE != 0 {
+                let len = (pages * 4096) as u64;
+                if unsafe { paging::back_range(cr3, vaddr as u64, len, true) }.is_err() {
+                    let freed = unsafe { paging::clear_range(cr3, vaddr, pages) };
+                    scheduler::current_task_uncharge_mem(freed);
+                    return u64::MAX;
+                }
+            }
+            0
+        }
+        SYS_MEM_INFO => {
+            let free = crate::pmm::free_count() as u64;
+            let charged = scheduler::current_task_mem() as u64;
+            (free.min(u32::MAX as u64) << 32) | charged.min(u32::MAX as u64)
         }
         SYS_RECV_TIMEOUT => {
             // arg0 = from, arg1 = msg_ptr, arg2 = timeout_ticks

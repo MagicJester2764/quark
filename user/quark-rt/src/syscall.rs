@@ -113,6 +113,8 @@ pub const SYS_IRQ_ACK: u64 = 113;
 pub const SYS_IOPORT: u64 = 114;
 pub const SYS_IOPORT_REP: u64 = 115;
 pub const SYS_GETRANDOM: u64 = 116;
+pub const SYS_MAP_ANON: u64 = 192;
+pub const SYS_MEM_INFO: u64 = 193;
 
 // --- 0x80  synchronisation ---
 pub const SYS_FUTEX_WAIT: u64 = 128;
@@ -668,6 +670,26 @@ pub fn sys_ioport_rep_outsw(port: u16, buf: &[u16]) -> Result<(), ()> {
         syscall4(SYS_IOPORT_REP, port as u64, buf.as_ptr() as u64, buf.len() as u64, 1)
     };
     if ret == u64::MAX { Err(()) } else { Ok(()) }
+}
+
+/// Reserve `pages` pages of memory at `addr`, each given its frame when first
+/// touched — or all of them now, with `populate`. The range must be empty.
+pub fn sys_map_anon(addr: usize, pages: usize, populate: bool) -> Result<(), ()> {
+    let ret = unsafe { syscall3(SYS_MAP_ANON, addr as u64, pages as u64, populate as u64) };
+    if ret == u64::MAX { Err(()) } else { Ok(()) }
+}
+
+/// `sys_map_anon`, refused outright if `pages` is more than the machine has:
+/// what Linux does for a mapping without `MAP_NORESERVE`.
+pub fn sys_map_anon_accounted(addr: usize, pages: usize) -> Result<(), ()> {
+    let ret = unsafe { syscall3(SYS_MAP_ANON, addr as u64, pages as u64, 2) };
+    if ret == u64::MAX { Err(()) } else { Ok(()) }
+}
+
+/// Free frames in the machine, and pages charged to this task.
+pub fn sys_mem_info() -> (usize, usize) {
+    let ret = unsafe { syscall0(SYS_MEM_INFO) };
+    ((ret >> 32) as usize, (ret & 0xFFFF_FFFF) as usize)
 }
 
 /// Fill as much of `buf` as one call gives (at most a mebibyte) with random

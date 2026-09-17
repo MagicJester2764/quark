@@ -127,6 +127,13 @@ These were established deliberately. Breaking one silently re-opens a hole.
   thread-local template through it, and without it every thread-local lands
   outside its block. So every spawner calls `set_args`, even with no
   arguments; a program reading an argument page that was never mapped faults.
+- **A reserved page is a non-present entry with `paging::MARKER` set**, in a
+  page table or, for 2 MiB at once, a page directory. It is not empty: the
+  walks that free tables and the checks that an address is free test for an
+  all-zero entry, not a clear `PRESENT` bit, or they throw reservations away
+  and free tables still in use. The kernel backs a reserved page before it
+  touches it (`validate_user_range`, the futex path), and a page fault on one
+  is served, so the first touch from anywhere gives it its frame.
 - **A fault in ring 3 ends the task, never the machine.** The task exits with
   the negated Linux signal number (`idt.rs`), and only a fault taken in ring 0
   halts. musl's `abort()` is a privileged `hlt`, so before this, one failed
@@ -336,12 +343,12 @@ change here: it has found what reading the code did not.
   a client's TID past one call — a lease, a registration, a foreground task —
   must watch it with `sys_task_watch` and forget it on death. Otherwise it
   treats whatever takes the TID next as the same client.
-- Nothing is demand-paged: memory is backed when it is mapped, not when it is
-  first touched. A program that maps far more than it uses — pixman's stress
-  test asks for a 2.7 GB mask and draws into a corner — is refused where Linux
-  would say yes, and a request bigger than free memory takes all of it for a
-  moment before it is. The C library's `mmap` gives back a partial mapping, so
-  the refusal is clean; the program has to check for it.
+- Nothing is ever paged out: anonymous memory is given its frames when first
+  touched (`SYS_MAP_ANON`, which the C library's `mmap` uses) and keeps them.
+  A machine that runs out ends whichever task touched the page it could not
+  give (SIGBUS), not the biggest. Reading an untouched page gives it a frame
+  of its own, where Linux maps one shared page of zeroes. Rust programs' heaps
+  still come from `SYS_MMAP`, backed at once.
 - Focus is a single stack with little policy: Tab cycles, a new window takes it,
   and a click raises the one under the pointer. Keyboard focus and pointer focus
   are tracked separately, as Wayland requires, but there is no follow-mouse, no

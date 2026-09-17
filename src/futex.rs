@@ -77,7 +77,11 @@ fn wait(addr: u64, expected: u32, timeout_ticks: Option<u64>) -> u64 {
     // Confirm the word is actually mapped *before* taking the lock. Faulting on
     // it while holding FUTEX with interrupts disabled would deadlock: the fault
     // path wants to reschedule to the pager.
-    if !unsafe { crate::paging::user_range_accessible(cr3, addr, 4, false) } {
+    let usable = unsafe {
+        crate::paging::back_range(cr3, addr, 4, false).is_ok()
+            && crate::paging::user_range_accessible(cr3, addr, 4, false)
+    };
+    if !usable {
         return u64::MAX;
     }
     let paddr = match unsafe { crate::paging::translate(cr3, addr as usize) } {

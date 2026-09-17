@@ -1461,6 +1461,12 @@ pub fn current_task_check_mem(pages: usize) -> bool {
     }
 }
 
+/// Pages charged to the current task.
+pub fn current_task_mem() -> usize {
+    let tid = current_tid();
+    unsafe { TASKS[tid].as_ref().map_or(0, |t| t.mem_pages) }
+}
+
 /// Add `pages` to the current task's memory usage counter.
 pub fn current_task_charge_mem(pages: usize) {
     let tid = current_tid();

@@ -34,6 +34,41 @@ pub const NO_EXECUTE: u64 = 1 << 63;
 /// bit keeps that true, and it is what makes freeing on unmap safe.
 pub const OWNED: u64 = 1 << 9;
 
+/// A reservation: a non-present entry with this bit set stands for memory a
+/// mapping promised and nothing has touched yet. In a page table it reserves
+/// one page; in a page directory, the 512 under it. Its `WRITABLE` and
+/// `NO_EXECUTE` bits say what the page will be once it is backed.
+///
+/// An entry carrying it is not empty. Everything that decides whether a table
+/// can be freed, or whether an address is free to map, has to look at the
+/// whole entry and not just `PRESENT`.
+pub const MARKER: u64 = 1 << 10;
+/// With `MARKER`: the page is a page of a memory object, named by the slot in
+/// bits 52–62 and the page index in bits 12–51, rather than fresh zeroes.
+pub const MARKER_OBJECT: u64 = 1 << 11;
+/// With `MARKER_OBJECT`: the object's page itself is to be mapped, not a copy.
+pub const MARKER_SHARED: u64 = 1 << 6;
+/// Where an object marker keeps its object's slot.
+pub const OBJECT_SHIFT: u64 = 52;
+
+/// A reservation for anonymous memory.
+pub fn marker_entry(writable: bool, exec: bool) -> u64 {
+    MARKER | if writable { WRITABLE } else { 0 } | if exec { 0 } else { NO_EXECUTE }
+}
+
+fn is_marker(raw: u64) -> bool {
+    raw & PRESENT == 0 && raw & MARKER != 0
+}
+
+/// Why a page could not be backed.
+#[derive(Debug)]
+pub enum Fault {
+    /// Nothing was promised there, or not that access: the task's fault.
+    Invalid,
+    /// It was promised and there is nothing to give it with.
+    NoMemory,
+}
+
 /// Highest canonical user address (exclusive). Everything at or above this is
 /// kernel/non-canonical and must never be mapped on behalf of user space.
 pub const USER_ADDR_LIMIT: u64 = 0x0000_8000_0000_0000;
@@ -76,6 +111,8 @@ pub enum PagingError {
     OutOfFrames,
     /// Page is not mapped.
     NotMapped,
+    /// Something is already mapped or reserved there.
+    AlreadyMapped,
 }
 
 /// A single page table entry (PTE/PDE/PDPE/PML4E).
@@ -199,26 +236,57 @@ fn alloc_table() -> Result<usize, PagingError> {
     Ok(addr)
 }
 
-/// Map a 4 KiB virtual page to a physical frame.
+/// The page table that maps `virt`, made if it is not there.
 ///
-/// Walks the 4-level page table hierarchy, allocating intermediate tables
-/// as needed. If a 2 MiB huge page is encountered at the PD level, it is
-/// split into 512 individual 4 KiB pages preserving the original mapping.
-/// 1 GiB huge pages at the PDPT level are not split (returns error).
-///
-/// When the requested flags include USER, intermediate entries are promoted
-/// to include USER so user-mode page walks succeed.
-///
-/// # Safety
-/// `pml4_phys` must point to a valid, identity-mapped PML4 table.
-pub unsafe fn map_page(
+/// Absent tables are allocated. A 2 MiB huge page is split into 512 pages that
+/// map what it mapped, and a 2 MiB reservation into 512 page reservations. A
+/// 1 GiB huge page cannot be split (`HugePageConflict`). With `user`, every
+/// entry on the way is given `USER`, so a user-mode walk succeeds.
+unsafe fn walk_create(
     pml4_phys: usize,
     virt_addr: usize,
-    phys_addr: usize,
-    flags: u64,
-) -> Result<(), PagingError> { unsafe {
-    let (pml4i, pdpti, pdi, pti) = table_indices(virt_addr);
-    let user = flags & USER;
+    user: u64,
+) -> Result<&'static mut PageTable, PagingError> { unsafe {
+    let (_, _, pdi, _) = table_indices(virt_addr);
+    let pd = walk_create_pd(pml4_phys, virt_addr, user)?;
+    let pde = pd.entries[pdi].raw();
+    if pde & PRESENT != 0 && pde & HUGE_PAGE != 0 {
+        // Split 2 MiB huge page into 512 × 4 KiB pages preserving the mapping
+        let huge_phys = pd.entries[pdi].frame_address();
+        let huge_flags = pde & !ADDR_MASK & !HUGE_PAGE;
+        let new_pt = alloc_table()?;
+        let pt = table_at(new_pt);
+        for j in 0..512 {
+            pt.entries[j].set(huge_phys + j * PAGE_SIZE, huge_flags);
+        }
+        pd.entries[pdi].set(new_pt, PRESENT | WRITABLE | user);
+    } else if is_marker(pde) {
+        // A 2 MiB reservation: the same promise, one page at a time.
+        let new_pt = alloc_table()?;
+        let pt = table_at(new_pt);
+        for e in pt.entries.iter_mut() {
+            *e = PageTableEntry(pde);
+        }
+        pd.entries[pdi].set(new_pt, PRESENT | WRITABLE | USER);
+    }
+    if !pd.entries[pdi].is_present() {
+        let new_table = alloc_table()?;
+        pd.entries[pdi].set(new_table, PRESENT | WRITABLE | user);
+    } else if user != 0 && pd.entries[pdi].raw() & USER == 0 {
+        pd.entries[pdi] = PageTableEntry(pd.entries[pdi].raw() | USER);
+    }
+
+    // Level 1: PT
+    Ok(table_at(pd.entries[pdi].frame_address()))
+}}
+
+/// The page directory that holds `virt`'s entry, made if it is not there.
+unsafe fn walk_create_pd(
+    pml4_phys: usize,
+    virt_addr: usize,
+    user: u64,
+) -> Result<&'static mut PageTable, PagingError> { unsafe {
+    let (pml4i, pdpti, _, _) = table_indices(virt_addr);
 
     // Level 4: PML4
     let pml4 = table_at(pml4_phys);
@@ -243,29 +311,24 @@ pub unsafe fn map_page(
     }
 
     // Level 2: PD
-    let pd_phys = pdpt.entries[pdpti].frame_address();
-    let pd = table_at(pd_phys);
-    if pd.entries[pdi].is_present() && pd.entries[pdi].is_huge() {
-        // Split 2 MiB huge page into 512 × 4 KiB pages preserving the mapping
-        let huge_phys = pd.entries[pdi].frame_address();
-        let huge_flags = pd.entries[pdi].raw() & !ADDR_MASK & !HUGE_PAGE;
-        let new_pt = alloc_table()?;
-        let pt = table_at(new_pt);
-        for j in 0..512 {
-            pt.entries[j].set(huge_phys + j * PAGE_SIZE, huge_flags);
-        }
-        pd.entries[pdi].set(new_pt, PRESENT | WRITABLE | user);
-    }
-    if !pd.entries[pdi].is_present() {
-        let new_table = alloc_table()?;
-        pd.entries[pdi].set(new_table, PRESENT | WRITABLE | user);
-    } else if user != 0 && pd.entries[pdi].raw() & USER == 0 {
-        pd.entries[pdi] = PageTableEntry(pd.entries[pdi].raw() | USER);
-    }
+    Ok(table_at(pdpt.entries[pdpti].frame_address()))
+}}
 
-    // Level 1: PT
-    let pt_phys = pd.entries[pdi].frame_address();
-    let pt = table_at(pt_phys);
+/// Map a 4 KiB virtual page to a physical frame.
+///
+/// Walks the 4-level page table hierarchy, allocating intermediate tables
+/// as needed (see [`walk_create`]). Mapping over a reservation replaces it.
+///
+/// # Safety
+/// `pml4_phys` must point to a valid, identity-mapped PML4 table.
+pub unsafe fn map_page(
+    pml4_phys: usize,
+    virt_addr: usize,
+    phys_addr: usize,
+    flags: u64,
+) -> Result<(), PagingError> { unsafe {
+    let (_, _, _, pti) = table_indices(virt_addr);
+    let pt = walk_create(pml4_phys, virt_addr, flags & USER)?;
 
     // Replacing a live mapping: if this address space owned the old frame and
     // we are pointing the PTE somewhere else, return the old frame to the PMM
@@ -280,6 +343,257 @@ pub unsafe fn map_page(
     invlpg(virt_addr);
 
     Ok(())
+}}
+
+/// Reserve `pages` pages from `virt` with reservation `entry`, which must be a
+/// marker. A whole 2 MiB is reserved in its page-directory entry, so a large
+/// reservation costs almost nothing until it is touched. Everything in the
+/// range must be free ([`range_is_free`]); on failure, what was reserved is
+/// left for the caller to clear.
+///
+/// # Safety
+/// `pml4_phys` must point to a valid, identity-mapped user PML4 table.
+pub unsafe fn reserve_range(
+    pml4_phys: usize,
+    virt: usize,
+    pages: usize,
+    entry: u64,
+) -> Result<(), PagingError> { unsafe {
+    const TWO_MIB: usize = 512 * PAGE_SIZE;
+    let end = virt + pages * PAGE_SIZE;
+    let mut va = virt;
+    while va < end {
+        let (_, _, pdi, pti) = table_indices(va);
+        if va & (TWO_MIB - 1) == 0 && end - va >= TWO_MIB {
+            // The whole page-directory entry, which must be unused.
+            let pd = walk_create_pd(pml4_phys, va, USER)?;
+            if pd.entries[pdi].raw() != 0 {
+                return Err(PagingError::AlreadyMapped);
+            }
+            pd.entries[pdi] = PageTableEntry(entry);
+            va += TWO_MIB;
+        } else {
+            let pt = walk_create(pml4_phys, va, USER)?;
+            if pt.entries[pti].raw() != 0 {
+                return Err(PagingError::AlreadyMapped);
+            }
+            pt.entries[pti] = PageTableEntry(entry);
+            va += PAGE_SIZE;
+        }
+    }
+    Ok(())
+}}
+
+/// The reservation covering `virt`, if the page is reserved and not backed.
+///
+/// # Safety
+/// `pml4_phys` must point to a valid, identity-mapped PML4 table.
+pub unsafe fn marker(pml4_phys: usize, virt: usize) -> Option<u64> { unsafe {
+    let (pml4i, pdpti, pdi, pti) = table_indices(virt);
+    let e = table_at(pml4_phys).entries[pml4i];
+    if !e.is_present() {
+        return None;
+    }
+    let e = table_at(e.frame_address()).entries[pdpti];
+    if !e.is_present() || e.is_huge() {
+        return None;
+    }
+    let e = table_at(e.frame_address()).entries[pdi];
+    if is_marker(e.raw()) {
+        return Some(e.raw());
+    }
+    if !e.is_present() || e.is_huge() {
+        return None;
+    }
+    let e = table_at(e.frame_address()).entries[pti];
+    is_marker(e.raw()).then_some(e.raw())
+}}
+
+/// Give the reserved page at `virt` its memory: a zeroed frame, charged to the
+/// current task, mapped as its reservation said. `write` is whether the access
+/// that wants it is a write.
+///
+/// # Safety
+/// `pml4_phys` must be the current task's address space; interrupts off, so
+/// nothing else changes its tables in between.
+pub unsafe fn back(pml4_phys: usize, virt: usize, write: bool) -> Result<(), Fault> { unsafe {
+    let (pml4i, pdpti, pdi, pti) = table_indices(virt);
+    if (virt as u64) < USER_MIN_ADDR || (virt as u64) >= USER_ADDR_LIMIT {
+        return Err(Fault::Invalid);
+    }
+    let e = table_at(pml4_phys).entries[pml4i];
+    if !e.is_present() {
+        return Err(Fault::Invalid);
+    }
+    let e = table_at(e.frame_address()).entries[pdpti];
+    if !e.is_present() || e.is_huge() {
+        return Err(Fault::Invalid);
+    }
+    let pd = table_at(e.frame_address());
+    let pde = pd.entries[pdi].raw();
+    if is_marker(pde) {
+        if pde & MARKER_OBJECT != 0 || (write && pde & WRITABLE == 0) {
+            return Err(Fault::Invalid);
+        }
+        // Split the 2 MiB reservation; the page wanted is backed below.
+        let new_pt = alloc_table().map_err(|_| Fault::NoMemory)?;
+        let pt = table_at(new_pt);
+        for entry in pt.entries.iter_mut() {
+            *entry = PageTableEntry(pde);
+        }
+        pd.entries[pdi].set(new_pt, PRESENT | WRITABLE | USER);
+    } else if pde & PRESENT == 0 || pde & HUGE_PAGE != 0 {
+        return Err(Fault::Invalid);
+    }
+    let pt = table_at(pd.entries[pdi].frame_address());
+    let raw = pt.entries[pti].raw();
+    if !is_marker(raw) || raw & MARKER_OBJECT != 0 || (write && raw & WRITABLE == 0) {
+        return Err(Fault::Invalid);
+    }
+    if !crate::scheduler::current_task_check_mem(1) {
+        return Err(Fault::NoMemory);
+    }
+    let frame = pmm::alloc().ok_or(Fault::NoMemory)?.address();
+    core::ptr::write_bytes(frame as *mut u8, 0, PAGE_SIZE);
+    crate::scheduler::current_task_charge_mem(1);
+    pt.entries[pti].set(frame, PRESENT | USER | OWNED | (raw & (WRITABLE | NO_EXECUTE)));
+    invlpg(virt & !0xFFF);
+    Ok(())
+}}
+
+/// Back every reserved page of `[addr, addr + len)`, so that the kernel can
+/// copy to or from it. Pages that are not reserved are left for the caller's
+/// own check.
+///
+/// # Safety
+/// As [`back`].
+pub unsafe fn back_range(pml4_phys: usize, addr: u64, len: u64, write: bool) -> Result<(), Fault> { unsafe {
+    if len == 0 {
+        return Ok(());
+    }
+    let Some(end) = addr.checked_add(len) else {
+        return Err(Fault::Invalid);
+    };
+    let mut page = addr & !0xFFF;
+    while page < end {
+        if marker(pml4_phys, page as usize).is_some() {
+            back(pml4_phys, page as usize, write)?;
+        }
+        page += PAGE_SIZE as u64;
+    }
+    Ok(())
+}}
+
+/// The next address after `va` that is a multiple of `size`.
+fn next_boundary(va: usize, size: usize) -> usize {
+    (va | (size - 1)).wrapping_add(1)
+}
+
+/// Whether nothing is mapped or reserved anywhere in `[virt, virt + pages)`.
+/// Absent tables are stepped over whole, so a large range costs little.
+///
+/// # Safety
+/// `pml4_phys` must point to a valid, identity-mapped PML4 table.
+pub unsafe fn range_is_free(pml4_phys: usize, virt: usize, pages: usize) -> bool { unsafe {
+    let end = virt + pages * PAGE_SIZE;
+    let mut va = virt;
+    while va < end {
+        let (pml4i, pdpti, pdi, pti) = table_indices(va);
+        let e4 = table_at(pml4_phys).entries[pml4i];
+        if e4.raw() == 0 {
+            va = next_boundary(va, 1 << 39);
+            continue;
+        }
+        if !e4.is_present() {
+            return false;
+        }
+        let e3 = table_at(e4.frame_address()).entries[pdpti];
+        if e3.raw() == 0 {
+            va = next_boundary(va, 1 << 30);
+            continue;
+        }
+        if !e3.is_present() || e3.is_huge() {
+            return false;
+        }
+        let e2 = table_at(e3.frame_address()).entries[pdi];
+        if e2.raw() == 0 {
+            va = next_boundary(va, 1 << 21);
+            continue;
+        }
+        if !e2.is_present() || e2.is_huge() {
+            return false;
+        }
+        if table_at(e2.frame_address()).entries[pti].raw() != 0 {
+            return false;
+        }
+        va += PAGE_SIZE;
+    }
+    true
+}}
+
+/// Clear `[virt, virt + pages)` of mappings and reservations alike, freeing
+/// the frames this address space owns and the tables left empty. Returns how
+/// many frames went back to the allocator.
+///
+/// # Safety
+/// `pml4_phys` must point to a valid, identity-mapped user PML4 table, and the
+/// range must be in the user window.
+pub unsafe fn clear_range(pml4_phys: usize, virt: usize, pages: usize) -> usize { unsafe {
+    const TWO_MIB: usize = 512 * PAGE_SIZE;
+    let end = virt + pages * PAGE_SIZE;
+    let mut va = virt;
+    let mut freed = 0;
+    while va < end {
+        let (pml4i, pdpti, pdi, _) = table_indices(va);
+        let e4 = table_at(pml4_phys).entries[pml4i];
+        if !e4.is_present() {
+            va = next_boundary(va, 1 << 39);
+            continue;
+        }
+        let e3 = table_at(e4.frame_address()).entries[pdpti];
+        if !e3.is_present() || e3.is_huge() {
+            va = next_boundary(va, 1 << 30);
+            continue;
+        }
+        let pd = table_at(e3.frame_address());
+        let pde = pd.entries[pdi].raw();
+        let chunk_end = next_boundary(va, TWO_MIB).min(end);
+        if is_marker(pde) {
+            if va & (TWO_MIB - 1) == 0 && chunk_end - va == TWO_MIB {
+                pd.entries[pdi].clear();
+                reclaim_empty_tables(pml4_phys, va);
+                va = chunk_end;
+                continue;
+            }
+            // Part of it goes: it has to be a page table first.
+            if walk_create(pml4_phys, va, USER).is_err() {
+                // No memory for the table: the reservation stays whole.
+                va = chunk_end;
+                continue;
+            }
+        } else if pde & PRESENT == 0 || pde & HUGE_PAGE != 0 {
+            va = chunk_end;
+            continue;
+        }
+        let pt = table_at(pd.entries[pdi].frame_address());
+        while va < chunk_end {
+            let (_, _, _, pti) = table_indices(va);
+            let e = pt.entries[pti];
+            if e.is_present() {
+                if e.raw() & OWNED != 0 {
+                    pmm::free(pmm::PhysFrame::from_address(e.frame_address()));
+                    freed += 1;
+                }
+                pt.entries[pti].clear();
+                invlpg(va);
+            } else if e.raw() != 0 {
+                pt.entries[pti].clear();
+            }
+            va += PAGE_SIZE;
+        }
+        reclaim_empty_tables(pml4_phys, va - PAGE_SIZE);
+    }
+    freed
 }}
 
 /// Look up the leaf PTE flags for `virt` in the address space rooted at
@@ -580,9 +894,10 @@ pub unsafe fn unmap_page(
     Ok((frame_addr, flags))
 }}
 
-/// True if every entry in the table at `phys` is absent.
+/// True if every entry in the table at `phys` is zero: neither mapped nor
+/// reserved.
 unsafe fn table_is_empty(phys: usize) -> bool { unsafe {
-    table_at(phys).entries.iter().all(|e| !e.is_present())
+    table_at(phys).entries.iter().all(|e| e.raw() == 0)
 }}
 
 /// Walk back up from a just-cleared PTE, freeing each level that is now empty.

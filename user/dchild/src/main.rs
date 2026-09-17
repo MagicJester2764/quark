@@ -19,7 +19,8 @@
 //! until that closes; `lock2 PATH` locks byte 1, says so, waits for byte 0,
 //! and says so again once it has it. `unlinked PATH` makes a file, removes it
 //! while holding it open, and waits for ever: stopping the machine then is a
-//! crash with an orphan on the disk.
+//! crash with an orphan on the disk. `hog` reserves four gigabytes and
+//! touches them until something stops it.
 
 use quark_rt::ipc::{Message, TID_ANY};
 use quark_rt::manifest::CapReq;
@@ -86,6 +87,17 @@ pub extern "C" fn _start() -> ! {
         let mut buf = [0u8; 1];
         while held.is_some() && matches!(syscall::sys_fd_read(CONN, &mut buf), 1..=0xFFFF) {}
         syscall::sys_exit_code(if held.is_some() { 0 } else { 1 });
+    }
+    if quark_rt::args::argv(1) == Some(&b"hog"[..]) {
+        const HOG: usize = 0xB0_0000_0000;
+        if syscall::sys_map_anon(HOG, 1 << 20, false).is_err() {
+            syscall::sys_exit_code(1);
+        }
+        for page in 0..1usize << 20 {
+            unsafe { core::ptr::write_volatile((HOG + page * 4096) as *mut u8, 1) };
+        }
+        // Four gigabytes, and nobody stopped it.
+        syscall::sys_exit_code(2);
     }
     if quark_rt::args::argv(1) == Some(&b"unlinked"[..]) {
         let path = quark_rt::args::argv(2).unwrap_or(b"");

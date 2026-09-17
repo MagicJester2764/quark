@@ -142,7 +142,7 @@ typedef unsigned long size_t;
 static unsigned long mmap_next = MMAP_BASE;
 
 #define PAGE_SIZE 4096UL
-/* What sys_mmap will take in one call. */
+/* What sys_munmap will take in one call. */
 #define MAP_CHUNK 256UL
 
 static void unmap_pages(unsigned long at, unsigned long pages) {
@@ -157,26 +157,6 @@ static void unmap_pages(unsigned long at, unsigned long pages) {
     }
 }
 
-/* All of it or none of it. The kernel backs a mapping as it makes it, so a
-   request for more than the machine has gets part way before it is refused —
-   and what it got on the way has to go back. Kept, it was memory nobody could
-   free, sitting exactly where the next mapping would be put; the kernel never
-   maps over anything, so every request after the first refusal failed too. */
-static long map_pages(unsigned long at, unsigned long pages) {
-    unsigned long done = 0;
-    while (done < pages) {
-        unsigned long n = pages - done;
-        if (n > MAP_CHUNK) {
-            n = MAP_CHUNK;
-        }
-        if (__syscall2(SYS_MMAP, at + done * PAGE_SIZE, n) == QUARK_ERR) {
-            unmap_pages(at, done);
-            return -1;
-        }
-        done += n;
-    }
-    return 0;
-}
 
 #ifdef QUARK_ABI_TRACE
 /* A porting aid, off unless asked for: an unimplemented call otherwise reaches
@@ -204,17 +184,30 @@ static void trace(const char *what, long n) {
 #define trace(what, n) ((void)0)
 #endif
 
-static long do_mmap(unsigned long len) {
+#define LX_MAP_POPULATE  0x8000
+#define LX_MAP_NORESERVE 0x4000
+
+/* Anonymous memory is reserved whole and given its frames as it is touched,
+   as Linux gives them: a mapping far bigger than what is used costs what is
+   used. As Linux's overcommit heuristic does, a mapping bigger than the whole
+   machine is refused unless MAP_NORESERVE says the program knows — calloc of
+   a size nothing could hold has to come back NULL, not succeed and then die
+   reading it. MAP_POPULATE asks for all of it now, which can be refused. */
+static long do_mmap(unsigned long len, long flags) {
     if (len == 0) {
         return -LX_EINVAL;
     }
     unsigned long pages = (len + PAGE_SIZE - 1) / PAGE_SIZE;
     unsigned long at = mmap_next;
-    if (at + pages * PAGE_SIZE > MMAP_LIMIT) {
+    if (pages > (MMAP_LIMIT - at) / PAGE_SIZE) {
         trace("mmap-arena-full", (long)pages);
         return -LX_ENOMEM;
     }
-    if (map_pages(at, pages) != 0) {
+    unsigned long how = (flags & LX_MAP_POPULATE) ? QUARK_MAP_POPULATE : 0;
+    if (!(flags & LX_MAP_NORESERVE)) {
+        how |= QUARK_MAP_ACCOUNT;
+    }
+    if (__syscall3(SYS_MAP_ANON, at, pages, how) == QUARK_ERR) {
         trace("mmap-failed-pages", (long)pages);
         return -LX_ENOMEM;
     }
@@ -426,7 +419,7 @@ long __quark_syscall(long n, long a1, long a2, long a3, long a4, long a5, long a
         if (a5 != -1L) {
             return do_mmap_fd(a5, (unsigned long)a2);
         }
-        return do_mmap((unsigned long)a2);
+        return do_mmap((unsigned long)a2, a4);
 
     case LX_munmap:
         return do_munmap((unsigned long)a1, (unsigned long)a2);

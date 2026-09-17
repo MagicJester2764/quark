@@ -75,6 +75,12 @@
 #define SYS_TICKS           144
 #define SYS_BOOT_TIME       145
 
+/* 0xC0  memory, continued */
+#define SYS_MAP_ANON        192
+#define SYS_MEM_INFO        193
+#define QUARK_MAP_POPULATE  1UL
+#define QUARK_MAP_ACCOUNT   2UL
+
 /* 0xA0  kernel console */
 #define SYS_WRITE           160
 
