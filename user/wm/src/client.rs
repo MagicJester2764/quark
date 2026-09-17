@@ -1575,9 +1575,38 @@ impl Client {
                 self.objects.remove(object);
                 Ok(())
             }
-            // Maximise, fullscreen, minimise, move, resize: this compositor
-            // decides where windows go and how big they are, and says so by
-            // never sending a configure that offers the client a choice.
+            // move(seat, serial): the same grab a press on the title bar
+            // starts, asked for by a client that draws its own decorations.
+            //
+            // The serial is read and not checked. A compositor is meant to
+            // refuse a grab whose serial was not a recent press, which needs a
+            // history of serials this one does not keep; refusing on a serial
+            // it cannot verify would be pretending to a check rather than
+            // making one, and it is written down as a gap instead.
+            proto::TOPLEVEL_MOVE => {
+                let _seat = take_object(&self.rbuf, args, false)?;
+                let _serial = take_u32(&self.rbuf, args)?;
+                // Only while the button is actually down. The serial is read
+                // and not checked — this compositor keeps no history of
+                // serials, and refusing on one it cannot verify would be
+                // pretending to a check rather than making one — but a grab
+                // with nothing held would end at the next release or never,
+                // so a client could take the pointer away from the person
+                // using the machine by asking at the wrong moment.
+                if !crate::pointer_held() {
+                    return Ok(());
+                }
+                if let Some(s) = surface::get(idx) {
+                    if s.window != surface::NONE {
+                        let (x, y) = crate::cursor::position();
+                        crate::grab::start_move(s.window, x, y);
+                    }
+                }
+                Ok(())
+            }
+            // Maximise, fullscreen, minimise, resize: this compositor decides
+            // how big windows are, and says so by never sending a configure
+            // that offers the client a choice.
             _ => Ok(()),
         }
     }

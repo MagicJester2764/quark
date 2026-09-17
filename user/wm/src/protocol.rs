@@ -147,6 +147,10 @@ pub const XDG_SURFACE_CONFIGURE: u16 = 0;
 // xdg_toplevel requests and events.
 pub const TOPLEVEL_DESTROY: u16 = 0;
 pub const TOPLEVEL_SET_TITLE: u16 = 2;
+/// `move(seat, serial)`: the client asking for the grab a press on its own
+/// title bar would have started. A client that draws its own decorations has
+/// no other way to move its window, because it does not know where it is.
+pub const TOPLEVEL_MOVE: u16 = 5;
 pub const TOPLEVEL_CONFIGURE: u16 = 0;
 pub const TOPLEVEL_CLOSE: u16 = 1;
 

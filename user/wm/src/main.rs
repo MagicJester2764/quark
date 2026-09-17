@@ -64,6 +64,7 @@ mod client;
 mod clipboard;
 mod cursor;
 mod draw;
+mod grab;
 mod keymap;
 mod objects;
 mod protocol;
@@ -238,6 +239,64 @@ static mut SESSION_LEN: usize = 0;
 /// Total size of a window on screen, frame included.
 fn framed_size(w: &Window) -> (usize, usize) {
     (w.w + BORDER * 2, w.h + TITLE_H + BORDER * 2)
+}
+
+/// How much of a window must stay on the screen.
+///
+/// A window dragged off the right or the bottom edge with no title bar left to
+/// take hold of is a window that cannot be brought back, and this compositor
+/// has no list of windows to get it from.
+const MIN_ON_SCREEN: usize = 64;
+
+/// Where a window's top-left corner is, for anything that needs to work in the
+/// window's own coordinates.
+pub fn window_origin(idx: usize) -> Option<(usize, usize)> {
+    if idx >= MAX_WINDOWS {
+        return None;
+    }
+    let win = unsafe { &WINDOWS[idx] };
+    if win.used { Some((win.x, win.y)) } else { None }
+}
+
+/// Put a window's corner somewhere, and repaint what that costs.
+///
+/// The clamp keeps the title bar reachable rather than keeping the window on
+/// the screen: dragging a window mostly off the edge is a thing people do on
+/// purpose, and losing the handle that brings it back is not.
+pub fn move_window(idx: usize, x: usize, y: usize) {
+    if idx >= MAX_WINDOWS || !unsafe { WINDOWS[idx].used } {
+        return;
+    }
+    let s = unsafe { &SCREEN };
+    let (fw, _) = framed_size(unsafe { &WINDOWS[idx] });
+    let nx = x.min(s.width.saturating_sub(MIN_ON_SCREEN.min(fw)));
+    let ny = y.min(s.height.saturating_sub(TITLE_H + BORDER));
+    if (nx, ny) == (unsafe { WINDOWS[idx].x }, unsafe { WINDOWS[idx].y }) {
+        return;
+    }
+    let before = framed_rect(idx);
+    unsafe {
+        WINDOWS[idx].x = nx;
+        WINDOWS[idx].y = ny;
+    }
+    let after = framed_rect(idx);
+    // One region when they touch and two when they do not, which is the same
+    // rule the pointer follows: a window dragged across the screen would
+    // otherwise repaint everything between where it was and where it is.
+    if overlapping(before, after) {
+        refresh(union(before, after));
+    } else {
+        refresh(before);
+        refresh(after);
+    }
+}
+
+/// Is a point on a window's title bar — the compositor's own furniture rather
+/// than the client's pixels?
+fn on_title_bar(idx: usize, x: usize, y: usize) -> bool {
+    let win = unsafe { &WINDOWS[idx] };
+    let (fw, _) = framed_size(win);
+    x >= win.x && x < win.x + fw && y >= win.y && y < win.y + TITLE_H + BORDER
 }
 
 /// Where a window sits on the screen, frame included.
@@ -585,12 +644,7 @@ fn pump_mouse() {
         return;
     }
     if overlapping(before, after) {
-        refresh(Rect {
-            x0: before.x0.min(after.x0),
-            y0: before.y0.min(after.y0),
-            x1: before.x1.max(after.x1),
-            y1: before.y1.max(after.y1),
-        });
+        refresh(union(before, after));
     } else {
         refresh(before);
         refresh(after);
@@ -601,24 +655,68 @@ fn overlapping(a: Rect, b: Rect) -> bool {
     !a.clip_to(&b).is_empty()
 }
 
+/// The smallest rectangle covering both.
+fn union(a: Rect, b: Rect) -> Rect {
+    Rect {
+        x0: a.x0.min(b.x0),
+        y0: a.y0.min(b.y0),
+        x1: a.x1.max(b.x1),
+        y1: a.y1.max(b.y1),
+    }
+}
+
+/// The driver's button bits: left, right, middle.
+const MOUSE_LEFT: u8 = 1 << 0;
+
+/// Is the left button down right now?
+///
+/// Asked by the requests a client uses to start a grab. A grab ends when the
+/// button comes up, so one started with no button down would end at the next
+/// release — or never — and a client could take the pointer away from the
+/// person using the machine by asking at the wrong moment.
+pub fn pointer_held() -> bool {
+    unsafe { LAST_BUTTONS & MOUSE_LEFT != 0 }
+}
+
 /// Tell whoever is under the pointer where it is and what it is doing.
 fn dispatch_pointer(buttons: u8, wheel: i32) {
     let (x, y) = cursor::position();
+    let was = unsafe { LAST_BUTTONS };
+    let pressed = buttons & !was;
+    let released = was & !buttons;
+    unsafe { LAST_BUTTONS = buttons };
+
+    // A grab first, and nothing else while one is on: between a press on the
+    // compositor's own furniture and the release that ends it, the pointer is
+    // the compositor's. A client hearing a motion here would be a client told
+    // about a movement that was never about it.
+    if grab::active() {
+        grab::motion(x, y);
+        if released & MOUSE_LEFT != 0 {
+            grab::release();
+        }
+        return;
+    }
 
     // Click to focus, on a press and only when the window is not already
     // focused. Tested against the *framed* rectangle rather than the contents,
     // because clicking a title bar to raise a window is the oldest gesture
     // there is.
-    let pressed = unsafe { buttons & !LAST_BUTTONS != 0 };
-    if pressed {
+    if pressed != 0 {
         if let Some(idx) = framed_window_at(x, y) {
             if unsafe { FOCUS } != idx {
                 raise(idx);
                 composite();
             }
+            // And the title bar is a handle. A press there is the compositor's
+            // own, which is why the client is told nothing about it: the
+            // gesture is about where its window is, not about its contents.
+            if pressed & MOUSE_LEFT != 0 && on_title_bar(idx, x, y) {
+                grab::start_move(idx, x, y);
+                return;
+            }
         }
     }
-    unsafe { LAST_BUTTONS = buttons };
 
     // After the raise, not before: raising changes which window is topmost, so
     // a click on one window's border that overlaps another's contents would
@@ -958,6 +1056,9 @@ pub fn suggested_size() -> (usize, usize) {
 
 /// Take a window off the screen and give its memory back.
 fn destroy_window(idx: usize) {
+    // Before anything else: a grab about this window would go on moving a slot
+    // that is about to belong to somebody else.
+    grab::window_gone(idx);
     unsafe {
         let win = WINDOWS[idx];
         if !win.used {

@@ -158,12 +158,12 @@ pointer, and a scroll wheel reaches a client.*
 - Produces: `xdg_toplevel.move(seat, serial)` starts the same grab, which is
   how a client-side title bar asks for one.
 
-- [ ] **Step 1: The failing check.** A key script that starts
+- [x] **Step 1: The failing check.** A key script that starts
   `wm weston-simple-shm`, presses the left button on the title bar, moves the
   pointer 200 pixels right and 100 down, releases, and takes a screenshot.
   Expected today: the window has not moved, and the click only raised it.
 
-- [ ] **Step 2: The grab.** A press inside a window's title bar (the frame's
+- [x] **Step 2: The grab.** A press inside a window's title bar (the frame's
   top `TITLE_H` pixels, outside the close button) starts a move grab
   recording the window and the pointer's offset inside it. Motion sets the
   window's `x` and `y` — clamped so that at least the title bar stays on
@@ -171,13 +171,17 @@ pointer, and a scroll wheel reaches a client.*
   ends it. While a grab is on, pointer events do not reach any client: the
   pointer belongs to the compositor.
 
-- [ ] **Step 3: The request.** `xdg_toplevel.move(seat, serial)` starts the
+- [x] **Step 3: The request.** `xdg_toplevel.move(seat, serial)` starts the
   same grab for the window the surface is showing in, with the offset taken
   from the pointer's current position. The serial is not checked against a
   press, because this compositor does not keep a history of serials; that is
-  written down as a gap rather than pretended.
+  written down as a gap rather than pretended. What *is* checked is that the
+  button is down: a grab ends when it comes up, so one started with nothing
+  held would end at the next release or never, and a client could take the
+  pointer away from the person using the machine by asking at the wrong
+  moment.
 
-- [ ] **Step 4: Verify.** The Step 1 script: the window is where it was
+- [x] **Step 4: Verify.** The Step 1 script: the window is where it was
   dragged to, its contents intact, the backdrop repainted behind it. A drag
   that leaves the screen edge keeps the title bar reachable. `wlcairo` keeps
   animating while it is dragged.
