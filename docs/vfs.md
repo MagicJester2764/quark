@@ -275,11 +275,14 @@ links, devices and FAT32 files are `NOT_SUPPORTED`.
 
 The server is the object's pager (`docs/abi.md`, "Memory objects"): it answers
 `TAG_PAGE_IN` with the page read from the file, zeroes past its end, and
-releases an object once the kernel says nothing maps it. A file stays in use
-while it is mapped, as while a handle names it. What `WRITE` writes into a
-mapped file is copied into any of its pages the kernel has cached, and a
-`TRUNCATE` resizes the object, so a mapping and the file agree. Thirty files
-can be mapped at once.
+releases an object once the kernel says nothing maps it, having first
+written back every page written through a shared mapping; `TAG_OBJECT_SYNC`
+writes them back on request (`msync`). A file stays in use while it is
+mapped, as while a handle names it. The file and its mappings agree both
+ways: what `WRITE` writes is copied into any of its pages the kernel has
+cached, `READ` reads cached pages from the cache, and `TRUNCATE` resizes the
+object (pages already mapped stay; a new fault past the end is SIGBUS).
+Thirty files can be mapped at once.
 
 ### Devices
 

@@ -101,6 +101,9 @@ pub const PAGER_BIT: u64 = 1 << 62;
 pub const TAG_PAGE_IN: u64 = 0xFFFF_0005;
 /// Nothing maps an object any more: `data` = `[cookie, object id]`, sender 0.
 pub const TAG_OBJECT_IDLE: u64 = 0xFFFF_0006;
+/// A task asks, through the kernel, for an object's written pages to reach
+/// its file: `data` = `[cookie, object id]`, sender marked as for a page-in.
+pub const TAG_OBJECT_SYNC: u64 = 0xFFFF_0007;
 
 /// Idle objects a pager has been told about and has not collected. Deeper
 /// than the death queues: a pager with many files mapped may see many go at
@@ -887,9 +890,14 @@ fn call_inner(
 /// A call from the kernel, on behalf of the current task, to the pager of an
 /// object it touched: the pager fills `frame`, lent for writing, and replies.
 /// The task's own capabilities have nothing to do with it.
-pub fn pager_call(pager: usize, msg: &Message, frame: usize) -> Result<Message, IpcError> {
-    let lent = Lent { addr: frame, len: 4096, access: crate::lend::LEND_WRITE, frame: true };
-    call_as(pager, msg, 0, Some(lent), None, PAGER_BIT)
+pub fn pager_call(pager: usize, msg: &Message, frame: Option<usize>) -> Result<Message, IpcError> {
+    let lent = frame.map(|addr| Lent {
+        addr,
+        len: 4096,
+        access: crate::lend::LEND_WRITE,
+        frame: true,
+    });
+    call_as(pager, msg, 0, lent, None, PAGER_BIT)
 }
 
 fn call_as(

@@ -43,6 +43,7 @@ typedef unsigned long size_t;
 #define LX_mmap              9
 #define LX_mprotect         10
 #define LX_munmap           11
+#define LX_msync            26
 #define LX_brk              12
 #define LX_rt_sigaction     13
 #define LX_rt_sigprocmask   14
@@ -459,6 +460,21 @@ long __quark_syscall(long n, long a1, long a2, long a3, long a4, long a5, long a
 
     case LX_munmap:
         return do_munmap((unsigned long)a1, (unsigned long)a2);
+
+    /* What a shared mapping wrote reaches the file before this returns,
+       whether it was asked for now (MS_SYNC) or eventually (MS_ASYNC):
+       nothing here writes asynchronously. MS_INVALIDATE asks for nothing a
+       mapping of the cache itself needs. */
+    case LX_msync: {
+        if ((a1 & (PAGE_SIZE - 1)) || (a3 & ~7L) || ((a3 & 1) && (a3 & 4))) {
+            return -LX_EINVAL;
+        }
+        unsigned long pages = ((unsigned long)a2 + PAGE_SIZE - 1) / PAGE_SIZE;
+        if (pages == 0) {
+            return 0;
+        }
+        return __syscall2(SYS_OBJECT_SYNC, (unsigned long)a1, pages) == QUARK_ERR ? -LX_EIO : 0;
+    }
 
     /* Nothing here has page permissions to change after the fact, and the
        mapping already allows what was asked for. Advice about how a file will

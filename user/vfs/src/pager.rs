@@ -164,11 +164,74 @@ pub fn page_in(sender: usize, msg: &Message) {
     reply_opened(sender, [0; 6]);
 }
 
-/// TAG_OBJECT_IDLE: object `id` is mapped nowhere. Release it, and the inode
+/// Write every dirty page of object `id` (file `inode`) back to the file,
+/// clipped to its size.
+fn write_back(inode_num: u32, id: u64) -> Result<(), u64> {
+    let buf = unsafe { core::slice::from_raw_parts_mut(CLIENT_BUF as *mut u8, PAGE_SIZE) };
+    let mut from = 0u64;
+    loop {
+        let page = syscall::sys_object_ctl(id, syscall::OBJECT_TAKE_DIRTY, buf.as_mut_ptr() as u64, from);
+        if page == u64::MAX {
+            return Ok(());
+        }
+        from = page + 1;
+        let e2 = crate::ext2_state_mut();
+        let mut inode = ext2::read_inode(e2, inode_num)?;
+        let at = page * PAGE_SIZE as u64;
+        let size = inode.size64();
+        if at >= size {
+            continue;
+        }
+        let len = (size - at).min(PAGE_SIZE as u64) as u32;
+        ext2::write_file_data(e2, &mut inode, inode_num, at as u32, len)?;
+    }
+}
+
+/// TAG_OBJECT_SYNC, from the kernel for `sender`: what was written through
+/// shared mappings of inode `data[0]` goes to the file now.
+pub fn sync(sender: usize, msg: &Message) {
+    let inode_num = msg.data[0] as u32;
+    let id = msg.data[1];
+    if ext2_state().read_only {
+        return error_reply(sender, ERR_READ_ONLY);
+    }
+    match write_back(inode_num, id) {
+        Ok(()) => reply_opened(sender, [0; 6]),
+        Err(code) => error_reply(sender, code),
+    }
+}
+
+/// TAG_OBJECT_IDLE: object `id` (inode `inode`) is mapped nowhere. What was
+/// written through it goes to the file, then it is released, and the inode
 /// with it if nothing else holds that.
-pub fn idle(id: u64) {
+pub fn idle(inode_num: u32, id: u64) {
+    if !ext2_state().read_only {
+        if let Err(code) = write_back(inode_num, id) {
+            quark_rt::println!("[vfs] could not write back inode {} ({})", inode_num, code);
+        }
+    }
     if let Some(ino) = try_release(id) {
         crate::settle(&[ino]);
+    }
+}
+
+/// `CLIENT_BUF` holds `len` bytes of `inode` read from the disk at `offset`.
+/// Any of it a mapping has cached is newer: copy that over it.
+pub fn read_through(inode: u32, offset: u64, len: usize) {
+    let Some(m) = find(inode) else { return };
+    let out = unsafe { core::slice::from_raw_parts_mut(CLIENT_BUF as *mut u8, len) };
+    let buf = page_buf();
+    let mut done = 0usize;
+    while done < len {
+        let at = offset + done as u64;
+        let page = at / PAGE_SIZE as u64;
+        let within = (at % PAGE_SIZE as u64) as usize;
+        let n = (PAGE_SIZE - within).min(len - done);
+        let ptr = buf.as_mut_ptr() as u64;
+        if syscall::sys_object_ctl(m.id, syscall::OBJECT_READ_PAGE, ptr, page) == 1 {
+            out[done..done + n].copy_from_slice(&buf[within..within + n]);
+        }
+        done += n;
     }
 }
 

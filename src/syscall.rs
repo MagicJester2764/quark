@@ -227,6 +227,8 @@ pub const SYS_OBJECT_CREATE: u64 = 194;
 pub const SYS_OBJECT_MAP: u64 = 195;
 /// A pager's operations on its object.
 pub const SYS_OBJECT_CTL: u64 = 196;
+/// Have what was written through shared mappings in a range reach the files.
+pub const SYS_OBJECT_SYNC: u64 = 197;
 /// SYS_OBJECT_MAP's flags.
 const OBJECT_MAP_WRITE: u64 = 1;
 const OBJECT_MAP_SHARED: u64 = 2;
@@ -243,7 +245,7 @@ pub const SYS_ABI_VERSION: u64 = 240;
 /// minor when calls are added. User space can refuse to run against a major it
 /// does not know, which is the point of exposing it at all.
 pub const ABI_VERSION_MAJOR: u64 = 2;
-pub const ABI_VERSION_MINOR: u64 = 6;
+pub const ABI_VERSION_MINOR: u64 = 7;
 
 /// Threads a task may make with no capability at all.
 ///
@@ -2231,6 +2233,31 @@ extern "C" fn syscall_dispatch(
                 return u64::MAX;
             }
             crate::memobj::ctl(scheduler::current_tid(), arg0, op, arg2, arg3)
+        }
+        SYS_OBJECT_SYNC => {
+            // arg0 = start address, arg1 = pages. Each object mapped shared
+            // there is asked, by its pager, to write back; this returns when
+            // they have all answered.
+            let (vaddr, pages) = (arg0 as usize & !0xFFF, arg1 as usize);
+            if pages == 0 || pages > MAP_ANON_MAX || !paging::user_range_ok(vaddr, pages) {
+                return u64::MAX;
+            }
+            let mut slots = [0usize; 16];
+            let n = unsafe { paging::shared_objects_in(paging::read_cr3(), vaddr, pages, &mut slots) };
+            let mut ok = true;
+            for &slot in &slots[..n] {
+                let Some((pager, cookie, id)) = crate::memobj::pager_of(slot) else {
+                    ok = false;
+                    continue;
+                };
+                let msg = crate::ipc::Message {
+                    sender: 0,
+                    tag: crate::ipc::TAG_OBJECT_SYNC,
+                    data: [cookie, id, 0, 0, 0, 0],
+                };
+                ok &= matches!(crate::ipc::pager_call(pager, &msg, None), Ok(r) if r.tag == 0);
+            }
+            if ok { 0 } else { u64::MAX }
         }
         SYS_MEM_INFO => {
             let free = crate::pmm::free_count() as u64;

@@ -118,6 +118,7 @@ pub const SYS_MEM_INFO: u64 = 193;
 pub const SYS_OBJECT_CREATE: u64 = 194;
 pub const SYS_OBJECT_MAP: u64 = 195;
 pub const SYS_OBJECT_CTL: u64 = 196;
+pub const SYS_OBJECT_SYNC: u64 = 197;
 
 /// `sys_object_map`'s flags.
 pub const OBJECT_MAP_WRITE: u64 = 1;
@@ -725,6 +726,13 @@ pub fn sys_object_map(slot: usize, addr: usize, pages: usize, first: u64, flags:
 /// comes back, depend on the operation.
 pub fn sys_object_ctl(id: u64, op: u64, a: u64, b: u64) -> u64 {
     unsafe { syscall4(SYS_OBJECT_CTL, id, op, a, b) }
+}
+
+/// Have what was written through shared file mappings in `pages` pages from
+/// `addr` reach the files, returning once it has.
+pub fn sys_object_sync(addr: usize, pages: usize) -> Result<(), ()> {
+    let ret = unsafe { syscall2(SYS_OBJECT_SYNC, addr as u64, pages as u64) };
+    if ret == u64::MAX { Err(()) } else { Ok(()) }
 }
 
 /// Free frames in the machine, and pages charged to this task.

@@ -1405,7 +1405,12 @@ pub extern "C" fn _start() -> ! {
             quark_rt::ipc::TAG_PAGE_IN if sender & quark_rt::ipc::PAGER_BIT != 0 => {
                 pager::page_in(sender, &msg)
             }
-            quark_rt::ipc::TAG_OBJECT_IDLE if sender == 0 => pager::idle(msg.data[1]),
+            quark_rt::ipc::TAG_OBJECT_SYNC if sender & quark_rt::ipc::PAGER_BIT != 0 => {
+                transacted(|| pager::sync(sender, &msg))
+            }
+            quark_rt::ipc::TAG_OBJECT_IDLE if sender == 0 => {
+                transacted(|| pager::idle(msg.data[0] as u32, msg.data[1]))
+            }
             // A task waiting for a lock has gone; nobody is left to answer.
             quark_rt::ipc::TAG_TASK_DIED if sender == 0 => locks::drop_task(msg.data[0] as usize),
             TAG_TRUNCATE => transacted(|| handle_truncate(sender, &msg)),
@@ -2383,11 +2388,17 @@ fn handle_read_ext2(sender: usize, msg: &Message) {
 
     match get_handle(handle, sender) {
         Some(file) => {
-            let inode = match ext2::read_inode(ext2_state(), file.inode_num()) {
+            let ino = file.inode_num();
+            let inode = match ext2::read_inode(ext2_state(), ino) {
                 Ok(inode) => inode,
                 Err(code) => return error_reply(sender, code),
             };
-            reply_read(sender, ext2::read_file_data(ext2_state(), &inode, offset, max_bytes));
+            let read = ext2::read_file_data(ext2_state(), &inode, offset, max_bytes);
+            // A shared mapping's writes are in the cache before the file.
+            if let Ok(n) = read {
+                pager::read_through(ino, offset as u64, n as usize);
+            }
+            reply_read(sender, read);
         }
         None => error_reply(sender, ERR_INVALID_HANDLE),
     }

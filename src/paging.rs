@@ -357,10 +357,7 @@ pub unsafe fn map_page(
     if old.is_present() && old.raw() & OWNED != 0 && old.frame_address() != phys_addr {
         pmm::free(pmm::PhysFrame::from_address(old.frame_address()));
     }
-    let slot = object_slot(old.raw());
-    if slot != 0 {
-        crate::memobj::unmap_ref(slot, 1);
-    }
+    crate::memobj::drop_entry(old.raw());
 
     pt.entries[pti].set(phys_addr, flags);
 
@@ -540,7 +537,7 @@ unsafe fn back_object(pml4_phys: usize, virt: usize, raw: u64, may_block: bool) 
         // The object's page itself, which this address space does not own.
         if shared && writable {
             // Anything written through it has to go back to the file.
-            crate::memobj::mark_dirty(slot, page);
+            crate::memobj::mapped_writable(slot, page);
         }
         let w = if shared && writable { WRITABLE } else { 0 };
         pt.entries[pti].set(frame, PRESENT | USER | w | keep);
@@ -596,6 +593,35 @@ pub unsafe fn back_range(pml4_phys: usize, addr: u64, len: u64, write: bool) -> 
         page += PAGE_SIZE as u64;
     }
     Ok(())
+}}
+
+/// The objects mapped shared, and so writable through to their files, in
+/// `[virt, virt + pages)`: up to `out.len()` distinct slots, and how many.
+///
+/// # Safety
+/// `pml4_phys` must point to a valid, identity-mapped PML4 table.
+pub unsafe fn shared_objects_in(pml4_phys: usize, virt: usize, pages: usize, out: &mut [usize]) -> usize { unsafe {
+    let end = virt.saturating_add(pages.saturating_mul(PAGE_SIZE));
+    let mut va = virt;
+    let mut n = 0;
+    while va < end {
+        let Some(pt) = leaf_table(pml4_phys, va) else {
+            va = next_boundary(va, 1 << 21);
+            continue;
+        };
+        let (_, _, _, pti) = table_indices(va);
+        let raw = pt.entries[pti].raw();
+        let slot = object_slot(raw);
+        // Present and not the address space's own: the object's frame, which
+        // a private writable mapping never maps.
+        let shared = slot != 0 && raw & PRESENT != 0 && raw & OWNED == 0;
+        if shared && !out[..n].contains(&slot) && n < out.len() {
+            out[n] = slot;
+            n += 1;
+        }
+        va += PAGE_SIZE;
+    }
+    n
 }}
 
 /// The next address after `va` that is a multiple of `size`.
@@ -693,7 +719,6 @@ pub unsafe fn clear_range(pml4_phys: usize, virt: usize, pages: usize) -> usize 
         while va < chunk_end {
             let (_, _, _, pti) = table_indices(va);
             let e = pt.entries[pti];
-            let slot = object_slot(e.raw());
             if e.is_present() {
                 if e.raw() & OWNED != 0 {
                     pmm::free(pmm::PhysFrame::from_address(e.frame_address()));
@@ -704,9 +729,7 @@ pub unsafe fn clear_range(pml4_phys: usize, virt: usize, pages: usize) -> usize 
             } else if e.raw() != 0 {
                 pt.entries[pti].clear();
             }
-            if slot != 0 {
-                crate::memobj::unmap_ref(slot, 1);
-            }
+            crate::memobj::drop_entry(e.raw());
             va += PAGE_SIZE;
         }
         reclaim_empty_tables(pml4_phys, va - PAGE_SIZE);
@@ -958,10 +981,7 @@ unsafe fn free_pt_leaves(pt_phys: usize) { unsafe {
             pmm::free(pmm::PhysFrame::from_address(frame_phys));
         }
         // Mapped or reserved, a page of an object is one reference fewer.
-        let slot = object_slot(pt.entries[i].raw());
-        if slot != 0 {
-            crate::memobj::unmap_ref(slot, 1);
-        }
+        crate::memobj::drop_entry(pt.entries[i].raw());
     }
     pmm::free(pmm::PhysFrame::from_address(pt_phys));
 }}
@@ -1003,10 +1023,7 @@ pub unsafe fn unmap_page(
 
     let frame_addr = pt.entries[pti].frame_address();
     let flags = pt.entries[pti].flags();
-    let slot = object_slot(pt.entries[pti].raw());
-    if slot != 0 {
-        crate::memobj::unmap_ref(slot, 1);
-    }
+    crate::memobj::drop_entry(pt.entries[pti].raw());
     pt.entries[pti].clear();
 
     invlpg(virt_addr);

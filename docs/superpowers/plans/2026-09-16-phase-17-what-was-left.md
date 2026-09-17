@@ -1256,7 +1256,7 @@ e2fsck clean.
 
 A shared page is the cached frame itself, mapped into every program that maps it, so all of them see one another's writes at once, and `read()` sees them because a mapped inode is read through its cache. A frame mapped writable is marked dirty for as long as it is mapped that way; the pager writes back every dirty page when the object goes idle, when `msync` asks, and before it releases the object. `write()` updates the cached copy in place, so mappings see it too. Shortening the file leaves pages already mapped as they are; a new fault past the new end is `SIGBUS`.
 
-- [ ] **Step 1: The failing test.** `maptest.c` gains, before `tidy up`:
+- [x] **Step 1: The failing test.** `maptest.c` gains, before `tidy up`:
 
 ```c
     fd = open(F, O_RDWR | O_CREAT | O_TRUNC, 0644);
@@ -1285,15 +1285,27 @@ A shared page is the cached frame itself, mapped into every program that maps it
 
 dtest `memory`: `dchild mapwrite /tmp/dtest-map` maps the (dtest-created, 4096-byte) file shared, writes `from the child` at offset 0 and exits without `msync`; afterwards dtest's `vfs::read` finds it (the object went idle when the child's address space was destroyed and the VFS wrote it back).
 
-- [ ] **Step 2: Run it.** Expected: `two shared mappings` passes (Task 10 maps them) but `see each other's writes` fails — each mapping has its own copy.
+- [x] **Step 2: Run it.** Expected: `two shared mappings` passes (Task 10 maps them) but `see each other's writes` fails — each mapping has its own copy.
 
-- [ ] **Step 3: Implement.** In `back`, an object marker with `MARKER_SHARED` maps the cached frame itself, writable if the marker is, and a writable one adds the page to `dirty`. `SYS_OBJECT_SYNC` walks the caller's range for entries with slot bits and `MARKER_SHARED`, and makes one `pager_call` per object with `TAG_OBJECT_SYNC`. The pager's `sync` and `idle` loop `SYS_OBJECT_CTL` op 3, writing each dirty page with the ordinary write path (clipped to the file's size), and op 4 releases after `idle`. `msync` in the layer calls `SYS_OBJECT_SYNC` for `MS_SYNC` and `MS_ASYNC` alike (asynchronous writing is not offered); `MS_INVALIDATE` is accepted and does nothing more.
+- [x] **Step 3: Implement.** In `back`, an object marker with `MARKER_SHARED` maps the cached frame itself, writable if the marker is, and a writable one adds the page to `dirty`. `SYS_OBJECT_SYNC` walks the caller's range for entries with slot bits and `MARKER_SHARED`, and makes one `pager_call` per object with `TAG_OBJECT_SYNC`. The pager's `sync` and `idle` loop `SYS_OBJECT_CTL` op 3, writing each dirty page with the ordinary write path (clipped to the file's size), and op 4 releases after `idle`. `msync` in the layer calls `SYS_OBJECT_SYNC` for `MS_SYNC` and `MS_ASYNC` alike (asynchronous writing is not offered); `MS_INVALIDATE` is accepted and does nothing more.
 
-- [ ] **Step 4: Verify.** Build, layer, suites, image; boot `runtests /etc/libc.tests`, `dtest memory`, `dtest`; `check-rootfs.sh`; the same on `make hd-ext4`.
+- [x] **Step 4: Verify.** Build, layer, suites, image; boot `runtests /etc/libc.tests`, `dtest memory`, `dtest`; `check-rootfs.sh`; the same on `make hd-ext4`.
 
-- [ ] **Step 5: Commit.** quark: "Shared file mappings"; explosion: "maptest: shared mappings".
+- [x] **Step 5: Commit.** quark: "Shared file mappings"; explosion: "maptest: shared mappings".
+
+**Done.** Task 10 already mapped the cached frame for a shared mapping, so
+step 2's expected failure would not have shown; the step was not run. What
+this task added: a page stays dirty while anything maps it writable (the
+object counts such entries, and `drop_entry` takes them back as entries go),
+so `TAKE_DIRTY` takes a starting page and the pager walks on from each page;
+`SYS_OBJECT_SYNC` (197, ABI 2.7) and `TAG_OBJECT_SYNC`; write-back on sync
+and before release, in a transaction; `READ` overlays cached pages; `msync`.
+maptest also checks that a write no `msync` asked for reaches the file.
+libc.tests 12/12 on ext2 and ext4, `dtest memory` 14/0, `dtest` 262/0,
+e2fsck clean on both.
 
 ---
+
 ### Task 12: Font caches built with the image
 
 **Files:**

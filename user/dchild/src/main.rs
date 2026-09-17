@@ -20,7 +20,8 @@
 //! and says so again once it has it. `unlinked PATH` makes a file, removes it
 //! while holding it open, and waits for ever: stopping the machine then is a
 //! crash with an orphan on the disk. `hog` reserves four gigabytes and
-//! touches them until something stops it.
+//! touches them until something stops it. `mapwrite PATH` maps a file shared,
+//! writes into it, and exits without asking for it to be written back.
 
 use quark_rt::ipc::{Message, TID_ANY};
 use quark_rt::manifest::CapReq;
@@ -98,6 +99,27 @@ pub extern "C" fn _start() -> ! {
         }
         // Four gigabytes, and nobody stopped it.
         syscall::sys_exit_code(2);
+    }
+    if quark_rt::args::argv(1) == Some(&b"mapwrite"[..]) {
+        const AT: usize = 0xB4_0000_0000;
+        let path = quark_rt::args::argv(2).unwrap_or(b"");
+        let mapped = nameserver::lookup_retry(b"vfs", 20).and_then(|vfs| {
+            let o = vfs::open_with(vfs, path, 0).ok()?;
+            let (slot, _) = vfs::map(vfs, o.handle, true).ok()?;
+            let flags = syscall::OBJECT_MAP_WRITE | syscall::OBJECT_MAP_SHARED;
+            let made = syscall::sys_object_map(slot, AT, 1, 0, flags);
+            let _ = syscall::sys_cap_delete(slot);
+            let _ = vfs::close(vfs, o.handle);
+            made.ok()
+        });
+        if mapped.is_none() {
+            syscall::sys_exit_code(1);
+        }
+        let text = b"from the child";
+        for (i, &b) in text.iter().enumerate() {
+            unsafe { core::ptr::write_volatile((AT + i) as *mut u8, b) };
+        }
+        syscall::sys_exit_code(0);
     }
     if quark_rt::args::argv(1) == Some(&b"unlinked"[..]) {
         let path = quark_rt::args::argv(2).unwrap_or(b"");

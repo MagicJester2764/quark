@@ -49,6 +49,9 @@ struct Object {
     bytes: u64,
     /// Page-table entries, present or not, that name this object.
     mapped: u64,
+    /// Of those, the ones mapping a cached frame writable. While any does, a
+    /// dirty page stays dirty after it is taken: it can change again unseen.
+    writable: u64,
 }
 
 impl Object {
@@ -60,6 +63,7 @@ impl Object {
         cookie: 0,
         bytes: 0,
         mapped: 0,
+        writable: 0,
     };
 
     fn pages(&self) -> u64 {
@@ -190,6 +194,7 @@ pub fn create(pager: usize, cookie: u64, bytes: u64) -> Option<(usize, u64)> {
             cookie,
             bytes,
             mapped: 0,
+            writable: 0,
         };
         (slot, id)
     });
@@ -207,6 +212,47 @@ fn release(slot: usize) {
         }
     }
     objects()[slot] = Object::EMPTY;
+}
+
+/// A page-table entry that named an object has been cleared or replaced.
+/// `raw` is what it held.
+pub fn drop_entry(raw: u64) {
+    let slot = crate::paging::object_slot(raw);
+    if slot == 0 {
+        return;
+    }
+    let shared_writable = raw & crate::paging::PRESENT != 0
+        && raw & crate::paging::WRITABLE != 0
+        && raw & crate::paging::OWNED == 0;
+    if shared_writable {
+        let flags = irq_save();
+        if let Some(o) = object(slot, 0) {
+            o.writable = o.writable.saturating_sub(1);
+        }
+        irq_restore(flags);
+    }
+    unmap_ref(slot, 1);
+}
+
+/// A page of the object in `slot` has been mapped writable, straight from the
+/// cache: it is dirty, and stays so while mapped that way.
+pub fn mapped_writable(slot: usize, page: u64) {
+    let flags = irq_save();
+    if let Some(o) = object(slot, 0) {
+        o.writable += 1;
+    }
+    if let Some(e) = find(key(slot, page)) {
+        e.dirty = true;
+    }
+    irq_restore(flags);
+}
+
+/// The pager and cookie of the object in `slot`, for a sync.
+pub fn pager_of(slot: usize) -> Option<(usize, u64, u64)> {
+    let flags = irq_save();
+    let found = object(slot, 0).filter(|o| o.pager_alive()).map(|o| (o.pager, o.cookie, o.id));
+    irq_restore(flags);
+    found
 }
 
 /// `n` more page-table entries name the object in `slot`.
@@ -282,7 +328,7 @@ pub fn page_in(slot: usize, page: u64, may_block: bool) -> Result<usize, Fault> 
         tag: ipc::TAG_PAGE_IN,
         data: [o.cookie, page, o.id, 0, 0, 0],
     };
-    let answered = ipc::pager_call(o.pager, &msg, frame);
+    let answered = ipc::pager_call(o.pager, &msg, Some(frame));
     let filled = matches!(answered, Ok(ref reply) if reply.tag == 0);
 
     let flags = irq_save();
@@ -306,16 +352,6 @@ pub fn page_in(slot: usize, page: u64, may_block: bool) -> Result<usize, Fault> 
     };
     irq_restore(flags);
     result
-}
-
-/// Page `page` of the object in `slot` has been written through a shared
-/// mapping.
-pub fn mark_dirty(slot: usize, page: u64) {
-    let flags = irq_save();
-    if let Some(e) = find(key(slot, page)) {
-        e.dirty = true;
-    }
-    irq_restore(flags);
 }
 
 /// `SYS_OBJECT_CTL`: the pager's operations on its own object. `buf` has been
@@ -355,17 +391,30 @@ fn ctl_locked(caller: usize, id: u64, op: u64, a: u64, b: u64) -> u64 {
             1
         }
         CTL_TAKE_DIRTY => {
-            for e in cache().iter_mut() {
-                if e.key != EMPTY_KEY && e.key != GONE_KEY && (e.key >> 40) as usize == slot && e.dirty {
-                    e.dirty = false;
-                    let _ua = crate::cpu::UserAccess::begin();
-                    unsafe {
-                        core::ptr::copy_nonoverlapping(e.frame as *const u8, a as *mut u8, PAGE);
+            // The dirty page with the lowest index at or after `b`. A page
+            // still mapped writable somewhere stays dirty, so a pager walks
+            // on from the page it was given rather than asking again.
+            let keep = o.writable != 0;
+            let mut best: Option<usize> = None;
+            for (i, e) in cache().iter().enumerate() {
+                let live = e.key != EMPTY_KEY && e.key != GONE_KEY;
+                if live && e.dirty && (e.key >> 40) as usize == slot && e.key & MAX_PAGE >= b {
+                    let page = e.key & MAX_PAGE;
+                    if best.is_none_or(|j| cache()[j].key & MAX_PAGE > page) {
+                        best = Some(i);
                     }
-                    return e.key & MAX_PAGE;
                 }
             }
-            u64::MAX
+            let Some(i) = best else { return u64::MAX };
+            let e = &mut cache()[i];
+            if !keep {
+                e.dirty = false;
+            }
+            let _ua = crate::cpu::UserAccess::begin();
+            unsafe {
+                core::ptr::copy_nonoverlapping(e.frame as *const u8, a as *mut u8, PAGE);
+            }
+            e.key & MAX_PAGE
         }
         CTL_RELEASE => {
             if o.mapped != 0 {

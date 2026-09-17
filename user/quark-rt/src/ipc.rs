@@ -50,5 +50,8 @@ pub const TAG_SPACE_DIED: u64 = 0xFFFF_0004;
 pub const TAG_PAGE_IN: u64 = 0xFFFF_0005;
 /// Nothing maps an object any more: `data` is `[cookie, object id]`, sender 0.
 pub const TAG_OBJECT_IDLE: u64 = 0xFFFF_0006;
-/// Set in `sender` by the kernel alone, on `TAG_PAGE_IN`.
+/// A program asked, through the kernel, for an object's written pages to reach
+/// its file: `data` is `[cookie, object id]`, sender marked as for a page-in.
+pub const TAG_OBJECT_SYNC: u64 = 0xFFFF_0007;
+/// Set in `sender` by the kernel alone, on `TAG_PAGE_IN` and `TAG_OBJECT_SYNC`.
 pub const PAGER_BIT: usize = 1 << 62;

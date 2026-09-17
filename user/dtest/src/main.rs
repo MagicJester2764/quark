@@ -1364,6 +1364,33 @@ fn test_memory() {
     check("and the range is free again", syscall::sys_mmap(LAZY, 1).is_ok());
     let _ = syscall::sys_munmap(LAZY, 1);
 
+    // A file written through a shared mapping, by a program that then exits
+    // without asking for it to be written back: it is written back anyway.
+    const MAPPED: &[u8] = b"/tmp/dtest-map";
+    let shared = nameserver::lookup_retry(b"vfs", 20).and_then(|vfs_tid| {
+        let o = vfs::open_with(vfs_tid, MAPPED, vfs::OPEN_CREATE | vfs::OPEN_TRUNCATE).ok()?;
+        let _ = vfs::truncate(vfs_tid, o.handle, 4096);
+        let _ = vfs::close(vfs_tid, o.handle);
+        let child = load_child(&[b"dchild", b"mapwrite", MAPPED])?;
+        let _ = vfs::give_cwd(vfs_tid, child.tid);
+        let _ = child.start();
+        let code = wait_for(child.tid);
+        let (h, _, _) = vfs::open(vfs_tid, MAPPED).ok()?;
+        let mut got = [0u8; 14];
+        let n = vfs::read(vfs_tid, h, &mut got, 0);
+        let _ = vfs::close(vfs_tid, h);
+        let _ = vfs::unlink(vfs_tid, MAPPED);
+        Some((code, n, got))
+    });
+    check(
+        "a child writes a file through a shared mapping",
+        matches!(shared, Some((Some(0), _, _))),
+    );
+    check(
+        "and the file has it once the child has gone",
+        matches!(shared, Some((_, Ok(14), got)) if &got == b"from the child"),
+    );
+
     // A program that takes more than it may is stopped, and gives it all back.
     let hog = load_child(&[b"dchild", b"hog"]).map(|c| {
         let _ = syscall::sys_set_mem_limit(c.tid, 2048);
