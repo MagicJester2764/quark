@@ -40,3 +40,7 @@ pub const TAG_NOTIFICATION: u64 = 0xFFFF_0002;
 /// up — a receive loop that reads sender 0 as "an IRQ" needs to check the tag
 /// before it believes that.
 pub const TAG_TASK_DIED: u64 = 0xFFFF_0003;
+
+/// From the kernel (sender 0): program `data[0]` — a space id — has no task
+/// left. See `syscall::sys_space_watch`.
+pub const TAG_SPACE_DIED: u64 = 0xFFFF_0004;

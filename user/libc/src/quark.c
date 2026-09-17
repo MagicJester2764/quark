@@ -73,17 +73,15 @@ size_t quark_lookup(const char *name) {
     return (size_t)reply.tag;
 }
 
-size_t quark_vfs(void) {
-    static size_t tid;
-    static int looked;
+static size_t vfs_tid;
 
+size_t quark_vfs(void) {
     /* Services come up alongside their clients, so an answer of "not yet" is
        worth asking about again; an answer of "here it is" is not. */
-    if (!looked || tid == 0) {
-        tid = quark_lookup("vfs");
-        looked = 1;
+    if (vfs_tid == 0) {
+        vfs_tid = quark_lookup("vfs");
     }
-    return tid;
+    return vfs_tid;
 }
 
 /* ------------------------------------------------------------------------ */
@@ -109,7 +107,20 @@ static int vfs_call_lend(struct quark_msg *msg, struct quark_msg *reply,
     int r = buf ? quark_call_lend(vfs, msg, reply, buf, len, access)
                 : quark_call(vfs, msg, reply);
     if (r != 0) {
-        return QUARK_VFS_UNREACHABLE;
+        /* A thread holds the capabilities its program held when the thread
+           started, not ones gained since, so a call that works from one
+           thread can be refused from another. Looking the server up again
+           grants this one its own, and finds a server that has restarted. */
+        vfs = quark_lookup("vfs");
+        if (vfs == 0) {
+            return QUARK_VFS_UNREACHABLE;
+        }
+        vfs_tid = vfs;
+        r = buf ? quark_call_lend(vfs, msg, reply, buf, len, access)
+                : quark_call(vfs, msg, reply);
+        if (r != 0) {
+            return QUARK_VFS_UNREACHABLE;
+        }
     }
     if (reply->tag == QUARK_ERR) {
         /* The server puts its code in the first word. A zero there would be

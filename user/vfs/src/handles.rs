@@ -6,10 +6,12 @@
 //! a file shortened through one cannot be written past its end through a
 //! stale block map in the other.
 //!
-//! A handle belongs to the task that opened it and goes when that task does.
-//! The server watches every task it gives a handle to; left behind, a dead
-//! task's handles would fill the table, and a task given its TID later would
-//! find them to be its own.
+//! A handle belongs to the program that opened it — every thread of it may use
+//! it — and goes when the program does. Programs are named by their address
+//! space's id, which the kernel never reuses; a TID would have made a file one
+//! thread opened useless to its siblings, and, being recycled, would have
+//! handed a dead task's files to whatever took its slot. The server watches
+//! every program it gives a handle to.
 
 use quark_rt::syscall;
 
@@ -32,7 +34,8 @@ pub enum FsFileData {
 
 pub struct OpenFile {
     pub in_use: bool,
-    pub owner_tid: usize,
+    /// The owning program's space id.
+    pub owner: u64,
     /// FAT32's size, which lives in its directory entry. An ext2 handle reads
     /// the inode instead.
     pub file_size: u32,
@@ -46,7 +49,7 @@ impl OpenFile {
     pub const fn empty() -> Self {
         OpenFile {
             in_use: false,
-            owner_tid: 0,
+            owner: 0,
             file_size: 0,
             is_dir: false,
             writable: false,
@@ -75,39 +78,42 @@ fn table() -> &'static mut [OpenFile; MAX_OPEN_FILES] {
 
 /// Put `file` in the table and return its handle, or None if it is full.
 pub fn alloc(file: OpenFile) -> Option<usize> {
-    let owner = file.owner_tid;
+    let owner = file.owner;
+    if owner == 0 {
+        return None;
+    }
     let t = table();
     let i = t.iter().position(|f| !f.in_use)?;
     t[i] = file;
     t[i].in_use = true;
-    // Told when the owner dies, so its handles go with it. Watching a task
-    // twice is the same as watching it once, and a task already dead cannot
-    // be calling.
-    let _ = syscall::sys_task_watch(owner);
+    // Told when the program is gone, so its handles go with it. Watching a
+    // program twice is the same as watching it once, and a program already
+    // gone cannot be calling.
+    let _ = syscall::sys_space_watch(owner);
     Some(i)
 }
 
-/// `tid`'s handle `handle`, if it is one.
-pub fn get(handle: usize, tid: usize) -> Option<&'static mut OpenFile> {
+/// Program `space`'s handle `handle`, if it is one.
+pub fn get(handle: usize, space: u64) -> Option<&'static mut OpenFile> {
     let f = table().get_mut(handle)?;
-    if f.in_use && f.owner_tid == tid { Some(f) } else { None }
+    if f.in_use && space != 0 && f.owner == space { Some(f) } else { None }
 }
 
-/// Close `tid`'s handle `handle`. Returns the inode it named (0 for FAT32),
-/// or None if it was not one of `tid`'s.
-pub fn close(handle: usize, tid: usize) -> Option<u32> {
-    let f = get(handle, tid)?;
+/// Close program `space`'s handle `handle`. Returns the inode it named (0 for
+/// FAT32), or None if it was not one of that program's.
+pub fn close(handle: usize, space: u64) -> Option<u32> {
+    let f = get(handle, space)?;
     let ino = f.inode_num();
     *f = OpenFile::empty();
     Some(ino)
 }
 
-/// Close every handle `tid` held. The inodes they named are written to
-/// `closed`, and their number returned.
-pub fn close_all(tid: usize, closed: &mut [u32; MAX_OPEN_FILES]) -> usize {
+/// Close every handle program `space` held. The inodes they named are written
+/// to `closed`, and their number returned.
+pub fn close_all(space: u64, closed: &mut [u32; MAX_OPEN_FILES]) -> usize {
     let mut n = 0;
     for f in table().iter_mut() {
-        if f.in_use && f.owner_tid == tid {
+        if f.in_use && f.owner == space {
             closed[n] = f.inode_num();
             n += 1;
             *f = OpenFile::empty();

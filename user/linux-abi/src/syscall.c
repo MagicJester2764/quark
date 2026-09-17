@@ -101,6 +101,8 @@ typedef unsigned long size_t;
 #define LX_AT_REMOVEDIR  0x200
 #define LX_getdents64      217
 #define LX_dup              32
+#define LX_pread64          17
+#define LX_pwrite64         18
 #define LX_dup2             33
 #define LX_dup3            292
 #define LX_O_CLOEXEC  02000000
@@ -560,6 +562,10 @@ long __quark_syscall(long n, long a1, long a2, long a3, long a4, long a5, long a
 
     case LX_fcntl:
         return __quark_fcntl(a1, a2, a3);
+    case LX_pread64:
+        return __quark_pread(a1, (void *)a2, (unsigned long)a3, a4);
+    case LX_pwrite64:
+        return __quark_pwrite(a1, (const void *)a2, (unsigned long)a3, a4);
     case LX_dup:
         return __quark_dup(a1, -1);
     case LX_dup2:

@@ -103,6 +103,8 @@ pub const SYS_TASK_START_ARG: u64 = 103;
 pub const SYS_TASK_WATCH: u64 = 104;
 pub const SYS_TASK_PRIORITY: u64 = 105;
 pub const SYS_SET_CLEAR_TID: u64 = 106;
+pub const SYS_TASK_SPACE: u64 = 107;
+pub const SYS_SPACE_WATCH: u64 = 108;
 
 // --- 0x70  hardware and drivers ---
 pub const SYS_IRQ_REGISTER: u64 = 112;
@@ -348,6 +350,20 @@ pub fn sys_task_priority(tid: usize, band: u8) -> Result<(), ()> {
 /// there is nothing to wait for and the caller may reclaim at once.
 pub fn sys_task_watch(tid: usize) -> Result<(), ()> {
     let ret = unsafe { syscall1(SYS_TASK_WATCH, tid as u64) };
+    if ret == u64::MAX { Err(()) } else { Ok(()) }
+}
+
+/// The program `tid` belongs to: its address space's id, never reused.
+/// Threads of one program share it.
+pub fn sys_task_space(tid: usize) -> Result<u64, ()> {
+    let ret = unsafe { syscall1(SYS_TASK_SPACE, tid as u64) };
+    if ret == u64::MAX { Err(()) } else { Ok(ret) }
+}
+
+/// Be sent [`crate::ipc::TAG_SPACE_DIED`] when program `space` has no task
+/// left: sender 0, `data[0]` the space id. `Err` if it has none already.
+pub fn sys_space_watch(space: u64) -> Result<(), ()> {
+    let ret = unsafe { syscall1(SYS_SPACE_WATCH, space) };
     if ret == u64::MAX { Err(()) } else { Ok(()) }
 }
 

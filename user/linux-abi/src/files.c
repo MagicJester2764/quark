@@ -274,11 +274,9 @@ long __quark_dup(long fd, long to) {
     return r == QUARK_ERR ? -LX_EBADF : to;
 }
 
-long __quark_file_read(long fd, void *buf, unsigned long n) {
-    struct openfile *f = slot(fd);
-    if (!f) {
-        return -LX_EBADF;
-    }
+/* Read from `*at`, moving it on. `read` passes the descriptor's position and
+   `pread` a copy of its argument, which is the whole difference between them. */
+static long read_at(struct openfile *f, void *buf, unsigned long n, unsigned long *at) {
     if (f->is_dir) {
         return -LX_EISDIR;
     }
@@ -296,7 +294,7 @@ long __quark_file_read(long fd, void *buf, unsigned long n) {
         }
         unsigned long got = 0;
         /* The caller's own buffer, lent to the VFS to fill. */
-        int e = quark_vfs_read(f->handle, out + done, f->offset, want, &got);
+        int e = quark_vfs_read(f->handle, out + done, *at, want, &got);
         if (e) {
             return done ? (long)done : vfs_errno(e);
         }
@@ -304,7 +302,7 @@ long __quark_file_read(long fd, void *buf, unsigned long n) {
             break; /* end of file */
         }
         done += got;
-        f->offset += got;
+        *at += got;
         /* A short read means the end, not a hiccup: the server answers from a
            page at a time and gives everything it has. */
         if (got < want) {
@@ -314,11 +312,28 @@ long __quark_file_read(long fd, void *buf, unsigned long n) {
     return (long)done;
 }
 
-long __quark_file_write(long fd, const void *buf, unsigned long n) {
+long __quark_file_read(long fd, void *buf, unsigned long n) {
     struct openfile *f = slot(fd);
     if (!f) {
         return -LX_EBADF;
     }
+    return read_at(f, buf, n, &f->offset);
+}
+
+long __quark_pread(long fd, void *buf, unsigned long n, long offset) {
+    struct openfile *f = slot(fd);
+    if (!f) {
+        return (fd >= 0 && fd < FIRST_FD) ? -LX_ESPIPE : -LX_EBADF;
+    }
+    if (offset < 0) {
+        return -LX_EINVAL;
+    }
+    unsigned long at = (unsigned long)offset;
+    return read_at(f, buf, n, &at);
+}
+
+/* Write at `*at`, moving it on; see `read_at`. */
+static long write_at(struct openfile *f, const void *buf, unsigned long n, unsigned long *at) {
     if (n == 0) {
         return 0;
     }
@@ -331,20 +346,40 @@ long __quark_file_write(long fd, const void *buf, unsigned long n) {
             want = PAGE_SIZE;
         }
         unsigned long put = 0;
-        int e = quark_vfs_write(f->handle, in + done, f->offset, want, &put);
+        int e = quark_vfs_write(f->handle, in + done, *at, want, &put);
         if (e) {
             return done ? (long)done : vfs_errno(e);
         }
         done += put;
-        f->offset += put;
-        if (f->offset > f->size) {
-            f->size = f->offset;
+        *at += put;
+        if (*at > f->size) {
+            f->size = *at;
         }
         if (put < want) {
             break;
         }
     }
     return (long)done;
+}
+
+long __quark_file_write(long fd, const void *buf, unsigned long n) {
+    struct openfile *f = slot(fd);
+    if (!f) {
+        return -LX_EBADF;
+    }
+    return write_at(f, buf, n, &f->offset);
+}
+
+long __quark_pwrite(long fd, const void *buf, unsigned long n, long offset) {
+    struct openfile *f = slot(fd);
+    if (!f) {
+        return (fd >= 0 && fd < FIRST_FD) ? -LX_ESPIPE : -LX_EBADF;
+    }
+    if (offset < 0) {
+        return -LX_EINVAL;
+    }
+    unsigned long at = (unsigned long)offset;
+    return write_at(f, buf, n, &at);
 }
 
 long __quark_lseek(long fd, long offset, long whence) {

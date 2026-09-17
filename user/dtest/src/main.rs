@@ -646,8 +646,56 @@ fn load_child(args: &[&[u8]]) -> Option<spawn::Spawned> {
     Some(info)
 }
 
+static SPACE_VFS: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+static SPACE_HANDLE: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(usize::MAX);
+static SPACE_OF_THREAD: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Open a file and leave it open. It belongs to the program, not to this
+/// thread, so it has to outlive the thread.
+extern "C" fn opener() -> ! {
+    use core::sync::atomic::Ordering::SeqCst;
+    let me = syscall::sys_getpid() as usize;
+    SPACE_OF_THREAD.store(syscall::sys_task_space(me).unwrap_or(0), SeqCst);
+    if let Ok((handle, _, _)) = vfs::open(SPACE_VFS.load(SeqCst), b"/etc/passwd") {
+        SPACE_HANDLE.store(handle, SeqCst);
+    }
+    syscall::sys_exit_code(0);
+}
+
+/// A program is its address space: its threads are part of it, and what one
+/// of them opens is the program's.
+fn test_program_is_its_space() {
+    use core::sync::atomic::Ordering::SeqCst;
+    let me = syscall::sys_getpid() as usize;
+    let space = syscall::sys_task_space(me);
+    check("a task belongs to a program", space.is_ok_and(|s| s != 0));
+    // Looked up first, so the thread starts holding the capability to call it.
+    let Some(vfs_tid) = nameserver::lookup_retry(b"vfs", 20) else {
+        check("find the VFS", false);
+        return;
+    };
+    SPACE_VFS.store(vfs_tid, SeqCst);
+    let Ok(t) = thread::spawn_with_stack(opener, 8) else {
+        check("start a thread to open a file", false);
+        return;
+    };
+    // Joined before any child is started, since a join reaps whatever exits.
+    let _ = t.join();
+    check("a thread is part of its program", space == Ok(SPACE_OF_THREAD.load(SeqCst)));
+    let handle = SPACE_HANDLE.load(SeqCst);
+    let mut got = [0u8; 4];
+    check(
+        "a file a thread opened outlives the thread",
+        handle != usize::MAX && vfs::read(vfs_tid, handle, &mut got, 0) == Ok(4) && &got == b"root",
+    );
+    if handle != usize::MAX {
+        let _ = vfs::close(vfs_tid, handle);
+    }
+}
+
 fn test_across_address_spaces() {
     println!("across address spaces:");
+    test_program_is_its_space();
     let (mine, theirs) = match syscall::sys_socketpair() {
         Ok(p) => p,
         Err(()) => { check("a pair", false); return; }
@@ -680,6 +728,14 @@ fn test_across_address_spaces() {
         return;
     }
     check("the child runs", true);
+    let me = syscall::sys_getpid() as usize;
+    check(
+        "a child is another program",
+        matches!(
+            (syscall::sys_task_space(me), syscall::sys_task_space(info.tid)),
+            (Ok(a), Ok(b)) if a != b
+        ),
+    );
 
     // Wait for its answer with the set, which is what makes this the whole
     // phase rather than three quarters of it.
@@ -912,7 +968,7 @@ fn test_lent_buffers() {
     // The thread may call this task: an Endpoint to it, from its creator.
     let granted = syscall::sys_cap_mint(syscall::SLOT_SCRATCH, syscall::CAP_TYPE_ENDPOINT, me as u64, 0)
         .is_ok()
-        && syscall::sys_cap_grant(t, syscall::SLOT_SCRATCH, syscall::SLOT_ENDPOINT).is_ok();
+        && syscall::sys_cap_grant_any(t, syscall::SLOT_SCRATCH).is_ok();
     let _ = syscall::sys_cap_delete(syscall::SLOT_SCRATCH);
     check("let the thread call us", granted);
     LEND_GO.release();
@@ -1096,7 +1152,7 @@ fn test_endpoint_objects() {
     let t = t.tid();
     check(
         "let the thread call us",
-        syscall::sys_cap_grant(t, SELF_SLOT, syscall::SLOT_ENDPOINT).is_ok(),
+        syscall::sys_cap_grant_any(t, SELF_SLOT).is_ok(),
     );
     OFFER_GO.release();
     let mut msg = Message::empty();

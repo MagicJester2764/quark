@@ -542,7 +542,7 @@ fn alloc_handle_fat32(
 ) -> Option<usize> {
     handles::alloc(OpenFile {
         in_use: true,
-        owner_tid: tid,
+        owner: space_of(tid),
         file_size: size,
         is_dir,
         writable: true, // FAT32: no permission checks
@@ -557,8 +557,14 @@ fn alloc_handle_fat32(
     })
 }
 
-fn get_handle(handle: usize, tid: usize) -> Option<&'static mut OpenFile> {
-    handles::get(handle, tid)
+/// The program a caller belongs to, or 0 if it has none (and so owns nothing).
+fn space_of(sender: usize) -> u64 {
+    syscall::sys_task_space(sender).unwrap_or(0)
+}
+
+/// `sender`'s program's handle `handle`.
+fn get_handle(handle: usize, sender: usize) -> Option<&'static mut OpenFile> {
+    handles::get(handle, space_of(sender))
 }
 
 // ---------------------------------------------------------------------------
@@ -1368,7 +1374,7 @@ pub extern "C" fn _start() -> ! {
             TAG_TRUNCATE => transacted(|| handle_truncate(sender, &msg)),
             TAG_STATFS => handle_statfs(sender),
             // From the kernel, which is not waiting for an answer.
-            quark_rt::ipc::TAG_TASK_DIED => client_died(msg.data[0] as usize),
+            quark_rt::ipc::TAG_SPACE_DIED if sender == 0 => client_died(msg.data[0]),
             TAG_READDIR_BULK => handle_readdir_bulk(&disk, sender, &msg),
             quark_rt::ipc::TAG_PING => {
                 // Liveness probe: reply immediately, touching no disk state.
@@ -1452,7 +1458,7 @@ fn open_ext2(sender: usize, path: &[u8], flags: u64) {
     }
     let file = OpenFile {
         in_use: true,
-        owner_tid: sender,
+        owner: space_of(sender),
         file_size: 0,
         is_dir: inode.is_dir(),
         writable,
@@ -1613,7 +1619,7 @@ fn handle_read(disk: &DiskState, sender: usize, msg: &Message) {
 /// Reply: tag=TAG_OK  OR  tag=TAG_ERROR
 fn handle_close(sender: usize, msg: &Message) {
     let handle = msg.data[0] as usize;
-    match handles::close(handle, sender) {
+    match handles::close(handle, space_of(sender)) {
         Some(ino) => {
             reply_opened(sender, [0; 6]);
             settle(&[ino]);
@@ -1623,9 +1629,10 @@ fn handle_close(sender: usize, msg: &Message) {
 }
 
 /// A task the server gave handles to has died: they are closed for it.
-fn client_died(dead: usize) {
+/// A program has gone: its handles go with it.
+fn client_died(space: u64) {
     let mut closed = [0u32; handles::MAX_OPEN_FILES];
-    let n = handles::close_all(dead, &mut closed);
+    let n = handles::close_all(space, &mut closed);
     settle(&closed[..n]);
 }
 

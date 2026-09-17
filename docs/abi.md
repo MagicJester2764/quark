@@ -1,6 +1,6 @@
 # Quark syscall ABI
 
-**Version 2.1.** Query the running kernel with `SYS_ABI_VERSION` (240), which
+**Version 2.2.** Query the running kernel with `SYS_ABI_VERSION` (240), which
 returns `(major << 16) | minor`.
 
 This document is the contract between the Quark kernel and everything above it.
@@ -130,6 +130,7 @@ rule still holds for everything else.
 | Version | Added |
 |---|---|
 | 2.1 | `SYS_BOOT_TIME` (145) — the date, read from the machine's clock at boot. Before it nothing here knew what day it was, and files were dated from 1970. |
+| 2.2 | `SYS_TASK_SPACE` (107) and `SYS_SPACE_WATCH` (108) — a program's identity is its address space, so a server can keep what a program holds for the program rather than for the one thread that asked. Also: a thread starts holding a copy of its creator's capabilities and descriptors, and in its band. |
 
 ### Deprecated
 
@@ -377,6 +378,11 @@ caller's table; moving one into another task is `SYS_FD_DUP` followed by closing
 the caller's copy. An end is reference counted, so that last step does not tell
 the peer the connection has gone.
 
+**Copying onto a descriptor closes it first**, as `dup2` does: `SYS_FD_DUP`,
+`SYS_FD_SET` and `SYS_PIPE_FD_SET` release whatever the target slot named, and
+copying a descriptor onto itself changes nothing. A poll set cannot be copied or
+sent at all: it counts no holders, so it has exactly one.
+
 **Passing a descriptor needs no authority over the peer.** `SYS_FD_DUP` puts one
 into a task that never asked, so it requires `TaskMgmt` over that task.
 `SYS_FD_SEND` hands one to a task that called `SYS_FD_RECV`: the sender chose to
@@ -439,6 +445,8 @@ cannot resurrect a revoked capability in practice.
 | 101 | `SYS_GET_TUID` | arg0 = tid | that task's UID | — |
 | 104 | `SYS_TASK_WATCH` | arg0 = tid | 0, or `u64::MAX` if that task is already gone | — |
 | 106 | `SYS_SET_CLEAR_TID` | arg0 = address of a `u32`, or 0 | this task's id / `u64::MAX` | — |
+| 107 | `SYS_TASK_SPACE` | arg0 = tid | that task's space id / `u64::MAX` | — |
+| 108 | `SYS_SPACE_WATCH` | arg0 = space id | 0, or `u64::MAX` if no task of it is alive | — |
 | 105 | `SYS_TASK_PRIORITY` | arg0 = tid, arg1 = band | 0 / `u64::MAX` | `TaskMgmt` for target, and the caller's own band or worse |
 
 There is no fork or exec. A parent creates a task, builds its address space,
@@ -465,6 +473,22 @@ Registrations are dropped when either task dies, so a watcher is never told
 about the next occupant of a recycled TID. A watcher that lets eight
 notifications go uncollected loses the ninth; a server whose whole job is to
 reclaim on death should not be one of them.
+
+A program is its address space. `SYS_TASK_SPACE` names it: every address
+space gets an id when it is made, counting up from 1 for as long as the machine
+runs and never given out again, and every thread of a program answers with the
+same one. A server that keeps something for a client — an open file, a lock, a
+working directory — keeps it for the space, so any thread of the program may
+use it. `SYS_SPACE_WATCH` is `SYS_TASK_WATCH` for a program: the notice is sender
+0, tag `0xFFFF_0004`, `data[0]` the space id, and it comes once, when the last
+live task of that space dies. Failure means none is alive.
+
+A task started with `SYS_TASK_START` in its creator's own address space is a
+thread of it, and starts with a copy of what its creator holds at that moment:
+each capability in a slot the creator did not already fill for it, each
+descriptor likewise (as `SYS_FD_DUP` would copy it; poll sets and sockets stay
+behind, since neither counts its holders), and the creator's band. A copy, not
+a share: what either is given or gives up afterwards, the other does not see.
 
 `SYS_TASK_PRIORITY` puts a task in a scheduling band: 0 drivers, 1 servers,
 2 ordinary programs, 3 the idle task. A task runs only when nothing in a better

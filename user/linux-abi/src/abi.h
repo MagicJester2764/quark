@@ -60,6 +60,8 @@ long __quark_truncate(const char *path, long length);
 long __quark_file_truncate(long fd, long length);
 long __quark_getdents(long fd, void *buf, unsigned long count);
 long __quark_dup(long fd, long to);
+long __quark_pread(long fd, void *buf, unsigned long n, long offset);
+long __quark_pwrite(long fd, const void *buf, unsigned long n, long offset);
 long __quark_readlink(const char *path, char *buf, unsigned long size);
 long __quark_statfs(const char *path, void *buf);
 long __quark_fstatfs(long fd, void *buf);

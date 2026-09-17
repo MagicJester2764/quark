@@ -156,6 +156,10 @@ pub const SYS_TASK_START_ARG: u64 = 103;
 /// refuses to grant a better band than the caller is in itself.
 pub const SYS_TASK_PRIORITY: u64 = 105;
 pub const SYS_SET_CLEAR_TID: u64 = 106;
+/// Which program a task belongs to: its address space's id.
+pub const SYS_TASK_SPACE: u64 = 107;
+/// Be told when a program's last task has died.
+pub const SYS_SPACE_WATCH: u64 = 108;
 
 /// Be told when a task dies, so that whatever it was lent can be taken back.
 /// Takes no capability: SYS_TASK_INFO already answers the same question by
@@ -209,7 +213,7 @@ pub const SYS_ABI_VERSION: u64 = 240;
 /// minor when calls are added. User space can refuse to run against a major it
 /// does not know, which is the point of exposing it at all.
 pub const ABI_VERSION_MAJOR: u64 = 2;
-pub const ABI_VERSION_MINOR: u64 = 1;
+pub const ABI_VERSION_MINOR: u64 = 2;
 
 /// Threads a task may make with no capability at all.
 ///
@@ -563,6 +567,22 @@ extern "C" fn syscall_dispatch(
             // No capability: SYS_TASK_INFO already answers "is that task
             // alive" for anybody, so this only spares the asking.
             match crate::ipc::sys_task_watch(scheduler::current_tid(), arg0 as usize) {
+                Ok(()) => 0,
+                Err(_) => u64::MAX,
+            }
+        }
+        SYS_TASK_SPACE => {
+            // No capability, for the reason SYS_TASK_INFO needs none: which
+            // program a task belongs to tells nobody anything they could not
+            // work out, and every server that keeps things per program needs
+            // to ask it of each caller.
+            match scheduler::space_of_task(arg0 as usize) {
+                0 => u64::MAX,
+                space => space,
+            }
+        }
+        SYS_SPACE_WATCH => {
+            match crate::ipc::sys_space_watch(scheduler::current_tid(), arg0) {
                 Ok(()) => 0,
                 Err(_) => u64::MAX,
             }
@@ -1109,6 +1129,12 @@ extern "C" fn syscall_dispatch(
             // arg4 carries the value for RDI; SYS_TASK_START leaves it zero
             // because syscall4 never sets that register.
             let entry_arg = if nr == SYS_TASK_START_ARG { arg4 } else { 0 };
+            // A task started in the caller's own address space is a thread of
+            // it, and holds what the caller holds.
+            let own_cr3 = unsafe { scheduler::get_task_mut(caller).map(|t| t.cr3) };
+            if own_cr3 == Some(cr3) {
+                scheduler::inherit_from_creator(tid, caller);
+            }
             match scheduler::start_task(tid, rip, rsp, cr3, entry_arg) {
                 Ok(()) => 0,
                 Err(()) => u64::MAX,
@@ -1454,6 +1480,11 @@ extern "C" fn syscall_dispatch(
             let kind = scheduler::current_fd(source_fd);
             if kind.is_empty() {
                 return u64::MAX;
+            }
+            // dup2 onto itself changes nothing, and must not close the
+            // descriptor on the way.
+            if target_tid == me && target_fd == source_fd {
+                return target_fd as u64;
             }
             // A second descriptor for one object is a second reference to it.
             // `retain_fd` is `release_fd`'s mirror, and keeping the match in

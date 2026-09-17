@@ -10,8 +10,13 @@
 //! register is set up per thread. Everything here is shared: use `sync` for
 //! anything two threads both touch.
 //!
-//! Spawning needs `TaskMgmt` to create a task and `PhysAlloc` to give it a
-//! stack, so a program that spawns threads must ask for both in its manifest.
+//! A thread is part of its program: it starts holding a copy of the
+//! capabilities and descriptors its creator holds, and servers that keep things
+//! per program (the VFS's open files) let it use them. A copy, not a share —
+//! what either is given afterwards is its own.
+//!
+//! Spawning needs no capability for the first sixteen threads (`TaskMgmt` lifts
+//! the limit), and a stack is ordinary memory.
 
 use crate::syscall;
 
@@ -94,13 +99,26 @@ fn start(entry: u64, arg: u64, slot: usize, stack_pages: usize) -> Result<Thread
     let tid = syscall::sys_task_create()?;
 
     // Map the stack into the address space we already share, so the thread can
-    // use it the moment it starts. Frames we allocate are ours to map: the
-    // kernel authorises that by ownership, without any capability.
+    // use it the moment it starts. It is ordinary memory, which any task may
+    // map: it used to be frames from `sys_phys_alloc`, which needs a
+    // capability, so a program started without one could not make a thread.
     let top = THREAD_STACK_BASE - slot * THREAD_STACK_STRIDE;
     let bottom = top - stack_pages * crate::spawn::PAGE_SIZE;
-    for p in 0..stack_pages {
-        let frame = syscall::sys_phys_alloc(1)?;
-        syscall::sys_map_phys(frame, bottom + p * crate::spawn::PAGE_SIZE, 1)?;
+    let mut mapped = 0;
+    while mapped < stack_pages {
+        let n = (stack_pages - mapped).min(256);
+        if syscall::sys_mmap(bottom + mapped * crate::spawn::PAGE_SIZE, n).is_err() {
+            let mut undo = 0;
+            while undo < mapped {
+                let m = (mapped - undo).min(256);
+                let _ = syscall::sys_munmap(bottom + undo * crate::spawn::PAGE_SIZE, m);
+                undo += m;
+            }
+            // The task was made but will never start; it goes with the rest.
+            let _ = syscall::sys_task_kill(tid);
+            return Err(());
+        }
+        mapped += n;
     }
 
     syscall::sys_task_start_arg(tid, entry, top as u64, cr3, arg)?;

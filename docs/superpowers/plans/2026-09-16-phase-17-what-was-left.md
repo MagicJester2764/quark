@@ -14,7 +14,7 @@
 
 - Repos are flat siblings under `~/src/osdev`: `quark`, `explosion`, `bang`, `rust` (branch `quark`). Commit on `main` (the fork: `quark`), one commit per task, push after each task. Commit messages end with the two attribution lines this session uses.
 - Every task is verified by booting QEMU (`explosion/tools/boot-test.sh <keys> <ppm>`), reading the screenshots and `/tmp/quark-boot-test/serial.log` (no `UFAULT`, `UPFAULT`, `KFAULT` or `PANIC` unless a test provokes one on purpose). Filesystem work is checked with `explosion/tools/check-rootfs.sh` on **both** `make hd` (ext2) and `make hd-ext4`.
-- New system calls take numbers in their subsystem's block: 102–103 (task identity), 116 (hardware: entropy), and the new block **0xC0 "Paging and memory objects"** (192–207). `ABI_VERSION_MINOR` becomes 2 (ABI 2.2), recorded in `docs/abi.md`'s "What each minor of 2 added" table in the task that adds the first of them. `tools/check-abi.sh` (run by `make`) must pass.
+- New system calls take numbers in their subsystem's block: 107–108 (task identity), 116 (hardware: entropy), and the new block **0xC0 "Paging and memory objects"** (192–207). `ABI_VERSION_MINOR` becomes 2 (ABI 2.2), recorded in `docs/abi.md`'s "What each minor of 2 added" table in the task that adds the first of them. `tools/check-abi.sh` (run by `make`) must pass.
 - New VFS requests take tags from 15 upward and are documented in `docs/vfs.md` in the same task. Numbers are never reused.
 - A server never panics on input. Unknown tags, forged notices, bad handles, bad lengths and bad lends get an error reply (or are dropped when nobody waits on a reply). Death notices are believed only from sender 0, the kernel.
 - A C test lives in `explosion/toolchain/tests/*.c` with a `// LINK:` or `// PKG:` first line and is listed in a `*.tests` file; a Rust check lives in `user/dtest` as a section. Where a test can run on the host (Linux), run it there first: that is what caught Phase 13's wrong element count.
@@ -127,7 +127,7 @@ pub fn read_line_result(buf: &mut [u8]) -> Result<usize, ()> {
 ### Task 2: A program is its address space
 
 **Files:**
-- Modify: `quark/src/userspace.rs` (a space id per registered address space), `quark/src/task.rs` (`Task.space`), `quark/src/scheduler.rs` (set on start; notice when a space's last task dies), `quark/src/ipc.rs` (space watchers and `TAG_SPACE_DIED`), `quark/src/syscall.rs` (`SYS_TASK_SPACE` 102, `SYS_SPACE_WATCH` 103, `ABI_VERSION_MINOR` 2)
+- Modify: `quark/src/userspace.rs` (a space id per registered address space), `quark/src/task.rs` (`Task.space`), `quark/src/scheduler.rs` (set on start; notice when a space's last task dies), `quark/src/ipc.rs` (space watchers and `TAG_SPACE_DIED`), `quark/src/syscall.rs` (`SYS_TASK_SPACE` 107, `SYS_SPACE_WATCH` 108, `ABI_VERSION_MINOR` 2)
 - Modify: `quark/user/quark-rt/src/syscall.rs`, `quark/user/quark-rt/src/ipc.rs`, `quark/user/quark-rt/src/thread.rs` (stacks from `sys_mmap`)
 - Modify: `quark/user/vfs/src/handles.rs`, `quark/user/vfs/src/main.rs` (handles owned by a space)
 - Modify: `quark/docs/abi.md`, `quark/docs/vfs.md`
@@ -135,12 +135,12 @@ pub fn read_line_result(buf: &mut [u8]) -> Result<usize, ()> {
 - Modify: `quark/user/dtest/src/main.rs` (section `spaces` gains the checks)
 
 **Interfaces:**
-- Produces (kernel and quark-rt): `SYS_TASK_SPACE = 102` (arg0 = tid → the task's space id, `u64::MAX` if none); `SYS_SPACE_WATCH = 103` (arg0 = space id → 0 or `u64::MAX`); `TAG_SPACE_DIED = 0xFFFF_0004`, sender 0, `data[0]` = space id, sent once when the last live task of that space dies. `quark_rt::syscall::sys_task_space(tid: usize) -> Result<u64, ()>`, `sys_space_watch(space: u64) -> Result<(), ()>`, `quark_rt::ipc::TAG_SPACE_DIED`.
+- Produces (kernel and quark-rt): `SYS_TASK_SPACE = 107` (arg0 = tid → the task's space id, `u64::MAX` if none); `SYS_SPACE_WATCH = 108` (arg0 = space id → 0 or `u64::MAX`); `TAG_SPACE_DIED = 0xFFFF_0004`, sender 0, `data[0]` = space id, sent once when the last live task of that space dies. `quark_rt::syscall::sys_task_space(tid: usize) -> Result<u64, ()>`, `sys_space_watch(space: u64) -> Result<(), ()>`, `quark_rt::ipc::TAG_SPACE_DIED`.
 - Produces (VFS): `OpenFile.owner` is a space id; `handles::get(handle, space)`, `handles::close(handle, space)`, `handles::close_all(space, &mut closed)`; `main.rs` gets `fn space_of(sender: usize) -> u64`.
 
 Space ids start at 1 and count up for as long as the machine runs; they are never reused, so a notice about a dead program can never be mistaken for a live one.
 
-- [ ] **Step 1: The failing tests.** `threadfile.c` (no `LINK:`; musl has threads):
+- [x] **Step 1: The failing tests.** `threadfile.c` (no `LINK:`; musl has threads):
 
 ```c
 /* A file one thread opened is the program's, not the thread's. */
@@ -177,9 +177,9 @@ int main(void) {
 
 In dtest's `spaces` section, a thread started with `thread::spawn_with_stack` opens `/etc/passwd` through `vfs::open` and hands the handle to the main thread through an `AtomicUsize`; the main thread reads it: `check("a thread's file is the program's", …)`. Also `check("a program has one space", sys_task_space(me) == sys_task_space(thread))` and `check("a child has another", sys_task_space(child) != sys_task_space(me))`.
 
-- [ ] **Step 2: Run them.** Expected: `threadfile: FAILED` (the read gets `INVALID_HANDLE`, EBADF); dtest fails to build (`sys_task_space` does not exist).
+- [x] **Step 2: Run them.** Expected: `threadfile: FAILED` (the read gets `INVALID_HANDLE`, EBADF); dtest fails to build (`sys_task_space` does not exist).
 
-- [ ] **Step 3: The kernel.** In `userspace.rs` the registry entry becomes `(cr3, owner, refs, space)`; `register_address_space` takes the next id from `static NEXT_SPACE: AtomicU64 = AtomicU64::new(1)`; `pub fn space_of(cr3) -> u64` looks it up (0 if unregistered). `Task` gains `pub space: u64`, set wherever a task's `cr3` is set (`start_task`, `spawn_init`). `SYS_TASK_SPACE` answers `task.space` for a live task. In `ipc.rs`:
+- [x] **Step 3: The kernel.** In `userspace.rs` the registry entry becomes `(cr3, owner, refs, space)`; `register_address_space` takes the next id from `static NEXT_SPACE: AtomicU64 = AtomicU64::new(1)`; `pub fn space_of(cr3) -> u64` looks it up (0 if unregistered). `Task` gains `pub space: u64`, set wherever a task's `cr3` is set (`start_task`, `spawn_init`). `SYS_TASK_SPACE` answers `task.space` for a live task. In `ipc.rs`:
 
 ```rust
 /// Watchers of a program: one entry per watched space, a bitmask of TIDs.
@@ -195,9 +195,9 @@ pub fn notify_space_watchers(space: u64)
 
 `notify_space_watchers` queues the id for each watcher and wakes it exactly as `notify_watchers` does; the receive path that turns `DEATHS` into `TAG_TASK_DIED` also turns `SPACE_DEATHS` into `Message { sender: 0, tag: TAG_SPACE_DIED, data: [space, 0, 0, 0, 0, 0] }`. `scheduler::exit_with`, after `notify_watchers(current)`, checks whether any other task with the same `space` is still not `Dead`, and calls `notify_space_watchers(space)` if none is. A watched space with no live task left is answered at once with `Err(DeadTask)`, like `sys_task_watch`. A watcher that dies has its bits cleared from `SPACE_WATCHES` in `cleanup_task_ipc`.
 
-- [ ] **Step 4: Threads without `PhysAlloc`.** `quark-rt/src/thread.rs` maps the stack with `syscall::sys_mmap(bottom, stack_pages)` (anonymous memory needs no capability) instead of `sys_phys_alloc` + `sys_map_phys`, and unmaps it on failure.
+- [x] **Step 4: Threads without `PhysAlloc`.** `quark-rt/src/thread.rs` maps the stack with `syscall::sys_mmap(bottom, stack_pages)` (anonymous memory needs no capability) instead of `sys_phys_alloc` + `sys_map_phys`, and unmaps it on failure.
 
-- [ ] **Step 5: The VFS.** `handles::alloc` takes the owner's space and calls `sys_space_watch(space)` instead of `sys_task_watch`; every `get_handle(handle, sender)` becomes `get_handle(handle, space_of(sender))`; the dispatch arm is:
+- [x] **Step 5: The VFS.** `handles::alloc` takes the owner's space and calls `sys_space_watch(space)` instead of `sys_task_watch`; every `get_handle(handle, sender)` becomes `get_handle(handle, space_of(sender))`; the dispatch arm is:
 
 ```rust
 quark_rt::ipc::TAG_SPACE_DIED if sender == 0 => client_died(msg.data[0]),
@@ -205,13 +205,25 @@ quark_rt::ipc::TAG_SPACE_DIED if sender == 0 => client_died(msg.data[0]),
 
 and `TAG_TASK_DIED` is no longer used by the VFS. `space_of` is `syscall::sys_task_space(sender).unwrap_or(0)`; a sender without a space (0) owns nothing and gets `INVALID_HANDLE`.
 
-- [ ] **Step 6: Documents.** `docs/abi.md`: rows 102 and 103 in the task table, ABI 2.2 row in "What each minor of 2 added" ("`SYS_TASK_SPACE` (102) and `SYS_SPACE_WATCH` (103): a program's identity is its address space…"), and the version line. `docs/vfs.md`: "A handle belongs to the program that opened it — every thread of it may use it — and the server closes a program's handles when its last task dies."
+- [x] **Step 6: Documents.** `docs/abi.md`: rows 107 and 108 in the task table, ABI 2.2 row in "What each minor of 2 added" ("`SYS_TASK_SPACE` (107) and `SYS_SPACE_WATCH` (108): a program's identity is its address space…"), and the version line. `docs/vfs.md`: "A handle belongs to the program that opened it — every thread of it may use it — and the server closes a program's handles when its last task dies."
 
-- [ ] **Step 7: Verify.** Build; relink C suites (the layer changed only if `pread64` was added); image; boot: `runtests /etc/libc.tests` (six now), `dtest spaces`, `dtest`, `hello` (threads still start), `wm hello` (threads now start without a manifest grant — Task 13 fixes the grant too). `check-rootfs.sh`.
+- [x] **Step 7: Verify.** Build; relink C suites (the layer changed only if `pread64` was added); image; boot: `runtests /etc/libc.tests` (six now), `dtest spaces`, `dtest`, `hello` (threads still start), `wm hello` (threads now start without a manifest grant — Task 13 fixes the grant too). `check-rootfs.sh`.
 
-- [ ] **Step 8: Commit.** quark: "A program is its address space"; explosion: "threadfile".
+- [x] **Step 8: Commit.** quark: "A program is its address space"; explosion: "threadfile".
+
+**Done.** Found on the way: a thread started with an empty CSpace and no
+descriptors, so it could call no server at all — not even the VFS about a file
+its program had opened. `SYS_TASK_START` into the caller's own address space
+now copies the creator's capabilities and descriptors into the slots it left
+empty (poll sets and sockets excepted: neither counts its holders) and its
+band. A copy, not a share — recorded as a known gap. The libc VFS client looks
+the server up again when a call fails, since a thread may lack a capability
+its program gained after it started. `set_fd` now closes what it replaces
+(dup2 semantics), a poll set can no longer be copied, and `dup2(fd, fd)` is a
+no-op. dtest: 221 passed; libc.tests 6/6; e2fsck clean.
 
 ---
+
 ### Task 3: Random numbers, and `/dev`
 
 **Files:**

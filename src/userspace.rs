@@ -29,9 +29,18 @@ pub const USER_ADDR_LIMIT: u64 = paging::USER_ADDR_LIMIT;
 /// The third field counts the tasks currently running in the address space.
 /// Threads are tasks that share one, so it cannot be destroyed when the first
 /// of them exits — only when the last does.
+///
+/// The fourth is the space's id: a program's name for as long as the machine
+/// runs. A physical address is no name — the frame is reused as soon as the
+/// space is gone — and neither is a TID, which a thread does not share with
+/// its siblings. Servers key what belongs to a program by this.
 const MAX_ADDRESS_SPACES: usize = crate::task::MAX_TASKS * 2;
-static mut ADDRESS_SPACES: [(usize, usize, u32); MAX_ADDRESS_SPACES] =
-    [(0, 0, 0); MAX_ADDRESS_SPACES];
+static mut ADDRESS_SPACES: [(usize, usize, u32, u64); MAX_ADDRESS_SPACES] =
+    [(0, 0, 0, 0); MAX_ADDRESS_SPACES];
+
+/// The next space id. Never reused, so a notice about a program that has gone
+/// cannot be mistaken for one about a program that is running.
+static NEXT_SPACE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
 
 /// Record `cr3` as an address space created by `owner`.
 /// Returns false if the registry is full.
@@ -40,7 +49,8 @@ fn register_address_space(cr3: usize, owner: usize) -> bool {
         let table = &mut *core::ptr::addr_of_mut!(ADDRESS_SPACES);
         for slot in table.iter_mut() {
             if slot.0 == 0 {
-                *slot = (cr3, owner, 0);
+                let id = NEXT_SPACE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                *slot = (cr3, owner, 0, id);
                 return true;
             }
         }
@@ -54,9 +64,21 @@ pub fn unregister_address_space(cr3: usize) {
         let table = &mut *core::ptr::addr_of_mut!(ADDRESS_SPACES);
         for slot in table.iter_mut() {
             if slot.0 == cr3 {
-                *slot = (0, 0, 0);
+                *slot = (0, 0, 0, 0);
             }
         }
+    }
+}
+
+/// The id of the address space rooted at `cr3`, or 0 if it is not a user
+/// address space.
+pub fn space_of(cr3: usize) -> u64 {
+    if cr3 == 0 {
+        return 0;
+    }
+    unsafe {
+        let table = &*core::ptr::addr_of!(ADDRESS_SPACES);
+        table.iter().find(|s| s.0 == cr3).map_or(0, |s| s.3)
     }
 }
 
@@ -67,7 +89,7 @@ pub fn is_owned_address_space(tid: usize, cr3: usize) -> bool {
     }
     unsafe {
         let table = &*core::ptr::addr_of!(ADDRESS_SPACES);
-        table.iter().any(|&(c, owner, _)| c == cr3 && owner == tid)
+        table.iter().any(|&(c, owner, _, _)| c == cr3 && owner == tid)
     }
 }
 

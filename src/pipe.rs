@@ -545,6 +545,7 @@ pub fn retain_in_flight(kind: &FdKind) -> Result<(), ()> {
             if crate::shmem::hold_in_flight(*handle) { Ok(()) } else { Err(()) }
         }
         FdKind::StreamEnd { stream, end } => crate::stream::retain_end(*stream, *end),
+        FdKind::PollSet { .. } => Err(()),
         _ => Ok(()),
     }
 }
@@ -571,6 +572,9 @@ pub fn retain_fd(kind: &FdKind, owner: usize) -> Result<(), ()> {
             if crate::shmem::add_access(*handle, owner) { Ok(()) } else { Err(()) }
         }
         FdKind::StreamEnd { stream, end } => crate::stream::retain_end(*stream, *end),
+        // A set counts no holders, and closing any copy destroys it, so it
+        // has exactly one.
+        FdKind::PollSet { .. } => Err(()),
         _ => Ok(()),
     }
 }

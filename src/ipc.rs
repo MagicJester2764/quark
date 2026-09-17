@@ -205,6 +205,21 @@ const DEATH_QUEUE: usize = 8;
 static mut DEATHS: [[u8; DEATH_QUEUE]; MAX_TASKS] = [[0; DEATH_QUEUE]; MAX_TASKS];
 static mut DEATHS_LEN: [usize; MAX_TASKS] = [0; MAX_TASKS];
 
+/// Who has asked to be told when each program — each address space — dies.
+///
+/// A program is gone when the last task running in it has died, which is when
+/// whatever it held as a program (its files, its working directory, its
+/// locks) can go. One entry per watched program, a bitmask of watchers; an
+/// entry is freed when its program dies or its last watcher does.
+const MAX_SPACE_WATCHES: usize = MAX_TASKS * 2;
+static mut SPACE_WATCHES: [(u64, u64); MAX_SPACE_WATCHES] = [(0, 0); MAX_SPACE_WATCHES];
+/// Program deaths a watcher has not collected yet.
+static mut SPACE_DEATHS: [[u64; DEATH_QUEUE]; MAX_TASKS] = [[0; DEATH_QUEUE]; MAX_TASKS];
+static mut SPACE_DEATHS_LEN: [usize; MAX_TASKS] = [0; MAX_TASKS];
+
+/// Tag for a program's death: `data[0]` is its space id.
+pub const TAG_SPACE_DIED: u64 = 0xFFFF_0004;
+
 /// Per-task signal kill deadline (PIT tick). 0 = no pending signal deadline.
 /// When nonzero, the task will be force-killed after the deadline expires.
 static mut SIGNAL_DEADLINE: [u64; MAX_TASKS] = [0; MAX_TASKS];
@@ -288,6 +303,62 @@ pub fn sys_task_watch(watcher: usize, target: usize) -> Result<(), IpcError> {
     Ok(())
 }
 
+/// Ask to be told when program `space` has no task left.
+pub fn sys_space_watch(watcher: usize, space: u64) -> Result<(), IpcError> {
+    if watcher >= MAX_TASKS || space == 0 {
+        return Err(IpcError::InvalidTid);
+    }
+    if !scheduler::space_is_live(space) {
+        return Err(IpcError::DeadTask);
+    }
+    let flags = irq_save();
+    let result = unsafe {
+        let table = &mut *core::ptr::addr_of_mut!(SPACE_WATCHES);
+        match table.iter().position(|e| e.0 == space) {
+            Some(i) => {
+                table[i].1 |= 1u64 << watcher;
+                Ok(())
+            }
+            None => match table.iter().position(|e| e.0 == 0) {
+                Some(i) => {
+                    table[i] = (space, 1u64 << watcher);
+                    Ok(())
+                }
+                None => Err(IpcError::WouldBlock),
+            },
+        }
+    };
+    irq_restore(flags);
+    result
+}
+
+/// Tell everyone watching program `space` that its last task has died.
+///
+/// Interrupts are off: this is called from the scheduler as a task dies.
+pub fn notify_space_watchers(space: u64) {
+    unsafe {
+        let table = &mut *core::ptr::addr_of_mut!(SPACE_WATCHES);
+        let Some(i) = table.iter().position(|e| e.0 == space) else { return };
+        let mut mask = table[i].1;
+        table[i] = (0, 0);
+        while mask != 0 {
+            let w = mask.trailing_zeros() as usize;
+            mask &= mask - 1;
+            if SPACE_DEATHS_LEN[w] < DEATH_QUEUE {
+                SPACE_DEATHS[w][SPACE_DEATHS_LEN[w]] = space;
+                SPACE_DEATHS_LEN[w] += 1;
+            }
+            match TASK_IPC[w].state {
+                IpcState::RecvBlocked(from) if from == 0 || from == TID_ANY => {
+                    TASK_IPC[w].state = IpcState::None;
+                    scheduler::unblock_task(w);
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
 /// Tell everyone watching `dead` that it has gone.
 ///
 /// Called when the task is marked Dead, not when it is reaped: reaping waits
@@ -337,6 +408,27 @@ unsafe fn take_death(receiver: usize) -> Option<Message> {
         }
         DEATHS_LEN[receiver] -= 1;
         Some(Message { sender: 0, tag: TAG_TASK_DIED, data: [dead, 0, 0, 0, 0, 0] })
+    }
+}
+
+/// Take one pending death notification — of a task, or of a program.
+///
+/// # Safety
+/// The caller holds interrupts off.
+unsafe fn take_any_death(receiver: usize) -> Option<Message> {
+    unsafe {
+        if let Some(msg) = take_death(receiver) {
+            return Some(msg);
+        }
+        if SPACE_DEATHS_LEN[receiver] == 0 {
+            return None;
+        }
+        let space = SPACE_DEATHS[receiver][0];
+        for i in 1..SPACE_DEATHS_LEN[receiver] {
+            SPACE_DEATHS[receiver][i - 1] = SPACE_DEATHS[receiver][i];
+        }
+        SPACE_DEATHS_LEN[receiver] -= 1;
+        Some(Message { sender: 0, tag: TAG_SPACE_DIED, data: [space, 0, 0, 0, 0, 0] })
     }
 }
 
@@ -608,7 +700,7 @@ pub fn sys_recv(from: usize) -> Result<Message, IpcError> {
 
         // A task this one was watching has died.
         if from == 0 || from == TID_ANY {
-            if let Some(msg) = take_death(receiver) {
+            if let Some(msg) = take_any_death(receiver) {
                 irq_restore(flags);
                 return Ok(msg);
             }
@@ -658,7 +750,7 @@ pub fn sys_recv(from: usize) -> Result<Message, IpcError> {
 
         // A task this one was watching has died.
         if from == 0 || from == TID_ANY {
-            if let Some(msg) = take_death(receiver) {
+            if let Some(msg) = take_any_death(receiver) {
                 TASK_IPC[receiver].state = IpcState::None;
                 irq_restore(flags);
                 return Ok(msg);
@@ -910,7 +1002,7 @@ pub fn sys_recv_timeout(from: usize, timeout_ticks: u64) -> Result<Message, IpcE
 
         // A task this one was watching has died.
         if from == 0 || from == TID_ANY {
-            if let Some(msg) = take_death(receiver) {
+            if let Some(msg) = take_any_death(receiver) {
                 irq_restore(flags);
                 return Ok(msg);
             }
@@ -967,7 +1059,7 @@ pub fn sys_recv_timeout(from: usize, timeout_ticks: u64) -> Result<Message, IpcE
 
         // A task this one was watching has died.
         if from == 0 || from == TID_ANY {
-            if let Some(msg) = take_death(receiver) {
+            if let Some(msg) = take_any_death(receiver) {
                 TASK_IPC[receiver].state = IpcState::None;
                 irq_restore(flags);
                 return Ok(msg);
@@ -1093,9 +1185,16 @@ pub fn cleanup_task_ipc(dead_tid: usize) {
         // lands in the slot next.
         WATCHERS[dead_tid] = 0;
         DEATHS_LEN[dead_tid] = 0;
+        SPACE_DEATHS_LEN[dead_tid] = 0;
         let bit = !(1u64 << dead_tid);
         for t in 0..MAX_TASKS {
             WATCHERS[t] &= bit;
+        }
+        for e in (*core::ptr::addr_of_mut!(SPACE_WATCHES)).iter_mut() {
+            e.1 &= bit;
+            if e.1 == 0 {
+                *e = (0, 0);
+            }
         }
         // Clear the dead task's own IPC state, timeout, notifications, and signal deadline
         TASK_IPC[dead_tid].state = IpcState::None;

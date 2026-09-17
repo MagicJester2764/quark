@@ -224,7 +224,7 @@ pub fn exit_with(code: i32) -> ! {
             // Told now rather than at reaping: reaping waits on a parent that
             // may never call sys_wait, and whatever this task was holding
             // needs reclaiming when it stops, not when it is tidied away.
-            crate::ipc::notify_watchers(current);
+            note_death(current);
             let parent = task.parent_tid;
             // If parent is blocked in sys_wait, wake it with our TID
             if parent != 0 && WAIT_BLOCKED[parent] {
@@ -806,7 +806,7 @@ pub fn kill_task(tid: usize) -> Result<(), ()> {
                 task.state = TaskState::Dead;
                 task.exit_code = -9; // killed, as SIGKILL
                 crate::ipc::clear_signal_deadline(tid);
-                crate::ipc::notify_watchers(tid);
+                note_death(tid);
                 let parent = task.parent_tid;
                 if parent != 0 && WAIT_BLOCKED[parent] {
                     WAIT_BLOCKED[parent] = false;
@@ -819,6 +819,70 @@ pub fn kill_task(tid: usize) -> Result<(), ()> {
             _ => Err(()),
         }
     }
+}
+
+/// The id of the program `tid` belongs to — its address space's — or 0 for a
+/// kernel task, a task not yet started, or no task at all.
+pub fn space_of_task(tid: usize) -> u64 {
+    if tid >= MAX_TASKS {
+        return 0;
+    }
+    let flags = irq_save();
+    let space = unsafe {
+        match TASKS[tid] {
+            Some(ref t) if t.state != TaskState::Dead && t.cr3 != crate::paging::kernel_cr3() => {
+                crate::userspace::space_of(t.cr3)
+            }
+            _ => 0,
+        }
+    };
+    irq_restore(flags);
+    space
+}
+
+/// Whether any task that has not died is running in address space `cr3`.
+///
+/// # Safety
+/// Interrupts must be off.
+unsafe fn space_has_live_task(cr3: usize) -> bool { unsafe {
+    (*core::ptr::addr_of!(TASKS)).iter().any(|t| matches!(t, Some(t) if t.cr3 == cr3 && t.state != TaskState::Dead))
+}}
+
+/// Tell whoever watches `tid` that it has died, and whoever watches its
+/// program if it was the program's last task.
+///
+/// `tid` is already marked dead.
+///
+/// # Safety
+/// Interrupts must be off.
+unsafe fn note_death(tid: usize) { unsafe {
+    crate::ipc::notify_watchers(tid);
+    let Some(ref t) = TASKS[tid] else { return };
+    let cr3 = t.cr3;
+    if cr3 == 0 || cr3 == crate::paging::kernel_cr3() {
+        return;
+    }
+    let space = crate::userspace::space_of(cr3);
+    if space != 0 && !space_has_live_task(cr3) {
+        crate::ipc::notify_space_watchers(space);
+    }
+}}
+
+/// Whether some task in program `space` is still alive.
+pub fn space_is_live(space: u64) -> bool {
+    if space == 0 {
+        return false;
+    }
+    let flags = irq_save();
+    let live = unsafe {
+        (*core::ptr::addr_of!(TASKS)).iter().any(|t| {
+            matches!(t, Some(t) if t.state != TaskState::Dead
+                && t.cr3 != crate::paging::kernel_cr3()
+                && crate::userspace::space_of(t.cr3) == space)
+        })
+    };
+    irq_restore(flags);
+    live
 }
 
 /// True if `tid` names a live (not-yet-reaped, not-dead) task.
@@ -1164,6 +1228,62 @@ pub fn create_empty_task() -> Option<usize> {
     Some(tid)
 }
 
+/// Give a new thread what its creator holds.
+///
+/// A thread is not a new principal: it runs in its creator's address space and
+/// can already do anything its creator can. It used to start with nothing — no
+/// capability, so it could call no server, not even the VFS about a file its
+/// program had opened; no descriptors; and the ordinary band whatever its
+/// program's. So it starts with a copy of each: the capabilities as they are
+/// (a revoked original takes the copy with it, since both name the same root),
+/// the descriptors as `dup` would make them, and the band.
+///
+/// A copy, not a share. What either task is given afterwards is its own, and
+/// a slot or descriptor the creator filled before starting the thread keeps
+/// what it was given. Poll sets and sockets are left behind: neither counts
+/// its holders, so a thread closing its copy would take the creator's with it.
+pub fn inherit_from_creator(tid: usize, creator: usize) {
+    if tid >= MAX_TASKS || creator >= MAX_TASKS || tid == creator {
+        return;
+    }
+    let flags = irq_save();
+    unsafe {
+        let Some(src) = TASKS[creator].as_ref() else {
+            irq_restore(flags);
+            return;
+        };
+        let cspace = src.cspace;
+        let caps = src.caps;
+        let band = src.base_priority;
+        let fds = src.fds;
+        if let Some(dst) = TASKS[tid].as_mut() {
+            for (slot, cap) in cspace.iter().enumerate() {
+                if dst.cspace[slot].cap_type == crate::cap::CapType::Empty {
+                    dst.cspace[slot] = *cap;
+                }
+            }
+            dst.caps = caps;
+            dst.base_priority = band;
+            dst.priority = band;
+            for (i, kind) in fds.iter().enumerate() {
+                if kind.is_empty() || !dst.fds[i].is_empty() {
+                    continue;
+                }
+                if matches!(
+                    kind,
+                    crate::task::FdKind::PollSet { .. } | crate::task::FdKind::Socket { .. }
+                ) {
+                    continue;
+                }
+                if crate::pipe::retain_fd(kind, tid).is_ok() {
+                    dst.fds[i] = *kind;
+                }
+            }
+        }
+    }
+    irq_restore(flags);
+}
+
 /// Configure and start a previously created empty task for userspace entry.
 /// Start `tid` in `cr3` at `rip`, with `arg` in RDI.
 ///
@@ -1235,15 +1355,19 @@ pub fn set_fd(tid: usize, fd: usize, entry: crate::task::FdKind) -> Result<(), (
     if tid >= MAX_TASKS || fd >= crate::task::MAX_FDS {
         return Err(());
     }
-    unsafe {
+    let old = unsafe {
         match TASKS[tid].as_mut() {
-            Some(task) => {
-                task.fds[fd] = entry;
-                Ok(())
-            }
-            None => Err(()),
+            Some(task) => core::mem::replace(&mut task.fds[fd], entry),
+            None => return Err(()),
         }
+    };
+    // Whatever the descriptor named before is closed, as dup2 closes it. A
+    // task that inherited its creator's descriptors has something in slots a
+    // spawner used to find empty, and overwriting it leaked a reference.
+    if !old.is_empty() {
+        crate::pipe::release_fd(&old, tid);
     }
+    Ok(())
 }
 
 /// Claim the lowest free descriptor on the current task.

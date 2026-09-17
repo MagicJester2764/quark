@@ -82,8 +82,10 @@ The reply's `mode` includes the file-type bits (`0o170000`), `access` is what
 this caller may do (4 read, 2 write, 1 execute), and `id` is the inode number
 (FAT32: the first cluster), stable for as long as the file exists.
 
-A handle belongs to the task that opened it. The server watches every task it
-gives a handle to and closes them all when the task dies.
+A handle belongs to the program that opened it — every thread of it may use
+it — and the server closes a program's handles when its last task dies. It
+knows a program by its address space (`SYS_TASK_SPACE`) and watches each one
+it gives a handle to (`SYS_SPACE_WATCH`).
 
 ### STAT
 
