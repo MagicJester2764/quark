@@ -113,6 +113,9 @@ pub const SYS_EXEC_SPACE: u64 = 111;
 pub const SYS_PTY_CREATE: u64 = 208;
 pub const SYS_PTY_CTL: u64 = 209;
 pub const SYS_PTY_OPEN: u64 = 210;
+pub const SYS_TIMER_CREATE: u64 = 146;
+pub const SYS_TIMER_SET: u64 = 147;
+pub const SYS_TIMER_GET: u64 = 148;
 
 // --- 0x70  hardware and drivers ---
 pub const SYS_IRQ_REGISTER: u64 = 112;

@@ -368,20 +368,20 @@ pub struct UserFrame {
 - Produces: one-shot and interval timers, in the PIT's ten-millisecond steps,
   which is the resolution this machine has.
 
-- [ ] **Step 1: The failing check.** A C test that makes a timerfd for 200 ms,
+- [x] **Step 1: The failing check.** A C test that makes a timerfd for 200 ms,
   polls it, and prints how long it waited. Expected: `timerfd_create` fails
   with `ENOSYS`.
 
-- [ ] **Step 2: The timer.** A table of timers, each a deadline in ticks and an
+- [x] **Step 2: The timer.** A table of timers, each a deadline in ticks and an
   interval; the tick handler makes expired ones readable and wakes their
   waiters. A read returns the count and clears it, blocking when there is
   nothing unless the descriptor is non-blocking.
 
-- [ ] **Step 3: Verify.** The test waits about 200 ms and reads 1; an interval
+- [x] **Step 3: Verify.** The test waits about 200 ms and reads 1; an interval
   timer polled twice reads 1 each time; a timer that has expired twice before
   it is read reads 2.
 
-- [ ] **Step 4: Commit.** quark: "timerfd".
+- [x] **Step 4: Commit.** quark: "timerfd".
 
 ---
 

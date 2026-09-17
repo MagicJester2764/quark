@@ -187,6 +187,10 @@ pub const SYS_ADDRSPACE_DESTROY: u64 = 38;
 pub const SYS_PTY_CREATE: u64 = 208;
 pub const SYS_PTY_CTL: u64 = 209;
 pub const SYS_PTY_OPEN: u64 = 210;
+/// Timers, in the time block.
+pub const SYS_TIMER_CREATE: u64 = 146;
+pub const SYS_TIMER_SET: u64 = 147;
+pub const SYS_TIMER_GET: u64 = 148;
 /// `SYS_PTY_CTL` operations.
 const PTY_GET_TERMIOS: u64 = 0;
 const PTY_SET_TERMIOS: u64 = 1;
@@ -1143,6 +1147,45 @@ extern "C" fn syscall_dispatch(
                 None => u64::MAX,
             }
         }
+        SYS_TIMER_CREATE => {
+            // A descriptor that becomes readable when its deadline passes.
+            // Nothing to ask for: it is the caller's own clock, and waiting on
+            // it is waiting on a descriptor the caller already holds.
+            let tid = scheduler::current_tid();
+            let Some(timer) = crate::timerfd::create(tid) else {
+                return u64::MAX;
+            };
+            match scheduler::current_alloc_fd(crate::task::FdKind::Timer { timer }) {
+                Ok(fd) => {
+                    crate::timerfd::retain(timer);
+                    fd as u64
+                }
+                Err(()) => {
+                    crate::timerfd::cleanup_orphans(tid);
+                    u64::MAX
+                }
+            }
+        }
+        SYS_TIMER_SET => {
+            // arg0 = fd, arg1 = ticks until the first expiration (0 disarms),
+            // arg2 = ticks between them afterwards.
+            let tid = scheduler::current_tid();
+            let Some(timer) = crate::timerfd::of_fd(tid, arg0 as usize) else {
+                return u64::MAX;
+            };
+            if crate::timerfd::set(timer, arg1, arg2) { 0 } else { u64::MAX }
+        }
+        SYS_TIMER_GET => {
+            // arg0 = fd: what is left, packed as (interval << 32) | until.
+            let tid = scheduler::current_tid();
+            let Some(timer) = crate::timerfd::of_fd(tid, arg0 as usize) else {
+                return u64::MAX;
+            };
+            match crate::timerfd::get(timer) {
+                Some((left, interval)) => (interval << 32) | (left & 0xFFFF_FFFF),
+                None => u64::MAX,
+            }
+        }
         SYS_PTY_CREATE => {
             // A new pair, and a descriptor for its master. The slave is opened
             // separately, by number, because that is the shape `openpty` has:
@@ -1580,6 +1623,8 @@ extern "C" fn syscall_dispatch(
                     drop(_ua);
                     n as u64
                 }
+                // A timer is armed, not written to.
+                crate::task::FdKind::Timer { .. } => u64::MAX,
                 crate::task::FdKind::StreamEnd { stream, end } => {
                     match crate::stream::pipes_for(stream, end) {
                         Some((_, wr)) => crate::pipe::write(wr, ptr, len),
@@ -1625,6 +1670,7 @@ extern "C" fn syscall_dispatch(
                 }
                 crate::task::FdKind::PipeWrite(_) => u64::MAX,
                 crate::task::FdKind::PtyEnd { pty, end } => pty_read(pty, end, ptr, max_len),
+                crate::task::FdKind::Timer { timer } => timer_read(timer, ptr, max_len),
                 crate::task::FdKind::StreamEnd { stream, end } => {
                     match crate::stream::pipes_for(stream, end) {
                         Some((rd, _)) => crate::pipe::read(rd, ptr, max_len),
@@ -3170,6 +3216,31 @@ pub unsafe fn enter_usermode_frame(frame: *const crate::task::UserFrame) -> ! { 
         options(att_syntax, noreturn)
     );
 }}
+
+/// Read a timer: the number of times it has fired, as a `u64`, waiting for
+/// the first if it has not fired yet. That is the shape Linux gives it, and
+/// what a toolkit's event loop reads to find out how many blinks it missed.
+fn timer_read(timer: usize, ptr: *mut u8, max_len: usize) -> u64 {
+    if max_len < 8 {
+        return u64::MAX;
+    }
+    loop {
+        if let Some(n) = crate::timerfd::take(timer) {
+            let _ua = crate::cpu::UserAccess::begin();
+            unsafe { core::ptr::write_unaligned(ptr as *mut u64, n) };
+            drop(_ua);
+            return 8;
+        }
+        if !crate::timerfd::wait(timer) {
+            // Either it fired while we were looking, or there was no room to
+            // be recorded — the loop takes the first and this returns for the
+            // second rather than sleeping unwoken.
+            if crate::timerfd::pending(timer) == 0 {
+                return u64::MAX;
+            }
+        }
+    }
+}
 
 /// Read from a terminal, waiting for something to arrive.
 ///

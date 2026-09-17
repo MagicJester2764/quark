@@ -120,6 +120,7 @@ pub fn watchable(tid: usize, fd: usize) -> bool {
                     | FdKind::PipeWrite(_)
                     | FdKind::StreamEnd { .. }
                     | FdKind::PtyEnd { .. }
+                    | FdKind::Timer { .. }
             ),
             None => false,
         }
@@ -217,6 +218,11 @@ fn readiness(tid: usize, fd: usize) -> u32 {
             }
             if stream::peer_gone(s, end) {
                 out |= HANGUP;
+            }
+        }
+        FdKind::Timer { timer } => {
+            if crate::timerfd::pending(timer) > 0 {
+                out |= READABLE;
             }
         }
         FdKind::PtyEnd { pty, end } => {
@@ -382,6 +388,29 @@ pub fn note_pty(pty: usize) {
         if watches.iter().any(|w| w.used && names_pty(tid, w.fd, pty)) {
             crate::ipc::wake_sleeper(tid);
         }
+    }
+}
+
+/// A timer fired: wake whoever is waiting on a set, and let the scan decide
+/// whether it was one of theirs. Unlike a pipe or a pty there is no handle to
+/// match on here, because the tick fires every armed timer there is and the
+/// scan is cheaper than working out whose.
+pub fn note_timer() {
+    let mut wake = [usize::MAX; MAX_SETS];
+    let mut n = 0;
+    let flags = irq_save();
+    unsafe {
+        let waiters = &*core::ptr::addr_of!(WAITERS);
+        for i in 0..MAX_SETS {
+            if waiters[i] != usize::MAX && sets()[i].in_use {
+                wake[n] = waiters[i];
+                n += 1;
+            }
+        }
+    }
+    irq_restore(flags);
+    for i in 0..n {
+        crate::ipc::wake_sleeper(wake[i]);
     }
 }
 

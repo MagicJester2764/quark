@@ -65,6 +65,9 @@ typedef unsigned long size_t;
 #define LX_vfork            58
 #define LX_clone            56
 #define LX_setsid          112
+#define LX_timerfd_create  283
+#define LX_timerfd_settime 286
+#define LX_timerfd_gettime 287
 #define LX_fcntl            72
 #define LX_flock            73
 #define LX_exit             60
@@ -663,6 +666,63 @@ long __quark_syscall(long n, long a1, long a2, long a3, long a4, long a5, long a
            `TIOCGPTN` is 0x80045430 — are negative in it, so they arrive here
            sign-extended and match nothing. */
         return __quark_ioctl(a1, (unsigned long)(unsigned int)a2, (unsigned long)a3);
+    /* A deadline as a descriptor.
+     *
+     * The clock and the flags are read and not honoured: there is one clock
+     * here, the tick, and a timerfd that is not close-on-exec is a
+     * distinction this system does not draw. The resolution is ten
+     * milliseconds, so anything asked for below that fires at the next tick —
+     * which is the next time anything happens at all. */
+    case LX_timerfd_create: {
+        unsigned long fd = __syscall0(SYS_TIMER_CREATE);
+        return fd == QUARK_ERR ? -LX_EMFILE : (long)fd;
+    }
+    case LX_timerfd_settime: {
+        /* itimerspec: interval seconds and nanoseconds, then the same for the
+           first expiration. Absolute deadlines (TFD_TIMER_ABSTIME) are turned
+           into a delay here, since the kernel counts only forwards. */
+        if (!a3) {
+            return -LX_EINVAL;
+        }
+        const long *it = (const long *)a3;
+        unsigned long interval = (unsigned long)(it[0] * 100 + it[1] / 10000000);
+        unsigned long first_s = (unsigned long)it[2];
+        unsigned long first_n = (unsigned long)it[3];
+        unsigned long first = first_s * 100 + first_n / 10000000;
+        if ((first_s || first_n) && first == 0) {
+            first = 1; /* sooner than a tick is the next tick */
+        }
+        if (a2 & 1 /* TFD_TIMER_ABSTIME */) {
+            unsigned long now = __syscall0(SYS_TICKS);
+            first = first > now ? first - now : 1;
+        }
+        if (a4) {
+            long *old = (long *)a4;
+            unsigned long left = __syscall1(SYS_TIMER_GET, (unsigned long)a1);
+            old[0] = (long)((left >> 32) / 100);
+            old[1] = (long)(((left >> 32) % 100) * 10000000);
+            old[2] = (long)((left & 0xFFFFFFFF) / 100);
+            old[3] = (long)(((left & 0xFFFFFFFF) % 100) * 10000000);
+        }
+        return __syscall3(SYS_TIMER_SET, (unsigned long)a1, first, interval) == QUARK_ERR
+                   ? -LX_EINVAL
+                   : 0;
+    }
+    case LX_timerfd_gettime: {
+        unsigned long left = __syscall1(SYS_TIMER_GET, (unsigned long)a1);
+        if (left == QUARK_ERR) {
+            return -LX_EINVAL;
+        }
+        if (a2) {
+            long *out = (long *)a2;
+            out[0] = (long)((left >> 32) / 100);
+            out[1] = (long)(((left >> 32) % 100) * 10000000);
+            out[2] = (long)((left & 0xFFFFFFFF) / 100);
+            out[3] = (long)(((left & 0xFFFFFFFF) % 100) * 10000000);
+        }
+        return 0;
+    }
+
     case LX_setsid:
         /* No sessions here. A terminal's child calls this and then asks for a
            controlling terminal; both are about which process group hears a

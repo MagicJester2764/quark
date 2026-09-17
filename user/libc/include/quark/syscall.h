@@ -75,6 +75,11 @@
 #define SYS_PTY_CTL         209
 #define SYS_PTY_OPEN        210
 
+/* 0x90  time */
+#define SYS_TIMER_CREATE    146
+#define SYS_TIMER_SET       147
+#define SYS_TIMER_GET       148
+
 /* 0x70  hardware */
 #define SYS_GETRANDOM       116
 

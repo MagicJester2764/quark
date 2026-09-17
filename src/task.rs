@@ -63,6 +63,10 @@ pub enum FdKind {
     /// slave. The master is held by whatever draws the terminal and the slave
     /// is the program in it — its standard input, output and error.
     PtyEnd { pty: usize, end: u8 },
+    /// A timer: readable once its deadline has passed, and read as the count
+    /// of times it has. A program's event loop waits on it with everything
+    /// else it waits on.
+    Timer { timer: usize },
     /// A network connection, held by the net server as `handle`.
     ///
     /// Unlike `Ipc`, which is one-directional and carries a fixed tag, a
