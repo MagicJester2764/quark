@@ -18,10 +18,17 @@ pub const COMPOSITOR: Interface = Interface { name: b"wl_compositor", version: 1
 pub const SHM: Interface = Interface { name: b"wl_shm", version: 1 };
 pub const OUTPUT: Interface = Interface { name: b"wl_output", version: 2 };
 pub const XDG_WM_BASE: Interface = Interface { name: b"xdg_wm_base", version: 1 };
-/// Version 4, which is `wl_seat.name` and `wl_keyboard.repeat_info`. Stopping
-/// there is deliberate: version 5 adds `wl_pointer.frame` and the axis detail
-/// that goes with it, and a client binding 5 would be right to expect them.
-pub const SEAT: Interface = Interface { name: b"wl_seat", version: 4 };
+/// Version 5: `wl_seat.name`, `wl_keyboard.repeat_info`, and `wl_pointer`'s
+/// `frame` with the axis detail that goes with it. A version is advertised
+/// only when every event of it is sent, so this moved from 4 to 5 in the same
+/// change that started sending them — a client binding 5 is right to expect a
+/// `frame` after every pointer event group, and gets one.
+///
+/// Version 6 is `wl_seat.release`'s tightened rules and version 8 is
+/// `axis_value120`, which replaces `axis_discrete` for high-resolution
+/// wheels. A PS/2 wheel has no fractions to report, so there is nothing 8
+/// would let this compositor say that 5 does not.
+pub const SEAT: Interface = Interface { name: b"wl_seat", version: 5 };
 /// Server-side decorations, which is the only answer this compositor has: it
 /// draws a title bar whether or not anybody asks. The value of saying so is
 /// that a toolkit stops drawing its own on top of it.
@@ -160,9 +167,7 @@ pub const SEAT_NAME: u16 = 1;
 pub const SEAT_CAP_POINTER: u32 = 1;
 pub const SEAT_CAP_KEYBOARD: u32 = 2;
 
-// wl_pointer requests and events. Version 4 is version 1's events plus the
-// `release` destructor; version 5's `frame` and axis detail are out, and the
-// seat is advertised at 4 so that no client expects them.
+// wl_pointer requests and events.
 pub const POINTER_SET_CURSOR: u16 = 0;
 pub const POINTER_RELEASE: u16 = 1;
 pub const POINTER_ENTER: u16 = 0;
@@ -170,6 +175,32 @@ pub const POINTER_LEAVE: u16 = 1;
 pub const POINTER_MOTION: u16 = 2;
 pub const POINTER_BUTTON: u16 = 3;
 pub const POINTER_AXIS: u16 = 4;
+/// The end of a group. Everything since the last one is one logical event —
+/// an enter and the motion that came with it, a wheel click and the axis
+/// detail describing it — and a client applies the group at once.
+pub const POINTER_FRAME: u16 = 5;
+pub const POINTER_AXIS_SOURCE: u16 = 6;
+pub const POINTER_AXIS_STOP: u16 = 7;
+pub const POINTER_AXIS_DISCRETE: u16 = 8;
+/// The version that added the four events above. An object below it hears none
+/// of them, which is why every send checks: a `frame` to a client that bound 4
+/// is an opcode its libwayland has no listener slot for.
+pub const POINTER_FRAME_SINCE: u32 = 5;
+
+/// `wl_pointer.axis`. Horizontal exists for completeness; a PS/2 wheel has one
+/// axis and a tilt this driver does not report.
+pub const AXIS_VERTICAL_SCROLL: u32 = 0;
+pub const AXIS_HORIZONTAL_SCROLL: u32 = 1;
+/// `wl_pointer.axis_source`. A wheel is the discrete one: it moves in clicks,
+/// which is what `axis_discrete` counts, and unlike a touchpad it has no end
+/// to a gesture — which is why `axis_stop` is defined here and never sent.
+pub const AXIS_SOURCE_WHEEL: u32 = 0;
+pub const AXIS_SOURCE_FINGER: u32 = 1;
+pub const AXIS_SOURCE_CONTINUOUS: u32 = 2;
+/// What one click of the wheel is worth in surface coordinates. Ten, which is
+/// what Weston sends, so a client tuned against a Linux compositor scrolls by
+/// the same amount here.
+pub const AXIS_STEP: i32 = 10;
 /// `wl_pointer.button_state`.
 pub const BUTTON_RELEASED: u32 = 0;
 pub const BUTTON_PRESSED: u32 = 1;

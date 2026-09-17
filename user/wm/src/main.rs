@@ -565,11 +565,12 @@ fn pump_mouse() {
         let dx = reply.data[0] as i64 as i32;
         let dy = reply.data[1] as i64 as i32;
         let buttons = reply.data[2] as u8;
+        let wheel = reply.data[3] as i64 as i32;
         if dx != 0 || dy != 0 || !cursor::visible() {
             cursor::move_by(dx, dy);
             moved = true;
         }
-        dispatch_pointer(buttons);
+        dispatch_pointer(buttons, wheel);
     }
 
     if !moved {
@@ -601,7 +602,7 @@ fn overlapping(a: Rect, b: Rect) -> bool {
 }
 
 /// Tell whoever is under the pointer where it is and what it is doing.
-fn dispatch_pointer(buttons: u8) {
+fn dispatch_pointer(buttons: u8, wheel: i32) {
     let (x, y) = cursor::position();
 
     // Click to focus, on a press and only when the window is not already
@@ -634,6 +635,10 @@ fn dispatch_pointer(buttons: u8) {
             None => seat::motion(&mut *ptr, usize::MAX, 0, 0),
         }
         seat::button(&mut *ptr, buttons);
+        // After the motion, so that a wheel turned while the pointer is
+        // crossing into a window reaches the window it ends up over rather
+        // than the one it was leaving.
+        seat::axis(&mut *ptr, wheel);
     }
 }
 

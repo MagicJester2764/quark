@@ -224,6 +224,26 @@ pub fn button(clients: &mut [Client; MAX_CLIENTS], buttons: u8) {
     }
 }
 
+/// The wheel turned, by `detents` clicks, positive towards the user.
+///
+/// It goes to the surface the pointer is over and not to the focused one: a
+/// wheel is part of the pointer, and scrolling the window you are pointing at
+/// is what every other system does. A client that has not taken a pointer
+/// hears nothing, which is the ordinary case for one that only draws.
+pub fn axis(clients: &mut [Client; MAX_CLIENTS], detents: i32) {
+    if detents == 0 {
+        return;
+    }
+    let focus = unsafe { POINTER_FOCUS };
+    if focus == surface::NONE {
+        return;
+    }
+    let Some((slot, id)) = locate_pointer(clients, focus) else {
+        return;
+    };
+    clients[slot].pointer_axis(id, crate::protocol::AXIS_VERTICAL_SCROLL, detents);
+}
+
 /// The surface the pointer is over.
 pub fn pointer_focus() -> usize {
     unsafe { POINTER_FOCUS }

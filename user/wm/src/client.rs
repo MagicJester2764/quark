@@ -978,6 +978,20 @@ impl Client {
         if self.pointer == 0 { None } else { Some(self.pointer) }
     }
 
+    /// End a group of pointer events.
+    ///
+    /// Version 5 and up only. Below it there is no such event, and a client
+    /// treats each event as its own group — which is exactly what the events
+    /// mean when nothing says otherwise, so nothing is lost by saying nothing.
+    pub fn pointer_frame(&mut self, id: u32) {
+        if self.objects.version_of(id) < proto::POINTER_FRAME_SINCE {
+            return;
+        }
+        if let Some(a) = self.begin(id, proto::POINTER_FRAME) {
+            self.end(a);
+        }
+    }
+
     pub fn pointer_enter(&mut self, id: u32, surface_idx: usize, x: i32, y: i32) {
         let Some(surface_id) = self.surface_id(surface_idx) else {
             return;
@@ -989,6 +1003,7 @@ impl Client {
             self.arg_u32(crate::seat::fixed(y));
             self.end(a);
         }
+        self.pointer_frame(id);
         self.flush();
     }
 
@@ -1003,6 +1018,7 @@ impl Client {
             self.arg_u32(surface_id);
             self.end(a);
         }
+        self.pointer_frame(id);
         self.flush();
     }
 
@@ -1013,6 +1029,7 @@ impl Client {
             self.arg_u32(crate::seat::fixed(y));
             self.end(a);
         }
+        self.pointer_frame(id);
         self.flush();
     }
 
@@ -1024,6 +1041,42 @@ impl Client {
             self.arg_u32(if press { proto::BUTTON_PRESSED } else { proto::BUTTON_RELEASED });
             self.end(a);
         }
+        self.pointer_frame(id);
+        self.flush();
+    }
+
+    /// One turn of the wheel, as one group.
+    ///
+    /// The order is the protocol's, not a preference: `axis_source` describes
+    /// the group before it says anything, and `axis_discrete` is defined as
+    /// coming *before* the `axis` it belongs to, so that a client reading
+    /// events in order knows the click count by the time it has the distance.
+    ///
+    /// A client below version 5 gets the `axis` alone, which is all version 1
+    /// ever had — the wheel still scrolls, it simply has no click count.
+    pub fn pointer_axis(&mut self, id: u32, axis: u32, detents: i32) {
+        if detents == 0 {
+            return;
+        }
+        let modern = self.objects.version_of(id) >= proto::POINTER_FRAME_SINCE;
+        if modern {
+            if let Some(a) = self.begin(id, proto::POINTER_AXIS_SOURCE) {
+                self.arg_u32(proto::AXIS_SOURCE_WHEEL);
+                self.end(a);
+            }
+            if let Some(a) = self.begin(id, proto::POINTER_AXIS_DISCRETE) {
+                self.arg_u32(axis);
+                self.arg_u32(detents as u32);
+                self.end(a);
+            }
+        }
+        if let Some(a) = self.begin(id, proto::POINTER_AXIS) {
+            self.arg_u32(crate::now_ms());
+            self.arg_u32(axis);
+            self.arg_u32(crate::seat::fixed(detents * proto::AXIS_STEP));
+            self.end(a);
+        }
+        self.pointer_frame(id);
         self.flush();
     }
 

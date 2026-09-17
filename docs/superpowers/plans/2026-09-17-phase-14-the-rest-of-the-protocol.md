@@ -112,23 +112,26 @@ pointer, and a scroll wheel reaches a client.*
   what version 5 means: enter, motion, button and axis are all parts of one
   group and a client applies them together.
 
-- [ ] **Step 1: The failing check.** Build `wlscroll`; boot;
+- [x] **Step 1: The failing check.** Build `wlscroll`; boot;
   `wm wlscroll`; send wheel events. Expected: nothing is printed, because the
   seat is advertised at 4 and no axis event is sent.
 
-- [ ] **Step 2: The events.** `pointer_axis(id, axis, value)` sends
-  `wl_pointer.axis(time, axis, value)` with `value` in fixed point — one
-  detent is 10.0, as Weston sends — then `axis_discrete(axis, 1)` for a
-  client at version 5, then `frame`. A wheel that stops sends `axis_stop`.
-  `axis_source` says `wheel` (0).
+- [x] **Step 2: The events.** `pointer_axis(id, axis, detents)` sends one
+  group in the order the protocol defines it: `axis_source(wheel)`, then
+  `axis_discrete(axis, detents)` — which is specified as coming *before* the
+  axis event it belongs to — then `wl_pointer.axis(time, axis, value)` with
+  `value` in fixed point, one detent being 10.0 as Weston sends, then `frame`.
+  A client below version 5 gets the `axis` alone, which is all version 1 ever
+  had. `axis_stop` is defined and never sent: it ends a gesture, and a wheel
+  has none — the protocol says a wheel source does not generate it.
 
-- [ ] **Step 3: Version 5 everywhere.** `SEAT` becomes version 5, and
+- [x] **Step 3: Version 5 everywhere.** `SEAT` becomes version 5, and
   `request_count` and the version checks stay as they are: a client that binds
   at 4 gets no `frame`, and `insert_at` already records what it bound at.
   Every place that sends a pointer event sends `frame` after it, guarded on
   the version.
 
-- [ ] **Step 4: Verify.** `wm wlscroll`, wheel up and down: one line per
+- [x] **Step 4: Verify.** `wm wlscroll`, wheel up and down: one line per
   detent, with the sign right. `wm weston-simple-shm wlcairo` still behaves,
   and `wlprobe` still reports the seat it gets. `wlfuzz` still leaves the
   compositor standing (twenty seeds).
