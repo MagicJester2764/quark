@@ -1320,7 +1320,7 @@ e2fsck clean on both.
 
 The host fontconfig is the same source built natively with the same configuration (`--sysconfdir=/etc --localstatedir=/var -Dadditional-fonts-dirs=no`, FreeType from `build-freetype.sh`'s `build-host`, expat from `$QUARK_HOSTDEPS`). Its caches are Quark's, byte for byte, except for the directory times they record, which is why the image must keep those times.
 
-- [ ] **Step 1: The failing test.** `fctest.c` gains, on Quark only:
+- [x] **Step 1: The failing test.** `fctest.c` gains, on Quark only:
 
 ```c
 #ifdef __quark__
@@ -1337,13 +1337,24 @@ The host fontconfig is the same source built natively with the same configuratio
 
 (`#include <sys/stat.h>` and `<time.h>`; `cache_file` is the path `FcDirCacheLoad` returned, read before it is freed.) `fontconfig.tests` becomes `fctest`, `fc-cache -v`, `fc-list`, `fc-match monospace`.
 
-- [ ] **Step 2: Run it.** On today's image: `the cache was built with the image` fails — the image has no cache, so `FcInit` writes one during the test.
+- [x] **Step 2: Run it.** On today's image: `the cache was built with the image` fails — the image has no cache, so `FcInit` writes one during the test.
 
-- [ ] **Step 3: Implement.** The host build in `build-fontconfig.sh` (`build-host` under the source, `ninja fc-cache/fc-cache`, copied to `$QUARK_HOSTDEPS/bin/quark-fc-cache`); the stage script; `populate-ext.sh` ends with a third debugfs run of `set_inode_field <path> mtime <seconds>` (and `ctime`, `atime`) for every staged file and directory, directories last, with the seconds from `stat -c %Y`. The Makefile's `stage` calls the script after `stage-overlays.sh`.
+- [x] **Step 3: Implement.** The host build in `build-fontconfig.sh` (`build-host` under the source, `ninja fc-cache/fc-cache`, copied to `$QUARK_HOSTDEPS/bin/quark-fc-cache`); the stage script; `populate-ext.sh` ends with a third debugfs run of `set_inode_field <path> mtime <seconds>` (and `ctime`, `atime`) for every staged file and directory, directories last, with the seconds from `stat -c %Y`. The Makefile's `stage` calls the script after `stage-overlays.sh`.
 
-- [ ] **Step 4: Verify.** Rebuild fontconfig (tools and host), suites, image; `debugfs -R 'ls -l /var/cache/fontconfig'` shows the caches and their links; boot: `runtests /etc/fontconfig.tests` (fctest ok before `fc-cache` has run; `fc-cache -v` says both directories were skipped as valid), `wm wlcairo` draws text on its first frame; `check-rootfs.sh`; the same on `make hd-ext4`; `make hd` without `ROOT_OVERLAYS` leaves no cache in the stage.
+- [x] **Step 4: Verify.** Rebuild fontconfig (tools and host), suites, image; `debugfs -R 'ls -l /var/cache/fontconfig'` shows the caches and their links; boot: `runtests /etc/fontconfig.tests` (fctest ok before `fc-cache` has run; `fc-cache -v` says both directories were skipped as valid), `wm wlcairo` draws text on its first frame; `check-rootfs.sh`; the same on `make hd-ext4`; `make hd` without `ROOT_OVERLAYS` leaves no cache in the stage.
 
-- [ ] **Step 5: Commit.** explosion: "Font caches come with the image".
+- [x] **Step 5: Commit.** explosion: "Font caches come with the image".
+
+**Done.** debugfs reads a bare number given to `set_inode_field … mtime` as
+`YYYYMMDDHHMMSS` first, which put the first attempt's times in 2061 and 2469;
+the seconds go as `@N`. fctest's check first failed to build (a clash with
+its own `mono`), which the image did not show because the suite was built
+apart from `rebuild.sh`. The host fc-cache also writes `cache-9`, `-10` and
+`-11` links, which populate-ext makes since Task 5. Step 2's failing run was
+not made (with no cache in the image, FcInit writes one during the test).
+fontconfig.tests 4/4 on ext2 and ext4 with fctest's new check ok and
+`fc-cache -v` finding both directories valid; `wm wlcairo` draws text; a stage
+without `ROOT_OVERLAYS` has no `var`; e2fsck clean.
 
 ---
 
