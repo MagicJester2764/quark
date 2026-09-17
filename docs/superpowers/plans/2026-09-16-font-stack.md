@@ -1613,7 +1613,7 @@ fc-match monospace
 - Consumes: FreeType (Quark and host), fontconfig, the fonts overlay.
 - Produces: `libcairo.a` with `CAIRO_HAS_FT_FONT` and `CAIRO_HAS_FC_FONT`; `wlcairo` showing text.
 
-- [ ] **Step 1: The failing test.** `cairotext.c`:
+- [x] **Step 1: The failing test.** `cairotext.c`:
 
 ```c
 // LINK: -lcairo -lpixman-1 -lfontconfig -lfreetype -lexpat -lz -lm
@@ -1722,17 +1722,19 @@ int main(int argc, char **argv) {
 
 `cairo.tests` gains `cairotext`; `cairotest.c`'s `LINK:` line gains `-lfontconfig -lfreetype -lexpat -lz` (cairo's objects now call them).
 
-- [ ] **Step 2: Run it.** Against today's cairo it does not link (`cairo_ft_font_face_create_for_ft_face`).
+- [x] **Step 2: Run it.** Against today's cairo it does not link (`cairo_ft_font_face_create_for_ft_face`).
 
-- [ ] **Step 3: `build-cairo.sh <cairo-src> [pixman-src] [freetype-src]`.** Quark: `-Dfreetype=enabled -Dfontconfig=enabled`. Host: `-Dfreetype=enabled -Dfontconfig=disabled`, with the host FreeType's `lib/pkgconfig` on `PKG_CONFIG_PATH`; the host run prints both `cairotest`'s and `cairotext`'s checksums (the latter on the tarball's `DejaVuSans.ttf`). The header's "freetype and fontconfig arrive with the rest of the font stack" becomes what happened.
+- [x] **Step 3: `build-cairo.sh <cairo-src> [pixman-src] [freetype-src]`.** Quark: `-Dfreetype=enabled -Dfontconfig=enabled`. Host: `-Dfreetype=enabled -Dfontconfig=disabled`, with the host FreeType's `lib/pkgconfig` on `PKG_CONFIG_PATH`; the host run prints both `cairotest`'s and `cairotext`'s checksums (the latter on the tarball's `DejaVuSans.ttf`). The header's "freetype and fontconfig arrive with the rest of the font stack" becomes what happened.
 
-- [ ] **Step 4: Expected value.** Put the host's `cairotext` checksum in. `cairotest`'s must not have moved.
+- [x] **Step 4: Expected value.** Put the host's `cairotext` checksum in. `cairotest`'s must not have moved.
 
-- [ ] **Step 5: `wlcairo` writes.** Below its drawing, two lines through the toy API — `sans-serif` 18 px: "Quark renders this with cairo, FreeType and fontconfig", `monospace` 14 px: "DejaVu Sans Mono, from /usr/share/fonts" — antialiased gray, repainted with the frame. `build-weston-client.sh` links `wlcairo` with `-lcairo -lpixman-1 -lfontconfig -lfreetype -lexpat -lz -lm`.
+- [x] **Step 5: `wlcairo` writes.** Below its drawing, two lines through the toy API — `sans-serif` 18 px: "Quark renders this with cairo, FreeType and fontconfig", `monospace` 14 px: "DejaVu Sans Mono, from /usr/share/fonts" — antialiased gray, repainted with the frame. `build-weston-client.sh` links `wlcairo` with `-lcairo -lpixman-1 -lfontconfig -lfreetype -lexpat -lz -lm`.
 
-- [ ] **Step 6: Verify.** Rebuild cairo (both), tests, clients (`WESTON_SRC=… build-weston-client.sh …`); image with every suite and the overlay; boot: `runtests /etc/cairo.tests` (2 passed), `runtests /etc/fontconfig.tests`, `runtests /etc/pixman.tests`, then `wm wlcairo` and a screenshot: **the Done-when** — both lines legible in the window. `wm weston-simple-shm wlcairo`, Esc, console back.
+- [x] **Step 6: Verify.** Rebuild cairo (both), tests, clients (`WESTON_SRC=… build-weston-client.sh …`); image with every suite and the overlay; boot: `runtests /etc/cairo.tests` (2 passed), `runtests /etc/fontconfig.tests`, `runtests /etc/pixman.tests`, then `wm wlcairo` and a screenshot: **the Done-when** — both lines legible in the window. `wm weston-simple-shm wlcairo`, Esc, console back.
 
-- [ ] **Step 7: Commit.** explosion: "cairo draws text from a font on disk".
+- [x] **Step 7: Commit.** explosion: "cairo draws text from a font on disk".
+
+**As built:** `cairotext.c` says `// PKG: cairo-ft cairo-fc` rather than a `LINK:` line — `<cairo/cairo-ft.h>` includes `<ft2build.h>`, which needs FreeType's `-I`, and cairo writes those two `.pc` files only when the backends are built, so the test is skipped rather than broken until then. The host checksum is `9D2AB01E`. `wlcairo`'s first line is 485 pixels wide at 18 px, so the window is 512 × 304: the 240-pixel scene with a 64-pixel band of text under it.
 
 ---
 
@@ -1744,7 +1746,7 @@ int main(int argc, char **argv) {
 **Interfaces:**
 - Produces: `libxkbcommon.a`, `xkbcommon.pc`; overlay `usr/share/xkb/us.xkb` (a copy of `quark/user/wm/src/us.xkb`, the keymap the compositor sends).
 
-- [ ] **Step 1: The failing test.** `xkbtest.c`:
+- [x] **Step 1: The failing test.** `xkbtest.c`:
 
 ```c
 // LINK: -lxkbcommon
@@ -1826,22 +1828,22 @@ int main(int argc, char **argv) {
 
 `xkb.tests`: `xkbtest /usr/share/xkb/us.xkb`.
 
-- [ ] **Step 2: Run it.** `xkbtest skipped, not built yet: xkbcommon`.
+- [x] **Step 2: Run it.** `xkbtest skipped, not built yet: xkbcommon`. *(Also run against a scratch host build of the library, which passed: the test asks the right questions of this keymap. The library's ninja target is `libxkbcommon.a`.)*
 
-- [ ] **Step 3: `build-xkbcommon.sh <src> <overlay-out>`.** `meson setup build-quark --cross-file … --prefix="$PREFIX" --buildtype=debugoptimized -Ddefault_library=static -Db_staticpic=false --wrap-mode=nofallback -Denable-tools=false -Denable-x11=false -Denable-wayland=false -Denable-xkbregistry=false -Denable-docs=false -Denable-bash-completion=false -Dxkb-config-root=/usr/share/X11/xkb -Dx-locale-root=/usr/share/X11/locale`; build the library target only (its own tests need data files the image does not carry); install; copy `../../quark/user/wm/src/us.xkb` into `<overlay>/usr/share/xkb/`. The header: no `xkeyboard-config` — a client is sent a whole keymap and needs none.
+- [x] **Step 3: `build-xkbcommon.sh <src> <overlay-out>`.** `meson setup build-quark --cross-file … --prefix="$PREFIX" --buildtype=debugoptimized -Ddefault_library=static -Db_staticpic=false --wrap-mode=nofallback -Denable-tools=false -Denable-x11=false -Denable-wayland=false -Denable-xkbregistry=false -Denable-docs=false -Denable-bash-completion=false -Dxkb-config-root=/usr/share/X11/xkb -Dx-locale-root=/usr/share/X11/locale`; build the library target only (its own tests need data files the image does not carry); install; copy `../../quark/user/wm/src/us.xkb` into `<overlay>/usr/share/xkb/`. The header: no `xkeyboard-config` — a client is sent a whole keymap and needs none.
 
-- [ ] **Step 4: Verify.** Build, tests, image with the overlay, boot: `runtests /etc/xkb.tests` passes; the other suites still pass.
+- [x] **Step 4: Verify.** Build, tests, image with the overlay, boot: `runtests /etc/xkb.tests` passes; the other suites still pass.
 
-- [ ] **Step 5: Commit.** explosion: "libxkbcommon, with the compositor's keymap".
+- [x] **Step 5: Commit.** explosion: "libxkbcommon, with the compositor's keymap".
 
 ---
 
 ### Task 10: Write it down
 
-- [ ] `quark/CLAUDE.md`: invariants — a handle names an inode, never a copy; a task's handles close when it dies; paths are lent, never cut; directory times change with their entries. Known gaps — times are seconds since boot (no clock); no hard or symbolic links; FAT32 roots cannot remove, rename or truncate; shortening a file whose extent tree has grown past the inode is refused; file `mmap` is refused (no pager).
-- [ ] `explosion/toolchain/README.md`: a section per port (what it needed, the three build fixes, the fonts and their licence, `bootstrap-fonts.sh`), and the stale sentences about a mapped transfer page and `getdents64` corrected.
-- [ ] `~/src/osdev/ROADMAP.md`: Phase 13 done — what the ports needed of the system, what the filesystem gained, the mmap decision and why, what was deferred; the running order updated.
-- [ ] Tick this plan; commit it; push quark and explosion.
+- [x] `quark/CLAUDE.md`: invariants — a handle names an inode, never a copy; a task's handles close when it dies; paths are lent, never cut; directory times change with their entries. Known gaps — ~~times are seconds since boot (no clock)~~ (Task 2 added the CMOS clock, so the gap written down is that nothing sets it and there is no time zone); no hard or symbolic links; FAT32 roots cannot remove, rename or truncate; shortening a file whose extent tree has grown past the inode is refused; file `mmap` is refused (no pager).
+- [x] `explosion/toolchain/README.md`: a section per port (what it needed, the three build fixes, the fonts and their licence, `bootstrap-fonts.sh`), and the stale sentences about a mapped transfer page and `getdents64` corrected.
+- [x] `~/src/osdev/ROADMAP.md`: Phase 13 done — what the ports needed of the system, what the filesystem gained, the mmap decision and why, what was deferred; the running order updated.
+- [x] Tick this plan; commit it; push quark and explosion.
 
 ---
 

@@ -286,6 +286,35 @@ Three things follow from that, and breaking any of them is quiet:
   callee already carries the caller's band when the scheduler decides whether
   handing straight over would run something ahead of its betters.
 
+## Files
+
+`user/vfs` serves ext2, ext4 and FAT32; `docs/vfs.md` is its protocol. What a
+C program sees goes through `user/linux-abi`, which turns descriptors and
+Linux's calls into that protocol. `tools/check-rootfs.sh` in ../explosion runs
+`e2fsck` on the image a boot test just used, and it is the check for any
+change here: it has found what reading the code did not.
+
+- **A handle names an inode, never a copy of one.** The inode is read when the
+  handle is used, so two handles on one file agree about its size and blocks,
+  and one cannot write through a block map the other just shortened.
+- **A task's handles close when it dies.** The server watches every task it
+  gives a handle to. A file whose last name went while a handle named it is
+  freed when that handle closes, not before.
+- **Paths are lent, never cut.** A path up to 4095 bytes travels in a buffer
+  lent with the call, and a longer one is refused. The old requests carried
+  paths in the message and truncated them, which opens a different file.
+- **A directory's times change with its entries**, which is how fontconfig
+  knows its cache is stale.
+- **A descriptor names an open file.** In the Linux layer, `dup` gives a file
+  a second descriptor that shares its position, and the VFS handle closes with
+  the last one. The server never sees the copies.
+- **A journaled write never lets a prefetch cache the old copy.** While a
+  transaction holds a sector, a read ahead skips it; caching what is on disk
+  under it lost a rename on ext4.
+- **A write allocates every block in its range, holes included.** A
+  truncate that lengthens a file leaves holes, and ext4 keeps the extent root
+  in logical order so that a block written into one is where a read looks.
+
 ## Known gaps
 
 - Servers still know their clients by TID (`Message.sender`). The kernel will
@@ -303,6 +332,26 @@ Three things follow from that, and breaking any of them is quiet:
   and a click raises the one under the pointer. Keyboard focus and pointer focus
   are tracked separately, as Wayland requires, but there is no follow-mouse, no
   focus stealing prevention, and no way to move or resize a window.
+- The clock is read once, from the CMOS clock at boot, as UTC. Nothing sets it,
+  and there is no time zone.
+- No hard links and no symbolic links: `link` is refused with EPERM, which is
+  what fontconfig's lock falls back from, and the server neither makes nor
+  follows symbolic links. There is no working directory either; a relative
+  path resolves from `/`, `getcwd` says so, and the `*at` calls accept only
+  `AT_FDCWD`.
+- A FAT32 root cannot remove, rename or shorten anything, and ext4 refuses to
+  shorten a file whose extent tree has grown past the inode.
+- Files cannot be mapped: there is no pager to fill the pages. FreeType is
+  built to read its fonts instead, and fontconfig reads its caches when the map
+  fails. A file descriptor cannot be `dup2`ed onto one of the kernel's numbers
+  (a program's stdout), nor the other way round.
+- No record locks (`F_SETLK`): fontconfig's directory lock goes without. No
+  `getrandom` and no `/dev/urandom`: expat salts its hash tables from the time.
+- A C program has 16 open files; the VFS has 128 handles for everybody.
+- A file removed while open is remembered in the server's memory, not on
+  ext4's on-disk orphan list, so a machine stopped before the last close
+  leaves an inode that `e2fsck` has to collect. Deletion times are kept above
+  the inode count so that none is mistaken for a link in that list.
 - The rust fork is one commit on `upstream/main`. Rebasing it means re-checking
   the PAL against std's internals, which move: the allocator PAL shape, the
   futex module location, `RawOsError`'s home and `BorrowedCursor`'s parameters
