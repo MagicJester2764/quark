@@ -50,6 +50,7 @@ pub extern "C" fn _start() -> ! {
     let mut moves = 0u32;
     let mut clicks = 0u32;
     let mut keys = 0u32;
+    let mut wheel = 0i64;
     let mut last_buttons = 0u64;
 
     let deadline = syscall::sys_ticks() + 1000;
@@ -76,6 +77,13 @@ pub extern "C" fn _start() -> ! {
         }
         x += reply.data[0] as i64;
         y += reply.data[1] as i64;
+        // Detents since the last poll, signed: a mouse without a wheel — or a
+        // driver that never asked for one — reports nothing here at all.
+        let detents = reply.data[3] as i64;
+        if detents != 0 {
+            wheel += detents;
+            println!("  wheel {}", detents);
+        }
         moves += 1;
         if reply.data[2] != last_buttons {
             last_buttons = reply.data[2];
@@ -90,7 +98,10 @@ pub extern "C" fn _start() -> ! {
             println!("  {} moves, at {} {}", moves, x, y);
         }
     }
-    println!("mousetest: {} moves, {} presses, {} keys", moves, clicks, keys);
+    println!(
+        "mousetest: {} moves, {} presses, {} keys, wheel: {}",
+        moves, clicks, keys, wheel
+    );
     let release = Message { sender: 0, tag: TAG_INPUT_RELEASE, data: [0; 6] };
     let mut done = Message::empty();
     let _ = syscall::sys_call(input, &release, &mut done);

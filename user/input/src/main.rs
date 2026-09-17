@@ -85,7 +85,12 @@ const TAG_INPUT_NONE: u64 = 0x204;
 /// pointer delivered to somebody other than the holder of the display would be
 /// clicking on windows it cannot see.
 const TAG_INPUT_POLL_MOUSE: u64 = 0x205;
-/// `data[0] = dx`, `data[1] = dy` as signed values, `data[2] = buttons`.
+/// `data[0] = dx`, `data[1] = dy` as signed values, `data[2] = buttons`,
+/// `data[3] = wheel` in detents, positive towards the user.
+///
+/// The driver's reply is passed on whole rather than copied field by field:
+/// what a pointer packet carries is the driver's business, and a field added
+/// there reaches a compositor without a change here.
 const TAG_INPUT_MOUSE: u64 = 0x206;
 
 const TAG_OK: u64 = 0;

@@ -42,10 +42,13 @@ const NOTIFY_CTRL_C: u64 = 1;
 const TAG_GET_KEY_NB: u64 = 5;
 /// Take a pointer movement if one is waiting, but do not wait for one.
 ///
-/// `data[0] = dx`, `data[1] = dy` as signed values widened to u64, and
-/// `data[2] = buttons`, bit 0 left, bit 1 right, bit 2 middle. Answered with
-/// [`TAG_NO_KEY`] when there is nothing, so a caller that asks a driver
-/// predating the mouse gets "no movement ever" rather than hanging.
+/// `data[0] = dx`, `data[1] = dy` as signed values widened to u64,
+/// `data[2] = buttons`, bit 0 left, bit 1 right, bit 2 middle, and
+/// `data[3] = wheel`, detents since the last packet, positive towards the
+/// user. Answered with [`TAG_NO_KEY`] when there is nothing, so a caller that
+/// asks a driver predating the mouse gets "no movement ever" rather than
+/// hanging — and one that asks a mouse without a wheel gets a zero there
+/// forever, which is the same thing said about the wheel.
 const TAG_GET_MOUSE_NB: u64 = 6;
 const TAG_MOUSE_EVENT: u64 = 7;
 
@@ -98,7 +101,17 @@ const CMD_TO_MOUSE: u8 = 0xD4;
 /// Mouse commands, and the byte it answers them with.
 const MOUSE_SET_DEFAULTS: u8 = 0xF6;
 const MOUSE_ENABLE_REPORTING: u8 = 0xF4;
+const MOUSE_SET_SAMPLE_RATE: u8 = 0xF3;
+const MOUSE_GET_DEVICE_ID: u8 = 0xF2;
 const MOUSE_ACK: u8 = 0xFA;
+
+/// What the device says it is, once asked.
+///
+/// A plain PS/2 mouse is 0 and sends three bytes. A mouse that has been shown
+/// the knock below answers 3 (IMPS/2, a wheel) or 4 (IMEX, a wheel and two
+/// more buttons), and sends four.
+const MOUSE_ID_WHEEL: u8 = 3;
+const MOUSE_ID_IMEX: u8 = 4;
 
 /// Configuration byte bits: bit 1 lets the auxiliary device raise IRQ 12, and
 /// bit 5 *disables* its clock, so it has to be cleared.
@@ -106,11 +119,16 @@ const CONFIG_AUX_IRQ: u8 = 1 << 1;
 const CONFIG_AUX_CLOCK_OFF: u8 = 1 << 5;
 
 /// One movement, as the compositor will want it.
+///
+/// `wheel` is detents since the previous packet, positive towards the user —
+/// which is the sign the hardware reports and the sign `wl_pointer.axis`
+/// wants, so nothing between here and a client has to flip it.
 #[derive(Clone, Copy)]
 struct MouseEvent {
     dx: i32,
     dy: i32,
     buttons: u8,
+    wheel: i32,
 }
 
 const MOUSE_BUF_SIZE: usize = 32;
@@ -128,7 +146,7 @@ struct MouseBuffer {
 
 impl MouseBuffer {
     const fn new() -> Self {
-        const EMPTY: MouseEvent = MouseEvent { dx: 0, dy: 0, buttons: 0 };
+        const EMPTY: MouseEvent = MouseEvent { dx: 0, dy: 0, buttons: 0, wheel: 0 };
         MouseBuffer { buf: [EMPTY; MOUSE_BUF_SIZE], head: 0, tail: 0 }
     }
 
@@ -150,19 +168,28 @@ impl MouseBuffer {
     }
 }
 
-/// Assembles the controller's three-byte packets.
+/// Assembles the controller's packets, three bytes long or four.
 ///
 /// Bit 3 of the first byte is always set, which is the only synchronisation
 /// signal there is: a stream that has lost its place is found by a first byte
 /// without it, and skipping that byte is how it is recovered.
+///
+/// The length is the device's own answer to [`MOUSE_GET_DEVICE_ID`] and not a
+/// guess: reading four bytes from a mouse sending three takes the next
+/// packet's first byte as this one's wheel and loses synchronisation for good.
 struct MouseDecoder {
-    bytes: [u8; 3],
+    bytes: [u8; 4],
     have: usize,
+    id: u8,
 }
 
 impl MouseDecoder {
-    const fn new() -> Self {
-        MouseDecoder { bytes: [0; 3], have: 0 }
+    const fn new(id: u8) -> Self {
+        MouseDecoder { bytes: [0; 4], have: 0, id }
+    }
+
+    const fn packet_len(&self) -> usize {
+        if self.id >= MOUSE_ID_WHEEL { 4 } else { 3 }
     }
 
     fn feed(&mut self, b: u8) -> Option<MouseEvent> {
@@ -171,7 +198,7 @@ impl MouseDecoder {
         }
         self.bytes[self.have] = b;
         self.have += 1;
-        if self.have < 3 {
+        if self.have < self.packet_len() {
             return None;
         }
         self.have = 0;
@@ -191,7 +218,25 @@ impl MouseDecoder {
             // The mouse counts upwards and the screen counts downwards.
             dy: -dy,
             buttons: flags & 0x07,
+            wheel: self.wheel(),
         })
+    }
+
+    /// The fourth byte, which two devices spell differently.
+    ///
+    /// IMPS/2 puts a signed byte there. IMEX keeps the wheel in the low four
+    /// bits and puts the fourth and fifth buttons above it, which this system
+    /// has nowhere to send, so they are dropped rather than read as a wheel
+    /// spun eight detents at once.
+    fn wheel(&self) -> i32 {
+        match self.id {
+            MOUSE_ID_WHEEL => self.bytes[3] as i8 as i32,
+            MOUSE_ID_IMEX => {
+                let v = (self.bytes[3] & 0x0F) as i32;
+                if v & 0x08 != 0 { v - 16 } else { v }
+            }
+            _ => 0,
+        }
     }
 }
 
@@ -242,30 +287,57 @@ fn mouse_command(byte: u8) -> bool {
     syscall::sys_ioport_read(PORT_DATA) as u8 == MOUSE_ACK
 }
 
+/// Ask the mouse for a wheel, and find out whether it has one.
+///
+/// The knock is the whole of it: three sample rates, 200, 100 and 80, which no
+/// program would set on purpose, and a device that recognises the sequence
+/// starts calling itself 3 and sending a fourth byte. A device that does not
+/// keeps answering 0, which is not a failure — it is a mouse without a wheel.
+fn ask_for_wheel() -> u8 {
+    for rate in [200u8, 100, 80] {
+        if !mouse_command(MOUSE_SET_SAMPLE_RATE) || !mouse_command(rate) {
+            return 0;
+        }
+    }
+    if !mouse_command(MOUSE_GET_DEVICE_ID) || !wait_readable() {
+        return 0;
+    }
+    syscall::sys_ioport_read(PORT_DATA) as u8
+}
+
 /// Turn the auxiliary device on and ask it to report.
 ///
-/// Returns whether there is a mouse. A machine without one is not an error —
-/// it is most machines this has ever run on — so the failure is quiet and the
-/// driver carries on being a keyboard.
-fn enable_mouse() -> bool {
+/// Returns the device id, or `None` when there is no mouse. A machine without
+/// one is not an error — it is most machines this has ever run on — so the
+/// failure is quiet and the driver carries on being a keyboard.
+fn enable_mouse() -> Option<u8> {
     command(CMD_ENABLE_AUX);
 
     command(CMD_READ_CONFIG);
     if !wait_readable() {
-        return false;
+        return None;
     }
     let mut config = syscall::sys_ioport_read(PORT_DATA) as u8;
     config |= CONFIG_AUX_IRQ;
     config &= !CONFIG_AUX_CLOCK_OFF;
     command(CMD_WRITE_CONFIG);
     if !wait_writable() {
-        return false;
+        return None;
     }
     syscall::sys_ioport_write(PORT_DATA, config);
 
     // Defaults first, so that whatever the firmware left behind — a different
-    // sample rate, a different resolution — is not inherited.
-    mouse_command(MOUSE_SET_DEFAULTS) && mouse_command(MOUSE_ENABLE_REPORTING)
+    // sample rate, a different resolution — is not inherited. The knock comes
+    // after it for the same reason, and reporting last: a device that is
+    // already sending packets would answer the knock in the middle of one.
+    if !mouse_command(MOUSE_SET_DEFAULTS) {
+        return None;
+    }
+    let id = ask_for_wheel();
+    if !mouse_command(MOUSE_ENABLE_REPORTING) {
+        return None;
+    }
+    Some(id)
 }
 
 struct KeyBuffer {
@@ -379,12 +451,15 @@ pub extern "C" fn _start() -> ! {
     let mut claimant_slot: usize = 0;
 
     let mut mousebuf = MouseBuffer::new();
-    let mut mouse = MouseDecoder::new();
-    let have_mouse = mouse_irq && enable_mouse();
-    if have_mouse {
-        println!("[keyboard] Mouse enabled on the auxiliary port.");
-    } else {
-        println!("[keyboard] No mouse; keys only.");
+    let mouse_id = if mouse_irq { enable_mouse() } else { None };
+    let have_mouse = mouse_id.is_some();
+    let mut mouse = MouseDecoder::new(mouse_id.unwrap_or(0));
+    match mouse_id {
+        Some(id) if id >= MOUSE_ID_WHEEL => {
+            println!("[keyboard] Mouse enabled on the auxiliary port, with a wheel (id {}).", id)
+        }
+        Some(_) => println!("[keyboard] Mouse enabled on the auxiliary port; no wheel."),
+        None => println!("[keyboard] No mouse; keys only."),
     }
 
     loop {
@@ -522,7 +597,7 @@ pub extern "C" fn _start() -> ! {
                                 ev.dx as i64 as u64,
                                 ev.dy as i64 as u64,
                                 ev.buttons as u64,
-                                0,
+                                ev.wheel as i64 as u64,
                                 0,
                                 0,
                             ],
