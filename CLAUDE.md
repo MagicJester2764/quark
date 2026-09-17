@@ -199,6 +199,22 @@ These were established deliberately. Breaking one silently re-opens a hole.
   `sys_call_offer` puts one on a call and `sys_cap_take` accepts it; nothing
   else can fill a server's CSpace, and a claim or registration made without
   one is refused.
+- **A program is its address space, not its task.** `SYS_TASK_SPACE` names the
+  program a task belongs to with an id the kernel never reuses, and
+  `SYS_SPACE_WATCH` says when its last task has gone. Anything a server keeps
+  for a program — an open file, a working directory, a lock — is kept by that,
+  so every thread of a program shares it and a recycled TID inherits nothing.
+- **A call from the kernel to a pager carries `PAGER_BIT` in its sender**, and
+  nothing else can: the bit is set by `call_as` and by no syscall. A pager
+  answers `TAG_PAGE_IN` and `TAG_OBJECT_SYNC` only for a sender that has it,
+  and replies to the sender as it came — the reply strips the bit and reaches
+  the faulting task.
+- **No server blocks on one client.** A request that cannot be answered now is
+  kept and answered later, rather than waited for: `input` holds a reader
+  until there is a line, the framebuffer device gives a claimant a second to
+  answer a handover and then goes on without it, and a compositor's writes to
+  a client are non-blocking. A server that waits on one client has stopped
+  serving every other, and a fuzzer finds that in seconds.
 - **A driver answers only the server that claimed it.** The disk driver
   serves the VFS and the keyboard driver serves `input`, each from the first
   claim until that claimant dies, and refuses everybody else (error 5). A
@@ -282,6 +298,25 @@ Three things to know before changing any of it:
   four-megabyte copy, which a client committing a dozen times a second turns
   into a compositor with no time left to read the keyboard. `wm` clips every
   drawing primitive to a region and copies only that region out.
+- **A client's request is read inside the request.** Every argument comes
+  through a cursor bounded by the size in the message's own header, and
+  anything that cannot be honoured — an opcode the interface does not have, an
+  object that is not there or is not what the request needs, a string that
+  does not end in a NUL, a `bind` above the version advertised — is a
+  `wl_display.error` naming the object and the reason before the connection
+  ends. Reading straight from the buffer took the next message's bytes, or the
+  last read's, as arguments a client had not sent.
+- **A slot is not freed while an object still names it.** `xdg_toplevel.destroy`
+  takes the role away and leaves the surface, because the client's
+  `wl_surface` still names it; destroying the surface takes away every object
+  of that client's that named it. A surface slot freed under a live name is a
+  slot the next client's surface takes — with the first client still able to
+  attach to it. Buffers count the surfaces showing them rather than carrying a
+  flag, for the same reason, and a pool is unmapped by what was mapped rather
+  than by what the client called a pool.
+- **What the compositor has, each client has a share of.** Pools, buffers and
+  surfaces are shared tables, so one client may hold a quarter of each: a
+  client asking for them in a loop is a client, not a compositor.
 - **Events are pulled, not pushed.** A server calls a client only when the
   client asked it to and handed over the right to — `fb` and the keyboard are
   offered an `Endpoint` with the request that needs one. Otherwise it answers:
@@ -396,6 +431,14 @@ change here: it has found what reading the code did not.
   mapping copies a page when it is first touched, read or write. A file
   descriptor cannot be `dup2`ed onto one of the kernel's numbers (a program's
   stdout), nor the other way round.
+- `mprotect` says yes and does nothing: a mapping is made with the protection
+  it will keep, so a program that maps read-only and then asks for write gets
+  a mapping that still faults on the write. Shortening a file does not take
+  away pages of it a program has already mapped past the new end; what it does
+  is stop new ones being filled from beyond it.
+- `std::fs` is not implemented for this target: a hosted Rust program reads
+  and writes through descriptors it is given, not through `File::open`. C
+  programs have the whole of the C library's file interface.
 - `flock` and `fcntl` locks are one kind here, so the two can keep each other
   out where Linux keeps them apart. Locks live in the server's memory, 256 at
   once.

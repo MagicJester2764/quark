@@ -1609,11 +1609,28 @@ of nonsense each.
 
 ### Task 18: Write it down
 
-- [ ] `quark/CLAUDE.md`: new invariants — a program is its address space (handles, working directories and locks belong to it); a reserved page is a marker, not an empty entry, and page-table code tests for an all-zero entry; a mapped file's pages are the object's, counted by the slot bits in every entry that names it; a page-in call carries `PAGER_BIT` and nothing else may claim to be one; the display and the keyboard are stacks; death notices come only from sender 0; drivers answer only their server; a server never blocks on one client. Known gaps: remove the ones fixed here (links, working directory, record locks, `getrandom`, file mapping, the orphan list, demand paging) and add what remains (for example: no `mprotect`; truncating a file leaves pages already mapped past the new end; `std::fs` is unsupported).
-- [ ] `quark/docs/abi.md` and `quark/docs/vfs.md`: every new call, tag, flag and error, with ABI 2.2's row.
-- [ ] `explosion/toolchain/README.md`: the font caches, FreeType mapping its fonts, the new tests and fuzzers, `runtests`' `?` and `@N`.
-- [ ] `~/src/osdev/ROADMAP.md`: a Phase 17 section (what it fixed, what the fuzzers found, what is left), the running order (17 ran between 13 and 14), and Phase 14 next.
-- [ ] Tick this plan; commit and push quark, explosion and the fork.
+- [x] `quark/CLAUDE.md`: new invariants — a program is its address space (handles, working directories and locks belong to it); a reserved page is a marker, not an empty entry, and page-table code tests for an all-zero entry; a mapped file's pages are the object's, counted by the slot bits in every entry that names it; a page-in call carries `PAGER_BIT` and nothing else may claim to be one; the display and the keyboard are stacks; death notices come only from sender 0; drivers answer only their server; a server never blocks on one client. Known gaps: remove the ones fixed here (links, working directory, record locks, `getrandom`, file mapping, the orphan list, demand paging) and add what remains (for example: no `mprotect`; truncating a file leaves pages already mapped past the new end; `std::fs` is unsupported).
+- [x] `quark/docs/abi.md` and `quark/docs/vfs.md`: every new call, tag, flag and error, with ABI 2.2's row.
+- [x] `explosion/toolchain/README.md`: the font caches, FreeType mapping its fonts, the new tests and fuzzers, `runtests`' `?` and `@N`.
+- [x] `~/src/osdev/ROADMAP.md`: a Phase 17 section (what it fixed, what the fuzzers found, what is left), the running order (17 ran between 13 and 14), and Phase 14 next.
+- [x] Tick this plan; commit and push quark, explosion and the fork.
+
+**Done.** The invariants this phase added are written down in
+`quark/CLAUDE.md`: a program is its address space; a reserved page is a marker
+rather than an empty entry; a page-table entry that names a memory object
+carries its slot; a call to a pager carries `PAGER_BIT` and nothing else can;
+the display and the keyboard are stacks; only the kernel reports a death; a
+driver answers only the server that claimed it; no server blocks on one
+client; a client's request is read inside the request; a slot is not freed
+while an object still names it. The gaps this phase closed are out of "Known
+gaps" and what is left is in it — `mprotect` says yes and does nothing,
+shortening a file leaves pages already mapped past the new end, and `std::fs`
+is not implemented for this target.
+
+`explosion/toolchain/README.md` gained a section on the list format `runtests`
+reads, the two fuzzers and the argument sweep. `~/src/osdev/ROADMAP.md` has
+Phase 17 as done, with what each half took, and says the phase ran between 13
+and 14.
 
 ---
 
