@@ -151,7 +151,9 @@ taken.
 ### UNLINK, RMDIR, RENAME and LINK
 
 `UNLINK` removes a name that is not a directory's; the file goes with its last
-name, or, if a handle still names it, when that handle closes. `RMDIR` removes
+name, or, if a handle still names it, when that handle closes. Until then it
+is on the filesystem's orphan list, so a machine stopped first frees it at the
+next mount. `RMDIR` removes
 an empty directory (`NOT_EMPTY` otherwise). Both need write permission on the
 parent.
 

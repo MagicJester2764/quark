@@ -922,7 +922,7 @@ re-run (the layer refused `F_SETLK`). libc.tests 10/10, `dtest locks` 9/0,
 
 ext4 and ext2 keep the list the same way: the superblock's `s_last_orphan` names the first inode, and each listed inode's `i_dtime` names the next (0 ends it). `unlink`, `rmdir` and `rename` that leave an inode with no links and an open handle (or a program's current directory) add it, in the same transaction; the release that frees it removes it first. At mount, before the first request, the server frees every listed inode — truncating it to nothing and clearing its bitmap bit — and clears the list. `release_inode`'s deletion-time guard stays for inodes that are freed outright.
 
-- [ ] **Step 1: The failing test.** `dchild orphan PATH` creates `PATH`, writes 5000 bytes, opens it, unlinks it, prints `holding PATH` and waits forever on `sys_recv`. `tools/crash-test.sh`:
+- [x] **Step 1: The failing test.** `dchild orphan PATH` creates `PATH`, writes 5000 bytes, opens it, unlinks it, prints `holding PATH` and waits forever on `sys_recv`. `tools/crash-test.sh`:
 
 ```sh
 #!/bin/sh
@@ -959,15 +959,27 @@ echo "== after recovery:"
 sh "$HERE/check-rootfs.sh"
 ```
 
-- [ ] **Step 2: Run it.** Expected today: the first check reports the removed inode (it is allocated, has no links and is on no list), the second boot prints no `orphaned inode` line, and the last check still reports it.
+- [x] **Step 2: Run it.** Expected today: the first check reports the removed inode (it is allocated, has no links and is on no list), the second boot prints no `orphaned inode` line, and the last check still reports it.
 
-- [ ] **Step 3: Implement.** `orphan_add` sets `inode.i_dtime = e2.last_orphan` and `e2.last_orphan = ino`, writing the inode and the superblock (the journal's transaction covers both). `orphan_remove` walks the chain from `last_orphan`, unlinking `ino` (either the superblock's field or the previous inode's `i_dtime`). `recover_orphans` pops the list, frees each inode through `release_inode` (which truncates it and clears its bit), and writes the superblock; each inode is its own transaction on ext4. The call sites are `settle` (the last reference went) and the three namespace operations (the last link went while a reference remains).
+- [x] **Step 3: Implement.** `orphan_add` sets `inode.i_dtime = e2.last_orphan` and `e2.last_orphan = ino`, writing the inode and the superblock (the journal's transaction covers both). `orphan_remove` walks the chain from `last_orphan`, unlinking `ino` (either the superblock's field or the previous inode's `i_dtime`). `recover_orphans` pops the list, frees each inode through `release_inode` (which truncates it and clears its bit), and writes the superblock; each inode is its own transaction on ext4. The call sites are `settle` (the last reference went) and the three namespace operations (the last link went while a reference remains).
 
-- [ ] **Step 4: Verify.** `sh tools/crash-test.sh hd` and `sh tools/crash-test.sh hd-ext4`: the first check shows the list (`-n` counts it as bitmap differences, as scoping found), the second boot prints `freed 1 orphaned inode`, the last check is clean. Then an ordinary boot's `dtest files` and `runtests /etc/libc.tests`.
+- [x] **Step 4: Verify.** `sh tools/crash-test.sh hd` and `sh tools/crash-test.sh hd-ext4`: the first check shows the list (`-n` counts it as bitmap differences, as scoping found), the second boot prints `freed 1 orphaned inode`, the last check is clean. Then an ordinary boot's `dtest files` and `runtests /etc/libc.tests`.
 
-- [ ] **Step 5: Commit.** quark: "Orphans that survive a crash"; explosion: "crash-test".
+- [x] **Step 5: Commit.** quark: "Orphans that survive a crash"; explosion: "crash-test".
+
+**Done.** The child mode is `dchild unlinked PATH` (`orphan` was taken). The
+server's messages reach the screen and not serial, so `crash-test.sh` keeps a
+screenshot of each boot instead of grepping the log; the second shows
+`[vfs] freed 1 orphaned inode`. `recover_orphan` pops one inode per
+transaction; an inode on the list that still has names is left alone. Run
+before the change: the removed inode stayed allocated through the second boot.
+After: the first check shows it as a bitmap difference (e2fsck -n does not
+process the list), the last is clean, on ext2 and ext4. Ordinary boots after:
+`dtest files` 33/0 and libc.tests 10/10 on both, e2fsck clean. CLAUDE.md's
+file invariants and known gaps are brought up to date for Tasks 2 to 8.
 
 ---
+
 ### Task 9: Memory on demand
 
 **Files:**

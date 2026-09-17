@@ -280,6 +280,9 @@ pub struct Ext2State {
     pub total_inodes: u32,
     pub free_blocks_count: u32,
     pub free_inodes_count: u32,
+    /// `s_last_orphan`: the first inode that lost its last name while still in
+    /// use. Each listed inode's `i_dtime` names the next, and 0 ends the list.
+    pub last_orphan: u32,
     /// Blocks only the superuser may take, of the free ones.
     pub reserved_blocks: u32,
     /// Size of one block group descriptor: 32, or 64 with `INCOMPAT_64BIT`.
@@ -324,6 +327,7 @@ impl Ext2State {
             total_inodes: 0,
             free_blocks_count: 0,
             free_inodes_count: 0,
+            last_orphan: 0,
             reserved_blocks: 0,
             desc_size: 32,
             feature_compat: 0,
@@ -616,6 +620,7 @@ pub fn init_ext2(ext2: &mut Ext2State, disk_tid: usize, part_lba: u32) -> Result
     ext2.total_inodes = s_inodes_count;
     ext2.free_blocks_count = s_free_blocks_count;
     ext2.free_inodes_count = s_free_inodes_count;
+    ext2.last_orphan = if s_rev_level >= 1 { read_u32(&sb_buf, 232) } else { 0 };
     ext2.reserved_blocks = s_r_blocks_count;
     ext2.desc_size = desc_size;
     ext2.feature_compat = feature_compat;
@@ -1290,6 +1295,9 @@ pub fn flush_superblock(ext2: &Ext2State) -> Result<(), u64> {
 
     write_u32(sb, 12, ext2.free_blocks_count);
     write_u32(sb, 16, ext2.free_inodes_count);
+    if read_u32(sb, 76) >= 1 {
+        write_u32(sb, 232, ext2.last_orphan);
+    }
     csum::set_superblock(sb);
 
     for s in 0..2usize {

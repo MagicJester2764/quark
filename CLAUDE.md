@@ -297,9 +297,23 @@ change here: it has found what reading the code did not.
 - **A handle names an inode, never a copy of one.** The inode is read when the
   handle is used, so two handles on one file agree about its size and blocks,
   and one cannot write through a block map the other just shortened.
-- **A task's handles close when it dies.** The server watches every task it
-  gives a handle to. A file whose last name went while a handle named it is
-  freed when that handle closes, not before.
+- **A handle is its program's, and closes when the program does.** The server
+  names a program by its address space (`SYS_TASK_SPACE`) and watches each one
+  it gives a handle to, a working directory or a lock. A file whose last name
+  went while a handle or a working directory held it is freed when that goes,
+  not before.
+- **A file removed while in use is on the disk's orphan list** (`s_last_orphan`,
+  each inode's `i_dtime` naming the next), in the same transaction that took
+  its last name, and comes off it before it is freed. The server frees what a
+  stopped machine left there before it answers anything. Deletion times are
+  kept above the inode count so that no freed inode reads as a link in that
+  list. `tools/crash-test.sh` stops a machine with one on the list.
+- **A symbolic link's text is not a block map.** A target under 60 bytes lives
+  in `i_block`; freeing, truncating or mapping such an inode as if it held
+  block numbers frees whatever blocks the text spells.
+- **`/dev` is the server's, whatever the disk holds.** The lookup answers for
+  the root's `dev` directory itself, so no path — through links, or relative —
+  reaches the disk's copy, and nothing is made there.
 - **Paths are lent, never cut.** A path up to 4095 bytes travels in a buffer
   lent with the call, and a longer one is refused. The old requests carried
   paths in the message and truncated them, which opens a different file.
@@ -334,24 +348,24 @@ change here: it has found what reading the code did not.
   focus stealing prevention, and no way to move or resize a window.
 - The clock is read once, from the CMOS clock at boot, as UTC. Nothing sets it,
   and there is no time zone.
-- No hard links and no symbolic links: `link` is refused with EPERM, which is
-  what fontconfig's lock falls back from, and the server neither makes nor
-  follows symbolic links. There is no working directory either; a relative
-  path resolves from `/`, `getcwd` says so, and the `*at` calls accept only
-  `AT_FDCWD`.
+- `O_CREAT` through a symbolic link whose target does not exist says EEXIST,
+  where Linux makes the target, and `linkat` cannot name its source by
+  descriptor (`AT_EMPTY_PATH`). FAT32 has no links, and no directory handles
+  to start a relative path from.
 - A FAT32 root cannot remove, rename or shorten anything, and ext4 refuses to
   shorten a file whose extent tree has grown past the inode.
 - Files cannot be mapped: there is no pager to fill the pages. FreeType is
   built to read its fonts instead, and fontconfig reads its caches when the map
   fails. A file descriptor cannot be `dup2`ed onto one of the kernel's numbers
   (a program's stdout), nor the other way round.
-- No record locks (`F_SETLK`): fontconfig's directory lock goes without. No
-  `getrandom` and no `/dev/urandom`: expat salts its hash tables from the time.
+- `flock` and `fcntl` locks are one kind here, so the two can keep each other
+  out where Linux keeps them apart. Locks live in the server's memory, 256 at
+  once.
+- A thread starts with a copy of what its creator holds — capabilities and
+  descriptors, poll sets and sockets excepted — not a share of it: what either
+  is given or closes afterwards, the other does not see. A pipe end that was
+  open when a thread started stays open until that thread closes it or exits.
 - A C program has 16 open files; the VFS has 128 handles for everybody.
-- A file removed while open is remembered in the server's memory, not on
-  ext4's on-disk orphan list, so a machine stopped before the last close
-  leaves an inode that `e2fsck` has to collect. Deletion times are kept above
-  the inode count so that none is mistaken for a link in that list.
 - The rust fork is one commit on `upstream/main`. Rebasing it means re-checking
   the PAL against std's internals, which move: the allocator PAL shape, the
   futex module location, `RawOsError`'s home and `BorrowedCursor`'s parameters

@@ -17,7 +17,9 @@
 //! name `passwd` opens: whoever started it gave it `/etc` as its directory.
 //! `lock PATH` locks the whole file, says so on descriptor 3, and holds it
 //! until that closes; `lock2 PATH` locks byte 1, says so, waits for byte 0,
-//! and says so again once it has it.
+//! and says so again once it has it. `unlinked PATH` makes a file, removes it
+//! while holding it open, and waits for ever: stopping the machine then is a
+//! crash with an orphan on the disk.
 
 use quark_rt::ipc::{Message, TID_ANY};
 use quark_rt::manifest::CapReq;
@@ -84,6 +86,26 @@ pub extern "C" fn _start() -> ! {
         let mut buf = [0u8; 1];
         while held.is_some() && matches!(syscall::sys_fd_read(CONN, &mut buf), 1..=0xFFFF) {}
         syscall::sys_exit_code(if held.is_some() { 0 } else { 1 });
+    }
+    if quark_rt::args::argv(1) == Some(&b"unlinked"[..]) {
+        let path = quark_rt::args::argv(2).unwrap_or(b"");
+        let held = nameserver::lookup_retry(b"vfs", 20).and_then(|vfs| {
+            let o = vfs::open_with(vfs, path, vfs::OPEN_CREATE | vfs::OPEN_TRUNCATE).ok()?;
+            let data = [0x5Au8; 1000];
+            for i in 0..5 {
+                vfs::write(vfs, o.handle, &data, i * 1000).ok()?;
+            }
+            vfs::unlink(vfs, path).ok()?;
+            Some(o.handle)
+        });
+        match held {
+            Some(_) => println!("holding {}", core::str::from_utf8(path).unwrap_or("?")),
+            None => syscall::sys_exit_code(1),
+        }
+        loop {
+            let mut msg = Message::empty();
+            let _ = syscall::sys_recv(TID_ANY, &mut msg);
+        }
     }
     if quark_rt::args::argv(1) == Some(&b"cwd"[..]) {
         let found = nameserver::lookup_retry(b"vfs", 20).is_some_and(|vfs| {

@@ -472,7 +472,7 @@ fn drop_link(e2: &mut Ext2State, ino: u32, inode: &mut Ext2Inode, t: u32) -> Res
     }
     if handles::inode_is_open(ino) {
         handles::add_orphan(ino);
-        return ext2::write_inode(e2, ino, inode);
+        return orphan_add(e2, ino, inode);
     }
     release_inode(e2, ino, inode, t)
 }
@@ -487,18 +487,85 @@ fn drop_dir(e2: &mut Ext2State, ino: u32, dir: &mut Ext2Inode, t: u32) -> Result
     ext2::flush_bgd(e2, group)?;
     if handles::inode_is_open(ino) {
         handles::add_orphan(ino);
-        return ext2::write_inode(e2, ino, dir);
+        return orphan_add(e2, ino, dir);
     }
     release_inode(e2, ino, dir, t)
 }
 
 /// Free inode `ino`, which has no names left, if it still has none.
 pub fn release(e2: &mut Ext2State, ino: u32) -> Result<(), u64> {
+    orphan_remove(e2, ino)?;
     let mut inode = ext2::read_inode(e2, ino)?;
     if inode.i_links_count != 0 {
         return Ok(());
     }
     release_inode(e2, ino, &mut inode, ext2::now())
+}
+
+/// Put `ino`, which has no names left but is still in use, at the head of the
+/// on-disk orphan list, so that a machine stopped before it is freed frees it
+/// at the next mount. Writes the inode.
+pub fn orphan_add(e2: &mut Ext2State, ino: u32, inode: &mut Ext2Inode) -> Result<(), u64> {
+    inode.i_dtime = e2.last_orphan;
+    ext2::write_inode(e2, ino, inode)?;
+    e2.last_orphan = ino;
+    ext2::flush_superblock(e2)
+}
+
+/// Take `ino` off the orphan list, if it is on it.
+pub fn orphan_remove(e2: &mut Ext2State, ino: u32) -> Result<(), u64> {
+    let mut prev = 0u32;
+    let mut cur = e2.last_orphan;
+    // The list can be no longer than there are inodes; a longer one loops.
+    for _ in 0..e2.total_inodes {
+        if cur == 0 || cur > e2.total_inodes {
+            return Ok(());
+        }
+        let mut inode = ext2::read_inode(e2, cur)?;
+        let next = inode.i_dtime;
+        if cur == ino {
+            inode.i_dtime = 0;
+            ext2::write_inode(e2, cur, &inode)?;
+            if prev == 0 {
+                e2.last_orphan = next;
+                return ext2::flush_superblock(e2);
+            }
+            let mut before = ext2::read_inode(e2, prev)?;
+            before.i_dtime = next;
+            return ext2::write_inode(e2, prev, &before);
+        }
+        prev = cur;
+        cur = next;
+    }
+    Err(ERR_IO)
+}
+
+/// Free the first inode on the orphan list, which a machine stopped while it
+/// was still in use left there. Returns whether there was one. Called at
+/// mount, once per inode, each in a transaction of its own.
+pub fn recover_orphan(e2: &mut Ext2State) -> Result<bool, u64> {
+    let ino = e2.last_orphan;
+    if ino == 0 {
+        return Ok(false);
+    }
+    if ino > e2.total_inodes {
+        // Not an inode: the list is damaged past here, and is dropped.
+        e2.last_orphan = 0;
+        ext2::flush_superblock(e2)?;
+        return Ok(false);
+    }
+    let mut inode = ext2::read_inode(e2, ino)?;
+    e2.last_orphan = inode.i_dtime;
+    inode.i_dtime = 0;
+    ext2::flush_superblock(e2)?;
+    if inode.i_links_count == 0 {
+        release_inode(e2, ino, &mut inode, ext2::now())?;
+    } else {
+        // Still named: a truncation the list was keeping, which this never
+        // makes. It is left as it is.
+        ext2::write_inode(e2, ino, &inode)?;
+    }
+    Ok(true)
 }
 
 /// Free everything `ino` holds, and `ino`.

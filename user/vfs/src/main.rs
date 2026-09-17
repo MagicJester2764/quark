@@ -1348,6 +1348,9 @@ pub extern "C" fn _start() -> ! {
 
     if unsafe { FS_TYPE } == FsType::Ext2 {
         ext2_dir::note_dev_dir(ext2_state());
+        if !ext2_state().read_only {
+            recover_orphans();
+        }
     }
 
     // Register with nameserver
@@ -1861,6 +1864,35 @@ fn client_died(space: u64) {
     settle(&closed[..n]);
     if let cwd::Where::Inode(ino) = cwd::forget(space) {
         settle(&[ino]);
+    }
+}
+
+/// Free what a machine stopped while files were removed but in use left on
+/// the orphan list. Before the first request: nothing can hold them now.
+fn recover_orphans() {
+    let mut freed = 0usize;
+    let mut failed = false;
+    // Bounded by the list's own bound; each pop is its own transaction.
+    for _ in 0..ext2_state().total_inodes {
+        let mut more = false;
+        transacted(|| match ext2_ops::recover_orphan(ext2_state_mut()) {
+            Ok(m) => more = m,
+            Err(code) => {
+                println!("[vfs] could not free an orphaned inode ({})", code);
+                failed = true;
+            }
+        });
+        if failed || !more {
+            break;
+        }
+        freed += 1;
+    }
+    if freed > 0 {
+        println!(
+            "[vfs] freed {} orphaned inode{}",
+            freed,
+            if freed == 1 { "" } else { "s" }
+        );
     }
 }
 
