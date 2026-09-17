@@ -61,6 +61,7 @@ typedef unsigned long size_t;
 #define LX_getppid         110
 #define LX_wait4            61
 #define LX_fork             57
+#define LX_execve           59
 #define LX_vfork            58
 #define LX_clone            56
 #define LX_fcntl            72
@@ -573,6 +574,11 @@ long __quark_syscall(long n, long a1, long a2, long a3, long a4, long a5, long a
      * musl's own thread path is a tail call into `__quark_clone`. Anything
      * asking for a new process with a shared file table or a stopped child is
      * asking for a Linux this is not. */
+    /* Become another program. It does not return unless it failed, and what
+       it answers then is what `execl` reports. */
+    case LX_execve:
+        return __quark_execve((const char *)a1, (char *const *)a2, (char *const *)a3);
+
     case LX_fork:
     case LX_vfork: {
         unsigned long child = __syscall0(SYS_FORK);

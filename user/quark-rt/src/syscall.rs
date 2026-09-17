@@ -36,6 +36,7 @@ pub const SYS_MUNMAP: u64 = 33;
 pub const SYS_PHYS_ALLOC: u64 = 34;
 pub const SYS_PHYS_FREE: u64 = 35;
 pub const SYS_ADDRSPACE_CREATE: u64 = 36;
+pub const SYS_ADDRSPACE_DESTROY: u64 = 38;
 pub const SYS_ADDRSPACE_MAP: u64 = 37;
 pub const SYS_MAP_PHYS: u64 = 38;
 pub const SYS_SET_MEM_LIMIT: u64 = 39;
@@ -108,6 +109,7 @@ pub const SYS_TASK_SPACE: u64 = 107;
 pub const SYS_SPACE_WATCH: u64 = 108;
 pub const SYS_TASK_CREATE_IN: u64 = 109;
 pub const SYS_FORK: u64 = 110;
+pub const SYS_EXEC_SPACE: u64 = 111;
 
 // --- 0x70  hardware and drivers ---
 pub const SYS_IRQ_REGISTER: u64 = 112;

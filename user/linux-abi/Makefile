@@ -19,7 +19,7 @@ CFLAGS  += $(EXTRA_CFLAGS)
 # in place would have two Makefiles writing one path with their own flags, and
 # whichever ran last would decide what the other one linked.
 OBJS    := src/syscall.o src/start.o src/files.o src/net.o src/clone.o \
-           src/clone-entry.o src/vfs-client.o
+           src/clone-entry.o src/vfs-client.o src/process.o
 # Linked for its section rather than its symbols, so it cannot live in the
 # archive: nothing references it and it would never be pulled in.
 MANIFEST := src/manifest.o

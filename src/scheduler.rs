@@ -217,6 +217,15 @@ pub fn exit_with(code: i32) -> ! {
             }
         }
 
+        // The descriptors go now, not at reaping. A dead task keeps its memory
+        // until its parent collects it — that is deliberate, and its exit
+        // status needs somewhere to live — but a descriptor is something
+        // *another* task can be waiting on: the oldest idiom there is has a
+        // child write down a pipe and exit while its parent reads to the end
+        // and only then waits for it. Held to reaping, the pipe never reaches
+        // its end and the two wait for each other for ever.
+        close_descriptors(current);
+
         if let Some(ref mut task) = TASKS[current] {
             task.clear_child_tid = 0;
             task.state = TaskState::Dead;
@@ -807,6 +816,8 @@ pub fn kill_task(tid: usize) -> Result<(), ()> {
                 task.state = TaskState::Dead;
                 task.exit_code = -9; // killed, as SIGKILL
                 crate::ipc::clear_signal_deadline(tid);
+                // As in `exit_with`: what others wait on is let go now.
+                close_descriptors(tid);
                 note_death(tid);
                 let parent = task.parent_tid;
                 if parent != 0 && WAIT_BLOCKED[parent] {
@@ -976,6 +987,29 @@ unsafe fn reap(i: usize) { unsafe {
 /// nothing will collect them now. A thread is a child of the thread that made
 /// it, so a program's exited threads are exactly these, and the address space
 /// they share goes only when the last of them does.
+/// Let go of everything a task holds that somebody else can be waiting on.
+///
+/// Called when a task dies rather than when it is reaped, and it empties the
+/// table so that reaping finds nothing left to do. What it does *not* touch is
+/// memory: a dead task keeps that until it is collected, which is what lets
+/// `sys_wait` report an exit status.
+pub fn close_descriptors(tid: usize) {
+    let flags = irq_save();
+    let fds = unsafe {
+        match TASKS[tid].as_mut() {
+            Some(t) => core::mem::replace(&mut t.fds, [crate::task::FdKind::Empty; crate::task::MAX_FDS]),
+            None => {
+                irq_restore(flags);
+                return;
+            }
+        }
+    };
+    irq_restore(flags);
+    // Outside the lock: closing a pipe end wakes whoever was waiting on it,
+    // which is a scheduler operation of its own.
+    crate::pipe::cleanup_task_fds(&fds, tid);
+}
+
 unsafe fn reap_one(i: usize) -> u64 { unsafe {
     let Some(ref mut task) = TASKS[i] else {
         return 0;
@@ -988,7 +1022,9 @@ unsafe fn reap_one(i: usize) -> u64 { unsafe {
     if !can_reap {
         return 0;
     }
-    // Clean up pipe refcounts and wake blocked tasks
+    // Pipe refcounts, for a task that died before this was moved to `exit_with`
+    // — a kernel task, say, that never went through it. Ordinarily the table
+    // is already empty by now.
     crate::pipe::cleanup_task_fds(&task.fds, i);
     // Reclaim pipes it created but never attached to an fd
     crate::pipe::cleanup_orphans(i);
@@ -1634,12 +1670,112 @@ pub fn fork_current() -> Option<usize> {
     Some(tid)
 }
 
+/// Is any task running in the address space with this id?
+pub fn space_in_use(space: u64) -> bool {
+    if space == 0 {
+        return false;
+    }
+    let flags = irq_save();
+    let used = unsafe { space_has_live_task(space) };
+    irq_restore(flags);
+    used
+}
+
+/// How many live tasks belong to a program.
+pub fn space_task_count(space: u64) -> usize {
+    let flags = irq_save();
+    let n = unsafe {
+        (*core::ptr::addr_of!(TASKS))
+            .iter()
+            .filter(|t| matches!(t, Some(t) if t.space == space && t.state != TaskState::Dead))
+            .count()
+    };
+    irq_restore(flags);
+    n
+}
+
+/// Become another program: keep the task, change the address space it runs in.
+///
+/// The task is the same task afterwards — same id, same descriptors, same
+/// capabilities, same parent — which is what `execve` promises. What changes
+/// is everything the old address space held, which is freed here, and the
+/// program's identity: a new address space is a new program, so servers see
+/// the caller become something else rather than carry on.
+///
+/// Refused for a program with more than one task. POSIX has `exec` end every
+/// other thread, and ending them means unwinding whatever they hold in a
+/// server; refusing is the honest version of not having done that yet.
+///
+/// Does not return on success.
+pub fn exec_into(cr3: usize, entry: u64, rsp: u64) -> Result<(), ()> {
+    let caller = current_tid();
+    let old_cr3 = crate::paging::read_cr3();
+    if cr3 == 0 || cr3 == old_cr3 || !crate::userspace::is_owned_address_space(caller, cr3) {
+        return Err(());
+    }
+    if entry < crate::paging::USER_MIN_ADDR || rsp < crate::paging::USER_MIN_ADDR {
+        return Err(());
+    }
+    let space = crate::userspace::space_of(cr3);
+    if space == 0 || space_in_use(space) {
+        return Err(());
+    }
+    let old_space = {
+        let flags = irq_save();
+        let s = unsafe { TASKS[caller].as_ref().map(|t| t.space) };
+        irq_restore(flags);
+        s.unwrap_or(0)
+    };
+    if space_task_count(old_space) > 1 {
+        return Err(());
+    }
+
+    {
+        let flags = irq_save();
+        unsafe {
+            if let Some(t) = TASKS[caller].as_mut() {
+                t.cr3 = cr3;
+                t.space = space;
+                // The new image has set no thread pointer and registered no
+                // word to clear: both named memory that is about to go.
+                t.fs_base = 0;
+                t.clear_child_tid = 0;
+                t.mem_pages = 0;
+                t.fpu = crate::fpu::clean();
+            }
+        }
+        crate::userspace::addrspace_ref(cr3);
+        irq_restore(flags);
+    }
+
+    // The kernel's own mappings are in PML4[0] and the upper half, which every
+    // address space shares, so this kernel stack stays where it is across the
+    // switch — and the old space can then be freed out from under nothing.
+    //
+    // The thread pointer goes with the address space it pointed into. The
+    // scheduler only loads FS on a switch, and there is no switch here: left
+    // alone, the new program's first thread-local — which for a C library is
+    // in its own startup — would read through an address the old program had
+    // and this one has not.
+    unsafe {
+        crate::paging::write_cr3(cr3);
+        crate::cpu::set_fs_base(0);
+        crate::fpu::restore(&crate::fpu::clean());
+    }
+    if crate::userspace::addrspace_unref(old_cr3) {
+        drop_unused_space(old_cr3);
+    }
+    unsafe {
+        crate::syscall::enter_usermode(entry, rsp, 0);
+    }
+}
+
 /// Throw away an address space no task ever ran in.
 ///
 /// The ordinary path frees one when its last task goes; a fork that fails
 /// part-way has one nothing is using, and leaving it would leak every page the
 /// copy had managed.
-fn drop_unused_space(cr3: usize) {
+pub fn drop_unused_space(cr3: usize) {
     unsafe {
         crate::paging::destroy_address_space(cr3);
         crate::userspace::unregister_address_space(cr3);

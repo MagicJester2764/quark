@@ -181,6 +181,8 @@ pub const SYS_SPACE_WATCH: u64 = 108;
 /// Make a task for an address space the caller created, to start later.
 pub const SYS_TASK_CREATE_IN: u64 = 109;
 pub const SYS_FORK: u64 = 110;
+pub const SYS_EXEC_SPACE: u64 = 111;
+pub const SYS_ADDRSPACE_DESTROY: u64 = 38;
 
 /// Be told when a task dies, so that whatever it was lent can be taken back.
 /// Takes no capability: SYS_TASK_INFO already answers the same question by
@@ -1102,6 +1104,19 @@ extern "C" fn syscall_dispatch(
                 None => u64::MAX,
             }
         }
+        SYS_EXEC_SPACE => {
+            // arg0 = an address space the caller made and filled, arg1 = where
+            // to start in it, arg2 = its stack. The caller becomes the program
+            // in it, keeping its id, its descriptors and its capabilities.
+            //
+            // No capability: everything here is the caller's own. It made the
+            // address space, it moved its own pages into it, and what it is
+            // replacing is itself.
+            match scheduler::exec_into(arg0 as usize, arg1, arg2) {
+                Ok(()) => 0,
+                Err(()) => u64::MAX,
+            }
+        }
         SYS_TASK_CREATE_IN => {
             // arg0 = an address space the caller made. The task belongs to
             // that program before it runs, which is what lets a spawner give
@@ -1118,10 +1133,33 @@ extern "C" fn syscall_dispatch(
                 None => u64::MAX,
             }
         }
-        SYS_ADDRSPACE_CREATE => {
-            if !crate::cap::task_has_task_mgmt(scheduler::current_tid(), 0) {
+        SYS_ADDRSPACE_DESTROY => {
+            // An address space the caller made and nothing is running in.
+            // What it frees is what the caller moved into it, which was the
+            // caller's own; a spawn or an exec that fails part-way has one of
+            // these and nothing else to do with it.
+            let caller = scheduler::current_tid();
+            let cr3 = arg0 as usize;
+            if cr3 == 0
+                || cr3 == paging::read_cr3()
+                || !crate::userspace::is_owned_address_space(caller, cr3)
+            {
                 return u64::MAX;
             }
+            if scheduler::space_in_use(crate::userspace::space_of(cr3)) {
+                return u64::MAX;
+            }
+            scheduler::drop_unused_space(cr3);
+            0
+        }
+        SYS_ADDRSPACE_CREATE => {
+            // No capability. A frame for a page table, registered to the
+            // caller, which confers authority over nothing: filling it needs
+            // pages the caller already owns, and starting a task in it is
+            // `SYS_TASK_CREATE_IN`, which does need `TaskMgmt`. A program
+            // replacing itself with `execve` makes one of these, and asking it
+            // to hold the capability that starts other people's tasks would be
+            // asking for far more than it is doing.
             match crate::userspace::create_address_space() {
                 Some(cr3) => cr3 as u64,
                 None => u64::MAX,
@@ -1186,10 +1224,10 @@ extern "C" fn syscall_dispatch(
             // is what keeps that sound. The caller cannot keep a mapping of
             // what it gave, so nothing is left pointing at the frame once the
             // child is gone and the allocator has handed it to someone else.
+            // No capability, for the reason `SYS_ADDRSPACE_CREATE` has none:
+            // the pages are the caller's own and the address space is one it
+            // made, which `may_use_address_space` below is what checks.
             let caller = scheduler::current_tid();
-            if !crate::cap::task_has_task_mgmt(caller, 0) {
-                return u64::MAX;
-            }
             let cr3 = arg0 as usize;
             let virt = arg1 as usize;
             let from = arg2 as usize;

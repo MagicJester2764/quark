@@ -220,6 +220,15 @@ pub struct UserFrame {
   at `entry`. The old space is freed. It does not return. The task's *space id*
   is the new space's, so servers see the program it has become rather than the
   one it was.
+- Produces: descriptors are released when a task *dies* rather than when it is
+  reaped. A dead task keeps its memory until its parent collects it, which is
+  deliberate; a descriptor is something another task can be waiting on, and the
+  oldest idiom there is — a child writes down a pipe and exits while its parent
+  reads to the end — deadlocked on it.
+- Produces: a descriptor sent over a stream stays deliverable after the sender
+  closes its end. `close_end` discarded the queue bound for the *peer* instead
+  of the one bound for itself, which nothing noticed while senders lingered
+  until reaping.
 - Produces: `execve(path, argv, envp)` in the C layer: read the ELF through the
   VFS, make an address space, give it the segments and a stack carrying
   `argv`/`envp` and the program's own header table at `PHDRS_AT`
@@ -227,18 +236,18 @@ pub struct UserFrame {
   before the last call it returns an error and the caller is untouched, which
   is what `execl` failing has to mean.
 
-- [ ] **Step 1: The failing check.** `exectest.c` prints "before", execs
+- [x] **Step 1: The failing check.** `exectest.c` prints "before", execs
   `/usr/bin/echo` with an argument, and prints "exec failed" if it returns.
   Expected: "exec failed: Function not implemented".
 
-- [ ] **Step 2: The kernel half.** `exec_into(cr3, entry, rsp)`: check the
+- [x] **Step 2: The kernel half.** `exec_into(cr3, entry, rsp)`: check the
   caller created that address space, take the old `cr3`, put the task in the
   new one, move the space id across, reset `fs_base` to 0 (the new image has
   not set a thread pointer), keep `fds`, `caps`, `cspace`, `parent_tid`, then
   enter user mode at `entry` with `rsp`. Free the old address space *after* the
   switch, since the call is running on its stack until then.
 
-- [ ] **Step 3: The loader.** `process.c` reads the ELF header and program
+- [x] **Step 3: The loader.** `process.c` reads the ELF header and program
   headers, maps each `PT_LOAD` segment into scratch pages of its own, zeroes
   the tail between `p_filesz` and `p_memsz`, and `SYS_ADDRSPACE_GIVE`s them to
   the new space at `p_vaddr`. The stack is one more give, built like
@@ -246,12 +255,12 @@ pub struct UserFrame {
   with `AT_PHDR`, `AT_PHENT`, `AT_PHNUM` and `AT_ENTRY`, and the argument page
   with the program headers copied to `PHDRS_AT`.
 
-- [ ] **Step 4: Verify.** `exectest` prints "before" and then `echo`'s
+- [x] **Step 4: Verify.** `exectest` prints "before" and then `echo`'s
   argument; its pid is unchanged across the exec, which it prints either side
   to show. `forktest` still passes. A failing exec — a path that is not there,
   a file that is not an ELF — returns and the program carries on.
 
-- [ ] **Step 5: Commit.** quark: "A task can exec".
+- [x] **Step 5: Commit.** quark: "A task can exec".
 
 ---
 

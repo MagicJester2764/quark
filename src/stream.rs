@@ -188,14 +188,19 @@ pub fn close_end(stream: usize, end: u8) {
         } else {
             (s.zero_to_one, s.one_to_zero)
         };
-        // Anything still travelling towards the peer will never arrive: this
-        // end is the one that would have delivered it. Take the queue out
-        // under the lock and release it after, since releasing a descriptor
-        // can reach back into this table.
+        // Descriptors waiting for *this* end will never be collected now, so
+        // they are released. The ones this end sent are not touched: they are
+        // in the stream rather than in the sender, and the peer can still read
+        // them — a program that writes, passes a descriptor and exits has
+        // delivered both, which is what a socket pair is for. Only when both
+        // ends have gone is the whole queue undeliverable.
+        //
+        // Taken out under the lock and released after, since releasing a
+        // descriptor can reach back into this table.
         let mut orphans = [FdKind::Empty; FD_QUEUE * 2];
         let mut n = 0;
         for side in 0..2 {
-            if side == 1 - end as usize || both {
+            if side == end as usize || both {
                 for i in 0..s.q_len[side] {
                     orphans[n] = s.q[side][i];
                     n += 1;

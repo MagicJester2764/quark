@@ -8,6 +8,7 @@
 #define LX_ENOENT    2
 #define LX_EBADF     9
 #define LX_ENOMEM   12
+#define LX_ENOEXEC   8
 #define LX_EFAULT   14
 #define LX_EINVAL   22
 #define LX_EMFILE   24
@@ -84,6 +85,7 @@ long __quark_fstatfs(long fd, void *buf);
 
 /* Streams, descriptor passing and waiting, in net.c. */
 long __quark_memfd(const char *name, long flags);
+long __quark_execve(const char *path, char *const argv[], char *const envp[]);
 long __quark_ftruncate(long fd, long length);
 long __quark_fcntl(long fd, long cmd, long arg);
 int __quark_fd_is_nonblock(long fd);

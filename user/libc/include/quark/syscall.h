@@ -38,6 +38,9 @@
 #define SYS_MAP_PHYS        38
 #define SYS_MMAP_FD         42
 #define SYS_ADDRSPACE_SELF  41
+#define SYS_ADDRSPACE_CREATE 36
+#define SYS_ADDRSPACE_GIVE  43
+#define SYS_ADDRSPACE_DESTROY 38
 
 /* 0x40  file descriptors */
 #define SYS_FD_READ         64
@@ -65,6 +68,7 @@
 #define SYS_SET_CLEAR_TID   106
 #define SYS_TASK_SPACE      107
 #define SYS_FORK            110
+#define SYS_EXEC_SPACE      111
 
 /* 0x70  hardware */
 #define SYS_GETRANDOM       116
