@@ -1509,13 +1509,52 @@ ext4 with `e2fsck` clean afterwards, as do fresh seeds from `sys_getrandom`;
 
 A client that breaks the protocol is sent `wl_display.error` with the object and a code, and disconnected, as the Wayland specification says. Nothing a client sends may take down `wm` or reach another client.
 
-- [ ] **Step 1: The fuzzer and a first run.** Build `wlfuzz`; image; a key script that runs, for seeds 1 to 20, `wm "wlfuzz <seed> 500" wlcairo` for eight seconds each (two screenshots a second apart, to see `wlcairo`'s square turn), then Esc. Expected on today's compositor: whatever it finds.
+- [x] **Step 1: The fuzzer and a first run.** Build `wlfuzz`; image; a key script that runs, for seeds 1 to 20, `wm "wlfuzz <seed> 500" wlcairo` for eight seconds each (two screenshots a second apart, to see `wlcairo`'s square turn), then Esc. Expected on today's compositor: whatever it finds.
 
-- [ ] **Step 2: Fix what it finds.** Every compositor fault or hang, and every case where a bad message is accepted without an error, is fixed; the seeds that found them are recorded in the commit message and added to the script's list.
+- [x] **Step 2: Fix what it finds.** Every compositor fault or hang, and every case where a bad message is accepted without an error, is fixed; the seeds that found them are recorded in the commit message and added to the script's list.
 
-- [ ] **Step 3: Verify.** The script, twenty seeds and the recorded ones: `wlcairo` keeps turning in every session, serial has no `UFAULT` for the compositor, each session ends on Esc and the console comes back. `wm weston-simple-shm wlcairo wlclip wlprobe` behaves as before.
+- [x] **Step 3: Verify.** The script, twenty seeds and the recorded ones: `wlcairo` keeps turning in every session, serial has no `UFAULT` for the compositor, each session ends on Esc and the console comes back. `wm weston-simple-shm wlcairo wlclip wlprobe` behaves as before.
 
-- [ ] **Step 4: Commit.** quark: "wm survives a bad client"; explosion: "wlfuzz".
+- [x] **Step 4: Commit.** quark: "wm survives a bad client"; explosion: "wlfuzz".
+
+**Done.** `wlfuzz` writes the wire format itself — libwayland would refuse to
+send most of what it sends — and its first run against the compositor as it
+was found no crash: twenty seeds, twenty windows still drawing, nothing in
+serial. What it did find was that the compositor said nothing: every one of
+those sessions ended with the connection closed and no word about why, after
+between 27 and 214 messages.
+
+So the whole of a request is read through a cursor bounded by the size in the
+message's own header — reading straight from the buffer took the next
+message's bytes, or the last read's, as arguments a client had not sent — and
+everything that cannot be honoured is a `wl_display.error` naming the object
+and the reason before the connection ends: an opcode the interface does not
+have, an object that is not there or is not what the request needs, a string
+that does not end in a NUL or is longer than the request holding it, a
+`bind` that names the wrong interface or a version that was not offered, a
+message longer than the buffer that reads it or whose size is not a multiple
+of four.
+
+Three things the fuzzer had not reached, found while writing that:
+
+- A pool was unmapped by the size the *client* called it, not by what was
+  mapped. A client that handed over more memory than it said left the rest
+  mapped and that pool slot unusable for the life of the compositor.
+- "The compositor is showing this buffer" was a flag rather than a count, so
+  a buffer attached to two surfaces was freed under the second one.
+- A surface slot was freed while the client's `wl_surface` still named it —
+  and the next client's surface takes that slot, with the first client still
+  able to attach to it. `xdg_toplevel.destroy` now takes the role away and
+  leaves the surface, and destroying the surface takes away every object of
+  that client's that named it.
+
+Pools, buffers and surfaces are a share per client now, so one client cannot
+take them all; a data offer stays until the client destroys it, as a client is
+told to.
+
+`weston-simple-shm`, `wlcairo`, `wlclip` and `wlprobe` still run together in
+one session, and twenty seeds against the stricter compositor leave every
+window drawing, nothing in serial, and every session ending on Esc.
 
 ---
 

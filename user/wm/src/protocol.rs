@@ -104,6 +104,10 @@ pub const SURFACE_OFFSET: u16 = 10;
 // wl_surface events.
 pub const SURFACE_ENTER: u16 = 0;
 
+/// `wl_surface.error`: a scale or a transform that is not one.
+pub const SURFACE_ERR_INVALID_SCALE: u32 = 0;
+pub const SURFACE_ERR_INVALID_TRANSFORM: u32 = 1;
+
 // wl_region requests. A region is an optimisation hint about which pixels are
 // opaque or want input; this compositor composites and routes the same either
 // way, so the object exists and its requests do nothing.
@@ -159,7 +163,8 @@ pub const SEAT_CAP_KEYBOARD: u32 = 2;
 // wl_pointer requests and events. Version 4 is version 1's events plus the
 // `release` destructor; version 5's `frame` and axis detail are out, and the
 // seat is advertised at 4 so that no client expects them.
-pub const POINTER_RELEASE: u16 = 0;
+pub const POINTER_SET_CURSOR: u16 = 0;
+pub const POINTER_RELEASE: u16 = 1;
 pub const POINTER_ENTER: u16 = 0;
 pub const POINTER_LEAVE: u16 = 1;
 pub const POINTER_MOTION: u16 = 2;
@@ -220,6 +225,7 @@ pub const DATA_SOURCE_CANCELLED: u16 = 2;
 // wl_data_device requests and events.
 pub const DATA_DEVICE_START_DRAG: u16 = 0;
 pub const DATA_DEVICE_SET_SELECTION: u16 = 1;
+pub const DATA_DEVICE_RELEASE: u16 = 2;
 pub const DATA_DEVICE_DATA_OFFER: u16 = 0;
 pub const DATA_DEVICE_SELECTION: u16 = 5;
 

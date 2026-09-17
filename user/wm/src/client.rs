@@ -40,6 +40,141 @@ const MAX_DUE: usize = 16;
 /// this compositor sends, which is `wl_output.geometry` with two strings.
 const EVENT_SLACK: usize = 256;
 
+/// A request that breaks the protocol: which object it was on, which of
+/// `wl_display.error`'s codes it earns, and what to say about it.
+///
+/// A protocol error is fatal to the connection by design — the client's idea
+/// of the object graph and the compositor's have diverged, and everything
+/// after this point would be read against the wrong one — but it is *said*
+/// first. A connection that simply stops leaves a client author guessing.
+struct Fault {
+    object: u32,
+    code: u32,
+    message: &'static [u8],
+}
+
+impl Fault {
+    /// An object that is not there, or is not what the request needs.
+    fn object(object: u32, message: &'static [u8]) -> Fault {
+        Fault { object, code: proto::ERR_INVALID_OBJECT, message }
+    }
+
+    /// A request this interface does not have, or cannot be honoured.
+    fn method(object: u32, message: &'static [u8]) -> Fault {
+        Fault { object, code: proto::ERR_INVALID_METHOD, message }
+    }
+
+    /// Nothing left to make it out of.
+    fn memory(object: u32, message: &'static [u8]) -> Fault {
+        Fault { object, code: proto::ERR_NO_MEMORY, message }
+    }
+}
+
+type Handled = Result<(), Fault>;
+
+/// One request's arguments: where they are, and where they end.
+///
+/// Every argument is read through this, so none is read past the size the
+/// message's own header gave. Reading straight from the buffer took the next
+/// message's bytes — or bytes from the read before — as arguments a client
+/// had not sent, which is a client choosing what the compositor parses.
+#[derive(Clone, Copy)]
+struct Args {
+    object: u32,
+    at: usize,
+    end: usize,
+}
+
+/// The next word, or a fault: a request too short for what it says it is.
+fn take_u32(buf: &[u8], a: &mut Args) -> Result<u32, Fault> {
+    if a.at + 4 > a.end {
+        return Err(Fault::method(a.object, b"a request shorter than its arguments"));
+    }
+    let v = u32::from_le_bytes([buf[a.at], buf[a.at + 1], buf[a.at + 2], buf[a.at + 3]]);
+    a.at += 4;
+    Ok(v)
+}
+
+fn take_i32(buf: &[u8], a: &mut Args) -> Result<i32, Fault> {
+    take_u32(buf, a).map(|v| v as i32)
+}
+
+/// An id for an object the client is making. Zero is not one.
+fn take_new_id(buf: &[u8], a: &mut Args) -> Result<u32, Fault> {
+    match take_u32(buf, a)? {
+        0 => Err(Fault::object(a.object, b"a new object with no id")),
+        id => Ok(id),
+    }
+}
+
+/// An id for an object the client already has. Zero means "none", and is a
+/// fault where the request does not allow it.
+fn take_object(buf: &[u8], a: &mut Args, nullable: bool) -> Result<u32, Fault> {
+    match take_u32(buf, a)? {
+        0 if !nullable => Err(Fault::object(a.object, b"a null object where one is needed")),
+        id => Ok(id),
+    }
+}
+
+/// The string at the cursor, without its NUL.
+///
+/// The length is the client's and is checked against the message rather than
+/// believed: it is the one argument whose size the client chooses.
+fn take_str<'a>(buf: &'a [u8], a: &mut Args, nullable: bool) -> Result<&'a [u8], Fault> {
+    let len = take_u32(buf, a)? as usize;
+    if len == 0 {
+        return if nullable {
+            Ok(&buf[..0])
+        } else {
+            Err(Fault::method(a.object, b"a null string where one is needed"))
+        };
+    }
+    let padded = wire::pad4(len);
+    if a.at + padded > a.end {
+        return Err(Fault::method(a.object, b"a string longer than the request holding it"));
+    }
+    let start = a.at;
+    a.at += padded;
+    if buf[start + len - 1] != 0 {
+        return Err(Fault::method(a.object, b"a string that does not end in a nul"));
+    }
+    Ok(&buf[start..start + len - 1])
+}
+
+/// How many requests an interface has, so that an opcode beyond them is
+/// refused rather than quietly doing nothing. A client sending one has
+/// mistaken the object for something else, and the requests after it will be
+/// read against the wrong interface too.
+fn request_count(kind: Kind) -> u16 {
+    match kind {
+        Kind::Display => 2,
+        Kind::Registry => 1,
+        Kind::Compositor => 2,
+        Kind::Shm => 2,
+        Kind::ShmPool { .. } => 3,
+        Kind::Buffer { .. } => 1,
+        Kind::Surface { .. } => 11,
+        Kind::Region => 3,
+        Kind::Output => 1,
+        Kind::XdgWmBase => 4,
+        Kind::XdgSurface { .. } => 5,
+        Kind::XdgToplevel { .. } => 14,
+        Kind::Seat => 4,
+        Kind::Keyboard => 1,
+        Kind::Pointer => 2,
+        Kind::Decoration => 2,
+        Kind::ToplevelDecoration => 3,
+        Kind::DataDeviceManager => 2,
+        Kind::DataSource => 3,
+        Kind::DataDevice => 3,
+        Kind::DataOffer => 5,
+        // A callback answers and is gone; `None` is the touch device this
+        // compositor records so that destroying it names something.
+        Kind::Callback => 0,
+        Kind::None => 1,
+    }
+}
+
 pub struct Client {
     pub used: bool,
     /// Which entry of the compositor's client table this is. Surfaces are kept
@@ -356,12 +491,33 @@ impl Client {
 
         let mut at = 0usize;
         while at + wire::HEADER <= self.rlen {
+            // A malformed header cannot be skipped past, because the size that
+            // would say how far is the part that is wrong. Say so and stop.
             let Some(h) = wire::parse_header(&self.rbuf[at..self.rlen]) else {
-                // A malformed header cannot be skipped past, because the size
-                // that would say how far is the part that is wrong.
-                return false;
+                return self.protocol_error(
+                    proto::DISPLAY_ID,
+                    proto::ERR_INVALID_METHOD,
+                    b"a message shorter than its own header",
+                );
             };
             let size = h.size as usize;
+            if size > READ_BUF {
+                // Longer than this can ever hold, so waiting for the rest of
+                // it would be waiting for ever — with the buffer full, the
+                // connection would go quiet rather than wrong.
+                return self.protocol_error(
+                    proto::DISPLAY_ID,
+                    proto::ERR_INVALID_METHOD,
+                    b"a message longer than the buffer that reads it",
+                );
+            }
+            if size % 4 != 0 {
+                return self.protocol_error(
+                    proto::DISPLAY_ID,
+                    proto::ERR_INVALID_METHOD,
+                    b"a message whose size is not a multiple of four",
+                );
+            }
             if at + size > self.rlen {
                 break; // the rest of it has not arrived
             }
@@ -379,34 +535,62 @@ impl Client {
     }
 
     fn handle(&mut self, h: wire::Header, at: usize) -> bool {
-        let body = at + wire::HEADER;
+        let mut args =
+            Args { object: h.object, at: at + wire::HEADER, end: at + h.size as usize };
+        match self.request(h, &mut args) {
+            Ok(()) => true,
+            Err(f) => self.protocol_error(f.object, f.code, f.message),
+        }
+    }
+
+    fn request(&mut self, h: wire::Header, args: &mut Args) -> Handled {
         let Some(kind) = self.objects.get(h.object) else {
-            // An object this client never made. libwayland does not do that,
-            // so something is out of step and continuing would compound it.
-            return false;
+            // An object this client never made, or one it has destroyed. The
+            // display is what the error names, since there is no object to
+            // name it on.
+            return Err(Fault::object(
+                proto::DISPLAY_ID,
+                b"a request for an object that is not there",
+            ));
         };
+        if h.opcode >= request_count(kind) {
+            return Err(Fault::method(h.object, b"a request this interface does not have"));
+        }
         match kind {
-            Kind::Display => self.display_request(h.opcode, body),
-            Kind::Registry => self.registry_request(h.opcode, body),
-            Kind::Shm => self.shm_request(h.object, h.opcode, body),
-            Kind::ShmPool { pool } => self.pool_request(h.object, pool, h.opcode, body),
-            Kind::Buffer { buffer } => self.buffer_request(h.object, buffer, h.opcode),
-            Kind::Compositor => self.compositor_request(h.opcode, body),
-            Kind::Surface { surface } => self.surface_request(h.object, surface, h.opcode, body),
+            Kind::Display => self.display_request(h.opcode, args),
+            Kind::Registry => self.registry_request(h.opcode, args),
+            Kind::Shm => self.shm_request(h.object, h.opcode, args),
+            Kind::ShmPool { pool } => self.pool_request(h.object, pool, h.opcode, args),
+            Kind::Buffer { buffer } => {
+                if h.opcode == proto::BUFFER_DESTROY {
+                    shm::destroy_buffer(buffer);
+                    self.objects.remove(h.object);
+                }
+                Ok(())
+            }
+            Kind::Compositor => self.compositor_request(h.opcode, args),
+            Kind::Surface { surface } => self.surface_request(h.object, surface, h.opcode, args),
             Kind::Region => {
                 if h.opcode == proto::REGION_DESTROY {
                     self.objects.remove(h.object);
+                } else {
+                    // add and subtract, each a rectangle: read to check the
+                    // request is as long as it says, and then let go. What is
+                    // opaque or takes input changes nothing here.
+                    for _ in 0..4 {
+                        take_i32(&self.rbuf, args)?;
+                    }
                 }
-                true
+                Ok(())
             }
-            Kind::XdgWmBase => self.wm_base_request(h.object, h.opcode, body),
+            Kind::XdgWmBase => self.wm_base_request(h.object, h.opcode, args),
             Kind::XdgSurface { surface } => {
-                self.xdg_surface_request(h.object, surface, h.opcode, body)
+                self.xdg_surface_request(h.object, surface, h.opcode, args)
             }
             Kind::XdgToplevel { surface } => {
-                self.toplevel_request(h.object, surface, h.opcode, body)
+                self.toplevel_request(h.object, surface, h.opcode, args)
             }
-            Kind::Seat => self.seat_request(h.object, h.opcode, body),
+            Kind::Seat => self.seat_request(h.object, h.opcode, args),
             Kind::Keyboard => {
                 if h.opcode == proto::KEYBOARD_RELEASE {
                     self.objects.remove(h.object);
@@ -414,40 +598,55 @@ impl Client {
                         self.keyboard = 0;
                     }
                 }
-                true
+                Ok(())
             }
             Kind::Pointer => {
+                if h.opcode == proto::POINTER_SET_CURSOR {
+                    // set_cursor(serial, surface, hotspot_x, hotspot_y). The
+                    // compositor draws its own pointer, so this is read to
+                    // check it and then let go.
+                    take_u32(&self.rbuf, args)?;
+                    let surface = take_object(&self.rbuf, args, true)?;
+                    take_i32(&self.rbuf, args)?;
+                    take_i32(&self.rbuf, args)?;
+                    if surface != 0
+                        && !matches!(self.objects.get(surface), Some(Kind::Surface { .. }))
+                    {
+                        return Err(Fault::object(h.object, b"set_cursor: not a surface"));
+                    }
+                    return Ok(());
+                }
                 if h.opcode == proto::POINTER_RELEASE {
                     self.objects.remove(h.object);
                     if self.pointer == h.object {
                         self.pointer = 0;
                     }
                 }
-                true
+                Ok(())
             }
-            Kind::Decoration => {
-                match h.opcode {
-                    proto::DECORATION_GET_TOPLEVEL => {
-                        // get_toplevel_decoration(new_id, toplevel)
-                        let (Some(id), Some(_toplevel)) = (
-                            wire::get_u32(&self.rbuf, body),
-                            wire::get_u32(&self.rbuf, body + 4),
-                        ) else {
-                            return false;
-                        };
-                        if !self.objects.insert(id, Kind::ToplevelDecoration) {
-                            return false;
-                        }
-                        self.decoration_configure(id);
-                        true
+            Kind::Decoration => match h.opcode {
+                proto::DECORATION_GET_TOPLEVEL => {
+                    // get_toplevel_decoration(new_id, toplevel)
+                    let id = take_new_id(&self.rbuf, args)?;
+                    let toplevel = take_object(&self.rbuf, args, false)?;
+                    if !matches!(self.objects.get(toplevel), Some(Kind::XdgToplevel { .. })) {
+                        return Err(Fault::object(
+                            h.object,
+                            b"get_toplevel_decoration: not a toplevel",
+                        ));
                     }
-                    proto::DECORATION_DESTROY => {
-                        self.objects.remove(h.object);
-                        true
+                    if !self.objects.insert(id, Kind::ToplevelDecoration) {
+                        return Err(self.no_room(id));
                     }
-                    _ => true,
+                    self.decoration_configure(id);
+                    Ok(())
                 }
-            }
+                proto::DECORATION_DESTROY => {
+                    self.objects.remove(h.object);
+                    Ok(())
+                }
+                _ => Ok(()),
+            },
             Kind::ToplevelDecoration => {
                 match h.opcode {
                     // A client may ask for either mode and is told which it
@@ -457,20 +656,56 @@ impl Client {
                     proto::TOPLEVEL_DECORATION_SET_MODE
                     | proto::TOPLEVEL_DECORATION_UNSET_MODE => {
                         self.decoration_configure(h.object);
-                        true
+                        Ok(())
                     }
                     proto::TOPLEVEL_DECORATION_DESTROY => {
                         self.objects.remove(h.object);
-                        true
+                        Ok(())
                     }
-                    _ => true,
+                    _ => Ok(()),
                 }
             }
-            Kind::DataDeviceManager => self.ddm_request(h.opcode, body),
-            Kind::DataSource => self.data_source_request(h.object, h.opcode, body),
-            Kind::DataDevice => self.data_device_request(h.object, h.opcode, body),
-            Kind::DataOffer => self.data_offer_request(h.object, h.opcode, body),
-            Kind::Output | Kind::Callback | Kind::None => true,
+            Kind::DataDeviceManager => self.ddm_request(h.opcode, args),
+            Kind::DataSource => self.data_source_request(h.object, h.opcode, args),
+            Kind::DataDevice => self.data_device_request(h.object, h.opcode, args),
+            Kind::DataOffer => self.data_offer_request(h.object, h.opcode, args),
+            // An output's one request, and the touch device this compositor
+            // records but never speaks to, are both destructors.
+            Kind::Output | Kind::None => {
+                self.objects.remove(h.object);
+                Ok(())
+            }
+            // Nothing is a request on a callback; `request_count` said so.
+            Kind::Callback => Ok(()),
+        }
+    }
+
+    /// Take away every object of this client's that named surface `idx`,
+    /// which has just been freed.
+    ///
+    /// The protocol says a role object is destroyed before the surface under
+    /// it, and a client that does it the other way round would otherwise be
+    /// left holding names for a slot the next client's surface takes.
+    fn forget_surface(&mut self, idx: usize) {
+        while let Some(id) = self.objects.find(|k| {
+            matches!(
+                k,
+                Kind::Surface { surface }
+                    | Kind::XdgSurface { surface }
+                    | Kind::XdgToplevel { surface } if *surface == idx
+            )
+        }) {
+            self.objects.remove(id);
+        }
+    }
+
+    /// An id a client cannot have: in use already, the compositor's to give,
+    /// or one more than its table holds.
+    fn no_room(&self, id: u32) -> Fault {
+        if self.objects.get(id).is_some() || id >= objects::CLIENT_ID_MAX {
+            Fault::object(proto::DISPLAY_ID, b"an id that is taken, or not the client's to give")
+        } else {
+            Fault::memory(proto::DISPLAY_ID, b"too many objects")
         }
     }
 
@@ -482,22 +717,24 @@ impl Client {
         self.flush();
     }
 
-    fn ddm_request(&mut self, opcode: u16, body: usize) -> bool {
-        let Some(id) = wire::get_u32(&self.rbuf, body) else {
-            return false;
-        };
+    fn ddm_request(&mut self, opcode: u16, args: &mut Args) -> Handled {
+        let id = take_new_id(&self.rbuf, args)?;
         match opcode {
             proto::DDM_CREATE_DATA_SOURCE => {
                 if !self.objects.insert(id, Kind::DataSource) {
-                    return false;
+                    return Err(self.no_room(id));
                 }
                 self.building = id;
                 self.building_mimes = NO_MIMES;
-                true
+                Ok(())
             }
             proto::DDM_GET_DATA_DEVICE => {
+                let seat = take_object(&self.rbuf, args, false)?;
+                if !matches!(self.objects.get(seat), Some(Kind::Seat)) {
+                    return Err(Fault::object(args.object, b"get_data_device: not a seat"));
+                }
                 if !self.objects.insert(id, Kind::DataDevice) {
-                    return false;
+                    return Err(self.no_room(id));
                 }
                 self.data_device = id;
                 // A device made while this client already has focus should hear
@@ -505,37 +742,30 @@ impl Client {
                 if crate::seat::focus_is_mine(self.slot) {
                     self.announce_selection();
                 }
-                true
+                Ok(())
             }
-            _ => true,
+            _ => Ok(()),
         }
     }
 
-    fn data_source_request(&mut self, object: u32, opcode: u16, body: usize) -> bool {
+    fn data_source_request(&mut self, object: u32, opcode: u16, args: &mut Args) -> Handled {
         match opcode {
             proto::DATA_SOURCE_OFFER => {
-                let Some((mime, _)) = wire::get_str(&self.rbuf, body) else {
-                    return false;
+                let pushed = {
+                    let mime = take_str(&self.rbuf, args, false)?;
+                    if object != self.building {
+                        // A type offered on a source that is not the one being
+                        // built. Nothing here can hold two part-built sources,
+                        // and silently dropping it would leave a client
+                        // believing it had offered something it had not.
+                        return Err(Fault::memory(object, b"one data source at a time"));
+                    }
+                    self.building_mimes.push(mime)
                 };
-                if object != self.building {
-                    // A type offered on a source that is not the one being
-                    // built. Nothing here can hold two part-built sources, and
-                    // silently dropping it would leave a client believing it
-                    // had offered something it had not.
-                    return self.protocol_error(
-                        object,
-                        proto::ERR_NO_MEMORY,
-                        b"one data source at a time",
-                    );
+                if !pushed {
+                    return Err(Fault::memory(object, b"too many mime types, or one too long"));
                 }
-                if !self.building_mimes.push(mime) {
-                    return self.protocol_error(
-                        object,
-                        proto::ERR_NO_MEMORY,
-                        b"too many mime types",
-                    );
-                }
-                true
+                Ok(())
             }
             proto::DATA_SOURCE_DESTROY => {
                 if clipboard::release(self.slot, object) {
@@ -546,19 +776,20 @@ impl Client {
                     self.building_mimes = NO_MIMES;
                 }
                 self.objects.remove(object);
-                true
+                Ok(())
             }
-            _ => true,
+            // set_actions belongs to drag and drop, which this manager does
+            // not advertise a version with.
+            _ => Ok(()),
         }
     }
 
-    fn data_device_request(&mut self, object: u32, opcode: u16, body: usize) -> bool {
+    fn data_device_request(&mut self, object: u32, opcode: u16, args: &mut Args) -> Handled {
         match opcode {
             proto::DATA_DEVICE_SET_SELECTION => {
                 // set_selection(source, serial). A null source clears it.
-                let Some(source) = wire::get_u32(&self.rbuf, body) else {
-                    return false;
-                };
+                let source = take_object(&self.rbuf, args, true)?;
+                let _serial = take_u32(&self.rbuf, args)?;
                 if source == 0 {
                     if let Some((slot, id)) = clipboard::owner() {
                         if slot == self.slot {
@@ -566,14 +797,10 @@ impl Client {
                             crate::announce_selection_to_focus();
                         }
                     }
-                    return true;
+                    return Ok(());
                 }
                 if !matches!(self.objects.get(source), Some(Kind::DataSource)) {
-                    return self.protocol_error(
-                        object,
-                        proto::ERR_INVALID_OBJECT,
-                        b"set_selection: not a data source",
-                    );
+                    return Err(Fault::object(object, b"set_selection: not a data source"));
                 }
                 let mimes = self.building_mimes;
                 let previous = clipboard::take(self.slot, source, mimes);
@@ -586,15 +813,26 @@ impl Client {
                     crate::cancel_source(slot, id);
                 }
                 crate::announce_selection_to_focus();
-                true
+                Ok(())
             }
-            // Drag and drop is version 2 and up, and this manager is version 1.
-            proto::DATA_DEVICE_START_DRAG => true,
-            _ => true,
+            proto::DATA_DEVICE_START_DRAG => {
+                // Drag and drop is version 2 and up, and this manager is
+                // version 1: the request exists so that its arguments are
+                // read and refused rather than ignored.
+                Err(Fault::method(object, b"no drag and drop"))
+            }
+            proto::DATA_DEVICE_RELEASE => {
+                self.objects.remove(object);
+                if self.data_device == object {
+                    self.data_device = 0;
+                }
+                Ok(())
+            }
+            _ => Ok(()),
         }
     }
 
-    fn data_offer_request(&mut self, object: u32, opcode: u16, body: usize) -> bool {
+    fn data_offer_request(&mut self, object: u32, opcode: u16, args: &mut Args) -> Handled {
         match opcode {
             proto::DATA_OFFER_RECEIVE => {
                 // receive(mime_type, fd). The descriptor is the point: it is a
@@ -604,47 +842,47 @@ impl Client {
                 // it: the name has to outlive the borrow, and taking the
                 // descriptor needs the buffer released.
                 let mut name = [0u8; clipboard::MIME_LEN];
-                let len = match wire::get_str(&self.rbuf, body) {
-                    Some((m, _)) if m.len() <= clipboard::MIME_LEN => {
-                        name[..m.len()].copy_from_slice(m);
-                        m.len()
-                    }
-                    Some(_) => return true, // longer than anything offerable
-                    None => return false,
+                let len = {
+                    let m = take_str(&self.rbuf, args, false)?;
+                    let len = m.len().min(clipboard::MIME_LEN);
+                    name[..len].copy_from_slice(&m[..len]);
+                    m.len()
                 };
-                let mime = &name[..len];
                 let Some(fd) = self.take_fd() else {
-                    return self.protocol_error(
-                        object,
-                        proto::ERR_INVALID_METHOD,
-                        b"receive without a descriptor",
-                    );
+                    return Err(Fault::method(object, b"receive without a descriptor"));
                 };
+                // A name longer than any that can be offered matches nothing,
+                // which is the same answer as a name nobody offered.
+                let mime = if len <= clipboard::MIME_LEN { &name[..len] } else { &[][..] };
                 if object != self.offer || !clipboard::mimes().has(mime) {
                     // A stale offer, or a type nobody promised. Closing the
                     // descriptor is what tells the client to stop reading:
                     // leaving it open would hang it on a pipe with no writer.
                     let _ = syscall::sys_fd_close(fd);
-                    return true;
+                    return Ok(());
                 }
                 let Some((slot, source)) = clipboard::owner() else {
                     let _ = syscall::sys_fd_close(fd);
-                    return true;
+                    return Ok(());
                 };
                 crate::send_to_source(slot, source, mime, fd);
-                true
+                Ok(())
             }
             proto::DATA_OFFER_DESTROY => {
                 if self.offer == object {
                     self.offer = 0;
                 }
                 self.objects.remove(object);
-                true
+                Ok(())
             }
             // `accept` says which type a drag would take, and there are no
-            // drags here.
-            proto::DATA_OFFER_ACCEPT => true,
-            _ => true,
+            // drags here; `finish` and `set_actions` are version 3.
+            proto::DATA_OFFER_ACCEPT => {
+                take_u32(&self.rbuf, args)?;
+                take_str(&self.rbuf, args, true)?;
+                Ok(())
+            }
+            _ => Ok(()),
         }
     }
 
@@ -658,13 +896,12 @@ impl Client {
         if device == 0 {
             return;
         }
-        // The previous offer is finished with. Left in the table it would be a
-        // second thing the client could call `receive` on, and the answer would
-        // be the current clipboard rather than the one it was offered.
-        if self.offer != 0 {
-            self.objects.remove(self.offer);
-            self.offer = 0;
-        }
+        // The previous offer is finished with, but it is the client's object
+        // to destroy: it stays in the table until it does, and `receive` on
+        // it is refused meanwhile because it is no longer the offer. Taking
+        // it away here would make a client that destroys its old offer — as a
+        // client is supposed to — name an object that is not there.
+        self.offer = 0;
         if !clipboard::is_held() {
             // A null offer means "there is nothing", which is a real thing to
             // say: a client that is never told stops trusting what it has.
@@ -675,8 +912,20 @@ impl Client {
             self.flush();
             return;
         }
-        let Some(id) = self.objects.allocate(Kind::DataOffer) else {
-            return;
+        let id = match self.objects.allocate(Kind::DataOffer) {
+            Some(id) => id,
+            None => {
+                // Full of offers the client never destroyed. One of them goes:
+                // there is nothing left to do with an offer that is not the
+                // selection.
+                if let Some(stale) = self.objects.find(|k| matches!(k, Kind::DataOffer)) {
+                    self.objects.remove(stale);
+                }
+                match self.objects.allocate(Kind::DataOffer) {
+                    Some(id) => id,
+                    None => return,
+                }
+            }
         };
         self.offer = id;
         if let Some(a) = self.begin(device, proto::DATA_DEVICE_DATA_OFFER) {
@@ -778,19 +1027,17 @@ impl Client {
         self.flush();
     }
 
-    fn seat_request(&mut self, object: u32, opcode: u16, body: usize) -> bool {
+    fn seat_request(&mut self, object: u32, opcode: u16, args: &mut Args) -> Handled {
         match opcode {
             proto::SEAT_GET_KEYBOARD => {
-                let Some(id) = wire::get_u32(&self.rbuf, body) else {
-                    return false;
-                };
+                let id = take_new_id(&self.rbuf, args)?;
                 // An object made by a request inherits the version of the
                 // object it was made from — that is how a client that bound
                 // wl_seat at 1 gets a wl_keyboard at 1, with five events and
                 // not six.
                 let version = self.objects.version_of(object);
                 if !self.objects.insert_at(id, Kind::Keyboard, version) {
-                    return false;
+                    return Err(self.no_room(id));
                 }
                 self.keyboard = id;
                 self.send_keymap(id);
@@ -811,15 +1058,13 @@ impl Client {
                     }
                 }
                 self.flush();
-                true
+                Ok(())
             }
             proto::SEAT_GET_POINTER => {
-                let Some(id) = wire::get_u32(&self.rbuf, body) else {
-                    return false;
-                };
+                let id = take_new_id(&self.rbuf, args)?;
                 let version = self.objects.version_of(object);
                 if !self.objects.insert_at(id, Kind::Pointer, version) {
-                    return false;
+                    return Err(self.no_room(id));
                 }
                 self.pointer = id;
                 // A pointer already over this client's surface would otherwise
@@ -831,23 +1076,24 @@ impl Client {
                     }
                 }
                 self.flush();
-                true
+                Ok(())
             }
             // Touch is not among the advertised capabilities, so asking for one
             // is a client ignoring what it was told. The object is recorded so
             // that destroying it does not look like a reference to nothing; it
             // simply never hears anything.
             proto::SEAT_GET_TOUCH => {
-                match wire::get_u32(&self.rbuf, body) {
-                    Some(id) => self.objects.insert(id, Kind::None),
-                    None => false,
+                let id = take_new_id(&self.rbuf, args)?;
+                if !self.objects.insert(id, Kind::None) {
+                    return Err(self.no_room(id));
                 }
+                Ok(())
             }
             proto::SEAT_RELEASE => {
                 self.objects.remove(object);
-                true
+                Ok(())
             }
-            _ => true,
+            _ => Ok(()),
         }
     }
 
@@ -955,97 +1201,129 @@ impl Client {
             .find(|k| matches!(k, Kind::Surface { surface: s } if *s == surface_idx))
     }
 
-    fn compositor_request(&mut self, opcode: u16, body: usize) -> bool {
-        let Some(id) = wire::get_u32(&self.rbuf, body) else {
-            return false;
-        };
+    fn compositor_request(&mut self, opcode: u16, args: &mut Args) -> Handled {
+        let id = take_new_id(&self.rbuf, args)?;
         match opcode {
             proto::COMPOSITOR_CREATE_SURFACE => {
                 let Some(idx) = surface::create(self.slot, self.tid) else {
-                    return self.protocol_error(id, proto::ERR_NO_MEMORY, b"too many surfaces");
+                    return Err(Fault::memory(id, b"too many surfaces"));
                 };
                 if !self.objects.insert(id, Kind::Surface { surface: idx }) {
                     surface::destroy(idx);
-                    return false;
+                    return Err(self.no_room(id));
                 }
-                true
+                Ok(())
             }
-            proto::COMPOSITOR_CREATE_REGION => self.objects.insert(id, Kind::Region),
-            _ => true,
+            proto::COMPOSITOR_CREATE_REGION => {
+                if !self.objects.insert(id, Kind::Region) {
+                    return Err(self.no_room(id));
+                }
+                Ok(())
+            }
+            _ => Ok(()),
         }
     }
 
-    fn surface_request(&mut self, object: u32, idx: usize, opcode: u16, body: usize) -> bool {
+    fn surface_request(
+        &mut self,
+        object: u32,
+        idx: usize,
+        opcode: u16,
+        args: &mut Args,
+    ) -> Handled {
         match opcode {
             proto::SURFACE_DESTROY => {
                 surface::destroy(idx);
-                self.objects.remove(object);
-                true
+                self.forget_surface(idx);
+                Ok(())
             }
             proto::SURFACE_ATTACH => {
                 // attach(buffer, x, y). A null buffer is a real request: it
                 // says there is nothing to show, which is not the same as
                 // saying nothing about the buffer at all.
-                let Some(buffer_id) = wire::get_u32(&self.rbuf, body) else {
-                    return false;
-                };
+                let buffer_id = take_object(&self.rbuf, args, true)?;
+                let _x = take_i32(&self.rbuf, args)?;
+                let _y = take_i32(&self.rbuf, args)?;
                 if buffer_id == 0 {
                     surface::attach(idx, surface::NONE);
-                    return true;
+                    return Ok(());
                 }
                 let Some(Kind::Buffer { buffer }) = self.objects.get(buffer_id) else {
-                    return self.protocol_error(
-                        object,
-                        proto::ERR_INVALID_OBJECT,
-                        b"attach: not a buffer",
-                    );
+                    return Err(Fault::object(object, b"attach: not a buffer"));
                 };
                 surface::attach(idx, buffer);
-                true
+                Ok(())
             }
             proto::SURFACE_DAMAGE | proto::SURFACE_DAMAGE_BUFFER => {
                 // Which pixels changed is not tracked. This compositor repaints
                 // a whole window when it commits, so the only thing damage
                 // decides here is whether to repaint at all — and the rectangle
                 // would have to be believed to be worth more than that.
+                for _ in 0..4 {
+                    take_i32(&self.rbuf, args)?;
+                }
                 surface::damage(idx);
-                true
+                Ok(())
             }
             proto::SURFACE_FRAME => {
-                let Some(id) = wire::get_u32(&self.rbuf, body) else {
-                    return false;
-                };
+                let id = take_new_id(&self.rbuf, args)?;
                 if !self.objects.insert(id, Kind::Callback) {
-                    return false;
+                    return Err(self.no_room(id));
                 }
                 if !surface::want_frame(idx, id) {
-                    return self.protocol_error(
-                        object,
-                        proto::ERR_NO_MEMORY,
-                        b"too many frame callbacks outstanding",
-                    );
+                    return Err(Fault::memory(object, b"too many frame callbacks outstanding"));
                 }
-                true
+                Ok(())
             }
             proto::SURFACE_COMMIT => self.commit(object, idx),
-            // Regions, transforms, scales and offsets: accepted and not acted
-            // on. Each is a hint or a transform this compositor does not apply,
-            // and refusing them would stop clients that set them by habit.
-            proto::SURFACE_SET_OPAQUE_REGION
-            | proto::SURFACE_SET_INPUT_REGION
-            | proto::SURFACE_SET_BUFFER_TRANSFORM
-            | proto::SURFACE_SET_BUFFER_SCALE
-            | proto::SURFACE_OFFSET => true,
-            _ => true,
+            proto::SURFACE_SET_OPAQUE_REGION | proto::SURFACE_SET_INPUT_REGION => {
+                // A region is a hint this compositor does not act on, and a
+                // null one is how a client takes the hint back.
+                let region = take_object(&self.rbuf, args, true)?;
+                if region != 0 && !matches!(self.objects.get(region), Some(Kind::Region)) {
+                    return Err(Fault::object(object, b"that is not a region"));
+                }
+                Ok(())
+            }
+            // Transforms, scales and offsets are read and checked, and not
+            // acted on: each is a transform this compositor does not apply,
+            // and refusing the ones that are meant would stop clients that
+            // set them by habit.
+            proto::SURFACE_SET_BUFFER_TRANSFORM => {
+                match take_i32(&self.rbuf, args)? {
+                    0..=7 => Ok(()),
+                    _ => Err(Fault {
+                        object,
+                        code: proto::SURFACE_ERR_INVALID_TRANSFORM,
+                        message: b"that is not a transform",
+                    }),
+                }
+            }
+            proto::SURFACE_SET_BUFFER_SCALE => {
+                match take_i32(&self.rbuf, args)? {
+                    n if n > 0 => Ok(()),
+                    _ => Err(Fault {
+                        object,
+                        code: proto::SURFACE_ERR_INVALID_SCALE,
+                        message: b"a scale of zero or less",
+                    }),
+                }
+            }
+            proto::SURFACE_OFFSET => {
+                take_i32(&self.rbuf, args)?;
+                take_i32(&self.rbuf, args)?;
+                Ok(())
+            }
+            _ => Ok(()),
         }
     }
 
     /// Apply everything the client has been accumulating, then tell it what
     /// that cost it: the buffer it may draw into again, and the callbacks that
     /// came due.
-    fn commit(&mut self, object: u32, idx: usize) -> bool {
+    fn commit(&mut self, object: u32, idx: usize) -> Handled {
         let Some(s) = surface::get(idx) else {
-            return false;
+            return Err(Fault::object(object, b"commit: no such surface"));
         };
         // A buffer attached to a surface that has not agreed to a size is the
         // one thing xdg_shell makes an error rather than a no-op: the client is
@@ -1057,14 +1335,14 @@ impl Client {
             && s.pending.attached
             && s.pending.buffer != surface::NONE
         {
-            return self.protocol_error(
+            return Err(Fault {
                 object,
-                proto::XDG_ERR_UNCONFIGURED_BUFFER,
-                b"buffer attached before ack_configure",
-            );
+                code: proto::XDG_ERR_UNCONFIGURED_BUFFER,
+                message: b"buffer attached before ack_configure",
+            });
         }
         let Some(applied) = surface::commit(idx) else {
-            return false;
+            return Err(Fault::object(object, b"commit: no such surface"));
         };
         if applied.repaint {
             if let Some(w) = surface::window_of(idx) {
@@ -1090,7 +1368,7 @@ impl Client {
                 self.send_frame(applied.frames[i]);
             }
         }
-        true
+        Ok(())
     }
 
     fn send_frame(&mut self, id: u32) {
@@ -1136,35 +1414,28 @@ impl Client {
         }
     }
 
-    fn wm_base_request(&mut self, object: u32, opcode: u16, body: usize) -> bool {
+    fn wm_base_request(&mut self, object: u32, opcode: u16, args: &mut Args) -> Handled {
         match opcode {
             proto::WM_BASE_GET_XDG_SURFACE => {
-                let (Some(id), Some(surface_id)) = (
-                    wire::get_u32(&self.rbuf, body),
-                    wire::get_u32(&self.rbuf, body + 4),
-                ) else {
-                    return false;
-                };
+                let id = take_new_id(&self.rbuf, args)?;
+                let surface_id = take_object(&self.rbuf, args, false)?;
                 let Some(Kind::Surface { surface: idx }) = self.objects.get(surface_id) else {
-                    return self.protocol_error(
-                        object,
-                        proto::ERR_INVALID_OBJECT,
-                        b"get_xdg_surface: not a surface",
-                    );
+                    return Err(Fault::object(object, b"get_xdg_surface: not a surface"));
                 };
-                self.objects.insert(id, Kind::XdgSurface { surface: idx })
+                if !self.objects.insert(id, Kind::XdgSurface { surface: idx }) {
+                    return Err(self.no_room(id));
+                }
+                Ok(())
             }
             proto::WM_BASE_DESTROY => {
                 self.objects.remove(object);
-                true
+                Ok(())
             }
             // A pong answers a ping this compositor does not send, and a
             // positioner belongs to popups, which it does not place.
-            proto::WM_BASE_PONG => true,
-            proto::WM_BASE_CREATE_POSITIONER => {
-                self.protocol_error(object, proto::ERR_INVALID_METHOD, b"no popups")
-            }
-            _ => true,
+            proto::WM_BASE_PONG => Ok(()),
+            proto::WM_BASE_CREATE_POSITIONER => Err(Fault::method(object, b"no popups")),
+            _ => Ok(()),
         }
     }
 
@@ -1173,22 +1444,20 @@ impl Client {
         object: u32,
         idx: usize,
         opcode: u16,
-        body: usize,
-    ) -> bool {
+        args: &mut Args,
+    ) -> Handled {
         match opcode {
             proto::XDG_SURFACE_GET_TOPLEVEL => {
-                let Some(id) = wire::get_u32(&self.rbuf, body) else {
-                    return false;
-                };
+                let id = take_new_id(&self.rbuf, args)?;
                 let Some(top) = shell::make_toplevel(idx) else {
-                    return self.protocol_error(
+                    return Err(Fault {
                         object,
-                        proto::XDG_ERR_ROLE,
-                        b"that surface already has a role",
-                    );
+                        code: proto::XDG_ERR_ROLE,
+                        message: b"that surface already has a role",
+                    });
                 };
                 if !self.objects.insert(id, Kind::XdgToplevel { surface: idx }) {
-                    return false;
+                    return Err(self.no_room(id));
                 }
                 // The size, then the state (none of them), then the configure
                 // that says "answer this". A client waits for all three before
@@ -1205,54 +1474,58 @@ impl Client {
                     self.end(a);
                 }
                 self.flush();
-                true
+                Ok(())
             }
             proto::XDG_SURFACE_ACK_CONFIGURE => {
-                let Some(serial) = wire::get_u32(&self.rbuf, body) else {
-                    return false;
-                };
+                let serial = take_u32(&self.rbuf, args)?;
                 if !surface::ack(idx, serial) {
-                    return self.protocol_error(
-                        object,
-                        proto::ERR_INVALID_METHOD,
-                        b"ack_configure: no such serial",
-                    );
+                    return Err(Fault::method(object, b"ack_configure: no such serial"));
                 }
-                true
+                Ok(())
             }
             proto::XDG_SURFACE_DESTROY => {
                 self.objects.remove(object);
-                true
+                Ok(())
             }
             // Window geometry says which part of the surface is the window
             // proper, excluding its own shadows. Nothing here draws client-side
             // decorations, so the whole surface is the window.
-            proto::XDG_SURFACE_SET_GEOMETRY => true,
-            proto::XDG_SURFACE_GET_POPUP => {
-                self.protocol_error(object, proto::ERR_INVALID_METHOD, b"no popups")
-            }
-            _ => true,
+            proto::XDG_SURFACE_SET_GEOMETRY => Ok(()),
+            proto::XDG_SURFACE_GET_POPUP => Err(Fault::method(object, b"no popups")),
+            _ => Ok(()),
         }
     }
 
-    fn toplevel_request(&mut self, object: u32, idx: usize, opcode: u16, body: usize) -> bool {
+    fn toplevel_request(
+        &mut self,
+        object: u32,
+        idx: usize,
+        opcode: u16,
+        args: &mut Args,
+    ) -> Handled {
         match opcode {
             proto::TOPLEVEL_SET_TITLE => {
-                let Some((title, _)) = wire::get_str(&self.rbuf, body) else {
-                    return false;
+                let mut title = [0u8; surface::MAX_TITLE];
+                let len = {
+                    let text = take_str(&self.rbuf, args, false)?;
+                    let len = text.len().min(surface::MAX_TITLE);
+                    title[..len].copy_from_slice(&text[..len]);
+                    len
                 };
-                surface::set_title(idx, title);
-                true
+                surface::set_title(idx, &title[..len]);
+                Ok(())
             }
             proto::TOPLEVEL_DESTROY => {
-                surface::destroy(idx);
+                // The window goes; the surface stays until the client destroys
+                // that too. It is the client's `wl_surface` that names it.
+                surface::clear_role(idx);
                 self.objects.remove(object);
-                true
+                Ok(())
             }
             // Maximise, fullscreen, minimise, move, resize: this compositor
             // decides where windows go and how big they are, and says so by
             // never sending a configure that offers the client a choice.
-            _ => true,
+            _ => Ok(()),
         }
     }
 
@@ -1274,67 +1547,80 @@ impl Client {
         false
     }
 
-    fn shm_request(&mut self, object: u32, opcode: u16, body: usize) -> bool {
+    fn shm_request(&mut self, object: u32, opcode: u16, args: &mut Args) -> Handled {
         if opcode != proto::SHM_CREATE_POOL {
-            return true;
+            self.objects.remove(object);
+            return Ok(());
         }
         // create_pool(new_id, fd, size). The descriptor is not in the message:
         // it came alongside it, and is claimed in the order requests ask.
-        let (Some(id), Some(size)) =
-            (wire::get_u32(&self.rbuf, body), wire::get_i32(&self.rbuf, body + 4))
-        else {
-            return false;
-        };
+        let id = take_new_id(&self.rbuf, args)?;
+        let size = take_i32(&self.rbuf, args)?;
         let Some(fd) = self.take_fd() else {
-            return self.protocol_error(
+            return Err(Fault {
                 object,
-                proto::SHM_ERR_INVALID_FD,
-                b"create_pool without a descriptor",
-            );
+                code: proto::SHM_ERR_INVALID_FD,
+                message: b"create_pool without a descriptor",
+            });
         };
         if size <= 0 {
             let _ = syscall::sys_fd_close(fd);
-            return self.protocol_error(object, proto::SHM_ERR_INVALID_STRIDE, b"pool size");
+            return Err(Fault {
+                object,
+                code: proto::SHM_ERR_INVALID_STRIDE,
+                message: b"pool size",
+            });
+        }
+        if shm::pools_of(self.tid) >= shm::MAX_POOLS_PER_CLIENT {
+            // One client's pools are its own share of them: without this,
+            // a client asking for pools in a loop takes the memory every
+            // other client draws through.
+            let _ = syscall::sys_fd_close(fd);
+            return Err(Fault::memory(object, b"too many pools"));
         }
         // `create_pool` consumes the descriptor whether or not it works out.
         let Some(pool) = shm::create_pool(self.tid, fd, size as usize) else {
-            return self.protocol_error(object, proto::ERR_NO_MEMORY, b"cannot map that pool");
+            return Err(Fault::memory(object, b"cannot map that pool"));
         };
         if !self.objects.insert(id, Kind::ShmPool { pool }) {
             shm::destroy_pool(pool);
-            return false;
+            return Err(self.no_room(id));
         }
-        true
+        Ok(())
     }
 
-    fn pool_request(&mut self, object: u32, pool: usize, opcode: u16, body: usize) -> bool {
+    fn pool_request(
+        &mut self,
+        object: u32,
+        pool: usize,
+        opcode: u16,
+        args: &mut Args,
+    ) -> Handled {
         match opcode {
             proto::SHM_POOL_CREATE_BUFFER => {
                 // create_buffer(new_id, offset, width, height, stride, format)
-                let mut args = [0i32; 5];
-                for (i, a) in args.iter_mut().enumerate() {
-                    match wire::get_i32(&self.rbuf, body + 4 + i * 4) {
-                        Some(v) => *a = v,
-                        None => return false,
-                    }
-                }
-                let Some(id) = wire::get_u32(&self.rbuf, body) else {
-                    return false;
-                };
-                let [offset, width, height, stride, format] = args;
+                let id = take_new_id(&self.rbuf, args)?;
+                let offset = take_i32(&self.rbuf, args)?;
+                let width = take_i32(&self.rbuf, args)?;
+                let height = take_i32(&self.rbuf, args)?;
+                let stride = take_i32(&self.rbuf, args)?;
+                let format = take_u32(&self.rbuf, args)?;
                 if offset < 0 || width <= 0 || height <= 0 || stride <= 0 {
-                    return self.protocol_error(
+                    return Err(Fault {
                         object,
-                        proto::SHM_ERR_INVALID_STRIDE,
-                        b"negative buffer geometry",
-                    );
+                        code: proto::SHM_ERR_INVALID_STRIDE,
+                        message: b"negative buffer geometry",
+                    });
                 }
-                if !shm::format_supported(format as u32) {
-                    return self.protocol_error(
+                if !shm::format_supported(format) {
+                    return Err(Fault {
                         object,
-                        proto::SHM_ERR_INVALID_FORMAT,
-                        b"unsupported pixel format",
-                    );
+                        code: proto::SHM_ERR_INVALID_FORMAT,
+                        message: b"unsupported pixel format",
+                    });
+                }
+                if shm::buffers_of(self.tid) >= shm::MAX_BUFFERS_PER_CLIENT {
+                    return Err(Fault::memory(object, b"too many buffers"));
                 }
                 let made = shm::create_buffer(
                     pool,
@@ -1342,64 +1628,49 @@ impl Client {
                     width as usize,
                     height as usize,
                     stride as usize,
-                    format as u32,
+                    format,
                 );
                 let Some(buffer) = made else {
                     // The arithmetic did not fit inside the pool. This is the
                     // check standing between a client's numbers and the
                     // compositor reading memory that is not there.
-                    return self.protocol_error(
+                    return Err(Fault {
                         object,
-                        proto::SHM_ERR_INVALID_STRIDE,
-                        b"buffer runs past its pool",
-                    );
+                        code: proto::SHM_ERR_INVALID_STRIDE,
+                        message: b"buffer runs past its pool",
+                    });
                 };
                 if !self.objects.insert(id, Kind::Buffer { buffer }) {
                     shm::destroy_buffer(buffer);
-                    return false;
+                    return Err(self.no_room(id));
                 }
-                true
+                Ok(())
             }
             proto::SHM_POOL_DESTROY => {
                 shm::destroy_pool(pool);
                 self.objects.remove(object);
-                true
+                Ok(())
             }
-            proto::SHM_POOL_RESIZE => {
-                // A pool may only grow, and growing means new memory, which
-                // means a new descriptor -- which resize does not carry. It is
-                // refused rather than ignored: a client that resized and then
-                // drew past the old end would fault the compositor.
-                self.protocol_error(object, proto::ERR_INVALID_METHOD, b"resize is not supported")
-            }
-            _ => true,
+            // A pool may only grow, and growing means new memory, which means
+            // a new descriptor -- which resize does not carry. It is refused
+            // rather than ignored: a client that resized and then drew past
+            // the old end would fault the compositor.
+            proto::SHM_POOL_RESIZE => Err(Fault::method(object, b"resize is not supported")),
+            _ => Ok(()),
         }
     }
 
-    fn buffer_request(&mut self, object: u32, buffer: usize, opcode: u16) -> bool {
-        if opcode == proto::BUFFER_DESTROY {
-            shm::destroy_buffer(buffer);
-            self.objects.remove(object);
-        }
-        true
-    }
-
-    fn display_request(&mut self, opcode: u16, body: usize) -> bool {
+    fn display_request(&mut self, opcode: u16, args: &mut Args) -> Handled {
+        let id = take_new_id(&self.rbuf, args)?;
         match opcode {
             proto::DISPLAY_GET_REGISTRY => {
-                let Some(id) = wire::get_u32(&self.rbuf, body) else {
-                    return false;
-                };
                 if !self.objects.insert(id, Kind::Registry) {
-                    return false;
+                    return Err(self.no_room(id));
                 }
                 self.send_globals(id);
-                true
+                Ok(())
             }
             proto::DISPLAY_SYNC => {
-                let Some(id) = wire::get_u32(&self.rbuf, body) else {
-                    return false;
-                };
                 // A sync is a barrier: the callback fires after everything
                 // queued before it, which here means after the globals.
                 if let Some(a) = self.begin(id, proto::CALLBACK_DONE) {
@@ -1412,9 +1683,9 @@ impl Client {
                     self.arg_u32(id);
                     self.end(a);
                 }
-                true
+                Ok(())
             }
-            _ => true,
+            _ => Ok(()),
         }
     }
 
@@ -1430,23 +1701,35 @@ impl Client {
         }
     }
 
-    fn registry_request(&mut self, opcode: u16, body: usize) -> bool {
+    fn registry_request(&mut self, opcode: u16, args: &mut Args) -> Handled {
         if opcode != proto::REGISTRY_BIND {
-            return true;
+            return Ok(());
         }
         // bind(name, interface, version, new_id)
-        let Some(name) = wire::get_u32(&self.rbuf, body) else {
-            return false;
+        let name = take_u32(&self.rbuf, args)?;
+        let global = proto::GLOBALS.get(name.wrapping_sub(1) as usize);
+        // The interface named has to be the one advertised under that number.
+        // A client that sends another has counted the globals wrongly, and
+        // would be answered with events for something it is not.
+        let named = {
+            let iface = take_str(&self.rbuf, args, false)?;
+            global.is_some_and(|g| iface == g.name)
         };
-        let Some((_iface, used)) = wire::get_str(&self.rbuf, body + 4) else {
-            return false;
+        let version = take_u32(&self.rbuf, args)?;
+        let id = take_new_id(&self.rbuf, args)?;
+        let Some(global) = global else {
+            return Err(Fault::object(args.object, b"bind: no such global"));
         };
-        let Some(version) = wire::get_u32(&self.rbuf, body + 4 + used) else {
-            return false;
-        };
-        let Some(id) = wire::get_u32(&self.rbuf, body + 8 + used) else {
-            return false;
-        };
+        if !named {
+            return Err(Fault::object(args.object, b"bind: not that global's interface"));
+        }
+        // What was advertised is what there is. Honouring a higher number
+        // would have the compositor promising events it has no code for, and
+        // libwayland indexes a client's listener struct by opcode without a
+        // bounds check.
+        if version == 0 || version > global.version {
+            return Err(Fault::object(args.object, b"bind: a version that was not offered"));
+        }
         let kind = match name {
             1 => Kind::Compositor,
             2 => Kind::Shm,
@@ -1454,17 +1737,10 @@ impl Client {
             4 => Kind::XdgWmBase,
             5 => Kind::Seat,
             6 => Kind::Decoration,
-            7 => Kind::DataDeviceManager,
-            _ => return false,
+            _ => Kind::DataDeviceManager,
         };
-        // Clamped to what was advertised. A client asking for more than it was
-        // offered is a client that did not read the registry, and honouring the
-        // number it sent would have the compositor promising events it has no
-        // code for.
-        let advertised = proto::GLOBALS[name as usize - 1].version;
-        let version = version.min(advertised).max(1);
         if !self.objects.insert_at(id, kind, version) {
-            return false;
+            return Err(self.no_room(id));
         }
         if kind == Kind::Seat {
             // What this seat has. A client reads it to decide what to ask for,
@@ -1523,6 +1799,6 @@ impl Client {
                 }
             }
         }
-        true
+        Ok(())
     }
 }

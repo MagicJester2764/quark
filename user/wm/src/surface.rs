@@ -15,6 +15,9 @@
 use crate::shm;
 
 pub const MAX_SURFACES: usize = 16;
+/// What one client may have: its share of them, so that a client making
+/// surfaces in a loop leaves the others theirs.
+pub const MAX_PER_CLIENT: usize = MAX_SURFACES / crate::client::MAX_CLIENTS;
 /// A title, capped at what a title bar can show.
 pub const MAX_TITLE: usize = 32;
 /// Frame callbacks one surface may have outstanding.
@@ -116,6 +119,10 @@ pub fn get(idx: usize) -> Option<Surface> {
 }
 
 pub fn create(client: usize, owner: usize) -> Option<usize> {
+    let mine = unsafe { SURFACES.iter().filter(|s| s.used && s.client == client).count() };
+    if mine >= MAX_PER_CLIENT {
+        return None;
+    }
     let idx = unsafe { SURFACES.iter().position(|s| !s.used) }?;
     unsafe {
         SURFACES[idx] = Surface { used: true, client, owner, ..NO_SURFACE };
@@ -283,28 +290,48 @@ pub fn commit(idx: usize) -> Option<Applied> {
                 crate::composite();
             }
             (NONE, _) => out.repaint = false,
-            (b, w) => {
-                let Some((px, bw, bh, stride)) = shm::pixels(b) else {
+            (b, w) => match shm::pixels(b) {
+                None => {
+                    // The client destroyed the buffer between attaching it and
+                    // committing it. There is nothing to show: the surface
+                    // keeps what it was showing, and nothing is released —
+                    // telling the client the old buffer was free while a
+                    // window still points at its pixels is how a compositor
+                    // ends up compositing memory that has been unmapped.
+                    s.current.buffer = previous;
+                    out.release = NONE;
+                    out.repaint = false;
                     return Some(out);
-                };
-                shm::set_in_use(b, true);
-                if w == NONE {
-                    match crate::adopt_window(owner, px as usize, bw, bh, stride) {
-                        Some(new) => {
-                            s.window = new;
-                            crate::set_window_title(new, &s.title[..s.title_len]);
-                            out.repaint = false; // a new window repaints everything
-                            adopted = true;
-                        }
-                        None => return Some(out),
-                    }
-                } else {
-                    crate::set_window_buffer(w, px as usize, bw, bh, stride);
                 }
-            }
+                Some((px, bw, bh, stride)) => {
+                    if w == NONE {
+                        match crate::adopt_window(owner, px as usize, bw, bh, stride) {
+                            Some(new) => {
+                                s.window = new;
+                                crate::set_window_title(new, &s.title[..s.title_len]);
+                                out.repaint = false; // a new window repaints everything
+                                adopted = true;
+                            }
+                            // No window to be had. The buffer is still what
+                            // the surface shows, so it is still held.
+                            None => out.repaint = false,
+                        }
+                    } else {
+                        crate::set_window_buffer(w, px as usize, bw, bh, stride);
+                    }
+                }
+            },
         }
-        if previous != NONE && previous != new_buffer {
-            shm::set_in_use(previous, false);
+        // What the surface shows changes at most once a commit, so the counts
+        // move exactly once — the new buffer held before the old is let go,
+        // so that a pool both are carved from is never briefly unused.
+        if new_buffer != previous {
+            if new_buffer != NONE {
+                shm::set_in_use(new_buffer, true);
+            }
+            if previous != NONE {
+                shm::set_in_use(previous, false);
+            }
         }
     }
     if adopted {
@@ -333,13 +360,52 @@ pub fn window_of(idx: usize) -> Option<usize> {
     get(idx).map(|s| s.window).filter(|&w| w != NONE)
 }
 
+/// The role object has gone, but the surface has not: it stops being a window
+/// and is a surface with no role again.
+///
+/// The slot stays taken, because the client's `wl_surface` still names it —
+/// and a slot freed while an object names it is a slot the next client's
+/// surface takes, with the first client still able to name it.
+pub fn clear_role(idx: usize) {
+    let (window, showing) = unsafe {
+        let Some(s) = SURFACES.get_mut(idx).filter(|s| s.used) else {
+            return;
+        };
+        let was = (s.window, s.current.buffer);
+        s.role = Role::None;
+        s.configured = false;
+        s.awaiting = 0;
+        s.window = NONE;
+        s.current = NO_STATE;
+        s.pending = NO_STATE;
+        s.nframe = 0;
+        s.xdg_surface = 0;
+        s.toplevel = 0;
+        was
+    };
+    if showing != NONE {
+        shm::set_in_use(showing, false);
+    }
+    crate::seat::surface_gone(idx);
+    if window != NONE {
+        crate::destroy_window(window);
+        crate::composite();
+    }
+}
+
 pub fn destroy(idx: usize) {
     unsafe {
         let Some(s) = SURFACES.get_mut(idx).filter(|s| s.used) else {
             return;
         };
         let window = s.window;
+        let showing = s.current.buffer;
         *s = NO_SURFACE;
+        // It is not showing anything any more, which is what lets a buffer
+        // the client destroyed while it was on screen finally go.
+        if showing != NONE {
+            shm::set_in_use(showing, false);
+        }
         // Before the window goes: `destroy_window` moves focus, and the seat
         // would otherwise be asked to announce a leave for a surface that no
         // longer exists.

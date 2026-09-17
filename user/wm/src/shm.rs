@@ -14,8 +14,13 @@
 
 use quark_rt::syscall;
 
-pub const MAX_POOLS: usize = 8;
-pub const MAX_BUFFERS: usize = 32;
+pub const MAX_POOLS: usize = 16;
+pub const MAX_BUFFERS: usize = 64;
+/// What one client may hold of each: its share, so that a client asking for
+/// them in a loop cannot leave another with none. Four pools and sixteen
+/// buffers is more than any client here uses; what it is not is unbounded.
+pub const MAX_POOLS_PER_CLIENT: usize = MAX_POOLS / crate::client::MAX_CLIENTS;
+pub const MAX_BUFFERS_PER_CLIENT: usize = MAX_BUFFERS / crate::client::MAX_CLIENTS;
 
 /// Where pools are mapped, one 16 MiB slot each — which is `MAX_PAGES_PER_REGION`,
 /// so a slot can always hold the largest region the kernel will make.
@@ -42,8 +47,13 @@ pub struct Pool {
     /// one client must not be visible to the next.
     pub owner: usize,
     pub vaddr: usize,
-    /// What the mapping actually turned out to be, not what the client said.
+    /// The client's figure for how much of the region is a pool, which is
+    /// never more than the mapping.
     pub size: usize,
+    /// Pages actually mapped, which is what has to be given back. The
+    /// client's size may be smaller, and unmapping that much left the rest of
+    /// the region mapped — and the slot unusable for ever after.
+    pub pages: usize,
     /// Buffers still referring to this pool. A client may destroy the pool
     /// while buffers carved from it are still in use, and the memory must stay
     /// until the last of them goes.
@@ -61,9 +71,10 @@ pub struct Buffer {
     pub height: usize,
     pub stride: usize,
     pub format: u32,
-    /// The compositor is reading these pixels right now. Releasing a buffer it
-    /// is still reading is what tears a frame in half.
-    pub in_use: bool,
+    /// How many surfaces are showing these pixels. A buffer may be attached
+    /// to more than one, and freeing it when the first lets go would unmap
+    /// the pool under a window still being composited.
+    pub users: u32,
     /// The client destroyed it while the compositor was still showing it.
     ///
     /// Wayland allows that, and a compositor that took it literally would
@@ -73,7 +84,7 @@ pub struct Buffer {
 }
 
 const NO_POOL: Pool =
-    Pool { used: false, owner: 0, vaddr: 0, size: 0, buffers: 0, zombie: false };
+    Pool { used: false, owner: 0, vaddr: 0, size: 0, pages: 0, buffers: 0, zombie: false };
 const NO_BUFFER: Buffer = Buffer {
     used: false,
     pool: 0,
@@ -82,7 +93,7 @@ const NO_BUFFER: Buffer = Buffer {
     height: 0,
     stride: 0,
     format: 0,
-    in_use: false,
+    users: 0,
     zombie: false,
 };
 
@@ -95,6 +106,21 @@ pub fn pool(idx: usize) -> Option<Pool> {
 
 pub fn buffer(idx: usize) -> Option<Buffer> {
     unsafe { BUFFERS.get(idx).copied().filter(|b| b.used) }
+}
+
+/// How many pools `owner` holds.
+pub fn pools_of(owner: usize) -> usize {
+    unsafe { POOLS.iter().filter(|p| p.used && p.owner == owner).count() }
+}
+
+/// How many buffers `owner` holds, in all of its pools.
+pub fn buffers_of(owner: usize) -> usize {
+    unsafe {
+        BUFFERS
+            .iter()
+            .filter(|b| b.used && POOLS.get(b.pool).is_some_and(|p| p.used && p.owner == owner))
+            .count()
+    }
 }
 
 /// Take a descriptor a client sent and map what it names.
@@ -116,8 +142,9 @@ pub fn create_pool(owner: usize, fd: usize, claimed: usize) -> Option<usize> {
     // and holding the descriptor as well would keep the region alive after the
     // client has finished with it.
     let _ = syscall::sys_fd_close(fd);
+    let pages = size.div_ceil(4096);
     if claimed == 0 || claimed > size {
-        unmap_range(vaddr, size / 4096);
+        unmap_range(vaddr, pages);
         return None;
     }
     unsafe {
@@ -128,6 +155,7 @@ pub fn create_pool(owner: usize, fd: usize, claimed: usize) -> Option<usize> {
             // The client's figure, since it is the smaller: the rest of the
             // region is real memory but the client has not said it is a pool.
             size: claimed,
+            pages,
             buffers: 0,
             zombie: false,
         };
@@ -174,7 +202,7 @@ pub fn create_buffer(
             height,
             stride,
             format,
-            in_use: false,
+            users: 0,
             zombie: false,
         };
         POOLS[pool_idx].buffers += 1;
@@ -189,17 +217,23 @@ pub fn pixels(idx: usize) -> Option<(*const u8, usize, usize, usize)> {
     Some(((p.vaddr + b.offset) as *const u8, b.width, b.height, b.stride))
 }
 
-/// Say whether the compositor is currently showing a buffer.
+/// Say that a surface has started, or stopped, showing a buffer.
 ///
-/// Stopping is what lets a buffer the client already destroyed finally go: it
-/// is the moment the pool underneath it is no longer being read.
+/// Counted rather than flagged: the same buffer may be attached to two
+/// surfaces, and the last one to let go is what lets a buffer the client
+/// already destroyed finally go — the moment the pool underneath it is no
+/// longer being read.
 pub fn set_in_use(idx: usize, yes: bool) {
     let finished = unsafe {
         let Some(b) = BUFFERS.get_mut(idx).filter(|b| b.used) else {
             return;
         };
-        b.in_use = yes;
-        !yes && b.zombie
+        if yes {
+            b.users += 1;
+        } else {
+            b.users = b.users.saturating_sub(1);
+        }
+        b.users == 0 && b.zombie
     };
     if finished {
         destroy_buffer(idx);
@@ -218,7 +252,7 @@ pub fn destroy_buffer(idx: usize) {
         if !b.used {
             return;
         }
-        if b.in_use {
+        if b.users > 0 {
             b.zombie = true;
             return;
         }
@@ -257,9 +291,10 @@ fn release_pool_ref(idx: usize) {
 fn unmap(idx: usize) {
     unsafe {
         let p = &mut POOLS[idx];
-        // Round up: the mapping is whole pages even when the client's size is
-        // not, and leaving the tail mapped leaks an address slot for good.
-        unmap_range(p.vaddr, (p.size + 4095) / 4096);
+        // What was mapped, not what the client called a pool: a client that
+        // hands over more memory than it says is a pool leaves the rest of it
+        // mapped otherwise, and the slot is never usable again.
+        unmap_range(p.vaddr, p.pages);
         *p = NO_POOL;
     }
 }
