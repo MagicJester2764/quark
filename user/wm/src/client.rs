@@ -203,6 +203,10 @@ pub struct Client {
     due: [u32; MAX_DUE],
     ndue: usize,
     fired_at: u64,
+    /// The `wl_output` this client bound, if it did. A surface's `enter` names
+    /// it, so a client that never bound one cannot be told where its surfaces
+    /// are — there is no object to say it with.
+    pub output: u32,
     /// The `wl_keyboard` this client asked for, if it did. Events go to
     /// objects, and a client that never took a keyboard has none to send to.
     keyboard: u32,
@@ -253,6 +257,7 @@ pub const NO_CLIENT: Client = Client {
     due: [0; MAX_DUE],
     ndue: 0,
     fired_at: 0,
+    output: 0,
     keyboard: 0,
     pointer: 0,
     data_device: 0,
@@ -1011,6 +1016,34 @@ impl Client {
         if let Some(a) = self.begin(xdg_surface, proto::XDG_SURFACE_CONFIGURE) {
             self.arg_u32(serial);
             self.end(a);
+        }
+        self.flush();
+    }
+
+    /// Tell this client which of its surfaces are on the output, and which
+    /// have stopped being.
+    ///
+    /// A client that never bound a `wl_output` is told nothing — there is no
+    /// object to name — and hears about every surface it has the moment it
+    /// binds one, which is the ordinary order for a toolkit that asks for the
+    /// registry, makes a window, and only then looks at the outputs.
+    pub fn reconcile_outputs(&mut self) {
+        if self.output == 0 {
+            return;
+        }
+        let output = self.output;
+        while let Some((idx, visible)) = surface::output_change(self.slot) {
+            let Some(id) = self.surface_id(idx) else {
+                // No object for it: nothing to address, and nothing to say.
+                surface::set_entered(idx, visible);
+                continue;
+            };
+            let opcode = if visible { proto::SURFACE_ENTER } else { proto::SURFACE_LEAVE };
+            if let Some(a) = self.begin(id, opcode) {
+                self.arg_u32(output);
+                self.end(a);
+            }
+            surface::set_entered(idx, visible);
         }
         self.flush();
     }
@@ -1932,6 +1965,10 @@ impl Client {
             }
         }
         if kind == Kind::Output {
+            // The object a surface's `enter` will name. A client may bind more
+            // than one; the latest is the one used, because a compositor with
+            // one output has nothing to choose between them.
+            self.output = id;
             // A client that binds an output waits for `done` before it
             // believes any of it, so all four go out together.
             let (w, h) = crate::screen_size();

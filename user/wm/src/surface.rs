@@ -93,6 +93,12 @@ pub struct Surface {
     /// It has acknowledged at least one. Nothing is shown before this: a
     /// client that has not agreed to a size has not agreed to be a window.
     pub configured: bool,
+    /// The client has been told this surface is on the output.
+    ///
+    /// Kept so the pair stays balanced: an enter for a surface already on the
+    /// output, or a leave for one that was never on it, is a client whose idea
+    /// of where its windows are drifts away from the compositor's.
+    pub entered: bool,
 
     /// The toplevel's title.
     ///
@@ -115,6 +121,7 @@ pub const NO_SURFACE: Surface = Surface {
     frame: [0; MAX_FRAME],
     nframe: 0,
     oldest: 0,
+    entered: false,
     xdg_surface: 0,
     toplevel: 0,
     awaiting: 0,
@@ -225,6 +232,34 @@ pub fn set_toplevel(idx: usize, id: u32) {
     unsafe {
         if let Some(s) = SURFACES.get_mut(idx).filter(|s| s.used) {
             s.toplevel = id;
+        }
+    }
+}
+
+/// A surface of this client whose visibility disagrees with what the client
+/// has been told, and which way it disagrees.
+///
+/// One at a time, because saying so is a send and a send can fail; the caller
+/// loops until there is nothing left to say.
+pub fn output_change(client: usize) -> Option<(usize, bool)> {
+    unsafe {
+        for (i, s) in SURFACES.iter().enumerate() {
+            if !s.used || s.client != client {
+                continue;
+            }
+            let visible = s.window != NONE;
+            if visible != s.entered {
+                return Some((i, visible));
+            }
+        }
+    }
+    None
+}
+
+pub fn set_entered(idx: usize, yes: bool) {
+    unsafe {
+        if let Some(s) = SURFACES.get_mut(idx).filter(|s| s.used) {
+            s.entered = yes;
         }
     }
 }
@@ -424,6 +459,9 @@ pub fn clear_role(idx: usize) {
         s.awaiting = 0;
         s.oldest = 0;
         s.window = NONE;
+        // `entered` is deliberately left alone: the surface has stopped being
+        // shown but the client has not been told yet, and that disagreement is
+        // exactly what makes the leave go out.
         s.current = NO_STATE;
         s.pending = NO_STATE;
         s.nframe = 0;

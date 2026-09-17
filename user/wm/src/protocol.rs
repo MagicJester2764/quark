@@ -109,7 +109,12 @@ pub const SURFACE_SET_BUFFER_SCALE: u16 = 8;
 pub const SURFACE_DAMAGE_BUFFER: u16 = 9;
 pub const SURFACE_OFFSET: u16 = 10;
 // wl_surface events.
+/// `wl_surface.enter(output)` and `.leave(output)`: which outputs a surface is
+/// being shown on. With one output it is nearly a formality, but a client uses
+/// it to pick a scale and to decide whether it is visible at all — a toolkit
+/// that never hears an enter is one that thinks it is off-screen.
 pub const SURFACE_ENTER: u16 = 0;
+pub const SURFACE_LEAVE: u16 = 1;
 
 /// `wl_surface.error`: a scale or a transform that is not one.
 pub const SURFACE_ERR_INVALID_SCALE: u32 = 0;

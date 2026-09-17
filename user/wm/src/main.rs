@@ -1939,7 +1939,12 @@ fn serve_clients() {
             }
             if !CLIENTS[i].dispatch() {
                 CLIENTS[i].close();
+                continue;
             }
+            // After the batch rather than inside the commit: a surface gains
+            // its window in one request and loses it in another, and this is
+            // the one place that sees both.
+            CLIENTS[i].reconcile_outputs();
         }
     }
 }

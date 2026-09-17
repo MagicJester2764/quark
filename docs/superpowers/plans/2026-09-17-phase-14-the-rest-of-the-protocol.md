@@ -288,14 +288,14 @@ pointer, and a scroll wheel reaches a client.*
   the client's `wl_output` object, if it has bound one, and `leave` when it
   stops being visible. A client that binds the output later is told then.
 
-- [ ] **Step 1: The failing check.** `wlprobe` prints the outputs its surface
+- [x] **Step 1: The failing check.** `wlprobe` prints the outputs its surface
   is on. Expected today: none, and the compositor never sends the event —
   `SURFACE_ENTER` is a constant nothing uses.
 
-- [ ] **Step 2: Send it.** On the commit that gives a surface its window, and
+- [x] **Step 2: Send it.** On the commit that gives a surface its window, and
   on `bind` of `wl_output` for a client that already has one.
 
-- [ ] **Step 3: Verify.** `wm wlprobe`: it names the output. `wlfuzz` still
+- [x] **Step 3: Verify.** `wm wlprobe`: it names the output. `wlfuzz` still
   leaves the compositor standing.
 
 - [ ] **Step 4: Commit.** quark: "A surface knows which output it is on".
