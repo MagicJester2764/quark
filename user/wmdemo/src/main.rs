@@ -66,7 +66,8 @@ pub extern "C" fn _start() -> ! {
     // copies of this program are otherwise the same picture twice.
     let mut title = [0u8; 9];
     title[..8].copy_from_slice(b"wmdemo #");
-    title[8] = args::argv(1).and_then(|a| a.first().copied()).unwrap_or(b'1');
+    // Which of the session's programs this is, as the compositor says.
+    title[8] = args::getenv(b"WM_SESSION").and_then(|a| a.first().copied()).unwrap_or(b'1');
 
     let Some(win) = wm::Window::create(server, W, H, &title, BUF) else {
         println!("wmdemo: no window");

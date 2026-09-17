@@ -1371,17 +1371,30 @@ without `ROOT_OVERLAYS` has no `var`; e2fsck clean.
 - Produces: `wm "<program> [args…]" …` — each argument is a program and its arguments, split on spaces. `wm` with no argument prints `usage: wm "<program> [args]" …` and exits 2 without touching the display; more than four programs is `wm: at most 4 programs`, exit 2; a program that cannot be loaded is named (`wm: cannot run 'foo'`), exit 1, and the display is never claimed. A session program's environment has `WM_SESSION=<n>` (1-based) beside `WAYLAND_SOCKET=3`; its `argv[0]` is its name and the rest are its own arguments. `wm`'s manifest asks for what the shell's does (`task_mgmt(0)`, `phys_alloc(64)`) so that it can grant what its programs ask for.
 - Produces: `qsh` splits words on spaces except inside `"…"` (where `\"` and `\\` are escapes) and `'…'` (literal); an unterminated quote prints `qsh: unterminated quote` and runs nothing; a seventeenth word prints `qsh: too many arguments` and runs nothing.
 
-- [ ] **Step 1: The failing checks.** A key script (`$SP/p17t13.keys`) with, one screenshot each: `wm`, `wm ctortest ctortest ctortest ctortest ctortest`, `wm nonexistent`, `wm "ls /etc"`, `wm hello`, `wm "dtest wire"`, `wm wmdemo`, `wm weston-simple-shm weston-simple-shm weston-simple-shm weston-simple-shm`, `wm qsh`, `echo "a  b" c`, `echo 'x y'`, `echo "unterminated`. Expected today: `wm` claims the display before complaining; five programs start four; `wm "ls /etc"` is one program named `"ls`; `hello` aborts; `wmdemo`'s title is right only because of `argv[1]`; the quotes are passed through.
+- [x] **Step 1: The failing checks.** A key script (`$SP/p17t13.keys`) with, one screenshot each: `wm`, `wm ctortest ctortest ctortest ctortest ctortest`, `wm nonexistent`, `wm "ls /etc"`, `wm hello`, `wm "dtest wire"`, `wm wmdemo`, `wm weston-simple-shm weston-simple-shm weston-simple-shm weston-simple-shm`, `wm qsh`, `echo "a  b" c`, `echo 'x y'`, `echo "unterminated`. Expected today: `wm` claims the display before complaining; five programs start four; `wm "ls /etc"` is one program named `"ls`; `hello` aborts; `wmdemo`'s title is right only because of `argv[1]`; the quotes are passed through.
 
-- [ ] **Step 2: The shell.** A `split_args(line: &[u8], out: &mut [&[u8]; 16], store: &mut [u8; 256]) -> Result<usize, &'static str>` copies each word, unquoted, into `store` and records slices of it; both the single-command path and each pipeline stage use it.
+- [x] **Step 2: The shell.** A `split_args(line: &[u8], out: &mut [&[u8]; 16], store: &mut [u8; 256]) -> Result<usize, &'static str>` copies each word, unquoted, into `store` and records slices of it; both the single-command path and each pipeline stage use it.
 
-- [ ] **Step 3: wm.** Before `claim`: check `argv(1)`, the count, and load every program (`spawn::load_path`), keeping the `Spawned`s; then claim, then grant (`sys_cap_grant` of the nameserver endpoint and `quark_rt::manifest::grant_image(tid, image, 12)` — the image is still in `FILE_BUF` when `load_path`'s `grant` closure runs, which is where the grant goes), connect, set `argv` and `env`, give the directory (Task 6) and start. `wmdemo` and `wmtype` read `quark_rt::args::getenv(b"WM_SESSION")` for their title number. After `EMPTY_HINT_TICKS` (300) with no window, the backdrop shows `No window yet. Esc ends the session.` in the middle of the screen until a window appears.
+- [x] **Step 3: wm.** Before `claim`: check `argv(1)`, the count, and load every program (`spawn::load_path`), keeping the `Spawned`s; then claim, then grant (`sys_cap_grant` of the nameserver endpoint and `quark_rt::manifest::grant_image(tid, image, 12)` — the image is still in `FILE_BUF` when `load_path`'s `grant` closure runs, which is where the grant goes), connect, set `argv` and `env`, give the directory (Task 6) and start. `wmdemo` and `wmtype` read `quark_rt::args::getenv(b"WM_SESSION")` for their title number. After `EMPTY_HINT_TICKS` (300) with no window, the backdrop shows `No window yet. Esc ends the session.` in the middle of the screen until a window appears.
 
-- [ ] **Step 4: runtests.** Lines: an optional `?`, then an optional `@N`, then the program and its arguments. The wait becomes: `sys_task_watch(child)`, `sys_recv_timeout(TID_ANY, …)` until `TAG_TASK_DIED` for the child (sender 0) or the deadline, then `sys_wait`; at the deadline, `sys_task_kill` and `  FAIL  name (timed out)`. With `?`, an exit status is a pass and only a signal (a negative status) or a timeout is a failure.
+- [x] **Step 4: runtests.** Lines: an optional `?`, then an optional `@N`, then the program and its arguments. The wait becomes: `sys_task_watch(child)`, `sys_recv_timeout(TID_ANY, …)` until `TAG_TASK_DIED` for the child (sender 0) or the deadline, then `sys_wait`; at the deadline, `sys_task_kill` and `  FAIL  name (timed out)`. With `?`, an exit status is a pass and only a signal (a negative status) or a timeout is a failure.
 
-- [ ] **Step 5: Verify.** Build; image; boot the Step 1 script: usage without a display change; `at most 4`; `cannot run 'nonexistent'` without a display change; `ls /etc`'s listing appears once the session ends; `hello` runs its threads to the end; `dtest wire` passes; `wmdemo #1`; four windows; `qsh` exits (no input); `a  b c`; `x y`; `qsh: unterminated quote`. `runtests /etc/libc.tests` still passes.
+- [x] **Step 5: Verify.** Build; image; boot the Step 1 script: usage without a display change; `at most 4`; `cannot run 'nonexistent'` without a display change; `ls /etc`'s listing appears once the session ends; `hello` runs its threads to the end; `dtest wire` passes; `wmdemo #1`; four windows; `qsh` exits (no input); `a  b c`; `x y`; `qsh: unterminated quote`. `runtests /etc/libc.tests` still passes.
 
-- [ ] **Step 6: Commit.** quark: "wm takes what it is given; the shell takes quotes".
+- [x] **Step 6: Commit.** quark: "wm takes what it is given; the shell takes quotes".
+
+**Done.** Found on the way: `wm` gave its programs only `WAYLAND_SOCKET`, so
+`wm dtest` failed three environment checks; a session program now gets the
+compositor's own environment, plus `WM_SESSION` and `WAYLAND_SOCKET`. The
+runner's own list (`selftest.tests`) exercises `?` and `@N`, with two new
+dchild modes, `fault` and `sleep`: 4 passed, 3 failed as it says. A quoted
+`|` is not a pipe, and adjacent quoted pieces make one word. Step 1's
+before-run was not made; every case was checked after: usage, `at most 4`
+and `cannot run 'nonexistent'` without touching the display; `ls /etc`'s
+listing; `hello`'s threads; `dtest wire` 12/0; `wmdemo #1`; four windows;
+`qsh` exits; `a  b c`; `x y`; `unterminated quote`; `say "hi" \ ok its`;
+the hint after three seconds with no window; `wm dtest` 262/0; libc.tests
+12/12.
 
 ---
 

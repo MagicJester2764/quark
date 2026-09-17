@@ -7,6 +7,8 @@ use quark_rt::spawn::{self, Scratch, Spawned};
 use quark_rt::{args, print, println, syscall, vfs};
 use quark_rt::stdio::read_line_result;
 
+mod words;
+
 use quark_rt::manifest::CapReq;
 
 // No physical range: the shell only maps frames it allocated itself to stage a
@@ -187,12 +189,12 @@ fn resolve_program(cmd: &[u8], vfs_tid: usize, out: &mut [u8; 64]) -> Option<usi
 }
 
 fn cmd_spawn(
-    cmd: &[u8],
-    args_str: &[u8],
+    argv: &[&[u8]],
     vfs_tid: usize,
     inherit_stdin: bool,
     inherit_stdout: bool,
 ) -> Option<Spawned> {
+    let cmd = argv[0];
     let mut path = [0u8; 64];
     let Some(len) = resolve_program(cmd, vfs_tid, &mut path) else {
         if let Ok(s) = core::str::from_utf8(cmd) {
@@ -234,33 +236,7 @@ fn cmd_spawn(
     }
     let _ = syscall::sys_fd_dup(tid, 2, 2);
 
-    // Build argv: [command_name, ...split args]
-    let mut argv_bufs: [&[u8]; 16] = [b""; 16];
-    let mut argc = 0;
-    argv_bufs[argc] = cmd;
-    argc += 1;
-
-    // Split args_str by spaces into argv
-    if !args_str.is_empty() {
-        let mut i = 0;
-        while i < args_str.len() && argc < 16 {
-            // Skip spaces
-            while i < args_str.len() && args_str[i] == b' ' {
-                i += 1;
-            }
-            if i >= args_str.len() {
-                break;
-            }
-            let start = i;
-            while i < args_str.len() && args_str[i] != b' ' {
-                i += 1;
-            }
-            argv_bufs[argc] = &args_str[start..i];
-            argc += 1;
-        }
-    }
-
-    let _ = spawn::set_args_env(&info, &argv_bufs[..argc], &BASE_ENV, &SPAWN_SCRATCH);
+    let _ = spawn::set_args_env(&info, argv, &BASE_ENV, &SPAWN_SCRATCH);
 
     Some(info)
 }
@@ -277,14 +253,6 @@ fn is_builtin(cmd: &[u8]) -> bool {
 }
 
 /// Split a stage into its command word and the rest.
-fn split_cmd(stage: &[u8]) -> (&[u8], &[u8]) {
-    let stage = stage.trim_ascii();
-    match stage.iter().position(|&b| b == b' ') {
-        Some(i) => (&stage[..i], stage[i + 1..].trim_ascii()),
-        None => (stage, &[] as &[u8]),
-    }
-}
-
 /// The status of a command the shell could not run at all — not found, or not
 /// loadable, or not startable. POSIX's "command not found" number.
 ///
@@ -295,8 +263,8 @@ fn split_cmd(stage: &[u8]) -> (&[u8], &[u8]) {
 const NOT_RUN: i32 = 127;
 
 /// Run one command to completion. Returns its exit status.
-fn cmd_exec(cmd: &[u8], args_str: &[u8], vfs_tid: usize, input_tid: usize) -> i32 {
-    let info = match cmd_spawn(cmd, args_str, vfs_tid, true, true) {
+fn cmd_exec(argv: &[&[u8]], vfs_tid: usize, input_tid: usize) -> i32 {
+    let info = match cmd_spawn(argv, vfs_tid, true, true) {
         Some(i) => i,
         None => return NOT_RUN,
     };
@@ -354,11 +322,20 @@ fn cmd_pipeline(stages: &[&[u8]], vfs_tid: usize, input_tid: usize) -> i32 {
     let mut spawned = 0;
 
     for i in 0..n {
-        let (cmd, args_str) = split_cmd(stages[i]);
-        if cmd.is_empty() {
+        let mut store = [0u8; words::STORE];
+        let mut argv: [&[u8]; words::MAX_WORDS] = [b""; words::MAX_WORDS];
+        let argc = match words::split(stages[i], &mut store, &mut argv) {
+            Ok(argc) => argc,
+            Err(why) => {
+                println!("qsh: {}", why);
+                break;
+            }
+        };
+        if argc == 0 {
             println!("shell: empty pipeline stage");
             break;
         }
+        let cmd = argv[0];
         if is_builtin(cmd) {
             if let Ok(c) = core::str::from_utf8(cmd) {
                 println!("shell: {}: builtin cannot be used in a pipeline", c);
@@ -366,7 +343,7 @@ fn cmd_pipeline(stages: &[&[u8]], vfs_tid: usize, input_tid: usize) -> i32 {
             break;
         }
 
-        let info = match cmd_spawn(cmd, args_str, vfs_tid, i == 0, i + 1 == n) {
+        let info = match cmd_spawn(&argv[..argc], vfs_tid, i == 0, i + 1 == n) {
             Some(v) => v,
             None => break,
         };
@@ -521,9 +498,8 @@ fn print_prompt(vfs_tid: usize) {
     print!("$ ");
 }
 
-fn cmd_cd(args_str: &[u8], vfs_tid: usize) {
-    let arg = args_str.trim_ascii();
-    let target = if arg.is_empty() { home_get() } else { arg };
+fn cmd_cd(arg: Option<&[u8]>, vfs_tid: usize) {
+    let target = arg.unwrap_or(home_get());
     if let Err(code) = vfs::chdir(vfs_tid, target) {
         let shown = core::str::from_utf8(target).unwrap_or("?");
         println!("cd: {}: {}", shown, dir_error(code));
@@ -598,42 +574,34 @@ pub extern "C" fn _start() -> ! {
         let line = &line[start..];
 
         // Pipeline: split on '|' before anything else, since the first word of
-        // `a | b` is a stage command rather than a builtin.
-        if line.contains(&b'|') {
-            let mut stages: [&[u8]; MAX_STAGES] = [b""; MAX_STAGES];
-            let mut n = 0;
-            let mut too_long = false;
-            for part in line.split(|&b| b == b'|') {
-                if n >= MAX_STAGES {
-                    too_long = true;
-                    break;
-                }
-                stages[n] = part;
-                n += 1;
-            }
-            if too_long {
-                println!("shell: pipeline too long (max {} stages)", MAX_STAGES);
-            } else {
-                let code = cmd_pipeline(&stages[..n], vfs_tid, input_tid);
-                set_status(b"pipeline", code);
-            }
+        // `a | b` is a stage command rather than a builtin. A quoted bar is
+        // not a pipe.
+        let mut stages: [&[u8]; MAX_STAGES + 1] = [b""; MAX_STAGES + 1];
+        let Some(nstages) = words::stages(line, &mut stages).filter(|&n| n <= MAX_STAGES) else {
+            println!("shell: pipeline too long (max {} stages)", MAX_STAGES);
+            continue;
+        };
+        if nstages > 1 {
+            let code = cmd_pipeline(&stages[..nstages], vfs_tid, input_tid);
+            set_status(b"pipeline", code);
             continue;
         }
 
-        // Split into command and args
-        let mut split = line.len();
-        for i in 0..line.len() {
-            if line[i] == b' ' {
-                split = i;
-                break;
+        let mut store = [0u8; words::STORE];
+        let mut argv: [&[u8]; words::MAX_WORDS] = [b""; words::MAX_WORDS];
+        let argc = match words::split(line, &mut store, &mut argv) {
+            Ok(n) => n,
+            Err(why) => {
+                println!("qsh: {}", why);
+                continue;
             }
-        }
-        let cmd = &line[..split];
-        let args_str = if split < line.len() {
-            &line[split + 1..]
-        } else {
-            &[] as &[u8]
         };
+        if argc == 0 {
+            continue;
+        }
+        let argv = &argv[..argc];
+        let cmd = argv[0];
+        let args = &argv[1..];
 
         // Builtin: exit
         if cmd == b"exit" {
@@ -642,7 +610,7 @@ pub extern "C" fn _start() -> ! {
 
         // Builtin: cd
         if cmd == b"cd" {
-            cmd_cd(args_str, vfs_tid);
+            cmd_cd(args.first().copied(), vfs_tid);
             continue;
         }
 
@@ -664,28 +632,28 @@ pub extern "C" fn _start() -> ! {
 
         // Builtin: kill [-9] <tid>
         if cmd == b"kill" {
-            let arg = args_str.trim_ascii();
-            let (sig, tid_arg) = if arg.starts_with(b"-9 ") {
-                (syscall::SIG_KILL, arg[3..].trim_ascii())
-            } else if arg == b"-9" {
-                println!("usage: kill [-9] <tid>");
-                continue;
-            } else {
-                (syscall::SIG_TERM, arg)
-            };
-            if let Some(tid) = parse_usize(tid_arg) {
-                if syscall::sys_signal(tid, sig).is_err() {
-                    println!("kill: failed to signal task {}", tid);
+            let (sig, tid_arg) = match args {
+                [b"-9", tid] => (syscall::SIG_KILL, *tid),
+                [tid] => (syscall::SIG_TERM, *tid),
+                _ => {
+                    println!("usage: kill [-9] <tid>");
+                    continue;
                 }
-            } else {
-                println!("usage: kill [-9] <tid>");
+            };
+            match parse_usize(tid_arg) {
+                Some(tid) => {
+                    if syscall::sys_signal(tid, sig).is_err() {
+                        println!("kill: failed to signal task {}", tid);
+                    }
+                }
+                None => println!("usage: kill [-9] <tid>"),
             }
             continue;
         }
 
         // External command. Relative paths in its arguments are its own
         // business: it starts in the shell's directory.
-        let code = cmd_exec(cmd, args_str, vfs_tid, input_tid);
+        let code = cmd_exec(argv, vfs_tid, input_tid);
         set_status(cmd, code);
     }
 }

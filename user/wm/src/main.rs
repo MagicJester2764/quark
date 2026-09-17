@@ -74,7 +74,12 @@ mod surface;
 
 use draw::{draw_text, fill_rect, pack_colour, present, Rect, Screen, CLIP, GLYPH_H, SCREEN};
 
-quark_rt::manifest!([quark_rt::manifest::CapReq::task_mgmt(0)]);
+// What the shell asks for, so that it can grant a session program what that
+// program asks for: the kernel lets a spawner give only what it holds.
+quark_rt::manifest!([
+    quark_rt::manifest::CapReq::task_mgmt(0),
+    quark_rt::manifest::CapReq::phys_alloc(64),
+]);
 
 /// Scratch addresses for staging a session program's pages into its new
 /// address space. Each spawner needs its own; these are the compositor's.
@@ -309,11 +314,23 @@ fn refresh(region: Rect) {
         for i in 0..STACK_LEN {
             draw_window(STACK[i]);
         }
+        if EMPTY_HINT && STACK_LEN == 0 {
+            let screen = draw::screen_rect();
+            let x = (screen.x1 / 2).saturating_sub(EMPTY_HINT_TEXT.len() * draw::GLYPH_W / 2);
+            let y = (screen.y1 / 2).saturating_sub(draw::GLYPH_H / 2);
+            draw_text(x, y, EMPTY_HINT_TEXT, pack_colour(0xB0, 0xB8, 0xC8));
+        }
     }
     // Last, because a pointer behind a window is not a pointer.
     cursor::draw();
     present(region);
 }
+
+/// What a session with no window says, and after how long.
+const EMPTY_HINT_TEXT: &[u8] = b"No window yet. Esc ends the session.";
+const EMPTY_HINT_TICKS: u64 = 300;
+/// Whether the backdrop is saying it.
+static mut EMPTY_HINT: bool = false;
 
 /// Redraw the whole screen. For anything structural — a window appearing,
 /// moving, being raised or going away — where what changed is not one window's
@@ -978,8 +995,39 @@ pub extern "C" fn _start() -> ! {
         println!("wm: no keymap; clients will guess the layout");
     }
 
+    // Everything that can go wrong with what was asked for goes wrong here,
+    // before the display is taken from anybody.
+    let session_count = (1..).take_while(|&i| args::argv(i).is_some()).count();
+    if session_count == 0 {
+        println!("usage: wm \"<program> [args]\" ...");
+        syscall::sys_exit_code(2);
+    }
+    if session_count > MAX_SESSION {
+        println!("wm: at most {} programs", MAX_SESSION);
+        syscall::sys_exit_code(2);
+    }
+    let mut loaded: [Option<Loaded>; MAX_SESSION] = [const { None }; MAX_SESSION];
+    for (n, slot) in loaded.iter_mut().enumerate().take(session_count) {
+        let line = args::argv(1 + n).unwrap_or(b"");
+        match load_session_program(line) {
+            Some(l) => *slot = Some(l),
+            None => {
+                let words = split_words(line);
+                let name = words.first().copied().unwrap_or(b"");
+                println!("wm: cannot run '{}'", core::str::from_utf8(name).unwrap_or("?"));
+                for l in loaded.iter().flatten() {
+                    let _ = syscall::sys_task_kill(l.info.tid);
+                }
+                syscall::sys_exit_code(1);
+            }
+        }
+    }
+
     let Some(fb) = nameserver::lookup_retry(b"fb", 20) else {
         println!("wm: no framebuffer device");
+        for l in loaded.iter().flatten() {
+            let _ = syscall::sys_task_kill(l.info.tid);
+        }
         syscall::sys_exit_code(1);
     };
     unsafe { FB_TID = fb };
@@ -991,6 +1039,9 @@ pub extern "C" fn _start() -> ! {
     let mut reply = Message::empty();
     if syscall::sys_call_offer_self(fb, &claim, &mut reply).is_err() || reply.tag == TAG_ERROR {
         println!("wm: could not claim the display");
+        for l in loaded.iter().flatten() {
+            let _ = syscall::sys_task_kill(l.info.tid);
+        }
         syscall::sys_exit_code(1);
     }
     if !init_screen(&reply) {
@@ -1007,16 +1058,10 @@ pub extern "C" fn _start() -> ! {
     cursor::centre();
     composite();
 
-    // What this session is for. Without one there is nothing to composite and
-    // nothing to wait for, so say so rather than sit on the display.
-    if args::argv(1).is_none() {
-        println!("usage: wm <program> [program...]");
-        quit();
-    }
-    let mut n = 0;
-    while n < MAX_SESSION {
-        let Some(program) = args::argv(1 + n) else { break };
-        let Some(tid) = start_session(program, n) else {
+    // What this session is for, loaded above and started now.
+    for (n, l) in loaded.iter().enumerate() {
+        let Some(l) = l else { break };
+        let Some(tid) = start_session(l, n) else {
             quit();
         };
         unsafe {
@@ -1026,9 +1071,9 @@ pub extern "C" fn _start() -> ! {
         // Watched from the start rather than from its first window: a program
         // that dies before it draws anything still ends the session.
         let _ = syscall::sys_task_watch(tid);
-        n += 1;
     }
 
+    let started = syscall::sys_ticks();
     let mut last_pump: u64 = 0;
     let mut last_check: u64 = 0;
     loop {
@@ -1058,6 +1103,14 @@ pub extern "C" fn _start() -> ! {
             last_check = now;
             if session_finished() {
                 quit();
+            }
+            // A session with nothing on the screen for a while says how to
+            // leave it, since nothing else on the screen will.
+            let empty = unsafe { STACK_LEN == 0 };
+            let hint = empty && now.wrapping_sub(started) >= EMPTY_HINT_TICKS;
+            if hint != unsafe { EMPTY_HINT } {
+                unsafe { EMPTY_HINT = hint };
+                composite();
             }
         }
 
@@ -1288,45 +1341,96 @@ fn session_finished() -> bool {
     }
 }
 
-/// Start one of the programs this session is for.
-///
-/// The compositor holds the display for as long as those programs run, and
-/// gives it back when the last of them stops — which is what `startx` does,
-/// and for the same reason: something has to decide when the graphical session
-/// is over, and the thing the user asked to run is the obvious candidate.
-fn start_session(name: &[u8], index: usize) -> Option<usize> {
+/// A session program, loaded and granted what it asked for, not yet started.
+struct Loaded {
+    info: spawn::Spawned,
+    /// Its command line, split into words.
+    line: &'static [u8],
+}
+
+/// The words of `line`, split on spaces. At most sixteen.
+fn split_words(line: &'static [u8]) -> heapless_words::Words {
+    heapless_words::Words::of(line)
+}
+
+/// A fixed list of words, since there is no allocator to hand.
+mod heapless_words {
+    pub struct Words {
+        words: [&'static [u8]; 16],
+        len: usize,
+    }
+
+    impl Words {
+        pub fn of(line: &'static [u8]) -> Self {
+            let mut w = Words { words: [b""; 16], len: 0 };
+            for word in line.split(|&b| b == b' ').filter(|w| !w.is_empty()) {
+                if w.len < w.words.len() {
+                    w.words[w.len] = word;
+                    w.len += 1;
+                }
+            }
+            w
+        }
+    }
+
+    impl core::ops::Deref for Words {
+        type Target = [&'static [u8]];
+        fn deref(&self) -> &Self::Target {
+            &self.words[..self.len]
+        }
+    }
+}
+
+/// Load one of the programs this session is for: `line` is its name and its
+/// arguments. It is given what its manifest asks for, from what this
+/// compositor holds, but not started. `None` if it cannot be loaded.
+fn load_session_program(line: &'static [u8]) -> Option<Loaded> {
+    let words = split_words(line);
+    let name = *words.first()?;
     let vfs_tid = nameserver::lookup_retry(b"vfs", 20)?;
 
     // The same two spellings the shell tries: lowercase for ext2, uppercase
-    // with .ELF for FAT32.
+    // with .ELF for FAT32. A name is a name, not a path.
+    if name.len() > 48 || name.contains(&b'/') {
+        return None;
+    }
     let mut lower = [0u8; 64];
     let mut upper = [0u8; 64];
     let prefix = b"/usr/bin/";
-    let n = name.len().min(48);
     lower[..prefix.len()].copy_from_slice(prefix);
     upper[..prefix.len()].copy_from_slice(prefix);
     let mut lp = prefix.len();
     let mut up = prefix.len();
-    for i in 0..n {
-        let c = name[i];
-        lower[lp] = if c.is_ascii_uppercase() { c + 32 } else { c };
-        upper[up] = if c.is_ascii_lowercase() { c - 32 } else { c };
+    for &c in name {
+        lower[lp] = c.to_ascii_lowercase();
+        upper[up] = c.to_ascii_uppercase();
         lp += 1;
         up += 1;
     }
     upper[up..up + 4].copy_from_slice(b".ELF");
     up += 4;
 
-    // Read, loaded, and the memory it was read into given back. This used to
-    // stage the image itself and keep the frames, so every client the
-    // compositor started cost its size in memory until the compositor exited.
-    let grant = |_: &[u8], _: usize| {};
-    let loaded = spawn::load_path(vfs_tid, &lower[..lp], FILE_BUF, &SPAWN_SCRATCH, grant)
-        .or_else(|()| spawn::load_path(vfs_tid, &upper[..up], FILE_BUF, &SPAWN_SCRATCH, grant));
-    let Ok(info) = loaded else {
-        println!("wm: cannot run that program");
-        return None;
+    // Read, loaded, and the memory it was read into given back. What the
+    // program asks for is granted while its image is still there to read.
+    let grant = |image: &[u8], tid: usize| {
+        quark_rt::manifest::grant_image(tid, image, 12);
     };
+    let info = spawn::load_path(vfs_tid, &lower[..lp], FILE_BUF, &SPAWN_SCRATCH, grant)
+        .or_else(|()| spawn::load_path(vfs_tid, &upper[..up], FILE_BUF, &SPAWN_SCRATCH, grant))
+        .ok()?;
+    Some(Loaded { info, line })
+}
+
+/// Start one of the programs this session is for: the `n`th, loaded already.
+///
+/// The compositor holds the display for as long as those programs run, and
+/// gives it back when the last of them stops — which is what `startx` does,
+/// and for the same reason: something has to decide when the graphical session
+/// is over, and the thing the user asked to run is the obvious candidate.
+fn start_session(loaded: &Loaded, n: usize) -> Option<usize> {
+    let info = &loaded.info;
+    let vfs_tid = nameserver::lookup_retry(b"vfs", 20)?;
+
     // A client needs no authority over anything — the memory it draws into is
     // memory this hands it — but it does need to be able to *ask*. Two grants:
     // this compositor's capability to the nameserver, so it can find anything
@@ -1348,24 +1452,38 @@ fn start_session(name: &[u8], index: usize) -> Option<usize> {
     let _ = syscall::sys_fd_dup(info.tid, 1, 1);
     let _ = syscall::sys_fd_dup(info.tid, 2, 2);
 
-    // argv[1] is which of the session's programs this one is. Two copies of
-    // the same program are otherwise indistinguishable on screen, and telling
-    // which window has focus is the entire point of having two.
-    let tag = [b'1' + (index % 9) as u8];
+    // WM_SESSION says which of the session's programs this one is. Two
+    // copies of the same program are otherwise indistinguishable on screen,
+    // and telling which window has focus is the entire point of having two.
+    let mut which = *b"WM_SESSION=1";
+    which[11] = b'1' + (n % 9) as u8;
+
+    // The environment this compositor was given, with the session's own two
+    // added: a program under it is still a program the shell ran.
+    let mut env: [&[u8]; MAX_ENV] = [b""; MAX_ENV];
+    let mut env_len = 0;
+    for i in 0..args::envc() {
+        let Some(entry) = args::envp(i) else { continue };
+        let ours = entry.starts_with(b"WM_SESSION=") || entry.starts_with(b"WAYLAND_SOCKET=");
+        if !ours && env_len < MAX_ENV - 2 {
+            env[env_len] = entry;
+            env_len += 1;
+        }
+    }
+    env[env_len] = &which;
+    env_len += 1;
 
     // A Wayland connection, if there is room for one. The child gets its end
     // at descriptor 3 and is told so; we keep ours and close our copy of its,
     // which is safe because an end is reference counted — the peer is not told
     // the connection has gone just because we let go of its half.
-    let mut env: [&[u8]; 1] = [b""];
-    let mut env_len = 0;
     if let Some(slot) = unsafe { CLIENTS.iter().position(|c| !c.used) } {
         if let Ok((mine, theirs)) = syscall::sys_socketpair() {
             if syscall::sys_fd_dup(info.tid, WAYLAND_FD, theirs).is_ok() {
                 let _ = syscall::sys_fd_close(theirs);
                 unsafe { CLIENTS[slot].open(slot, mine, info.tid) };
-                env[0] = b"WAYLAND_SOCKET=3";
-                env_len = 1;
+                env[env_len] = b"WAYLAND_SOCKET=3";
+                env_len += 1;
             } else {
                 let _ = syscall::sys_fd_close(mine);
                 let _ = syscall::sys_fd_close(theirs);
@@ -1373,7 +1491,9 @@ fn start_session(name: &[u8], index: usize) -> Option<usize> {
         }
     }
 
-    let _ = spawn::set_args_env(&info, &[name, &tag], &env[..env_len], &SPAWN_SCRATCH);
+    // Its own name and its own arguments: nothing of the compositor's.
+    let words = split_words(loaded.line);
+    let _ = spawn::set_args_env(info, &words, &env[..env_len], &SPAWN_SCRATCH);
     if info.start().is_err() {
         println!("wm: could not start that program");
         return None;
@@ -1383,6 +1503,8 @@ fn start_session(name: &[u8], index: usize) -> Option<usize> {
 
 /// Where a client finds its end of the connection.
 const WAYLAND_FD: usize = 3;
+/// The most environment entries a session program is given.
+const MAX_ENV: usize = 16;
 
 /// Let every connected client speak, and drop the ones that have stopped.
 fn serve_clients() {

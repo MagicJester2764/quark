@@ -22,6 +22,7 @@
 //! crash with an orphan on the disk. `hog` reserves four gigabytes and
 //! touches them until something stops it. `mapwrite PATH` maps a file shared,
 //! writes into it, and exits without asking for it to be written back.
+//! `fault` writes through a null pointer; `sleep` sleeps ten seconds.
 
 use quark_rt::ipc::{Message, TID_ANY};
 use quark_rt::manifest::CapReq;
@@ -99,6 +100,14 @@ pub extern "C" fn _start() -> ! {
         }
         // Four gigabytes, and nobody stopped it.
         syscall::sys_exit_code(2);
+    }
+    if quark_rt::args::argv(1) == Some(&b"fault"[..]) {
+        unsafe { core::ptr::write_volatile(core::hint::black_box(0usize) as *mut u8, 1) };
+        syscall::sys_exit_code(0);
+    }
+    if quark_rt::args::argv(1) == Some(&b"sleep"[..]) {
+        syscall::sleep_ticks(1000);
+        syscall::sys_exit_code(0);
     }
     if quark_rt::args::argv(1) == Some(&b"mapwrite"[..]) {
         const AT: usize = 0xB4_0000_0000;
