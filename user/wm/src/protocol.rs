@@ -153,6 +153,8 @@ pub const TOPLEVEL_SET_TITLE: u16 = 2;
 pub const TOPLEVEL_MOVE: u16 = 5;
 /// `resize(seat, serial, edges)`: the same, for a corner or an edge.
 pub const TOPLEVEL_RESIZE: u16 = 6;
+pub const TOPLEVEL_SET_MAXIMIZED: u16 = 9;
+pub const TOPLEVEL_UNSET_MAXIMIZED: u16 = 10;
 
 /// `xdg_toplevel.resize_edge`, which is a pair of bits and not an enumeration
 /// of nine values: a corner is its two edges together.

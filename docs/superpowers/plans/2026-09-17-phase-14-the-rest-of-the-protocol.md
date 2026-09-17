@@ -257,18 +257,18 @@ pointer, and a scroll wheel reaches a client.*
   `xdg_toplevel.close`, which is a request to the client rather than an order:
   a client that ignores it stays. `wm` prints nothing; the client decides.
 
-- [ ] **Step 1: The failing check.** Click where the close box will be on
+- [x] **Step 1: The failing check.** Click where the close box will be on
   `wlcairo`'s title bar; double click its title bar. Expected today: both
   raise the window and nothing else.
 
-- [ ] **Step 2: The close box.** Drawn in `draw_window` as an `×` in a box at
+- [x] **Step 2: The close box.** Drawn in `draw_window` as an `×` in a box at
   the frame's top right, hit-tested before the move grab so that a press
   there is a close and not a drag.
 
-- [ ] **Step 3: Maximise.** The states array, the saved geometry, and the
+- [x] **Step 3: Maximise.** The states array, the saved geometry, and the
   double-click timing (two presses within 50 ticks in the same title bar).
 
-- [ ] **Step 4: Verify.** `wlcairo` closes when its box is clicked (it exits,
+- [x] **Step 4: Verify.** `wlcairo` closes when its box is clicked (it exits,
   and the session ends when its last program does); `weston-simple-shm`
   maximises and comes back to its old size. A client that has no close
   handler stays open.

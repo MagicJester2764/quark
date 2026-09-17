@@ -1015,6 +1015,24 @@ impl Client {
         self.flush();
     }
 
+    /// Ask a client to close.
+    ///
+    /// `xdg_toplevel.close` has no reply and no force behind it: the client
+    /// decides. A compositor that killed the connection instead would be one
+    /// where clicking the box loses whatever the program was holding.
+    pub fn send_close(&mut self, surface_idx: usize) {
+        let Some(s) = surface::get(surface_idx) else {
+            return;
+        };
+        if s.toplevel == 0 {
+            return;
+        }
+        if let Some(a) = self.begin(s.toplevel, proto::TOPLEVEL_CLOSE) {
+            self.end(a);
+        }
+        self.flush();
+    }
+
     /// End a group of pointer events.
     ///
     /// Version 5 and up only. Below it there is no such event, and a client
@@ -1663,6 +1681,19 @@ impl Client {
                     if s.window != surface::NONE {
                         let (x, y) = crate::cursor::position();
                         crate::grab::start_resize(s.window, edges & 0xF, x, y);
+                    }
+                }
+                Ok(())
+            }
+            // The client asking for what a double click on its title bar
+            // does. Both are a request rather than a statement: the answer is
+            // a configure with a size and the state, which the client is free
+            // to ignore like any other.
+            proto::TOPLEVEL_SET_MAXIMIZED | proto::TOPLEVEL_UNSET_MAXIMIZED => {
+                let want = opcode == proto::TOPLEVEL_SET_MAXIMIZED;
+                if let Some(s) = surface::get(idx) {
+                    if s.window != surface::NONE && crate::window_maximized(s.window) != want {
+                        crate::toggle_maximized(s.window);
                     }
                 }
                 Ok(())

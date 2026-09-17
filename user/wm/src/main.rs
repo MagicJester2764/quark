@@ -171,6 +171,16 @@ struct Window {
     x: usize,
     y: usize,
     stride: usize,
+    /// Filling the screen, and where it was before it did.
+    ///
+    /// Kept on the window rather than on the surface because it is the
+    /// compositor's own memory of a decision it made: the client is told a
+    /// size and a state, and what it does with them is its business.
+    maximized: bool,
+    restore_x: usize,
+    restore_y: usize,
+    restore_w: usize,
+    restore_h: usize,
     title: [u8; MAX_TITLE],
     title_len: usize,
     /// Keys waiting to be collected, packed by [`pack_event`].
@@ -190,6 +200,11 @@ const NO_WINDOW: Window = Window {
     x: 0,
     y: 0,
     stride: 0,
+    maximized: false,
+    restore_x: 0,
+    restore_y: 0,
+    restore_w: 0,
+    restore_h: 0,
     title: [0; MAX_TITLE],
     title_len: 0,
     events: [0; EVENT_QUEUE],
@@ -351,6 +366,10 @@ pub fn ask_resize(idx: usize, w: usize, h: usize, resizing: bool) {
     }
     let mut states = [0u32; protocol::MAX_STATES];
     let mut n = 0;
+    if unsafe { WINDOWS[idx].maximized } {
+        states[n] = protocol::STATE_MAXIMIZED;
+        n += 1;
+    }
     if resizing {
         states[n] = protocol::STATE_RESIZING;
         n += 1;
@@ -362,6 +381,89 @@ pub fn ask_resize(idx: usize, w: usize, h: usize, resizing: bool) {
     unsafe {
         let clients = &raw mut CLIENTS;
         (*clients)[slot].configure_toplevel(surface_idx, w as u32, h as u32, &states[..n]);
+    }
+}
+
+/// The box at the right of the title bar that asks a client to go.
+///
+/// As tall as the bar and as wide, which makes it a square: a target smaller
+/// than that is one people miss and then wonder what they clicked instead.
+fn close_box(idx: usize) -> Rect {
+    let win = unsafe { &WINDOWS[idx] };
+    let (fw, _) = framed_size(win);
+    let side = TITLE_H + BORDER;
+    let x0 = win.x + fw.saturating_sub(side);
+    Rect { x0, y0: win.y, x1: win.x + fw, y1: win.y + side }
+}
+
+fn on_close_box(idx: usize, x: usize, y: usize) -> bool {
+    let b = close_box(idx);
+    x >= b.x0 && x < b.x1 && y >= b.y0 && y < b.y1
+}
+
+/// Fill the screen, or go back to where it was.
+///
+/// The move is the compositor's and the size is an ask, as every size is: a
+/// client that ignores the configure ends up in the corner at the size it
+/// chose, which is a reasonable thing for a compositor to have done with a
+/// client that will not be told.
+pub fn toggle_maximized(idx: usize) {
+    if idx >= MAX_WINDOWS || !unsafe { WINDOWS[idx].used } {
+        return;
+    }
+    let s = unsafe { &SCREEN };
+    let now = unsafe { WINDOWS[idx].maximized };
+    if now {
+        let (x, y, w, h) = unsafe {
+            let win = &WINDOWS[idx];
+            (win.restore_x, win.restore_y, win.restore_w, win.restore_h)
+        };
+        unsafe { WINDOWS[idx].maximized = false };
+        move_window(idx, x, y);
+        ask_resize(idx, w, h, false);
+    } else {
+        unsafe {
+            let win = &mut WINDOWS[idx];
+            win.restore_x = win.x;
+            win.restore_y = win.y;
+            win.restore_w = win.w;
+            win.restore_h = win.h;
+            win.maximized = true;
+        }
+        move_window(idx, 0, 0);
+        ask_resize(
+            idx,
+            s.width.saturating_sub(BORDER * 2),
+            s.height.saturating_sub(TITLE_H + BORDER * 2),
+            false,
+        );
+    }
+    refresh_window(idx);
+}
+
+/// Is this window filling the screen?
+pub fn window_maximized(idx: usize) -> bool {
+    idx < MAX_WINDOWS && unsafe { WINDOWS[idx].used && WINDOWS[idx].maximized }
+}
+
+/// Ask a client to close.
+///
+/// A request and not an order: `xdg_toplevel.close` is the compositor saying
+/// somebody clicked the box, and a client with unsaved work is entitled to
+/// stay. Nothing here waits for it or complains if it does.
+pub fn ask_close(idx: usize) {
+    let Some(surface_idx) = surface::by_window(idx) else {
+        return;
+    };
+    let Some(s) = surface::get(surface_idx) else {
+        return;
+    };
+    if s.client >= client::MAX_CLIENTS {
+        return;
+    }
+    unsafe {
+        let clients = &raw mut CLIENTS;
+        (*clients)[s.client].send_close(surface_idx);
     }
 }
 
@@ -403,6 +505,23 @@ fn draw_window(idx: usize) {
     fill_rect(win.x, win.y + fh - BORDER, fw, BORDER, frame);
 
     draw_text(win.x + BORDER + 3, win.y + 3, &win.title[..win.title_len], title_fg);
+
+    // The close box, over the right end of the bar and after the title, so a
+    // long title runs under it rather than through it.
+    let b = close_box(idx);
+    let side = b.x1 - b.x0;
+    if side >= 12 && fw > side * 2 {
+        let inset = 6;
+        let span = side - inset * 2;
+        for i in 0..span {
+            // Two diagonals, two pixels thick so that they read as lines
+            // rather than as dust at this size.
+            for t in 0..2 {
+                draw::put_pixel(b.x0 + inset + i, b.y0 + inset + i + t, title_fg);
+                draw::put_pixel(b.x0 + inset + i, b.y0 + inset + span - 1 - i + t, title_fg);
+            }
+        }
+    }
 
     // The client's pixels, straight out of the memory it shares with us —
     // only the rows and columns the region being painted actually covers.
@@ -742,6 +861,27 @@ fn union(a: Rect, b: Rect) -> Rect {
 /// The driver's button bits: left, right, middle.
 const MOUSE_LEFT: u8 = 1 << 0;
 
+/// How close together two presses have to be to be one double click. Half a
+/// second, which is what every other system has settled on.
+const DOUBLE_CLICK_TICKS: u64 = 50;
+static mut LAST_CLICK: u64 = 0;
+static mut LAST_CLICK_WINDOW: usize = usize::MAX;
+
+/// Was this press the second of a pair on the same window's title bar?
+///
+/// Asked once per press, and it remembers the answer: two clicks make one
+/// double click and a third starts again, rather than every click after the
+/// first being a double.
+fn double_click(idx: usize) -> bool {
+    let now = syscall::sys_ticks();
+    unsafe {
+        let again = LAST_CLICK_WINDOW == idx && now.wrapping_sub(LAST_CLICK) <= DOUBLE_CLICK_TICKS;
+        LAST_CLICK = if again { 0 } else { now };
+        LAST_CLICK_WINDOW = if again { usize::MAX } else { idx };
+        again
+    }
+}
+
 /// Is the left button down right now?
 ///
 /// Asked by the requests a client uses to start a grab. A grab ends when the
@@ -782,10 +922,14 @@ fn dispatch_pointer(buttons: u8, wheel: i32) {
                 raise(idx);
                 composite();
             }
-            // The frame is a handle, and its edges are different handles.
-            // Edges first: the top one runs along the title bar, and a press
-            // there means the size and not the position.
+            // The frame is a handle, and its parts are different handles.
+            // The close box first, because it sits inside the title bar and
+            // the corner it shares with the frame's edge is still a close.
             if pressed & MOUSE_LEFT != 0 {
+                if on_close_box(idx, x, y) {
+                    ask_close(idx);
+                    return;
+                }
                 let edges = resize_edges_at(idx, x, y);
                 if edges != 0 {
                     grab::start_resize(idx, edges, x, y);
@@ -795,7 +939,11 @@ fn dispatch_pointer(buttons: u8, wheel: i32) {
                 // why the client is told nothing about it: the gesture is
                 // about where its window is, not about its contents.
                 if on_title_bar(idx, x, y) {
-                    grab::start_move(idx, x, y);
+                    if double_click(idx) {
+                        toggle_maximized(idx);
+                    } else {
+                        grab::start_move(idx, x, y);
+                    }
                     return;
                 }
             }
