@@ -24,8 +24,12 @@
 //! mint one for a program that did not exist when it started. Answering a
 //! caller needs no capability at all, which is what makes the pull the shape
 //! that works.
+//!
+//! Claims stack, as the display's do: a compositor started inside another
+//! takes the keys, and they go back to the outer one when it lets go. Line
+//! readers are served when nobody at all holds the keyboard.
 
-use quark_rt::ipc::{Message, TAG_NOTIFICATION, TAG_TASK_DIED, TID_ANY};
+use quark_rt::ipc::{death_notice, Message, TAG_NOTIFICATION, TID_ANY};
 use quark_rt::nameserver;
 use quark_rt::{print, println, syscall};
 
@@ -142,6 +146,43 @@ fn answer_reader(
     }
 }
 
+/// How many programs can hold the keyboard, one above another.
+const MAX_CLAIMANTS: usize = 8;
+
+/// Who holds the keyboard raw: oldest first, and the last one gets the keys.
+struct Claims {
+    tids: [usize; MAX_CLAIMANTS],
+    depth: usize,
+}
+
+impl Claims {
+    /// Who gets the keys, or 0 for the line readers.
+    fn top(&self) -> usize {
+        self.tids[..self.depth].last().copied().unwrap_or(0)
+    }
+
+    /// Put `tid` on top, out of wherever it was. False if there is no room.
+    fn push(&mut self, tid: usize) -> bool {
+        let _ = self.remove(tid);
+        if self.depth == MAX_CLAIMANTS {
+            return false;
+        }
+        self.tids[self.depth] = tid;
+        self.depth += 1;
+        true
+    }
+
+    /// Take `tid` out of the stack. Whether it had the keys, or `None` if it
+    /// held no claim.
+    fn remove(&mut self, tid: usize) -> Option<bool> {
+        let i = self.tids[..self.depth].iter().position(|&t| t == tid)?;
+        let top = i + 1 == self.depth;
+        self.tids.copy_within(i + 1..self.depth, i);
+        self.depth -= 1;
+        Some(top)
+    }
+}
+
 #[derive(Clone, Copy)]
 struct KeyEvent {
     press: bool,
@@ -180,8 +221,7 @@ pub extern "C" fn _start() -> ! {
     let mut foreground_tid: usize = 0;
     let mut pending = Pending::new();
 
-    // Who holds the keyboard raw, if anyone.
-    let mut raw_owner: usize = 0;
+    let mut claims = Claims { tids: [0; MAX_CLAIMANTS], depth: 0 };
     let mut deferred: [(usize, usize); MAX_DEFERRED] = [(0, 0); MAX_DEFERRED];
     let mut deferred_len: usize = 0;
 
@@ -192,12 +232,40 @@ pub extern "C" fn _start() -> ! {
         }
         let sender = msg.sender;
 
+        // A claimant has died: out of the stack, and if nobody is left
+        // holding the keyboard, the readers waiting on it are served. The
+        // kernel is not waiting for an answer; the same tag from anybody else
+        // is an unknown request.
+        if let Some(dead) = death_notice(&msg) {
+            if let Some(top) = claims.remove(dead) {
+                if top {
+                    println!("[input] tid {} died holding the keyboard", dead);
+                    handed_down(kbd_tid, claims.top());
+                }
+                if claims.top() == 0 {
+                    for &(tid, max) in &deferred[..deferred_len] {
+                        answer_reader(
+                            kbd_tid,
+                            tid,
+                            max,
+                            &mut pending,
+                            &mut line_buf,
+                            &mut line_len,
+                            &mut foreground_tid,
+                        );
+                    }
+                    deferred_len = 0;
+                }
+            }
+            continue;
+        }
+
         match msg.tag {
             TAG_SET_FOREGROUND => {
                 foreground_tid = msg.data[0] as usize;
                 let _ = syscall::sys_reply(sender, &ok());
             }
-            TAG_NOTIFICATION => {
+            TAG_NOTIFICATION if sender == 0 => {
                 // Ctrl+C from the keyboard driver, which sends it whether or
                 // not anyone is reading. While the keyboard belongs to someone
                 // else, ^C is theirs to interpret — it is sitting in the
@@ -205,82 +273,65 @@ pub extern "C" fn _start() -> ! {
                 // else. Acting on it here would kill the compositor, which is
                 // the foreground task, and it would die still holding the
                 // display.
-                if raw_owner == 0 {
+                if claims.top() == 0 {
                     handle_ctrl_c(&mut foreground_tid, &mut line_len);
                     pending.clear();
                 }
             }
 
             TAG_INPUT_CLAIM => {
-                if raw_owner != 0 && raw_owner != sender {
-                    let _ = syscall::sys_reply(sender, &error());
-                } else {
-                    raw_owner = sender;
+                let reply = if claims.top() == sender {
+                    ok() // already theirs
+                } else if claims.push(sender) {
                     // A claimant that dies without releasing would otherwise
-                    // leave every reader here waiting for a release that never
-                    // comes, which is a console nobody can type at.
+                    // keep the keys from everybody below it, down to a
+                    // console nobody can type at.
                     let _ = syscall::sys_task_watch(sender);
                     // Whatever was typed before the claim was typed at
                     // something else. Throw it away rather than delivering a
                     // shell command's tail to a compositor.
                     while get_key_nb(kbd_tid).is_some() {}
-                    let _ = syscall::sys_reply(sender, &ok());
                     println!("[input] keyboard claimed by tid {}", sender);
-                }
+                    ok()
+                } else {
+                    error()
+                };
+                let _ = syscall::sys_reply(sender, &reply);
             }
 
-            TAG_INPUT_RELEASE => {
-                if raw_owner != sender {
+            TAG_INPUT_RELEASE => match claims.remove(sender) {
+                None => {
                     let _ = syscall::sys_reply(sender, &error());
-                } else {
-                    raw_owner = 0;
+                }
+                Some(top) => {
                     // Answer the releaser first: serving a deferred reader
                     // blocks in here until a whole line is typed, and the
                     // program giving the keyboard back is usually on its way
                     // out.
                     let _ = syscall::sys_reply(sender, &ok());
                     println!("[input] keyboard released by tid {}", sender);
-
-                    for i in 0..deferred_len {
-                        let (tid, max) = deferred[i];
-                        answer_reader(
-                            kbd_tid,
-                            tid,
-                            max,
-                            &mut pending,
-                            &mut line_buf,
-                            &mut line_len,
-                            &mut foreground_tid,
-                        );
+                    if top {
+                        handed_down(kbd_tid, claims.top());
                     }
-                    deferred_len = 0;
-                }
-            }
-
-            // Whoever held the keyboard has died. Take it back, and serve
-            // whoever was waiting on a line.
-            TAG_TASK_DIED => {
-                if raw_owner != 0 && msg.data[0] as usize == raw_owner {
-                    println!("[input] tid {} died holding the keyboard", raw_owner);
-                    raw_owner = 0;
-                    for i in 0..deferred_len {
-                        let (tid, max) = deferred[i];
-                        answer_reader(
-                            kbd_tid,
-                            tid,
-                            max,
-                            &mut pending,
-                            &mut line_buf,
-                            &mut line_len,
-                            &mut foreground_tid,
-                        );
+                    if claims.top() == 0 {
+                        for &(tid, max) in &deferred[..deferred_len] {
+                            answer_reader(
+                                kbd_tid,
+                                tid,
+                                max,
+                                &mut pending,
+                                &mut line_buf,
+                                &mut line_len,
+                                &mut foreground_tid,
+                            );
+                        }
+                        deferred_len = 0;
                     }
-                    deferred_len = 0;
                 }
-            }
+            },
 
             TAG_INPUT_POLL => {
-                let reply = if raw_owner != sender {
+                let reply = if claims.top() != sender {
                     error()
                 } else {
                     match get_key_nb(kbd_tid) {
@@ -303,7 +354,7 @@ pub extern "C" fn _start() -> ! {
             }
 
             TAG_INPUT_POLL_MOUSE => {
-                let reply = if raw_owner != sender {
+                let reply = if claims.top() != sender {
                     error()
                 } else {
                     let ask = Message { sender: 0, tag: TAG_GET_MOUSE_NB, data: [0; 6] };
@@ -322,7 +373,7 @@ pub extern "C" fn _start() -> ! {
 
             TAG_READ => {
                 let max_bytes = (msg.data[0] as usize).min(40);
-                if raw_owner != 0 {
+                if claims.top() != 0 {
                     // Someone else has the keyboard. Hold the reader instead
                     // of answering it: reading here would take keys out of the
                     // owner's hands, and an empty answer would only bring the
@@ -357,8 +408,21 @@ pub extern "C" fn _start() -> ! {
                 };
                 let _ = syscall::sys_reply(sender, &reply);
             }
-            _ => {}
+            _ => {
+                let _ = syscall::sys_reply(sender, &error());
+            }
         }
+    }
+}
+
+/// The keyboard has gone back down the stack, to `tid`. What was typed before
+/// now was typed at the program that let go, and is thrown away as a claim
+/// throws away what was typed before it. Nothing to do for the line readers:
+/// a line in progress is theirs.
+fn handed_down(kbd_tid: usize, tid: usize) {
+    if tid != 0 {
+        while get_key_nb(kbd_tid).is_some() {}
+        println!("[input] keyboard back with tid {}", tid);
     }
 }
 

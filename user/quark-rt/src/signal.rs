@@ -15,9 +15,10 @@ pub use crate::syscall::{SIG_INT, SIG_KILL, SIG_MASK, SIG_TERM};
 /// Returns the signal bits (nonzero if signal present).
 ///
 /// This is the preferred way to detect signals: check every `TAG_NOTIFICATION`
-/// message in your event loop via `extract_signal(&msg)`.
+/// message in your event loop via `extract_signal(&msg)`. Only the kernel's
+/// count: a program can send the tag, but not as sender 0.
 pub fn extract_signal(msg: &Message) -> u64 {
-    if msg.tag == syscall::TAG_NOTIFICATION {
+    if msg.sender == 0 && msg.tag == syscall::TAG_NOTIFICATION {
         msg.data[0] & SIG_MASK
     } else {
         0

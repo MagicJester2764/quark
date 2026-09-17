@@ -1411,15 +1411,30 @@ the hint after three seconds with no window; `wm dtest` 262/0; libc.tests
 - Produces: `quark_rt::ipc::death_notice(msg: &Message) -> Option<usize>` — `Some(tid)` only for `sender == 0 && tag == TAG_TASK_DIED`; `space_death_notice(msg) -> Option<u64>` likewise for `TAG_SPACE_DIED`. A forged notice is an unknown request and is answered with an error.
 - Produces (fb and input): a claim pushes the claimant (the one below is told it lost the display, as today); a release by the top pops it and hands the display (keyboard) to the new top, or to nobody when the stack is empty; a release or death of a claimant below the top removes it without disturbing the top; a ninth claim is refused.
 
-- [ ] **Step 1: The failing checks.** dtest `service`: a call to the nameserver with `TAG_TASK_DIED` and `data[0]` = the VFS's TID is answered with an error (today it is never answered: the call times out after 50 ticks), and `nameserver::lookup(b"vfs")` still succeeds afterwards; the same forged notice to `fb` is answered with an error. A key script: `wm "wm weston-simple-shm"`, shot, Esc, shot, Esc, shot, `echo back`, shot.
+- [x] **Step 1: The failing checks.** dtest `service`: a call to the nameserver with `TAG_TASK_DIED` and `data[0]` = the VFS's TID is answered with an error (today it is never answered: the call times out after 50 ticks), and `nameserver::lookup(b"vfs")` still succeeds afterwards; the same forged notice to `fb` is answered with an error. A key script: `wm "wm weston-simple-shm"`, shot, Esc, shot, Esc, shot, `echo back`, shot.
 
-- [ ] **Step 2: Run them.** Expected: the forged calls time out and `lookup(b"vfs")` fails from then on (reboot before continuing); the nested session ends on a blank screen that never returns to the console.
+- [x] **Step 2: Run them.** Expected: the forged calls time out and `lookup(b"vfs")` fails from then on (reboot before continuing); the nested session ends on a blank screen that never returns to the console.
 
-- [ ] **Step 3: Implement.** The helpers; every server's `TAG_TASK_DIED`/`TAG_SPACE_DIED` arm becomes a guard on the helper, so a forged one falls through to the error arm. `fb`: `static mut STACK: [(usize, usize); 8]` of `(tid, slot)` and a length replacing `OWNER`/`PREVIOUS`; `hand_back` gives the display to the new top; `TAG_TASK_DIED` removes the dead TID wherever it is. `input`: `raw_stack: [usize; 8]`; the top is the owner that `TAG_INPUT_POLL` and the key pump serve; releasing or dying pops or removes. `wm` repaints everything when it is handed the display back (`TAG_FB_GAINED`), including the hint.
+- [x] **Step 3: Implement.** The helpers; every server's `TAG_TASK_DIED`/`TAG_SPACE_DIED` arm becomes a guard on the helper, so a forged one falls through to the error arm. `fb`: `static mut STACK: [(usize, usize); 8]` of `(tid, slot)` and a length replacing `OWNER`/`PREVIOUS`; `hand_back` gives the display to the new top; `TAG_TASK_DIED` removes the dead TID wherever it is. `input`: `raw_stack: [usize; 8]`; the top is the owner that `TAG_INPUT_POLL` and the key pump serve; releasing or dying pops or removes. `wm` repaints everything when it is handed the display back (`TAG_FB_GAINED`), including the hint.
 
-- [ ] **Step 4: Verify.** Build; image; boot: dtest `service` passes; the nested script shows the inner window, then the outer backdrop with its hint (the outer compositor has the display and the keyboard back), then the console; `wm weston-simple-shm wlcairo` and Esc still behave.
+- [x] **Step 4: Verify.** Build; image; boot: dtest `service` passes; the nested script shows the inner window, then the outer backdrop with its hint (the outer compositor has the display and the keyboard back), then the console; `wm weston-simple-shm wlcairo` and Esc still behave.
 
-- [ ] **Step 5: Commit.** quark: "Displays and keyboards nest; only the kernel reports deaths".
+- [x] **Step 5: Commit.** quark: "Displays and keyboards nest; only the kernel reports deaths".
+
+**Done.** The plan's key script had the outer session hold only the inner
+compositor, so the first Esc would have ended both: a session ends with its
+last program. The scripts used `wm "wm weston-simple-shm" "dchild sleep"`
+(the outer backdrop comes back with its hint, then the console) and
+`wm "wm weston-simple-shm" wlcairo` (the outer window comes back, drawn while
+the display was elsewhere). A compositor that loses the display now unmaps it
+and waits instead of exiting, keeps its keyboard claim under the new one, and
+stops polling input until it is handed the display back. Found on the way,
+the same hole with other tags: `qtty` and `wm` took `TAG_FB_LOST` from anyone
+(now only from `fb`), `input` took Ctrl-C notifications from anyone and left
+unknown requests unanswered, and `signal::extract_signal` believed any
+sender. `fb` now gives a claimant `HANDOVER_TICKS` (100) to answer being
+told the display is changing hands, rather than waiting for ever. dtest
+`service`: 11 checks from the console, 12 under `wm`.
 
 ---
 

@@ -382,8 +382,6 @@ pub fn sys_task_space(tid: usize) -> Result<u64, ()> {
     if ret == u64::MAX { Err(()) } else { Ok(ret) }
 }
 
-/// Be sent [`crate::ipc::TAG_SPACE_DIED`] when program `space` has no task
-/// left: sender 0, `data[0]` the space id. `Err` if it has none already.
 /// Make a task for the address space `cr3`, which this task created, to be
 /// started there later. It belongs to that program from the start.
 pub fn sys_task_create_in(cr3: u64) -> Result<usize, ()> {
@@ -391,6 +389,8 @@ pub fn sys_task_create_in(cr3: u64) -> Result<usize, ()> {
     if ret == u64::MAX { Err(()) } else { Ok(ret as usize) }
 }
 
+/// Be sent [`crate::ipc::TAG_SPACE_DIED`] when program `space` has no task
+/// left: sender 0, `data[0]` the space id. `Err` if it has none already.
 pub fn sys_space_watch(space: u64) -> Result<(), ()> {
     let ret = unsafe { syscall1(SYS_SPACE_WATCH, space) };
     if ret == u64::MAX { Err(()) } else { Ok(()) }

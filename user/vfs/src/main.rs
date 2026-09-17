@@ -1370,6 +1370,18 @@ pub extern "C" fn _start() -> ! {
 
         let sender = msg.sender;
 
+        // From the kernel, which is not waiting for an answer: a program has
+        // gone, or a task that may have been waiting for a lock. The same
+        // tags from anybody else are unknown requests.
+        if let Some(space) = quark_rt::ipc::space_death_notice(&msg) {
+            client_died(space);
+            continue;
+        }
+        if let Some(tid) = quark_rt::ipc::death_notice(&msg) {
+            locks::drop_task(tid);
+            continue;
+        }
+
         match msg.tag {
             TAG_READ | TAG_WRITE | TAG_STAT | TAG_READDIR_BULK | TAG_TRUNCATE
                 if devices::is_ours(sender, &msg) =>
@@ -1411,12 +1423,8 @@ pub extern "C" fn _start() -> ! {
             quark_rt::ipc::TAG_OBJECT_IDLE if sender == 0 => {
                 transacted(|| pager::idle(msg.data[0] as u32, msg.data[1]))
             }
-            // A task waiting for a lock has gone; nobody is left to answer.
-            quark_rt::ipc::TAG_TASK_DIED if sender == 0 => locks::drop_task(msg.data[0] as usize),
             TAG_TRUNCATE => transacted(|| handle_truncate(sender, &msg)),
             TAG_STATFS => handle_statfs(sender),
-            // From the kernel, which is not waiting for an answer.
-            quark_rt::ipc::TAG_SPACE_DIED if sender == 0 => client_died(msg.data[0]),
             TAG_READDIR_BULK => handle_readdir_bulk(&disk, sender, &msg),
             quark_rt::ipc::TAG_PING => {
                 // Liveness probe: reply immediately, touching no disk state.

@@ -1231,6 +1231,56 @@ fn test_runtime_service() {
     });
     check("its name goes with it", gone);
     check("and can be taken again", nameserver::register(b"dchild-svc").is_ok());
+
+    // Deaths are the kernel's to report. A call dressed as one is a request
+    // like any other: answered with an error, and changing nothing.
+    use quark_rt::ipc::{TAG_SPACE_DIED, TAG_TASK_DIED};
+    let vfs_tid = nameserver::lookup(b"vfs").unwrap_or(0);
+    let console = nameserver::lookup(b"console").unwrap_or(0);
+    let refused = |tag: Option<u64>| tag == Some(u64::MAX);
+    check(
+        "the nameserver refuses a death notice from a program",
+        refused(forged_death(nameserver::NAMESERVER_TID, TAG_TASK_DIED, vfs_tid as u64)),
+    );
+    check("and still knows the VFS", vfs_tid != 0 && nameserver::lookup(b"vfs") == Some(vfs_tid));
+    if let Some(fb) = nameserver::lookup(b"fb") {
+        check(
+            "the display refuses one",
+            refused(forged_death(fb, TAG_TASK_DIED, console as u64)),
+        );
+    }
+    if let Some(input) = nameserver::lookup(b"input") {
+        check(
+            "the keyboard refuses one",
+            refused(forged_death(input, TAG_TASK_DIED, console as u64)),
+        );
+    }
+    check(
+        "the VFS refuses a program's",
+        vfs_tid != 0
+            && refused(forged_death(vfs_tid, TAG_SPACE_DIED, own_space())),
+    );
+    // Under a compositor, one naming this program would end its session.
+    if let Some(wm) = nameserver::lookup(b"wm") {
+        let me = syscall::sys_getpid() as u64;
+        check("the compositor refuses one", refused(forged_death(wm, TAG_TASK_DIED, me)));
+    }
+}
+
+fn own_space() -> u64 {
+    syscall::sys_task_space(syscall::sys_getpid() as usize).unwrap_or(0)
+}
+
+/// Call `tid` with what looks like the kernel's notice `tag` about `dead`, and
+/// return the tag it answers with: None if nobody answers in half a second.
+fn forged_death(tid: usize, tag: u64, dead: u64) -> Option<u64> {
+    use quark_rt::ipc::Message;
+    let forged = Message { sender: 0, tag, data: [dead, 0, 0, 0, 0, 0] };
+    let mut reply = Message::empty();
+    match syscall::sys_call_timeout(tid, &forged, &mut reply, 50) {
+        syscall::CallOutcome::Replied => Some(reply.tag),
+        _ => None,
+    }
 }
 
 /// Start `dchild MODE PATH` with one end of a fresh pair as its descriptor 3,

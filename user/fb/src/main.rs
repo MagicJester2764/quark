@@ -30,10 +30,15 @@
 //!
 //! Telling them takes the right to call them, which nothing else gives this
 //! server: a claim is made with a capability to the claimant on offer, and a
-//! claim without one is refused. It is kept for as long as the claimant owns
-//! the display or is next in line for it.
+//! claim without one is refused. It is kept for as long as the claimant is in
+//! line for the display.
+//!
+//! The line is a stack. Each claim goes on top and displaces the one below,
+//! which gets the display back when everything above it has let go — a
+//! console under a compositor under another compositor unwinds in that order.
+//! A claimant below the top that lets go or dies just leaves the line.
 
-use quark_rt::ipc::{Message, TAG_TASK_DIED, TID_ANY};
+use quark_rt::ipc::{death_notice, Message, TID_ANY};
 use quark_rt::{nameserver, println, syscall};
 
 // No capabilities here. The framebuffer's address is whatever mode the
@@ -107,36 +112,62 @@ static mut MODE: Mode = Mode {
     b_pos: 0,
 };
 
-/// Who is drawing, and who gets it back when they let go. One deep: a console
-/// that the compositor displaces and returns to is the case that exists, and a
-/// stack would be inventing a policy nothing has asked for.
-static mut OWNER: usize = 0;
-static mut PREVIOUS: usize = 0;
-/// Where the capability to call each of them is, or 0.
-static mut OWNER_SLOT: usize = 0;
-static mut PREVIOUS_SLOT: usize = 0;
+/// How many programs can be in line for the display. A ninth claim is
+/// refused: deeper nesting than this is a program claiming in a loop.
+const MAX_CLAIMANTS: usize = 8;
 
-/// Delete `slot` unless the owner or the one before still needs it.
-fn drop_slot(slot: usize) {
+/// A program in line for the display, and the slot holding the capability to
+/// call it.
+#[derive(Clone, Copy)]
+struct Claimant {
+    tid: usize,
+    slot: usize,
+}
+
+/// Oldest first: the last one is drawing.
+static mut LINE: [Claimant; MAX_CLAIMANTS] = [Claimant { tid: 0, slot: 0 }; MAX_CLAIMANTS];
+static mut DEPTH: usize = 0;
+
+fn line() -> &'static [Claimant] {
     unsafe {
-        if slot != 0 && slot != OWNER_SLOT && slot != PREVIOUS_SLOT {
-            let _ = syscall::sys_cap_delete(slot);
-        }
+        let line: &'static [Claimant; MAX_CLAIMANTS] = &*core::ptr::addr_of!(LINE);
+        &line[..DEPTH]
     }
 }
 
-/// Nobody has the display, or is waiting for it; returns who was waiting.
-fn clear_owners() -> (usize, usize) {
+/// Who is drawing, or 0.
+fn owner() -> usize {
+    line().last().map_or(0, |c| c.tid)
+}
+
+fn push(tid: usize, slot: usize) {
     unsafe {
-        let back = (PREVIOUS, PREVIOUS_SLOT);
-        let gone = OWNER_SLOT;
-        OWNER = 0;
-        PREVIOUS = 0;
-        OWNER_SLOT = 0;
-        PREVIOUS_SLOT = 0;
-        drop_slot(gone);
-        back
+        LINE[DEPTH] = Claimant { tid, slot };
+        DEPTH += 1;
     }
+}
+
+/// Take `tid` out of line, wherever it is, and let go of the capability to
+/// call it. Returns whether it was drawing, or `None` if it was not in line.
+fn remove(tid: usize) -> Option<bool> {
+    let i = line().iter().position(|c| c.tid == tid)?;
+    unsafe {
+        let top = i + 1 == DEPTH;
+        let _ = syscall::sys_cap_delete(LINE[i].slot);
+        LINE.copy_within(i + 1..DEPTH, i);
+        DEPTH -= 1;
+        Some(top)
+    }
+}
+
+/// How long a claimant has to answer being told the display is changing
+/// hands. One that does not is passed over: a wedged program must not keep
+/// the screen from everybody else.
+const HANDOVER_TICKS: u64 = 100;
+
+fn call_claimant(tid: usize, msg: &Message) {
+    let mut reply = Message::empty();
+    let _ = syscall::sys_call_timeout(tid, msg, &mut reply, HANDOVER_TICKS);
 }
 
 fn mode_reply() -> Message {
@@ -163,23 +194,52 @@ fn ok() -> Message {
     Message { sender: 0, tag: TAG_OK, data: [0; 6] }
 }
 
-/// Give the display to `back`, which had it before, and tell it the mode.
-/// `slot` holds the capability to call it.
-fn hand_back((back, slot): (usize, usize)) {
-    if back == 0 || !lease_to(back) {
-        drop_slot(slot);
-        return;
+/// Give the display to whoever is on top of the line now, and tell it the
+/// mode. One that cannot be given it leaves the line, and the next is tried.
+fn hand_back() {
+    while owner() != 0 {
+        let tid = owner();
+        if lease_to(tid) {
+            println!("[fb] display returned to tid {}", tid);
+            let msg = mode_reply();
+            call_claimant(tid, &Message { sender: 0, tag: TAG_FB_GAINED, data: msg.data });
+            return;
+        }
+        let _ = remove(tid);
     }
-    unsafe {
-        OWNER = back;
-        OWNER_SLOT = slot;
+}
+
+/// `sender` wants the display.
+fn claim(sender: usize) -> Message {
+    if owner() == sender {
+        return mode_reply(); // already theirs
     }
-    let _ = syscall::sys_task_watch(back);
-    println!("[fb] display returned to tid {}", back);
-    let msg = mode_reply();
-    let handover = Message { sender: 0, tag: TAG_FB_GAINED, data: msg.data };
-    let mut ack = Message::empty();
-    let _ = syscall::sys_call(back, &handover, &mut ack);
+    let again = line().iter().any(|c| c.tid == sender);
+    if !again && line().len() == MAX_CLAIMANTS {
+        return error();
+    }
+    // Nothing to tell it with when somebody else claims, without this.
+    let Ok(slot) = syscall::sys_cap_take_any(sender) else {
+        return error();
+    };
+    // Claiming again from further down the line is asking to be on top, not
+    // to be in line twice.
+    if again {
+        let _ = remove(sender);
+    }
+    take_back();
+    if !lease_to(sender) {
+        let _ = syscall::sys_cap_delete(slot);
+        hand_back();
+        return error();
+    }
+    push(sender, slot);
+    // A program that dies still holding the display would otherwise keep it
+    // for good: revocation stops it mapping the framebuffer again, but
+    // nothing gives the screen back to whoever is next in line.
+    let _ = syscall::sys_task_watch(sender);
+    println!("[fb] display claimed by tid {}", sender);
+    mode_reply()
 }
 
 /// Hand the right to map the framebuffer to `tid`.
@@ -205,14 +265,12 @@ fn lease_to(tid: usize) -> bool {
 
 /// Take the display away from whoever has it, telling them first.
 fn take_back() {
-    let owner = unsafe { OWNER };
+    let owner = owner();
     if owner != 0 {
         // A call, not a send: the point is to know they have stopped before
         // anybody else starts. If they cannot answer, go ahead anyway — a
         // wedged client must not make the screen unusable for everything else.
-        let msg = Message { sender: 0, tag: TAG_FB_LOST, data: [0; 6] };
-        let mut reply = Message::empty();
-        let _ = syscall::sys_call(owner, &msg, &mut reply);
+        call_claimant(owner, &Message { sender: 0, tag: TAG_FB_LOST, data: [0; 6] });
     }
     let _ = syscall::sys_cap_revoke(LEASE_SLOT);
 }
@@ -261,88 +319,36 @@ pub extern "C" fn _start() -> ! {
         }
         let sender = msg.sender;
 
+        // A claimant has died. The kernel is not waiting for an answer; the
+        // same tag from anybody else is an unknown request.
+        if let Some(dead) = death_notice(&msg) {
+            if remove(dead) == Some(true) {
+                println!("[fb] tid {} died holding the display", dead);
+                let _ = syscall::sys_cap_revoke(LEASE_SLOT);
+                hand_back();
+            }
+            continue;
+        }
+
         let reply = match msg.tag {
             TAG_FB_INFO => mode_reply(),
 
-            TAG_FB_CLAIM => {
-                let owner = unsafe { OWNER };
-                if owner == sender {
-                    mode_reply() // already theirs
-                } else if let Ok(slot) = syscall::sys_cap_take_any(sender) {
-                    let dropped = unsafe { PREVIOUS_SLOT };
-                    if owner != 0 {
-                        take_back();
-                        unsafe {
-                            PREVIOUS = owner;
-                            PREVIOUS_SLOT = OWNER_SLOT;
-                        }
-                    }
-                    let reply = if lease_to(sender) {
-                        unsafe {
-                            OWNER = sender;
-                            OWNER_SLOT = slot;
-                        }
-                        // A program that dies still holding the display would
-                        // otherwise keep it for good: revocation stops it
-                        // mapping the framebuffer again, but nothing gives the
-                        // screen back, and there is no console to return to.
-                        let _ = syscall::sys_task_watch(sender);
-                        println!("[fb] display claimed by tid {}", sender);
-                        mode_reply()
-                    } else {
-                        unsafe {
-                            OWNER = 0;
-                            OWNER_SLOT = 0;
-                        }
-                        error()
-                    };
-                    drop_slot(dropped);
-                    drop_slot(slot);
-                    reply
-                } else {
-                    // Nothing to tell it with when somebody else claims.
-                    error()
-                }
-            }
+            TAG_FB_CLAIM => claim(sender),
 
-            TAG_FB_RELEASE => {
-                if unsafe { OWNER } != sender {
-                    error()
-                } else {
+            TAG_FB_RELEASE => match remove(sender) {
+                None => error(),
+                // Further down the line: whoever is drawing carries on.
+                Some(false) => ok(),
+                Some(true) => {
                     let _ = syscall::sys_cap_revoke(LEASE_SLOT);
-                    let back = clear_owners();
                     // Answer the releaser before telling the next owner: they
                     // are waiting on this reply, and handing the display over
                     // is a call of its own.
                     let _ = syscall::sys_reply(sender, &ok());
-
-                    hand_back(back);
+                    hand_back();
                     continue; // already replied
                 }
-            }
-
-            // Whoever had the display has died. Nobody is waiting on an
-            // answer to this, so take it back and give it to whoever was
-            // displaced — the text console, on the path that matters.
-            TAG_TASK_DIED => {
-                let dead = msg.data[0] as usize;
-                unsafe {
-                    if PREVIOUS == dead {
-                        let slot = PREVIOUS_SLOT;
-                        PREVIOUS = 0;
-                        PREVIOUS_SLOT = 0;
-                        drop_slot(slot);
-                    }
-                    if OWNER != dead {
-                        continue;
-                    }
-                }
-                println!("[fb] tid {} died holding the display", dead);
-                let _ = syscall::sys_cap_revoke(LEASE_SLOT);
-                let back = clear_owners();
-                hand_back(back);
-                continue; // the kernel is not waiting for a reply
-            }
+            },
 
             _ => error(),
         };

@@ -50,7 +50,7 @@
 //! can be redrawn, and not before. Damage tracking would make the blink cheap;
 //! the back buffer is what makes it invisible.
 
-use quark_rt::ipc::{Message, TAG_TASK_DIED, TID_ANY};
+use quark_rt::ipc::{death_notice, Message, TID_ANY};
 use quark_rt::spawn::{self, Scratch};
 use quark_rt::wm as proto;
 use quark_rt::{args, nameserver, println, syscall, vfs};
@@ -96,6 +96,8 @@ const TAG_FB_RELEASE: u64 = 3;
 /// Well clear of this compositor's own protocol numbers: both arrive at the
 /// same `sys_recv`, and 4 was already `TAG_WM_FOCUS`.
 const TAG_FB_LOST: u64 = 0x100;
+/// The display is back, with the mode as a claim's answer has it.
+const TAG_FB_GAINED: u64 = 0x101;
 
 /// Talking to the input server, which arbitrates the keyboard the same way the
 /// framebuffer device arbitrates the screen.
@@ -1088,7 +1090,7 @@ pub extern "C" fn _start() -> ! {
         // busy, and hanging the keyboard off an idle moment would mean it went
         // unread for exactly as long as anything was happening.
         let now = syscall::sys_ticks();
-        if now != last_pump {
+        if now != last_pump && have_display() {
             last_pump = now;
             pump_input();
             pump_mouse();
@@ -1121,6 +1123,14 @@ pub extern "C" fn _start() -> ! {
             continue;
         }
         let sender = msg.sender;
+
+        // The kernel is not waiting for an answer. The same tag from a
+        // client is an unknown request: believing it would let one program
+        // close another's windows, or end the session.
+        if let Some(dead) = death_notice(&msg) {
+            task_died(dead);
+            continue;
+        }
 
         let reply = match msg.tag {
             TAG_WM_CREATE => handle_create(sender, &msg),
@@ -1186,55 +1196,25 @@ pub extern "C" fn _start() -> ! {
                 }
                 None => error(1),
             },
-            // A client has gone. Its windows go with it, and the session ends
-            // when the last of its programs has stopped.
-            TAG_TASK_DIED => {
-                let dead = msg.data[0] as usize;
-                for i in 0..MAX_WINDOWS {
-                    if unsafe { WINDOWS[i].used && WINDOWS[i].owner == dead } {
-                        destroy_window(i);
-                    }
-                }
-                let mut was_session = false;
-                unsafe {
-                    let mut out = 0;
-                    for i in 0..SESSION_LEN {
-                        if SESSION[i] == dead {
-                            was_session = true;
-                        } else {
-                            SESSION[out] = SESSION[i];
-                            out += 1;
-                        }
-                    }
-                    SESSION_LEN = out;
-                    if SESSION_LEN == 0 {
-                        quit();
-                    }
-                }
-                if was_session {
-                    // Collect it. A task this one started keeps its slot and
-                    // its address space until its parent asks, and there is a
-                    // dead child waiting right now — so this answers at once
-                    // rather than blocking.
-                    let _ = syscall::sys_wait();
-                }
-                composite();
-                continue; // the kernel is not waiting for a reply
+            // The framebuffer device wants the display for somebody else — a
+            // compositor this session started, as often as not. Stop drawing
+            // and wait: the display comes back when they let go of it.
+            TAG_FB_LOST if sender == unsafe { FB_TID } => {
+                lose_display();
+                ok()
             }
-
-            // The framebuffer device wants the display back for somebody
-            // else. There is nowhere for a compositor to go without a screen,
-            // so acknowledge and quit rather than linger invisibly.
-            TAG_FB_LOST => {
+            TAG_FB_GAINED if sender == unsafe { FB_TID } => {
+                // Answered first: the device is waiting on this, and giving
+                // the display up again would be a call to it.
                 let _ = syscall::sys_reply(sender, &ok());
-                unsafe {
-                    SCREEN.fb = 0;
-                    SCREEN.back = 0;
+                if !regain_display(&msg) {
+                    println!("wm: could not map the display again");
+                    quit();
                 }
-                // The keyboard came with the screen and goes back with it.
-                release_input();
-                println!("wm: display taken; exiting");
-                syscall::sys_exit_code(0);
+                // Everything: what is on the screen is whatever the last
+                // owner left there.
+                composite();
+                continue;
             }
             TAG_WM_SCREEN => {
                 let s = unsafe { &SCREEN };
@@ -1256,6 +1236,82 @@ pub extern "C" fn _start() -> ! {
 
         let _ = syscall::sys_reply(sender, &reply);
     }
+}
+
+/// A client has gone. Its windows go with it, and the session ends when the
+/// last of its programs has stopped.
+fn task_died(dead: usize) {
+    for i in 0..MAX_WINDOWS {
+        if unsafe { WINDOWS[i].used && WINDOWS[i].owner == dead } {
+            destroy_window(i);
+        }
+    }
+    let mut was_session = false;
+    unsafe {
+        let mut out = 0;
+        for i in 0..SESSION_LEN {
+            if SESSION[i] == dead {
+                was_session = true;
+            } else {
+                SESSION[out] = SESSION[i];
+                out += 1;
+            }
+        }
+        SESSION_LEN = out;
+        if SESSION_LEN == 0 {
+            quit();
+        }
+    }
+    if was_session {
+        // Collect it. A task this one started keeps its slot and its address
+        // space until its parent asks, and there is a dead child waiting right
+        // now — so this answers at once rather than blocking.
+        let _ = syscall::sys_wait();
+    }
+    composite();
+}
+
+fn have_display() -> bool {
+    unsafe { SCREEN.fb != 0 }
+}
+
+/// Stop drawing and give up the mapping: revocation governs the right to map
+/// the framebuffer, not the pages already mapped, so leaving them would be
+/// holding a window onto somebody else's screen.
+fn lose_display() {
+    let bytes = unsafe { SCREEN.pitch * SCREEN.height };
+    unsafe { SCREEN.fb = 0 };
+    const MUNMAP_MAX: usize = 256;
+    let pages = bytes.div_ceil(4096);
+    let mut done = 0;
+    while done < pages {
+        let chunk = (pages - done).min(MUNMAP_MAX);
+        let _ = syscall::sys_munmap(FB_VADDR + done * 4096, chunk);
+        done += chunk;
+    }
+    // The slot must be empty to be granted into again, which is how the
+    // display comes back.
+    let _ = syscall::sys_cap_delete(FB_LEASE_SLOT);
+}
+
+/// Map the framebuffer again, now that the device has lent it back.
+fn regain_display(msg: &Message) -> bool {
+    let s = unsafe { &SCREEN };
+    let same = (msg.data[0] >> 32) as usize == s.width
+        && (msg.data[0] & 0xFFFF_FFFF) as usize == s.height
+        && (msg.data[1] >> 32) as usize == s.pitch;
+    // The back buffer is the shape of the old mode. The device's mode is the
+    // bootloader's and does not change, so a different one is a device that
+    // cannot be trusted with the screen.
+    if !same {
+        return false;
+    }
+    let pages = (s.pitch * s.height).div_ceil(4096);
+    if syscall::sys_map_phys(msg.data[3] as usize, FB_VADDR, pages).is_err() {
+        return false;
+    }
+    unsafe { SCREEN.fb = FB_VADDR };
+    true
 }
 
 /// Map the framebuffer the device just lent us, and a back buffer beside it.

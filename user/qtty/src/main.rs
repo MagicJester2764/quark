@@ -242,8 +242,11 @@ fn poll_display_handover(ticks: u64) {
     if syscall::sys_recv_timeout(TID_ANY, &mut msg, ticks).is_err() {
         return;
     }
+    // Only the device can take the display away or give it back. Anybody
+    // else saying so would blank the console.
+    let from_fb = msg.sender == unsafe { FB_TID };
     match msg.tag {
-        TAG_FB_LOST => {
+        TAG_FB_LOST if from_fb => {
             // Stop drawing before answering: the reply is what lets the new
             // owner start, and two programs writing the same pixels is the
             // thing this protocol exists to prevent.
@@ -258,7 +261,7 @@ fn poll_display_handover(ticks: u64) {
             let ack = Message { sender: 0, tag: 0, data: [0; 6] };
             let _ = syscall::sys_reply(msg.sender, &ack);
         }
-        TAG_FB_GAINED => {
+        TAG_FB_GAINED if from_fb => {
             let ok = adopt_mode(&msg);
             let ack = Message { sender: 0, tag: 0, data: [0; 6] };
             let _ = syscall::sys_reply(msg.sender, &ack);

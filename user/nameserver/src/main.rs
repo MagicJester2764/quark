@@ -10,7 +10,7 @@
 //! A registration without one is refused, and so is one for a name a live task
 //! already holds. Registrants are watched, and their names go when they do.
 
-use quark_rt::ipc::{Message, TAG_TASK_DIED, TID_ANY};
+use quark_rt::ipc::{death_notice, Message, TID_ANY};
 use quark_rt::{println, syscall};
 
 // A server: programs are usually blocked waiting on this, so it runs
@@ -161,6 +161,13 @@ pub extern "C" fn _start() -> ! {
             continue;
         }
 
+        // From the kernel, which is not waiting for an answer. The same tag
+        // from anybody else falls through to the unknown request it is.
+        if let Some(dead) = death_notice(&msg) {
+            forget(&mut services, dead);
+            continue;
+        }
+
         match msg.tag {
             TAG_REGISTER => {
                 let (name, len) = extract_name(&msg);
@@ -191,8 +198,6 @@ pub extern "C" fn _start() -> ! {
                 let reply = Message { sender: 0, tag, data: [0; 6] };
                 let _ = syscall::sys_reply(sender, &reply);
             }
-            // From the kernel, which is not waiting for an answer.
-            TAG_TASK_DIED => forget(&mut services, msg.data[0] as usize),
             TAG_LOOKUP_TID => {
                 let sender = msg.sender;
                 let want = msg.data[0] as usize;

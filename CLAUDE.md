@@ -199,6 +199,12 @@ These were established deliberately. Breaking one silently re-opens a hole.
   `sys_call_offer` puts one on a call and `sys_cap_take` accepts it; nothing
   else can fill a server's CSpace, and a claim or registration made without
   one is refused.
+- **Only the kernel reports a death.** Any program that can call a server can
+  send `TAG_TASK_DIED`; what it cannot do is send as sender 0. A server
+  believes a notice through `quark_rt::ipc::death_notice` (or
+  `space_death_notice`) and answers anything else with that tag as the
+  unknown request it is. The nameserver used to forget a service, and `fb`
+  give up the console's display, because a program said so.
 
 `init` spawns `FB`, `CONSOLE`, `INPUT` and `VFS` in passes of their own. If a
 program misbehaves for lack of a capability, check that its pass actually calls
@@ -241,6 +247,14 @@ losing that race is a keyboard that types rubbish or stops.
 
 Three things to know before changing any of it:
 
+- **The display is a stack, and so is the keyboard.** A claim goes on top and
+  displaces the one below, which gets it back (`TAG_FB_GAINED`) when
+  everything above has let go; a claimant further down that releases or dies
+  just leaves the line. So `wm "wm <program>"` unwinds to the outer session
+  and then the console. A compositor that loses the display unmaps it and
+  waits, keeping its keyboard claim below the new one, and repaints all of
+  the screen when the display comes back. Eight deep, then claims are
+  refused.
 - **The display is lent, not shared.** `init` grants the framebuffer
   `PhysRange` to `fb` and nowhere else; `fb` mints a derived capability per
   claimant and revokes it to take the display back. Revocation governs the

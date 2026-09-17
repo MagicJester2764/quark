@@ -55,3 +55,19 @@ pub const TAG_OBJECT_IDLE: u64 = 0xFFFF_0006;
 pub const TAG_OBJECT_SYNC: u64 = 0xFFFF_0007;
 /// Set in `sender` by the kernel alone, on `TAG_PAGE_IN` and `TAG_OBJECT_SYNC`.
 pub const PAGER_BIT: usize = 1 << 62;
+
+/// The task `msg` reports dead, if it is the kernel's [`TAG_TASK_DIED`].
+///
+/// The tag alone proves nothing: any program that can call a server can send
+/// it. The sender is what the kernel stamps, and it is 0 only for what the
+/// kernel made up. A message with the tag and any other sender is a request,
+/// and an unknown one — a server that believed it would forget a lease, a
+/// registration or a claim because somebody asked it to.
+pub fn death_notice(msg: &Message) -> Option<usize> {
+    (msg.sender == 0 && msg.tag == TAG_TASK_DIED).then_some(msg.data[0] as usize)
+}
+
+/// The program `msg` reports gone, if it is the kernel's [`TAG_SPACE_DIED`].
+pub fn space_death_notice(msg: &Message) -> Option<u64> {
+    (msg.sender == 0 && msg.tag == TAG_SPACE_DIED).then_some(msg.data[0])
+}
