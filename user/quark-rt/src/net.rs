@@ -109,11 +109,40 @@ pub fn icmp_ping(net_tid: usize, dst_ip: u32, id: u16, seq: u16) -> Result<(u64,
     Ok((rtt, ttl, size))
 }
 
+/// Whether `name` could be a host's name at all.
+///
+/// Labels of letters, digits and hyphens, none empty, longer than 63 bytes,
+/// or starting or ending with a hyphen; 253 bytes in all; and a last label
+/// that is not all digits, since that would be a bad address rather than a
+/// name. A program handed `--help`, a path or a line of punctuation as a host
+/// is a program that would otherwise have the network look it up — and a
+/// lookup is a question asked of somebody else's machine.
+pub fn valid_hostname(name: &[u8]) -> bool {
+    let name = name.strip_suffix(b".").unwrap_or(name);
+    if name.is_empty() || name.len() > 253 {
+        return false;
+    }
+    let mut all_digits = false;
+    for label in name.split(|&b| b == b'.') {
+        let (Some(&first), Some(&last)) = (label.first(), label.last()) else {
+            return false;
+        };
+        if label.len() > 63 || first == b'-' || last == b'-' {
+            return false;
+        }
+        if !label.iter().all(|b| b.is_ascii_alphanumeric() || *b == b'-') {
+            return false;
+        }
+        all_digits = label.iter().all(u8::is_ascii_digit);
+    }
+    !all_digits
+}
+
 /// Resolve a hostname to an IPv4 address via DNS.
 /// Returns the IP as a packed big-endian u32 on success.
 /// Hostname must be <= 48 bytes.
 pub fn dns_resolve(net_tid: usize, hostname: &[u8]) -> Result<u32, u64> {
-    if hostname.is_empty() || hostname.len() > 48 {
+    if hostname.len() > 48 || !valid_hostname(hostname) {
         return Err(1);
     }
     let mut name_buf = [0u8; 48];

@@ -2445,6 +2445,14 @@ pub extern "C" fn _start() -> ! {
                 }
                 let name_len = name.iter().position(|&b| b == 0).unwrap_or(48);
                 let hostname = &name[..name_len];
+                // A name that is not one is refused here rather than asked of
+                // the network: a query leaves the machine, and whatever is
+                // upstream reads it.
+                if !quark_rt::net::valid_hostname(hostname) {
+                    let reply = Message { sender: 0, tag: TAG_ERROR, data: [1, 0, 0, 0, 0, 0] };
+                    let _ = syscall::sys_reply(msg.sender, &reply);
+                    continue;
+                }
 
                 // Check cache first
                 if let Some(ip) = dns_cache_lookup(hostname) {

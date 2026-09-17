@@ -1567,13 +1567,43 @@ window drawing, nothing in serial, and every session ending on Esc.
 **Interfaces:**
 - Produces: `hostile.tests` — for every program in `/usr/bin` except `shutdown`, `login`, `wm`, `runtests` and `qfuzz` (which the sweep must not start with arbitrary arguments), one `?@30` line with each of: no arguments; `-`; `--`; `-x`; `--help`; a 300-byte word; `/nonexistent`; `/etc`; `/dev/null`; `/usr/bin/ls`; `99999999999999999999`; `-1`; `0`; UTF-8 (`héllo`); a control byte (`\x01`); and fifteen arguments. A program may complain and exit with any status; it may not fault or run past its deadline. Programs that read standard input get none (runtests gives them none) and must say so rather than wait.
 
-- [ ] **Step 1: The first sweep.** Generate, image, boot, `runtests /etc/hostile.tests`. Expected: a list of faults and timeouts.
+- [x] **Step 1: The first sweep.** Generate, image, boot, `runtests /etc/hostile.tests`. Expected: a list of faults and timeouts.
 
-- [ ] **Step 2: Fix every one.** In Rust programs: no `unwrap`, `expect` or indexing on anything that came from outside; parse errors are messages. In C programs: check `argc` and every call that can fail. Clients started without a compositor say so and exit 1. Each fix is checked by rerunning the sweep.
+- [x] **Step 2: Fix every one.** In Rust programs: no `unwrap`, `expect` or indexing on anything that came from outside; parse errors are messages. In C programs: check `argc` and every call that can fail. Clients started without a compositor say so and exit 1. Each fix is checked by rerunning the sweep.
 
-- [ ] **Step 3: Verify.** `runtests /etc/hostile.tests` passes; serial has no `UFAULT` or `PANIC`; `dtest` and every suite still pass; `check-rootfs.sh` is clean.
+- [x] **Step 3: Verify.** `runtests /etc/hostile.tests` passes; serial has no `UFAULT` or `PANIC`; `dtest` and every suite still pass; `check-rootfs.sh` is clean.
 
-- [ ] **Step 4: Commit.** quark: "Every program takes bad arguments"; explosion: "hostile.tests".
+- [x] **Step 4: Commit.** quark: "Every program takes bad arguments"; explosion: "hostile.tests".
+
+**Done.** The first sweep was a list of artefacts rather than a list of faults.
+zlib's `example` writes a gzip file over whatever path it is given, and the
+path the sweep handed every program was `/usr/bin/ls` — so every `ls` line
+after that said "not found". The sample is `/etc/hostile-sample` now, written
+by the generator for programs to read, write and ruin. The suites' own test
+programs are left out as well: they read their arguments as test numbers and
+iteration counts, and `pixel-test 99999999999999999999` faulting is upstream's
+harness rather than a program falling over. `weston-simple-shm` is left out
+too — it asserts that it has a compositor, and nothing here patches a client.
+
+In our own programs the sweep found nothing that faulted or hung. About the
+system it found one thing: a program could claim to have been killed. The exit
+status came back as it was given, and a negative status is how this kernel
+says "killed by a signal", so `stress-test` returning -1 was reported as a
+signal. `SYS_EXIT_CODE` keeps the low eight bits now, as Linux's wait status
+does.
+
+Two things were fixed for the sweep before it could be read at all: `dtest`
+with an unknown section ran nothing and said "0 passed, 0 failed", and now
+prints the sections and exits 2; `runtests` read at most 4096 bytes of a list
+and named a failing program without its arguments, and now reads a list of any
+size, says the arguments, and says the failures again at the end, since five
+hundred lines scroll the first ones off the screen. A host that is not a
+host — `--help`, a path, a line of punctuation — is refused by
+`quark_rt::net::valid_hostname` before it can become a DNS query that leaves
+the machine.
+
+`runtests /etc/hostile.tests`: 544 of 544, thirty-four programs, sixteen kinds
+of nonsense each.
 
 ---
 

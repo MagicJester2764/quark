@@ -10,7 +10,7 @@
 
 use quark_rt::manifest::CapReq;
 use quark_rt::wl::wire;
-use quark_rt::{nameserver, println, spawn, sync, syscall, thread, vfs};
+use quark_rt::{nameserver, print, println, spawn, sync, syscall, thread, vfs};
 
 quark_rt::manifest!([CapReq::task_mgmt(0), CapReq::phys_alloc(64)]);
 
@@ -2040,18 +2040,27 @@ pub extern "C" fn _start() -> ! {
         ("fpu", test_fpu),
         ("wire", test_wire),
     ];
-    println!("[dtest] kernel and runtime checks");
     let only = quark_rt::args::argv(1);
+    let known = only.is_none_or(|o| SECTIONS.iter().any(|(name, _)| o == name.as_bytes()));
+    if !known || quark_rt::args::argv(2).is_some() {
+        println!("usage: dtest [SECTION]");
+        print!("sections:");
+        for (name, _) in SECTIONS {
+            print!(" {}", name);
+        }
+        println!();
+        syscall::sys_exit_code(2);
+    }
+    println!("[dtest] kernel and runtime checks");
     for (name, section) in SECTIONS {
         if only.is_none_or(|o| o == name.as_bytes()) {
             section();
         }
     }
 
-    unsafe {
-        println!("[dtest] {} passed, {} failed", PASSED, FAILED);
-        syscall::sys_exit_code(if FAILED == 0 { 0 } else { 1 });
-    }
+    let (passed, failed) = unsafe { (PASSED, FAILED) };
+    println!("[dtest] {} passed, {} failed", passed, failed);
+    syscall::sys_exit_code(if failed == 0 { 0 } else { 1 });
 }
 
 #[panic_handler]

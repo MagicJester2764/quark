@@ -208,13 +208,18 @@ everything else returns promptly.
 | # | Name | Arguments | Returns | Cap |
 |---|---|---|---|---|
 | 0 | `SYS_EXIT` | — | does not return | — |
-| 1 | `SYS_EXIT_CODE` | arg0 = status | does not return | — |
+| 1 | `SYS_EXIT_CODE` | arg0 = status, of which the low eight bits are kept | does not return | — |
 | 2 | `SYS_YIELD` | — | 0 | — |
 | 3 | `SYS_GETPID` | — | current TID | — |
 | 4 | `SYS_WAIT` | — | `tid \| (exit_code << 32)`, or `u64::MAX` if no children. **Blocks.** | — |
 | 5 | `SYS_TASK_KILL` | arg0 = tid | 0 / `u64::MAX` | `TaskMgmt` for target, or same UID |
 | 6 | `SYS_SIGNAL` | arg0 = tid, arg1 = signal bits | 0 / `u64::MAX` | as above |
 | 7 | `SYS_TASK_INFO` | arg0 = tid | packed info, or `u64::MAX` | — |
+
+A status is kept as its low eight bits, as Linux's wait status keeps it. A
+negative status is how the kernel says a task was killed — `SYS_TASK_KILL`
+reports -9, a fault the negated signal — so a task cannot set one and claim it
+was.
 
 `SYS_EXIT` is equivalent to `SYS_EXIT_CODE(0)`; it exists separately because
 `syscall0` leaves RDI undefined, so the original call could not grow an

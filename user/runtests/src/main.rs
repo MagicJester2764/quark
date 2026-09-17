@@ -30,7 +30,11 @@ quark_rt::manifest!([CapReq::task_mgmt(0), CapReq::phys_alloc(64)]);
 
 /// Where a program's image is read to before it is loaded. Freed each time.
 const IMAGE_AT: usize = 0x9A_0000_0000;
-const LIST_MAX: usize = 4096;
+/// Where the list is read to, and how much of it there may be: enough for a
+/// line for every program with every argument the hostile sweep gives it.
+const LIST_AT: usize = 0x9E_0000_0000;
+const LIST_PAGES: usize = 64;
+const LIST_MAX: usize = LIST_PAGES * 4096;
 
 static SCRATCH: Scratch = Scratch {
     elf: 0x9B_0000_0000,
@@ -91,6 +95,7 @@ fn split_words<'a>(name: &'a [u8], args: &'a [u8], out: &mut [&'a [u8]; 16]) -> 
 const DEFAULT_SECONDS: u64 = 300;
 const TICKS_PER_SECOND: u64 = 100;
 
+#[derive(Clone, Copy)]
 enum Outcome {
     Passed,
     Exit(i32),
@@ -114,6 +119,14 @@ impl Outcome {
     }
 }
 
+/// A line of the list that failed, as places in the list.
+#[derive(Clone)]
+struct Failure {
+    name: core::ops::Range<usize>,
+    args: core::ops::Range<usize>,
+    outcome: Outcome,
+}
+
 /// How a program run by `run` ended.
 enum End {
     Status(i32),
@@ -121,14 +134,39 @@ enum End {
     TimedOut,
 }
 
-fn report(name: &[u8], o: &Outcome) {
-    let name = core::str::from_utf8(name).unwrap_or("?");
+/// A program's name and arguments as a line of a report says them: the
+/// arguments cut short, and anything unprintable as `?`, so that a report
+/// stays a line whatever a list gave the program.
+struct Shown<'a>(&'a [u8], &'a [u8]);
+
+impl core::fmt::Display for Shown<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        const MAX_ARGS: usize = 48;
+        let printable = |b: u8| if (0x20..0x7F).contains(&b) { b as char } else { '?' };
+        for &b in self.0 {
+            write!(f, "{}", printable(b))?;
+        }
+        if !self.1.is_empty() {
+            write!(f, " ")?;
+        }
+        for &b in self.1.iter().take(MAX_ARGS) {
+            write!(f, "{}", printable(b))?;
+        }
+        if self.1.len() > MAX_ARGS {
+            write!(f, "...")?;
+        }
+        Ok(())
+    }
+}
+
+fn report(name: &[u8], args: &[u8], o: &Outcome) {
+    let what = Shown(name, args);
     match o {
-        Outcome::Passed => println!("  ok    {}", name),
-        Outcome::Exit(c) => println!("  FAIL  {} (exit {})", name, c),
-        Outcome::Signal(s) => println!("  FAIL  {} (signal {})", name, s),
-        Outcome::Missing => println!("  FAIL  {} (not found)", name),
-        Outcome::TimedOut => println!("  FAIL  {} (timed out)", name),
+        Outcome::Passed => println!("  ok    {}", Shown(name, &[])),
+        Outcome::Exit(c) => println!("  FAIL  {} (exit {})", what, c),
+        Outcome::Signal(s) => println!("  FAIL  {} (signal {})", what, s),
+        Outcome::Missing => println!("  FAIL  {} (not found)", what),
+        Outcome::TimedOut => println!("  FAIL  {} (timed out)", what),
     }
 }
 
@@ -172,13 +210,21 @@ fn reap(tid: usize) -> Option<i32> {
     }
 }
 
-/// Read a list into `buf`. Returns its length.
-fn read_list(vfs_tid: usize, path: &[u8], buf: &mut [u8; LIST_MAX]) -> Option<usize> {
+/// Read a list into `buf`, a read at a time. Its length, or `None` if it
+/// cannot be read or does not fit.
+fn read_list(vfs_tid: usize, path: &[u8], buf: &mut [u8]) -> Option<usize> {
     let (handle, size, _) = vfs::open(vfs_tid, path).ok()?;
-    let size = (size as usize).min(LIST_MAX);
-    let got = vfs::read(vfs_tid, handle, &mut buf[..size], 0).ok();
+    let size = size as usize;
+    let mut got = 0;
+    while got < size.min(buf.len()) {
+        let end = (got + vfs::MAX_IO).min(size).min(buf.len());
+        match vfs::read(vfs_tid, handle, &mut buf[got..end], got as u32) {
+            Ok(n) if n > 0 => got += n as usize,
+            _ => break,
+        }
+    }
     let _ = vfs::close(vfs_tid, handle);
-    got.map(|n| (n as usize).min(size))
+    (got == size).then_some(got)
 }
 
 /// Run one program to completion, or for `seconds` at most.
@@ -229,15 +275,25 @@ pub extern "C" fn _start() -> ! {
         println!("runtests: no filesystem");
         syscall::sys_exit_code(2);
     };
-    let mut buf = [0u8; LIST_MAX];
-    let Some(len) = read_list(vfs_tid, list, &mut buf) else {
-        println!("runtests: cannot read the list");
+    if syscall::sys_mmap(LIST_AT, LIST_PAGES).is_err() {
+        println!("runtests: no memory for the list");
+        syscall::sys_exit_code(2);
+    }
+    let buf = unsafe { core::slice::from_raw_parts_mut(LIST_AT as *mut u8, LIST_MAX) };
+    let Some(len) = read_list(vfs_tid, list, buf) else {
+        println!("runtests: cannot read the list, or it is longer than {} bytes", LIST_MAX);
         syscall::sys_exit_code(2);
     };
 
     let mut passed = 0u32;
     let mut failed = 0u32;
-    for raw in buf[..len].split(|&b| b == b'\n') {
+    // Where each failure's line is, so that they can be said again at the
+    // end: a long list scrolls them off the screen.
+    const RECAP: usize = 128;
+    let mut failures: [Failure; RECAP] =
+        core::array::from_fn(|_| Failure { name: 0..0, args: 0..0, outcome: Outcome::Passed });
+    let list_text: &[u8] = &buf[..len];
+    for raw in list_text.split(|&b| b == b'\n') {
         let line = raw.strip_suffix(b"\r").unwrap_or(raw);
         if line.is_empty() || line[0] == b'#' {
             continue;
@@ -259,12 +315,28 @@ pub extern "C" fn _start() -> ! {
         if matches!(outcome, Outcome::Passed) {
             passed += 1;
         } else {
+            if let Some(slot) = failures.get_mut(failed as usize) {
+                let within = |part: &[u8]| {
+                    let at = part.as_ptr() as usize - list_text.as_ptr() as usize;
+                    at..at + part.len()
+                };
+                *slot = Failure { name: within(name), args: within(args), outcome };
+            }
             failed += 1;
         }
-        report(name, &outcome);
+        report(name, args, &outcome);
     }
 
     println!("runtests: {} passed, {} failed", passed, failed);
+    if failed > 1 {
+        println!("runtests: the failures again:");
+        for f in failures.iter().take(failed as usize) {
+            report(&list_text[f.name.clone()], &list_text[f.args.clone()], &f.outcome);
+        }
+        if failed as usize > RECAP {
+            println!("runtests: and {} more", failed as usize - RECAP);
+        }
+    }
     syscall::sys_exit_code(if failed == 0 { 0 } else { 1 });
 }
 

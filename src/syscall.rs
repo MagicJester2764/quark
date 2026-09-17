@@ -569,7 +569,12 @@ extern "C" fn syscall_dispatch(
             scheduler::exit()
         }
         SYS_EXIT_CODE => {
-            scheduler::exit_with(arg0 as i32)
+            // The low eight bits, as Linux's wait status keeps them. A
+            // negative status is how *this* kernel says a task was killed by
+            // a signal, so a task that could set one would be able to claim
+            // it had been — and every program that reads a child's status
+            // would believe it.
+            scheduler::exit_with((arg0 & 0xFF) as i32)
         }
         SYS_SET_CLEAR_TID => {
             // Register a word to clear and wake when this task exits, which is
