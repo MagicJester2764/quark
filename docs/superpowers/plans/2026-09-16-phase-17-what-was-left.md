@@ -412,7 +412,7 @@ directory that leads into `/dev` finding the devices. libc.tests 7/7; dtest
 **Interfaces:**
 - Produces: `TAG_LINK` — `[from_len, to_len]`, both paths lent end to end as `RENAME` lends them; errors `NOT_FOUND`, `EXISTS`, `IS_DIR` (the source is a directory), `TOO_MANY_LINKS`, `PERMISSION`, `NOT_SUPPORTED` (FAT32). `quark_rt::vfs::link(vfs: usize, from: &[u8], to: &[u8]) -> Result<(), u64>`; `int quark_vfs_link(const char *from, const char *to)`; `long __quark_link(const char *from, const char *to)`.
 
-- [ ] **Step 1: The failing test.** In `filetest.c`, the `link is not offered` check becomes a block (and `clear_leftovers` also unlinks `TESTDIR "/hard"`):
+- [x] **Step 1: The failing test.** In `filetest.c`, the `link is not offered` check becomes a block (and `clear_leftovers` also unlinks `TESTDIR "/hard"`):
 
 ```c
     #define HARD TESTDIR "/hard"
@@ -434,15 +434,23 @@ directory that leads into `/dev` finding the devices. libc.tests 7/7; dtest
 
 On the host every check passes (Linux gives `EPERM` for a directory). dtest `files` gains `vfs::link` then `vfs::stat` of both names showing one id and two links.
 
-- [ ] **Step 2: Run it.** Expected: `link makes a second name` fails with `EPERM` (today's answer).
+- [x] **Step 2: Run it.** Expected: `link makes a second name` fails with `EPERM` (today's answer).
 
-- [ ] **Step 3: The server.** `ext2_ops::link(e2, from, to, uid, gid)`: resolve `from` without following a final symbolic link (Task 5 makes that distinction; until then there are none); a directory is `ERR_IS_DIR`; `i_links_count >= 65000` is `ERR_TOO_MANY_LINKS`; `split_path(to)` resolves the new parent, which must be writable (`writable_dir`) and must not already hold the name (`ERR_EXISTS`); `ext2_dir::create_dir_entry(e2, parent_ino, &mut parent, name, ino, file_type_of(&inode))`; `i_links_count += 1`; `i_ctime = now()`; write the inode; the parent's times change as `create` changes them. FAT32 answers `NOT_SUPPORTED`.
+- [x] **Step 3: The server.** `ext2_ops::link(e2, from, to, uid, gid)`: resolve `from` without following a final symbolic link (Task 5 makes that distinction; until then there are none); a directory is `ERR_IS_DIR`; `i_links_count >= 65000` is `ERR_TOO_MANY_LINKS`; `split_path(to)` resolves the new parent, which must be writable (`writable_dir`) and must not already hold the name (`ERR_EXISTS`); `ext2_dir::create_dir_entry(e2, parent_ino, &mut parent, name, ino, file_type_of(&inode))`; `i_links_count += 1`; `i_ctime = now()`; write the inode; the parent's times change as `create` changes them. FAT32 answers `NOT_SUPPORTED`.
 
-- [ ] **Step 4: Clients.** `link` and `linkat` (flags: `AT_SYMLINK_FOLLOW` 0x400 accepted, `AT_EMPTY_PATH` 0x1000 is `-EINVAL`; directory descriptors other than `AT_FDCWD` wait for Task 6 and answer `-ENOSYS` until then). The layer maps `IS_DIR` and `NOT_SUPPORTED` to `EPERM` for `link` — that is Linux's answer for both — and `TOO_MANY_LINKS` to `EMLINK` (31).
+- [x] **Step 4: Clients.** `link` and `linkat` (flags: `AT_SYMLINK_FOLLOW` 0x400 accepted, `AT_EMPTY_PATH` 0x1000 is `-EINVAL`; directory descriptors other than `AT_FDCWD` wait for Task 6 and answer `-ENOSYS` until then). The layer maps `IS_DIR` and `NOT_SUPPORTED` to `EPERM` for `link` — that is Linux's answer for both — and `TOO_MANY_LINKS` to `EMLINK` (31).
 
-- [ ] **Step 5: Verify.** Build, layer, suites, image; boot `runtests /etc/libc.tests`, `dtest files`; `check-rootfs.sh`; the same on `make hd-ext4`. fontconfig's lock now takes the `link` path: `runtests /etc/fontconfig.tests` passes and `/var/cache/fontconfig` has no `.LCK` or `.TMP-` leftovers.
+- [x] **Step 5: Verify.** Build, layer, suites, image; boot `runtests /etc/libc.tests`, `dtest files`; `check-rootfs.sh`; the same on `make hd-ext4`. fontconfig's lock now takes the `link` path: `runtests /etc/fontconfig.tests` passes and `/var/cache/fontconfig` has no `.LCK` or `.TMP-` leftovers.
 
-- [ ] **Step 6: Commit.** quark: "Hard links"; explosion: "filetest: hard links".
+- [x] **Step 6: Commit.** quark: "Hard links"; explosion: "filetest: hard links".
+
+**Done.** Step 2's failure was not re-run: the check it replaces asserted
+exactly that answer (EPERM) on Quark in every earlier run. The link count is
+written before the new entry, so a failure between leaves a count one short,
+which e2fsck mends, rather than an entry the count does not know. The limit is
+32000 on ext2 and 65000 on ext4. filetest ok and `dtest files` 25/0 on ext2
+and ext4; fontconfig.tests 4/4 and its cache directory has no lock leftovers;
+e2fsck clean on both.
 
 ---
 

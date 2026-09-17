@@ -196,7 +196,8 @@ int quark_vfs_rmdir(const char *path) {
     return vfs_path_call(QUARK_VFS_TAG_RMDIR, path, &msg, &reply);
 }
 
-int quark_vfs_rename(const char *from, const char *to) {
+/* A request naming two paths, lent in one buffer, one after the other. */
+static int vfs_two_paths(unsigned long tag, const char *from, const char *to) {
     struct quark_msg msg;
     struct quark_msg reply;
     char both[2 * QUARK_VFS_MAX_PATH];
@@ -209,14 +210,21 @@ int quark_vfs_rename(const char *from, const char *to) {
     if (a > QUARK_VFS_MAX_PATH || b > QUARK_VFS_MAX_PATH) {
         return QUARK_VFS_NAME_TOO_LONG;
     }
-    /* Both paths in one lent buffer, one after the other. */
     copy(both, from, a);
     copy(both + a, to, b);
     zero(&msg, sizeof msg);
-    msg.tag = QUARK_VFS_TAG_RENAME;
+    msg.tag = tag;
     msg.data[0] = a;
     msg.data[1] = b;
     return vfs_call_lend(&msg, &reply, both, a + b, QUARK_LEND_READ);
+}
+
+int quark_vfs_rename(const char *from, const char *to) {
+    return vfs_two_paths(QUARK_VFS_TAG_RENAME, from, to);
+}
+
+int quark_vfs_link(const char *from, const char *to) {
+    return vfs_two_paths(QUARK_VFS_TAG_LINK, from, to);
 }
 
 int quark_vfs_truncate(unsigned long handle, unsigned long size) {

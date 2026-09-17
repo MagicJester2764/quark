@@ -95,6 +95,7 @@ static long vfs_errno(int code) {
     case QUARK_VFS_NOT_SUPPORTED:  return -LX_EOPNOTSUPP;
     case QUARK_VFS_NAME_TOO_LONG:  return -LX_ENAMETOOLONG;
     case QUARK_VFS_NO_SPACE:       return -LX_ENOSPC;
+    case QUARK_VFS_TOO_MANY_LINKS: return -LX_EMLINK;
     default:                       return -LX_EIO;
     }
 }
@@ -649,6 +650,16 @@ long __quark_rmdir(const char *path) {
 
 long __quark_rename(const char *from, const char *to) {
     int err = quark_vfs_rename(from, to);
+    return err ? vfs_errno(err) : 0;
+}
+
+long __quark_link(const char *from, const char *to) {
+    int err = quark_vfs_link(from, to);
+    /* A directory, and a filesystem with no hard links, are both EPERM on
+       Linux, and EPERM is what fontconfig's lock knows to fall back from. */
+    if (err == QUARK_VFS_IS_DIR || err == QUARK_VFS_NOT_SUPPORTED) {
+        return -LX_EPERM;
+    }
     return err ? vfs_errno(err) : 0;
 }
 

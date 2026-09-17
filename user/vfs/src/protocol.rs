@@ -25,6 +25,8 @@ pub const TAG_RENAME: u64 = 12;
 pub const TAG_TRUNCATE: u64 = 13;
 /// What the filesystem is and how full.
 pub const TAG_STATFS: u64 = 14;
+/// A second name for a file: two paths, lent end to end as RENAME lends them.
+pub const TAG_LINK: u64 = 15;
 pub const TAG_OK: u64 = 0;
 pub const TAG_ERROR: u64 = u64::MAX;
 
@@ -57,6 +59,8 @@ pub const ERR_NOT_SUPPORTED: u64 = 12;
 pub const ERR_NAME_TOO_LONG: u64 = 13;
 /// Nowhere to put what was written.
 pub const ERR_NO_SPACE: u64 = 14;
+/// The file has as many names as the filesystem allows.
+pub const ERR_TOO_MANY_LINKS: u64 = 18;
 
 pub const MAX_PATH: usize = 4095;
 /// What an ext2 directory entry's one-byte length allows.

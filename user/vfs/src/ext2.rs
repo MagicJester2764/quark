@@ -33,6 +33,20 @@ pub const FT_REG_FILE: u8 = 1;
 pub const FT_DIR: u8 = 2;
 pub const FT_SYMLINK: u8 = 7;
 
+/// The directory-entry type for an inode, from its mode.
+pub fn file_type_of(inode: &Ext2Inode) -> u8 {
+    match inode.i_mode & S_IFMT {
+        S_IFREG => FT_REG_FILE,
+        S_IFDIR => FT_DIR,
+        S_IFLNK => FT_SYMLINK,
+        0x2000 => 3, // character device
+        0x6000 => 4, // block device
+        0x1000 => 5, // FIFO
+        0xC000 => 6, // socket
+        _ => 0,
+    }
+}
+
 /// A directory whose blocks carry an htree index as well as entries.
 pub const EXT2_INDEX_FL: u32 = 0x1000;
 

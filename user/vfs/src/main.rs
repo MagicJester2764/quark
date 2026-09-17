@@ -1374,7 +1374,7 @@ pub extern "C" fn _start() -> ! {
             TAG_STAT => handle_stat(sender, &msg),
             TAG_WRITE => transacted(|| handle_write(&disk, sender, &msg)),
             TAG_MKDIR => transacted(|| handle_mkdir(&disk, sender, &msg)),
-            TAG_UNLINK | TAG_RMDIR | TAG_RENAME => {
+            TAG_UNLINK | TAG_RMDIR | TAG_RENAME | TAG_LINK => {
                 transacted(|| handle_namespace(sender, &msg))
             }
             TAG_TRUNCATE => transacted(|| handle_truncate(sender, &msg)),
@@ -1664,8 +1664,8 @@ fn settle(inodes: &[u32]) {
     }
 }
 
-/// TAG_UNLINK and TAG_RMDIR lend a path, `data[0]` long; TAG_RENAME lends two,
-/// end to end, `data[0]` and `data[1]` long.
+/// TAG_UNLINK and TAG_RMDIR lend a path, `data[0]` long; TAG_RENAME and
+/// TAG_LINK lend two, end to end, `data[0]` and `data[1]` long.
 fn handle_namespace(sender: usize, msg: &Message) {
     if unsafe { FS_TYPE } != FsType::Ext2 {
         return error_reply(sender, ERR_NOT_SUPPORTED);
@@ -1687,6 +1687,7 @@ fn handle_namespace(sender: usize, msg: &Message) {
         TAG_RMDIR => ext2_ops::rmdir(e2, first, uid, gid),
         _ => match protocol::lent_path(sender, msg.data[0] as usize, msg.data[1] as usize, 4096) {
             Ok(second) if devices::refuses(second) => Err(ERR_PERMISSION),
+            Ok(second) if msg.tag == TAG_LINK => ext2_ops::link(e2, first, second, uid, gid),
             Ok(second) => ext2_ops::rename(e2, first, second, uid, gid),
             Err(code) => Err(code),
         },

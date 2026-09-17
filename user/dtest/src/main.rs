@@ -1332,6 +1332,27 @@ fn test_files() {
             o.size == 4
         });
     check("rename onto a name replaces what had it", replaced);
+    // A second name is the same file.
+    let _ = vfs::unlink(vfs_tid, moved);
+    check("link a second name", vfs::link(vfs_tid, file, moved).is_ok());
+    let names = (vfs::open_with(vfs_tid, file, 0), vfs::open_with(vfs_tid, moved, 0));
+    if let (Ok(a), Ok(b)) = &names {
+        let stats = (vfs::stat_full(vfs_tid, a.handle), vfs::stat_full(vfs_tid, b.handle));
+        check(
+            "both names are one file with two links",
+            matches!(stats, (Ok(x), Ok(y)) if x.id == y.id && x.links == 2 && y.links == 2),
+        );
+    } else {
+        check("both names are one file with two links", false);
+    }
+    for o in [names.0, names.1].into_iter().flatten() {
+        let _ = vfs::close(vfs_tid, o.handle);
+    }
+    check(
+        "a directory has one name",
+        vfs::link(vfs_tid, dir, b"/tmp/dtest-dir-link").err() == Some(vfs::ERR_IS_DIR),
+    );
+    check("and the second name goes", vfs::unlink(vfs_tid, moved).is_ok());
     check(
         "a directory with something in it stays",
         vfs::rmdir(vfs_tid, dir).err() == Some(vfs::ERR_NOT_EMPTY),

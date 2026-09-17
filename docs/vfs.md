@@ -33,6 +33,7 @@ code in `data[0]`:
 | 12 | `NOT_SUPPORTED` | This filesystem cannot do that |
 | 13 | `NAME_TOO_LONG` | A path over 4095 bytes, or a name over 255 |
 | 14 | `NO_SPACE` | Nowhere to put what was written |
+| 18 | `TOO_MANY_LINKS` | The file has as many names as it can |
 
 Permission is checked against the caller's user and group, which the server
 asks the kernel for (`SYS_GET_TUID`). User 0 is not checked. FAT32 has no
@@ -62,6 +63,7 @@ directory.
 | 12 | `RENAME` | `[from_len, to_len]` | both paths, end to end | — |
 | 13 | `TRUNCATE` | `[handle, size]` | — | — |
 | 14 | `STATFS` | — | 64 bytes to fill | `[64]` |
+| 15 | `LINK` | `[from_len, to_len]` | both paths, end to end | — |
 
 Numbers are never reused. 4 was `READDIR`, which returned one entry per call
 and cut its name to 32 bytes. 7 was `CREATE`, which carried its path in the
@@ -115,7 +117,7 @@ instead, and so does everything else on it.
 Makes a directory, mode 0755, owned by the caller. `EXISTS` if the name is
 taken.
 
-### UNLINK, RMDIR and RENAME
+### UNLINK, RMDIR, RENAME and LINK
 
 `UNLINK` removes a name that is not a directory's; the file goes with its last
 name, or, if a handle still names it, when that handle closes. `RMDIR` removes
@@ -125,7 +127,13 @@ parent.
 `RENAME` lends the source path followed directly by the destination, with the
 two lengths in `data[0]` and `data[1]`. It replaces a destination of the same
 kind — a file for a file, an empty directory for a directory — and refuses to
-move a directory inside itself (`INVALID_PATH`). FAT32 answers all three with
+move a directory inside itself (`INVALID_PATH`).
+
+`LINK` lends its two paths the same way and gives the file at the first a
+second name at the second. A directory is refused (`IS_DIR`), and so is a name
+that is taken (`EXISTS`) and a file with as many names as the filesystem
+allows (`TOO_MANY_LINKS`: 32000 on ext2, 65000 on ext4). The new name's
+directory needs write permission, as for `UNLINK`. FAT32 answers all four with
 `NOT_SUPPORTED`.
 
 ### TRUNCATE

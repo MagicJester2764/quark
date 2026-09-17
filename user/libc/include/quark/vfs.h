@@ -26,6 +26,7 @@
 #define QUARK_VFS_TAG_TRUNCATE 13
 #define QUARK_VFS_TAG_READDIR  8   /* the bulk read; 4 is retired */
 #define QUARK_VFS_TAG_STATFS  14
+#define QUARK_VFS_TAG_LINK    15
 
 /* A directory record, as QUARK_VFS_TAG_READDIR fills a buffer with them:
    `id`, `next` and `size` (8 bytes each), `reclen` (2), `type` (1) and
@@ -55,6 +56,7 @@
 #define QUARK_VFS_NOT_SUPPORTED 12
 #define QUARK_VFS_NAME_TOO_LONG 13
 #define QUARK_VFS_NO_SPACE      14
+#define QUARK_VFS_TOO_MANY_LINKS 18
 
 /* The server's devices have ids from here up, in the order null, zero, full,
    random, urandom. */
@@ -111,6 +113,7 @@ int quark_vfs_mkdir(const char *path);
 int quark_vfs_unlink(const char *path);
 int quark_vfs_rmdir(const char *path);
 int quark_vfs_rename(const char *from, const char *to);
+int quark_vfs_link(const char *from, const char *to);
 int quark_vfs_truncate(unsigned long handle, unsigned long size);
 
 /* Fill `buf` (at most a page) with the records of a directory from entry

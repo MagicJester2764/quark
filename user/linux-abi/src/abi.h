@@ -28,6 +28,7 @@
 #define LX_EOPNOTSUPP 95
 #define LX_ERANGE   34
 #define LX_ENOSPC   28
+#define LX_EMLINK   31
 
 /* Descriptors from here up are files.c's VFS files; below, the kernel's.
    The split sits at the kernel's MAX_FDS — see files.c. */
@@ -36,6 +37,7 @@
 /* There is no working directory anywhere in this system, so this is the only
    value the *at calls accept for one. */
 #define LX_AT_FDCWD (-100)
+#define LX_AT_SYMLINK_FOLLOW 0x400
 
 /* Open flags this layer acts on. Shared because `pipe2` and `fcntl` have to
    agree about what O_NONBLOCK means. */
@@ -57,6 +59,7 @@ long __quark_mkdir(const char *path);
 long __quark_unlink(const char *path);
 long __quark_rmdir(const char *path);
 long __quark_rename(const char *from, const char *to);
+long __quark_link(const char *from, const char *to);
 long __quark_truncate(const char *path, long length);
 long __quark_file_truncate(long fd, long length);
 long __quark_getdents(long fd, void *buf, unsigned long count);

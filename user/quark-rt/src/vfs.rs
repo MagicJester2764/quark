@@ -17,6 +17,7 @@ const TAG_MKDIR: u64 = 9;
 const TAG_UNLINK: u64 = 10;
 const TAG_RMDIR: u64 = 11;
 const TAG_RENAME: u64 = 12;
+const TAG_LINK: u64 = 15;
 const TAG_TRUNCATE: u64 = 13;
 const TAG_STATFS: u64 = 14;
 const TAG_ERROR: u64 = u64::MAX;
@@ -50,6 +51,7 @@ pub const ERR_NOT_EMPTY: u64 = 11;
 pub const ERR_NOT_SUPPORTED: u64 = 12;
 pub const ERR_NAME_TOO_LONG: u64 = 13;
 pub const ERR_NO_SPACE: u64 = 14;
+pub const ERR_TOO_MANY_LINKS: u64 = 18;
 
 /// File-type bits of a mode, as [`Stat::mode`] carries them.
 pub const S_IFMT: u32 = 0o170000;
@@ -335,6 +337,15 @@ pub fn rmdir(vfs_tid: usize, path: &[u8]) -> Result<(), u64> {
 
 /// Give the file at `from` the name `to`, replacing whatever had it.
 pub fn rename(vfs_tid: usize, from: &[u8], to: &[u8]) -> Result<(), u64> {
+    two_paths(vfs_tid, TAG_RENAME, from, to)
+}
+
+/// Give the file at `from` a second name, `to`.
+pub fn link(vfs_tid: usize, from: &[u8], to: &[u8]) -> Result<(), u64> {
+    two_paths(vfs_tid, TAG_LINK, from, to)
+}
+
+fn two_paths(vfs_tid: usize, tag: u64, from: &[u8], to: &[u8]) -> Result<(), u64> {
     if from.is_empty() || to.is_empty() {
         return Err(ERR_INVALID_PATH);
     }
@@ -347,7 +358,7 @@ pub fn rename(vfs_tid: usize, from: &[u8], to: &[u8]) -> Result<(), u64> {
     both[from.len()..from.len() + to.len()].copy_from_slice(to);
     let msg = Message {
         sender: 0,
-        tag: TAG_RENAME,
+        tag,
         data: [from.len() as u64, to.len() as u64, 0, 0, 0, 0],
     };
     let mut reply = Message::empty();

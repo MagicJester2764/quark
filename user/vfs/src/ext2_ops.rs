@@ -14,6 +14,7 @@ use crate::{ext2_alloc, ext2_dir, ext4, handles};
 use crate::{
     DISK_IO_BUF, ERR_EXISTS, ERR_INVALID_PATH, ERR_IO, ERR_IS_DIR, ERR_NAME_TOO_LONG,
     ERR_NOT_DIR, ERR_NOT_EMPTY, ERR_NOT_FOUND, ERR_NOT_SUPPORTED, ERR_PERMISSION,
+    ERR_TOO_MANY_LINKS,
 };
 
 /// Split a path into its parent directory and its last name.
@@ -229,6 +230,37 @@ pub fn rename(e2: &mut Ext2State, from: &[u8], to: &[u8], uid: u32, gid: u32) ->
     }
     inode.i_ctime = t;
     ext2::write_inode(e2, ino, &inode)
+}
+
+/// Give the file at `from` a second name, `to`.
+///
+/// Directories have exactly one name, so they are refused. The new name's
+/// directory must be one the caller may change, as for `create`.
+pub fn link(e2: &mut Ext2State, from: &[u8], to: &[u8], uid: u32, gid: u32) -> Result<(), u64> {
+    let (ino, mut inode, _) = ext2_dir::resolve_path(e2, from, uid, gid)?;
+    if inode.is_dir() {
+        return Err(ERR_IS_DIR);
+    }
+    // What e2fsck accepts: ext2's own limit, and ext4's.
+    let most = if e2.is_ext4() { 65000 } else { 32000 };
+    if inode.i_links_count >= most {
+        return Err(ERR_TOO_MANY_LINKS);
+    }
+    let (to_parent, to_name) = split_path(to)?;
+    let (tpi, mut tp) = writable_dir(e2, to_parent, uid, gid)?;
+    if ext2_dir::find_entry(e2, &tp, to_name)?.is_some() {
+        return Err(ERR_EXISTS);
+    }
+    let t = ext2::now();
+    // The count first: a failure after it leaves a file with one name too
+    // few, which e2fsck mends, rather than a name the count does not know.
+    inode.i_links_count += 1;
+    inode.i_ctime = t;
+    ext2::write_inode(e2, ino, &inode)?;
+    ext2_dir::create_dir_entry(e2, tpi, &mut tp, to_name, ino, ext2::file_type_of(&inode))?;
+    tp.i_mtime = t;
+    tp.i_ctime = t;
+    ext2::write_inode(e2, tpi, &tp)
 }
 
 /// Whether directory `dir` is `ancestor` or somewhere beneath it.

@@ -637,12 +637,18 @@ long __quark_syscall(long n, long a1, long a2, long a3, long a4, long a5, long a
             return -LX_EINVAL;
         }
         return __quark_rename((const char *)a2, (const char *)a4);
-    /* A second name for a file is something this filesystem server does not
-       make. EPERM is Linux's answer for a filesystem without hard links, and
-       the one callers such as fontconfig's lock know to fall back from. */
     case LX_link:
+        return __quark_link((const char *)a1, (const char *)a2);
     case LX_linkat:
-        return -LX_EPERM;
+        if (a1 != LX_AT_FDCWD || a3 != LX_AT_FDCWD) {
+            return -LX_ENOSYS;
+        }
+        /* Following a symbolic link at the source is accepted; naming the
+           source by descriptor is not offered. */
+        if (a5 & ~LX_AT_SYMLINK_FOLLOW) {
+            return -LX_EINVAL;
+        }
+        return __quark_link((const char *)a2, (const char *)a4);
     case LX_truncate:
         return __quark_truncate((const char *)a1, a2);
 
