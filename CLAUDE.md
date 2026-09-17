@@ -249,8 +249,20 @@ socketpair end as descriptor 3 and `WAYLAND_SOCKET=3`, which is what
 `user/wm/src` is one module per part of that: `client` (a connection and its
 buffered bytes), `objects` (one id table per client, which is what makes "a
 client cannot name another client's objects" true by construction), `surface`,
-`shell`, `shm`, `seat`, `clipboard`, `cursor`, `keymap`, `protocol`, `draw`.
+`shell`, `shm`, `seat`, `grab` (what the pointer is doing between a press on
+the compositor's own furniture and the release that ends it), `clipboard`,
+`cursor`, `keymap`, `protocol`, `draw`.
 `user/wmdemo` and the older six-tag window protocol still work alongside it.
+
+The pointer has a wheel, and it reaches a client as `wl_pointer.axis` with the
+group the version-5 events describe: `axis_source` says it is a wheel,
+`axis_discrete` gives the click count, the axis carries ten units per detent as
+Weston sends, and a `frame` ends the group. It starts at the i8042: a PS/2
+mouse says nothing about a wheel until it is asked, and what asks is the knock
+in `user/keyboard` — sample rate 200, then 100, then 80 — after which the
+device calls itself 3 and sends four bytes instead of three. The packet length
+comes from that answer and not from hope; reading a fourth byte from a mouse
+sending three loses the stream for good.
 
 The keyboard goes with it, and so does the pointer. `user/input` has the same
 claim protocol: while a program holds it, raw key and pointer events go to that
@@ -270,7 +282,7 @@ byte for one device can be waiting when the other's interrupt arrives. Two
 drivers sharing port 0x60 would take each other's bytes, and the symptom of
 losing that race is a keyboard that types rubbish or stops.
 
-Three things to know before changing any of it:
+Some things to know before changing any of it:
 
 - **The display is a stack, and so is the keyboard.** A claim goes on top and
   displaces the one below, which gets it back (`TAG_FB_GAINED`) when
@@ -317,6 +329,36 @@ Three things to know before changing any of it:
 - **What the compositor has, each client has a share of.** Pools, buffers and
   surfaces are shared tables, so one client may hold a quarter of each: a
   client asking for them in a loop is a client, not a compositor.
+- **Between a press on the compositor's own furniture and the release that
+  ends it, the pointer is the compositor's.** That is a grab (`wm/src/grab.rs`),
+  and while one is on no client hears a motion or a button — the movement is
+  not about them. A press on the title bar moves the window, one within `GRIP`
+  of an edge or corner resizes it, one on the close box asks the client to go,
+  and two on the bar within half a second fill the screen. A grab ends when the
+  button comes up, when the window goes, or when its client disconnects; the
+  last two are one thing, and `destroy_window` says so before it frees the slot,
+  or the grab would go on moving a window somebody else has since been given.
+  `xdg_toplevel.move` and `.resize` start the same grabs for a client that
+  draws its own decorations, and are refused unless a button is actually down —
+  a grab with nothing held ends at the next release or never, which is a client
+  taking the pointer away from whoever is using the machine.
+- **A size is agreed, not imposed.** The compositor never resizes a window
+  itself: it sends `xdg_toplevel.configure` with a size and the states, then
+  `xdg_surface.configure` with a serial, and the window follows whatever buffer
+  the client attaches. A client that ignores the pair keeps the size it had and
+  nothing waits for it. The two halves go together — one without the other
+  leaves a client waiting for a serial that never comes — and a surface accepts
+  any serial from the oldest unanswered one up to the newest sent, because a
+  resize sends one per tick and answering one supersedes the older ones. A
+  compositor that insisted on the newest killed a client for being a frame
+  behind.
+- **A version is advertised only when every event of it is sent.** `wl_seat` is
+  5 because `wl_pointer.frame` and the axis events go out; `wl_output` is 2 for
+  `scale` and `done`; `xdg_wm_base`, `wl_shm`, `wl_compositor`, the decoration
+  manager, `wl_data_device_manager` and the primary selection are 1. The
+  clipboard stops at 1 deliberately: 2 and 3 are drag and drop. An object made
+  from another inherits its version, which is how a client that bound
+  `wl_seat` at 4 gets a `wl_pointer` with no `frame`.
 - **Events are pulled, not pushed.** A server calls a client only when the
   client asked it to and handed over the right to — `fb` and the keyboard are
   offered an `Endpoint` with the request that needs one. Otherwise it answers:
@@ -415,8 +457,21 @@ change here: it has found what reading the code did not.
   still come from `SYS_MMAP`, backed at once.
 - Focus is a single stack with little policy: Tab cycles, a new window takes it,
   and a click raises the one under the pointer. Keyboard focus and pointer focus
-  are tracked separately, as Wayland requires, but there is no follow-mouse, no
-  focus stealing prevention, and no way to move or resize a window.
+  are tracked separately, as Wayland requires, but there is no follow-mouse and
+  no focus stealing prevention.
+- The compositor keeps no history of serials, so `xdg_toplevel.move` and
+  `.resize` cannot check that the serial they are given was a recent press.
+  What they check instead is that a button is down. Drag and drop, touch and
+  key repeat as a compositor policy are all still missing, and so is any way to
+  put a window somewhere other than on the one screen: fullscreen and minimise
+  are read and ignored.
+- **`wl_shm_pool.resize` is refused.** A pool may only grow, and growing means
+  new memory, which means a descriptor the request does not carry; a client
+  that drew past the old end would fault the compositor. A client that needs a
+  bigger pool makes a new one and lets the old go after the commit that
+  replaces it — which is safe because a buffer destroyed while it is being
+  shown becomes a zombie and its pool stays mapped until nothing shows it.
+  Toolkits do call `resize`, so this is a real gap rather than a preference.
 - The clock is read once, from the CMOS clock at boot, as UTC. Nothing sets it,
   and there is no time zone.
 - `O_CREAT` through a symbolic link whose target does not exist says EEXIST,

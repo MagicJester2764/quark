@@ -87,7 +87,7 @@ pointer, and a scroll wheel reaches a client.*
   `wheel: N` with N the number of clicks sent. `dtest` still passes, and
   typing at the prompt still works — the same controller carries both.
 
-- [ ] **Step 5: Commit.** quark: "A wheel on the same controller".
+- [x] **Step 5: Commit.** quark: "A wheel on the same controller".
 
 ---
 
@@ -136,7 +136,7 @@ pointer, and a scroll wheel reaches a client.*
   and `wlprobe` still reports the seat it gets. `wlfuzz` still leaves the
   compositor standing (twenty seeds).
 
-- [ ] **Step 5: Commit.** quark: "A scroll wheel reaches a client";
+- [x] **Step 5: Commit.** quark: "A scroll wheel reaches a client";
   explosion: "wlscroll".
 
 ---
@@ -186,7 +186,7 @@ pointer, and a scroll wheel reaches a client.*
   that leaves the screen edge keeps the title bar reachable. `wlcairo` keeps
   animating while it is dragged.
 
-- [ ] **Step 5: Commit.** quark: "A window can be moved".
+- [x] **Step 5: Commit.** quark: "A window can be moved".
 
 ---
 
@@ -237,7 +237,7 @@ pointer, and a scroll wheel reaches a client.*
   sends a configure without `resizing`. A client that ignores the configure
   (`wlprobe`) keeps its old size and nothing breaks.
 
-- [ ] **Step 5: Commit.** quark: "A window can be resized".
+- [x] **Step 5: Commit.** quark: "A window can be resized".
 
 ---
 
@@ -273,7 +273,7 @@ pointer, and a scroll wheel reaches a client.*
   maximises and comes back to its old size. A client that has no close
   handler stays open.
 
-- [ ] **Step 5: Commit.** quark: "Maximise, and a close button".
+- [x] **Step 5: Commit.** quark: "Maximise, and a close button".
 
 ---
 
@@ -298,7 +298,7 @@ pointer, and a scroll wheel reaches a client.*
 - [x] **Step 3: Verify.** `wm wlprobe`: it names the output. `wlfuzz` still
   leaves the compositor standing.
 
-- [ ] **Step 4: Commit.** quark: "A surface knows which output it is on".
+- [x] **Step 4: Commit.** quark: "A surface knows which output it is on".
 
 ---
 
@@ -334,20 +334,33 @@ pointer, and a scroll wheel reaches a client.*
   paste"` moves the text; the ordinary clipboard still works alongside it;
   `wlfuzz` still leaves the compositor standing.
 
-- [ ] **Step 4: Commit.** quark: "The middle button pastes"; explosion:
+- [x] **Step 4: Commit.** quark: "The middle button pastes"; explosion:
   "wlclip: the primary selection".
 
 ---
 
 ### Task 8: Write it down
 
-- [ ] `quark/CLAUDE.md`: the grab (the pointer belongs to the compositor
+- [x] `quark/CLAUDE.md`: the grab (the pointer belongs to the compositor
   between a press on its chrome and the release), the configure round trip
   (a size is agreed, not imposed), and which versions each interface is
-  advertised at and why.
-- [ ] `~/src/osdev/ROADMAP.md`: Phase 14 done, what it took, what is left
+  advertised at and why. Also the wheel's handshake, `grab.rs` in the module
+  list, and three new gaps: no serial history, `wl_shm_pool.resize` refused,
+  and no drag and drop, touch or key repeat.
+- [x] `~/src/osdev/ROADMAP.md`: Phase 14 done, what it took, what is left
   (drag and drop, touch, key repeat as a compositor policy).
-- [ ] Tick this plan; commit and push quark and explosion.
+- [x] Tick this plan; commit and push quark and explosion.
+
+**Acceptance, run on both filesystems.** ext2: `wlscroll` read four detents
+down and two up as `axis vertical ±10.00 discrete ±1 source wheel`;
+weston-simple-shm moved from (34,34) to (234,138) and resized from 644x506 to
+796x658 exactly following the drags; `wlprobe` printed "surface enter: output
+6"; `wlclip --primary` moved 25 bytes between two programs; clicking wlcairo's
+close box ended it and the session with it; twenty wlfuzz seeds — forty
+clients — each ended with the compositor naming what they did wrong and
+staying up. ext4: `dtest` 267/0, `libc.tests` 12/0, `fontconfig.tests` 4/0,
+`cairo.tests` 2/0, `hostile.tests` 560/0, `e2fsck` clean. No faults on serial
+in either boot.
 
 ---
 
