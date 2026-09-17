@@ -151,6 +151,27 @@ pub const TOPLEVEL_SET_TITLE: u16 = 2;
 /// title bar would have started. A client that draws its own decorations has
 /// no other way to move its window, because it does not know where it is.
 pub const TOPLEVEL_MOVE: u16 = 5;
+/// `resize(seat, serial, edges)`: the same, for a corner or an edge.
+pub const TOPLEVEL_RESIZE: u16 = 6;
+
+/// `xdg_toplevel.resize_edge`, which is a pair of bits and not an enumeration
+/// of nine values: a corner is its two edges together.
+pub const EDGE_TOP: u32 = 1;
+pub const EDGE_BOTTOM: u32 = 2;
+pub const EDGE_LEFT: u32 = 4;
+pub const EDGE_RIGHT: u32 = 8;
+
+/// `xdg_toplevel.state`, the array a configure carries.
+///
+/// `activated` is what a client draws its title bar differently for, and
+/// `resizing` is what tells one to stop chasing its own frame rate while the
+/// size is still moving.
+pub const STATE_MAXIMIZED: u32 = 1;
+pub const STATE_FULLSCREEN: u32 = 2;
+pub const STATE_RESIZING: u32 = 3;
+pub const STATE_ACTIVATED: u32 = 4;
+/// How many of them one configure can carry here.
+pub const MAX_STATES: usize = 4;
 pub const TOPLEVEL_CONFIGURE: u16 = 0;
 pub const TOPLEVEL_CLOSE: u16 = 1;
 

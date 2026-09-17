@@ -978,6 +978,43 @@ impl Client {
         if self.pointer == 0 { None } else { Some(self.pointer) }
     }
 
+    /// Ask this client's toplevel to be a size, with the states that go with
+    /// the asking.
+    ///
+    /// The pair is the round trip the shell is built on: the toplevel's
+    /// configure carries the size and the state array, and the xdg_surface's
+    /// carries the serial that has to come back. Sending one without the other
+    /// leaves a client waiting for a serial that never arrives.
+    pub fn configure_toplevel(&mut self, surface_idx: usize, w: u32, h: u32, states: &[u32]) {
+        let Some(s) = surface::get(surface_idx) else {
+            return;
+        };
+        if s.toplevel == 0 || s.xdg_surface == 0 {
+            return; // a surface that is not a toplevel has nothing to configure
+        }
+        let (toplevel, xdg_surface) = (s.toplevel, s.xdg_surface);
+        if let Some(a) = self.begin(toplevel, proto::TOPLEVEL_CONFIGURE) {
+            self.arg_u32(w);
+            self.arg_u32(h);
+            // The state array is an array of four-byte values, not of bytes:
+            // what goes on the wire is a length in bytes and that many, so the
+            // numbers are laid out here and the length follows from them.
+            let mut bytes = [0u8; 4 * proto::MAX_STATES];
+            let n = states.len().min(proto::MAX_STATES);
+            for (i, st) in states.iter().take(n).enumerate() {
+                bytes[i * 4..i * 4 + 4].copy_from_slice(&st.to_le_bytes());
+            }
+            self.arg_array(&bytes[..n * 4]);
+            self.end(a);
+        }
+        let serial = shell::begin_configure(surface_idx);
+        if let Some(a) = self.begin(xdg_surface, proto::XDG_SURFACE_CONFIGURE) {
+            self.arg_u32(serial);
+            self.end(a);
+        }
+        self.flush();
+    }
+
     /// End a group of pointer events.
     ///
     /// Version 5 and up only. Below it there is no such event, and a client
@@ -1478,6 +1515,7 @@ impl Client {
                 if !self.objects.insert(id, Kind::XdgSurface { surface: idx }) {
                     return Err(self.no_room(id));
                 }
+                surface::set_xdg_surface(idx, id);
                 Ok(())
             }
             proto::WM_BASE_DESTROY => {
@@ -1512,6 +1550,7 @@ impl Client {
                 if !self.objects.insert(id, Kind::XdgToplevel { surface: idx }) {
                     return Err(self.no_room(id));
                 }
+                surface::set_toplevel(idx, id);
                 // The size, then the state (none of them), then the configure
                 // that says "answer this". A client waits for all three before
                 // it draws anything at all.
@@ -1537,6 +1576,9 @@ impl Client {
                 Ok(())
             }
             proto::XDG_SURFACE_DESTROY => {
+                // As with the toplevel: an id the client has destroyed must
+                // not be one a configure is later addressed to.
+                surface::set_xdg_surface(idx, 0);
                 self.objects.remove(object);
                 Ok(())
             }
@@ -1571,6 +1613,8 @@ impl Client {
             proto::TOPLEVEL_DESTROY => {
                 // The window goes; the surface stays until the client destroys
                 // that too. It is the client's `wl_surface` that names it.
+                // `clear_role` forgets both shell ids, so nothing configures an
+                // object the client has just destroyed.
                 surface::clear_role(idx);
                 self.objects.remove(object);
                 Ok(())
@@ -1604,9 +1648,27 @@ impl Client {
                 }
                 Ok(())
             }
-            // Maximise, fullscreen, minimise, resize: this compositor decides
-            // how big windows are, and says so by never sending a configure
-            // that offers the client a choice.
+            // resize(seat, serial, edges): the same grab a press on a corner
+            // starts. The edges are the client's to choose — it knows where
+            // the pointer went down inside its own decorations — and an
+            // `edges` of zero is "none", which starts nothing.
+            proto::TOPLEVEL_RESIZE => {
+                let _seat = take_object(&self.rbuf, args, false)?;
+                let _serial = take_u32(&self.rbuf, args)?;
+                let edges = take_u32(&self.rbuf, args)?;
+                if !crate::pointer_held() {
+                    return Ok(());
+                }
+                if let Some(s) = surface::get(idx) {
+                    if s.window != surface::NONE {
+                        let (x, y) = crate::cursor::position();
+                        crate::grab::start_resize(s.window, edges & 0xF, x, y);
+                    }
+                }
+                Ok(())
+            }
+            // Fullscreen and minimise: this compositor has one screen and no
+            // place to put a window that is not on it.
             _ => Ok(()),
         }
     }

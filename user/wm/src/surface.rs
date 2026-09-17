@@ -78,8 +78,18 @@ pub struct Surface {
     /// destroying the surface can tell the client its objects are gone.
     pub xdg_surface: u32,
     pub toplevel: u32,
-    /// The configure the client must acknowledge. Zero once acknowledged.
+    /// The newest configure sent and not yet acknowledged. Zero once every
+    /// one has been.
     pub awaiting: u32,
+    /// The oldest one it may still acknowledge.
+    ///
+    /// A resize sends a configure per tick, and a client answers them in its
+    /// own time — so by the time one ack arrives there may be three newer
+    /// serials outstanding. The protocol lets a client acknowledge any
+    /// configure it has been sent and not already answered, and acknowledging
+    /// one supersedes every older one; a compositor that insisted on the
+    /// newest would kill a client for being a frame behind. This one did.
+    pub oldest: u32,
     /// It has acknowledged at least one. Nothing is shown before this: a
     /// client that has not agreed to a size has not agreed to be a window.
     pub configured: bool,
@@ -104,6 +114,7 @@ pub const NO_SURFACE: Surface = Surface {
     current: NO_STATE,
     frame: [0; MAX_FRAME],
     nframe: 0,
+    oldest: 0,
     xdg_surface: 0,
     toplevel: 0,
     awaiting: 0,
@@ -195,26 +206,62 @@ pub fn set_title(idx: usize, title: &[u8]) {
     }
 }
 
+/// Record the shell objects wrapping a surface.
+///
+/// The compositor needs them to say anything to a client it was not asked a
+/// question by: a configure it decides to send — because a window is being
+/// resized, or maximised — goes to these two ids and to nothing else. Kept
+/// here rather than looked up in the client's object table because the table
+/// is indexed by id, and this is the other direction.
+pub fn set_xdg_surface(idx: usize, id: u32) {
+    unsafe {
+        if let Some(s) = SURFACES.get_mut(idx).filter(|s| s.used) {
+            s.xdg_surface = id;
+        }
+    }
+}
+
+pub fn set_toplevel(idx: usize, id: u32) {
+    unsafe {
+        if let Some(s) = SURFACES.get_mut(idx).filter(|s| s.used) {
+            s.toplevel = id;
+        }
+    }
+}
+
 pub fn set_configure(idx: usize, serial: u32) {
     unsafe {
         if let Some(s) = SURFACES.get_mut(idx).filter(|s| s.used) {
+            if s.awaiting == 0 {
+                s.oldest = serial;
+            }
             s.awaiting = serial;
         }
     }
 }
 
-/// The client acknowledged a configure. Only the one outstanding counts: a
-/// serial the compositor never sent is a client answering a question nobody
-/// asked.
+/// The client acknowledged a configure.
+///
+/// Any serial from the oldest unanswered one up to the newest sent, because
+/// that is the set the client has been given and not yet answered. Answering
+/// one supersedes the older ones, so the window moves up rather than closing:
+/// a serial from before that is one already answered, and a serial after it is
+/// one nobody sent — both are a client answering a question that was not
+/// asked, which is what the error says.
 pub fn ack(idx: usize, serial: u32) -> bool {
     unsafe {
         let Some(s) = SURFACES.get_mut(idx).filter(|s| s.used) else {
             return false;
         };
-        if s.awaiting == 0 || s.awaiting != serial {
+        if s.awaiting == 0 || serial < s.oldest || serial > s.awaiting {
             return false;
         }
-        s.awaiting = 0;
+        if serial == s.awaiting {
+            s.awaiting = 0;
+            s.oldest = 0;
+        } else {
+            s.oldest = serial + 1;
+        }
         s.configured = true;
         true
     }
@@ -375,6 +422,7 @@ pub fn clear_role(idx: usize) {
         s.role = Role::None;
         s.configured = false;
         s.awaiting = 0;
+        s.oldest = 0;
         s.window = NONE;
         s.current = NO_STATE;
         s.pending = NO_STATE;

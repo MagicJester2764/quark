@@ -208,24 +208,31 @@ pointer, and a scroll wheel reaches a client.*
 - Produces: `xdg_toplevel.resize(seat, serial, edges)` starts the same grab.
 - Produces: a client that never acknowledges is not waited for: the window
   keeps the size of the buffer it last attached.
+- Produces: `surface::ack` accepts any configure from the oldest unanswered
+  one up to the newest sent. A resize sends one per tick and a client answers
+  in its own time, so insisting on the newest kills a client for being a frame
+  behind — which is what it did, with `ack_configure: no such serial`.
+- Produces: `surface.xdg_surface` and `.toplevel` are recorded when the client
+  makes them. They were declared and cleared but never set, so a configure the
+  compositor decided to send had no object to address.
 
-- [ ] **Step 1: The failing check.** A key script that drags the bottom-right
+- [x] **Step 1: The failing check.** A key script that drags the bottom-right
   corner of `wlcairo`'s window 150 pixels out and screenshots. Expected
   today: the window does not change size, and the drag moves the pointer over
   the backdrop.
 
-- [ ] **Step 2: The grab.** `grab::start_resize(window, edges, x, y)` keeps
+- [x] **Step 2: The grab.** `grab::start_resize(window, edges, x, y)` keeps
   the window's rectangle at the start and computes a new one per motion,
   clamped to a minimum of 64 by 48 and to the screen. The compositor does not
   resize the window itself: it asks, and the client's next commit is what
   changes it.
 
-- [ ] **Step 3: The configure.** A configure carries the state array —
+- [x] **Step 3: The configure.** A configure carries the state array —
   `resizing` (3) while the grab is on, `activated` (4) when the surface has
   focus — which means `arg_array` with four-byte entries rather than the
   empty array sent today. Sizes are the *content* size, without the frame.
 
-- [ ] **Step 4: Verify.** The Step 1 script: `wlcairo` redraws at the new
+- [x] **Step 4: Verify.** The Step 1 script: `wlcairo` redraws at the new
   size with its scene scaled to it, and `weston-simple-shm` too. Releasing
   sends a configure without `resizing`. A client that ignores the configure
   (`wlprobe`) keeps its old size and nothing breaks.

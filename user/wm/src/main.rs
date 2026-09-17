@@ -291,6 +291,80 @@ pub fn move_window(idx: usize, x: usize, y: usize) {
     }
 }
 
+/// A window's content size, which is what a client is configured with: the
+/// frame is the compositor's and the client never hears about it.
+pub fn window_size(idx: usize) -> Option<(usize, usize)> {
+    if idx >= MAX_WINDOWS {
+        return None;
+    }
+    let win = unsafe { &WINDOWS[idx] };
+    if win.used { Some((win.w, win.h)) } else { None }
+}
+
+/// How close to an edge counts as taking hold of it.
+///
+/// Wider than the border it is drawn on. The border is two pixels, and a
+/// two-pixel target is one nobody can hit on purpose.
+const GRIP: usize = BORDER + 4;
+
+/// Which edges of a window a point is within reach of, as the protocol's pair
+/// of bits. Zero for a point that is not near one.
+fn resize_edges_at(idx: usize, x: usize, y: usize) -> u32 {
+    let win = unsafe { &WINDOWS[idx] };
+    let (fw, fh) = framed_size(win);
+    let (x0, y0) = (win.x, win.y);
+    let (x1, y1) = (win.x + fw, win.y + fh);
+    if x < x0 || x >= x1 || y < y0 || y >= y1 {
+        return 0;
+    }
+    let mut edges = 0;
+    if x < x0 + GRIP {
+        edges |= protocol::EDGE_LEFT;
+    } else if x + GRIP >= x1 {
+        edges |= protocol::EDGE_RIGHT;
+    }
+    if y < y0 + GRIP {
+        edges |= protocol::EDGE_TOP;
+    } else if y + GRIP >= y1 {
+        edges |= protocol::EDGE_BOTTOM;
+    }
+    edges
+}
+
+/// Ask a window's client to be a size.
+///
+/// An ask and not an order: the configure carries a size and a serial, the
+/// client acknowledges it and attaches a buffer, and the window follows the
+/// buffer. A client that ignores it keeps the size it had, and nothing here
+/// waits for one — a compositor that blocked on a client would be a compositor
+/// one client could stop.
+pub fn ask_resize(idx: usize, w: usize, h: usize, resizing: bool) {
+    let Some(surface_idx) = surface::by_window(idx) else {
+        return;
+    };
+    let Some(s) = surface::get(surface_idx) else {
+        return;
+    };
+    let slot = s.client;
+    if slot >= client::MAX_CLIENTS {
+        return;
+    }
+    let mut states = [0u32; protocol::MAX_STATES];
+    let mut n = 0;
+    if resizing {
+        states[n] = protocol::STATE_RESIZING;
+        n += 1;
+    }
+    if unsafe { FOCUS } == idx {
+        states[n] = protocol::STATE_ACTIVATED;
+        n += 1;
+    }
+    unsafe {
+        let clients = &raw mut CLIENTS;
+        (*clients)[slot].configure_toplevel(surface_idx, w as u32, h as u32, &states[..n]);
+    }
+}
+
 /// Is a point on a window's title bar — the compositor's own furniture rather
 /// than the client's pixels?
 fn on_title_bar(idx: usize, x: usize, y: usize) -> bool {
@@ -708,12 +782,22 @@ fn dispatch_pointer(buttons: u8, wheel: i32) {
                 raise(idx);
                 composite();
             }
-            // And the title bar is a handle. A press there is the compositor's
-            // own, which is why the client is told nothing about it: the
-            // gesture is about where its window is, not about its contents.
-            if pressed & MOUSE_LEFT != 0 && on_title_bar(idx, x, y) {
-                grab::start_move(idx, x, y);
-                return;
+            // The frame is a handle, and its edges are different handles.
+            // Edges first: the top one runs along the title bar, and a press
+            // there means the size and not the position.
+            if pressed & MOUSE_LEFT != 0 {
+                let edges = resize_edges_at(idx, x, y);
+                if edges != 0 {
+                    grab::start_resize(idx, edges, x, y);
+                    return;
+                }
+                // A press on the title bar is the compositor's own, which is
+                // why the client is told nothing about it: the gesture is
+                // about where its window is, not about its contents.
+                if on_title_bar(idx, x, y) {
+                    grab::start_move(idx, x, y);
+                    return;
+                }
             }
         }
     }
@@ -1002,7 +1086,8 @@ pub fn adopt_window(owner: usize, buf: usize, w: usize, h: usize, stride: usize)
 /// of the same size means only this window changed, which is the case a client
 /// hits sixty times a second.
 pub fn set_window_buffer(idx: usize, buf: usize, w: usize, h: usize, stride: usize) {
-    let resized = unsafe { WINDOWS[idx].w != w || WINDOWS[idx].h != h };
+    let (ow, oh) = unsafe { (WINDOWS[idx].w, WINDOWS[idx].h) };
+    let resized = ow != w || oh != h;
     unsafe {
         let win = &mut WINDOWS[idx];
         if !win.used {
@@ -1014,6 +1099,20 @@ pub fn set_window_buffer(idx: usize, buf: usize, w: usize, h: usize, stride: usi
         win.stride = stride;
     }
     if resized {
+        // A window being dragged by its left or top edge has to move as it
+        // changes size, or the edge the pointer is *not* holding walks across
+        // the screen while the one it is holding stays put.
+        if let Some(edges) = grab::resize_edges(idx) {
+            unsafe {
+                let win = &mut WINDOWS[idx];
+                if edges & protocol::EDGE_LEFT != 0 {
+                    win.x = (win.x + ow).saturating_sub(w);
+                }
+                if edges & protocol::EDGE_TOP != 0 {
+                    win.y = (win.y + oh).saturating_sub(h);
+                }
+            }
+        }
         composite();
     }
 }
