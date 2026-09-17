@@ -39,6 +39,8 @@ pub const TAG_FCHDIR: u64 = 19;
 pub const TAG_GETCWD: u64 = 20;
 /// Start a program the caller is making in the caller's directory.
 pub const TAG_GIVE_CWD: u64 = 21;
+/// Take, drop or ask about a record lock on an open file.
+pub const TAG_LOCK: u64 = 22;
 pub const TAG_OK: u64 = 0;
 pub const TAG_ERROR: u64 = u64::MAX;
 
@@ -55,6 +57,13 @@ pub const OPEN_NOFOLLOW: u64 = 16;
 
 /// LINK: follow a symbolic link at the end of the source path.
 pub const LINK_FOLLOW: u64 = 1;
+
+/// LOCK: answer when the lock is granted rather than refusing now.
+pub const LOCK_WAIT: u64 = 1;
+/// LOCK: the lock is the handle's, not the program's.
+pub const LOCK_OFD: u64 = 2;
+/// LOCK: grant nothing; say what would be in the way.
+pub const LOCK_QUERY: u64 = 4;
 
 // Error codes, in an error reply's first word.
 pub const ERR_NOT_FOUND: u64 = 1;
@@ -78,6 +87,10 @@ pub const ERR_NAME_TOO_LONG: u64 = 13;
 pub const ERR_NO_SPACE: u64 = 14;
 /// A lookup followed more symbolic links than it may.
 pub const ERR_LOOP: u64 = 15;
+/// A lock that would have to wait, asked for without waiting.
+pub const ERR_WOULD_BLOCK: u64 = 16;
+/// Waiting for this lock would wait for ever.
+pub const ERR_DEADLOCK: u64 = 17;
 /// The file has as many names as the filesystem allows.
 pub const ERR_TOO_MANY_LINKS: u64 = 18;
 

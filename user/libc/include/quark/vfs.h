@@ -33,6 +33,13 @@
 #define QUARK_VFS_TAG_FCHDIR  19
 #define QUARK_VFS_TAG_GETCWD  20
 #define QUARK_VFS_TAG_GIVE_CWD 21
+#define QUARK_VFS_TAG_LOCK    22
+
+/* QUARK_VFS_TAG_LOCK's flags: wait to be granted; the lock belongs to the
+   handle, not the program; grant nothing and say what is in the way. */
+#define QUARK_VFS_LOCK_WAIT  1UL
+#define QUARK_VFS_LOCK_OFD   2UL
+#define QUARK_VFS_LOCK_QUERY 4UL
 
 /* A directory record, as QUARK_VFS_TAG_READDIR fills a buffer with them:
    `id`, `next` and `size` (8 bytes each), `reclen` (2), `type` (1) and
@@ -64,6 +71,8 @@
 #define QUARK_VFS_NAME_TOO_LONG 13
 #define QUARK_VFS_NO_SPACE      14
 #define QUARK_VFS_LOOP          15
+#define QUARK_VFS_WOULD_BLOCK   16
+#define QUARK_VFS_DEADLOCK      17
 #define QUARK_VFS_TOO_MANY_LINKS 18
 
 /* The server's devices have ids from here up, in the order null, zero, full,
@@ -152,6 +161,13 @@ int quark_vfs_chdir(const char *path);
 int quark_vfs_fchdir(unsigned long handle);
 long quark_vfs_getcwd(char *out, unsigned long len);
 int quark_vfs_give_cwd(unsigned long child);
+
+/* A record lock on `handle`'s file: `kind` 0 unlock, 1 shared, 2 exclusive,
+   over `start` for `len` bytes (0: to the end and beyond). With
+   QUARK_VFS_LOCK_QUERY, `out` gets the kind, start, length and holding
+   program of the first lock in the way (kind 0 if none). */
+int quark_vfs_lock(unsigned long handle, unsigned long kind, unsigned long start,
+                   unsigned long len, unsigned long flags, unsigned long out[4]);
 
 /* Fill `buf` (at most a page) with the records of a directory from entry
    `start`. `*next` is where the next call should start, `*end` says there is

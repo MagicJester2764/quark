@@ -249,6 +249,27 @@ long quark_vfs_getcwd(char *out, unsigned long len) {
     return (long)n;
 }
 
+int quark_vfs_lock(unsigned long handle, unsigned long kind, unsigned long start,
+                   unsigned long len, unsigned long flags, unsigned long out[4]) {
+    struct quark_msg msg;
+    struct quark_msg reply;
+
+    zero(&msg, sizeof msg);
+    msg.tag = QUARK_VFS_TAG_LOCK;
+    msg.data[0] = handle;
+    msg.data[1] = kind;
+    msg.data[2] = start;
+    msg.data[3] = len;
+    msg.data[4] = flags;
+    int err = vfs_call(&msg, &reply);
+    if (!err && out) {
+        for (int i = 0; i < 4; i++) {
+            out[i] = reply.data[i];
+        }
+    }
+    return err;
+}
+
 int quark_vfs_give_cwd(unsigned long child) {
     struct quark_msg msg;
     struct quark_msg reply;

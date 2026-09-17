@@ -14,6 +14,7 @@
 #define SYS_EXIT_CODE       1
 #define SYS_YIELD           2
 #define SYS_GETPID          3
+#define SYS_RECV_TIMEOUT    21
 #define SYS_WAIT            4
 
 /* 0x10  IPC */

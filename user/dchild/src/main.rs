@@ -15,6 +15,9 @@
 //! any of them, saying how many it got. `echo` answers every call with its
 //! tag plus one, until a call whose tag is 0. `cwd` exits 0 if the relative
 //! name `passwd` opens: whoever started it gave it `/etc` as its directory.
+//! `lock PATH` locks the whole file, says so on descriptor 3, and holds it
+//! until that closes; `lock2 PATH` locks byte 1, says so, waits for byte 0,
+//! and says so again once it has it.
 
 use quark_rt::ipc::{Message, TID_ANY};
 use quark_rt::manifest::CapReq;
@@ -62,6 +65,26 @@ pub extern "C" fn _start() -> ! {
         syscall::sys_exit_code(t.tid() as i32);
     }
 
+    if let Some(mode @ (b"lock" | b"lock2")) = quark_rt::args::argv(1) {
+        let path = quark_rt::args::argv(2).unwrap_or(b"");
+        let held = nameserver::lookup_retry(b"vfs", 20).and_then(|vfs| {
+            let (h, _, _) = vfs::open(vfs, path).ok()?;
+            if mode == b"lock" {
+                vfs::lock(vfs, h, vfs::LOCK_EXCLUSIVE, 0, 0, vfs::LOCK_WAIT).ok()?;
+                let _ = syscall::sys_fd_write(CONN, b"L");
+            } else {
+                vfs::lock(vfs, h, vfs::LOCK_EXCLUSIVE, 1, 1, 0).ok()?;
+                let _ = syscall::sys_fd_write(CONN, b"1");
+                vfs::lock(vfs, h, vfs::LOCK_EXCLUSIVE, 0, 1, vfs::LOCK_WAIT).ok()?;
+                let _ = syscall::sys_fd_write(CONN, b"2");
+            }
+            Some(())
+        });
+        // Held until the parent lets go of its end.
+        let mut buf = [0u8; 1];
+        while held.is_some() && matches!(syscall::sys_fd_read(CONN, &mut buf), 1..=0xFFFF) {}
+        syscall::sys_exit_code(if held.is_some() { 0 } else { 1 });
+    }
     if quark_rt::args::argv(1) == Some(&b"cwd"[..]) {
         let found = nameserver::lookup_retry(b"vfs", 20).is_some_and(|vfs| {
             vfs::open(vfs, b"passwd").map(|(h, _, _)| vfs::close(vfs, h)).is_ok()

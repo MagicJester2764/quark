@@ -14,6 +14,7 @@ pub mod disk;
 pub mod ext2_ops;
 pub mod handles;
 pub mod journal;
+pub mod locks;
 pub mod protocol;
 
 pub use protocol::*;
@@ -1393,6 +1394,9 @@ pub extern "C" fn _start() -> ! {
             TAG_CHDIR | TAG_FCHDIR => handle_chdir(&disk, sender, &msg),
             TAG_GETCWD => handle_getcwd(sender),
             TAG_GIVE_CWD => handle_give_cwd(sender, &msg),
+            TAG_LOCK => handle_lock(sender, &msg),
+            // A task waiting for a lock has gone; nobody is left to answer.
+            quark_rt::ipc::TAG_TASK_DIED if sender == 0 => locks::drop_task(msg.data[0] as usize),
             TAG_TRUNCATE => transacted(|| handle_truncate(sender, &msg)),
             TAG_STATFS => handle_statfs(sender),
             // From the kernel, which is not waiting for an answer.
@@ -1732,12 +1736,119 @@ fn handle_read(disk: &DiskState, sender: usize, msg: &Message) {
 /// Reply: tag=TAG_OK  OR  tag=TAG_ERROR
 fn handle_close(sender: usize, msg: &Message) {
     let handle = msg.data[0] as usize;
-    match handles::close(handle, space_of(sender)) {
+    let space = space_of(sender);
+    // Closing any handle on a file drops every lock the program holds on it,
+    // as POSIX has it; the handle's own locks go with the handle.
+    let key = get_handle(handle, sender).and_then(|f| handles::lock_key(f));
+    match handles::close(handle, space) {
         Some(ino) => {
             reply_opened(sender, [0; 6]);
+            // Another thread may be waiting for a lock through this handle.
+            while let Some(w) = locks::drop_handle(handle) {
+                error_reply(w.sender, ERR_INVALID_HANDLE);
+            }
+            if let Some(key) = key {
+                locks::release(locks::Owner::Program(space), Some(key));
+            }
+            grant_waiters();
             settle(&[ino]);
         }
         None => error_reply(sender, ERR_INVALID_HANDLE),
+    }
+}
+
+/// TAG_LOCK: `[handle, kind, start, len, flags]`. `kind` is 0 to unlock, 1
+/// shared, 2 exclusive; `len` 0 runs to the end of the file and beyond. With
+/// `LOCK_QUERY` the reply is `[kind, start, len, holder]` of the first lock in
+/// the way (`kind` 0 if none, `holder` the program, or all ones for a
+/// handle's). With `LOCK_WAIT` a lock that cannot be granted yet is answered
+/// when it can be.
+fn handle_lock(sender: usize, msg: &Message) {
+    let handle = msg.data[0] as usize;
+    let [_, kind, start, len, flags, _] = msg.data;
+    let space = space_of(sender);
+    let Some(file) = get_handle(handle, sender) else {
+        return error_reply(sender, ERR_INVALID_HANDLE);
+    };
+    let Some(inode) = handles::lock_key(file) else {
+        return error_reply(sender, ERR_NOT_SUPPORTED);
+    };
+    if kind > 2 || flags & !(LOCK_WAIT | LOCK_OFD | LOCK_QUERY) != 0 {
+        return error_reply(sender, ERR_INVALID_PATH);
+    }
+    let end = if len == 0 {
+        u64::MAX
+    } else {
+        match start.checked_add(len) {
+            Some(end) => end,
+            None => return error_reply(sender, ERR_INVALID_PATH),
+        }
+    };
+    let owner = if flags & LOCK_OFD != 0 {
+        locks::Owner::Handle(handle)
+    } else {
+        locks::Owner::Program(space)
+    };
+    let want = locks::Range { inode, owner, start, end, exclusive: kind == 2 };
+
+    if flags & LOCK_QUERY != 0 {
+        if kind == 0 {
+            return error_reply(sender, ERR_INVALID_PATH);
+        }
+        let answer = match locks::conflict(&want) {
+            Some(held) => [
+                if held.exclusive { 2 } else { 1 },
+                held.start,
+                if held.end == u64::MAX { 0 } else { held.end - held.start },
+                match held.owner {
+                    locks::Owner::Program(s) => s,
+                    locks::Owner::Handle(_) => u64::MAX,
+                },
+                0,
+                0,
+            ],
+            None => [0; 6],
+        };
+        return reply_opened(sender, answer);
+    }
+
+    if kind == 0 {
+        match locks::apply(&want, true) {
+            Ok(()) => reply_opened(sender, [0; 6]),
+            Err(code) => error_reply(sender, code),
+        }
+        return grant_waiters();
+    }
+    match locks::conflict(&want) {
+        None => match locks::apply(&want, false) {
+            // An exclusive lock made shared may let a waiter in.
+            Ok(()) => {
+                reply_opened(sender, [0; 6]);
+                grant_waiters();
+            }
+            Err(code) => error_reply(sender, code),
+        },
+        Some(_) if flags & LOCK_WAIT != 0 => {
+            match locks::wait(locks::Waiter { sender, space, want }) {
+                // No answer until it is granted. If the task waiting goes
+                // first, the server is told, and forgets the request.
+                Ok(()) => {
+                    let _ = syscall::sys_task_watch(sender);
+                }
+                Err(code) => error_reply(sender, code),
+            }
+        }
+        Some(_) => error_reply(sender, ERR_WOULD_BLOCK),
+    }
+}
+
+/// Answer every waiting lock request that can now be granted.
+fn grant_waiters() {
+    while let Some(w) = locks::grantable() {
+        match locks::apply(&w.want, false) {
+            Ok(()) => reply_opened(w.sender, [0; 6]),
+            Err(code) => error_reply(w.sender, code),
+        }
     }
 }
 
@@ -1745,6 +1856,8 @@ fn handle_close(sender: usize, msg: &Message) {
 fn client_died(space: u64) {
     let mut closed = [0u32; handles::MAX_OPEN_FILES];
     let n = handles::close_all(space, &mut closed);
+    locks::drop_space(space);
+    grant_waiters();
     settle(&closed[..n]);
     if let cwd::Where::Inode(ino) = cwd::forget(space) {
         settle(&[ino]);

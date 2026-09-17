@@ -765,7 +765,7 @@ was not re-run (`chdir` was not answered). libc.tests 9/9 on ext2 and ext4,
 
 Semantics are Linux's. A program's (POSIX) locks: its own locks never conflict with each other, a new lock replaces and merges its old ones over the same range, and closing *any* of the program's handles on the file releases all of its locks on that file. An open handle's (OFD, `flock`) locks: they conflict with every other owner, including another handle of the same program, and go when that handle closes. A program's death releases everything it owned and drops its waiters. A waiting request is answered when it can be granted, re-checked whenever a lock on that inode is released; before a program waits, the server follows the waits-for chain (program owners only) and answers `DEADLOCK` if it would come back to the program asking.
 
-- [ ] **Step 1: The failing tests.** `locktest.c` (runs on Linux):
+- [x] **Step 1: The failing tests.** `locktest.c` (runs on Linux):
 
 ```c
 #define _GNU_SOURCE /* F_OFD_* */
@@ -863,9 +863,9 @@ int main(void) {
 
 dtest `locks` (new section): `dchild lock /tmp/dtest-lock` takes an exclusive program lock with `vfs::lock(…, LOCK_WAIT)`, writes one byte to descriptor 3 (a socketpair end the parent gave it, as `spaces` does) and then blocks reading it; dtest waits for the byte, then checks `vfs::lock(…, 2, 0, 0, 0)` is `ERR_WOULD_BLOCK`, `LOCK_QUERY` names the child's space, closes its end (the child's read ends and it exits), and checks the lock is granted once the child has gone. A deadlock check: dtest holds byte 0, the child holds byte 1 and waits for byte 0; dtest's wait for byte 1 answers `ERR_DEADLOCK`.
 
-- [ ] **Step 2: Run them.** Host: all ok. Quark: the first `F_SETLK` fails (`EINVAL`).
+- [x] **Step 2: Run them.** Host: all ok. Quark: the first `F_SETLK` fails (`EINVAL`).
 
-- [ ] **Step 3: The server.** `locks.rs`:
+- [x] **Step 3: The server.** `locks.rs`:
 
 ```rust
 #[derive(Clone, Copy, PartialEq)]
@@ -889,11 +889,23 @@ pub fn drop_space(space: u64)                          // locks and waiters of a
 
 `end` is exclusive and `u64::MAX` for "to the end"; ranges are compared as half-open intervals. `handle_lock` answers at once unless `LOCK_WAIT` finds a conflict, in which case it calls `locks::wait` and does not reply. After every `release` or `apply(unlock)`, the main loop drains `locks::grantable()`, applies each and replies `OK` to its sender. `handle_close` releases `Owner::Handle(h)` and `Owner::Program(space)` on that inode; `client_died` calls `drop_space`.
 
-- [ ] **Step 4: Clients.** The layer's `fcntl`: `F_GETLK` (5), `F_SETLK` (6), `F_SETLKW` (7) with `LOCK_OFD` clear; `F_OFD_GETLK` (36), `F_OFD_SETLK` (37), `F_OFD_SETLKW` (38) with it set. `struct flock` is `short l_type` (`F_RDLCK` 0, `F_WRLCK` 1, `F_UNLCK` 2) at 0, `short l_whence` at 2, `l_start` at 8, `l_len` at 16, `l_pid` at 24; `l_whence` is resolved against the descriptor's offset (`SEEK_CUR`) or size (`SEEK_END`); a negative `l_len` covers the bytes before `l_start`. A query fills `l_type` (`F_UNLCK` if nothing conflicts), `l_start`, `l_len` (0 for "to the end") and `l_pid` (-1 for an OFD lock, else the holder's space id). `WOULD_BLOCK` is `EAGAIN`, `DEADLOCK` is `EDEADLK` (35). `flock` (73): `LOCK_SH` 1, `LOCK_EX` 2, `LOCK_UN` 8, `LOCK_NB` 4 → an OFD lock on the whole file, waiting unless `LOCK_NB`.
+- [x] **Step 4: Clients.** The layer's `fcntl`: `F_GETLK` (5), `F_SETLK` (6), `F_SETLKW` (7) with `LOCK_OFD` clear; `F_OFD_GETLK` (36), `F_OFD_SETLK` (37), `F_OFD_SETLKW` (38) with it set. `struct flock` is `short l_type` (`F_RDLCK` 0, `F_WRLCK` 1, `F_UNLCK` 2) at 0, `short l_whence` at 2, `l_start` at 8, `l_len` at 16, `l_pid` at 24; `l_whence` is resolved against the descriptor's offset (`SEEK_CUR`) or size (`SEEK_END`); a negative `l_len` covers the bytes before `l_start`. A query fills `l_type` (`F_UNLCK` if nothing conflicts), `l_start`, `l_len` (0 for "to the end") and `l_pid` (-1 for an OFD lock, else the holder's space id). `WOULD_BLOCK` is `EAGAIN`, `DEADLOCK` is `EDEADLK` (35). `flock` (73): `LOCK_SH` 1, `LOCK_EX` 2, `LOCK_UN` 8, `LOCK_NB` 4 → an OFD lock on the whole file, waiting unless `LOCK_NB`.
 
-- [ ] **Step 5: Verify.** Build, layer, suites, image; boot `runtests /etc/libc.tests` (locktest ok), `dtest locks`, `runtests /etc/fontconfig.tests` (fontconfig's directory lock now works; no `F_SETLKW` failure path); `check-rootfs.sh`.
+- [x] **Step 5: Verify.** Build, layer, suites, image; boot `runtests /etc/libc.tests` (locktest ok), `dtest locks`, `runtests /etc/fontconfig.tests` (fontconfig's directory lock now works; no `F_SETLKW` failure path); `check-rootfs.sh`.
 
-- [ ] **Step 6: Commit.** quark: "Record locks"; explosion: "locktest".
+- [x] **Step 6: Commit.** quark: "Record locks"; explosion: "locktest".
+
+**Done.** locktest's waiting check first failed for a reason outside locks:
+the Linux layer answered neither `nanosleep` nor `clock_nanosleep`, so every C
+`sleep` returned at once and the releasing thread let go before anything
+waited. Both are answered now, in whole ticks rounded up. Also: a waiter is
+watched (`sys_task_watch`) so a task that dies waiting is forgotten, and one
+whose handle another thread closes is answered `INVALID_HANDLE`; closing a
+copy of a descriptor sends an unlock for the program's locks, since the
+server only sees the last close; the lock table's room is counted before
+anything changes. The dtest section is `locks`. Step 2's failure was not
+re-run (the layer refused `F_SETLK`). libc.tests 10/10, `dtest locks` 9/0,
+`dtest` 248/0, fontconfig.tests 4/4, e2fsck clean.
 
 ---
 

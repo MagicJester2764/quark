@@ -1233,6 +1233,92 @@ fn test_runtime_service() {
     check("and can be taken again", nameserver::register(b"dchild-svc").is_ok());
 }
 
+/// Start `dchild MODE PATH` with one end of a fresh pair as its descriptor 3,
+/// and return it with this end.
+fn lock_child(mode: &[u8], path: &[u8]) -> Option<(spawn::Spawned, usize)> {
+    let (mine, theirs) = syscall::sys_socketpair().ok()?;
+    let child = load_child(&[b"dchild", mode, path])?;
+    let given = syscall::sys_fd_dup(child.tid, 3, theirs).is_ok();
+    let _ = syscall::sys_fd_close(theirs);
+    if !given || child.start().is_err() {
+        let _ = syscall::sys_fd_close(mine);
+        return None;
+    }
+    Some((child, mine))
+}
+
+/// One byte from `fd`, which a child writes when it has done something.
+fn child_says(fd: usize) -> Option<u8> {
+    let mut b = [0u8; 1];
+    (syscall::sys_fd_read(fd, &mut b) == 1).then_some(b[0])
+}
+
+fn test_locks() {
+    println!("locks across programs:");
+    let Some(vfs_tid) = nameserver::lookup_retry(b"vfs", 20) else {
+        check("find the VFS", false);
+        return;
+    };
+    const FILE: &[u8] = b"/tmp/dtest-lock";
+    if let Ok(o) = vfs::open_with(vfs_tid, FILE, vfs::OPEN_CREATE) {
+        let _ = vfs::close(vfs_tid, o.handle);
+    }
+    let Ok((h, _, _)) = vfs::open(vfs_tid, FILE) else {
+        check("open a file to lock", false);
+        return;
+    };
+    let (ex, wait, query) = (vfs::LOCK_EXCLUSIVE, vfs::LOCK_WAIT, vfs::LOCK_QUERY);
+
+    // Another program's lock keeps this one out, until that program has gone.
+    match lock_child(b"lock", FILE) {
+        Some((child, mine)) => {
+            check("a child takes a lock", child_says(mine) == Some(b'L'));
+            check(
+                "which keeps this program out",
+                vfs::lock(vfs_tid, h, ex, 0, 0, 0).err() == Some(vfs::ERR_WOULD_BLOCK),
+            );
+            let theirs = syscall::sys_task_space(child.tid).unwrap_or(0);
+            check(
+                "and a query names the child",
+                vfs::lock(vfs_tid, h, ex, 0, 0, query).is_ok_and(|a| a[0] == ex && a[3] == theirs),
+            );
+            let _ = syscall::sys_fd_close(mine);
+            check("the child lets go and exits", wait_for(child.tid) == Some(0));
+            check("and its lock went with it", vfs::lock(vfs_tid, h, ex, 0, 0, 0).is_ok());
+            let _ = vfs::lock(vfs_tid, h, vfs::LOCK_UNLOCK, 0, 0, 0);
+        }
+        None => check("a child takes a lock", false),
+    }
+
+    // Two programs each waiting for what the other holds.
+    let _ = vfs::lock(vfs_tid, h, ex, 0, 1, 0);
+    match lock_child(b"lock2", FILE) {
+        Some((child, mine)) => {
+            check("a child takes byte 1", child_says(mine) == Some(b'1'));
+            // Its next call waits for byte 0, which this program holds.
+            let blocked = (0..100).any(|_| {
+                syscall::sys_task_info(child.tid).is_ok_and(|(state, _, _)| state == 2) || {
+                    syscall::sleep_ticks(1);
+                    false
+                }
+            });
+            syscall::sleep_ticks(5);
+            check("and waits for byte 0", blocked);
+            check(
+                "waiting for byte 1 would never end",
+                vfs::lock(vfs_tid, h, ex, 1, 1, wait).err() == Some(vfs::ERR_DEADLOCK),
+            );
+            let _ = vfs::lock(vfs_tid, h, vfs::LOCK_UNLOCK, 0, 1, 0);
+            check("letting go of byte 0 lets the child in", child_says(mine) == Some(b'2'));
+            let _ = syscall::sys_fd_close(mine);
+            let _ = wait_for(child.tid);
+        }
+        None => check("a child takes byte 1", false),
+    }
+    let _ = vfs::close(vfs_tid, h);
+    let _ = vfs::unlink(vfs_tid, FILE);
+}
+
 fn test_random() {
     println!("random numbers:");
     let mut a = [0u8; 32];
@@ -1814,6 +1900,7 @@ pub extern "C" fn _start() -> ! {
         ("calls", test_call_storm),
         ("service", test_runtime_service),
         ("random", test_random),
+        ("locks", test_locks),
         ("files", test_files),
         ("sync", test_sync),
         ("fpu", test_fpu),

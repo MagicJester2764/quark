@@ -120,14 +120,42 @@ pub fn close(handle: usize, space: u64) -> Option<u32> {
 /// to `closed`, and their number returned.
 pub fn close_all(space: u64, closed: &mut [u32; MAX_OPEN_FILES]) -> usize {
     let mut n = 0;
-    for f in table().iter_mut() {
+    for (i, f) in table().iter_mut().enumerate() {
         if f.in_use && f.owner == space {
             closed[n] = f.inode_num();
             n += 1;
             *f = OpenFile::empty();
+            // The program is going, so whoever waited through it is too.
+            while crate::locks::drop_handle(i).is_some() {}
         }
     }
     n
+}
+
+/// What locks on `file` are keyed by: its inode, or for a file with none,
+/// something as stable. `None` for a handle nothing can lock.
+pub fn lock_key(file: &OpenFile) -> Option<u32> {
+    if file.link {
+        return None;
+    }
+    match &file.fs {
+        FsFileData::Ext2 { inode_num } => Some(*inode_num),
+        // An empty FAT32 file has no cluster: its directory and name stand in,
+        // folded into the half of the numbers clusters never reach.
+        FsFileData::Fat32 { first_cluster, dir_cluster, fat_name, .. } => {
+            if *first_cluster != 0 {
+                return Some(*first_cluster);
+            }
+            let mut h = *dir_cluster ^ 0x9E37_79B9;
+            for &b in fat_name {
+                h = h.rotate_left(5) ^ b as u32;
+            }
+            Some(0x8000_0000 | h)
+        }
+        FsFileData::Device(dev) => Some(crate::devices::id_of(*dev) as u32),
+        FsFileData::DevDir => Some(crate::devices::DIR_ID as u32),
+        FsFileData::None => None,
+    }
 }
 
 /// Whether any handle still names inode `ino`.

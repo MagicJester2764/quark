@@ -24,6 +24,7 @@ const TAG_CHDIR: u64 = 18;
 const TAG_FCHDIR: u64 = 19;
 const TAG_GETCWD: u64 = 20;
 const TAG_GIVE_CWD: u64 = 21;
+const TAG_LOCK: u64 = 22;
 const TAG_TRUNCATE: u64 = 13;
 const TAG_STATFS: u64 = 14;
 const TAG_ERROR: u64 = u64::MAX;
@@ -61,6 +62,18 @@ pub const ERR_NOT_SUPPORTED: u64 = 12;
 pub const ERR_NAME_TOO_LONG: u64 = 13;
 pub const ERR_NO_SPACE: u64 = 14;
 pub const ERR_LOOP: u64 = 15;
+pub const ERR_WOULD_BLOCK: u64 = 16;
+pub const ERR_DEADLOCK: u64 = 17;
+
+/// `lock`'s kinds.
+pub const LOCK_UNLOCK: u64 = 0;
+pub const LOCK_SHARED: u64 = 1;
+pub const LOCK_EXCLUSIVE: u64 = 2;
+/// `lock`'s flags: wait to be granted; the lock is the handle's rather than
+/// the program's; grant nothing and say what is in the way.
+pub const LOCK_WAIT: u64 = 1;
+pub const LOCK_OFD: u64 = 2;
+pub const LOCK_QUERY: u64 = 4;
 pub const ERR_TOO_MANY_LINKS: u64 = 18;
 
 /// File-type bits of a mode, as [`Stat::mode`] carries them.
@@ -429,6 +442,22 @@ pub fn getcwd(vfs_tid: usize, out: &mut [u8]) -> Result<usize, u64> {
 /// Call it before starting the child.
 pub fn give_cwd(vfs_tid: usize, child: usize) -> Result<(), u64> {
     simple_call(vfs_tid, TAG_GIVE_CWD, [child as u64, 0, 0, 0, 0, 0]).map(|_| ())
+}
+
+/// Take, drop or ask about a lock on bytes `start..start + len` (`len` 0: to
+/// the end and beyond) of the file open as `handle`. A query answers
+/// `[kind, start, len, holder]` of the first lock in the way, `kind` 0 if
+/// none; anything else answers zeroes.
+pub fn lock(
+    vfs_tid: usize,
+    handle: usize,
+    kind: u64,
+    start: u64,
+    len: u64,
+    flags: u64,
+) -> Result<[u64; 4], u64> {
+    let r = simple_call(vfs_tid, TAG_LOCK, [handle as u64, kind, start, len, flags, 0])?;
+    Ok([r.data[0], r.data[1], r.data[2], r.data[3]])
 }
 
 fn simple_call(vfs_tid: usize, tag: u64, data: [u64; 6]) -> Result<Message, u64> {

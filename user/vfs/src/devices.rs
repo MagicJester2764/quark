@@ -31,7 +31,7 @@ pub const NAMES: [(&[u8], Device); 5] = [
 /// Ids beside anything a filesystem hands out: the devices in the order of
 /// [`NAMES`], then the directory.
 const FIRST_ID: u64 = 0xFFFF_FF00;
-const DIR_ID: u64 = FIRST_ID + NAMES.len() as u64;
+pub const DIR_ID: u64 = FIRST_ID + NAMES.len() as u64;
 /// The root directory's inode, which is what `..` names.
 const ROOT_ID: u64 = 2;
 
@@ -88,6 +88,11 @@ pub fn lookup(path: &[u8]) -> Lookup {
 /// The device called `name` in `/dev`.
 pub fn by_name(name: &[u8]) -> Option<Device> {
     NAMES.iter().find(|(n, _)| *n == name).map(|(_, d)| *d)
+}
+
+/// A device's id, as `STAT` gives it.
+pub fn id_of(dev: Device) -> u64 {
+    FIRST_ID + index_of(dev) as u64
 }
 
 fn index_of(dev: Device) -> usize {

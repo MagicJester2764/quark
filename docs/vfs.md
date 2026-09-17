@@ -34,6 +34,8 @@ code in `data[0]`:
 | 13 | `NAME_TOO_LONG` | A path over 4095 bytes, or a name over 255 |
 | 14 | `NO_SPACE` | Nowhere to put what was written |
 | 15 | `LOOP` | A lookup followed more than 40 symbolic links |
+| 16 | `WOULD_BLOCK` | A lock is held that keeps this one out |
+| 17 | `DEADLOCK` | Waiting for this lock would wait for ever |
 | 18 | `TOO_MANY_LINKS` | The file has as many names as it can |
 
 Permission is checked against the caller's user and group, which the server
@@ -86,6 +88,7 @@ where the link was.
 | 19 | `FCHDIR` | `[handle]` | — | — |
 | 20 | `GETCWD` | — | 4096 bytes to fill | `[len]` |
 | 21 | `GIVE_CWD` | `[child_tid]` | — | — |
+| 22 | `LOCK` | `[handle, kind, start, len, flags]` | — | `[kind, start, len, holder]` for a query |
 
 Numbers are never reused. 4 was `READDIR`, which returned one entry per call
 and cut its name to 32 bytes. 7 was `CREATE`, which carried its path in the
@@ -228,6 +231,35 @@ must be a task the caller's program made (`SYS_TASK_CREATE_IN` lets that be
 before it runs) for another program; anything else is `PERMISSION`. A
 spawner calls it before starting the child, so the child's first relative
 path already starts in the right place.
+
+### LOCK
+
+A record lock on the file open as `handle`: `kind` 0 unlocks, 1 is shared, 2
+exclusive, over `len` bytes from `start` (`len` 0 runs to the end of the file
+and past it). `flags` is a set of:
+
+| Bit | Name | Effect |
+|---|---|---|
+| 1 | `WAIT` | Answer when the lock is granted, rather than `WOULD_BLOCK` now |
+| 2 | `OFD` | The lock is the handle's, not the program's |
+| 4 | `QUERY` | Grant nothing: reply with the first lock in the way |
+
+A program's locks are Linux's POSIX locks: its own never conflict, a new one
+replaces what the program held over its range and joins neighbours of the same
+kind, and closing any of the program's handles on the file drops all of them.
+A handle's locks (`OFD`, which is also what `flock` is) conflict with every
+other owner, another handle of the same program included, and go when the
+handle closes. A program's death drops everything it held or was waiting for.
+
+A query's reply names the lock in the way — `kind` (0 if none), `start`, `len`
+(0 for "to the end") and the program holding it, all ones for a handle's
+lock. A waiting request is answered when a release lets it in; closing the
+handle it was made through answers it `INVALID_HANDLE`. Before a program
+waits, the server follows the programs holding what it wants, and the
+requests they are waiting on in turn; if that leads back to the program
+asking, the answer is `DEADLOCK`. Locks live in the server's memory, 256 at
+once (`NO_SPACE` beyond), and are keyed by inode — on FAT32 by first cluster,
+or for an empty file by its directory and name.
 
 ### Devices
 

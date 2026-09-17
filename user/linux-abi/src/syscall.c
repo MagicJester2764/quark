@@ -58,6 +58,7 @@ typedef unsigned long size_t;
 #define LX_fadvise64       221
 #define LX_getpid           39
 #define LX_fcntl            72
+#define LX_flock            73
 #define LX_exit             60
 #define LX_uname            63
 #define LX_getcwd           79
@@ -118,6 +119,12 @@ typedef unsigned long size_t;
 #define LX_CLOCK_REALTIME        0
 #define LX_CLOCK_REALTIME_COARSE 5
 #define LX_CLOCK_TAI             11
+#define LX_CLOCK_MONOTONIC       1
+#define LX_CLOCK_PROCESS_CPUTIME 2
+#define LX_CLOCK_THREAD_CPUTIME  3
+#define LX_TIMER_ABSTIME         1
+#define LX_nanosleep            35
+#define LX_clock_nanosleep     230
 
 #define ARCH_SET_FS 0x1002
 #define ARCH_GET_FS 0x1003
@@ -259,6 +266,46 @@ struct lx_timespec {
     long tv_sec;
     long tv_nsec;
 };
+
+/* Sleep until `req` has passed on `clock` — or, with TIMER_ABSTIME, until
+   the clock reads `req`. Time here is a 100 Hz tick, so a sleep is rounded
+   up to whole ticks and one more, never ending early. It waits by receiving
+   from itself, which nobody sends to. */
+static long do_sleep(long clock, long flags, const struct lx_timespec *req) {
+    if (!req) {
+        return -LX_EFAULT;
+    }
+    if (req->tv_sec < 0 || req->tv_nsec < 0 || req->tv_nsec >= 1000000000L) {
+        return -LX_EINVAL;
+    }
+    if (clock == LX_CLOCK_PROCESS_CPUTIME || clock == LX_CLOCK_THREAD_CPUTIME || clock < 0) {
+        return -LX_EINVAL;
+    }
+    unsigned long now = __syscall0(SYS_TICKS);
+    unsigned long ticks = (unsigned long)req->tv_sec * 100 +
+                          ((unsigned long)req->tv_nsec + 9999999UL) / 10000000UL;
+    unsigned long deadline;
+    if (flags & LX_TIMER_ABSTIME) {
+        long boot = 0;
+        if (clock == LX_CLOCK_REALTIME || clock == LX_CLOCK_REALTIME_COARSE || clock == LX_CLOCK_TAI) {
+            boot = (long)__syscall0(SYS_BOOT_TIME);
+        }
+        long since_boot = req->tv_sec - boot;
+        if (since_boot < 0) {
+            return 0;
+        }
+        deadline = (unsigned long)since_boot * 100 +
+                   ((unsigned long)req->tv_nsec + 9999999UL) / 10000000UL;
+    } else {
+        deadline = now + ticks + (ticks ? 1 : 0);
+    }
+    unsigned long self = __syscall0(SYS_GETPID);
+    while ((now = __syscall0(SYS_TICKS)) < deadline) {
+        struct quark_msg m;
+        __syscall3(SYS_RECV_TIMEOUT, self, (unsigned long)&m, deadline - now);
+    }
+    return 0;
+}
 
 /* Setting the thread pointer arrives here rather than through the numbered
  * table: musl issues it from assembly, because on Linux it is one instruction
@@ -475,6 +522,11 @@ long __quark_syscall(long n, long a1, long a2, long a3, long a4, long a5, long a
         return 0;
     }
 
+    case LX_nanosleep:
+        return do_sleep(LX_CLOCK_MONOTONIC, 0, (const struct lx_timespec *)a1);
+    case LX_clock_nanosleep:
+        return do_sleep(a1, a2, (const struct lx_timespec *)a3);
+
     /* Refused deliberately, and each for a reason worth stating rather than
        leaving as an unexplained failure later:
 
@@ -485,8 +537,8 @@ long __quark_syscall(long n, long a1, long a2, long a3, long a4, long a5, long a
        signals — Quark has three, delivered to a task rather than to a handler
                 a program installs. Accepting a sigaction would be promising
                 something that cannot happen.
-       rseq, robust lists, getrandom, prlimit — no equivalent, and musl copes
-                with being refused all four. */
+       rseq, robust lists, prlimit — no equivalent, and musl copes with
+                being refused all three. */
     case LX_ioctl:
         return -LX_ENOTTY;
     case LX_rt_sigaction:
@@ -586,6 +638,8 @@ long __quark_syscall(long n, long a1, long a2, long a3, long a4, long a5, long a
 
     case LX_fcntl:
         return __quark_fcntl(a1, a2, a3);
+    case LX_flock:
+        return __quark_flock(a1, a2);
     case LX_pread64:
         return __quark_pread(a1, (void *)a2, (unsigned long)a3, a4);
     case LX_pwrite64:

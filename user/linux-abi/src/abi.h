@@ -30,6 +30,8 @@
 #define LX_ENOSPC   28
 #define LX_EMLINK   31
 #define LX_ELOOP    40
+#define LX_EDEADLK  35
+#define LX_ENOLCK   37
 
 /* Descriptors from here up are files.c's VFS files; below, the kernel's.
    The split sits at the kernel's MAX_FDS — see files.c. */
@@ -65,6 +67,7 @@ long __quark_rename(long fromfd, const char *from, long tofd, const char *to);
 long __quark_link(long fromfd, const char *from, long tofd, const char *to, int follow);
 long __quark_symlink(const char *target, long dirfd, const char *path);
 long __quark_chdir(const char *path);
+long __quark_flock(long fd, long op);
 long __quark_fchdir(long fd);
 long __quark_getcwd(char *buf, unsigned long size);
 long __quark_truncate(const char *path, long length);

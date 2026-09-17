@@ -55,6 +55,10 @@ struct openfile {
 
 static struct openfile files[MAX_FILES];
 
+/* Whether this program has ever taken a lock of its own (fcntl's F_SETLK),
+   which is when closing a copy of a descriptor has something to drop. */
+static int posix_locks_taken;
+
 /* Which open file each of this layer's descriptors names: an index into
    `files` plus one, so that zero is a free descriptor. */
 static unsigned char fdmap[MAX_FILES];
@@ -252,6 +256,11 @@ long __quark_close(long fd) {
     fdmap[fd - FIRST_FD] = 0;
     if (--f->refs == 0) {
         quark_vfs_close(f->handle);
+    } else if (posix_locks_taken) {
+        /* Closing any descriptor for a file drops the program's locks on it,
+           even one whose open file lives on in a copy. The server sees only
+           the last close, so this one is said as an unlock. */
+        quark_vfs_lock(f->handle, 0, 0, 0, 0, 0);
     }
     return 0;
 }
@@ -912,6 +921,142 @@ long __quark_write(long fd, const void *buf, unsigned long n) {
 #define LX_F_GETFL          3
 #define LX_F_SETFL          4
 #define LX_F_DUPFD_CLOEXEC  1030
+#define LX_F_GETLK          5
+#define LX_F_SETLK          6
+#define LX_F_SETLKW         7
+#define LX_F_OFD_GETLK      36
+#define LX_F_OFD_SETLK      37
+#define LX_F_OFD_SETLKW     38
+#define LX_F_RDLCK          0
+#define LX_F_WRLCK          1
+#define LX_F_UNLCK          2
+#define LX_SEEK_SET         0
+#define LX_SEEK_CUR         1
+#define LX_SEEK_END         2
+
+/* Linux's struct flock on x86-64. */
+struct lx_flock {
+    short l_type;
+    short l_whence;
+    long l_start;
+    long l_len;
+    int l_pid;
+};
+
+static long lock_error(int err) {
+    switch (err) {
+    case QUARK_VFS_WOULD_BLOCK: return -LX_EAGAIN;
+    case QUARK_VFS_DEADLOCK:    return -LX_EDEADLK;
+    case QUARK_VFS_NO_SPACE:    return -LX_ENOLCK;
+    default:                    return vfs_errno(err);
+    }
+}
+
+/* fcntl's record locks. The F_OFD_ forms belong to the open file, the others
+   to the program; the server keeps both. */
+static long file_lock(long fd, long cmd, struct lx_flock *fl) {
+    struct openfile *f = slot(fd);
+    if (!f) {
+        return -LX_EBADF;
+    }
+    if (!fl) {
+        return -LX_EFAULT;
+    }
+    int ofd = cmd == LX_F_OFD_GETLK || cmd == LX_F_OFD_SETLK || cmd == LX_F_OFD_SETLKW;
+    int query = cmd == LX_F_GETLK || cmd == LX_F_OFD_GETLK;
+    int wait = cmd == LX_F_SETLKW || cmd == LX_F_OFD_SETLKW;
+    if (ofd && fl->l_pid != 0) {
+        return -LX_EINVAL;
+    }
+    unsigned long kind;
+    switch (fl->l_type) {
+    case LX_F_RDLCK: kind = 1; break;
+    case LX_F_WRLCK: kind = 2; break;
+    case LX_F_UNLCK: kind = 0; break;
+    default: return -LX_EINVAL;
+    }
+    if (query && kind == 0) {
+        return -LX_EINVAL;
+    }
+    long base;
+    switch (fl->l_whence) {
+    case LX_SEEK_SET:
+        base = 0;
+        break;
+    case LX_SEEK_CUR:
+        base = (long)f->offset;
+        break;
+    case LX_SEEK_END: {
+        struct quark_vfs_stat r;
+        int err = quark_vfs_stat(f->handle, &r);
+        if (err) {
+            return vfs_errno(err);
+        }
+        base = (long)r.size;
+        break;
+    }
+    default:
+        return -LX_EINVAL;
+    }
+    long start = base + fl->l_start;
+    long len = fl->l_len;
+    /* A negative length covers the bytes before the start. */
+    if (len < 0) {
+        start += len;
+        len = -len;
+    }
+    if (start < 0) {
+        return -LX_EINVAL;
+    }
+    unsigned long flags = (ofd ? QUARK_VFS_LOCK_OFD : 0) | (wait ? QUARK_VFS_LOCK_WAIT : 0) |
+                          (query ? QUARK_VFS_LOCK_QUERY : 0);
+    unsigned long out[4];
+    int err = quark_vfs_lock(f->handle, kind, (unsigned long)start, (unsigned long)len, flags, out);
+    if (err) {
+        return lock_error(err);
+    }
+    if (!ofd && !query && kind != 0) {
+        posix_locks_taken = 1;
+    }
+    if (query) {
+        if (out[0] == 0) {
+            fl->l_type = LX_F_UNLCK;
+        } else {
+            fl->l_type = out[0] == 2 ? LX_F_WRLCK : LX_F_RDLCK;
+            fl->l_whence = LX_SEEK_SET;
+            fl->l_start = (long)out[1];
+            fl->l_len = (long)out[2];
+            /* Linux names an open file's lock's holder -1; a program's is
+               named by its program id. */
+            fl->l_pid = out[3] == ~0UL ? -1 : (int)out[3];
+        }
+    }
+    return 0;
+}
+
+#define LX_LOCK_SH 1
+#define LX_LOCK_EX 2
+#define LX_LOCK_NB 4
+#define LX_LOCK_UN 8
+
+/* flock: a lock on the whole file, belonging to the open file, as Linux has
+   it. Unlike Linux's, it and fcntl's locks are one kind and can collide. */
+long __quark_flock(long fd, long op) {
+    struct openfile *f = slot(fd);
+    if (!f) {
+        return -LX_EBADF;
+    }
+    unsigned long kind;
+    switch (op & ~LX_LOCK_NB) {
+    case LX_LOCK_SH: kind = 1; break;
+    case LX_LOCK_EX: kind = 2; break;
+    case LX_LOCK_UN: kind = 0; break;
+    default: return -LX_EINVAL;
+    }
+    unsigned long flags = QUARK_VFS_LOCK_OFD | ((op & LX_LOCK_NB) ? 0 : QUARK_VFS_LOCK_WAIT);
+    int err = quark_vfs_lock(f->handle, kind, 0, 0, flags, 0);
+    return err ? lock_error(err) : 0;
+}
 
 /* Which descriptors a program has asked to be non-blocking. One bit per
    kernel descriptor; this layer's own file numbers are always blocking,
@@ -942,6 +1087,13 @@ long __quark_fcntl(long fd, long cmd, long arg) {
                                      arg < 0 ? 0 : (unsigned long)arg);
         return r == QUARK_ERR ? -LX_EMFILE : (long)r;
     }
+    case LX_F_GETLK:
+    case LX_F_SETLK:
+    case LX_F_SETLKW:
+    case LX_F_OFD_GETLK:
+    case LX_F_OFD_SETLK:
+    case LX_F_OFD_SETLKW:
+        return file_lock(fd, cmd, (struct lx_flock *)arg);
     case LX_F_GETFD:
     case LX_F_SETFD:
         /* FD_CLOEXEC and nothing else. There is no exec, so every descriptor
