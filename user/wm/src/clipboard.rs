@@ -13,6 +13,13 @@
 //! The selection follows keyboard focus. `wl_data_device.selection` goes to
 //! whichever client has it, so a client that never has focus can never read the
 //! clipboard, which is the rule that makes having one safe.
+//!
+//! There are two of them, and they work the same way. The clipboard is what a
+//! client copied on purpose; the *primary* selection is what was last
+//! highlighted, which the middle button pastes. X11 has had both for thirty
+//! years and Wayland keeps them apart for the same reason: a program that puts
+//! every selection on the clipboard destroys what somebody copied to paste
+//! next. Everything below is indexed by which of the two it is.
 
 pub const MAX_MIMES: usize = 4;
 pub const MIME_LEN: usize = 64;
@@ -69,35 +76,40 @@ struct Selection {
     mimes: Mimes,
 }
 
-static mut SELECTION: Selection =
+/// Which of the two. Used as an index, so the pair is one array and every
+/// function below takes it rather than existing twice.
+pub const CLIPBOARD: usize = 0;
+pub const PRIMARY: usize = 1;
+pub const KINDS: usize = 2;
+
+const NO_SELECTION: Selection =
     Selection { held: false, owner: 0, source: 0, mimes: NO_MIMES };
 
-pub fn is_held() -> bool {
-    unsafe { SELECTION.held }
+static mut SELECTIONS: [Selection; KINDS] = [NO_SELECTION; KINDS];
+
+pub fn is_held(which: usize) -> bool {
+    unsafe { SELECTIONS[which].held }
 }
 
-pub fn mimes() -> Mimes {
-    unsafe { SELECTION.mimes }
+pub fn mimes(which: usize) -> Mimes {
+    unsafe { SELECTIONS[which].mimes }
 }
 
 /// Who to ask for the bytes.
-pub fn owner() -> Option<(usize, u32)> {
+pub fn owner(which: usize) -> Option<(usize, u32)> {
     unsafe {
-        if SELECTION.held {
-            Some((SELECTION.owner, SELECTION.source))
-        } else {
-            None
-        }
+        let s = &SELECTIONS[which];
+        if s.held { Some((s.owner, s.source)) } else { None }
     }
 }
 
 /// Take the selection. Returns the previous owner, who must be told it has been
 /// cancelled — a source that is still offering something nobody can reach is a
 /// program waiting for a request that will never come.
-pub fn take(owner: usize, source: u32, mimes: Mimes) -> Option<(usize, u32)> {
-    let previous = self_owner();
+pub fn take(which: usize, owner: usize, source: u32, mimes: Mimes) -> Option<(usize, u32)> {
+    let previous = self::owner(which);
     unsafe {
-        SELECTION = Selection { held: true, owner, source, mimes };
+        SELECTIONS[which] = Selection { held: true, owner, source, mimes };
     }
     previous
 }
@@ -106,32 +118,25 @@ pub fn take(owner: usize, source: u32, mimes: Mimes) -> Option<(usize, u32)> {
 ///
 /// Scoped rather than unconditional: a client destroying an old source it has
 /// already replaced must not clear somebody else's clipboard.
-pub fn release(owner: usize, source: u32) -> bool {
+pub fn release(which: usize, owner: usize, source: u32) -> bool {
     unsafe {
-        if SELECTION.held && SELECTION.owner == owner && SELECTION.source == source {
-            SELECTION = Selection { held: false, owner: 0, source: 0, mimes: NO_MIMES };
+        let s = &mut SELECTIONS[which];
+        if s.held && s.owner == owner && s.source == source {
+            *s = NO_SELECTION;
             return true;
         }
     }
     false
 }
 
-/// Everything a client had. A client may disconnect holding the selection, and
-/// what it was offering goes with it.
+/// Everything a client had, of either kind. A client may disconnect holding a
+/// selection, and what it was offering goes with it.
 pub fn forget_client(owner_slot: usize) {
     unsafe {
-        if SELECTION.held && SELECTION.owner == owner_slot {
-            SELECTION = Selection { held: false, owner: 0, source: 0, mimes: NO_MIMES };
-        }
-    }
-}
-
-fn self_owner() -> Option<(usize, u32)> {
-    unsafe {
-        if SELECTION.held {
-            Some((SELECTION.owner, SELECTION.source))
-        } else {
-            None
+        for s in SELECTIONS.iter_mut() {
+            if s.held && s.owner == owner_slot {
+                *s = NO_SELECTION;
+            }
         }
     }
 }

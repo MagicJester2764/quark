@@ -623,20 +623,20 @@ fn raise(idx: usize) {
 /// The selection follows keyboard focus, which is the rule that makes a
 /// clipboard on a compositor safe to have: a client that never has focus can
 /// never read it.
-pub fn announce_selection_to_focus() {
+pub fn announce_selection_to_focus(which: usize) {
     unsafe {
         let Some(slot) = seat::focused_client() else { return };
         if slot < client::MAX_CLIENTS && CLIENTS[slot].used {
-            CLIENTS[slot].announce_selection();
+            CLIENTS[slot].announce_selection(which);
         }
     }
 }
 
 /// Hand a receiver's pipe to whoever owns the selection.
-pub fn send_to_source(slot: usize, source: u32, mime: &[u8], fd: usize) {
+pub fn send_to_source(slot: usize, source: u32, mime: &[u8], fd: usize, which: usize) {
     unsafe {
         if slot < client::MAX_CLIENTS && CLIENTS[slot].used {
-            CLIENTS[slot].source_send(source, mime, fd);
+            CLIENTS[slot].source_send(source, mime, fd, which);
         } else {
             // The owner has gone. Closing the pipe is what stops the receiver
             // waiting for bytes that will never come.
@@ -646,10 +646,10 @@ pub fn send_to_source(slot: usize, source: u32, mime: &[u8], fd: usize) {
 }
 
 /// Tell a client its source has been displaced.
-pub fn cancel_source(slot: usize, source: u32) {
+pub fn cancel_source(slot: usize, source: u32, which: usize) {
     unsafe {
         if slot < client::MAX_CLIENTS && CLIENTS[slot].used {
-            CLIENTS[slot].source_cancelled(source);
+            CLIENTS[slot].source_cancelled(source, which);
         }
     }
 }
@@ -662,8 +662,10 @@ pub fn announce_focus() {
         let ptr = &raw mut CLIENTS;
         seat::focus_changed(&mut *ptr, FOCUS);
     }
-    // The clipboard follows the keyboard, so it moves with it.
-    announce_selection_to_focus();
+    // Both selections follow the keyboard, so they move with it.
+    for which in 0..clipboard::KINDS {
+        announce_selection_to_focus(which);
+    }
 }
 
 /// End the session.

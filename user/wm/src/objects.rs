@@ -34,10 +34,14 @@ pub enum Kind {
     Pointer,
     Decoration,
     ToplevelDecoration,
-    DataDeviceManager,
-    DataDevice,
-    DataSource,
-    DataOffer,
+    /// The two selections. `which` is `clipboard::CLIPBOARD` or `PRIMARY`:
+    /// the same four objects exist twice over, with different numbers on the
+    /// wire, and an object carries which protocol it belongs to so that a
+    /// client cannot set the clipboard with a primary source.
+    DataDeviceManager { which: u8 },
+    DataDevice { which: u8 },
+    DataSource { which: u8 },
+    DataOffer { which: u8 },
     XdgWmBase,
     XdgSurface { surface: usize },
     XdgToplevel { surface: usize },

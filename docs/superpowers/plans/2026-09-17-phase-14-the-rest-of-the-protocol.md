@@ -316,16 +316,21 @@ pointer, and a scroll wheel reaches a client.*
   selection is set by a client and announced to whoever has keyboard focus,
   exactly as the clipboard is; the compositor never sees the bytes.
 
-- [ ] **Step 1: The failing check.** `wlclip --primary copy` and
+- [x] **Step 1: The failing check.** ~~`wlclip --primary copy` and
   `wlclip --primary paste` in one session. Expected today: the manager is not
-  advertised and the client says so.
+  advertised and the client says so.~~ Not run as a boot of its own: the
+  client and the interface arrived in the same change, and `wlclip` had no
+  `--primary` to fail with before it. The check survives as the path the
+  client takes when the manager is missing — it prints
+  "no zwp_primary_selection_device_manager_v1" and exits 1 — which is what any
+  other compositor would give it.
 
-- [ ] **Step 2: The interfaces.** A second `Mimes` and owner in
+- [x] **Step 2: The interfaces.** A second `Mimes` and owner in
   `clipboard.rs`, and the three objects in `client.rs`, written as the
   clipboard's are. The offer is named by the compositor, as the clipboard's
   is.
 
-- [ ] **Step 3: Verify.** `wm "wlclip --primary copy" "wlclip --primary
+- [x] **Step 3: Verify.** `wm "wlclip --primary copy" "wlclip --primary
   paste"` moves the text; the ordinary clipboard still works alongside it;
   `wlfuzz` still leaves the compositor standing.
 

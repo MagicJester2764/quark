@@ -164,10 +164,15 @@ fn request_count(kind: Kind) -> u16 {
         Kind::Pointer => 2,
         Kind::Decoration => 2,
         Kind::ToplevelDecoration => 3,
-        Kind::DataDeviceManager => 2,
-        Kind::DataSource => 3,
-        Kind::DataDevice => 3,
-        Kind::DataOffer => 5,
+        // The clipboard's manager has two requests and the primary's has
+        // three, and the rest come from the table that says what each
+        // protocol's numbers are.
+        Kind::DataDeviceManager { which } => {
+            if which as usize == clipboard::PRIMARY { 3 } else { 2 }
+        }
+        Kind::DataSource { which } => proto::SELECTION_WIRE[which as usize].source_requests,
+        Kind::DataDevice { which } => proto::SELECTION_WIRE[which as usize].device_requests,
+        Kind::DataOffer { which } => proto::SELECTION_WIRE[which as usize].offer_requests,
         // A callback answers and is gone; `None` is the touch device this
         // compositor records so that destroying it names something.
         Kind::Callback => 0,
@@ -212,18 +217,19 @@ pub struct Client {
     keyboard: u32,
     /// The `wl_pointer`, likewise.
     pointer: u32,
-    /// The `wl_data_device` this client asked for, which is where a selection
-    /// is announced to it.
-    data_device: u32,
-    /// The `wl_data_source` it is building, and what it has offered on it.
+    /// The `wl_data_device` and its primary-selection twin, which is where
+    /// each selection is announced to this client. Indexed by
+    /// `clipboard::CLIPBOARD` and `PRIMARY`, as every pair below is.
+    data_device: [u32; clipboard::KINDS],
+    /// The source it is building for each, and what it has offered on it.
     ///
-    /// One at a time: a client offers types and then sets the selection, and
-    /// nothing here needs two sources part-built at once.
-    building: u32,
-    building_mimes: Mimes,
-    /// The offer this client was last given, so that a `receive` on it can be
-    /// matched to the selection it names.
-    offer: u32,
+    /// One at a time per selection: a client offers types and then sets the
+    /// selection, and nothing here needs two sources part-built at once.
+    building: [u32; clipboard::KINDS],
+    building_mimes: [Mimes; clipboard::KINDS],
+    /// The offer this client was last given of each, so that a `receive` on it
+    /// can be matched to the selection it names.
+    offer: [u32; clipboard::KINDS],
     /// A descriptor to attach to the next flush.
     ///
     /// `wl_keyboard.keymap` carries one, and the kernel queues a descriptor
@@ -260,10 +266,10 @@ pub const NO_CLIENT: Client = Client {
     output: 0,
     keyboard: 0,
     pointer: 0,
-    data_device: 0,
-    building: 0,
-    building_mimes: NO_MIMES,
-    offer: 0,
+    data_device: [0; clipboard::KINDS],
+    building: [0; clipboard::KINDS],
+    building_mimes: [NO_MIMES; clipboard::KINDS],
+    offer: [0; clipboard::KINDS],
     pending_fd: usize::MAX,
     wfail: false,
 };
@@ -280,10 +286,11 @@ impl Client {
         self.nfds = 0;
         self.keyboard = 0;
         self.pointer = 0;
-        self.data_device = 0;
-        self.building = 0;
-        self.building_mimes = NO_MIMES;
-        self.offer = 0;
+        self.output = 0;
+        self.data_device = [0; clipboard::KINDS];
+        self.building = [0; clipboard::KINDS];
+        self.building_mimes = [NO_MIMES; clipboard::KINDS];
+        self.offer = [0; clipboard::KINDS];
         self.pending_fd = usize::MAX;
         // wl_display is object 1 and exists before anything is asked for.
         self.objects.insert(proto::DISPLAY_ID, Kind::Display);
@@ -310,8 +317,9 @@ impl Client {
         }
         self.keyboard = 0;
         self.pointer = 0;
-        self.data_device = 0;
-        self.offer = 0;
+        self.output = 0;
+        self.data_device = [0; clipboard::KINDS];
+        self.offer = [0; clipboard::KINDS];
         self.used = false;
         self.fd = 0;
         self.tid = 0;
@@ -670,10 +678,18 @@ impl Client {
                     _ => Ok(()),
                 }
             }
-            Kind::DataDeviceManager => self.ddm_request(h.opcode, args),
-            Kind::DataSource => self.data_source_request(h.object, h.opcode, args),
-            Kind::DataDevice => self.data_device_request(h.object, h.opcode, args),
-            Kind::DataOffer => self.data_offer_request(h.object, h.opcode, args),
+            Kind::DataDeviceManager { which } => {
+                self.ddm_request(which as usize, h.opcode, args)
+            }
+            Kind::DataSource { which } => {
+                self.data_source_request(which as usize, h.object, h.opcode, args)
+            }
+            Kind::DataDevice { which } => {
+                self.data_device_request(which as usize, h.object, h.opcode, args)
+            }
+            Kind::DataOffer { which } => {
+                self.data_offer_request(which as usize, h.object, h.opcode, args)
+            }
             // An output's one request, and the touch device this compositor
             // records but never speaks to, are both destructors.
             Kind::Output | Kind::None => {
@@ -722,30 +738,36 @@ impl Client {
         self.flush();
     }
 
-    fn ddm_request(&mut self, opcode: u16, args: &mut Args) -> Handled {
+    /// Either manager. `destroy` is the primary's third request and takes no
+    /// arguments, so it is answered before an id is read for it.
+    fn ddm_request(&mut self, which: usize, opcode: u16, args: &mut Args) -> Handled {
+        if which == clipboard::PRIMARY && opcode == 2 {
+            self.objects.remove(args.object);
+            return Ok(());
+        }
         let id = take_new_id(&self.rbuf, args)?;
         match opcode {
-            proto::DDM_CREATE_DATA_SOURCE => {
-                if !self.objects.insert(id, Kind::DataSource) {
+            proto::SELECTION_CREATE_SOURCE => {
+                if !self.objects.insert(id, Kind::DataSource { which: which as u8 }) {
                     return Err(self.no_room(id));
                 }
-                self.building = id;
-                self.building_mimes = NO_MIMES;
+                self.building[which] = id;
+                self.building_mimes[which] = NO_MIMES;
                 Ok(())
             }
-            proto::DDM_GET_DATA_DEVICE => {
+            proto::SELECTION_GET_DEVICE => {
                 let seat = take_object(&self.rbuf, args, false)?;
                 if !matches!(self.objects.get(seat), Some(Kind::Seat)) {
                     return Err(Fault::object(args.object, b"get_data_device: not a seat"));
                 }
-                if !self.objects.insert(id, Kind::DataDevice) {
+                if !self.objects.insert(id, Kind::DataDevice { which: which as u8 }) {
                     return Err(self.no_room(id));
                 }
-                self.data_device = id;
+                self.data_device[which] = id;
                 // A device made while this client already has focus should hear
                 // about the selection now, not the next time focus moves.
                 if crate::seat::focus_is_mine(self.slot) {
-                    self.announce_selection();
+                    self.announce_selection(which);
                 }
                 Ok(())
             }
@@ -753,32 +775,39 @@ impl Client {
         }
     }
 
-    fn data_source_request(&mut self, object: u32, opcode: u16, args: &mut Args) -> Handled {
+    fn data_source_request(
+        &mut self,
+        which: usize,
+        object: u32,
+        opcode: u16,
+        args: &mut Args,
+    ) -> Handled {
+        let wire = &proto::SELECTION_WIRE[which];
         match opcode {
-            proto::DATA_SOURCE_OFFER => {
+            op if op == wire.source_offer => {
                 let pushed = {
                     let mime = take_str(&self.rbuf, args, false)?;
-                    if object != self.building {
+                    if object != self.building[which] {
                         // A type offered on a source that is not the one being
                         // built. Nothing here can hold two part-built sources,
                         // and silently dropping it would leave a client
                         // believing it had offered something it had not.
                         return Err(Fault::memory(object, b"one data source at a time"));
                     }
-                    self.building_mimes.push(mime)
+                    self.building_mimes[which].push(mime)
                 };
                 if !pushed {
                     return Err(Fault::memory(object, b"too many mime types, or one too long"));
                 }
                 Ok(())
             }
-            proto::DATA_SOURCE_DESTROY => {
-                if clipboard::release(self.slot, object) {
-                    crate::announce_selection_to_focus();
+            op if op == wire.source_destroy => {
+                if clipboard::release(which, self.slot, object) {
+                    crate::announce_selection_to_focus(which);
                 }
-                if self.building == object {
-                    self.building = 0;
-                    self.building_mimes = NO_MIMES;
+                if self.building[which] == object {
+                    self.building[which] = 0;
+                    self.building_mimes[which] = NO_MIMES;
                 }
                 self.objects.remove(object);
                 Ok(())
@@ -789,57 +818,77 @@ impl Client {
         }
     }
 
-    fn data_device_request(&mut self, object: u32, opcode: u16, args: &mut Args) -> Handled {
+    fn data_device_request(
+        &mut self,
+        which: usize,
+        object: u32,
+        opcode: u16,
+        args: &mut Args,
+    ) -> Handled {
+        let wire = &proto::SELECTION_WIRE[which];
         match opcode {
-            proto::DATA_DEVICE_SET_SELECTION => {
+            op if op == wire.device_set_selection => {
                 // set_selection(source, serial). A null source clears it.
                 let source = take_object(&self.rbuf, args, true)?;
                 let _serial = take_u32(&self.rbuf, args)?;
                 if source == 0 {
-                    if let Some((slot, id)) = clipboard::owner() {
+                    if let Some((slot, id)) = clipboard::owner(which) {
                         if slot == self.slot {
-                            clipboard::release(slot, id);
-                            crate::announce_selection_to_focus();
+                            clipboard::release(which, slot, id);
+                            crate::announce_selection_to_focus(which);
                         }
                     }
                     return Ok(());
                 }
-                if !matches!(self.objects.get(source), Some(Kind::DataSource)) {
+                // A source of the *other* protocol is not this protocol's
+                // source, however much it looks like one: setting the
+                // clipboard from a primary source is a client that has
+                // confused its two selections.
+                if !matches!(self.objects.get(source),
+                             Some(Kind::DataSource { which: w }) if w as usize == which)
+                {
                     return Err(Fault::object(object, b"set_selection: not a data source"));
                 }
-                let mimes = self.building_mimes;
-                let previous = clipboard::take(self.slot, source, mimes);
-                self.building = 0;
-                self.building_mimes = NO_MIMES;
+                let mimes = self.building_mimes[which];
+                let previous = clipboard::take(which, self.slot, source, mimes);
+                self.building[which] = 0;
+                self.building_mimes[which] = NO_MIMES;
                 // The client that had it is told, because a source still
                 // offering something nobody can reach is a program waiting for
                 // a request that will never come.
                 if let Some((slot, id)) = previous {
-                    crate::cancel_source(slot, id);
+                    crate::cancel_source(slot, id, which);
                 }
-                crate::announce_selection_to_focus();
+                crate::announce_selection_to_focus(which);
                 Ok(())
             }
-            proto::DATA_DEVICE_START_DRAG => {
+            op if op == wire.device_destroy => {
+                self.objects.remove(object);
+                if self.data_device[which] == object {
+                    self.data_device[which] = 0;
+                }
+                Ok(())
+            }
+            proto::DATA_DEVICE_START_DRAG if which == clipboard::CLIPBOARD => {
                 // Drag and drop is version 2 and up, and this manager is
                 // version 1: the request exists so that its arguments are
                 // read and refused rather than ignored.
                 Err(Fault::method(object, b"no drag and drop"))
             }
-            proto::DATA_DEVICE_RELEASE => {
-                self.objects.remove(object);
-                if self.data_device == object {
-                    self.data_device = 0;
-                }
-                Ok(())
-            }
             _ => Ok(()),
         }
     }
 
-    fn data_offer_request(&mut self, object: u32, opcode: u16, args: &mut Args) -> Handled {
+    fn data_offer_request(
+        &mut self,
+        which: usize,
+        object: u32,
+        opcode: u16,
+        args: &mut Args,
+    ) -> Handled {
+        let wire = &proto::SELECTION_WIRE[which];
         match opcode {
-            proto::DATA_OFFER_RECEIVE => {
+            op if op == wire.offer_receive => {
                 // receive(mime_type, fd). The descriptor is the point: it is a
                 // pipe this client made, and the compositor's whole part in the
                 // transfer is handing it to the other end.
@@ -859,30 +908,32 @@ impl Client {
                 // A name longer than any that can be offered matches nothing,
                 // which is the same answer as a name nobody offered.
                 let mime = if len <= clipboard::MIME_LEN { &name[..len] } else { &[][..] };
-                if object != self.offer || !clipboard::mimes().has(mime) {
+                if object != self.offer[which] || !clipboard::mimes(which).has(mime) {
                     // A stale offer, or a type nobody promised. Closing the
                     // descriptor is what tells the client to stop reading:
                     // leaving it open would hang it on a pipe with no writer.
                     let _ = syscall::sys_fd_close(fd);
                     return Ok(());
                 }
-                let Some((slot, source)) = clipboard::owner() else {
+                let Some((slot, source)) = clipboard::owner(which) else {
                     let _ = syscall::sys_fd_close(fd);
                     return Ok(());
                 };
-                crate::send_to_source(slot, source, mime, fd);
+                crate::send_to_source(slot, source, mime, fd, which);
                 Ok(())
             }
-            proto::DATA_OFFER_DESTROY => {
-                if self.offer == object {
-                    self.offer = 0;
+            op if op == wire.offer_destroy => {
+                if self.offer[which] == object {
+                    self.offer[which] = 0;
                 }
                 self.objects.remove(object);
                 Ok(())
             }
             // `accept` says which type a drag would take, and there are no
-            // drags here; `finish` and `set_actions` are version 3.
-            proto::DATA_OFFER_ACCEPT => {
+            // drags here; `finish` and `set_actions` are version 3. The
+            // primary selection has neither, and nothing but receive and
+            // destroy to mistake them for.
+            proto::DATA_OFFER_ACCEPT if which == clipboard::CLIPBOARD => {
                 take_u32(&self.rbuf, args)?;
                 take_str(&self.rbuf, args, true)?;
                 Ok(())
@@ -896,56 +947,58 @@ impl Client {
     /// The offer object is named by the *compositor*: the client did not ask
     /// for it and has nothing to name it with, which is what the server half of
     /// the id space is for.
-    pub fn announce_selection(&mut self) {
-        let device = self.data_device;
+    pub fn announce_selection(&mut self, which: usize) {
+        let device = self.data_device[which];
         if device == 0 {
             return;
         }
+        let wire = &proto::SELECTION_WIRE[which];
         // The previous offer is finished with, but it is the client's object
         // to destroy: it stays in the table until it does, and `receive` on
         // it is refused meanwhile because it is no longer the offer. Taking
         // it away here would make a client that destroys its old offer — as a
         // client is supposed to — name an object that is not there.
-        self.offer = 0;
-        if !clipboard::is_held() {
+        self.offer[which] = 0;
+        if !clipboard::is_held(which) {
             // A null offer means "there is nothing", which is a real thing to
             // say: a client that is never told stops trusting what it has.
-            if let Some(a) = self.begin(device, proto::DATA_DEVICE_SELECTION) {
+            if let Some(a) = self.begin(device, wire.device_selection) {
                 self.arg_u32(0);
                 self.end(a);
             }
             self.flush();
             return;
         }
-        let id = match self.objects.allocate(Kind::DataOffer) {
+        let kind = Kind::DataOffer { which: which as u8 };
+        let id = match self.objects.allocate(kind) {
             Some(id) => id,
             None => {
                 // Full of offers the client never destroyed. One of them goes:
                 // there is nothing left to do with an offer that is not the
                 // selection.
-                if let Some(stale) = self.objects.find(|k| matches!(k, Kind::DataOffer)) {
+                if let Some(stale) = self.objects.find(|k| matches!(k, Kind::DataOffer { .. })) {
                     self.objects.remove(stale);
                 }
-                match self.objects.allocate(Kind::DataOffer) {
+                match self.objects.allocate(kind) {
                     Some(id) => id,
                     None => return,
                 }
             }
         };
-        self.offer = id;
-        if let Some(a) = self.begin(device, proto::DATA_DEVICE_DATA_OFFER) {
+        self.offer[which] = id;
+        if let Some(a) = self.begin(device, wire.device_data_offer) {
             self.arg_u32(id);
             self.end(a);
         }
-        let mimes = clipboard::mimes();
+        let mimes = clipboard::mimes(which);
         for i in 0..mimes.len() {
             let Some(name) = mimes.get(i) else { break };
-            if let Some(a) = self.begin(id, proto::DATA_OFFER_OFFER) {
+            if let Some(a) = self.begin(id, wire.offer_offer) {
                 self.arg_str(name);
                 self.end(a);
             }
         }
-        if let Some(a) = self.begin(device, proto::DATA_DEVICE_SELECTION) {
+        if let Some(a) = self.begin(device, wire.device_selection) {
             self.arg_u32(id);
             self.end(a);
         }
@@ -953,11 +1006,11 @@ impl Client {
     }
 
     /// Ask this client for the bytes, handing it the receiver's pipe.
-    pub fn source_send(&mut self, source: u32, mime: &[u8], fd: usize) {
+    pub fn source_send(&mut self, source: u32, mime: &[u8], fd: usize, which: usize) {
         // Alone in the buffer: a descriptor rides with the write it was
         // attached to, and libwayland pops descriptors in message order.
         self.flush();
-        if let Some(a) = self.begin(source, proto::DATA_SOURCE_SEND) {
+        if let Some(a) = self.begin(source, proto::SELECTION_WIRE[which].source_send) {
             self.arg_str(mime);
             self.end(a);
         }
@@ -966,8 +1019,8 @@ impl Client {
     }
 
     /// Tell this client its source is no longer the selection.
-    pub fn source_cancelled(&mut self, source: u32) {
-        if let Some(a) = self.begin(source, proto::DATA_SOURCE_CANCELLED) {
+    pub fn source_cancelled(&mut self, source: u32, which: usize) {
+        if let Some(a) = self.begin(source, proto::SELECTION_WIRE[which].source_cancelled) {
             self.end(a);
         }
         self.flush();
@@ -1945,7 +1998,8 @@ impl Client {
             4 => Kind::XdgWmBase,
             5 => Kind::Seat,
             6 => Kind::Decoration,
-            _ => Kind::DataDeviceManager,
+            7 => Kind::DataDeviceManager { which: clipboard::CLIPBOARD as u8 },
+            _ => Kind::DataDeviceManager { which: clipboard::PRIMARY as u8 },
         };
         if !self.objects.insert_at(id, kind, version) {
             return Err(self.no_room(id));

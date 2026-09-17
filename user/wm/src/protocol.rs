@@ -39,10 +39,15 @@ pub const DECORATION: Interface =
 /// icon surface and is a larger thing than copying text.
 pub const DATA_DEVICE_MANAGER: Interface =
     Interface { name: b"wl_data_device_manager", version: 1 };
+/// The other selection: what was last highlighted, which the middle button
+/// pastes. The same shape as the clipboard with different numbers on the wire,
+/// which is what [`SELECTION_WIRE`] is for.
+pub const PRIMARY_SELECTION_MANAGER: Interface =
+    Interface { name: b"zwp_primary_selection_device_manager_v1", version: 1 };
 
 /// What the registry advertises, and the order it advertises them in. The
 /// index is the `name` a client binds by.
-pub const GLOBALS: [&Interface; 7] = [
+pub const GLOBALS: [&Interface; 8] = [
     &COMPOSITOR,
     &SHM,
     &OUTPUT,
@@ -50,6 +55,7 @@ pub const GLOBALS: [&Interface; 7] = [
     &SEAT,
     &DECORATION,
     &DATA_DEVICE_MANAGER,
+    &PRIMARY_SELECTION_MANAGER,
 ];
 
 // wl_display requests.
@@ -174,6 +180,7 @@ pub const EDGE_RIGHT: u32 = 8;
 /// `resizing` is what tells one to stop chasing its own frame rate while the
 /// size is still moving.
 pub const STATE_MAXIMIZED: u32 = 1;
+#[allow(dead_code)] // named because the protocol has it
 pub const STATE_FULLSCREEN: u32 = 2;
 pub const STATE_RESIZING: u32 = 3;
 pub const STATE_ACTIVATED: u32 = 4;
@@ -212,6 +219,7 @@ pub const POINTER_AXIS: u16 = 4;
 /// detail describing it — and a client applies the group at once.
 pub const POINTER_FRAME: u16 = 5;
 pub const POINTER_AXIS_SOURCE: u16 = 6;
+#[allow(dead_code)] // named because the protocol has it
 pub const POINTER_AXIS_STOP: u16 = 7;
 pub const POINTER_AXIS_DISCRETE: u16 = 8;
 /// The version that added the four events above. An object below it hears none
@@ -222,12 +230,15 @@ pub const POINTER_FRAME_SINCE: u32 = 5;
 /// `wl_pointer.axis`. Horizontal exists for completeness; a PS/2 wheel has one
 /// axis and a tilt this driver does not report.
 pub const AXIS_VERTICAL_SCROLL: u32 = 0;
+#[allow(dead_code)] // named because the protocol has it
 pub const AXIS_HORIZONTAL_SCROLL: u32 = 1;
 /// `wl_pointer.axis_source`. A wheel is the discrete one: it moves in clicks,
 /// which is what `axis_discrete` counts, and unlike a touchpad it has no end
 /// to a gesture — which is why `axis_stop` is defined here and never sent.
 pub const AXIS_SOURCE_WHEEL: u32 = 0;
+#[allow(dead_code)] // named because the protocol has it
 pub const AXIS_SOURCE_FINGER: u32 = 1;
+#[allow(dead_code)] // named because the protocol has it
 pub const AXIS_SOURCE_CONTINUOUS: u32 = 2;
 /// What one click of the wheel is worth in surface coordinates. Ten, which is
 /// what Weston sends, so a client tuned against a Linux compositor scrolls by
@@ -271,31 +282,94 @@ pub const TOPLEVEL_DECORATION_CONFIGURE: u16 = 0;
 /// which it gets; this compositor always answers `SERVER_SIDE`, because the
 /// frame is drawn before the client's pixels are and there is no way for it to
 /// not be drawn.
+#[allow(dead_code)] // named because the protocol has it
 pub const DECORATION_MODE_CLIENT_SIDE: u32 = 1;
 pub const DECORATION_MODE_SERVER_SIDE: u32 = 2;
 
-// wl_data_device_manager requests.
-pub const DDM_CREATE_DATA_SOURCE: u16 = 0;
-pub const DDM_GET_DATA_DEVICE: u16 = 1;
-
-// wl_data_source requests and events.
-pub const DATA_SOURCE_OFFER: u16 = 0;
-pub const DATA_SOURCE_DESTROY: u16 = 1;
-pub const DATA_SOURCE_TARGET: u16 = 0;
-pub const DATA_SOURCE_SEND: u16 = 1;
-pub const DATA_SOURCE_CANCELLED: u16 = 2;
-
-// wl_data_device requests and events.
+// The numbers both selections share, and the ones only the clipboard has.
+// Everything else about the two is in `SELECTION_WIRE` below, because it is
+// the same protocol with different opcodes and writing it out twice is how the
+// two would drift apart.
 pub const DATA_DEVICE_START_DRAG: u16 = 0;
-pub const DATA_DEVICE_SET_SELECTION: u16 = 1;
-pub const DATA_DEVICE_RELEASE: u16 = 2;
-pub const DATA_DEVICE_DATA_OFFER: u16 = 0;
-pub const DATA_DEVICE_SELECTION: u16 = 5;
 
 // wl_data_offer requests and events.
+/// The two selections, as numbers on the wire.
+///
+/// `wl_data_device_manager` and `zwp_primary_selection_device_manager_v1` are
+/// the same protocol twice: a manager that makes sources and devices, a device
+/// that sets a selection and is told about offers, an offer whose types are
+/// listed and whose bytes are asked for down a pipe. Only the opcodes differ —
+/// the clipboard's device carries drag and drop it never uses, so its
+/// `selection` is event 5 where the primary's is event 1 — so the code is
+/// written once and reads its numbers from here.
+pub struct SelectionWire {
+    pub device_set_selection: u16,
+    pub device_destroy: u16,
+    pub device_data_offer: u16,
+    pub device_selection: u16,
+    pub offer_receive: u16,
+    pub offer_destroy: u16,
+    pub offer_offer: u16,
+    pub source_offer: u16,
+    pub source_destroy: u16,
+    pub source_send: u16,
+    pub source_cancelled: u16,
+    /// How many requests each of the three has, for the check that a client is
+    /// not calling an opcode the interface has not got.
+    pub device_requests: u16,
+    pub offer_requests: u16,
+    pub source_requests: u16,
+}
+
+pub const SELECTION_WIRE: [SelectionWire; 2] = [
+    // wl_data_*: start_drag 0, set_selection 1, release 2; accept 0, receive 1,
+    // destroy 2; offer 0, destroy 1.
+    SelectionWire {
+        device_set_selection: 1,
+        device_destroy: 2,
+        device_data_offer: 0,
+        device_selection: 5,
+        offer_receive: 1,
+        offer_destroy: 2,
+        offer_offer: 0,
+        source_offer: 0,
+        source_destroy: 1,
+        source_send: 1,
+        source_cancelled: 2,
+        device_requests: 3,
+        offer_requests: 5,
+        source_requests: 3,
+    },
+    // zwp_primary_selection_*: set_selection 0, destroy 1; receive 0, destroy
+    // 1; offer 0, destroy 1. No drag and drop, so no room taken for it.
+    SelectionWire {
+        device_set_selection: 0,
+        device_destroy: 1,
+        device_data_offer: 0,
+        device_selection: 1,
+        offer_receive: 0,
+        offer_destroy: 1,
+        offer_offer: 0,
+        source_offer: 0,
+        source_destroy: 1,
+        source_send: 0,
+        source_cancelled: 1,
+        device_requests: 2,
+        offer_requests: 2,
+        source_requests: 2,
+    },
+];
+
+/// The manager's requests, which are the same two numbers for both.
+pub const SELECTION_CREATE_SOURCE: u16 = 0;
+pub const SELECTION_GET_DEVICE: u16 = 1;
+
 pub const DATA_OFFER_ACCEPT: u16 = 0;
+#[allow(dead_code)] // named because the protocol has it
 pub const DATA_OFFER_RECEIVE: u16 = 1;
+#[allow(dead_code)] // named because the protocol has it
 pub const DATA_OFFER_DESTROY: u16 = 2;
+#[allow(dead_code)] // named because the protocol has it
 pub const DATA_OFFER_OFFER: u16 = 0;
 
 /// The object id of `wl_display`, which exists before anything is asked for.
