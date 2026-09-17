@@ -7,6 +7,25 @@ const TAG_WRITE: u64 = 1;
 const MAX_WRITE_BYTES: usize = 40;
 
 static mut CONSOLE_TID: usize = 0;
+/// Whether descriptor 1 is connected to anything: 0 unasked, 1 yes, 2 no.
+static mut STDOUT: u8 = 0;
+
+/// Is there a descriptor 1 to write to?
+///
+/// Asked with a write of nothing, which every kind of descriptor accepts and
+/// an empty slot refuses — the kernel's own way of saying "there is nothing
+/// here". Asked once: a program's descriptors are wired by whoever started it,
+/// before it runs, so the answer does not change under it. A forked child
+/// inherits both the descriptor and this answer; an exec starts a new image
+/// and asks again.
+fn have_stdout() -> bool {
+    unsafe {
+        if STDOUT == 0 {
+            STDOUT = if syscall::sys_fd_write(1, &[]) == u64::MAX { 2 } else { 1 };
+        }
+        STDOUT == 1
+    }
+}
 
 fn resolve_console() -> usize {
     unsafe {
@@ -53,9 +72,22 @@ fn bytes_to_data(bytes: &[u8], len: usize) -> [u64; 5] {
     words
 }
 
-/// Write bytes to the console server via IPC.
-/// Falls back to sys_write if console not available.
+/// Write bytes to standard output.
+///
+/// Descriptor 1 first, and the console service only when there is no
+/// descriptor on it. That order is the whole point: a program's output should
+/// go wherever its output was pointed — into a pipe, into a terminal's pty,
+/// into a file — and the console is where a program with nowhere else to
+/// write ends up, not where everything goes regardless.
+///
+/// The fallback is not a formality. A driver started before the console
+/// exists, and `init` before it has wired anybody's descriptors, still have
+/// to be able to say something.
 pub fn console_write(s: &[u8]) {
+    if have_stdout() {
+        syscall::sys_fd_write(1, s);
+        return;
+    }
     let tid = resolve_console();
     if tid == 0 {
         syscall::sys_write(s);

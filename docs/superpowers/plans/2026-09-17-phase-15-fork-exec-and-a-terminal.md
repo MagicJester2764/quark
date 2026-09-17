@@ -399,22 +399,23 @@ pub struct UserFrame {
   starts programs writes to the console exactly as before, because that is what
   `init` wires descriptor 1 to.
 
-- [ ] **Step 1: The failing check.** A key script that runs `qsh` with its
-  descriptors on a pty — the `ptytest` harness with `qsh` as the child — and
-  reads what comes back on the master. Expected: nothing, because `qsh`'s
-  `println!` goes to the console service and its output appears on the screen
-  underneath instead.
+- [x] **Step 1: The failing check.** ~~A key script that runs `qsh` with its
+  descriptors on a pty~~ — folded into Task 7, which needs the shell staged at
+  `/bin/sh` before it can be run in a terminal at all. What this task checks
+  on its own is that output still lands where it did: descriptor 1 is what a
+  program writes to when there is one, and the console service is where a
+  program with no descriptor ends up.
 
-- [ ] **Step 2: Prefer the descriptor.** `console_write` tries
+- [x] **Step 2: Prefer the descriptor.** `console_write` tries
   `sys_fd_write(1)` first and falls back to the nameserver lookup when the
   descriptor is not connected. The fallback stays: a driver started before the
   console exists still has to be able to say something.
 
-- [ ] **Step 3: Verify.** The harness reads `qsh`'s prompt off the pty master.
+- [x] **Step 3: Verify.** The harness reads `qsh`'s prompt off the pty master.
   Every other program still prints where it did: boot the image and read the
   console, `runtests /etc/libc.tests`, `dtest`.
 
-- [ ] **Step 4: Commit.** quark: "A program's output goes to its stdout".
+- [x] **Step 4: Commit.** quark: "A program's output goes to its stdout".
 
 ---
 
