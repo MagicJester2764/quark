@@ -45,6 +45,11 @@ fn main() {
     let reuse: Vec<u64> = (0..100).collect();
     println!("Reuse vec len: {}", reuse.len());
 
+    // A HashMap seeds its hasher from the kernel's random numbers.
+    let mut map = std::collections::HashMap::new();
+    map.insert("quark", 1);
+    println!("HashMap: {:?}", map.get("quark"));
+
     let handle = std::thread::spawn(|| 40u64 + 2);
     match handle.join() {
         Ok(v) => println!("thread returned {}", v),

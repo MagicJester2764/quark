@@ -8,6 +8,7 @@ pub mod ext2_alloc;
 pub mod ext2_dir;
 pub mod ext4;
 pub mod csum;
+pub mod devices;
 pub mod disk;
 pub mod ext2_ops;
 pub mod handles;
@@ -1359,6 +1360,11 @@ pub extern "C" fn _start() -> ! {
         let sender = msg.sender;
 
         match msg.tag {
+            TAG_READ | TAG_WRITE | TAG_STAT | TAG_READDIR_BULK | TAG_TRUNCATE
+                if devices::is_ours(sender, &msg) =>
+            {
+                devices::serve(sender, &msg)
+            }
             TAG_OPEN if msg.data[1] & (OPEN_CREATE | OPEN_TRUNCATE) != 0 => {
                 transacted(|| handle_open(&disk, sender, &msg))
             }
@@ -1402,6 +1408,10 @@ fn handle_open(disk: &DiskState, sender: usize, msg: &Message) {
         Ok(p) => p,
         Err(code) => return error_reply(sender, code),
     };
+    match devices::lookup(path) {
+        devices::Lookup::Elsewhere => {}
+        found => return devices::open(sender, path, found, flags),
+    }
     if unsafe { FS_TYPE } == FsType::Ext2 {
         open_ext2(sender, path, flags);
     } else {
@@ -1550,6 +1560,9 @@ fn handle_mkdir(disk: &DiskState, sender: usize, msg: &Message) {
         Ok(p) => p,
         Err(code) => return error_reply(sender, code),
     };
+    if devices::refuses(path) {
+        return error_reply(sender, ERR_PERMISSION);
+    }
     let made = if unsafe { FS_TYPE } == FsType::Ext2 {
         if ext2_state().read_only {
             Err(ERR_READ_ONLY)
@@ -1628,7 +1641,6 @@ fn handle_close(sender: usize, msg: &Message) {
     }
 }
 
-/// A task the server gave handles to has died: they are closed for it.
 /// A program has gone: its handles go with it.
 fn client_died(space: u64) {
     let mut closed = [0u32; handles::MAX_OPEN_FILES];
@@ -1665,12 +1677,16 @@ fn handle_namespace(sender: usize, msg: &Message) {
         Ok(p) => p,
         Err(code) => return error_reply(sender, code),
     };
+    if devices::refuses(first) {
+        return error_reply(sender, ERR_PERMISSION);
+    }
     let (uid, gid) = get_sender_uid_gid(sender);
     let e2 = ext2_state_mut();
     let done = match msg.tag {
         TAG_UNLINK => ext2_ops::unlink(e2, first, uid, gid),
         TAG_RMDIR => ext2_ops::rmdir(e2, first, uid, gid),
         _ => match protocol::lent_path(sender, msg.data[0] as usize, msg.data[1] as usize, 4096) {
+            Ok(second) if devices::refuses(second) => Err(ERR_PERMISSION),
             Ok(second) => ext2_ops::rename(e2, first, second, uid, gid),
             Err(code) => Err(code),
         },
@@ -1742,7 +1758,9 @@ fn handle_stat(sender: usize, msg: &Message) {
                 block_size: e2.block_size as u64,
             }
         }
-        FsFileData::None => return error_reply(sender, ERR_INVALID_HANDLE),
+        FsFileData::Device(_) | FsFileData::DevDir | FsFileData::None => {
+            return error_reply(sender, ERR_INVALID_HANDLE)
+        }
     };
     match syscall::sys_lent_write(sender, 0, &record.to_bytes()) {
         Ok(n) if n == STAT_LEN => reply_opened(sender, [STAT_LEN as u64, 0, 0, 0, 0, 0]),

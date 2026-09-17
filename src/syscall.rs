@@ -171,6 +171,8 @@ pub const SYS_IRQ_REGISTER: u64 = 112;
 pub const SYS_IRQ_ACK: u64 = 113;
 pub const SYS_IOPORT: u64 = 114;
 pub const SYS_IOPORT_REP: u64 = 115;
+/// Random bytes from the kernel's generator.
+pub const SYS_GETRANDOM: u64 = 116;
 
 // --- 0x80  synchronisation ---
 pub const SYS_FUTEX_WAIT: u64 = 128;
@@ -213,7 +215,7 @@ pub const SYS_ABI_VERSION: u64 = 240;
 /// minor when calls are added. User space can refuse to run against a major it
 /// does not know, which is the point of exposing it at all.
 pub const ABI_VERSION_MAJOR: u64 = 2;
-pub const ABI_VERSION_MINOR: u64 = 2;
+pub const ABI_VERSION_MINOR: u64 = 3;
 
 /// Threads a task may make with no capability at all.
 ///
@@ -2076,6 +2078,31 @@ extern "C" fn syscall_dispatch(
             crate::pit::ticks()
         }
         SYS_BOOT_TIME => crate::rtc::boot_time(),
+        SYS_GETRANDOM => {
+            // arg0 = buffer, arg1 = length, arg2 = flags (none yet). No
+            // capability: a random number is nobody's secret until it has
+            // been handed out. At most a mebibyte a call, a page at a time,
+            // so interrupts are never off for long.
+            let len = (arg1 as usize).min(1 << 20);
+            if !validate_user_ptr_mut(arg0, len as u64) {
+                return u64::MAX;
+            }
+            let mut chunk = [0u8; 4096];
+            let mut done = 0;
+            while done < len {
+                let n = (len - done).min(chunk.len());
+                crate::random::fill(&mut chunk[..n]);
+                {
+                    let _ua = crate::cpu::UserAccess::begin();
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(chunk.as_ptr(), (arg0 as *mut u8).add(done), n);
+                    }
+                }
+                done += n;
+            }
+            chunk.fill(0);
+            done as u64
+        }
         SYS_WAIT => {
             // Block until a child task exits. Returns child TID or u64::MAX.
             scheduler::sys_wait()

@@ -1,6 +1,6 @@
 # Quark syscall ABI
 
-**Version 2.2.** Query the running kernel with `SYS_ABI_VERSION` (240), which
+**Version 2.3.** Query the running kernel with `SYS_ABI_VERSION` (240), which
 returns `(major << 16) | minor`.
 
 This document is the contract between the Quark kernel and everything above it.
@@ -131,6 +131,7 @@ rule still holds for everything else.
 |---|---|
 | 2.1 | `SYS_BOOT_TIME` (145) — the date, read from the machine's clock at boot. Before it nothing here knew what day it was, and files were dated from 1970. |
 | 2.2 | `SYS_TASK_SPACE` (107) and `SYS_SPACE_WATCH` (108) — a program's identity is its address space, so a server can keep what a program holds for the program rather than for the one thread that asked. Also: a thread starts holding a copy of its creator's capabilities and descriptors, and in its band. |
+| 2.3 | `SYS_GETRANDOM` (116) — random bytes from a ChaCha20 generator seeded from RDSEED or RDRAND and the machine's timing. Before it a program had the clock, and expat salted its hash tables with it. |
 
 ### Deprecated
 
@@ -526,12 +527,24 @@ to hear from.
 | 113 | `SYS_IRQ_ACK` | arg0 = irq | 0 / `u64::MAX` | `Irq` for that line |
 | 114 | `SYS_IOPORT` | arg0 = port, arg1 = op, arg2 = value | read value, or 0 / `u64::MAX` | `IoPort` covering the port |
 | 115 | `SYS_IOPORT_REP` | arg0 = port, arg1 = buf, arg2 = words, arg3 = op | 0 / `u64::MAX` | `IoPort` covering the port |
+| 116 | `SYS_GETRANDOM` | arg0 = buf, arg1 = len, arg2 = flags (none yet) | bytes written, at most 1 MiB / `u64::MAX` | — |
 
 `SYS_IOPORT` ops: 0 = read8, 1 = write8, 2 = read16, 3 = write16, 4 = read32,
 5 = write32. `SYS_IOPORT_REP` ops: 0 = `rep insw`, 1 = `rep outsw`.
 
 Interrupts are delivered to the registered task as notifications through a
 per-IRQ ring buffer, polled in `SYS_RECV`.
+
+`SYS_GETRANDOM` never blocks and needs nothing. The generator is ChaCha20
+(RFC 8439) with fast key erasure: each call's first block replaces the key
+before anything is handed out, so a key read out of memory later recomputes
+nothing given out before it. It is seeded at boot from RDSEED, else RDRAND,
+with the TSC, the timer and the clock, and every timer tick folds the TSC into
+what the next call mixes in. A CPU with neither instruction is seeded from
+timing alone, which is guessable, and the kernel says so on the serial line
+(`[random] no RDRAND or RDSEED; seeded from timing`). The kernel checks the
+block function against the RFC's test vector at boot and will not start if it
+is wrong.
 
 ### Synchronisation (0x80)
 

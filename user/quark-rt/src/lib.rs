@@ -20,6 +20,7 @@ pub mod nameserver;
 pub mod net;
 pub mod socket;
 pub mod passwd;
+pub mod random;
 pub mod vfs;
 pub mod wm;
 

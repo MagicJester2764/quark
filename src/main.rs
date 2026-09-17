@@ -21,6 +21,7 @@ mod multiboot2;
 pub mod paging;
 mod pic;
 mod pit;
+mod random;
 mod pmm;
 mod rtc;
 pub mod scheduler;
@@ -81,6 +82,7 @@ pub extern "C" fn kernel_main(multiboot_info: usize) -> ! {
     }
     console::puts(b"Interrupts enabled.\n");
     rtc::init();
+    random::init();
 
     // Initialize FAT32 driver (receives kernel services)
     fat32::init();

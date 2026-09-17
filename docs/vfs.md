@@ -32,6 +32,7 @@ code in `data[0]`:
 | 11 | `NOT_EMPTY` | The directory still has entries |
 | 12 | `NOT_SUPPORTED` | This filesystem cannot do that |
 | 13 | `NAME_TOO_LONG` | A path over 4095 bytes, or a name over 255 |
+| 14 | `NO_SPACE` | Nowhere to put what was written |
 
 Permission is checked against the caller's user and group, which the server
 asks the kernel for (`SYS_GET_TUID`). User 0 is not checked. FAT32 has no
@@ -146,7 +147,7 @@ with entry `start` (the first is 0). Each record is:
 | 8 | 8 | `next` — the `start` that continues after this entry |
 | 16 | 8 | `size` in bytes |
 | 24 | 2 | `reclen` — this record's length, a multiple of 8 |
-| 26 | 1 | `type` — `DT_DIR` 4, `DT_REG` 8, `DT_LNK` 10, or 0 |
+| 26 | 1 | `type` — `DT_DIR` 4, `DT_REG` 8, `DT_LNK` 10, `DT_CHR` 2, or 0 |
 | 27 | 1 | `namelen` |
 | 28 | | the name, a NUL, and padding to `reclen` |
 
@@ -156,6 +157,28 @@ yields zero bytes and `end` clear. `.` and `..` are listed where the
 filesystem stores them. A position is only meaningful for the directory it
 came from, and entries made or removed between two calls may be missed or
 seen twice, as with any `readdir`.
+
+### Devices
+
+`/dev` is the server's own, whatever the root filesystem holds there, and a
+path is checked against it before any filesystem sees it — spelled any way,
+`/tmp/../dev/null` included. It holds five character devices, mode `0666`,
+with ids from `0xFFFF_FF00` in this order:
+
+| Name | Read | Write |
+|---|---|---|
+| `null` | nothing: 0 bytes | accepted and dropped |
+| `zero` | zeroes | accepted and dropped |
+| `full` | zeroes | `NO_SPACE` |
+| `random` | random bytes (`SYS_GETRANDOM`) | accepted and dropped |
+| `urandom` | the same | accepted and dropped |
+
+`/dev` itself (id `0xFFFF_FF05`, mode `0755`) lists `.`, `..` and the five,
+typed `DT_CHR`. Nothing can be made, removed or renamed under it
+(`PERMISSION`); `OPEN_CREATE` on a device opens it, and with `OPEN_EXCLUSIVE`
+says `EXISTS`. `STAT` gives a device size 0 and the current time. The Linux
+layer reports Linux's device numbers for them (1:3, 1:5, 1:7, 1:8, 1:9). The
+images carry an empty `/dev` directory so that listing `/` shows it.
 
 ### STATFS
 

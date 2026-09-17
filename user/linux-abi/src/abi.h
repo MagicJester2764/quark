@@ -27,6 +27,7 @@
 #define LX_ENOTEMPTY 39
 #define LX_EOPNOTSUPP 95
 #define LX_ERANGE   34
+#define LX_ENOSPC   28
 
 /* Descriptors from here up are files.c's VFS files; below, the kernel's.
    The split sits at the kernel's MAX_FDS — see files.c. */

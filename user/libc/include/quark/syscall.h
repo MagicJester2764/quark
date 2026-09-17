@@ -63,6 +63,9 @@
 #define SYS_TASK_START_ARG  103
 #define SYS_SET_CLEAR_TID   106
 
+/* 0x70  hardware */
+#define SYS_GETRANDOM       116
+
 /* 0x80  futex */
 #define SYS_FUTEX_WAIT      128
 #define SYS_FUTEX_WAKE      129

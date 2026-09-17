@@ -491,8 +491,29 @@ long __quark_syscall(long n, long a1, long a2, long a3, long a4, long a5, long a
     case LX_set_robust_list:
     case LX_rseq:
     case LX_prlimit64:
-    case LX_getrandom:
         return -LX_ENOSYS;
+
+    /* The kernel's generator never blocks, so GRND_NONBLOCK, GRND_RANDOM
+       and GRND_INSECURE all get the same answer. One kernel call gives at
+       most a mebibyte; Linux gives at most this much in one of its own. */
+    case LX_getrandom: {
+        if ((unsigned long)a3 & ~7ul) {
+            return -LX_EINVAL;
+        }
+        unsigned long want = (unsigned long)a2;
+        if (want > 33554431ul) {
+            want = 33554431ul;
+        }
+        unsigned long done = 0;
+        while (done < want) {
+            unsigned long n = __syscall2(SYS_GETRANDOM, (unsigned long)a1 + done, want - done);
+            if (n == QUARK_ERR || n == 0) {
+                return done ? (long)done : -LX_EFAULT;
+            }
+            done += n;
+        }
+        return (long)done;
+    }
 
     case LX_uname:
         return do_uname((char *)a1);

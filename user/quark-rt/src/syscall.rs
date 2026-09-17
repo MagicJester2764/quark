@@ -111,6 +111,7 @@ pub const SYS_IRQ_REGISTER: u64 = 112;
 pub const SYS_IRQ_ACK: u64 = 113;
 pub const SYS_IOPORT: u64 = 114;
 pub const SYS_IOPORT_REP: u64 = 115;
+pub const SYS_GETRANDOM: u64 = 116;
 
 // --- 0x80  synchronisation ---
 pub const SYS_FUTEX_WAIT: u64 = 128;
@@ -659,6 +660,13 @@ pub fn sys_ioport_rep_outsw(port: u16, buf: &[u16]) -> Result<(), ()> {
         syscall4(SYS_IOPORT_REP, port as u64, buf.as_ptr() as u64, buf.len() as u64, 1)
     };
     if ret == u64::MAX { Err(()) } else { Ok(()) }
+}
+
+/// Fill as much of `buf` as one call gives (at most a mebibyte) with random
+/// bytes, and say how much that was.
+pub fn sys_getrandom(buf: &mut [u8]) -> Result<usize, ()> {
+    let ret = unsafe { syscall3(SYS_GETRANDOM, buf.as_mut_ptr() as u64, buf.len() as u64, 0) };
+    if ret == u64::MAX { Err(()) } else { Ok(ret as usize) }
 }
 
 pub fn sys_irq_register(irq: u8) -> Result<(), ()> {

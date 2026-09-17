@@ -29,6 +29,10 @@ pub enum FsFileData {
     Ext2 {
         inode_num: u32,
     },
+    /// One of `/dev`'s devices, which no disk holds.
+    Device(crate::devices::Device),
+    /// `/dev` itself.
+    DevDir,
     None,
 }
 

@@ -1233,6 +1233,24 @@ fn test_runtime_service() {
     check("and can be taken again", nameserver::register(b"dchild-svc").is_ok());
 }
 
+fn test_random() {
+    println!("random numbers:");
+    let mut a = [0u8; 32];
+    let mut b = [0u8; 32];
+    check("the kernel fills a buffer", syscall::sys_getrandom(&mut a) == Ok(32));
+    check("and another, differently", syscall::sys_getrandom(&mut b) == Ok(32) && a != b);
+    check("with something other than zeroes", a.iter().any(|&x| x != 0));
+    check("an empty request is answered", syscall::sys_getrandom(&mut []) == Ok(0));
+    // A buffer the caller cannot write is refused, not written.
+    let bad = unsafe { core::slice::from_raw_parts_mut(0x1000 as *mut u8, 16) };
+    check("a buffer that is not the caller's is refused", syscall::sys_getrandom(bad).is_err());
+    let mut big = [0u8; 5000];
+    check(
+        "the runtime fills more than a page",
+        quark_rt::random::fill(&mut big).is_ok() && big[4096..].iter().any(|&x| x != 0),
+    );
+}
+
 /// `dir`/entry-NN-nnn…, the name 100 bytes long. Returns the path's length.
 fn listing_entry(buf: &mut [u8; 160], dir: &[u8], i: usize) -> usize {
     buf[..dir.len()].copy_from_slice(dir);
@@ -1741,6 +1759,7 @@ pub extern "C" fn _start() -> ! {
         ("endpoints", test_endpoint_objects),
         ("calls", test_call_storm),
         ("service", test_runtime_service),
+        ("random", test_random),
         ("files", test_files),
         ("sync", test_sync),
         ("fpu", test_fpu),

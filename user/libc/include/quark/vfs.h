@@ -54,6 +54,11 @@
 #define QUARK_VFS_NOT_EMPTY     11
 #define QUARK_VFS_NOT_SUPPORTED 12
 #define QUARK_VFS_NAME_TOO_LONG 13
+#define QUARK_VFS_NO_SPACE      14
+
+/* The server's devices have ids from here up, in the order null, zero, full,
+   random, urandom. */
+#define QUARK_VFS_DEVICE_ID 0xFFFFFF00ul
 
 /* A path is lent with the call that names it. One longer than this is
    refused, never shortened. */

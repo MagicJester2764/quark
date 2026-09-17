@@ -94,6 +94,7 @@ static long vfs_errno(int code) {
     case QUARK_VFS_NOT_EMPTY:      return -LX_ENOTEMPTY;
     case QUARK_VFS_NOT_SUPPORTED:  return -LX_EOPNOTSUPP;
     case QUARK_VFS_NAME_TOO_LONG:  return -LX_ENAMETOOLONG;
+    case QUARK_VFS_NO_SPACE:       return -LX_ENOSPC;
     default:                       return -LX_EIO;
     }
 }
@@ -448,6 +449,13 @@ static void fill_stat(struct lx_kstat *st, const struct quark_vfs_stat *r) {
     st->st_atime_sec = (long)r->atime;
     st->st_mtime_sec = (long)r->mtime;
     st->st_ctime_sec = (long)r->ctime;
+    /* The server's devices, by the numbers Linux gives them: 1:3 null,
+       1:5 zero, 1:7 full, 1:8 random, 1:9 urandom. */
+    static const unsigned char minors[] = {3, 5, 7, 8, 9};
+    unsigned long dev = r->id - QUARK_VFS_DEVICE_ID;
+    if ((r->mode & 0170000) == 020000 && dev < sizeof minors) {
+        st->st_rdev = (1ul << 8) | minors[dev];
+    }
 }
 
 long __quark_fstat(long fd, void *statbuf) {

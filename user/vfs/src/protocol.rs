@@ -55,6 +55,8 @@ pub const ERR_NOT_EMPTY: u64 = 11;
 pub const ERR_NOT_SUPPORTED: u64 = 12;
 /// A path over [`MAX_PATH`] bytes, or a name over [`MAX_NAME`].
 pub const ERR_NAME_TOO_LONG: u64 = 13;
+/// Nowhere to put what was written.
+pub const ERR_NO_SPACE: u64 = 14;
 
 pub const MAX_PATH: usize = 4095;
 /// What an ext2 directory entry's one-byte length allows.
@@ -94,6 +96,7 @@ pub fn lent_path(sender: usize, offset: usize, len: usize, at: usize) -> Result<
 /// `type` (1), `namelen` (1), then the name and a NUL, padded to 8.
 pub const DIRENT_HEADER: usize = 28;
 pub const DT_UNKNOWN: u8 = 0;
+pub const DT_CHR: u8 = 2;
 pub const DT_DIR: u8 = 4;
 pub const DT_REG: u8 = 8;
 pub const DT_LNK: u8 = 10;

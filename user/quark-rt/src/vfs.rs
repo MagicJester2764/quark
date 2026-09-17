@@ -49,6 +49,7 @@ pub const ERR_EXISTS: u64 = 10;
 pub const ERR_NOT_EMPTY: u64 = 11;
 pub const ERR_NOT_SUPPORTED: u64 = 12;
 pub const ERR_NAME_TOO_LONG: u64 = 13;
+pub const ERR_NO_SPACE: u64 = 14;
 
 /// File-type bits of a mode, as [`Stat::mode`] carries them.
 pub const S_IFMT: u32 = 0o170000;
@@ -117,11 +118,12 @@ pub struct DirEntry {
     pub is_dir: bool,
     /// The inode number (FAT32: the first cluster).
     pub id: u64,
-    /// `DT_DIR`, `DT_REG`, `DT_LNK` or `DT_UNKNOWN`.
+    /// `DT_DIR`, `DT_REG`, `DT_LNK`, `DT_CHR` or `DT_UNKNOWN`.
     pub kind: u8,
 }
 
 pub const DT_UNKNOWN: u8 = 0;
+pub const DT_CHR: u8 = 2;
 pub const DT_DIR: u8 = 4;
 pub const DT_REG: u8 = 8;
 pub const DT_LNK: u8 = 10;

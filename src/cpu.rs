@@ -38,6 +38,29 @@ fn cpuid_7_0_ebx() -> u32 {
     ebx
 }
 
+/// CPUID leaf 1: ECX bit 30 = RDRAND.
+fn cpuid_1_ecx() -> u32 {
+    let ecx: u32;
+    unsafe {
+        core::arch::asm!(
+            "mov {tmp:r}, rbx",
+            "cpuid",
+            "mov rbx, {tmp:r}",
+            tmp = out(reg) _,
+            inout("eax") 1 => _,
+            inout("ecx") 0 => ecx,
+            out("edx") _,
+            options(nostack),
+        );
+    }
+    ecx
+}
+
+/// Whether the CPU has RDSEED and RDRAND, in that order.
+pub fn random_instructions() -> (bool, bool) {
+    (cpuid_7_0_ebx() & (1 << 18) != 0, cpuid_1_ecx() & (1 << 30) != 0)
+}
+
 fn read_cr4() -> u64 {
     let val: u64;
     unsafe { core::arch::asm!("mov {}, cr4", out(reg) val, options(nomem, nostack)) };

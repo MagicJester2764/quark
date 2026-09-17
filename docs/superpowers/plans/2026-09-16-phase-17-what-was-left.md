@@ -241,7 +241,7 @@ no-op. dtest: 221 passed; libc.tests 6/6; e2fsck clean.
 
 The generator is ChaCha20 (RFC 8439) with fast key erasure: each request draws a keystream block from the current key, uses the first 32 bytes as the next key and hands out what follows. It is seeded at boot from RDSEED, else RDRAND, plus the TSC, the PIT count and the RTC time; each timer tick folds the TSC into a 64-bit pool, and every request mixes the pool into the key first. With neither instruction, the kernel says so on serial (`[random] no RDRAND or RDSEED; seeded from timing`), because that seed is guessable.
 
-- [ ] **Step 1: The failing test.** `randtest.c` (runs on Linux as it is):
+- [x] **Step 1: The failing test.** `randtest.c` (runs on Linux as it is):
 
 ```c
 /* Random bytes from the kernel, and the devices every C program expects. */
@@ -322,9 +322,9 @@ int main(void) {
 
 Added to `libc.tests`. Run it on the host (`cc -O2 randtest.c && ./a.out`): all ok.
 
-- [ ] **Step 2: Run it on Quark.** Expected: `getrandom` fails (ENOSYS) and `/dev/urandom` does not open.
+- [x] **Step 2: Run it on Quark.** Expected: `getrandom` fails (ENOSYS) and `/dev/urandom` does not open.
 
-- [ ] **Step 3: The kernel.** `random.rs`:
+- [x] **Step 3: The kernel.** `random.rs`:
 
 ```rust
 /// One ChaCha20 block (RFC 8439 §2.3): `out` is the keystream for `key`,
@@ -363,9 +363,9 @@ fn block(key: &[u8; 32], counter: u32, nonce: &[u8; 12], out: &mut [u8; 64]) {
 
 `SYS_GETRANDOM` validates the user buffer writable, fills a 4096-byte kernel buffer at a time and copies it out under `UserAccess`, as `fd_read_ipc` does.
 
-- [ ] **Step 4: quark-rt and std.** `random::fill` loops `sys_getrandom` until the buffer is full. The fork's `random/quark.rs` becomes `quark_rt::random::fill(bytes).expect("the kernel has no random numbers")` — failing loudly rather than handing out zeroes.
+- [x] **Step 4: quark-rt and std.** `random::fill` loops `sys_getrandom` until the buffer is full. The fork's `random/quark.rs` becomes `quark_rt::random::fill(bytes).expect("the kernel has no random numbers")` — failing loudly rather than handing out zeroes.
 
-- [ ] **Step 5: The devices.** `devices.rs` in the VFS:
+- [x] **Step 5: The devices.** `devices.rs` in the VFS:
 
 ```rust
 #[derive(Clone, Copy, PartialEq)]
@@ -383,11 +383,21 @@ pub fn lookup(path: &[u8]) -> Option<Option<Device>>
 
 `lookup` strips a leading `/`, repeated and trailing slashes; `dev` alone is the directory; `dev/<name>` is a device; `dev/<anything else>` is `ERR_NOT_FOUND`. `handle_open` asks `devices::lookup` first. A device handle: `is_dir` false, mode `0o020666`, id `0xFFFF_FF00 + index`, readable and writable by everybody. `READ`: `Null` → 0 bytes; `Zero` and `Full` → zeroes; `Random`/`Urandom` → `sys_getrandom` into `CLIENT_BUF`, then `lend_out`. `WRITE`: `Full` → `ERR_NO_SPACE`, the rest accept everything. `STAT` fills the record from those values, times from `quark_rt::syscall::unix_time()`. `READDIR_BULK` on `/dev` lists the five with `DT_CHR` (2). The filesystem must have a `/dev` directory for `ls /` to show it; the image makes one.
 
-- [ ] **Step 6: The Linux layer.** `getrandom` (318) calls `SYS_GETRANDOM` in a loop until the request is met; `fill_stat` keeps `S_IFCHR` from the server's mode; `vfs_errno` maps `QUARK_VFS_NO_SPACE` to `-LX_ENOSPC` (28).
+- [x] **Step 6: The Linux layer.** `getrandom` (318) calls `SYS_GETRANDOM` in a loop until the request is met; `fill_stat` keeps `S_IFCHR` from the server's mode; `vfs_errno` maps `QUARK_VFS_NO_SPACE` to `-LX_ENOSPC` (28).
 
-- [ ] **Step 7: Verify.** `make` (check-abi); layer and suites; the fork (`hello` rebuilds); image (`dev` exists); boot: `runtests /etc/libc.tests` (randtest ok), `ls /dev`, `dtest` (a new check in `service`: two `sys_getrandom` buffers differ), `hello`. Serial shows no `no RDRAND` line under `-cpu max`. `check-rootfs.sh`.
+- [x] **Step 7: Verify.** `make` (check-abi); layer and suites; the fork (`hello` rebuilds); image (`dev` exists); boot: `runtests /etc/libc.tests` (randtest ok), `ls /dev`, `dtest` (a new check in `service`: two `sys_getrandom` buffers differ), `hello`. Serial shows no `no RDRAND` line under `-cpu max`. `check-rootfs.sh`.
 
-- [ ] **Step 8: Commit.** quark: "Random numbers, and /dev"; rust: "std: random bytes from the kernel"; explosion: "randtest; the root has /dev".
+- [x] **Step 8: Commit.** quark: "Random numbers, and /dev"; rust: "std: random bytes from the kernel"; explosion: "randtest; the root has /dev".
+
+**Done.** The generator adds `SYS_GETRANDOM` at ABI 2.3 rather than folding
+into 2.2, which was already pushed. The dtest checks are a section of their
+own, `random`, rather than part of `service`. `hello` makes a `HashMap`, which
+is what reaches std's random path (nothing did before). The FAT32 root gets
+`/dev` too, and the Linux layer reports Linux's device numbers. A path is
+checked against `/dev` after `.` and `..` are taken lexically; Task 5's
+symbolic links and Task 6's relative paths must keep a link or a working
+directory that leads into `/dev` finding the devices. libc.tests 7/7; dtest
+227 passed; e2fsck clean; FAT32 boot lists `/dev` and passes randtest.
 
 ---
 
