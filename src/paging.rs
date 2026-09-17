@@ -1097,3 +1097,128 @@ pub unsafe fn unmap_page_owned(pml4_phys: usize, virt_addr: usize) -> bool { uns
         _ => false,
     }
 }}
+
+/// Copy the user half of an address space, for a fork.
+///
+/// A page the source owns becomes a page of its own with the same bytes; a
+/// page it does not own — shared memory, a device, a file's page — is mapped
+/// at the same frame, because that is what sharing means and because `OWNED`
+/// is what decides who may free a frame. A reservation is copied as a
+/// reservation: the promise is inherited, and whoever touches the page first
+/// gets a frame for it.
+///
+/// Eager, and not copy-on-write. A frame here has no reference count, so
+/// sharing one writable between two address spaces would need one; the
+/// immediate use of `fork` is a child that immediately execs, where
+/// copy-on-write saves all of the copying and none of the correctness.
+///
+/// Returns the pages charged to the child, or `None` if anything ran out. On
+/// failure the caller destroys the half-built space, which frees exactly what
+/// this made: everything it allocated carries `OWNED`.
+///
+/// # Safety
+/// Both must be valid, identity-mapped PML4 tables, and `dst_pml4` must be a
+/// fresh space from `create_address_space`.
+pub unsafe fn copy_user_space(src_pml4: usize, dst_pml4: usize) -> Option<usize> { unsafe {
+    let src = table_at(src_pml4);
+    let dst = table_at(dst_pml4);
+    let mut pages = 0usize;
+    // PML4[1..256] is user space: [`USER_MIN_ADDR`] upwards, and the stack at
+    // the top of it. PML4[0] is the kernel's and is already shared by
+    // `create_address_space`; 256 and above is the kernel's upper half.
+    for i in 1..256 {
+        if !src.entries[i].is_present() {
+            continue;
+        }
+        let src_pdpt = src.entries[i].frame_address();
+        let flags = src.entries[i].raw() & (PRESENT | WRITABLE | USER);
+        let new_pdpt = pmm::alloc()?.address();
+        core::ptr::write_bytes(new_pdpt as *mut u8, 0, PAGE_SIZE);
+        dst.entries[i].set(new_pdpt, flags);
+        pages += copy_pdpt(src_pdpt, new_pdpt)?;
+    }
+    Some(pages)
+}}
+
+unsafe fn copy_pdpt(src_phys: usize, dst_phys: usize) -> Option<usize> { unsafe {
+    let src = table_at(src_phys);
+    let dst = table_at(dst_phys);
+    let mut pages = 0usize;
+    for i in 0..512 {
+        let raw = src.entries[i].raw();
+        if raw == 0 {
+            continue;
+        }
+        if !src.entries[i].is_present() || src.entries[i].is_huge() {
+            // A gigabyte reservation, or a huge mapping nothing here makes.
+            dst.entries[i] = src.entries[i];
+            crate::memobj::map_ref(object_slot(raw), 1);
+            continue;
+        }
+        let new_pd = pmm::alloc()?.address();
+        core::ptr::write_bytes(new_pd as *mut u8, 0, PAGE_SIZE);
+        dst.entries[i].set(new_pd, raw & (PRESENT | WRITABLE | USER));
+        pages += copy_pd(src.entries[i].frame_address(), new_pd)?;
+    }
+    Some(pages)
+}}
+
+unsafe fn copy_pd(src_phys: usize, dst_phys: usize) -> Option<usize> { unsafe {
+    let src = table_at(src_phys);
+    let dst = table_at(dst_phys);
+    let mut pages = 0usize;
+    for i in 0..512 {
+        let raw = src.entries[i].raw();
+        if raw == 0 {
+            continue;
+        }
+        if !src.entries[i].is_present() || src.entries[i].is_huge() {
+            // A two-megabyte reservation is one entry and no table under it.
+            dst.entries[i] = src.entries[i];
+            crate::memobj::map_ref(object_slot(raw), 1);
+            continue;
+        }
+        let new_pt = pmm::alloc()?.address();
+        core::ptr::write_bytes(new_pt as *mut u8, 0, PAGE_SIZE);
+        dst.entries[i].set(new_pt, raw & (PRESENT | WRITABLE | USER));
+        pages += copy_pt(src.entries[i].frame_address(), new_pt)?;
+    }
+    Some(pages)
+}}
+
+unsafe fn copy_pt(src_phys: usize, dst_phys: usize) -> Option<usize> { unsafe {
+    let src = table_at(src_phys);
+    let dst = table_at(dst_phys);
+    let mut pages = 0usize;
+    for i in 0..512 {
+        let raw = src.entries[i].raw();
+        if raw == 0 {
+            continue;
+        }
+        if raw & PRESENT != 0 && raw & OWNED != 0 {
+            // The child's own copy of the page, and the only one it may free.
+            let frame = pmm::alloc()?.address();
+            core::ptr::copy_nonoverlapping(
+                src.entries[i].frame_address() as *const u8,
+                frame as *mut u8,
+                PAGE_SIZE,
+            );
+            dst.entries[i].set(frame, raw & !ADDR_MASK);
+            pages += 1;
+            continue;
+        }
+        // Shared, or a device, or a page of an object, or a reservation: the
+        // same entry, and one more reference to whatever it names.
+        dst.entries[i] = src.entries[i];
+        let slot = object_slot(raw);
+        if slot != 0 {
+            crate::memobj::map_ref(slot, 1);
+            if raw & PRESENT != 0 && raw & WRITABLE != 0 && raw & MARKER_SHARED != 0 {
+                // A second shared writable mapping of the same page, which the
+                // object counts so that it knows to write back.
+                crate::memobj::mapped_writable(slot, (raw >> 12) & crate::memobj::MAX_PAGE);
+            }
+        }
+    }
+    Some(pages)
+}}

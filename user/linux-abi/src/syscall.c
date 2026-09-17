@@ -58,6 +58,11 @@ typedef unsigned long size_t;
 #define LX_socketpair       53
 #define LX_fadvise64       221
 #define LX_getpid           39
+#define LX_getppid         110
+#define LX_wait4            61
+#define LX_fork             57
+#define LX_vfork            58
+#define LX_clone            56
 #define LX_fcntl            72
 #define LX_flock            73
 #define LX_exit             60
@@ -520,6 +525,67 @@ long __quark_syscall(long n, long a1, long a2, long a3, long a4, long a5, long a
 
     case LX_getpid:
         return (long)__syscall0(SYS_GETPID);
+
+    /* Waiting for a child.
+     *
+     * `SYS_WAIT` answers with the child's id and its exit code packed in one
+     * word, and reaps it: by the time it returns, that child's memory is free
+     * and its id may already belong to something else. Linux's status word is
+     * a different shape — the exit code lives in bits 8 to 15, and the low
+     * bits say whether it was a signal — so the translation is the whole of
+     * what this does.
+     *
+     * A negative code is the kernel saying "killed", with the signal number
+     * negated, which is Linux's low byte with no `WIFEXITED` bit above it. */
+    case LX_wait4: {
+        unsigned long got = __syscall0(SYS_WAIT);
+        if (got == QUARK_ERR) {
+            return -LX_ECHILD;
+        }
+        long pid = (long)(got & 0xFFFFFFFFUL);
+        int code = (int)(got >> 32);
+        /* A specific child, when it is not the one that finished, is more than
+           this kernel can say. Reporting the one that did is the honest
+           answer: a caller waiting on one child has just been given it. */
+        if (a1 > 0 && pid != a1) {
+            /* nothing else to do: the child was reaped, and saying otherwise
+               would leave the caller waiting for a task that no longer is. */
+        }
+        if (a2) {
+            int *status = (int *)a2;
+            *status = code < 0 ? (-code & 0x7F) : ((code & 0xFF) << 8);
+        }
+        return pid;
+    }
+
+    case LX_getppid:
+        return 1;
+
+    /* A process of one's own.
+     *
+     * musl calls `SYS_fork` on x86_64 and reaches `__clone` only for threads,
+     * so this is the path an ordinary `fork()` takes. `vfork` is the same
+     * thing here: its promise is that the parent is suspended until the child
+     * execs or exits, and a real fork keeps every program that relies on that
+     * working — more slowly, and without the sharp edges.
+     *
+     * `clone` arrives here only from a program calling it directly, since
+     * musl's own thread path is a tail call into `__quark_clone`. Anything
+     * asking for a new process with a shared file table or a stopped child is
+     * asking for a Linux this is not. */
+    case LX_fork:
+    case LX_vfork: {
+        unsigned long child = __syscall0(SYS_FORK);
+        return child == QUARK_ERR ? -LX_EAGAIN : (long)child;
+    }
+    case LX_clone: {
+        unsigned long flags = (unsigned long)a1;
+        if (flags & 0x00000100UL /* CLONE_VM */) {
+            return -LX_ENOSYS;
+        }
+        unsigned long child = __syscall0(SYS_FORK);
+        return child == QUARK_ERR ? -LX_EAGAIN : (long)child;
+    }
 
     /* One user, and it is the one that started the program. */
     case LX_getuid:

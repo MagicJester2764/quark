@@ -1530,3 +1530,155 @@ pub fn current_fd(fd: usize) -> crate::task::FdKind {
         }
     }
 }
+
+/// The top of the running task's kernel stack.
+///
+/// The syscall stub sets RSP to this and pushes a [`UserFrame`], so it is also
+/// where that frame is, less its size. Published to the per-CPU area on every
+/// switch, and by `enter_user_inner` when a task first goes to user mode.
+pub fn current_kernel_stack_top() -> u64 {
+    let flags = irq_save();
+    let top = unsafe {
+        match TASKS[current_tid()].as_ref() {
+            Some(t) if !t.kernel_stack_base.is_null() => {
+                t.kernel_stack_base as u64 + t.kernel_stack_size as u64
+            }
+            _ => 0,
+        }
+    };
+    irq_restore(flags);
+    top
+}
+
+/// The register state the running task will return to user mode with.
+///
+/// Only meaningful inside a system call, which is the only time this is asked.
+fn current_user_frame() -> Option<crate::task::UserFrame> {
+    let top = current_kernel_stack_top();
+    if top == 0 {
+        return None;
+    }
+    let at = top as usize - core::mem::size_of::<crate::task::UserFrame>();
+    Some(unsafe { core::ptr::read(at as *const crate::task::UserFrame) })
+}
+
+/// Make a copy of the running task: a task of its own, in a copy of this
+/// address space, that returns 0 from the system call this is inside.
+///
+/// Returns the child's TID to the caller. Everything a task has that a child
+/// inherits is copied here: descriptors — with their reference counts — and
+/// capabilities and band through `inherit_from_creator`, the thread pointer,
+/// the memory limit, and the parent. What is not copied is the thread-list
+/// word `SYS_SET_CLEAR_TID` registered: it names a lock in the *parent's*
+/// thread list, and a child clearing it on exit would unlock a list it was
+/// never in.
+pub fn fork_current() -> Option<usize> {
+    let frame = current_user_frame()?;
+    let parent = current_tid();
+    let (parent_cr3, fs_base, mem_limit, uid, gid) = {
+        let flags = irq_save();
+        let got = unsafe {
+            TASKS[parent]
+                .as_ref()
+                .map(|t| (t.cr3, t.fs_base, t.mem_limit, t.uid, t.gid))
+        };
+        irq_restore(flags);
+        got?
+    };
+    if parent_cr3 == 0 {
+        return None;
+    }
+
+    // The address space first: it is the part that can run out, and it is the
+    // part that is worth doing before a task slot is taken.
+    let child_cr3 = crate::userspace::create_address_space()?;
+    let pages = match unsafe { crate::paging::copy_user_space(parent_cr3, child_cr3) } {
+        Some(n) => n,
+        None => {
+            drop_unused_space(child_cr3);
+            return None;
+        }
+    };
+
+    let tid = match create_task_in(child_cr3) {
+        Some(t) => t,
+        None => {
+            drop_unused_space(child_cr3);
+            return None;
+        }
+    };
+    inherit_from_creator(tid, parent);
+    {
+        let flags = irq_save();
+        unsafe {
+            if let Some(t) = TASKS[tid].as_mut() {
+                t.fs_base = fs_base;
+                t.mem_limit = mem_limit;
+                t.mem_pages = pages;
+                t.parent_tid = parent;
+                t.uid = uid;
+                t.gid = gid;
+                // The parent's floating-point state is in the registers right
+                // now — this is its system call — so it is saved from there
+                // rather than copied from where the last switch left it.
+                crate::fpu::save(&raw mut t.fpu);
+            }
+        }
+        irq_restore(flags);
+    }
+
+    if start_forked(tid, child_cr3, &frame).is_err() {
+        kill_task(tid);
+        return None;
+    }
+    Some(tid)
+}
+
+/// Throw away an address space no task ever ran in.
+///
+/// The ordinary path frees one when its last task goes; a fork that fails
+/// part-way has one nothing is using, and leaving it would leak every page the
+/// copy had managed.
+fn drop_unused_space(cr3: usize) {
+    unsafe {
+        crate::paging::destroy_address_space(cr3);
+        crate::userspace::unregister_address_space(cr3);
+    }
+}
+
+/// Start a task that is a copy of another, at the point that other one is.
+fn start_forked(tid: usize, cr3: usize, frame: &crate::task::UserFrame) -> Result<(), ()> {
+    if tid >= MAX_TASKS {
+        return Err(());
+    }
+    let flags = irq_save();
+    unsafe {
+        let Some(task) = TASKS[tid].as_mut() else {
+            irq_restore(flags);
+            return Err(());
+        };
+        if task.state != TaskState::Blocked {
+            irq_restore(flags);
+            return Err(());
+        }
+        task.cr3 = cr3;
+        crate::userspace::addrspace_ref(cr3);
+
+        // The frame goes where a system call's frame would be, because that is
+        // what it is: the child returns from the call its parent is in.
+        let top = (task.kernel_stack_base as usize + task.kernel_stack_size) & !0xF;
+        let at = top - core::mem::size_of::<crate::task::UserFrame>();
+        core::ptr::write(at as *mut crate::task::UserFrame, *frame);
+        core::ptr::write((at - 8) as *mut u64, crate::task::task_exit_trampoline as u64);
+
+        task.context.rip = crate::userspace::fork_return_trampoline as *const () as u64;
+        task.context.rsp = (at - 8) as u64;
+        task.context.rbp = 0;
+        task.context.r12 = at as u64;
+        task.context.r14 = cr3 as u64;
+        task.state = TaskState::Ready;
+        enqueue(tid);
+    }
+    irq_restore(flags);
+    Ok(())
+}

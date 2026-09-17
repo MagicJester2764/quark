@@ -107,6 +107,7 @@ pub const SYS_SET_CLEAR_TID: u64 = 106;
 pub const SYS_TASK_SPACE: u64 = 107;
 pub const SYS_SPACE_WATCH: u64 = 108;
 pub const SYS_TASK_CREATE_IN: u64 = 109;
+pub const SYS_FORK: u64 = 110;
 
 // --- 0x70  hardware and drivers ---
 pub const SYS_IRQ_REGISTER: u64 = 112;

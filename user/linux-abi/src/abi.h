@@ -21,6 +21,7 @@
 #define LX_EISDIR   21
 #define LX_ENODEV   19
 #define LX_EAGAIN   11
+#define LX_ECHILD   10
 #define LX_EEXIST   17
 #define LX_EXDEV    18
 #define LX_ENAMETOOLONG 36

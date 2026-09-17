@@ -261,6 +261,35 @@ pub unsafe extern "C" fn enter_user_trampoline() {
     );
 }
 
+/// Where a forked child starts: r12 is its saved frame, r14 its address space.
+#[unsafe(naked)]
+pub unsafe extern "C" fn fork_return_trampoline() {
+    core::arch::naked_asm!(
+        "mov rdi, r12",
+        "mov rsi, r14",
+        "call {inner}",
+        inner = sym fork_return_inner,
+    );
+}
+
+/// Finish a fork, in the child.
+///
+/// The parent is somewhere inside `SYS_FORK`; this is the same point in the
+/// same program, with the same registers and a different address space. The
+/// call's value is the only difference, and it is the whole of what `fork`
+/// tells a program about which half it is.
+fn fork_return_inner(frame: *const crate::task::UserFrame, pml4: u64) -> ! {
+    unsafe {
+        paging::write_cr3(pml4 as usize);
+    }
+    let kernel_rsp = crate::scheduler::current_kernel_stack_top();
+    unsafe {
+        syscall::setup_percpu(kernel_rsp);
+        crate::idt::update_tss_rsp0(kernel_rsp);
+        syscall::enter_usermode_frame(frame)
+    }
+}
+
 /// Inner function called by the trampoline with proper C ABI args.
 fn enter_user_inner(entry: u64, stack: u64, pml4: u64, arg: u64) {
     // Switch to the user's address space
@@ -269,10 +298,16 @@ fn enter_user_inner(entry: u64, stack: u64, pml4: u64, arg: u64) {
     }
 
     // Set up per-CPU kernel stack for syscall re-entry and TSS RSP0
-    // for hardware exception handling from ring 3
-    let kernel_rsp: u64;
+    // for hardware exception handling from ring 3.
+    //
+    // The *top* of the stack rather than the RSP this is running on: nothing
+    // below it survives entering user mode, and the scheduler publishes the
+    // top on every switch — so this is what makes the two agree. `fork` reads
+    // a caller's saved registers from the top less their size, and would find
+    // them somewhere else for a task that had not been switched away from
+    // since it started.
+    let kernel_rsp = crate::scheduler::current_kernel_stack_top();
     unsafe {
-        core::arch::asm!("mov {}, rsp", out(reg) kernel_rsp, options(nomem, nostack));
         syscall::setup_percpu(kernel_rsp);
         crate::idt::update_tss_rsp0(kernel_rsp);
     }

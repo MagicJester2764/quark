@@ -180,6 +180,7 @@ pub const SYS_TASK_SPACE: u64 = 107;
 pub const SYS_SPACE_WATCH: u64 = 108;
 /// Make a task for an address space the caller created, to start later.
 pub const SYS_TASK_CREATE_IN: u64 = 109;
+pub const SYS_FORK: u64 = 110;
 
 /// Be told when a task dies, so that whatever it was lent can be taken back.
 /// Takes no capability: SYS_TASK_INFO already answers the same question by
@@ -262,7 +263,7 @@ pub const SYS_ABI_VERSION: u64 = 240;
 /// minor when calls are added. User space can refuse to run against a major it
 /// does not know, which is the point of exposing it at all.
 pub const ABI_VERSION_MAJOR: u64 = 2;
-pub const ABI_VERSION_MINOR: u64 = 8;
+pub const ABI_VERSION_MINOR: u64 = 9;
 
 /// Threads a task may make with no capability at all.
 ///
@@ -1085,6 +1086,18 @@ extern "C" fn syscall_dispatch(
                 return u64::MAX;
             }
             match scheduler::create_empty_task() {
+                Some(tid) => tid as u64,
+                None => u64::MAX,
+            }
+        }
+        SYS_FORK => {
+            // A copy of this task in a copy of this address space, which
+            // returns 0 there and the child's id here. No capability: a task
+            // may always make a copy of itself, because everything the copy
+            // gets is already the caller's — its pages are copied out of the
+            // caller's own and charged to the child, and the descriptors and
+            // capabilities are the ones the caller holds.
+            match scheduler::fork_current() {
                 Some(tid) => tid as u64,
                 None => u64::MAX,
             }
@@ -2955,6 +2968,42 @@ pub fn update_kernel_rsp(rsp: u64) {
         PER_CPU.kernel_rsp = rsp;
     }
 }
+
+/// Go back to user mode with a whole register frame, as a forked child does.
+///
+/// [`enter_usermode`] starts a program: one entry point, one stack, one
+/// argument. This *resumes* one — every register the system call stub would
+/// have restored, and RAX set to zero, because the child's only difference
+/// from its parent is what `fork` answered.
+///
+/// # Safety
+/// `frame` must be a `UserFrame` in memory this address space has mapped, and
+/// its RIP and RSP must be a user address.
+pub unsafe fn enter_usermode_frame(frame: *const crate::task::UserFrame) -> ! { unsafe {
+    core::arch::asm!(
+        // The iretq frame, built from the saved one.
+        "pushq $0x2B",                 // SS
+        "pushq 80(%rcx)",              // RSP
+        "pushq 72(%rcx)",              // RFLAGS
+        "pushq $0x33",                 // CS
+        "pushq 64(%rcx)",              // RIP
+        // Everything the stub would have popped. RCX is the frame until the
+        // last of them, and iretq does not care what is in it.
+        "movq 0(%rcx), %rsi",
+        "movq 8(%rcx), %rdi",
+        "movq 16(%rcx), %r15",
+        "movq 24(%rcx), %r14",
+        "movq 32(%rcx), %r13",
+        "movq 40(%rcx), %r12",
+        "movq 48(%rcx), %rbp",
+        "movq 56(%rcx), %rbx",
+        "xorl %eax, %eax",             // fork returns 0 in the child
+        "swapgs",
+        "iretq",
+        in("rcx") frame,
+        options(att_syntax, noreturn)
+    );
+}}
 
 /// Enter user mode via iretq.
 ///

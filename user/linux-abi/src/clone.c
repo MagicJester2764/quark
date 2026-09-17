@@ -48,9 +48,26 @@ void __quark_thread_exit(int code) {
 
 long __quark_clone(int (*func)(void *), void *stack, int flags, void *arg,
                    int *ptid, void *tls, int *ctid) {
-    /* Only a thread. A child with a *copy* of the address space is fork, and
-       there is none here — saying so is better than making half of one. */
-    if (!(flags & CLONE_VM) || !(flags & CLONE_THREAD)) {
+    /* A child with a *copy* of the address space rather than a share of it is
+       a process, and the kernel makes one in a single call: it copies the
+       caller's pages, its descriptors and its capabilities, and the child
+       returns from that call rather than starting at an entry point. So
+       nothing of the thread path below applies to it.
+       
+       musl's `fork` sends SIGCHLD and nothing else; anything asking for a new
+       process *and* something clever — a shared file table, a stopped child —
+       is asking for a Linux this is not. */
+    if (!(flags & CLONE_VM)) {
+        if (flags & (CLONE_THREAD | CLONE_SETTLS)) {
+            return -LX_ENOSYS;
+        }
+        unsigned long child = __syscall0(SYS_FORK);
+        if (child == QUARK_ERR) {
+            return -LX_EAGAIN;
+        }
+        return (long)child;
+    }
+    if (!(flags & CLONE_THREAD)) {
         return -LX_ENOSYS;
     }
     if (!func || !stack) {

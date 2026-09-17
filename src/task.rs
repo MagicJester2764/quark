@@ -18,6 +18,32 @@ const STACK_ALIGN: usize = 16;
 /// whether or not it is used, because the table is inline in the task.
 pub const MAX_FDS: usize = 32;
 
+/// What the syscall entry stub pushed, read back as a structure.
+///
+/// The stub is the definition: it sets RSP to the task's kernel stack top and
+/// pushes these eleven words, so a task that is inside a system call has them
+/// at `kernel_stack_base + kernel_stack_size - size_of::<UserFrame>()`. That
+/// is how `fork` gets the whole of a caller's register state without the stub
+/// having to record anything — the position is a consequence of the pushes,
+/// and the assertion below is what keeps the two lists equal.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct UserFrame {
+    pub rsi: u64,
+    pub rdi: u64,
+    pub r15: u64,
+    pub r14: u64,
+    pub r13: u64,
+    pub r12: u64,
+    pub rbp: u64,
+    pub rbx: u64,
+    pub rip: u64,
+    pub rflags: u64,
+    pub rsp: u64,
+}
+
+const _: () = assert!(core::mem::size_of::<UserFrame>() == 88);
+
 /// File descriptor kind — routes I/O to either an IPC service or a kernel pipe.
 #[derive(Debug, Clone, Copy)]
 pub enum FdKind {
