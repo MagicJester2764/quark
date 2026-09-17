@@ -110,6 +110,9 @@ pub const SYS_SPACE_WATCH: u64 = 108;
 pub const SYS_TASK_CREATE_IN: u64 = 109;
 pub const SYS_FORK: u64 = 110;
 pub const SYS_EXEC_SPACE: u64 = 111;
+pub const SYS_PTY_CREATE: u64 = 208;
+pub const SYS_PTY_CTL: u64 = 209;
+pub const SYS_PTY_OPEN: u64 = 210;
 
 // --- 0x70  hardware and drivers ---
 pub const SYS_IRQ_REGISTER: u64 = 112;

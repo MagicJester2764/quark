@@ -86,6 +86,9 @@ long __quark_fstatfs(long fd, void *buf);
 /* Streams, descriptor passing and waiting, in net.c. */
 long __quark_memfd(const char *name, long flags);
 long __quark_execve(const char *path, char *const argv[], char *const envp[]);
+long __quark_pty_open(const char *path);
+int __quark_pty_path(const char *path);
+long __quark_ioctl(long fd, unsigned long request, unsigned long arg);
 long __quark_ftruncate(long fd, long length);
 long __quark_fcntl(long fd, long cmd, long arg);
 int __quark_fd_is_nonblock(long fd);

@@ -35,6 +35,7 @@ mod shmem;
 mod pollset;
 mod stream;
 pub mod pipe;
+mod pty;
 pub mod serial;
 pub mod task;
 mod userspace;

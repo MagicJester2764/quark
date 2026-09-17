@@ -273,9 +273,12 @@ pub struct UserFrame {
 - Create: `explosion/toolchain/ptytest.c`
 
 **Interfaces:**
-- Produces: `SYS_PTY_CREATE` (74), `arg0 = flags`, returning
-  `master_fd | (slave_fd << 32)`. Both are ordinary descriptors: they are
-  inherited, closed, `dup2`ed and polled like any other.
+- Produces: `SYS_PTY_CREATE` (208), a descriptor for a new pty's master, and
+  `SYS_PTY_OPEN` (210), one for its slave by number — which is the shape
+  `openpty` has: open the multiplexer, ask which pty it gave you, open that
+  one. `SYS_PTY_CTL` (209) carries the `termios`, the window size and the
+  number. Both ends are ordinary descriptors: inherited, closed, `dup2`ed and
+  polled like any other.
 - Produces: a pty is two 4 KiB rings and a `termios`. What is written to the
   master is input to the slave; what is written to the slave is output on the
   master. With `ECHO` set, input is copied back to the master as it arrives.
@@ -287,16 +290,16 @@ pub struct UserFrame {
   nothing in the kernel interprets — it is a fact a terminal stores for the
   program in it to read.
 
-- [ ] **Step 1: The failing check.** `ptytest.c` calls `openpty` and prints the
+- [x] **Step 1: The failing check.** `ptytest.c` calls `openpty` and prints the
   two descriptors. Expected: "openpty: No such file or directory", because
   `/dev/ptmx` is not there.
 
-- [ ] **Step 2: The kernel's pty.** `pty.rs`, modelled on `pipe.rs`: a table of
+- [x] **Step 2: The kernel's pty.** `pty.rs`, modelled on `pipe.rs`: a table of
   pairs, each with two rings, waiter lists for both directions, a `termios`, a
   `winsize`, and reference counts for the two ends. Closing the last master
   makes reads on the slave return end-of-file, and the other way round.
 
-- [ ] **Step 3: The line discipline.** On a write to the master: if `ECHO`,
+- [x] **Step 3: The line discipline.** On a write to the master: if `ECHO`,
   copy to the output ring; if `ICANON`, hold the bytes in a line buffer and
   release them to the slave's readable ring at `\n`, with `\b` and `\x7f`
   taking one back and un-echoing it. `\r` becomes `\n` when `ICRNL` is set,
@@ -304,12 +307,12 @@ pub struct UserFrame {
   `\r\n` on the way out, which is what makes a terminal's cursor return to the
   left.
 
-- [ ] **Step 4: Verify.** `ptytest` writes "hi\n" to the master and reads it
+- [x] **Step 4: Verify.** `ptytest` writes "hi\n" to the master and reads it
   from the slave; writes "there\n" to the slave and reads it from the master,
   seeing `\r\n`; turns `ECHO` off and sees nothing come back; polls both ends
   and gets the readiness it expects. `dtest` still passes.
 
-- [ ] **Step 5: Commit.** quark: "A pseudo-terminal".
+- [x] **Step 5: Commit.** quark: "A pseudo-terminal".
 
 ---
 
@@ -333,20 +336,20 @@ pub struct UserFrame {
 - Produces: `setsid` returns the caller's own id rather than an error, because
   there are no sessions here and a terminal only wants to know it succeeded.
 
-- [ ] **Step 1: The failing check.** `ptytest` gains a second half: `forkpty`,
+- [x] **Step 1: The failing check.** `ptytest` gains a second half: `forkpty`,
   the child writes a line and exits, the parent reads it. Expected: it stops at
   `openpty` as before, or at `login_tty`.
 
-- [ ] **Step 2: The paths.** `/dev/ptmx` and `/dev/pts/N` in the C layer's
+- [x] **Step 2: The paths.** `/dev/ptmx` and `/dev/pts/N` in the C layer's
   open path, ahead of the VFS, the way `/dev/null` and `/dev/random` already
   are. A pty's number is its kernel table index, which is what `TIOCGPTN`
   answers and what the slave's path names.
 
-- [ ] **Step 3: Verify.** `ptytest`'s second half prints the line the child
+- [x] **Step 3: Verify.** `ptytest`'s second half prints the line the child
   wrote, and the child's exit status. The parent's `read` returns 0 when the
   child has gone, which is what tells a terminal its shell has exited.
 
-- [ ] **Step 4: Commit.** quark: "forkpty".
+- [x] **Step 4: Commit.** quark: "forkpty".
 
 ---
 

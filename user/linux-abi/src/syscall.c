@@ -64,6 +64,7 @@ typedef unsigned long size_t;
 #define LX_execve           59
 #define LX_vfork            58
 #define LX_clone            56
+#define LX_setsid          112
 #define LX_fcntl            72
 #define LX_flock            73
 #define LX_exit             60
@@ -657,7 +658,17 @@ long __quark_syscall(long n, long a1, long a2, long a3, long a4, long a5, long a
        rseq, robust lists, prlimit — no equivalent, and musl copes with
                 being refused all three. */
     case LX_ioctl:
-        return -LX_ENOTTY;
+        /* Masked to thirty-two bits on the way in. A request is an `int` in
+           the C library's signature, and the ones with the "read" bit set —
+           `TIOCGPTN` is 0x80045430 — are negative in it, so they arrive here
+           sign-extended and match nothing. */
+        return __quark_ioctl(a1, (unsigned long)(unsigned int)a2, (unsigned long)a3);
+    case LX_setsid:
+        /* No sessions here. A terminal's child calls this and then asks for a
+           controlling terminal; both are about which process group hears a
+           signal, and there are no signals. Answering with the caller's own id
+           is what a successful `setsid` looks like. */
+        return (long)__syscall0(SYS_GETPID);
     case LX_rt_sigaction:
     case LX_rt_sigprocmask:
         return 0; /* accepted and ignored: musl masks signals during startup */

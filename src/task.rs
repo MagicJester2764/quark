@@ -59,6 +59,10 @@ pub enum FdKind {
     /// A set of descriptors to wait on. A set is a descriptor itself, so it
     /// can be held, closed and passed like any other.
     PollSet { set: usize },
+    /// One end of a pseudo-terminal: `end` is 0 for the master, 1 for the
+    /// slave. The master is held by whatever draws the terminal and the slave
+    /// is the program in it — its standard input, output and error.
+    PtyEnd { pty: usize, end: u8 },
     /// A network connection, held by the net server as `handle`.
     ///
     /// Unlike `Ipc`, which is one-directional and carries a fixed tag, a

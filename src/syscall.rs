@@ -183,6 +183,16 @@ pub const SYS_TASK_CREATE_IN: u64 = 109;
 pub const SYS_FORK: u64 = 110;
 pub const SYS_EXEC_SPACE: u64 = 111;
 pub const SYS_ADDRSPACE_DESTROY: u64 = 38;
+/// Block 0xD0: terminals.
+pub const SYS_PTY_CREATE: u64 = 208;
+pub const SYS_PTY_CTL: u64 = 209;
+pub const SYS_PTY_OPEN: u64 = 210;
+/// `SYS_PTY_CTL` operations.
+const PTY_GET_TERMIOS: u64 = 0;
+const PTY_SET_TERMIOS: u64 = 1;
+const PTY_GET_WINSIZE: u64 = 2;
+const PTY_SET_WINSIZE: u64 = 3;
+const PTY_NUMBER: u64 = 4;
 
 /// Be told when a task dies, so that whatever it was lent can be taken back.
 /// Takes no capability: SYS_TASK_INFO already answers the same question by
@@ -1133,6 +1143,100 @@ extern "C" fn syscall_dispatch(
                 None => u64::MAX,
             }
         }
+        SYS_PTY_CREATE => {
+            // A new pair, and a descriptor for its master. The slave is opened
+            // separately, by number, because that is the shape `openpty` has:
+            // open the multiplexer, ask which pty it gave you, open that one.
+            // The pair is kept alive by the master until then.
+            let tid = scheduler::current_tid();
+            let Some(pty) = crate::pty::create(tid) else {
+                return u64::MAX;
+            };
+            match scheduler::current_alloc_fd(crate::task::FdKind::PtyEnd { pty, end: 0 }) {
+                Ok(master) => {
+                    crate::pty::retain(pty, 0);
+                    master as u64
+                }
+                Err(()) => {
+                    crate::pty::cleanup_orphans(tid);
+                    u64::MAX
+                }
+            }
+        }
+        SYS_PTY_OPEN => {
+            // arg0 = a pty's number: a descriptor for its slave end. Refused
+            // for a pty whose master has gone, which is a number naming
+            // nothing rather than a terminal to talk to.
+            let pty = arg0 as usize;
+            if !crate::pty::slave_openable(pty) {
+                return u64::MAX;
+            }
+            match scheduler::current_alloc_fd(crate::task::FdKind::PtyEnd { pty, end: 1 }) {
+                Ok(fd) => {
+                    crate::pty::retain(pty, 1);
+                    fd as u64
+                }
+                Err(()) => u64::MAX,
+            }
+        }
+        SYS_PTY_CTL => {
+            // arg0 = a descriptor naming either end, arg1 = operation,
+            // arg2 = a structure to read or write.
+            let tid = scheduler::current_tid();
+            let Some((pty, _)) = crate::pty::of_fd(tid, arg0 as usize) else {
+                return u64::MAX;
+            };
+            match arg1 {
+                PTY_NUMBER => pty as u64,
+                PTY_GET_TERMIOS => {
+                    let Some(t) = crate::pty::get_termios(pty) else {
+                        return u64::MAX;
+                    };
+                    let size = core::mem::size_of::<crate::pty::Termios>();
+                    if !validate_user_ptr_mut(arg2, size as u64) {
+                        return u64::MAX;
+                    }
+                    let _ua = crate::cpu::UserAccess::begin();
+                    unsafe { core::ptr::write_unaligned(arg2 as *mut crate::pty::Termios, t) };
+                    drop(_ua);
+                    0
+                }
+                PTY_SET_TERMIOS => {
+                    let size = core::mem::size_of::<crate::pty::Termios>();
+                    if !validate_user_ptr(arg2, size as u64) {
+                        return u64::MAX;
+                    }
+                    let _ua = crate::cpu::UserAccess::begin();
+                    let t = unsafe { core::ptr::read_unaligned(arg2 as *const crate::pty::Termios) };
+                    drop(_ua);
+                    if crate::pty::set_termios(pty, &t) { 0 } else { u64::MAX }
+                }
+                PTY_GET_WINSIZE => {
+                    let Some(w) = crate::pty::get_winsize(pty) else {
+                        return u64::MAX;
+                    };
+                    let size = core::mem::size_of::<crate::pty::WinSize>();
+                    if !validate_user_ptr_mut(arg2, size as u64) {
+                        return u64::MAX;
+                    }
+                    let _ua = crate::cpu::UserAccess::begin();
+                    unsafe { core::ptr::write_unaligned(arg2 as *mut crate::pty::WinSize, w) };
+                    drop(_ua);
+                    0
+                }
+                PTY_SET_WINSIZE => {
+                    let size = core::mem::size_of::<crate::pty::WinSize>();
+                    if !validate_user_ptr(arg2, size as u64) {
+                        return u64::MAX;
+                    }
+                    let _ua = crate::cpu::UserAccess::begin();
+                    let w = unsafe { core::ptr::read_unaligned(arg2 as *const crate::pty::WinSize) };
+                    drop(_ua);
+                    if crate::pty::set_winsize(pty, &w) { 0 } else { u64::MAX }
+                }
+                _ => u64::MAX,
+            }
+        }
         SYS_ADDRSPACE_DESTROY => {
             // An address space the caller made and nothing is running in.
             // What it frees is what the caller moved into it, which was the
@@ -1469,6 +1573,13 @@ extern "C" fn syscall_dispatch(
                     crate::pipe::write(handle, ptr, len)
                 }
                 crate::task::FdKind::PipeRead(_) => u64::MAX,
+                crate::task::FdKind::PtyEnd { pty, end } => {
+                    let _ua = crate::cpu::UserAccess::begin();
+                    let slice = unsafe { core::slice::from_raw_parts(ptr, len) };
+                    let n = crate::pty::write(pty, end, slice);
+                    drop(_ua);
+                    n as u64
+                }
                 crate::task::FdKind::StreamEnd { stream, end } => {
                     match crate::stream::pipes_for(stream, end) {
                         Some((_, wr)) => crate::pipe::write(wr, ptr, len),
@@ -1513,6 +1624,7 @@ extern "C" fn syscall_dispatch(
                     crate::pipe::read(handle, ptr, max_len)
                 }
                 crate::task::FdKind::PipeWrite(_) => u64::MAX,
+                crate::task::FdKind::PtyEnd { pty, end } => pty_read(pty, end, ptr, max_len),
                 crate::task::FdKind::StreamEnd { stream, end } => {
                     match crate::stream::pipes_for(stream, end) {
                         Some((rd, _)) => crate::pipe::read(rd, ptr, max_len),
@@ -1539,6 +1651,22 @@ extern "C" fn syscall_dispatch(
             match scheduler::current_fd(fd) {
                 crate::task::FdKind::PipeRead(handle) => {
                     crate::pipe::read_nonblock(handle, ptr, max_len)
+                }
+                // A terminal without waiting, which is what a program that
+                // polls first and reads second asks for.
+                crate::task::FdKind::PtyEnd { pty, end } => {
+                    let mut buf = [0u8; 256];
+                    let want = max_len.min(buf.len());
+                    match crate::pty::read(pty, end, &mut buf[..want]) {
+                        Ok(0) => 0,
+                        Ok(n) => {
+                            let _ua = crate::cpu::UserAccess::begin();
+                            unsafe { core::ptr::copy_nonoverlapping(buf.as_ptr(), ptr, n) };
+                            drop(_ua);
+                            n as u64
+                        }
+                        Err(()) => crate::pipe::WOULD_BLOCK,
+                    }
                 }
                 _ => u64::MAX,
             }
@@ -3042,6 +3170,36 @@ pub unsafe fn enter_usermode_frame(frame: *const crate::task::UserFrame) -> ! { 
         options(att_syntax, noreturn)
     );
 }}
+
+/// Read from a terminal, waiting for something to arrive.
+///
+/// Through a kernel buffer rather than into the caller's pages directly: the
+/// copy happens with the SMAP window open, and that window must not be held
+/// across the wait — which is a reschedule, and RFLAGS.AC travels with the
+/// task that owns it.
+fn pty_read(pty: usize, end: u8, ptr: *mut u8, max_len: usize) -> u64 {
+    let mut buf = [0u8; 256];
+    let want = max_len.min(buf.len());
+    if want == 0 {
+        return 0;
+    }
+    loop {
+        match crate::pty::read(pty, end, &mut buf[..want]) {
+            Ok(0) => return 0, // the other end has gone: end of file
+            Ok(n) => {
+                let _ua = crate::cpu::UserAccess::begin();
+                unsafe { core::ptr::copy_nonoverlapping(buf.as_ptr(), ptr, n) };
+                drop(_ua);
+                return n as u64;
+            }
+            Err(()) => {
+                if !crate::pty::wait_readable(pty, end) {
+                    return u64::MAX; // no room to be woken; better said than slept
+                }
+            }
+        }
+    }
+}
 
 /// Enter user mode via iretq.
 ///

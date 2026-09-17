@@ -519,6 +519,7 @@ pub fn release_fd(kind: &FdKind, owner: usize) {
     match kind {
         FdKind::PipeRead(handle) => drop_ref(*handle, false),
         FdKind::PipeWrite(handle) => drop_ref(*handle, true),
+        FdKind::PtyEnd { pty, end } => crate::pty::release(*pty, *end),
         FdKind::MemFd { handle } => crate::shmem::close_ref(*handle, owner),
         FdKind::StreamEnd { stream, end } => crate::stream::close_end(*stream, *end),
         FdKind::PollSet { set } => crate::pollset::destroy(*set),
@@ -572,6 +573,10 @@ pub fn retain_fd(kind: &FdKind, owner: usize) -> Result<(), ()> {
             if crate::shmem::add_access(*handle, owner) { Ok(()) } else { Err(()) }
         }
         FdKind::StreamEnd { stream, end } => crate::stream::retain_end(*stream, *end),
+        FdKind::PtyEnd { pty, end } => {
+            crate::pty::retain(*pty, *end);
+            Ok(())
+        }
         // A set counts no holders, and closing any copy destroys it, so it
         // has exactly one.
         FdKind::PollSet { .. } => Err(()),

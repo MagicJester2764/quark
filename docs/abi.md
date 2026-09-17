@@ -138,7 +138,7 @@ rule still holds for everything else.
 | 2.6 | `SYS_OBJECT_CREATE` (194), `SYS_OBJECT_MAP` (195), `SYS_OBJECT_CTL` (196) and capability type 9, `MemObject` — memory objects whose pages a user-space pager provides as they are touched, which is how a file is mapped. Also: a task's page fault can call a pager (`TAG_PAGE_IN`, sender marked with bit 62), a pager hears when nothing maps an object (`TAG_OBJECT_IDLE`), and notices from the kernel are received before calls waiting behind them. |
 | 2.7 | `SYS_OBJECT_SYNC` (197) — what was written through shared mappings reaches the files (`TAG_OBJECT_SYNC` to each pager). Also: `SYS_OBJECT_CTL` op 3 takes a starting page, and leaves a page dirty while it is mapped writable. |
 | 2.8 | `SYS_CALL_WITH` (27) — a call with any of a buffer lent, a capability offered and a deadline. |
-| 2.9 | What a process is. `SYS_FORK` (110) — a copy of the caller in a copy of its address space, which returns 0 there. `SYS_EXEC_SPACE` (111) — the caller becomes the program in an address space it built, keeping its id, its descriptors and its capabilities. `SYS_ADDRSPACE_DESTROY` (38) — throw away an address space nothing is running in, which a spawn or an exec that failed part-way had no way to do. Also: `SYS_ADDRSPACE_CREATE` (36) and `SYS_ADDRSPACE_GIVE` (43) no longer ask for `TaskMgmt` — an address space the caller made, filled with pages it already owned, confers authority over nothing, and *starting a task* in one still does ask. |
+| 2.9 | What a process is, and what it runs in. Block 0xD0 opens: `SYS_PTY_CREATE` (208) and `SYS_PTY_CTL` (209) — a pseudo-terminal pair as two ordinary descriptors, with a line discipline (echo, canonical input, newline translation), a `termios` and a window size. `SYS_FORK` (110) — a copy of the caller in a copy of its address space, which returns 0 there. `SYS_EXEC_SPACE` (111) — the caller becomes the program in an address space it built, keeping its id, its descriptors and its capabilities. `SYS_ADDRSPACE_DESTROY` (38) — throw away an address space nothing is running in, which a spawn or an exec that failed part-way had no way to do. Also: `SYS_ADDRSPACE_CREATE` (36) and `SYS_ADDRSPACE_GIVE` (43) no longer ask for `TaskMgmt` — an address space the caller made, filled with pages it already owned, confers authority over nothing, and *starting a task* in one still does ask. |
 
 ### Deprecated
 
@@ -736,6 +736,9 @@ go when nothing maps them.
 
 | # | Name | Arguments | Returns | Cap |
 |---|---|---|---|---|
+| 208 | `SYS_PTY_CREATE` | — | a descriptor for a new pty's master / `u64::MAX` | — |
+| 210 | `SYS_PTY_OPEN` | arg0 = a pty's number | a descriptor for its slave / `u64::MAX` | — |
+| 209 | `SYS_PTY_CTL` | arg0 = a descriptor naming either end, arg1 = op (0 get termios, 1 set termios, 2 get window size, 3 set window size, 4 the pty's number), arg2 = the structure | per op / `u64::MAX` | — |
 | 240 | `SYS_ABI_VERSION` | — | `(major << 16) \| minor` | — |
 
 ## User pointers

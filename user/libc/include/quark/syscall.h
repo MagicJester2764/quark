@@ -70,6 +70,11 @@
 #define SYS_FORK            110
 #define SYS_EXEC_SPACE      111
 
+/* 0xD0  terminals */
+#define SYS_PTY_CREATE      208
+#define SYS_PTY_CTL         209
+#define SYS_PTY_OPEN        210
+
 /* 0x70  hardware */
 #define SYS_GETRANDOM       116
 

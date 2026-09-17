@@ -161,6 +161,12 @@ long __quark_openat(long dirfd, const char *path, long flags) {
     if (!path || !*path) {
         return -LX_ENOENT;
     }
+    /* A terminal is not a file. `/dev/ptmx` and `/dev/pts/N` are pairs of
+       kernel descriptors, caught here ahead of the VFS the way a Linux kernel
+       catches them ahead of its filesystems. */
+    if (__quark_pty_path(path)) {
+        return __quark_pty_open(path);
+    }
     unsigned long base;
     long bad = base_for(dirfd, path, &base);
     if (bad) {

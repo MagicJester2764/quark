@@ -116,7 +116,10 @@ pub fn watchable(tid: usize, fd: usize) -> bool {
         match scheduler::get_task_mut(tid) {
             Some(t) => matches!(
                 t.fds[fd],
-                FdKind::PipeRead(_) | FdKind::PipeWrite(_) | FdKind::StreamEnd { .. }
+                FdKind::PipeRead(_)
+                    | FdKind::PipeWrite(_)
+                    | FdKind::StreamEnd { .. }
+                    | FdKind::PtyEnd { .. }
             ),
             None => false,
         }
@@ -214,6 +217,20 @@ fn readiness(tid: usize, fd: usize) -> u32 {
             }
             if stream::peer_gone(s, end) {
                 out |= HANGUP;
+            }
+        }
+        FdKind::PtyEnd { pty, end } => {
+            // `readable` says how many bytes are waiting, and `None` when
+            // there are none and the other end has gone — which a terminal
+            // emulator reads as its shell having exited, and is a hangup as
+            // much as an end of file.
+            match crate::pty::readable(pty, end) {
+                Some(n) if n > 0 => out |= READABLE,
+                Some(_) => {}
+                None => out |= READABLE | HANGUP,
+            }
+            if crate::pty::writable(pty, end) {
+                out |= WRITABLE;
             }
         }
         _ => {}
@@ -323,6 +340,62 @@ pub fn note_pipe(handle: usize) {
             crate::ipc::wake_sleeper(tid);
         }
     }
+}
+
+/// Something changed at one end of a pty: wake whoever is waiting on a set
+/// that watches it.
+///
+/// The twin of `note_pipe`, and for the same reason — a set is waited on by a
+/// task that is asleep, and nothing else would tell it that a shell has
+/// printed something or gone.
+pub fn note_pty(pty: usize) {
+    let mut wake = [usize::MAX; MAX_SETS];
+    let mut n = 0;
+    let flags = irq_save();
+    unsafe {
+        let waiters = &*core::ptr::addr_of!(WAITERS);
+        for i in 0..MAX_SETS {
+            let waiter = waiters[i];
+            if waiter == usize::MAX || !sets()[i].in_use {
+                continue;
+            }
+            wake[n] = waiter;
+            n += 1;
+        }
+    }
+    irq_restore(flags);
+
+    for i in 0..n {
+        let tid = wake[i];
+        let watches = {
+            let flags = irq_save();
+            let w = unsafe {
+                match sets().iter().position(|s| s.in_use && s.owner == tid) {
+                    Some(idx) => Some(sets()[idx].watches),
+                    None => None,
+                }
+            };
+            irq_restore(flags);
+            w
+        };
+        let Some(watches) = watches else { continue };
+        if watches.iter().any(|w| w.used && names_pty(tid, w.fd, pty)) {
+            crate::ipc::wake_sleeper(tid);
+        }
+    }
+}
+
+fn names_pty(tid: usize, fd: usize, pty: usize) -> bool {
+    if fd >= crate::task::MAX_FDS {
+        return false;
+    }
+    let kind = unsafe {
+        match scheduler::get_task_mut(tid) {
+            Some(t) => t.fds[fd],
+            None => return false,
+        }
+    };
+    matches!(kind, FdKind::PtyEnd { pty: p, .. } if p == pty)
 }
 
 /// Collect what is ready. Returns how many entries of `out` were filled.
