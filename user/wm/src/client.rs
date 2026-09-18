@@ -1798,6 +1798,18 @@ impl Client {
     /// worth the bytes — libwayland prints it, and a client author reads the
     /// object id and the reason rather than guessing why a socket closed.
     fn protocol_error(&mut self, object: u32, code: u32, message: &[u8]) -> bool {
+        // Said out loud as well as sent. A client that dies of a protocol
+        // error usually says nothing about it — libwayland hands the reason to
+        // the program, and most programs exit quietly — so a compositor that
+        // kills one and keeps the reason to itself is a compositor nobody can
+        // debug against.
+        quark_rt::println!(
+            "[wm] client {} killed: object {} error {}: {}",
+            self.slot,
+            object,
+            code,
+            core::str::from_utf8(message).unwrap_or("?")
+        );
         if let Some(a) = self.begin(proto::DISPLAY_ID, proto::DISPLAY_ERROR) {
             self.arg_u32(object);
             self.arg_u32(code);

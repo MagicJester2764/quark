@@ -472,23 +472,29 @@ pub struct UserFrame {
   and libwayland, with the protocol stubs generated from the same XML weston
   generates them from.
 - Produces: whatever the build finds missing, added to Quark rather than
-  patched out of weston. Expect `signalfd`, `sigaction`, `getpwuid` and
-  `realpath` to be where it stops.
+  patched out of weston. What it actually stopped at: libpng (weston's
+  decorations load their images with it, and cairo had been built for this
+  target with PNG disabled because there was no libpng); `-D_GNU_SOURCE`, for
+  `strchrnul`; weston's own `shared/signal.h` answering `#include <signal.h>`
+  when `shared/` is on the include path; the same `os_create_anonymous_file`
+  in both weston's `shared/` and wayland's `cursor/`; and the four decoration
+  images, which `frame_create` *fails* without — a window with no frame is not
+  a window.
 
-- [ ] **Step 1: The failing check.** Write the script, run it, and read the
+- [x] **Step 1: The failing check.** Write the script, run it, and read the
   first error. Expected: a list of missing pieces rather than one.
 
-- [ ] **Step 2: Close them one at a time**, each as its own small change to
+- [x] **Step 2: Close them one at a time**, each as its own small change to
   `user/linux-abi` or `user/libc`, with a note in the commit of what wanted it.
   A function that cannot be made to work honestly — `getpwuid` on a system with
   no password file — returns the failure the caller is required to handle
   rather than a fiction.
 
-- [ ] **Step 3: Verify.** `libtoytoolkit.a` links. `weston-simple-shm` still
+- [x] **Step 3: Verify.** `libtoytoolkit.a` links. `weston-simple-shm` still
   builds and runs, which is the check that nothing added for the toolkit broke
   the client that was already working.
 
-- [ ] **Step 4: Commit.** explosion: "The toytoolkit builds for Quark"; quark:
+- [x] **Step 4: Commit.** explosion: "The toytoolkit builds for Quark"; quark:
   whatever the layer needed.
 
 ---
@@ -504,20 +510,20 @@ pub struct UserFrame {
 - Produces: `wm weston-terminal` — a window with `qsh` running in it, keys
   reaching the shell and its output drawn in the window.
 
-- [ ] **Step 1: The failing check.** Build and run it. Expected: it starts,
+- [x] **Step 1: The failing check.** Build and run it. Expected: it starts,
   and stops somewhere — the first stop is the interesting output of this step,
   not a failure of it.
 
-- [ ] **Step 2: Whatever it is.** Each thing it stops at is a fix in Quark: a
+- [x] **Step 2: Whatever it is.** Each thing it stops at is a fix in Quark: a
   missing `ioctl`, a `poll` that does not report a pty, an `epoll` that cannot
   hold a timerfd, a `wl_shm_pool.resize` the compositor refuses. Keep a list in
   the commit message; that list is the real content of this phase.
 
-- [ ] **Step 3: Verify.** A key script: `wm weston-terminal`, wait, type
+- [x] **Step 3: Verify.** A key script: `wm weston-terminal`, wait, type
   `echo hello`, Return, screenshot. The screenshot shows the command and its
   output in the window. `ls /` in it lists the root.
 
-- [ ] **Step 4: Commit.** quark and explosion: "A terminal, with a shell in
+- [x] **Step 4: Commit.** quark and explosion: "A terminal, with a shell in
   it".
 
 ---

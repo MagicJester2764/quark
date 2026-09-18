@@ -14,7 +14,21 @@ pub struct Interface {
     pub version: u32,
 }
 
-pub const COMPOSITOR: Interface = Interface { name: b"wl_compositor", version: 1 };
+/// Version 4: `wl_surface`'s buffer transform (2), buffer scale (3) and
+/// `damage_buffer` (4), all of which are read and checked here — a transform
+/// or a scale this compositor cannot honour is refused rather than ignored,
+/// and damage in buffer coordinates is damage.
+///
+/// Stopping at 4 is deliberate. Version 5 makes a non-zero offset in
+/// `wl_surface.attach` an error and moves it to `wl_surface.offset`, which
+/// means enforcing a rule rather than advertising one; version 6 adds the
+/// `preferred_buffer_scale` and `preferred_buffer_transform` events, and a
+/// version is advertised here only when every event of it is sent.
+///
+/// It has to be at least 3: weston's toytoolkit binds `wl_compositor` at 3
+/// with no negotiation at all, and a compositor offering less is one that
+/// every weston client dies against.
+pub const COMPOSITOR: Interface = Interface { name: b"wl_compositor", version: 4 };
 pub const SHM: Interface = Interface { name: b"wl_shm", version: 1 };
 pub const OUTPUT: Interface = Interface { name: b"wl_output", version: 2 };
 pub const XDG_WM_BASE: Interface = Interface { name: b"xdg_wm_base", version: 1 };
