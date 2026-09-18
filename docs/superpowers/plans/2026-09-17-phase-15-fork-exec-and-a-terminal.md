@@ -537,19 +537,21 @@ pub struct UserFrame {
 - Produces: dragging across the terminal's text selects it, and the selection
   is on the clipboard: `wlclip paste` in the same session prints it.
 
-- [ ] **Step 1: The failing check.** `wm weston-terminal "wlclip paste"`: type
+- [x] **Step 1: The failing check.** `wm weston-terminal "wlclip paste"`: type
   something in the terminal, select it with the pointer, and see what `wlclip`
   reads. Expected: nothing, or whatever is wrong.
 
-- [ ] **Step 2: Fix what it finds.** The terminal sets the selection with
-  `wl_data_device.set_selection`, which `wm` has; what it needs that a test
-  client did not is likely the serial from a real press and a
-  `wl_data_source.send` while its own event loop is elsewhere.
+- [x] **Step 2: Fix what it finds.** ~~The terminal sets the selection with
+  `wl_data_device.set_selection`...~~ Nothing needed fixing. What the check
+  had wrong was the gesture: weston-terminal copies on **Ctrl+Shift+C**, not
+  on the drag — the drag only marks the text — and the selection is announced
+  to whoever has keyboard focus, so the paster hears about it when focus
+  reaches it.
 
-- [ ] **Step 3: Verify.** The text typed into the terminal comes out of
+- [x] **Step 3: Verify.** The text typed into the terminal comes out of
   `wlclip paste`, and the primary selection too if the terminal sets one.
 
-- [ ] **Step 4: Commit.** quark: "Selecting and pasting from the terminal".
+- [x] **Step 4: Commit.** quark: "Selecting and pasting from the terminal".
 
 ---
 
