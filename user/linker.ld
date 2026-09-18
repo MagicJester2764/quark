@@ -16,6 +16,23 @@ SECTIONS {
         KEEP(*(.quark.manifest))
     }
 
+    /* The frame tables an exception unwinds through.
+     *
+     * These were discarded until C++ arrived, which was harmless while nothing
+     * threw: Rust here is panic=abort and C does not unwind. libstdc++ does,
+     * and the unwinder walks this table to find the handler — with it thrown
+     * away, the first `throw` dereferenced nothing and the program took a
+     * page fault instead of catching.
+     *
+     * The order is the whole mechanism: crtbegin.o contributes an empty
+     * .eh_frame first, which is the address `__register_frame_info` is handed,
+     * and crtend.o contributes the zero word that ends the walk. They are the
+     * first and last objects on the link line, so link order places them.
+     */
+    .eh_frame : ALIGN(8) {
+        KEEP(*(.eh_frame))
+    }
+
     /* The start of everything writable, on a page of its own. The counter is
      * advanced here rather than the section aligned, for the reason given at
      * .tdata below: a program with no GOT has an empty .got, the linker drops
@@ -132,8 +149,6 @@ SECTIONS {
     .shstrtab 0 : { *(.shstrtab) }
 
     /DISCARD/ : {
-        *(.eh_frame)
-        *(.eh_frame_hdr)
         *(.note.*)
         *(.comment)
     }

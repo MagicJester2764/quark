@@ -146,9 +146,11 @@ These were established deliberately. Breaking one silently re-opens a hole.
   assert stopped everything.
 - **C objects must put constructors in `.init_array`.** The cross compiler is
   configured `--enable-initfini-array`, and the user link script places the
-  arrays and refuses `.ctors` outright: nothing here links the crtbegin that
-  would run them, so an object carrying them has constructors that silently
-  never run.
+  arrays and refuses `.ctors` outright, so an object carrying them has
+  constructors that silently never run. `crtbegin.o` and `crtend.o` are on the
+  link line, but for the other thing they do: they bracket `.eh_frame` and
+  register it, which is how a C++ exception finds its handler. Their own
+  constructor is in `.init_array` like everybody else's.
 - **Capabilities are the authority.** There is no UID 0 bypass; `uid == 0` no
   longer short-circuits `cap::task_has_*`. A service that cannot do something
   is missing a capability, not a privilege level.
