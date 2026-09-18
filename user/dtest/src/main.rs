@@ -17,12 +17,24 @@ quark_rt::manifest!([CapReq::task_mgmt(0), CapReq::phys_alloc(64)]);
 static mut PASSED: u32 = 0;
 static mut FAILED: u32 = 0;
 
-fn check(what: &str, ok: bool) {
+/// What failed, kept for the end.
+///
+/// Two hundred and sixty-odd checks are four screens of text and a console
+/// that does not scroll back, so a run that says "three failed" and nothing
+/// else is a run somebody has to repeat section by section to read. The names
+/// are `&'static str`, so remembering them costs a pointer each.
+const RECAP: usize = 16;
+static mut FAILURES: [&str; RECAP] = [""; RECAP];
+
+fn check(what: &'static str, ok: bool) {
     unsafe {
         if ok {
             PASSED += 1;
             println!("  ok    {}", what);
         } else {
+            if (FAILED as usize) < RECAP {
+                FAILURES[FAILED as usize] = what;
+            }
             FAILED += 1;
             println!("  FAIL  {}", what);
         }
@@ -2059,6 +2071,16 @@ pub extern "C" fn _start() -> ! {
     }
 
     let (passed, failed) = unsafe { (PASSED, FAILED) };
+    // The names again, at the end, where they are still on the screen.
+    if failed > 0 {
+        let names = unsafe { &*core::ptr::addr_of!(FAILURES) };
+        for name in names.iter().take((failed as usize).min(RECAP)) {
+            println!("  FAILED: {}", name);
+        }
+        if failed as usize > RECAP {
+            println!("  ... and {} more", failed as usize - RECAP);
+        }
+    }
     println!("[dtest] {} passed, {} failed", passed, failed);
     syscall::sys_exit_code(if failed == 0 { 0 } else { 1 });
 }

@@ -557,15 +557,29 @@ pub struct UserFrame {
 
 ### Task 11: Write it down
 
-- [ ] `quark/CLAUDE.md`: what a process is here now — `fork` copies eagerly and
+- [x] `quark/CLAUDE.md`: what a process is here now — `fork` copies eagerly and
   what that does not share, `exec` keeps the task and its descriptors and
   changes the program, a pty is a kernel descriptor and why, and the gaps this
   phase leaves.
-- [ ] `quark/docs/abi.md`: the new calls, with the ABI minor bumped once for
-  the phase.
-- [ ] `~/src/osdev/ROADMAP.md`: Phase 15 done, the decision it turned on and
+- [x] `quark/docs/abi.md`: the new calls, with the ABI minor bumped once for
+  the phase (2.9).
+- [x] `~/src/osdev/ROADMAP.md`: Phase 15 done, the decision it turned on and
   why, what it took, and what is left.
-- [ ] Tick this plan; commit and push quark and explosion.
+- [x] Tick this plan; commit and push quark and explosion.
+
+**Acceptance, run on both filesystems.** ext2: `wm weston-terminal` opened a
+window with `qsh` in it, `echo` answered and `ls /` listed the root; `exit`
+ended the terminal and the session with it; text dragged over with the pointer
+and copied with Ctrl+Shift+C came out of `wlclip paste` as 27 bytes;
+`shelltest` and `dtest` passed; twenty `wlfuzz` seeds left the compositor
+standing, each one named in the compositor's own log. ext4: `dtest` 267/0,
+`libc.tests` 17/0, `fontconfig.tests` 4/0, `cairo.tests` 2/0,
+`hostile.tests` 592/0, `e2fsck` clean. No faults on serial in either boot.
+
+The acceptance found one bug on its way through: `dtest` failed three checks
+after a compositor session, because the per-task pipe cap counted by TID and
+TIDs are recycled. It is counted by program now, and `dtest` says which checks
+failed rather than only how many.
 
 ---
 

@@ -27,6 +27,15 @@ struct Pipe {
     /// Without this, sys_pipe_create leaked a slot permanently on every
     /// failed spawn and the 31 slots could be exhausted for good.
     creator: usize,
+    /// The *program* that created it, for the cap below.
+    ///
+    /// A TID is recycled and a space id is not, which matters because a pipe
+    /// outlives its creator: its ends are descriptors other tasks hold. Counted
+    /// by TID, a fresh task inherited the pipe budget of whatever had its
+    /// number before — and a program that had spent its eight left the next
+    /// task to take that number unable to make any. dtest found it by asking
+    /// for eight pipes after a compositor session had ended.
+    owner_space: u64,
     buf: [u8; PIPE_BUF_SIZE],
     read_pos: usize,
     write_pos: usize,
@@ -44,6 +53,7 @@ impl Pipe {
         Pipe {
             in_use: false,
             creator: 0,
+            owner_space: 0,
             buf: [0; PIPE_BUF_SIZE],
             read_pos: 0,
             write_pos: 0,
@@ -94,6 +104,7 @@ const MAX_PIPES_PER_TASK: usize = 8;
 /// four connections per program.
 pub fn create_for_stream() -> Option<usize> {
     let creator = scheduler::current_tid();
+    let space = scheduler::space_of_task(creator);
     let flags = irq_save();
     let result = unsafe {
         let mut found = None;
@@ -102,6 +113,7 @@ pub fn create_for_stream() -> Option<usize> {
                 PIPES[i] = Pipe::new();
                 PIPES[i].in_use = true;
                 PIPES[i].creator = creator;
+                PIPES[i].owner_space = space;
                 found = Some(i);
                 break;
             }
@@ -168,13 +180,15 @@ pub fn drop_unreferenced(handle: usize) {
 
 pub fn create() -> Option<usize> {
     let creator = scheduler::current_tid();
+    let space = scheduler::space_of_task(creator);
     let flags = irq_save();
     let result = unsafe {
-        // Per-task cap: sys_pipe_create needs no capability (the shell needs
-        // it for `|`), so bound it here rather than letting one task drain the
-        // global table.
+        // Per-program cap: sys_pipe_create needs no capability (the shell needs
+        // it for `|`), so bound it here rather than letting one program drain
+        // the global table. By program rather than by task, because a space id
+        // is never reused and a TID is: see `owner_space`.
         let held = (1..MAX_PIPES)
-            .filter(|&i| PIPES[i].in_use && PIPES[i].creator == creator)
+            .filter(|&i| PIPES[i].in_use && PIPES[i].owner_space == space)
             .count();
         if held >= MAX_PIPES_PER_TASK {
             None
@@ -185,6 +199,7 @@ pub fn create() -> Option<usize> {
                     PIPES[i] = Pipe::new();
                     PIPES[i].in_use = true;
                     PIPES[i].creator = creator;
+                    PIPES[i].owner_space = space;
                     found = Some(i);
                     break;
                 }

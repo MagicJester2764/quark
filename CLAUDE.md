@@ -227,10 +227,71 @@ These were established deliberately. Breaking one silently re-opens a hole.
   unknown request it is. The nameserver used to forget a service, and `fb`
   give up the console's display, because a program said so.
 
+A **pseudo-terminal** is a kernel descriptor, for the same reason a pipe is: a
+terminal emulator waits on its master with `poll`, and readiness the kernel
+cannot see is readiness `poll` cannot report. `/dev/ptmx` makes a pair and
+answers with the master, `/dev/pts/N` opens its slave, and both paths are
+caught in the C layer ahead of the VFS. The line discipline is the part
+programs depend on and no more — echo, canonical input, and the newline
+translations — and the rest of a `termios` is stored and handed back unchanged.
+Between the master being opened and the slave being opened the master's read
+waits rather than reporting an end of file: the program that will hold the
+slave has not been started yet. Afterwards, the last slave closing *is* the end
+of file, which is how a terminal learns its shell has exited.
+
+A **timer is a descriptor too** (`SYS_TIMER_CREATE`), because a program's event
+loop already waits on descriptors and a cursor that blinks needs the same wait
+to end at a time rather than at an event.
+
 `init` spawns `FB`, `CONSOLE`, `INPUT` and `VFS` in passes of their own. If a
 program misbehaves for lack of a capability, check that its pass actually calls
 `grant_caps_from_manifest` — there is no shared path that does it for them, and
 INPUT's pass once granted nothing at all, which the UID bypass hid.
+
+## What a process is
+
+A program here starts one of two ways, and both are now ordinary.
+
+A **spawner** builds one: it makes an address space, reads an ELF into its own
+memory, moves the pages across, wires the descriptors, hands over the
+capabilities and starts a task in it. That is `quark_rt::spawn`, and it needs
+authority over nobody — a task the caller created and has not started is its
+own to fill, because nothing else can name it, it holds nothing and it cannot
+run. `TaskMgmt` buys the unbounded form; without it a program may have as many
+children at once as it may have threads.
+
+Or a program **forks** and **execs**, which is what a C program does and what
+every Unix program assumes:
+
+- **`fork` copies eagerly.** The child is a task in a copy of the caller's
+  address space that returns 0 from the same system call — which works because
+  the syscall stub's eleven pushes always land at `kernel_stack_top - 88`, so a
+  task inside a call has its whole register frame at a known place. A page the
+  parent owns becomes a page of the child's own; a page it does not own —
+  shared memory, a device, a file's page — is shared, because `OWNED` is what
+  decides who may free a frame. Copy-on-write would save all of the copying and
+  none of the correctness, and it needs reference counts frames here have not
+  got.
+- **`exec` keeps the task and changes the program.** The C layer loads the ELF
+  into an address space it made and `SYS_EXEC_SPACE` swaps the task into it:
+  same id, same descriptors, same capabilities, same parent, new address space
+  — and therefore a new program as far as every server is concerned. The
+  thread pointer is cleared with it, or the new program's first thread-local
+  reads through an address the old one had.
+- **A kernel budget is per program, not per TID.** A pipe outlives its
+  creator — its ends are descriptors other tasks hold — so counting the
+  per-task cap by TID gave a fresh task the budget of whatever had its number
+  before, and a program that had spent its eight left the next task to take
+  that number unable to make any. Space ids are never reused; TIDs are. The
+  same trap is written down under Known gaps for servers, and it is worth
+  looking for anywhere in the kernel that remembers a number.
+- **Descriptors are released when a task dies, not when it is reaped.** Its
+  memory waits for a parent to collect it, which is where the exit status
+  lives; a descriptor is something another task can be *waiting on*, and the
+  oldest idiom in Unix — a child writes down a pipe and exits, a parent reads
+  to the end and then waits — had each half waiting for the other.
+- **A descriptor sent over a stream outlives the sender's end.** It is in the
+  stream rather than in the sender, and the peer can still take it.
 
 ## The screen
 
@@ -353,12 +414,20 @@ Some things to know before changing any of it:
   compositor that insisted on the newest killed a client for being a frame
   behind.
 - **A version is advertised only when every event of it is sent.** `wl_seat` is
-  5 because `wl_pointer.frame` and the axis events go out; `wl_output` is 2 for
-  `scale` and `done`; `xdg_wm_base`, `wl_shm`, `wl_compositor`, the decoration
-  manager, `wl_data_device_manager` and the primary selection are 1. The
+  5 because `wl_pointer.frame` and the axis events go out; `wl_compositor` is 4
+  — the buffer transform, the buffer scale and `damage_buffer` are read and
+  checked, and `wl_surface.enter`/`leave` are the only events up to it —
+  because weston's toytoolkit binds it at 3 with no negotiation and a
+  compositor offering less is one every weston client dies against; `wl_output`
+  is 2 for `scale` and `done`; `xdg_wm_base`, `wl_shm`, the decoration manager,
+  `wl_data_device_manager` and the primary selection are 1. The
   clipboard stops at 1 deliberately: 2 and 3 are drag and drop. An object made
   from another inherits its version, which is how a client that bound
   `wl_seat` at 4 gets a `wl_pointer` with no `frame`.
+- **Say why a client was killed.** A protocol error is fatal to a connection
+  and most programs die of one in silence: libwayland hands the reason to the
+  program, and the program exits. `weston-terminal` exited three times without
+  a word before the compositor started printing what it had refused.
 - **Events are pulled, not pushed.** A server calls a client only when the
   client asked it to and handed over the right to — `fb` and the keyboard are
   offered an `Endpoint` with the request that needs one. Otherwise it answers:
@@ -459,6 +528,24 @@ change here: it has found what reading the code did not.
   and a click raises the one under the pointer. Keyboard focus and pointer focus
   are tracked separately, as Wayland requires, but there is no follow-mouse and
   no focus stealing prevention.
+- A **forked child inherits the numbers but not the files**. The kernel's
+  descriptors — pipes, streams, ptys, shared memory, timers — are the task's
+  and are copied to a child and kept across an exec. The C layer's *VFS* files
+  live in the program's own memory and are named by its address space, so a
+  forked child holds numbers the server will not answer for, and an exec starts
+  with none; a working directory is the same. `weston-terminal` needs neither,
+  and the next piece of this hole is making the VFS understand that one program
+  is a copy of another.
+- `fork` copies every page the caller owns, eagerly, and a threaded program
+  cannot `exec`: POSIX has it end every other thread, and ending them means
+  unwinding what they hold in a server, so it is refused rather than half done.
+- There are **no signals**. `setsid` answers with the caller's own id,
+  `TIOCSCTTY` is accepted, and a terminal's Ctrl-C reaches the program in it as
+  a byte rather than as a signal — there are no process groups for one to go
+  to. `sigaction` is accepted and remembered by nobody.
+- A pty's window size is stored and nothing is told when it changes: Linux
+  sends `SIGWINCH`, and there are no signals. A program that draws itself to
+  the terminal's size reads it once.
 - The compositor keeps no history of serials, so `xdg_toplevel.move` and
   `.resize` cannot check that the serial they are given was a recent press.
   What they check instead is that a button is down. Drag and drop, touch and
