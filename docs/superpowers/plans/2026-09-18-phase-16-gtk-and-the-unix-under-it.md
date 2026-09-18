@@ -55,14 +55,14 @@ program cannot be compiled at all, let alone linked.
   `libsupc++.a` in the musl prefix, and C++ headers under
   `$PREFIX/include/c++/15.2.0`.
 
-- [ ] **Step 1: add C++ to the cross compiler**
+- [x] **Step 1: add C++ to the cross compiler**
 
   In `build.sh`, `--enable-languages=c` becomes `--enable-languages=c,c++`.
   `--disable-libstdcxx` **stays**: gcc's in-tree libstdc++ would be built
   against the sysroot's tiny `libc`, which has no `wchar.h` and no threads.
   libstdc++ is built separately, against musl, in step 3.
 
-- [ ] **Step 2: build and install it**
+- [x] **Step 2: build and install it**
 
   ```bash
   mkdir -p ~/src/build-gcc-quark-cxx && cd ~/src/build-gcc-quark-cxx
@@ -77,7 +77,7 @@ program cannot be compiled at all, let alone linked.
   x86_64-quark-g++ --version      # expect: 15.2.0
   ```
 
-- [ ] **Step 3: write `build-libstdcxx.sh`**
+- [x] **Step 3: write `build-libstdcxx.sh`**
 
   libstdc++-v3 configures on its own, which is what makes this possible: it is
   built with the musl wrapper, for the musl prefix, and never sees the other
@@ -103,7 +103,7 @@ program cannot be compiled at all, let alone linked.
   through `fputs` to `stderr` before anything has set up a FILE, and there is
   nothing to gain from a message that may not arrive.
 
-- [ ] **Step 4: write the `musl-g++` wrapper**
+- [x] **Step 4: write the `musl-g++` wrapper**
 
   In `build-musl.sh`, beside the `musl-gcc` wrapper. It is the same rotation of
   arguments and the same specs file, with the C++ include directories added by
@@ -117,7 +117,7 @@ program cannot be compiled at all, let alone linked.
       -isystem "$PREFIX/include/c++/$VER/backward" "$@"
   ```
 
-- [ ] **Step 5: write the failing test**
+- [x] **Step 5: write the failing test**
 
   `tests/cxxtest.cpp` — a static constructor, `std::vector`, `std::string`,
   `std::map`, `std::sort`, a virtual call through a base pointer, `dynamic_cast`
@@ -126,12 +126,12 @@ program cannot be compiled at all, let alone linked.
   program means the program headers must be in the auxv — which they are,
   because the argument page carries them.
 
-- [ ] **Step 6: build the tests with a C++ compiler**
+- [x] **Step 6: build the tests with a C++ compiler**
 
   `build-tests.sh` loops over `tests/*.c`; it takes `tests/*.cpp` too, built
   with `x86_64-quark-musl-g++`. Add `cxxtest` to `tests/libc.tests`.
 
-- [ ] **Step 7: boot and check**
+- [x] **Step 7: boot and check**
 
   ```bash
   sh $SP/rebuild.sh hd
@@ -139,7 +139,7 @@ program cannot be compiled at all, let alone linked.
   ```
   Expected: `cxxtest: 0 failed`.
 
-- [ ] **Step 8: commit**
+- [x] **Step 8: commit**
 
 ---
 
@@ -164,7 +164,7 @@ lying, and each was found by running a real program.
 - Produces: `SYS_EVENT_CREATE` (kernel), `FdKind::Event`, a `read`/`write` that
   returns `EAGAIN` rather than blocking when the descriptor says non-blocking.
 
-- [ ] **Step 1: write the failing tests**
+- [x] **Step 1: write the failing tests**
 
   `tests/polltest.c`: the monotonic clock advances; `poll` times out; `poll`
   sees a ready pipe; `poll` with no descriptors is a sleep; `eventfd` counts,
@@ -175,7 +175,7 @@ lying, and each was found by running a real program.
   `g_cond_wait_until` gives up. (This one needs glib, so it is skipped by
   `build-tests.sh` until Task 3 — write it now, run it then.)
 
-- [ ] **Step 2: a futex wait with a timeout**
+- [x] **Step 2: a futex wait with a timeout**
 
   `LX_futex` drops its fourth argument, so every timed wait waits for ever, and
   it returns 0 whatever happened, so a caller cannot tell a timeout from a
@@ -184,7 +184,7 @@ lying, and each was found by running a real program.
   `SYS_FUTEX_WAIT_TIMEOUT` (130), rounding the timespec up to 100 Hz ticks, and
   map the kernel's answers: 1 → `EAGAIN`, 2 → `ETIMEDOUT`.
 
-- [ ] **Step 3: `O_NONBLOCK` on a descriptor means what it says**
+- [x] **Step 3: `O_NONBLOCK` on a descriptor means what it says**
 
   `F_SETFL` sets a bit in `nonblock_mask` that only `sendmsg`/`recvmsg` read;
   `read` and `write` always use the blocking calls. `pipe2` refuses
@@ -198,12 +198,12 @@ lying, and each was found by running a real program.
   `SYS_FD_WRITE_NB`; `__quark_pipe` sets the bit for both ends instead of
   refusing.
 
-- [ ] **Step 4: `poll` with no descriptors**
+- [x] **Step 4: `poll` with no descriptors**
 
   A loop whose sources are all timeouts polls nothing at all for a while.
   `SYS_POLL` returns at once when `nfds == 0` instead of sleeping.
 
-- [ ] **Step 5: `eventfd`**
+- [x] **Step 5: `eventfd`**
 
   A counter with a descriptor: `eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK)` is the
   first thing glib reaches for, and libwayland's and GTK's loops use one too.
@@ -211,7 +211,7 @@ lying, and each was found by running a real program.
   not zero, `EFD_SEMAPHORE` subtracting one rather than all. `FdKind::Event`,
   `SYS_EVENT_CREATE`, `pollset` readiness, `pipe::release_fd`/`retain_fd`.
 
-- [ ] **Step 6: run the tests, bump the ABI, commit**
+- [x] **Step 6: run the tests, bump the ABI, commit**
 
   `polltest: 0 failed`. `docs/abi.md` gets the new calls and the version 3.0
   row; `tools/check-abi.sh` passes.
@@ -227,28 +227,28 @@ lying, and each was found by running a real program.
 - Create: `../explosion/toolchain/tests/glibtest.c`
 - Modify: `../explosion/Makefile` (a bigger root)
 
-- [ ] **Step 1: PCRE2**, which `GRegex` is and which glib's build will not
+- [x] **Step 1: PCRE2**, which `GRegex` is and which glib's build will not
   start without. autotools; `config.sub` needs the quark line, and pcre2's
   `config.sub` ends its OS list differently from the one libpng and expat ship,
   so `teach-config-sub.sh` learns both shapes.
 
-- [ ] **Step 2: glib**, meson, static, with the parts Quark has no equivalent
+- [x] **Step 2: glib**, meson, static, with the parts Quark has no equivalent
   of turned off (`selinux`, `libmount`, `xattr`, `systemtap`, `sysprof`,
   `dtrace`, `introspection`, `nls`, `libelf`, `man-pages`, `documentation`,
   `tests`). The cross file gets the answers meson cannot get by running a
   program: musl's `*printf` are C99 and Unix98; a Quark stack does not grow;
   `va_list` is copyable; there is no `/proc/self/cmdline`.
 
-- [ ] **Step 3: `tests/glibtest.c`** — a hash table, a string, split and join,
+- [x] **Step 3: `tests/glibtest.c`** — a hash table, a string, split and join,
   a GObject with a property and a signal, a GRegex, a main loop that runs
   timeouts, a thread that wakes it, a thread pool, and a file through GLib and
   then through GIO.
 
-- [ ] **Step 4: room for it.** A program that links glib statically is four
+- [x] **Step 4: room for it.** A program that links glib statically is four
   megabytes; the 64 MiB root fills up. 128 MiB, and the staging strip is what
   keeps that from being 250.
 
-- [ ] **Step 5: boot, check `glibtest: 0 failed`, commit**
+- [x] **Step 5: boot, check `glibtest: 0 failed`, commit**
 
 ---
 

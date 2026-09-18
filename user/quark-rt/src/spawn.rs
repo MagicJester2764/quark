@@ -386,8 +386,15 @@ fn release(at: usize, pages: usize) {
     }
 }
 
-/// The largest program [`load_path`] will read: four megabytes.
-pub const MAX_IMAGE_PAGES: usize = 1024;
+/// The largest program [`load_path`] will read: thirty-two megabytes.
+///
+/// It was four, which was generous for a program written here and not nearly
+/// enough for one that links a toolkit: pango and its dependencies come to
+/// seven megabytes of static library before anything is drawn, and GTK is
+/// several times that. The cost is address space in the spawner while the
+/// image is being read, not memory — the pages are mapped as they are filled
+/// and given to the child.
+pub const MAX_IMAGE_PAGES: usize = 8192;
 
 /// Read a program from the filesystem, load it, and give back the memory it
 /// was read into.
