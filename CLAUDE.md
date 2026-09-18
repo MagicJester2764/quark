@@ -154,6 +154,16 @@ These were established deliberately. Breaking one silently re-opens a hole.
 - **Capabilities are the authority.** There is no UID 0 bypass; `uid == 0` no
   longer short-circuits `cap::task_has_*`. A service that cannot do something
   is missing a capability, not a privilege level.
+- **A descriptor that says non-blocking must not park the task.** `O_NONBLOCK`
+  was accepted and ignored for a phase: the flag set a bit only `sendmsg` read,
+  and `read`/`write` always used the calls that park. Every main loop drains
+  its wake-up "until it is empty", and empty is a read that answers `EAGAIN`;
+  a read that waits there is a program that stops rather than one that fails —
+  glib's does it holding its context lock, so nothing else in the program ever
+  runs again. `SYS_FD_READ_NB` and `SYS_FD_WRITE_NB` are the calls that answer
+  instead, and the same goes for a futex wait with a deadline: dropping the
+  timeout makes `g_cond_wait_until` wait for ever.
+
 - **`UserAccess` guards must not span a block or yield.** RFLAGS.AC travels
   with the task's saved flags, so a guard held across a reschedule leaves the
   SMAP window open in whatever runs next. Copy into a kernel buffer first — see
@@ -437,6 +447,47 @@ Some things to know before changing any of it:
   server, and one that is itself calling the server would deadlock with it. A
   reply needs no capability, so every other hop here is the client asking.
 
+## Toolkits
+
+Above the font stack there is now a whole GNOME-shaped one, built for Quark and
+running on it: **glib** (with GObject, GIO, a main loop and a thread pool),
+**harfbuzz**, **fribidi**, **pango**, **graphene**, **gdk-pixbuf**, and
+**GTK 4**. `wm hello-world` draws GTK's own `examples/hello/hello-world.c`,
+unmodified, in a window — and prints "Hello World" when the button is clicked.
+
+The rules that got it there, and that a further port should follow:
+
+- **Nothing patches an upstream library.** Everything each one needed was added
+  to Quark: `eventfd`, a futex wait that honours its timeout, an `O_NONBLOCK`
+  that means it, a `poll` with no descriptors that waits, a spawner that can
+  read a program bigger than four megabytes, and a compiler that admits this is
+  a Unix. Teaching a package's `config.sub` the word `quark` is not a patch to
+  the package; it is a patch to autoconf's idea of what operating systems
+  exist.
+- **Static, and non-PIC.** There is no dynamic loader here, so
+  `-Ddefault_library=static -Db_staticpic=false` is on every meson build and
+  the compiler wrapper drops `-fPIC` whatever a build system says. A module
+  that would be `dlopen`ed has to be built in instead — gdk-pixbuf's loaders
+  are, which is also why no loader cache is needed.
+- **glib is built twice.** Three of its tools are C programs rather than Python
+  — `glib-compile-resources`, `glib-compile-schemas` and `gio-querymodules` —
+  and GTK's build runs two of them to turn XML into C. The copies in the target
+  prefix are Quark binaries and cannot run on the build machine, so a native
+  glib lives in `$QUARK_HOSTDEPS` beside the host expat, and every build script
+  puts it on PATH first.
+- **There is no OpenGL.** GTK links libepoxy whatever it draws with; epoxy was
+  built to look for a GL implementation at run time and correctly finds none,
+  so GSK falls back to its cairo renderer. A Mesa software rasteriser is a
+  project of its own and is not this one.
+- **GTK 4 has no static build.** `gtk/meson.build` says `shared_library` with
+  no choice about it. What it also has is the `static_library` the shared one
+  wraps, so `build-gtk.sh` builds those and `build-gtk-client.sh` links a
+  program against them — the same shape as the weston toytoolkit port.
+- **A toolkit program is twenty-five megabytes**, and the spawner reads the
+  whole image into its own memory before giving the pages away, so it is in
+  memory twice while it starts. QEMU gets a gigabyte and the root filesystem is
+  128 MiB.
+
 ## Scheduling
 
 Four bands, best first: drivers, servers, ordinary programs, idle. A task runs
@@ -592,6 +643,19 @@ change here: it has found what reading the code did not.
   open when a thread started stays open until that thread closes it or exits.
 - A C program has 16 open files; the VFS has 512 handles for everybody, and
   128 for any one program.
+- **No OpenGL, no D-Bus, no `dlopen`.** GTK starts without any of them and says
+  so: `g_module_symbol` complains about a NULL module twice, the session bus
+  cannot be reached, and GSK draws through cairo. Each is a real absence rather
+  than a stub, and each is a thing a bigger application may ask for and not get.
+- **Quark has no dma-buf**, and the Linux uapi headers copied wholesale into
+  the sysroot said it did until `linux/dma-buf.h` was taken out of them. Every
+  other header there describes something a program can ask for and be told no;
+  that one is asked at *build* time, and a yes makes a toolkit compile a path
+  that cannot work.
+- The shell cannot set a variable for one command — there is no
+  `VAR=value program`, only the four in `BASE_ENV`. Nothing has needed it yet,
+  because GTK falls back to the cairo renderer by itself, but the next program
+  that wants an environment variable will need the shell to grow one.
 - The rust fork is one commit on `upstream/main`. Rebasing it means re-checking
   the PAL against std's internals, which move: the allocator PAL shape, the
   futex module location, `RawOsError`'s home and `BorrowedCursor`'s parameters

@@ -258,13 +258,13 @@ lying, and each was found by running a real program.
 - Create: `../explosion/toolchain/build-harfbuzz.sh`
 - Create: `../explosion/toolchain/tests/hbtest.c`
 
-- [ ] **Step 1:** meson, `-Dtests=disabled -Ddocs=disabled -Dintrospection=disabled
+- [x] **Step 1:** meson, `-Dtests=disabled -Ddocs=disabled -Dintrospection=disabled
   -Dcairo=enabled -Dfreetype=enabled -Dglib=enabled -Dicu=disabled`, C++ from
   Task 1.
-- [ ] **Step 2:** `hbtest.c` shapes a string of Latin text with the DejaVu Sans
+- [x] **Step 2:** `hbtest.c` shapes a string of Latin text with the DejaVu Sans
   on the image and checks the glyph count, the cluster map and the advance
   widths against what the same harfbuzz says on the host.
-- [ ] **Step 3:** boot, check, commit.
+- [x] **Step 3:** boot, check, commit.
 
 ---
 
@@ -274,14 +274,14 @@ lying, and each was found by running a real program.
 - Create: `../explosion/toolchain/build-fribidi.sh`, `build-pango.sh`
 - Create: `../explosion/toolchain/tests/pangotest.c`
 
-- [ ] **Step 1: fribidi**, which pango requires: meson, `-Ddocs=false
+- [x] **Step 1: fribidi**, which pango requires: meson, `-Ddocs=false
   -Dbin=false -Dtests=false`.
-- [ ] **Step 2: pango**, meson, with the cairo, freetype and fontconfig
+- [x] **Step 2: pango**, meson, with the cairo, freetype and fontconfig
   backends and no introspection.
-- [ ] **Step 3: `tests/pangotest.c`** — a `PangoLayout` in a cairo image
+- [x] **Step 3: `tests/pangotest.c`** — a `PangoLayout` in a cairo image
   surface, in a font found through fontconfig, with a checksum of the result
   and the layout's reported extents.
-- [ ] **Step 4:** boot, check, commit. A screenshot of text drawn by pango in a
+- [x] **Step 4:** boot, check, commit. A screenshot of text drawn by pango in a
   window belongs in the phase's evidence.
 
 ---
@@ -293,19 +293,19 @@ lying, and each was found by running a real program.
 - Modify: `bootstrap-wayland.sh` (install into the prefix, `libwayland-egl`
   included)
 
-- [ ] **Step 1: wayland installed rather than used in place.** GTK finds
+- [x] **Step 1: wayland installed rather than used in place.** GTK finds
   `wayland-client`, `wayland-cursor`, `wayland-egl` and `wayland-scanner`
   through pkg-config, and nothing is installed into the musl prefix today —
   every client so far named the build directory. `ninja install`, and the
   clients' build scripts use the prefix.
-- [ ] **Step 2: graphene** (meson, `-Dgtk_doc=false -Dtests=false
+- [x] **Step 2: graphene** (meson, `-Dgtk_doc=false -Dtests=false
   -Dinstalled_tests=false`), a vector maths library with SSE paths.
-- [ ] **Step 3: gdk-pixbuf** (meson, `-Dtests=false -Dman=false
+- [x] **Step 3: gdk-pixbuf** (meson, `-Dtests=false -Dman=false
   -Dintrospection=disabled -Dpng=enabled -Djpeg=disabled -Dtiff=disabled`),
   which needs the loaders built in rather than as modules: there is no dlopen.
-- [ ] **Step 4: libepoxy** with `-Degl=no -Dglx=no -Dx11=false`. GTK links it
+- [x] **Step 4: libepoxy** with `-Degl=no -Dglx=no -Dx11=false`. GTK links it
   whatever renderer it uses.
-- [ ] **Step 5:** a test per library that links and runs, and a commit.
+- [x] **Step 5:** a test per library that links and runs, and a commit.
 
 ---
 
@@ -315,28 +315,28 @@ lying, and each was found by running a real program.
 - Create: `../explosion/toolchain/build-gtk.sh`
 - Modify: `../explosion/Makefile` (stage GTK's data)
 
-- [ ] **Step 1: configure it.** `-Dbuild-demos=false -Dbuild-examples=false
+- [x] **Step 1: configure it.** `-Dbuild-demos=false -Dbuild-examples=false
   -Dbuild-tests=false -Dbuild-testsuite=false -Dintrospection=disabled
   -Dvulkan=disabled -Dmedia-gstreamer=disabled -Dprint-cups=disabled
   -Dwayland-backend=true -Dx11-backend=false -Dmacos-backend=false
   -Dwin32-backend=false`.
-- [ ] **Step 2: what it needs at runtime** — `GSK_RENDERER=cairo` and
+- [x] **Step 2: what it needs at runtime** — `GSK_RENDERER=cairo` and
   `GDK_DEBUG=gl-disable`, GTK's own resources (compiled into the library), and
   the settings it reads. A GTK program that cannot reach a settings portal
   falls back to defaults; check that it does rather than waiting for one.
-- [ ] **Step 3: the first window.** `gtk4-demo` is not built here (no demos),
+- [x] **Step 3: the first window.** `gtk4-demo` is not built here (no demos),
   so the application is a program from GTK's own examples built against the
   installed library — `examples/hello-world.c` from the GTK documentation,
   which is somebody else's program against somebody else's toolkit.
-- [ ] **Step 4: boot it under `wm`, screenshot the window, commit.**
+- [x] **Step 4: boot it under `wm`, screenshot the window, commit.**
 
 ---
 
 ### Task 8: the phase's acceptance
 
-- [ ] **Step 1:** `dtest` and `runtests` green on ext2 and ext4.
-- [ ] **Step 2:** `tools/check-rootfs.sh` clean after both.
-- [ ] **Step 3:** a screenshot of a GTK window on Quark.
-- [ ] **Step 4:** `CLAUDE.md` gains what a port of this size taught, and
+- [x] **Step 1:** `dtest` and `runtests` green on ext2 and ext4.
+- [x] **Step 2:** `tools/check-rootfs.sh` clean after both.
+- [x] **Step 3:** a screenshot of a GTK window on Quark.
+- [x] **Step 4:** `CLAUDE.md` gains what a port of this size taught, and
   `../../ROADMAP.md` gets Phase 16's "what it took".
-- [ ] **Step 5:** commit and push.
+- [x] **Step 5:** commit and push.

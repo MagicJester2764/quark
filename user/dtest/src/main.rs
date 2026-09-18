@@ -1054,7 +1054,22 @@ fn call_tag(tid: usize) -> Option<u64> {
     let mut reply = Message::empty();
     match syscall::sys_call_timeout(tid, &Message::empty(), &mut reply, 50) {
         syscall::CallOutcome::Replied => Some(reply.tag),
-        _ => None,
+        // Which of the two it was matters and the check cannot say: a call
+        // that was refused is a capability that is not there, and one that ran
+        // out of time is a child that had not reached `sys_recv` half a second
+        // after it was started. The second has been seen once, on a machine
+        // doing something else at the time, and nothing recorded why.
+        other => {
+            println!(
+                "[dtest] call to {} did not reply: {}",
+                tid,
+                match other {
+                    syscall::CallOutcome::TimedOut => "timed out",
+                    _ => "refused",
+                }
+            );
+            None
+        }
     }
 }
 
