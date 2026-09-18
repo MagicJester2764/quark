@@ -1,6 +1,6 @@
 # Quark syscall ABI
 
-**Version 2.8.** Query the running kernel with `SYS_ABI_VERSION` (240), which
+**Version 3.0.** Query the running kernel with `SYS_ABI_VERSION` (240), which
 returns `(major << 16) | minor`.
 
 This document is the contract between the Quark kernel and everything above it.
@@ -62,9 +62,10 @@ unused slots in a block are reserved for that subsystem.
 | 0xA0  | 160–175   | Kernel debug console          |
 | 0xB0  | 176–191   | Sockets                       |
 | 0xC0  | 192–207   | Memory, continued             |
+| 0xD0  | 208–223   | Terminals                     |
 | 0xF0  | 240–255   | ABI introspection             |
 
-Blocks 0xD0–0xE0 are unassigned and available for new subsystems. Threads
+Block 0xE0 is unassigned and available for a new subsystem. Threads
 never needed one: a thread is a task started with its creator's address space,
 so it is built from calls that already existed.
 
@@ -138,7 +139,31 @@ rule still holds for everything else.
 | 2.6 | `SYS_OBJECT_CREATE` (194), `SYS_OBJECT_MAP` (195), `SYS_OBJECT_CTL` (196) and capability type 9, `MemObject` — memory objects whose pages a user-space pager provides as they are touched, which is how a file is mapped. Also: a task's page fault can call a pager (`TAG_PAGE_IN`, sender marked with bit 62), a pager hears when nothing maps an object (`TAG_OBJECT_IDLE`), and notices from the kernel are received before calls waiting behind them. |
 | 2.7 | `SYS_OBJECT_SYNC` (197) — what was written through shared mappings reaches the files (`TAG_OBJECT_SYNC` to each pager). Also: `SYS_OBJECT_CTL` op 3 takes a starting page, and leaves a page dirty while it is mapped writable. |
 | 2.8 | `SYS_CALL_WITH` (27) — a call with any of a buffer lent, a capability offered and a deadline. |
-| 2.9 | What a process is, and what it runs in. `SYS_TIMER_CREATE` (146), `SYS_TIMER_SET` (147) and `SYS_TIMER_GET` (148) — a deadline as a descriptor, so that a program's event loop waits for a blink with everything else it waits for. Block 0xD0 opens: `SYS_PTY_CREATE` (208) and `SYS_PTY_CTL` (209) — a pseudo-terminal pair as two ordinary descriptors, with a line discipline (echo, canonical input, newline translation), a `termios` and a window size. `SYS_FORK` (110) — a copy of the caller in a copy of its address space, which returns 0 there. `SYS_EXEC_SPACE` (111) — the caller becomes the program in an address space it built, keeping its id, its descriptors and its capabilities. `SYS_ADDRSPACE_DESTROY` (38) — throw away an address space nothing is running in, which a spawn or an exec that failed part-way had no way to do. Also: `SYS_ADDRSPACE_CREATE` (36) and `SYS_ADDRSPACE_GIVE` (43) no longer ask for `TaskMgmt` — an address space the caller made, filled with pages it already owned, confers authority over nothing, and *starting a task* in one still does ask. |
+| 2.9 | What a process is, and what it runs in. `SYS_TIMER_CREATE` (146), `SYS_TIMER_SET` (147) and `SYS_TIMER_GET` (148) — a deadline as a descriptor, so that a program's event loop waits for a blink with everything else it waits for. Block 0xD0 opens: `SYS_PTY_CREATE` (208) and `SYS_PTY_CTL` (209) — a pseudo-terminal pair as two ordinary descriptors, with a line discipline (echo, canonical input, newline translation), a `termios` and a window size. `SYS_FORK` (110) — a copy of the caller in a copy of its address space, which returns 0 there. `SYS_EXEC_SPACE` (111) — the caller becomes the program in an address space it built, keeping its id, its descriptors and its capabilities. `SYS_ADDRSPACE_DESTROY` (38, and see 3.0 — the number collided and the call never ran) — throw away an address space nothing is running in, which a spawn or an exec that failed part-way had no way to do. Also: `SYS_ADDRSPACE_CREATE` (36) and `SYS_ADDRSPACE_GIVE` (43) no longer ask for `TaskMgmt` — an address space the caller made, filled with pages it already owned, confers authority over nothing, and *starting a task* in one still does ask. |
+
+### What 3.0 changed
+
+**`SYS_ADDRSPACE_DESTROY` moves from 38 to 44**, because 38 was already
+`SYS_MAP_PHYS`. The dispatch is a `match` and takes the first arm that matches,
+so the call added at 2.9 never ran: every attempt to throw away an address
+space mapped physical memory instead, and the leak it was written to close was
+never closed. Nothing could have depended on the old number — it did not do
+what its name said — so this is a correction rather than a change of
+interface, but it is a number that moved and the major version says so.
+`tools/check-abi.sh` now fails on two names sharing a number, on the C header
+disagreeing with the kernel, and not only on the kernel and quark-rt drifting
+apart.
+
+Added with it:
+
+| Call | What |
+|---|---|
+| `SYS_FD_WRITE_NB` (79) | The mirror of `SYS_FD_READ_NB`: a write that answers "would block" rather than parking. A descriptor a program marked non-blocking must not park it in either direction. |
+| `SYS_EVENT_CREATE` (131) | A counter with a descriptor — `eventfd`. One task adds to it, another waits until it is not zero and takes what is there. Semaphore mode takes one instead of all. It is in the synchronisation block because that is what it is for, and because the descriptor block is full. |
+
+Also: **`SYS_POLL` with no descriptors is a sleep** rather than an immediate
+return. A main loop whose sources are all timeouts polls nothing at all, and
+returning at once turned that loop into a spin.
 
 ### Deprecated
 
@@ -306,7 +331,7 @@ call to a task that never reaches `SYS_RECV` blocks forever.
 | 34 | `SYS_PHYS_ALLOC` | arg0 = pages | physical address / `u64::MAX` | `PhysAlloc` |
 | 35 | `SYS_PHYS_FREE` | arg0 = phys, arg1 = count | 0 / `u64::MAX` | `PhysAlloc` + frame ownership |
 | 36 | `SYS_ADDRSPACE_CREATE` | — | CR3 / `u64::MAX` | — |
-| 38 | `SYS_ADDRSPACE_DESTROY` | arg0 = cr3 the caller made, with no task in it | 0 / `u64::MAX` | — |
+| 44 | `SYS_ADDRSPACE_DESTROY` | arg0 = cr3 the caller made, with no task in it | 0 / `u64::MAX` | — |
 | 37 | `SYS_ADDRSPACE_MAP` | arg0 = cr3, arg1 = virt, arg2 = phys, arg3 = pages, arg4 = flags | 0 / `u64::MAX` | `TaskMgmt` + frame ownership or `PhysRange` — **deprecated** |
 | 43 | `SYS_ADDRSPACE_GIVE` | arg0 = cr3, arg1 = virt there, arg2 = virt here, arg3 = pages (at most 256), arg4 = flags (bit 0: writable) | 0 / `u64::MAX` | an address space the caller made, or runs in, and the pages are its own |
 | 38 | `SYS_MAP_PHYS` | arg0 = phys, arg1 = virt, arg2 = pages | 0 / `u64::MAX` | frame ownership or `PhysRange` |
@@ -395,6 +420,7 @@ frees the object, and is what makes a pipe's reader see end-of-file.
 | 76 | `SYS_POLLSET_CTL` | arg0 = set fd, arg1 = op (0 add, 1 modify, 2 remove), arg2 = fd, arg3 = events, arg4 = token | 0 / `u64::MAX` | — |
 | 77 | `SYS_POLLSET_WAIT` | arg0 = set fd, arg1 = array of `(u64 token, u32 events, u32 pad)`, arg2 = capacity, arg3 = timeout in ticks | entries filled, 0 = timed out / `u64::MAX` | — |
 | 78 | `SYS_POLL` | arg0 = array of `(u32 fd, u32 events, u32 revents, u32 pad)`, arg1 = count, arg2 = timeout in ticks | entries with non-zero `revents` / `u64::MAX` | — |
+| 79 | `SYS_FD_WRITE_NB` | arg0 = fd, arg1 = buf, arg2 = len | bytes written, **`0xFFFF_FFFE` = would block**, `u64::MAX` = error | — |
 
 **Streams.** `SYS_SOCKETPAIR` makes two connected ends and puts both in the
 caller's table; moving one into another task is `SYS_FD_DUP` followed by closing
@@ -582,6 +608,7 @@ is wrong.
 | 128 | `SYS_FUTEX_WAIT` | arg0 = addr (4-byte aligned), arg1 = expected | 0 = woken, 1 = value already differed, `u64::MAX` = bad address or no wait slot. **Blocks.** | — |
 | 129 | `SYS_FUTEX_WAKE` | arg0 = addr, arg1 = max to wake | number woken | — |
 | 130 | `SYS_FUTEX_WAIT_TIMEOUT` | arg0 = addr, arg1 = expected, arg2 = ticks | 0 = woken, 1 = value already differed, 2 = timed out, `u64::MAX` = bad address or no wait slot. **Blocks.** | — |
+| 131 | `SYS_EVENT_CREATE` | arg0 = the count it starts at, arg1 = flags (1 = semaphore) | a descriptor readable while the counter is not zero / `u64::MAX` | — |
 
 Futexes are keyed on **physical** address, so a word in shared memory is one
 futex to every task that maps it, whatever virtual address each uses.

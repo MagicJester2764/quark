@@ -121,6 +121,7 @@ pub fn watchable(tid: usize, fd: usize) -> bool {
                     | FdKind::StreamEnd { .. }
                     | FdKind::PtyEnd { .. }
                     | FdKind::Timer { .. }
+                    | FdKind::Event { .. }
             ),
             None => false,
         }
@@ -223,6 +224,14 @@ fn readiness(tid: usize, fd: usize) -> u32 {
         FdKind::Timer { timer } => {
             if crate::timerfd::pending(timer) > 0 {
                 out |= READABLE;
+            }
+        }
+        FdKind::Event { ev } => {
+            if crate::eventfd::readable(ev) {
+                out |= READABLE;
+            }
+            if crate::eventfd::writable(ev) {
+                out |= WRITABLE;
             }
         }
         FdKind::PtyEnd { pty, end } => {
@@ -412,6 +421,13 @@ pub fn note_timer() {
     for i in 0..n {
         crate::ipc::wake_sleeper(wake[i]);
     }
+}
+
+/// A counter was added to or taken from: same reasoning as `note_timer`, and
+/// the same scan. There are sixteen of these in the machine; finding out which
+/// sets name this one costs more than waking them to look.
+pub fn note_event() {
+    note_timer();
 }
 
 fn names_pty(tid: usize, fd: usize, pty: usize) -> bool {

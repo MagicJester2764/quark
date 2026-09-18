@@ -34,6 +34,7 @@
 #define LX_ELOOP    40
 #define LX_EDEADLK  35
 #define LX_ENOLCK   37
+#define LX_ETIMEDOUT 110
 
 /* Descriptors from here up are files.c's VFS files; below, the kernel's.
    The split sits at the kernel's MAX_FDS — see files.c. */
@@ -45,6 +46,10 @@
 #define LX_AT_SYMLINK_FOLLOW 0x400
 #define LX_AT_SYMLINK_NOFOLLOW 0x100
 #define LX_AT_EMPTY_PATH 0x1000
+
+/* eventfd's flags. EFD_CLOEXEC is accepted and ignored, like O_CLOEXEC. */
+#define LX_EFD_SEMAPHORE 1
+#define LX_EFD_NONBLOCK  0x800
 
 /* Open flags this layer acts on. Shared because `pipe2` and `fcntl` have to
    agree about what O_NONBLOCK means. */
@@ -92,6 +97,7 @@ long __quark_ioctl(long fd, unsigned long request, unsigned long arg);
 long __quark_ftruncate(long fd, long length);
 long __quark_fcntl(long fd, long cmd, long arg);
 int __quark_fd_is_nonblock(long fd);
+void __quark_fd_set_nonblock(long fd, int on);
 long __quark_pipe(int *fds, long flags);
 long __quark_socketpair(long domain, long type, long protocol, int *sv);
 long __quark_sendmsg(long fd, const void *msg, long flags);

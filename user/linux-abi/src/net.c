@@ -119,12 +119,11 @@ long __quark_ftruncate(long fd, long length) {
  * the write end to the compositor, and reads the read end until end of file --
  * which is the whole reason the compositor never sees the data. */
 long __quark_pipe(int *fds, long flags) {
-    /* O_CLOEXEC is meaningless without exec. O_NONBLOCK is not honoured on a
-       pipe here, and saying so is better than pretending: a caller that needs
-       it would otherwise block in a read it was told would return. */
-    if (flags & LX_O_NONBLOCK) {
-        return -LX_ENOSYS;
-    }
+    /* O_CLOEXEC survives an exec here rather than closing, because a Quark
+       descriptor table is kept across `SYS_EXEC_SPACE` and nothing marks
+       entries; a program that depends on it closes what it does not want.
+       O_NONBLOCK is honoured: both ends are recorded as non-blocking, and the
+       read and write paths use the calls that answer EAGAIN. */
     if (!fds) {
         return -LX_EFAULT;
     }
@@ -146,6 +145,10 @@ long __quark_pipe(int *fds, long flags) {
     }
     fds[0] = (int)r;
     fds[1] = (int)w;
+    if (flags & LX_O_NONBLOCK) {
+        __quark_fd_set_nonblock((long)r, 1);
+        __quark_fd_set_nonblock((long)w, 1);
+    }
     return 0;
 }
 
@@ -311,9 +314,12 @@ long __quark_recvmsg(long fd, void *msg, long flags) {
 
 long __quark_poll(void *fds, long nfds, long timeout_ms) {
     struct lx_pollfd *p = fds;
-    if (!p || nfds < 0) {
+    if (nfds < 0 || (!p && nfds > 0)) {
         return -LX_EFAULT;
     }
+    /* Waiting on nothing at all is a sleep, and `poll(NULL, 0, ms)` is how a
+       main loop whose sources are all timeouts spends its time. Refusing it
+       because the array is null turned that wait into a spin. */
     if (nfds > MAX_POLL) {
         return -LX_EINVAL;
     }

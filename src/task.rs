@@ -67,6 +67,10 @@ pub enum FdKind {
     /// of times it has. A program's event loop waits on it with everything
     /// else it waits on.
     Timer { timer: usize },
+    /// A counter one task adds to and another waits on: `eventfd`. The wake-up
+    /// every main loop is built out of, in one descriptor rather than a pipe's
+    /// two.
+    Event { ev: usize },
     /// A network connection, held by the net server as `handle`.
     ///
     /// Unlike `Ipc`, which is one-directional and carries a fixed tag, a

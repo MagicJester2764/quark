@@ -36,7 +36,7 @@ pub const SYS_MUNMAP: u64 = 33;
 pub const SYS_PHYS_ALLOC: u64 = 34;
 pub const SYS_PHYS_FREE: u64 = 35;
 pub const SYS_ADDRSPACE_CREATE: u64 = 36;
-pub const SYS_ADDRSPACE_DESTROY: u64 = 38;
+pub const SYS_ADDRSPACE_DESTROY: u64 = 44;
 pub const SYS_ADDRSPACE_MAP: u64 = 37;
 pub const SYS_MAP_PHYS: u64 = 38;
 pub const SYS_SET_MEM_LIMIT: u64 = 39;
@@ -70,6 +70,7 @@ pub const SYS_POLLSET_CREATE: u64 = 75;
 pub const SYS_POLLSET_CTL: u64 = 76;
 pub const SYS_POLLSET_WAIT: u64 = 77;
 pub const SYS_POLL: u64 = 78;
+pub const SYS_FD_WRITE_NB: u64 = 79;
 
 pub const POLL_READABLE: u32 = 1;
 pub const POLL_WRITABLE: u32 = 2;
@@ -148,6 +149,7 @@ pub const OBJECT_ACCESS_WRITE: u64 = 2;
 pub const SYS_FUTEX_WAIT: u64 = 128;
 pub const SYS_FUTEX_WAKE: u64 = 129;
 pub const SYS_FUTEX_WAIT_TIMEOUT: u64 = 130;
+pub const SYS_EVENT_CREATE: u64 = 131;
 
 // --- 0x90  time ---
 pub const SYS_TICKS: u64 = 144;

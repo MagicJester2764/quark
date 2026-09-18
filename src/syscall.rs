@@ -128,6 +128,7 @@ pub const SYS_POLLSET_CREATE: u64 = 75;
 pub const SYS_POLLSET_CTL: u64 = 76;
 pub const SYS_POLLSET_WAIT: u64 = 77;
 pub const SYS_POLL: u64 = 78;
+pub const SYS_FD_WRITE_NB: u64 = 79;
 
 // --- 0x50  capabilities ---
 pub const SYS_CAP_MINT: u64 = 80;
@@ -182,7 +183,7 @@ pub const SYS_SPACE_WATCH: u64 = 108;
 pub const SYS_TASK_CREATE_IN: u64 = 109;
 pub const SYS_FORK: u64 = 110;
 pub const SYS_EXEC_SPACE: u64 = 111;
-pub const SYS_ADDRSPACE_DESTROY: u64 = 38;
+pub const SYS_ADDRSPACE_DESTROY: u64 = 44;
 /// Block 0xD0: terminals.
 pub const SYS_PTY_CREATE: u64 = 208;
 pub const SYS_PTY_CTL: u64 = 209;
@@ -215,6 +216,11 @@ pub const SYS_GETRANDOM: u64 = 116;
 pub const SYS_FUTEX_WAIT: u64 = 128;
 pub const SYS_FUTEX_WAKE: u64 = 129;
 pub const SYS_FUTEX_WAIT_TIMEOUT: u64 = 130;
+/// A counter with a descriptor. In the synchronisation block rather than the
+/// descriptor one because that block is full and because this is what it is
+/// for: one task adds, another waits. `eventfd`, in one call — the flags a
+/// program passes to the Linux call are the argument here.
+pub const SYS_EVENT_CREATE: u64 = 131;
 
 // --- 0x90  time ---
 pub const SYS_TICKS: u64 = 144;
@@ -278,8 +284,8 @@ pub const SYS_ABI_VERSION: u64 = 240;
 /// Major changes when a call's meaning or signature changes incompatibly;
 /// minor when calls are added. User space can refuse to run against a major it
 /// does not know, which is the point of exposing it at all.
-pub const ABI_VERSION_MAJOR: u64 = 2;
-pub const ABI_VERSION_MINOR: u64 = 9;
+pub const ABI_VERSION_MAJOR: u64 = 3;
+pub const ABI_VERSION_MINOR: u64 = 0;
 
 /// Threads a task may make with no capability at all.
 ///
@@ -1201,6 +1207,29 @@ extern "C" fn syscall_dispatch(
                 }
             }
         }
+        SYS_EVENT_CREATE => {
+            // arg0 = the count it starts at, arg1 = flags (1 = semaphore).
+            //
+            // The descriptor is the counter's only name, so it is installed in
+            // the caller's own table here rather than handed back as a handle
+            // somebody then has to place.
+            let me = scheduler::current_tid();
+            let semaphore = arg1 & 1 != 0;
+            let ev = match crate::eventfd::create(me, arg0, semaphore) {
+                Some(e) => e,
+                None => return u64::MAX,
+            };
+            match scheduler::current_alloc_fd(crate::task::FdKind::Event { ev }) {
+                Ok(fd) => {
+                    crate::eventfd::retain(ev);
+                    fd as u64
+                }
+                Err(()) => {
+                    crate::eventfd::cleanup_orphans(me);
+                    u64::MAX
+                }
+            }
+        }
         SYS_TIMER_SET => {
             // arg0 = fd, arg1 = ticks until the first expiration (0 disarms),
             // arg2 = ticks between them afterwards.
@@ -1667,6 +1696,7 @@ extern "C" fn syscall_dispatch(
                 }
                 // A timer is armed, not written to.
                 crate::task::FdKind::Timer { .. } => u64::MAX,
+                crate::task::FdKind::Event { ev } => event_write(ev, ptr, len, true),
                 crate::task::FdKind::StreamEnd { stream, end } => {
                     match crate::stream::pipes_for(stream, end) {
                         Some((_, wr)) => crate::pipe::write(wr, ptr, len),
@@ -1713,6 +1743,7 @@ extern "C" fn syscall_dispatch(
                 crate::task::FdKind::PipeWrite(_) => u64::MAX,
                 crate::task::FdKind::PtyEnd { pty, end } => pty_read(pty, end, ptr, max_len),
                 crate::task::FdKind::Timer { timer } => timer_read(timer, ptr, max_len),
+                crate::task::FdKind::Event { ev } => event_read(ev, ptr, max_len),
                 crate::task::FdKind::StreamEnd { stream, end } => {
                     match crate::stream::pipes_for(stream, end) {
                         Some((rd, _)) => crate::pipe::read(rd, ptr, max_len),
@@ -1756,6 +1787,77 @@ extern "C" fn syscall_dispatch(
                         Err(()) => crate::pipe::WOULD_BLOCK,
                     }
                 }
+                crate::task::FdKind::StreamEnd { stream, end } => {
+                    match crate::stream::pipes_for(stream, end) {
+                        Some((rd, _)) => crate::pipe::read_nonblock(rd, ptr, max_len),
+                        None => u64::MAX,
+                    }
+                }
+                crate::task::FdKind::Event { ev } => {
+                    if max_len < 8 {
+                        u64::MAX
+                    } else {
+                        match crate::eventfd::take(ev) {
+                            Some(n) => {
+                                let _ua = crate::cpu::UserAccess::begin();
+                                unsafe { core::ptr::write_unaligned(ptr as *mut u64, n) };
+                                drop(_ua);
+                                8
+                            }
+                            None => crate::pipe::WOULD_BLOCK,
+                        }
+                    }
+                }
+                crate::task::FdKind::Timer { timer } => {
+                    if max_len < 8 {
+                        u64::MAX
+                    } else {
+                        match crate::timerfd::take(timer) {
+                            Some(n) => {
+                                let _ua = crate::cpu::UserAccess::begin();
+                                unsafe { core::ptr::write_unaligned(ptr as *mut u64, n) };
+                                drop(_ua);
+                                8
+                            }
+                            None => crate::pipe::WOULD_BLOCK,
+                        }
+                    }
+                }
+                _ => u64::MAX,
+            }
+        }
+        SYS_FD_WRITE_NB => {
+            // The mirror of SYS_FD_READ_NB. A descriptor a program has marked
+            // non-blocking must not park it in a write either: a main loop that
+            // writes to a peer which has stopped reading would otherwise stop
+            // serving everybody else.
+            let fd = arg0 as usize;
+            let ptr = arg1 as *const u8;
+            let len = arg2 as usize;
+            if len > 0 && !validate_user_ptr(arg1, arg2) {
+                return u64::MAX;
+            }
+            match scheduler::current_fd(fd) {
+                crate::task::FdKind::PipeWrite(handle) => {
+                    crate::pipe::write_nonblock(handle, ptr, len)
+                }
+                crate::task::FdKind::StreamEnd { stream, end } => {
+                    match crate::stream::pipes_for(stream, end) {
+                        Some((_, wr)) => crate::pipe::write_nonblock(wr, ptr, len),
+                        None => u64::MAX,
+                    }
+                }
+                // A terminal's buffer is drained by whoever is at the other
+                // end; a write that does not fit returns what did, which is a
+                // short write and not a block.
+                crate::task::FdKind::PtyEnd { pty, end } => {
+                    let _ua = crate::cpu::UserAccess::begin();
+                    let slice = unsafe { core::slice::from_raw_parts(ptr, len) };
+                    let n = crate::pty::write(pty, end, slice);
+                    drop(_ua);
+                    if n == 0 && len > 0 { crate::pipe::WOULD_BLOCK } else { n as u64 }
+                }
+                crate::task::FdKind::Event { ev } => event_write(ev, ptr, len, false),
                 _ => u64::MAX,
             }
         }
@@ -1946,7 +2048,22 @@ extern "C" fn syscall_dispatch(
             // calls where one will do. Waiting cannot be done without a set,
             // because that is what a pipe becoming ready looks for.
             let n = (arg1 as usize).min(32);
-            if n == 0 || !validate_user_ptr_mut(arg0, (n * 16) as u64) {
+            if n == 0 {
+                // Waiting on nothing at all is a sleep, and a main loop whose
+                // sources are all timeouts does exactly that. Returning at once
+                // turned that loop into a spin.
+                let tid = scheduler::current_tid();
+                let deadline = crate::pit::ticks().saturating_add(arg2);
+                loop {
+                    let now = crate::pit::ticks();
+                    if now >= deadline {
+                        break;
+                    }
+                    let _ = crate::ipc::sys_recv_timeout(tid, deadline - now);
+                }
+                return 0;
+            }
+            if !validate_user_ptr_mut(arg0, (n * 16) as u64) {
                 return u64::MAX;
             }
             let tid = scheduler::current_tid();
@@ -3273,6 +3390,58 @@ pub unsafe fn enter_usermode_frame(frame: *const crate::task::UserFrame) -> ! { 
 /// Read a timer: the number of times it has fired, as a `u64`, waiting for
 /// the first if it has not fired yet. That is the shape Linux gives it, and
 /// what a toolkit's event loop reads to find out how many blinks it missed.
+/// Read a counter, waiting for it to be something.
+///
+/// Eight bytes, because that is what the value is; a shorter buffer is an
+/// error rather than a truncation, which is what Linux answers too.
+fn event_read(ev: usize, ptr: *mut u8, max_len: usize) -> u64 {
+    if max_len < 8 {
+        return u64::MAX;
+    }
+    loop {
+        if let Some(n) = crate::eventfd::take(ev) {
+            let _ua = crate::cpu::UserAccess::begin();
+            unsafe { core::ptr::write_unaligned(ptr as *mut u64, n) };
+            drop(_ua);
+            return 8;
+        }
+        if !crate::eventfd::wait(ev) && !crate::eventfd::readable(ev) {
+            // Either it was added to while we were looking, or there was no
+            // room to be recorded as a waiter. The loop takes the first; the
+            // second must return rather than sleep unwoken.
+            return u64::MAX;
+        }
+    }
+}
+
+/// Add to a counter. `block` decides what happens when it is full, which is
+/// only ever the case at 2^64 - 1 and so is close to unreachable.
+fn event_write(ev: usize, ptr: *const u8, len: usize, block: bool) -> u64 {
+    if len < 8 {
+        return u64::MAX;
+    }
+    let n = {
+        let _ua = crate::cpu::UserAccess::begin();
+        unsafe { core::ptr::read_unaligned(ptr as *const u64) }
+    };
+    if n == u64::MAX || n == 0 {
+        // u64::MAX is reserved so that it is always an error rather than a
+        // wrap, and a zero add would be a wake-up that woke nobody.
+        return u64::MAX;
+    }
+    loop {
+        if crate::eventfd::add(ev, n) {
+            return 8;
+        }
+        if !block {
+            return crate::pipe::WOULD_BLOCK;
+        }
+        if !crate::eventfd::wait(ev) {
+            return u64::MAX;
+        }
+    }
+}
+
 fn timer_read(timer: usize, ptr: *mut u8, max_len: usize) -> u64 {
     if max_len < 8 {
         return u64::MAX;

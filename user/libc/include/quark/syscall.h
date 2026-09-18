@@ -40,11 +40,13 @@
 #define SYS_ADDRSPACE_SELF  41
 #define SYS_ADDRSPACE_CREATE 36
 #define SYS_ADDRSPACE_GIVE  43
-#define SYS_ADDRSPACE_DESTROY 38
+#define SYS_ADDRSPACE_DESTROY 44
 
 /* 0x40  file descriptors */
 #define SYS_FD_READ         64
 #define SYS_FD_WRITE        65
+#define SYS_FD_READ_NB      66
+#define SYS_FD_WRITE_NB     79
 #define SYS_FD_DUP          68
 #define SYS_PIPE_CREATE     69
 #define SYS_PIPE_FD_SET     70
@@ -86,6 +88,8 @@
 /* 0x80  futex */
 #define SYS_FUTEX_WAIT      128
 #define SYS_FUTEX_WAKE      129
+#define SYS_FUTEX_WAIT_TIMEOUT 130
+#define SYS_EVENT_CREATE    131
 
 /* 0x90  time */
 #define SYS_TICKS           144

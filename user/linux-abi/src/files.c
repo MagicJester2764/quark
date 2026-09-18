@@ -894,8 +894,20 @@ long __quark_access(long dirfd, const char *path, long mode) {
 /* Reads and writes on 0, 1 and 2 go to the kernel; anything else is a file. */
 long __quark_read(long fd, void *buf, unsigned long n) {
     if (fd >= 0 && fd < FIRST_FD) {
-        unsigned long r = __syscall3(SYS_FD_READ, (unsigned long)fd,
-                                     (unsigned long)buf, n);
+        /* O_NONBLOCK has to mean it. A main loop drains its wake-up "until it
+           is empty", which is a read that answers EAGAIN rather than one that
+           waits; glib's does exactly that with its context lock held, so a
+           read that blocks there is a program that stops rather than one that
+           fails. Setting the flag and ignoring it is the worst of both. */
+        unsigned long r;
+        if (__quark_fd_is_nonblock(fd)) {
+            r = __syscall3(SYS_FD_READ_NB, (unsigned long)fd, (unsigned long)buf, n);
+            if (r == QUARK_WOULD_BLOCK) {
+                return -LX_EAGAIN;
+            }
+        } else {
+            r = __syscall3(SYS_FD_READ, (unsigned long)fd, (unsigned long)buf, n);
+        }
         return r == QUARK_ERR ? -LX_EBADF : (long)r;
     }
     return __quark_file_read(fd, buf, n);
@@ -903,8 +915,15 @@ long __quark_read(long fd, void *buf, unsigned long n) {
 
 long __quark_write(long fd, const void *buf, unsigned long n) {
     if (fd >= 0 && fd < FIRST_FD) {
-        unsigned long r = __syscall3(SYS_FD_WRITE, (unsigned long)fd,
-                                     (unsigned long)buf, n);
+        unsigned long r;
+        if (__quark_fd_is_nonblock(fd)) {
+            r = __syscall3(SYS_FD_WRITE_NB, (unsigned long)fd, (unsigned long)buf, n);
+            if (r == QUARK_WOULD_BLOCK) {
+                return -LX_EAGAIN;
+            }
+        } else {
+            r = __syscall3(SYS_FD_WRITE, (unsigned long)fd, (unsigned long)buf, n);
+        }
         return r == QUARK_ERR ? -LX_EBADF : (long)r;
     }
     return __quark_file_write(fd, buf, n);
@@ -1092,6 +1111,19 @@ long __quark_flock(long fd, long op) {
    kernel descriptor; this layer's own file numbers are always blocking,
    because the VFS is a synchronous call and there is nothing to wait for. */
 static unsigned int nonblock_mask;
+
+/* Say that a descriptor was made non-blocking when it was created, which is
+   what `pipe2` and `eventfd` take a flag for. */
+void __quark_fd_set_nonblock(long fd, int on) {
+    if (fd < 0 || fd >= FIRST_FD) {
+        return;
+    }
+    if (on) {
+        nonblock_mask |= 1u << fd;
+    } else {
+        nonblock_mask &= ~(1u << fd);
+    }
+}
 
 int __quark_fd_is_nonblock(long fd) {
     return fd >= 0 && fd < FIRST_FD && (nonblock_mask & (1u << fd)) != 0;

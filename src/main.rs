@@ -37,6 +37,7 @@ mod stream;
 pub mod pipe;
 mod pty;
 mod timerfd;
+mod eventfd;
 pub mod serial;
 pub mod task;
 mod userspace;

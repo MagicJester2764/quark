@@ -54,6 +54,8 @@ typedef unsigned long size_t;
 #define LX_sendmsg          46
 #define LX_recvmsg          47
 #define LX_pipe              22
+#define LX_eventfd         284
+#define LX_eventfd2        290
 #define LX_pipe2           293
 #define LX_socketpair       53
 #define LX_fadvise64       221
@@ -612,15 +614,42 @@ long __quark_syscall(long n, long a1, long a2, long a3, long a4, long a5, long a
     case LX_futex: {
         /* FUTEX_WAIT is 0 and FUTEX_WAKE is 1, with the private flag masked
            off: every process here has its own address space, so every futex
-           is private already. */
+           is private already.
+         *
+         * The fourth argument is a *relative* timeout for FUTEX_WAIT, and the
+         * answer matters as much as the wait: a caller that gave a deadline
+         * asks which happened, so it is ETIMEDOUT when the time ran out and
+         * EAGAIN when the word had already changed. Dropping the timeout made
+         * every wait with a deadline wait for ever -- which is what
+         * `g_cond_wait_until` and musl's `sem_timedwait` are built out of,
+         * and glib's thread pool is built out of that. */
         long op = a2 & 0x7f;
         if (op == 0) {
-            __syscall2(SYS_FUTEX_WAIT, (unsigned long)a1, (unsigned long)a3);
+            unsigned long r;
+            if (a4) {
+                const struct lx_timespec *ts = (const struct lx_timespec *)a4;
+                /* Rounded up: the PIT ticks at 100 Hz, and a wait that came
+                   back early would be a wait that did not happen. */
+                unsigned long ticks =
+                    (unsigned long)ts->tv_sec * 100 + (unsigned long)((ts->tv_nsec + 9999999) / 10000000);
+                r = __syscall3(SYS_FUTEX_WAIT_TIMEOUT, (unsigned long)a1, (unsigned long)a3, ticks);
+            } else {
+                r = __syscall2(SYS_FUTEX_WAIT, (unsigned long)a1, (unsigned long)a3);
+            }
+            if (r == QUARK_ERR) {
+                return -LX_EINVAL;
+            }
+            if (r == 1) {
+                return -LX_EAGAIN;
+            }
+            if (r == 2) {
+                return -LX_ETIMEDOUT;
+            }
             return 0;
         }
         if (op == 1) {
-            __syscall2(SYS_FUTEX_WAKE, (unsigned long)a1, (unsigned long)a3);
-            return 0;
+            unsigned long woken = __syscall2(SYS_FUTEX_WAKE, (unsigned long)a1, (unsigned long)a3);
+            return woken == QUARK_ERR ? -LX_EINVAL : (long)woken;
         }
         return -LX_ENOSYS;
     }
@@ -907,6 +936,25 @@ long __quark_syscall(long n, long a1, long a2, long a3, long a4, long a5, long a
            There is nothing to preallocate here -- a region's frames are taken
            when it is sized -- so the size is all of it. */
         return __quark_ftruncate(a1, a3 + a4);
+    case LX_eventfd:
+    case LX_eventfd2: {
+        /* A counter with a descriptor. glib reaches for this before anything
+           else to wake a sleeping main loop, falling back to a pipe only when
+           it fails — and so do libwayland's loop and GTK's. Two of the flags
+           are ours to act on: EFD_NONBLOCK, which the read path reads, and
+           EFD_SEMAPHORE, which the kernel's counter implements. EFD_CLOEXEC
+           means nothing here, as it does for a pipe. */
+        long flags = (n == LX_eventfd2) ? a2 : 0;
+        unsigned long fd = __syscall2(SYS_EVENT_CREATE, (unsigned long)a1,
+                                      (flags & LX_EFD_SEMAPHORE) ? 1UL : 0UL);
+        if (fd == QUARK_ERR) {
+            return -LX_EMFILE;
+        }
+        if (flags & LX_EFD_NONBLOCK) {
+            __quark_fd_set_nonblock((long)fd, 1);
+        }
+        return (long)fd;
+    }
     case LX_pipe:
         return __quark_pipe((int *)a1, 0);
     case LX_pipe2:
