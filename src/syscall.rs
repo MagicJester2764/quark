@@ -322,6 +322,14 @@ pub const SYS_FD_FLAGS: u64 = 228;
 pub const SYS_FD_REAP: u64 = 229;
 /// What kind of thing a descriptor names, and whether its other end has gone.
 pub const SYS_FD_KIND: u64 = 230;
+/// A server gives a task that is calling it an end of the pipe a key of the
+/// server's names: how a named pipe is opened.
+pub const SYS_FD_SERVE_PIPE: u64 = 231;
+/// Wait for somebody to hold the other end of a pipe.
+pub const SYS_PIPE_PEER: u64 = 232;
+/// SYS_FD_SERVE_PIPE: the writing end, and only if the other end is held.
+const SERVE_PIPE_WRITE: u64 = 1;
+const SERVE_PIPE_PEER: u64 = 2;
 /// SYS_FD_KIND: nothing is left at the other end.
 const FD_KIND_GONE: u64 = 0x100;
 /// SYS_FD_FLAGS: close this descriptor on `SYS_EXEC_SPACE`.
@@ -336,7 +344,7 @@ pub const SYS_ABI_VERSION: u64 = 240;
 /// minor when calls are added. User space can refuse to run against a major it
 /// does not know, which is the point of exposing it at all.
 pub const ABI_VERSION_MAJOR: u64 = 3;
-pub const ABI_VERSION_MINOR: u64 = 6;
+pub const ABI_VERSION_MINOR: u64 = 7;
 
 /// Threads a task may make with no capability at all.
 ///
@@ -784,6 +792,63 @@ extern "C" fn syscall_dispatch(
             }
         }
         SYS_FD_REAP => crate::served::reap(scheduler::current_tid()).unwrap_or(u64::MAX),
+        SYS_FD_SERVE_PIPE => {
+            // arg0 = the client, arg1 = a key of the caller's own choosing,
+            // arg2 = which end and how: bit 0 for the writing end, bit 1 to
+            // give it only if somebody holds the other.
+            //
+            // The rule is SYS_FD_SERVE's: a task is handed a descriptor only
+            // while it is in a call to whoever is handing it over. What is
+            // handed over here is an ordinary pipe's end, of the one pipe the
+            // key names for this server while anybody holds an end of it.
+            let me = scheduler::current_tid();
+            let client = arg0 as usize;
+            if client == me || !crate::ipc::is_calling(client, me) {
+                return u64::MAX;
+            }
+            let write = arg2 & SERVE_PIPE_WRITE != 0;
+            let server = crate::cap::endpoint_of(me);
+            let (pipe, wait) =
+                match crate::pipe::open_named(server, arg1, write, arg2 & SERVE_PIPE_PEER != 0) {
+                    crate::pipe::Opened::End(pipe, wait) => (pipe, wait),
+                    crate::pipe::Opened::NoPeer => return crate::pipe::WOULD_BLOCK,
+                    crate::pipe::Opened::Full => return u64::MAX,
+                };
+            let kind = if write {
+                crate::task::FdKind::PipeWrite(pipe)
+            } else {
+                crate::task::FdKind::PipeRead(pipe)
+            };
+            // The end was counted before it is in anybody's table: a
+            // descriptor is never seen naming an end that is not held.
+            match crate::fdtable::install(client, kind, 3) {
+                Some(fd) => fd as u64 | wait << 32,
+                None => {
+                    crate::pipe::drop_ref(pipe, write);
+                    u64::MAX
+                }
+            }
+        }
+        SYS_PIPE_PEER => {
+            // arg0 = a descriptor for one end of a named pipe, arg1 = what
+            // came with it when it was given. Waits until somebody opens the
+            // other end, if nobody has since then.
+            let me = scheduler::current_tid();
+            let peer = |handle: usize, is_write: bool| match crate::pipe::wait_peer(handle, is_write, arg1) {
+                crate::pipe::Peer::There => 0,
+                crate::pipe::Peer::Interrupted => crate::signal::INTERRUPTED,
+                crate::pipe::Peer::Failed => u64::MAX,
+            };
+            // Held while it waits: the descriptor is the program's, and a
+            // sibling may close it.
+            let done = match crate::fdtable::hold(me, arg0 as usize) {
+                crate::task::FdKind::PipeRead(handle) => peer(handle, false),
+                crate::task::FdKind::PipeWrite(handle) => peer(handle, true),
+                _ => u64::MAX,
+            };
+            crate::fdtable::unhold(me);
+            done
+        }
         SYS_FD_KIND => {
             // arg0 = one of the caller's descriptors. What it is, as a number,
             // with a bit above it if the other end has gone: the difference

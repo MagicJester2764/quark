@@ -46,6 +46,17 @@ struct Pipe {
     read_waiter_count: usize,
     write_waiters: [usize; MAX_WAITERS],
     write_waiter_count: usize,
+    /// A pipe a server's key names (see [`open_named`]): a FIFO.
+    named: bool,
+    /// How many times each end of a named pipe has been opened: the reading
+    /// end, then the writing. They only go up. Somebody waiting for the
+    /// other end to be opened is waiting for one of these to move, not for
+    /// the end to be held — a writer that opened, wrote and closed before
+    /// the reader ran again has still been, and the reader's wait is over.
+    opens: [u32; 2],
+    /// Tasks waiting for the other end to be opened by somebody.
+    peer_waiters: [usize; MAX_WAITERS],
+    peer_waiter_count: usize,
 }
 
 impl Pipe {
@@ -64,7 +75,213 @@ impl Pipe {
             read_waiter_count: 0,
             write_waiters: [0; MAX_WAITERS],
             write_waiter_count: 0,
+            named: false,
+            opens: [0; 2],
+            peer_waiters: [0; MAX_WAITERS],
+            peer_waiter_count: 0,
         }
+    }
+}
+
+/// Named pipes: FIFOs.
+///
+/// A pipe two programs find by a name rather than by being handed its ends.
+/// The name is a server's business — a file server has an inode for it, with
+/// an owner and a mode — and the pipe is the kernel's, like any other, since
+/// a program waits on one with `poll`. What joins them is here: a server
+/// names a pipe by a key of its own choosing, and for as long as anybody
+/// holds an end of the pipe that key names, the key names that pipe.
+///
+/// The key is the server's, so the table is keyed by the server too — by its
+/// endpoint number, which is never given out again. A server that dies leaves
+/// keys nobody can ask for, and they go with the last end like any other.
+#[derive(Clone, Copy)]
+struct Named {
+    /// The server's endpoint number; 0 is a free entry.
+    server: u64,
+    key: u64,
+    pipe: usize,
+}
+
+/// More than a system has names for at once, and a table small enough to
+/// search.
+const MAX_NAMED: usize = 32;
+static mut NAMED: [Named; MAX_NAMED] = [Named { server: 0, key: 0, pipe: 0 }; MAX_NAMED];
+
+/// What opening a named pipe came to.
+pub enum Opened {
+    /// The pipe, with the end counted, and what its opener should wait for:
+    /// 0 if somebody holds the other end, and otherwise a number to hand to
+    /// [`wait_peer`], which says how things stood at this moment.
+    End(usize, u64),
+    /// Asked for an end only if the other is held, and it is not.
+    NoPeer,
+    /// No room for another pipe, or for another name.
+    Full,
+}
+
+/// Open one end of the pipe that `key` names for `server`, making the pipe
+/// if nobody has it open.
+///
+/// Finding it, counting the end and looking at the other are one step. In
+/// two, a writer could come and go between a reader being given its end and
+/// the reader asking whether to wait, and the reader would wait for a writer
+/// that had already been.
+///
+/// Not counted against any program's pipes: the server did not ask for a
+/// pipe, a client of it opened a name.
+pub fn open_named(server: u64, key: u64, write: bool, only_with_peer: bool) -> Opened {
+    if server == 0 {
+        return Opened::Full;
+    }
+    let creator = scheduler::current_tid();
+    let flags = irq_save();
+    let out = unsafe {
+        let table = &mut *core::ptr::addr_of_mut!(NAMED);
+        let known = table.iter().position(|n| n.server == server && n.key == key);
+        let held = |i: usize| if write { PIPES[i].readers > 0 } else { PIPES[i].writers > 0 };
+        if only_with_peer && !known.is_some_and(|slot| held(table[slot].pipe)) {
+            Opened::NoPeer
+        } else {
+            let handle = match known {
+                Some(slot) => Some(table[slot].pipe),
+                None => {
+                    let free = table.iter().position(|n| n.server == 0);
+                    let pipe = (1..MAX_PIPES).find(|&i| !PIPES[i].in_use);
+                    match (free, pipe) {
+                        (Some(slot), Some(i)) => {
+                            PIPES[i] = Pipe::new();
+                            PIPES[i].in_use = true;
+                            PIPES[i].creator = creator;
+                            PIPES[i].named = true;
+                            table[slot] = Named { server, key, pipe: i };
+                            Some(i)
+                        }
+                        _ => None,
+                    }
+                }
+            };
+            match handle {
+                None => Opened::Full,
+                Some(i) => {
+                    let pipe = &mut PIPES[i];
+                    let (mine, theirs) = if write { (1, 0) } else { (0, 1) };
+                    if write {
+                        pipe.writers += 1;
+                    } else {
+                        pipe.readers += 1;
+                    }
+                    pipe.opens[mine] = pipe.opens[mine].wrapping_add(1);
+                    // Whoever was waiting for this end to be opened has what
+                    // it was waiting for.
+                    for w in 0..pipe.peer_waiter_count {
+                        scheduler::unblock_task(pipe.peer_waiters[w]);
+                    }
+                    pipe.peer_waiter_count = 0;
+                    let others = if write { pipe.readers } else { pipe.writers };
+                    let wait = if others > 0 { 0 } else { since(pipe.opens[theirs]) };
+                    Opened::End(i, wait)
+                }
+            }
+        }
+    };
+    irq_restore(flags);
+    out
+}
+
+/// A pipe has gone: whatever key named it names nothing. Interrupts are off.
+unsafe fn forget_name(handle: usize) {
+    unsafe {
+        for n in (*core::ptr::addr_of_mut!(NAMED)).iter_mut() {
+            if n.server != 0 && n.pipe == handle {
+                n.server = 0;
+            }
+        }
+    }
+}
+
+/// A count of openings as an opener is given it to wait on: never 0, which
+/// is what says there is nothing to wait for, and small enough to travel
+/// above a descriptor number in one word.
+fn since(opens: u32) -> u64 {
+    1 + (opens & 0x3FFF_FFFF) as u64
+}
+
+/// What waiting for the other end of a pipe came to.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Peer {
+    /// Somebody has it, or has had it since the wait was asked for.
+    There,
+    /// A signal the program handles arrived first.
+    Interrupted,
+    /// Not a pipe, or too many are waiting on this one already.
+    Failed,
+}
+
+/// Wait until somebody opens the other end of a pipe from the one a task
+/// has: the write end if it has the read end, and the read end if it has the
+/// write. `since` is what [`open_named`] gave with the end. What makes
+/// opening a named pipe wait, as it must — a reader that did not would find
+/// no writer, which is how a pipe says it has ended.
+pub fn wait_peer(handle: usize, is_write: bool, since: u64) -> Peer {
+    if since == 0 {
+        return Peer::There;
+    }
+    let tid = scheduler::current_tid();
+    loop {
+        let flags = irq_save();
+        unsafe {
+            if handle >= MAX_PIPES || !PIPES[handle].in_use {
+                irq_restore(flags);
+                return Peer::Failed;
+            }
+            let pipe = &mut PIPES[handle];
+            let (others, opens) = if is_write {
+                (pipe.readers, pipe.opens[0])
+            } else {
+                (pipe.writers, pipe.opens[1])
+            };
+            if others > 0 || self::since(opens) != since {
+                irq_restore(flags);
+                return Peer::There;
+            }
+            // Asking whether to wait and parking are one step, as for every
+            // wait a signal ends.
+            if crate::signal::interrupted(tid) {
+                irq_restore(flags);
+                return Peer::Interrupted;
+            }
+            if pipe.peer_waiter_count >= MAX_WAITERS {
+                irq_restore(flags);
+                return Peer::Failed;
+            }
+            pipe.peer_waiters[pipe.peer_waiter_count] = tid;
+            pipe.peer_waiter_count += 1;
+            scheduler::block_task(tid);
+        }
+        irq_restore(flags);
+        scheduler::yield_now();
+    }
+}
+
+/// A signal has arrived for a task that may be waiting for the other end of
+/// a pipe: if it is, it stops waiting and goes to see.
+pub fn interrupt(tid: usize) {
+    let mut found = false;
+    let flags = irq_save();
+    unsafe {
+        for i in 1..MAX_PIPES {
+            let pipe = &mut PIPES[i];
+            if pipe.in_use && pipe.peer_waiter_count > 0 {
+                let before = pipe.peer_waiter_count;
+                forget_in(&mut pipe.peer_waiters, &mut pipe.peer_waiter_count, tid);
+                found |= pipe.peer_waiter_count != before;
+            }
+        }
+    }
+    irq_restore(flags);
+    if found {
+        scheduler::unblock_task(tid);
     }
 }
 
@@ -140,17 +357,30 @@ pub fn no_readers(handle: usize) -> bool {
     out
 }
 
+/// The writers have gone. Not the same as there being none: a named pipe
+/// opened to read by somebody who would not wait has no writer *yet*, and
+/// that is not the end of anything. A program polling it for the first
+/// writer's first word would otherwise be told there was something to read,
+/// read nothing, and ask again as fast as it could.
+pub fn ended(handle: usize) -> bool {
+    let flags = irq_save();
+    let out = unsafe {
+        handle < MAX_PIPES && PIPES[handle].in_use && {
+            let pipe = &PIPES[handle];
+            pipe.writers == 0 && (pipe.opens[1] > 0 || !pipe.named)
+        }
+    };
+    irq_restore(flags);
+    out
+}
+
 /// Is a read able to return now — with bytes, or with the end-of-file a
 /// departed writer means?
 pub fn readable(handle: usize) -> bool {
     let flags = irq_save();
-    let out = unsafe {
-        handle < MAX_PIPES
-            && PIPES[handle].in_use
-            && (PIPES[handle].len > 0 || PIPES[handle].writers == 0)
-    };
+    let out = unsafe { handle < MAX_PIPES && PIPES[handle].in_use && PIPES[handle].len > 0 };
     irq_restore(flags);
-    out
+    out || ended(handle)
 }
 
 /// Is there room to write?
@@ -173,6 +403,7 @@ pub fn drop_unreferenced(handle: usize) {
             && PIPES[handle].writers == 0
         {
             PIPES[handle].in_use = false;
+            forget_name(handle);
         }
     }
     irq_restore(flags);
@@ -225,6 +456,7 @@ pub fn cleanup_orphans(tid: usize) {
                 && PIPES[i].writers == 0
             {
                 PIPES[i].in_use = false;
+                forget_name(i);
             }
         }
     }
@@ -580,6 +812,7 @@ fn forget_on_pipe(handle: usize, tid: usize) {
         if pipe.in_use {
             forget_in(&mut pipe.read_waiters, &mut pipe.read_waiter_count, tid);
             forget_in(&mut pipe.write_waiters, &mut pipe.write_waiter_count, tid);
+            forget_in(&mut pipe.peer_waiters, &mut pipe.peer_waiter_count, tid);
         }
     }
     irq_restore(flags);
@@ -664,6 +897,7 @@ fn drop_ref_inner(handle: usize, is_write: bool) {
         // Free pipe if both sides closed
         if pipe.readers == 0 && pipe.writers == 0 {
             pipe.in_use = false;
+            forget_name(handle);
         }
     }
     irq_restore(flags);

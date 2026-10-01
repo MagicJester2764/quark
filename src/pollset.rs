@@ -196,7 +196,7 @@ fn readiness(tid: usize, fd: usize) -> u32 {
             if pipe::readable(h) {
                 out |= READABLE;
             }
-            if pipe::no_writers(h) {
+            if pipe::ended(h) {
                 out |= HANGUP;
             }
         }

@@ -155,13 +155,15 @@ fn tell(tid: usize, word: usize) {
 }
 
 /// End the waits of `tid`'s program that a signal ends: a task asleep or in
-/// a poll, and one reading a terminal.
+/// a poll, one reading a terminal, and one waiting for the other end of a
+/// named pipe to be opened.
 fn wake(tid: usize) {
     let mut tasks = [0usize; 16];
     let n = fdtable::tasks_of(tid, &mut tasks);
     for &t in &tasks[..n] {
         crate::ipc::wake_sleeper(t);
         crate::pty::interrupt(t);
+        crate::pipe::interrupt(t);
     }
 }
 

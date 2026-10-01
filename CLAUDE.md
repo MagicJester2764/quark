@@ -134,7 +134,7 @@ system hung.
 
 There are no tests in this tree, and that is the shape of a microkernel rather
 than an omission: the kernel is tested from outside, through the ABI, by a
-program. `dtest` in `../quarkutils` makes 376 checks — capabilities, IPC,
+program. `dtest` in `../quarkutils` makes 397 checks — capabilities, IPC,
 memory, descriptors, signals, scheduling, `dtest calls` with three million calls in
 three seconds — and `qfuzz` throws random requests at every service.
 
@@ -342,6 +342,25 @@ and kept in memory that `exec` throws away. Three things hold it together:
   capability for the server: the descriptor is the permission, as it is for a
   pipe.
 
+A **named pipe** is the other thing a file server hands out, and it is not
+a served descriptor: it is a pipe. The name, its owner and its mode are the
+server's; what a program reads, writes and polls is the kernel's, the same
+object `SYS_PIPE_CREATE` makes. `SYS_FD_SERVE_PIPE` joins them — a server
+gives a task that is calling it an end of the pipe a key of the server's
+names (`pipe::open_named`), for as long as anybody holds an end.
+
+- **Finding the pipe, counting the end and looking at the other are one
+  step.** The ends are opened one at a time by programs that have not met,
+  and each usually waits for the other (`SYS_PIPE_PEER`). What it waits for
+  is an *opening*, counted, since the moment it was given its end: a writer
+  that opened, wrote and closed before the reader ran again has still been,
+  and a wait for "a writer is there" would outlast it.
+- **A copy of an end is not an opening of it.** `dup` and `fork` go through
+  `add_ref`; only `open_named` moves the count.
+- **A reader with no writer yet has not been hung up on** (`pipe::ended`).
+  `poll` says a named pipe has ended only once a writer has been; said
+  sooner, a program waiting for its first writer spins.
+
 Descriptor 64 — one past the ordinary numbers — is the program's working
 directory, a served descriptor like any other. It is in the table so that it
 follows a program through `fork` and `exec` with no server being told.
@@ -453,7 +472,7 @@ no job control starts a background job that Ctrl-C does not reach.
   (`pty::wait_readable`, `ipc::sys_recv_timeout`). A signal raised between
   the two finds nobody parked, and the wait outlasts it.
 - **A signal ends only a wait that looks again when it is woken**: a read of
-  a terminal, a poll, a sleep. A call to a server is not one — woken with no
+  a terminal, a poll, a sleep, an open of a named pipe. A call to a server is not one — woken with no
   reply, it fails — so `signal::wake` reaches for sleepers and terminal
   readers by what they are, and never for a task by its state.
 - **Ctrl-C is for every program holding the terminal's slave**

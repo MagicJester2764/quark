@@ -1,6 +1,6 @@
 # Quark syscall ABI
 
-**Version 3.6.** Query the running kernel with `SYS_ABI_VERSION` (240), which
+**Version 3.7.** Query the running kernel with `SYS_ABI_VERSION` (240), which
 returns `(major << 16) | minor`.
 
 This document is the contract between the Quark kernel and everything above it.
@@ -194,6 +194,7 @@ returning at once turned that loop into a spin.
 | 3.4 | **A process id that is never used twice.** `SYS_PID` (14) answers with the process id of the program a task belongs to: the number of the task it began as, which no other task is ever given. `SYS_WAIT_FOR` (10) takes a flag to name the child that way, there and back, and `SYS_SIG_RAISE` (12) a third argument to name its target so. A task id is a slot, and a slot let go is the next one handed out; a program that remembers a child's number — every shell — took the next thing it started for the last thing it had. |
 | 3.5 | **Two signals the kernel raises itself.** `SYS_SIG_ALARM` (15) has SIGALRM raised for the caller's program after a time, once or again and again: the program's alarm, one for all its threads, kept across `SYS_EXEC_SPACE` and not copied by `SYS_FORK`. And SIGCHLD is raised for a program when a child of it ends, which does nothing to one that has not asked to hear. Nothing could stand in for either: a program waiting for a child *or* a time, whichever comes first, has to be woken by the one that came, and until now it was woken by neither. GNU `timeout` waited for ever, and a shell's `read -t` never timed out. |
 | 3.6 | **A terminal's input is UTF-8.** `IUTF8` in a terminal's `c_iflag` is acted on, and set on a new one: in canonical mode, erasing takes back a character — the byte that begins it and every byte that continues it — where it took back a byte, and left the program to read the front of a character with no end. A change of behaviour and no new number. |
+| 3.7 | **Named pipes.** `SYS_FD_SERVE_PIPE` (231): a server gives a task that is calling it one end of the pipe a key of the server's names — the same pipe for everybody who is given the same key, for as long as any of them holds an end. `SYS_PIPE_PEER` (232): wait until somebody has opened the other end. The name, its owner and its mode are a file server's; the pipe is the kernel's, because a program waits on one with `SYS_POLL`. |
 
 3.1 was a change of behaviour and no change of number, so a minor: nothing built for
 3.0 calls anything that means something else now. What it could have relied on
@@ -1063,6 +1064,8 @@ which may be less, or nothing.
 | 228 | `SYS_FD_FLAGS` | arg0 = fd, arg1 = 0 to read or 1 to set, arg2 = flags (1 = close when the program becomes another) | the flags, or 0 on a set / `u64::MAX` | — |
 | 229 | `SYS_FD_REAP` | — | the cookie of one of the caller's objects that no descriptor names any more / `u64::MAX` when there is none | — |
 | 230 | `SYS_FD_KIND` | arg0 = one of the caller's descriptors (64 allowed) | what it names, `\| 0x100` if its other end has gone / `u64::MAX` if it names nothing | — |
+| 231 | `SYS_FD_SERVE_PIPE` | arg0 = client tid, arg1 = a key of the caller's choosing, arg2 = bit 0 for the writing end rather than the reading, bit 1 to give it only if the other end is held | the descriptor, the lowest free from 3 in the client, with what to wait for above it: `fd \| wait << 32`, where `wait` is 0 if the other end is held; `0xFFFF_FFFE` if bit 1 was set and it is not / `u64::MAX` | the client is in a call to the caller |
+| 232 | `SYS_PIPE_PEER` | arg0 = a descriptor for one end of a named pipe, arg1 = the `wait` that came with it | 0 when the other end has been opened; `0xFFFF_FFFD` if a signal the program handles came first / `u64::MAX`. **Blocks.** | — |
 
 `SYS_FD_KIND` answers 1 for an IPC endpoint, 2 and 3 for the reading and
 writing ends of a pipe, 4 for a stream, 5 and 6 for a terminal's master and
@@ -1115,6 +1118,39 @@ writable, always. None of those is a message to the server.
 A server is known by its endpoint, which no other task is ever given. When it
 dies, every descriptor for its objects goes on existing and does nothing:
 reads, writes and `SYS_FD_SERVED` fail, and the last close simply forgets it.
+
+**A named pipe is a pipe a server's key names.** A FIFO has a name in the
+filesystem, with an owner and a mode, and those are the file server's: it has
+an inode for it and decides who may open it. What is opened is a pipe, and
+that is the kernel's — the same as any `SYS_PIPE_CREATE` makes, read and
+written and polled the same way. `SYS_FD_SERVE_PIPE` is where the two meet:
+the server, having decided a caller may open the name, gives it the reading
+or the writing end of the pipe that a key names. The key is the server's own
+(a file server uses the inode), and keys are kept apart by the server's
+endpoint, which no other task is ever given. While anybody holds an end, the
+key names that pipe and every opener is given an end of it; when the last
+end goes the pipe goes, with whatever was in it, and the key names nothing
+until it is asked for again.
+
+An ordinary pipe is made with both its ends. A named one has its ends opened
+one at a time, by programs that have not met, and three things follow.
+
+- **An opener usually waits for the other end**, because a reader that went
+  ahead would find no writer, and that is how a pipe says it has ended. The
+  server cannot wait for it, being a server, so the opener does:
+  `SYS_FD_SERVE_PIPE` answers with the descriptor and with a number to wait
+  on, 0 if somebody holds the other end already, and `SYS_PIPE_PEER` waits
+  until the other end has been *opened* since that number was given. Opened,
+  not held: a writer that opened, wrote and closed before the reader ran
+  again has been, and the reader goes on to read what it left. Giving the end
+  and taking the number are one step in the kernel for the same reason.
+- **A writer that will not wait is refused** rather than given an end nobody
+  is reading (bit 1). A reader that will not wait is given its end.
+- **A reader that did not wait has no writer *yet*.** `SYS_POLL` does not
+  report a named pipe readable for having no writer until one has opened it,
+  though a read of it answers 0 as a read of any pipe with no writer does.
+
+A copy of an end — `SYS_FD_DUP`, `SYS_FORK` — is not an opening of it.
 
 **Descriptor 64 is the working directory.** It is one more slot of the
 program's table, past the ordinary numbers, and holds a served descriptor for
