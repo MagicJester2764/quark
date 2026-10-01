@@ -331,6 +331,8 @@ run-uefi: iso
 # reaches into a sibling repo to put them somewhere.
 #
 #   $(DESTDIR)/kernel.bin
+#   $(DESTDIR)/usr/include/quark/abi.h      the system call numbers
+#   $(DESTDIR)/usr/share/doc/quark/abi.md   and what they mean
 #   $(DESTDIR)/drivers/      loaded by the bootloader from the ESP
 #   $(DESTDIR)/boot/         essential services, staged into boot.img
 #   $(DESTDIR)/usr/bin/      everything else, staged into the root filesystem
@@ -356,6 +358,14 @@ install: all
 	@rm -f $(DESTDIR)/boot/*.ELF $(DESTDIR)/usr/bin/*.ELF
 	@cp $(KERNEL) $(DESTDIR)/kernel.bin
 	@cp $(VGA_DRV_BIN) $(FAT32_DRV_BIN) $(DESTDIR)/drivers/
+	@# The ABI, which is what a kernel installs for the programs that will run
+	@# on it: the numbers as a header generated from the source the dispatch is
+	@# compiled from, and the document that says what each one means. A
+	@# userland in another repository checks its own copy of the numbers
+	@# against this, and has nothing else of the kernel's to look at.
+	@mkdir -p $(DESTDIR)/usr/include/quark $(DESTDIR)/usr/share/doc/quark
+	@./tools/gen-abi-header.sh > $(DESTDIR)/usr/include/quark/abi.h
+	@cp docs/abi.md $(DESTDIR)/usr/share/doc/quark/abi.md
 	@cp $(INIT_ELF) $(DESTDIR)/drivers/init.elf
 	@for p in $(BOOT_SERVICES); do \
 		src=$${p%%:*}; dst=$${p##*:}; \
