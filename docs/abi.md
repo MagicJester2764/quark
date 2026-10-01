@@ -139,7 +139,7 @@ rule still holds for everything else.
 | 2.6 | `SYS_OBJECT_CREATE` (194), `SYS_OBJECT_MAP` (195), `SYS_OBJECT_CTL` (196) and capability type 9, `MemObject` — memory objects whose pages a user-space pager provides as they are touched, which is how a file is mapped. Also: a task's page fault can call a pager (`TAG_PAGE_IN`, sender marked with bit 62), a pager hears when nothing maps an object (`TAG_OBJECT_IDLE`), and notices from the kernel are received before calls waiting behind them. |
 | 2.7 | `SYS_OBJECT_SYNC` (197) — what was written through shared mappings reaches the files (`TAG_OBJECT_SYNC` to each pager). Also: `SYS_OBJECT_CTL` op 3 takes a starting page, and leaves a page dirty while it is mapped writable. |
 | 2.8 | `SYS_CALL_WITH` (27) — a call with any of a buffer lent, a capability offered and a deadline. |
-| 2.9 | What a process is, and what it runs in. `SYS_TIMER_CREATE` (146), `SYS_TIMER_SET` (147) and `SYS_TIMER_GET` (148) — a deadline as a descriptor, so that a program's event loop waits for a blink with everything else it waits for. Block 0xD0 opens: `SYS_PTY_CREATE` (208) and `SYS_PTY_CTL` (209) — a pseudo-terminal pair as two ordinary descriptors, with a line discipline (echo, canonical input, newline translation), a `termios` and a window size. `SYS_FORK` (110) — a copy of the caller in a copy of its address space, which returns 0 there. `SYS_EXEC_SPACE` (111) — the caller becomes the program in an address space it built, keeping its id, its descriptors and its capabilities. `SYS_ADDRSPACE_DESTROY` (38, and see 3.0 — the number collided and the call never ran) — throw away an address space nothing is running in, which a spawn or an exec that failed part-way had no way to do. Also: `SYS_ADDRSPACE_CREATE` (36) and `SYS_ADDRSPACE_GIVE` (43) no longer ask for `TaskMgmt` — an address space the caller made, filled with pages it already owned, confers authority over nothing, and *starting a task* in one still does ask. |
+| 2.9 | What a process is, and what it runs in. `SYS_TIMER_CREATE` (146), `SYS_TIMER_SET` (147) and `SYS_TIMER_GET` (148) — a deadline as a descriptor, so that a program's event loop waits for a blink with everything else it waits for. Block 0xD0 opens: `SYS_PTY_CREATE` (208) and `SYS_PTY_CTL` (209) — a pseudo-terminal pair as two ordinary descriptors, with a line discipline (echo, canonical input, newline translation), a `termios` and a window size. `SYS_FORK` (110) — a copy of the caller in a copy of its address space, which returns 0 there. `SYS_EXEC_SPACE` (111) — the caller becomes the program in an address space it built, keeping its id, its descriptors and its capabilities. `SYS_ADDRSPACE_DESTROY` (38, and see 3.0 — the number collided and the call never ran) — throw away an address space nothing is running in, which a spawn or an exec that failed part-way had no way to do. Also: `SYS_ADDRSPACE_CREATE` (36) and `SYS_ADDRSPACE_GIVE` (43) no longer ask for `TaskMgmt` — an address space the caller made, filled with pages it already owned, confers authority over nothing — and a task the caller created and has not started is its own to fill and to start, so `SYS_TASK_CREATE_IN` (109), `SYS_TASK_START` (97), `SYS_FD_DUP` (68), `SYS_PIPE_FD_SET` (70) and `SYS_CAP_GRANT` (81) accept one without it. |
 
 ### What 3.0 changed
 
@@ -331,6 +331,7 @@ call to a task that never reaches `SYS_RECV` blocks forever.
 | 34 | `SYS_PHYS_ALLOC` | arg0 = pages | physical address / `u64::MAX` | `PhysAlloc` |
 | 35 | `SYS_PHYS_FREE` | arg0 = phys, arg1 = count | 0 / `u64::MAX` | `PhysAlloc` + frame ownership |
 | 36 | `SYS_ADDRSPACE_CREATE` | — | CR3 / `u64::MAX` | — |
+| 41 | `SYS_ADDRSPACE_SELF` | — | the address space the caller is running in, as the CR3 the other address-space calls take / `u64::MAX` | — |
 | 44 | `SYS_ADDRSPACE_DESTROY` | arg0 = cr3 the caller made, with no task in it | 0 / `u64::MAX` | — |
 | 37 | `SYS_ADDRSPACE_MAP` | arg0 = cr3, arg1 = virt, arg2 = phys, arg3 = pages, arg4 = flags | 0 / `u64::MAX` | `TaskMgmt` + frame ownership or `PhysRange` — **deprecated** |
 | 43 | `SYS_ADDRSPACE_GIVE` | arg0 = cr3, arg1 = virt there, arg2 = virt here, arg3 = pages (at most 256), arg4 = flags (bit 0: writable) | 0 / `u64::MAX` | an address space the caller made, or runs in, and the pages are its own |
@@ -409,9 +410,9 @@ frees the object, and is what makes a pipe's reader see end-of-file.
 | 65 | `SYS_FD_WRITE` | arg0 = fd, arg1 = buf, arg2 = len | bytes written / `u64::MAX` | — |
 | 66 | `SYS_FD_READ_NB` | arg0 = fd, arg1 = buf, arg2 = max len | bytes, `0` = EOF, **`0xFFFF_FFFE` = would block**, `u64::MAX` = error | — |
 | 67 | `SYS_FD_SET` | arg0 = target tid, arg1 = fd, arg2 = service tid, arg3 = tag | 0 / `u64::MAX` | `TaskMgmt` |
-| 68 | `SYS_FD_DUP` | arg0 = target tid, arg1 = target fd or `u64::MAX - 1` for any free one, arg2 = source fd, arg3 = lowest acceptable fd when arg1 asks for any | the fd it took / `u64::MAX` | `TaskMgmt` over the target, unless the target is the caller |
+| 68 | `SYS_FD_DUP` | arg0 = target tid, arg1 = target fd or `u64::MAX - 1` for any free one, arg2 = source fd, arg3 = lowest acceptable fd when arg1 asks for any | the fd it took / `u64::MAX` | `TaskMgmt` over the target, unless the target is the caller or a child it has not started |
 | 69 | `SYS_PIPE_CREATE` | — | handle / `u64::MAX` | — (bounded per task) |
-| 70 | `SYS_PIPE_FD_SET` | arg0 = target tid, arg1 = fd or `u64::MAX - 1` for any free one, arg2 = pipe handle, arg3 = 1 for write end | the fd it took / `u64::MAX` | `TaskMgmt` over the target, unless the target is the caller |
+| 70 | `SYS_PIPE_FD_SET` | arg0 = target tid, arg1 = fd or `u64::MAX - 1` for any free one, arg2 = pipe handle, arg3 = 1 for write end | the fd it took / `u64::MAX` | `TaskMgmt` over the target, unless the target is the caller or a child it has not started |
 | 71 | `SYS_FD_CLOSE` | arg0 = fd | 0 / `u64::MAX` | — |
 | 72 | `SYS_SOCKETPAIR` | — | `(fd0 << 32) \| fd1`, both in the caller's table / `u64::MAX` | — |
 | 73 | `SYS_FD_SEND` | arg0 = stream fd, arg1 = buf, arg2 = len, arg3 = fd to pass or `u64::MAX`, arg4 = flags (1 = do not wait) | bytes written, `0xFFFF_FFFE` if it would have blocked / `u64::MAX` | — |
@@ -460,7 +461,7 @@ inherited, or the previous endpoint's reference is stranded.
 | # | Name | Arguments | Returns | Cap |
 |---|---|---|---|---|
 | 80 | `SYS_CAP_MINT` | arg0 = slot, arg1 = type, arg2 = param0, arg3 = param1 | 0 / `u64::MAX` | must already hold one covering it; for an `Endpoint`, param0 is the destination's TID and the rule is ownership (above) |
-| 81 | `SYS_CAP_GRANT` | arg0 = dest tid, arg1 = src slot, arg2 = dest slot or `u64::MAX - 1` for any | 0, or the slot used when any; `u64::MAX` on failure | `TaskMgmt` over dest, or its consent |
+| 81 | `SYS_CAP_GRANT` | arg0 = dest tid, arg1 = src slot, arg2 = dest slot or `u64::MAX - 1` for any | 0, or the slot used when any; `u64::MAX` on failure | `TaskMgmt` over dest, its consent, or dest is a child the caller has not started |
 | 82 | `SYS_CAP_REVOKE` | arg0 = slot | 0 / `u64::MAX` | must be the minter |
 | 83 | `SYS_CAP_INSPECT` | arg0 = slot | packed descriptor | — |
 | 84 | `SYS_CAP_DELETE` | arg0 = slot | 0 / `u64::MAX` | — |
@@ -486,25 +487,37 @@ cannot resurrect a revoked capability in practice.
 
 | # | Name | Arguments | Returns | Cap |
 |---|---|---|---|---|
-| 96 | `SYS_TASK_CREATE` | — | TID / `u64::MAX` | `TaskMgmt` |
-| 97 | `SYS_TASK_START` | arg0 = tid, arg1 = rip, arg2 = rsp, arg3 = cr3 | 0 / `u64::MAX` | `TaskMgmt` |
+| 96 | `SYS_TASK_CREATE` | — | TID / `u64::MAX` | — for up to sixteen children at once; `TaskMgmt` for more |
+| 97 | `SYS_TASK_START` | arg0 = tid, arg1 = rip, arg2 = rsp, arg3 = cr3 | 0 / `u64::MAX` | `TaskMgmt`; or none, for a child of the caller's started in the caller's own address space (a thread) or in one the caller made (a spawn) |
+| 103 | `SYS_TASK_START_ARG` | as `SYS_TASK_START`, and arg4 = the value the task finds in RDI | 0 / `u64::MAX` | as `SYS_TASK_START` |
 | 98 | `SYS_GET_UID` | — | current UID | — |
 | 99 | `SYS_SET_UID` | arg0 = tid, arg1 = uid | 0 / `u64::MAX` | `SetUid` |
 | 100 | `SYS_SET_GID` | arg0 = tid, arg1 = gid | 0 / `u64::MAX` | `SetUid` |
 | 101 | `SYS_GET_TUID` | arg0 = tid | that task's UID | — |
+| 102 | `SYS_SET_FS_BASE` | arg0 = the caller's new FS base, a user address | 0 / `u64::MAX` | — |
 | 104 | `SYS_TASK_WATCH` | arg0 = tid | 0, or `u64::MAX` if that task is already gone | — |
 | 106 | `SYS_SET_CLEAR_TID` | arg0 = address of a `u32`, or 0 | this task's id / `u64::MAX` | — |
 | 107 | `SYS_TASK_SPACE` | arg0 = tid | that task's space id / `u64::MAX` | — |
 | 108 | `SYS_SPACE_WATCH` | arg0 = space id | 0, or `u64::MAX` if no task of it is alive | — |
-| 109 | `SYS_TASK_CREATE_IN` | arg0 = cr3 of an address space the caller created | TID / `u64::MAX` | `TaskMgmt` |
+| 109 | `SYS_TASK_CREATE_IN` | arg0 = cr3 of an address space the caller created | TID / `u64::MAX` | as `SYS_TASK_CREATE` |
 | 110 | `SYS_FORK` | — | the child's TID, `0` in the child / `u64::MAX` | — |
 | 111 | `SYS_EXEC_SPACE` | arg0 = cr3 the caller made, arg1 = entry, arg2 = rsp | does not return / `u64::MAX` | — |
 | 105 | `SYS_TASK_PRIORITY` | arg0 = tid, arg1 = band | 0 / `u64::MAX` | `TaskMgmt` for target, and the caller's own band or worse |
 
-There is no fork or exec. A parent creates a task, builds its address space,
-loads its image, sets its arguments and capabilities, then starts it. TIDs are
-reused once a task is reaped, so a TID identifies a task only for as long as
-that task lives — see the note on TID reuse below.
+A program starts one of two ways. A parent may *build* one: it creates a task,
+makes its address space, loads its image, sets its arguments, descriptors and
+capabilities, and starts it. A task the caller created and has not started is
+its own to fill — nobody else can name it, it holds nothing and it cannot run —
+so none of that asks for `TaskMgmt`; the capability buys more than sixteen
+children at once, and the right to touch a task that is already running. Or a
+task may `SYS_FORK`, which copies it, and `SYS_EXEC_SPACE`, which keeps the
+task and replaces the program it runs. TIDs are reused once a task is reaped,
+so a TID identifies a task only for as long as that task lives — see the note
+on TID reuse below.
+
+`SYS_SET_FS_BASE` takes effect at once rather than at the next switch: the
+caller is running and will use the register before it is scheduled again. A
+base in the kernel's half of the address space is refused.
 
 `SYS_GET_TUID` exists for servers doing permission checks on behalf of a
 caller: the VFS uses it to evaluate file modes against the requester.
