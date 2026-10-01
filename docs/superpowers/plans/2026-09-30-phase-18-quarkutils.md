@@ -228,5 +228,6 @@ runtime compiled for ABI 3 can now meet a kernel that has moved on.
 - [x] **Step 2:** ext2 and ext4: `dtest`, `runtests /etc/libc.tests`,
   `runtests /etc/pixman.tests`, `wm hello-world`, `check-rootfs.sh`.
 - [x] **Step 3:** `ROADMAP.md`; the memory index's paths.
-- [ ] **Step 4:** the question that is the user's: create
-  `MagicJester2764/quarkutils` and push.
+- [x] **Step 4:** the question that is the user's: create
+  `MagicJester2764/quarkutils` and push. *Answered: public, like the others;
+  all four are pushed.*
