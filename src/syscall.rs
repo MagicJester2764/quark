@@ -336,7 +336,7 @@ pub const SYS_ABI_VERSION: u64 = 240;
 /// minor when calls are added. User space can refuse to run against a major it
 /// does not know, which is the point of exposing it at all.
 pub const ABI_VERSION_MAJOR: u64 = 3;
-pub const ABI_VERSION_MINOR: u64 = 5;
+pub const ABI_VERSION_MINOR: u64 = 6;
 
 /// Threads a task may make with no capability at all.
 ///

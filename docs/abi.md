@@ -1,6 +1,6 @@
 # Quark syscall ABI
 
-**Version 3.5.** Query the running kernel with `SYS_ABI_VERSION` (240), which
+**Version 3.6.** Query the running kernel with `SYS_ABI_VERSION` (240), which
 returns `(major << 16) | minor`.
 
 This document is the contract between the Quark kernel and everything above it.
@@ -193,6 +193,7 @@ returning at once turned that loop into a spin.
 | 3.3 | **Signals a program can handle.** `SYS_SIG_ACTION` (11) says what the caller's program does about a signal — nothing, ignore it, or run a handler — `SYS_SIG_RAISE` (12) raises one for the program a task belongs to, and `SYS_SIG_TAKE` (13) returns the ones raised that have a handler. The kernel carries out a signal's default, which is nearly always the end of the program; a handler it never runs — the program's runtime does, having been told by a word in its own memory and by the wait it was in ending early: a read of a terminal, `SYS_POLL`, `SYS_POLLSET_WAIT` and a sleep can now answer that a signal ended them. A terminal's interrupt and quit characters raise 2 and 3 for every program holding its slave. `SYS_FD_KIND` (230) says what a descriptor names and whether its other end has gone, which is how a write that failed is told apart: nobody reading, or no such descriptor. |
 | 3.4 | **A process id that is never used twice.** `SYS_PID` (14) answers with the process id of the program a task belongs to: the number of the task it began as, which no other task is ever given. `SYS_WAIT_FOR` (10) takes a flag to name the child that way, there and back, and `SYS_SIG_RAISE` (12) a third argument to name its target so. A task id is a slot, and a slot let go is the next one handed out; a program that remembers a child's number — every shell — took the next thing it started for the last thing it had. |
 | 3.5 | **Two signals the kernel raises itself.** `SYS_SIG_ALARM` (15) has SIGALRM raised for the caller's program after a time, once or again and again: the program's alarm, one for all its threads, kept across `SYS_EXEC_SPACE` and not copied by `SYS_FORK`. And SIGCHLD is raised for a program when a child of it ends, which does nothing to one that has not asked to hear. Nothing could stand in for either: a program waiting for a child *or* a time, whichever comes first, has to be woken by the one that came, and until now it was woken by neither. GNU `timeout` waited for ever, and a shell's `read -t` never timed out. |
+| 3.6 | **A terminal's input is UTF-8.** `IUTF8` in a terminal's `c_iflag` is acted on, and set on a new one: in canonical mode, erasing takes back a character — the byte that begins it and every byte that continues it — where it took back a byte, and left the program to read the front of a character with no end. A change of behaviour and no new number. |
 
 3.1 was a change of behaviour and no change of number, so a minor: nothing built for
 3.0 calls anything that means something else now. What it could have relied on
@@ -1018,16 +1019,20 @@ termios, 36 bytes: c_iflag, c_oflag, c_cflag, c_lflag (u32 each),
 winsize,  8 bytes: ws_row, ws_col, ws_xpixel, ws_ypixel (u16 each)
 ```
 
-Of a `termios` the kernel acts on six bits and seven characters, and stores
-the rest: `ICRNL` in `c_iflag` (a carriage return typed arrives as a newline),
-`OPOST` with `ONLCR` in `c_oflag` (a newline written goes out as carriage
-return and newline), and `ICANON`, `ECHO` and `ISIG` in `c_lflag`. A new pty
-has all six set, and is 24 rows by 80 columns. The window size is stored and
+Of a `termios` the kernel acts on seven bits and seven characters, and stores
+the rest: `ICRNL` and `IUTF8` in `c_iflag` (a carriage return typed arrives
+as a newline; what is typed is UTF-8), `OPOST` with `ONLCR` in `c_oflag` (a
+newline written goes out as carriage return and newline), and `ICANON`,
+`ECHO` and `ISIG` in `c_lflag`. A new pty has all seven set, and is 24 rows
+by 80 columns. The window size is stored and
 handed back, and nobody is told when it changes.
 
 With `ICANON`, input is held until a newline, and four characters from `c_cc`
 edit what is being held: `VERASE` (and backspace and delete, whichever the
 terminal sends) takes a character back, `VKILL` the line, `VWERASE` a word.
+A character is a byte, or with `IUTF8` the bytes of one character in UTF-8;
+either way it is rubbed out of the echo as one column, which for a character
+two columns wide is one too few.
 `VEOF` hands over what has been typed as it stands, with no newline — and
 typed on an empty line that is a read of nothing, once, which is how a program
 reading a terminal is told there is no more. A poll reports that as readable,

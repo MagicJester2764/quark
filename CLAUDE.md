@@ -134,7 +134,7 @@ system hung.
 
 There are no tests in this tree, and that is the shape of a microkernel rather
 than an omission: the kernel is tested from outside, through the ABI, by a
-program. `dtest` in `../quarkutils` makes 374 checks — capabilities, IPC,
+program. `dtest` in `../quarkutils` makes 376 checks — capabilities, IPC,
 memory, descriptors, signals, scheduling, `dtest calls` with three million calls in
 three seconds — and `qfuzz` throws random requests at every service.
 
@@ -302,7 +302,10 @@ caught in the C layer (`../quarkutils/linux-abi`) ahead of the VFS. The line
 discipline is the part programs depend on and no more — echo, canonical input
 and the characters a line is edited with, end of file, the newline
 translations, and the interrupt character taken out of what is typed — and
-the rest of a `termios` is stored and handed back unchanged.
+the rest of a `termios` is stored and handed back unchanged. What is typed is
+UTF-8 (`IUTF8`, set on a new terminal): erasing takes back a character, the
+byte that begins it and every byte that continues it, and not the last byte
+of one.
 What a program prints waits for room when the terminal is full, all of it: a
 write that came back short, or with nothing, is what a full disk looks like,
 and `cat` said so. What a terminal emulator types does not wait, because its

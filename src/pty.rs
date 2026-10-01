@@ -18,7 +18,8 @@
 //! - `ECHO`: what is written to the master comes back out of it, so that
 //!   typing appears without the shell having to print it.
 //! - `ICANON`: input is held until a newline, and backspace takes a character
-//!   back — the reason a shell does not see half a line.
+//!   back — the reason a shell does not see half a line. A character, with
+//!   `IUTF8`, and not a byte of one.
 //! - `ICRNL` and `ONLCR`: Return arrives as a newline, and a newline goes out
 //!   as carriage return and newline, which is what puts the cursor at the left.
 //! - The characters a line is edited with, from `c_cc`: erase, kill the line,
@@ -66,6 +67,8 @@ const LINE: usize = 1024;
 
 /// `termios.c_iflag`
 pub const ICRNL: u32 = 0o400;
+/// What is typed is UTF-8, so a character may be more than one byte.
+pub const IUTF8: u32 = 0o40000;
 /// `termios.c_oflag`
 pub const OPOST: u32 = 0o1;
 pub const ONLCR: u32 = 0o4;
@@ -229,7 +232,7 @@ const NO_PTY: Pty = Pty {
     // return and newline. A program that wants raw bytes turns them off, which
     // is what `tcsetattr` is for.
     termios: Termios {
-        c_iflag: ICRNL,
+        c_iflag: ICRNL | IUTF8,
         c_oflag: OPOST | ONLCR,
         c_cflag: 0o2277, // B38400 | CS8 | CREAD, as Linux's default
         c_lflag: ISIG | ICANON | ECHO,
@@ -398,6 +401,16 @@ fn rub_out(p: &mut Pty, echo: bool) -> bool {
         return false;
     }
     p.line_len -= 1;
+    // In UTF-8 a character is a first byte and the bytes that continue it,
+    // and taking back the last byte of one leaves the rest as something that
+    // is not a character at all — which is then what the program reads. With
+    // `IUTF8` the whole of it goes: back through the continuing bytes to the
+    // byte that began it.
+    if p.termios.c_iflag & IUTF8 != 0 {
+        while p.line_len > 0 && p.line[p.line_len] & 0xC0 == 0x80 {
+            p.line_len -= 1;
+        }
+    }
     if echo && p.to_master.room() >= 3 {
         for c in *b"\x08 \x08" {
             p.to_master.push(c);
