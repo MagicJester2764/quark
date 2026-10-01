@@ -230,6 +230,12 @@ pub fn exit_with(code: i32) -> ! {
         // its end and the two wait for each other for ever.
         close_descriptors(current);
 
+        // Nothing comes between marking the task dead and switching away
+        // from it. A dead task is never run again, so a tick that preempted
+        // it in here left the rest undone for good: nobody was told it had
+        // gone, and a parent waiting for it went on waiting. Interrupts stay
+        // off until the switch, which is the last thing this task does.
+        let _ = irq_save();
         if let Some(ref mut task) = TASKS[current] {
             task.clear_child_tid = 0;
             task.state = TaskState::Dead;
@@ -1443,6 +1449,19 @@ pub fn start_task(tid: usize, rip: u64, rsp: u64, cr3: usize, arg: u64) -> Resul
     if tid >= MAX_TASKS {
         return Err(());
     }
+    // Interrupts off, as `start_forked` has them: this is a system call's
+    // doing and those run with interrupts on, and putting a task on the
+    // ready queue is three writes. A tick between them queued the task it
+    // preempted in the same place, and the one being started was ready and
+    // in no queue — a program that was started and never ran.
+    let flags = irq_save();
+    let started = unsafe { start_task_locked(tid, rip, rsp, cr3, arg) };
+    irq_restore(flags);
+    started
+}
+
+/// [`start_task`], with interrupts off.
+unsafe fn start_task_locked(tid: usize, rip: u64, rsp: u64, cr3: usize, arg: u64) -> Result<(), ()> {
     unsafe {
         let task = match TASKS[tid].as_mut() {
             Some(t) => t,

@@ -70,14 +70,25 @@ pub unsafe extern "C" fn context_switch(old: *mut CpuContext, new: *const CpuCon
         "mov r15, [rsi + 0x28]",
         "mov rsp, [rsi + 0x30]",
 
-        // Restore RFLAGS from new context (re-enables interrupts
-        // atomically with the context switch — no window for
-        // nested timer interrupts between flag restore and switch)
+        // Where to go, read while interrupts are still off; then the new
+        // context's RFLAGS, which may turn them on; then go.
+        //
+        // The order matters. Restoring the flags first left one instruction
+        // -- the read of the new RIP -- to run with interrupts on, and an
+        // interrupt taken there that rescheduled saved this task's context
+        // over the one being read: when it was resumed it read the RIP of
+        // *that* save, the label below, and not where it had been going. For
+        // a task switched out from here the two are the same. For one that
+        // had never run they are not: it returned through the label into
+        // whatever was on top of its new stack, which is the trampoline that
+        // ends a task, and a program that had just been started exited with
+        // status 0 without running an instruction. With the address already
+        // on the stack there is nothing left to read: an interrupt taken
+        // before the `ret` pushes its frame below it and comes back to it.
+        "push QWORD PTR [rsi + 0x38]",
         "push QWORD PTR [rsi + 0x40]",
         "popfq",
 
-        // Push new RIP and ret into it
-        "push QWORD PTR [rsi + 0x38]",
         "ret",
 
         // This is where we resume when switched back

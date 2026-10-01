@@ -471,6 +471,33 @@ Three things follow from that, and breaking any of them is quiet:
   callee already carries the caller's band when the scheduler decides whether
   handing straight over would run something ahead of its betters.
 
+A system call runs with interrupts on, so anything the scheduler does in more
+than one step is a tick away from being done in half. Three of these were
+found by reading, and each was shown by holding its window open — a loop of
+a few hundred million iterations where the tick had to land — before it was
+closed:
+
+- **Nothing comes between a task being marked dead and the switch away from
+  it.** A dead task is never run again, so one preempted there left the rest
+  of its exit undone for good: nobody was told it had gone, and a parent in
+  `sys_wait` waited for ever. `exit_with` turns interrupts off first, as
+  `end_other`'s callers always did.
+- **A switch reads where it is going before it restores the flags.**
+  `context_switch` used to `popfq` and then read the new RIP out of the
+  task's context — one instruction with interrupts on. An interrupt taken
+  there that rescheduled saved this same task over what was about to be
+  read, and resumed, the task went to the resume label instead. For a task
+  switched out from there that is where it was going anyway. For one that
+  had never run it was not: it returned into the trampoline that ends a
+  task, and a program just started exited with status 0 having run nothing.
+  The RIP is pushed first now, so an interrupt in the window finds it on the
+  stack.
+- **The ready queue is touched only with interrupts off.** Putting a task on
+  it is three writes; a tick between them queued the task it preempted in
+  the same place, and the one being queued was ready and in no queue.
+  `start_task` did that from a system call. Every caller of `unblock_task`
+  holds interrupts off, or is an interrupt.
+
 ## Known gaps
 
 - Nothing is ever paged out: anonymous memory is given its frames when first
