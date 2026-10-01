@@ -53,8 +53,11 @@ is a call nobody outside this tree can use correctly.
   `docs/abi.md` and a line in its version history; the minor version goes up
   for an addition and the major when a number moves or a call changes meaning.
   Then the userland's copies — `quark-rt/src/syscall.rs`, and
-  `libc/include/quark/syscall.h` if C needs it — in *its* repository. The
-  stage fails until the two agree, which is the point.
+  `libc/include/quark/syscall.h` if C needs it — in *its* repository, with the
+  version it says it was written for. The stage fails until the two agree,
+  which is the point: at one version the two tables are the same table, so a
+  call added without a new minor is refused by the userland's check, and a
+  userland built for another major is refused by `init` at boot.
 - **The document goes stale quietly.** Its rows said `TaskMgmt` for five calls
   that had asked for less since 2.9, and "There is no fork or exec" two lines
   under the rows for both. Nothing checks the prose; read the neighbours when
