@@ -24,9 +24,13 @@
 //!
 //! So a handler runs at a system-call boundary and nowhere else. A program
 //! that has asked to handle a signal and then computes for ever without a
-//! call is not interrupted by it. Everything else about signals that is
-//! missing is missing on purpose and written down in `MISSING.md`: process
-//! groups, jobs that stop, a signal when a terminal changes size.
+//! call is not interrupted by it.
+//!
+//! Four signals stop a program instead of ending it, and one starts it
+//! again; that, and who a signal typed at a terminal is for, is `job.rs`.
+//! What is decided here is only whether one of them does what it does: a
+//! program can ignore or handle three of the four, and a group with nobody
+//! to continue it is not stopped from a terminal at all.
 //!
 //! Two signals the kernel raises of its own accord, because nothing else
 //! can: SIGALRM when a program's alarm is due ([`alarm`], [`tick`]), and
@@ -61,21 +65,26 @@ pub const SIGQUIT: u8 = 3;
 pub const SIGKILL: u8 = 9;
 const SIGALRM: u8 = 14;
 const SIGCHLD: u8 = 17;
-const SIGCONT: u8 = 18;
+pub const SIGCONT: u8 = 18;
 pub const SIGSTOP: u8 = 19;
-const SIGTSTP: u8 = 20;
-const SIGTTIN: u8 = 21;
-const SIGTTOU: u8 = 22;
+pub const SIGTSTP: u8 = 20;
+pub const SIGTTIN: u8 = 21;
+pub const SIGTTOU: u8 = 22;
 const SIGURG: u8 = 23;
 const SIGWINCH: u8 = 28;
 /// The highest signal there is.
 pub const NSIG: u8 = 64;
 
-/// The signals that do nothing to a program that has said nothing. Linux's
-/// list, and the ones that stop a program or start it again: stopping a job
-/// needs jobs.
+/// The signals that do nothing to a program that has said nothing: Linux's
+/// list. SIGCONT is here because what it does — start a stopped program —
+/// it has done by the time anybody asks what else.
 fn harmless(signo: u8) -> bool {
-    matches!(signo, SIGCHLD | SIGURG | SIGWINCH | SIGCONT | SIGSTOP | SIGTSTP | SIGTTIN | SIGTTOU)
+    matches!(signo, SIGCHLD | SIGURG | SIGWINCH | SIGCONT)
+}
+
+/// The signals that stop a program that has said nothing.
+fn stops(signo: u8) -> bool {
+    matches!(signo, SIGSTOP | SIGTSTP | SIGTTIN | SIGTTOU)
 }
 
 /// `SYS_SIG_ACTION`: what the caller's program does about a signal, as a
@@ -103,6 +112,12 @@ pub fn raise(tid: usize, signo: u8) -> Result<(), ()> {
     if signo == 0 || signo > NSIG || tid <= 1 || tid >= MAX_TASKS {
         return Err(());
     }
+    // A stopped program is started by SIGCONT whatever it has said about
+    // the signal: ignoring it does not keep a program stopped, and a handler
+    // for it could not run until this had happened.
+    if signo == SIGCONT {
+        crate::job::resume(tid);
+    }
     let said = if signo == SIGKILL {
         Disposition::Default
     } else {
@@ -118,6 +133,18 @@ pub fn raise(tid: usize, signo: u8) -> Result<(), ()> {
         }
     };
     if said == Disposition::Ignore || harmless(signo) {
+        return Ok(());
+    }
+    if stops(signo) {
+        // SIGSTOP stops. The other three are how a terminal stops a job,
+        // and a job is stopped for somebody to start again: a group with
+        // nobody to do that — a shell that runs its commands in its own
+        // group, a login — is left running.
+        if signo == SIGSTOP || !crate::job::orphaned(crate::job::pgid_of(tid)) {
+            crate::job::stop(tid, signo);
+            // If that was the caller's own program, this is where it stops.
+            scheduler::stop_here();
+        }
         return Ok(());
     }
     scheduler::end_program(tid, -(signo as i32))
@@ -194,6 +221,8 @@ pub fn tick(now: u64) {
     while let Some(tid) = fdtable::alarm_due(now) {
         let _ = raise(tid, SIGALRM);
     }
+    // And the groups a death left stopped with nobody to start them.
+    crate::job::hang_up();
 }
 
 /// A child of `parent` has ended: SIGCHLD for the parent's program, which
@@ -214,15 +243,26 @@ pub fn take(tid: usize, word: usize) -> u64 {
     fdtable::sig_take(tid, word)
 }
 
-/// A character typed at a terminal raised a signal: it is for every program
-/// with the terminal open.
+/// A character typed at a terminal raised a signal: it is for the group in
+/// front of the terminal.
 ///
-/// Unix sends it to the terminal's foreground process group. There are no
-/// groups here, so it goes to whoever holds the slave, and what keeps a
-/// shell alive under its own Ctrl-C is what does on Unix when a shell has no
-/// job control: the shell handles the signal, what it runs in the background
-/// is started ignoring it, and what it runs in the foreground is not.
+/// That is what a terminal with a session has: a shell with job control puts
+/// each job in a group of its own and says which is in front, and Ctrl-C is
+/// for that one and not for the shell or for what it left running behind.
+///
+/// A terminal nobody has made the controlling terminal of a session has no
+/// group in front of it, and the signal goes to every program that has the
+/// terminal open. What keeps a shell alive under its own Ctrl-C there is
+/// what does on Unix when a shell has no job control: the shell handles the
+/// signal, what it runs in the background is started ignoring it, and what
+/// it runs in the foreground is not.
 pub fn from_terminal(pty: usize, signo: u8) {
+    if let Some((session, front)) = crate::pty::job(pty) {
+        if session != 0 {
+            crate::job::raise_for_group(front, signo);
+            return;
+        }
+    }
     let mut holders = [0usize; 32];
     let n = fdtable::holders(
         |kind| matches!(kind, FdKind::PtyEnd { pty: p, end: 1 } if *p == pty),

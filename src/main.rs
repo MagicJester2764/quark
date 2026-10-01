@@ -35,6 +35,7 @@ mod shmem;
 mod pollset;
 mod served;
 mod signal;
+mod job;
 mod stream;
 pub mod pipe;
 mod pty;

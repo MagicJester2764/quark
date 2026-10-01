@@ -134,7 +134,7 @@ system hung.
 
 There are no tests in this tree, and that is the shape of a microkernel rather
 than an omission: the kernel is tested from outside, through the ABI, by a
-program. `dtest` in `../quarkutils` makes 397 checks — capabilities, IPC,
+program. `dtest` in `../quarkutils` makes 425 checks — capabilities, IPC,
 memory, descriptors, signals, scheduling, `dtest calls` with three million calls in
 three seconds — and `qfuzz` throws random requests at every service.
 
@@ -437,7 +437,7 @@ every Unix program assumes:
   task id is a slot, and the next task made is given the lowest one free —
   usually the one just let go. Every Unix program that remembers a child
   assumes a number it was told a moment ago is not somebody else by now:
-  bash, without job control, decides whether to wait for a command by
+  bash decides whether to wait for a command by
   comparing its pid with the last background job's, and after `sleep 2 &`
   every command that was given that task id ran unwaited-for. A process id
   is the endpoint number of the task the program began as — assigned when
@@ -452,8 +452,8 @@ every Unix program assumes:
 
 A signal is said to a program (`signal.rs`), and what the program has said
 about each one lives in its descriptor table's record — because `fork` copies
-that and `exec` keeps what is ignored, which is the whole of how a shell with
-no job control starts a background job that Ctrl-C does not reach.
+that and `exec` keeps what is ignored, which is how a shell starts a
+background job that ignores what its terminal raises.
 
 - **The kernel runs no handler.** Nothing is pushed on a user stack and
   nothing is returned from. A program that has said nothing is ended, here
@@ -475,11 +475,14 @@ no job control starts a background job that Ctrl-C does not reach.
   a terminal, a poll, a sleep, an open of a named pipe. A call to a server is not one — woken with no
   reply, it fails — so `signal::wake` reaches for sleepers and terminal
   readers by what they are, and never for a task by its state.
-- **Ctrl-C is for every program holding the terminal's slave**
-  (`signal::from_terminal`). There are no process groups to pick a foreground
-  from. `getty`, `login` and `qsh` hold it too, and each says what it does
-  about signal 2; a new program that holds a session's terminal and is not
-  what the session runs has to say so too, or Ctrl-C ends it.
+- **Ctrl-C is for the group in front of the terminal**
+  (`signal::from_terminal`), and so are Ctrl-\ and Ctrl-Z: see *Jobs*. A
+  terminal no session has claimed has no group in front, and there the
+  signal is for every program holding the slave. Either way a shell that
+  does nothing about groups is in one group with what started it and what
+  it starts: `getty`, `login` and `qsh` all hear Ctrl-C, and each says what
+  it does about signal 2. A new program that holds a session's terminal and
+  is not what the session runs has to say so too, or Ctrl-C ends it.
 - **Two signals are raised by the kernel of its own accord**, because nothing
   else can raise them: SIGALRM when a program's alarm is due
   (`SYS_SIG_ALARM`; the alarm is in the program's table, so `exec` keeps it
@@ -491,6 +494,58 @@ no job control starts a background job that Ctrl-C does not reach.
   alarm put away before its signal is raised: for a program that has said
   nothing the signal is the end of it, and if that is the program the tick
   interrupted, `signal::tick` does not return.
+
+## Jobs
+
+A shell with job control puts each pipeline in a *process group*, says which
+group is in front of the terminal, and is told when one stops. All of that
+is here (`job.rs`), because none of it can be anywhere else: who a typed
+character is for is decided where the terminal is, and a program that is
+stopped is one the scheduler does not run.
+
+- **A group and a session are named by process ids**, which are never used
+  twice, and are kept by task beside the process id (`job::PGID`, `SID`) —
+  a parent asks about a child after the child's program has gone. A task is
+  born where its creator is; a thread is where its program is; `exec`
+  changes nothing.
+- **Stopped is not a state.** A task of a stopped program goes on being
+  what it was — blocked in a call, asleep, ready — and has to be that when
+  the program is continued. It is *held* (`scheduler::HELD`): never put on a
+  ready queue and never switched to. `enqueue` and `donate_to` are the two
+  places a task becomes runnable, and both ask. What would have woken it
+  leaves it `Ready` and in no queue; continuing queues every task that is.
+  A new way to make a task run has to ask too.
+- **The running task can be the one stopped** — a program that stops
+  itself, or reads a terminal from behind. It is held with the rest and
+  stops at `scheduler::stop_here`, which whoever raised the signal calls
+  once it has nothing left to finish. So a stop is raised for the caller's
+  own program *last* (`job::raise_for_group`), like a signal that ends it.
+- **A group with nobody to continue it is not stopped from a terminal.**
+  That is the orphaned-group rule (`job::orphaned`), and it is what makes
+  Ctrl-Z harmless at a shell that runs its commands in its own group: the
+  shell, the command and the login that started them would otherwise all
+  stop, with nobody left to type `fg`. SIGSTOP stops regardless.
+- **A job left stopped by the death that orphans it is hung up on**: SIGHUP
+  and SIGCONT. Not from inside the death — that is somebody in the middle
+  of ending a program, and a hangup can end the caller's own — but from the
+  next tick (`job::hang_up`), which is already where an alarm may end
+  whatever was running. A stopped program nobody can start is a task slot
+  gone for good, and there are sixty-four.
+- **A terminal knows its session and who is in front** (`pty.rs`). Its
+  signals go there. A read by any other group of the session stops the
+  reader (SIGTTIN) and is asked again when it is continued — and looked at
+  again every time round, because a job that was in front when it began to
+  wait may have been stopped and put behind since. `job::resume` takes a
+  continued task off a terminal's wait list for that reason.
+- **A parent hears of a stop the way it hears of a death**: SIGCHLD, and
+  `SYS_WAIT_FOR` if it asked. The answer for a stop is marked and collects
+  nothing. A waiter is woken to *look again* (`WAIT_AGAIN`), not handed a
+  child: the report is taken by whoever looks first.
+- **The kernel cannot see a signal mask.** A shell takes its terminal back
+  from behind with SIGTTOU blocked, which on Unix is what stops it being
+  stopped for asking. Here the runtime says so in the call
+  (`PTY_FRONT_QUIETLY`). Anything else that should treat a blocked signal
+  differently needs telling the same way.
 
 ## Scheduling
 
@@ -566,11 +621,12 @@ closed:
 - **Signals are told to a program, not delivered to it** (see *Signals*). So a
   handler runs at a system-call boundary and nowhere else: a program that
   handles a signal and computes without making a call is not interrupted.
-  There are no process groups, no sessions and no jobs — the signals that stop
-  a program do nothing. Nothing is raised when a terminal changes size. A
-  signal a
+  Nothing is raised when a terminal changes size. A signal a
   program has blocked and has no handler for is not held back: the mask is its
-  runtime's, and the kernel does what the signal does at once. A wait for a
+  runtime's, and the kernel does what the signal does at once — a blocked
+  SIGTSTP stops. A terminal stops a job that reads it from behind and one
+  that puts itself in front, and not one that writes to it (`TOSTOP`) or
+  changes its settings. A wait for a
   child is not one of the waits a signal ends. And the three *task* signals
   of `SYS_SIGNAL` — bits in one task's notification word, with a deadline —
   are still what a program written for this system is asked to stop with.

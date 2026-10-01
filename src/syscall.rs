@@ -61,6 +61,12 @@ pub const SYS_WAIT_FOR: u64 = 10;
 const WAIT_NO_WAIT: u64 = 1;
 /// SYS_WAIT_FOR: the child is named by its process id, there and back.
 const WAIT_BY_PID: u64 = 2;
+/// SYS_WAIT_FOR: answer for a child that has stopped, or been continued, as
+/// well as for one that has ended.
+const WAIT_STOPPED: u64 = 4;
+const WAIT_CONTINUED: u64 = 8;
+/// SYS_WAIT_FOR: what is named is a process group of children.
+const WAIT_GROUP: u64 = 16;
 /// What the caller's program does about a signal: default, ignore, or run a
 /// handler of its own.
 pub const SYS_SIG_ACTION: u64 = 11;
@@ -72,6 +78,9 @@ pub const SYS_SIG_TAKE: u64 = 13;
 pub const SYS_PID: u64 = 14;
 /// SYS_SIG_RAISE: the program is named by its process id.
 const RAISE_BY_PID: u64 = 1;
+/// SYS_SIG_RAISE: what is named is a process group, and the signal is for
+/// every program in it.
+const RAISE_GROUP: u64 = 2;
 /// Have SIGALRM raised for the caller's program after a time.
 pub const SYS_SIG_ALARM: u64 = 15;
 /// SYS_SIG_ALARM: say how the alarm stands and change nothing.
@@ -218,6 +227,16 @@ pub const SYS_ADDRSPACE_DESTROY: u64 = 44;
 pub const SYS_PTY_CREATE: u64 = 208;
 pub const SYS_PTY_CTL: u64 = 209;
 pub const SYS_PTY_OPEN: u64 = 210;
+/// Process groups and sessions: what a shell's jobs are made of.
+pub const SYS_PGROUP: u64 = 211;
+/// `SYS_PGROUP` operations.
+const PGROUP_GET: u64 = 0;
+const PGROUP_SET: u64 = 1;
+const SESSION_GET: u64 = 2;
+const SESSION_NEW: u64 = 3;
+/// What a call about groups, sessions or a terminal's answers when the rules
+/// say no, as distinct from there being nothing of the kind (`u64::MAX`).
+const NOT_ALLOWED: u64 = u64::MAX - 1;
 /// Timers, in the time block.
 pub const SYS_TIMER_CREATE: u64 = 146;
 pub const SYS_TIMER_SET: u64 = 147;
@@ -228,6 +247,16 @@ const PTY_SET_TERMIOS: u64 = 1;
 const PTY_GET_WINSIZE: u64 = 2;
 const PTY_SET_WINSIZE: u64 = 3;
 const PTY_NUMBER: u64 = 4;
+/// Which process group is in front of the terminal, set and asked; making it
+/// the caller's controlling terminal; and whose it is.
+const PTY_SET_FRONT: u64 = 5;
+const PTY_GET_FRONT: u64 = 6;
+const PTY_SET_SESSION: u64 = 7;
+const PTY_GET_SESSION: u64 = 8;
+/// With `PTY_SET_FRONT`, above the group: the caller is not to be stopped
+/// for asking from behind. Its runtime says so for a program that has
+/// blocked the signal, which the kernel has no way to see.
+const PTY_FRONT_QUIETLY: u64 = 1 << 63;
 
 /// Be told when a task dies, so that whatever it was lent can be taken back.
 /// Takes no capability: SYS_TASK_INFO already answers the same question by
@@ -344,7 +373,7 @@ pub const SYS_ABI_VERSION: u64 = 240;
 /// minor when calls are added. User space can refuse to run against a major it
 /// does not know, which is the point of exposing it at all.
 pub const ABI_VERSION_MAJOR: u64 = 3;
-pub const ABI_VERSION_MINOR: u64 = 7;
+pub const ABI_VERSION_MINOR: u64 = 8;
 
 /// Threads a task may make with no capability at all.
 ///
@@ -1609,6 +1638,58 @@ extern "C" fn syscall_dispatch(
                     let w = unsafe { core::ptr::read_unaligned(arg2 as *const crate::pty::WinSize) };
                     drop(_ua);
                     if crate::pty::set_winsize(pty, &w) { 0 } else { u64::MAX }
+                }
+                PTY_SET_SESSION => {
+                    // The caller's session takes this terminal as its own,
+                    // with the caller's group in front. For the session's
+                    // leader to ask, of a terminal that is nobody's.
+                    let session = crate::job::sid_of(tid);
+                    if session != scheduler::pid_of(tid) {
+                        return NOT_ALLOWED;
+                    }
+                    if crate::pty::set_session(pty, session, crate::job::pgid_of(tid)) {
+                        0
+                    } else {
+                        NOT_ALLOWED
+                    }
+                }
+                PTY_GET_SESSION | PTY_GET_FRONT | PTY_SET_FRONT => {
+                    // All three are about the caller's own terminal: the one
+                    // its session controls. Of any other there is nothing to
+                    // say to it.
+                    let session = crate::job::sid_of(tid);
+                    let front = match crate::pty::job(pty) {
+                        Some((s, front)) if s != 0 && s == session => front,
+                        _ => return u64::MAX,
+                    };
+                    if arg1 == PTY_GET_SESSION {
+                        return session;
+                    }
+                    if arg1 == PTY_GET_FRONT {
+                        return front;
+                    }
+                    let group = arg2 & !PTY_FRONT_QUIETLY;
+                    if !crate::job::group_in_session(group, session) {
+                        return NOT_ALLOWED;
+                    }
+                    // Asked from behind, it is the asker that is stopped —
+                    // a job in the background does not put itself in front —
+                    // unless it has said the signal is not to stop it.
+                    let mine = crate::job::pgid_of(tid);
+                    if mine != front && arg2 & PTY_FRONT_QUIETLY == 0 {
+                        let ttou = crate::signal::SIGTTOU;
+                        let ignored = crate::signal::action(tid, ttou as u64, u64::MAX) == 1;
+                        if !ignored {
+                            if crate::job::orphaned(mine) {
+                                return NOT_ALLOWED;
+                            }
+                            crate::job::raise_for_group(mine, ttou);
+                            // Stopped, and started again; or told, with a
+                            // handler to run. Either way it is asked again.
+                            return crate::signal::INTERRUPTED;
+                        }
+                    }
+                    if crate::pty::set_front(pty, group) { 0 } else { u64::MAX }
                 }
                 _ => u64::MAX,
             }
@@ -3100,7 +3181,22 @@ extern "C" fn syscall_dispatch(
         }
         SYS_WAIT_FOR => {
             // arg0 = the child to wait for, or 0 for any; arg1 = flags.
-            scheduler::sys_wait_for(arg0, arg1 & WAIT_NO_WAIT != 0, arg1 & WAIT_BY_PID != 0)
+            let mut reports = 0;
+            if arg1 & WAIT_STOPPED != 0 {
+                reports |= crate::job::HAS_STOPPED;
+            }
+            if arg1 & WAIT_CONTINUED != 0 {
+                reports |= crate::job::HAS_CONTINUED;
+            }
+            scheduler::sys_wait_for(
+                arg0,
+                scheduler::Wait {
+                    no_wait: arg1 & WAIT_NO_WAIT != 0,
+                    by_pid: arg1 & WAIT_BY_PID != 0,
+                    group: arg1 & WAIT_GROUP != 0,
+                    reports,
+                },
+            )
         }
         SYS_PID => {
             // arg0 = a task, or 0 for the caller.
@@ -3120,6 +3216,48 @@ extern "C" fn syscall_dispatch(
             // program's process id — and arg1 = the signal, or 0 to ask only
             // whether it could be. Whoever may kill a task may signal it:
             // TaskMgmt for the target, or the same user.
+            let caller = scheduler::current_tid();
+            let caller_uid = scheduler::current_task_uid();
+            let may = |tid: usize| {
+                crate::cap::task_has_task_mgmt(caller, tid)
+                    || scheduler::task_uid_gid(tid).is_ok_and(|(uid, _)| uid == caller_uid)
+            };
+            if arg2 & RAISE_GROUP != 0 {
+                // arg0 = a process group, or 0 for the caller's own. For
+                // every program in it that the caller may signal, and the
+                // caller's own last: what the signal does to it may be the
+                // last thing the caller does.
+                if arg1 > crate::signal::NSIG as u64 {
+                    return u64::MAX;
+                }
+                let group = if arg0 == 0 { crate::job::pgid_of(caller) } else { arg0 };
+                let mut tasks = [0usize; crate::task::MAX_TASKS];
+                let n = crate::job::members(group, &mut tasks);
+                if n == 0 {
+                    return u64::MAX;
+                }
+                let mine = scheduler::pid_of(caller);
+                let mut own = None;
+                let mut any = false;
+                for &tid in tasks[..n].iter().filter(|&&tid| may(tid)) {
+                    any = true;
+                    if arg1 == 0 {
+                        continue;
+                    }
+                    if scheduler::pid_of(tid) == mine {
+                        own = Some(tid);
+                    } else {
+                        let _ = crate::signal::raise(tid, arg1 as u8);
+                    }
+                }
+                if !any {
+                    return NOT_ALLOWED;
+                }
+                if let Some(tid) = own {
+                    let _ = crate::signal::raise(tid, arg1 as u8);
+                }
+                return 0;
+            }
             let by_pid = arg2 & RAISE_BY_PID != 0;
             let tid = if by_pid {
                 match scheduler::task_of_pid(arg0) {
@@ -3129,13 +3267,7 @@ extern "C" fn syscall_dispatch(
             } else {
                 arg0 as usize
             };
-            let caller = scheduler::current_tid();
-            let caller_uid = scheduler::current_task_uid();
-            let has_cap = crate::cap::task_has_task_mgmt(caller, tid);
-            let same_uid = scheduler::task_uid_gid(tid)
-                .map(|(uid, _)| uid == caller_uid)
-                .unwrap_or(false);
-            if !has_cap && !same_uid {
+            if !may(tid) {
                 return u64::MAX;
             }
             if !scheduler::task_is_live(tid) {
@@ -3154,6 +3286,23 @@ extern "C" fn syscall_dispatch(
             match crate::signal::raise(tid, arg1 as u8) {
                 Ok(()) => 0,
                 Err(()) => u64::MAX,
+            }
+        }
+        SYS_PGROUP => {
+            // arg0 = what is asked; arg1 = a process id, 0 for the caller's
+            // own; arg2 = a process group, for the one that sets it.
+            let caller = scheduler::current_tid();
+            let of = |pid: u64| if pid == 0 { Some(caller) } else { scheduler::task_of_pid(pid) };
+            match arg0 {
+                PGROUP_GET => of(arg1).map_or(u64::MAX, crate::job::pgid_of),
+                PGROUP_SET => match crate::job::set_pgid(caller, arg1, arg2) {
+                    Ok(()) => 0,
+                    Err(crate::job::Refused::NoSuch) => u64::MAX,
+                    Err(crate::job::Refused::NotAllowed) => NOT_ALLOWED,
+                },
+                SESSION_GET => of(arg1).map_or(u64::MAX, crate::job::sid_of),
+                SESSION_NEW => crate::job::set_sid(caller).unwrap_or(NOT_ALLOWED),
+                _ => u64::MAX,
             }
         }
         SYS_SIG_ALARM => {
@@ -3302,17 +3451,20 @@ extern "C" fn syscall_dispatch(
         }
         SYS_TASK_INFO => {
             // arg0 = tid. Returns packed info or u64::MAX if no task.
-            // bits [3:0] = state (0=Ready,1=Running,2=Blocked,3=Dead)
+            // bits [3:0] = state (0=Ready,1=Running,2=Blocked,3=Dead,4=Stopped)
             // bits [31:4] = parent_tid
             // bits [63:32] = uid
             let tid = arg0 as usize;
             match scheduler::task_info(tid) {
                 Some((state, uid, _gid, parent)) => {
                     let state_bits = match state {
+                        crate::task::TaskState::Dead => 3,
+                        // Whatever else it is, it is not running until its
+                        // program is continued.
+                        _ if crate::job::is_stopped(tid) => 4,
                         crate::task::TaskState::Ready => 0u64,
                         crate::task::TaskState::Running => 1,
                         crate::task::TaskState::Blocked => 2,
-                        crate::task::TaskState::Dead => 3,
                     };
                     state_bits | ((parent as u64) << 4) | ((uid as u64) << 32)
                 }
@@ -3863,6 +4015,31 @@ fn timer_read(timer: usize, ptr: *mut u8, max_len: usize) -> u64 {
 /// copy happens with the SMAP window open, and that window must not be held
 /// across the wait — which is a reschedule, and RFLAGS.AC travels with the
 /// task that owns it.
+/// A read of a terminal by a program its session has put behind: not a read
+/// at all. What is typed is for whoever is in front, and a job that reads
+/// from the background is stopped until it is brought forward (SIGTTIN).
+///
+/// `None` if the caller is in front, or the terminal is not its session's
+/// to be behind — then the read is a read. Otherwise the answer to give
+/// instead of reading: the read failed, for a program that ignores the
+/// signal or has nobody to continue it; or it was interrupted, for one that
+/// has been stopped and started again, or has a handler to run. A program
+/// that asks again is looked at again.
+fn read_from_behind(pty: usize) -> Option<u64> {
+    let me = scheduler::current_tid();
+    let (session, front) = crate::pty::job(pty)?;
+    let group = crate::job::pgid_of(me);
+    if session == 0 || crate::job::sid_of(me) != session || group == front {
+        return None;
+    }
+    let ttin = crate::signal::SIGTTIN;
+    if crate::signal::action(me, ttin as u64, u64::MAX) == 1 || crate::job::orphaned(group) {
+        return Some(u64::MAX);
+    }
+    crate::job::raise_for_group(group, ttin);
+    Some(crate::signal::INTERRUPTED)
+}
+
 fn pty_read(pty: usize, end: u8, ptr: *mut u8, max_len: usize) -> u64 {
     let mut buf = [0u8; 256];
     let want = max_len.min(buf.len());
@@ -3870,6 +4047,13 @@ fn pty_read(pty: usize, end: u8, ptr: *mut u8, max_len: usize) -> u64 {
         return 0;
     }
     loop {
+        // Every time round: a job that was in front when it began to wait
+        // may have been stopped and put behind since.
+        if end == 1 {
+            if let Some(answer) = read_from_behind(pty) {
+                return answer;
+            }
+        }
         match crate::pty::read(pty, end, &mut buf[..want]) {
             Ok(0) => return 0, // the other end has gone: end of file
             Ok(n) => {

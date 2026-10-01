@@ -26,9 +26,15 @@
 //!   erase a word — and end of file, which hands over what has been typed with
 //!   no newline, and typed on an empty line is a read of nothing. That last is
 //!   the only way a program reading a terminal is ever told there is no more.
-//! - `ISIG`: the interrupt and quit characters are not input. They are taken
-//!   out of what is typed and reported to whoever asks (`take_signal`), and
-//!   the line they interrupted is thrown away.
+//! - `ISIG`: the interrupt, quit and suspend characters are not input. They
+//!   are taken out of what is typed and reported to whoever asks
+//!   (`take_signal`), and the line they interrupted is thrown away.
+//!
+//! And it knows who it is the terminal *of*: the session it is the
+//! controlling terminal of, and which of that session's process groups is in
+//! front (`job.rs`). The signal a typed character raises is for the group in
+//! front, and a read by any other group of the session is not a read but a
+//! reason to stop the reader.
 //!
 //! Everything else a `termios` can say is stored and given back unchanged, so
 //! that a program which saves and restores it gets what it left.
@@ -89,6 +95,7 @@ const VWERASE: usize = 14;
 /// The signals a terminal raises, by Linux's numbers.
 pub const SIGINT: u8 = 2;
 pub const SIGQUIT: u8 = 3;
+pub const SIGTSTP: u8 = 20;
 
 /// What `TCGETS` and `TCSETS` carry, in Linux's layout: four flag words, a
 /// line discipline byte and nineteen control characters.
@@ -212,6 +219,11 @@ struct Pty {
     eofs: u32,
     /// A signal a typed character raised and nobody has collected.
     signal: u8,
+    /// The session this is the controlling terminal of, and the process
+    /// group of it that is in front. 0 for none: a terminal nobody has
+    /// claimed, whose typed signals go to whoever has it open.
+    session: u64,
+    front: u64,
     termios: Termios,
     size: WinSize,
 }
@@ -227,6 +239,8 @@ const NO_PTY: Pty = Pty {
     line_len: 0,
     eofs: 0,
     signal: 0,
+    session: 0,
+    front: 0,
     // What a terminal looks like before anybody has said otherwise: canonical
     // input with echo, Return read as a newline, newline written as carriage
     // return and newline. A program that wants raw bytes turns them off, which
@@ -437,21 +451,24 @@ fn input(p: &mut Pty, bytes: &[u8]) -> usize {
         // program in the terminal. The line they were typed into goes, and
         // what was waiting to be read with it, as on Linux.
         if p.termios.c_lflag & ISIG != 0 && (is(VINTR) || is(VQUIT) || is(VSUSP)) {
-            if !is(VSUSP) {
-                p.signal = if is(VINTR) { SIGINT } else { SIGQUIT };
-                p.line_len = 0;
-                p.to_slave.head = 0;
-                p.to_slave.tail = 0;
-                p.to_slave.len = 0;
-                p.eofs = 0;
-                // Shown as `^C`, and no more: the newline after it is the
-                // shell's to print, when it finds what the signal did.
-                if echo && p.to_master.room() >= 2 {
-                    p.to_master.push(b'^');
-                    p.to_master.push(b ^ 0x40);
-                }
+            p.signal = if is(VINTR) {
+                SIGINT
+            } else if is(VQUIT) {
+                SIGQUIT
+            } else {
+                SIGTSTP
+            };
+            p.line_len = 0;
+            p.to_slave.head = 0;
+            p.to_slave.tail = 0;
+            p.to_slave.len = 0;
+            p.eofs = 0;
+            // Shown as `^C`, and no more: the newline after it is the
+            // shell's to print, when it finds what the signal did.
+            if echo && p.to_master.room() >= 2 {
+                p.to_master.push(b'^');
+                p.to_master.push(b ^ 0x40);
             }
-            // Stopping a job needs jobs. The character is dropped.
             done += 1;
             continue;
         }
@@ -814,6 +831,71 @@ pub fn take_signal(pty: usize) -> Option<u8> {
     let sig = core::mem::replace(&mut ptys()[pty].signal, 0);
     irq_restore(flags);
     (sig != 0).then_some(sig)
+}
+
+/// The session this terminal is the controlling terminal of, and the group
+/// in front of it; `None` for no such terminal.
+pub fn job(pty: usize) -> Option<(u64, u64)> {
+    if pty >= MAX_PTYS {
+        return None;
+    }
+    let flags = irq_save();
+    let p = &ptys()[pty];
+    let out = if p.in_use { Some((p.session, p.front)) } else { None };
+    irq_restore(flags);
+    out
+}
+
+/// Make this the controlling terminal of `session`, with `group` in front.
+///
+/// A terminal is one session's, and a session has one terminal: refused if
+/// the terminal is another session's already, or the session has another
+/// terminal. Asking for what is already so is not refused.
+pub fn set_session(pty: usize, session: u64, group: u64) -> bool {
+    if pty >= MAX_PTYS || session == 0 {
+        return false;
+    }
+    let flags = irq_save();
+    let all = ptys();
+    let free = all[pty].in_use && (all[pty].session == 0 || all[pty].session == session);
+    let elsewhere = all.iter().enumerate().any(|(i, p)| i != pty && p.in_use && p.session == session);
+    let ok = free && !elsewhere;
+    if ok && all[pty].session == 0 {
+        all[pty].session = session;
+        all[pty].front = group;
+    }
+    irq_restore(flags);
+    ok
+}
+
+/// Put `group` in front of this terminal.
+pub fn set_front(pty: usize, group: u64) -> bool {
+    if pty >= MAX_PTYS {
+        return false;
+    }
+    let flags = irq_save();
+    let ok = ptys()[pty].in_use;
+    if ok {
+        ptys()[pty].front = group;
+    }
+    irq_restore(flags);
+    ok
+}
+
+/// A session's leader has gone, and with it the session's claim on its
+/// terminal: the terminal is nobody's, and the next to ask may have it.
+pub fn session_gone(session: u64) {
+    if session == 0 {
+        return;
+    }
+    let flags = irq_save();
+    for p in ptys().iter_mut() {
+        if p.in_use && p.session == session {
+            p.session = 0;
+            p.front = 0;
+        }
+    }
+    irq_restore(flags);
 }
 
 pub fn get_termios(pty: usize) -> Option<Termios> {

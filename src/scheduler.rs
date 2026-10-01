@@ -49,6 +49,26 @@ static mut WAIT_RESULT: [usize; MAX_TASKS] = [0; MAX_TASKS];
 /// Which child a task blocked in a wait is waiting for: 0 for whichever goes
 /// first. Another child going is not what it asked to be woken for.
 static mut WAIT_TARGET: [usize; MAX_TASKS] = [0; MAX_TASKS];
+/// Or which process group of children, when that is what it named; 0 when
+/// it named a child or none.
+static mut WAIT_GROUP: [u64; MAX_TASKS] = [0; MAX_TASKS];
+/// What else it asked to hear of besides a child ending: `job::HAS_STOPPED`,
+/// `job::HAS_CONTINUED`.
+static mut WAIT_REPORTS: [u8; MAX_TASKS] = [0; MAX_TASKS];
+/// Set when a waiter is woken to look again rather than with a dead child:
+/// one of its children has stopped, or been continued.
+static mut WAIT_AGAIN: [bool; MAX_TASKS] = [false; MAX_TASKS];
+
+/// Tasks that may not run: every task of a program a signal has stopped
+/// (`job.rs`).
+///
+/// It is not a state of its own, because a task goes on being whatever it
+/// was — blocked in a call, asleep, or ready to run — and has to be that
+/// again when the program is continued. A held task is simply never put on
+/// a ready queue, and never switched to. What would have made it runnable
+/// makes it `Ready` and in no queue, and continuing the program queues
+/// every task of it that is.
+static mut HELD: [bool; MAX_TASKS] = [false; MAX_TASKS];
 
 /// The process id of the program each task belongs to: the number, never
 /// given out twice, of the task the program began as.
@@ -264,10 +284,7 @@ pub fn exit_with(code: i32) -> ! {
             note_death(current);
             let parent = task.parent_tid;
             // If parent is blocked in sys_wait, wake it with our TID
-            if parent != 0
-                && WAIT_BLOCKED[parent]
-                && (WAIT_TARGET[parent] == 0 || WAIT_TARGET[parent] == current)
-            {
+            if parent != 0 && waits_for(parent, current) {
                 WAIT_BLOCKED[parent] = false;
                 WAIT_RESULT[parent] = current;
                 WAIT_CODE[parent] = code;
@@ -541,8 +558,11 @@ pub fn donate_to(tid: usize, flags: u64) {
         }
         let current_tid = CURRENT_TID.load(Ordering::SeqCst);
 
+        // A task of a stopped program is not handed the processor: it is
+        // ready, in no queue, and stays so until the program is continued.
         let mut takeable = tid < MAX_TASKS
             && tid != current_tid
+            && !HELD[tid]
             && TASKS[tid].as_ref().map(|t| t.state == TaskState::Ready).unwrap_or(false);
         // Handing the CPU straight to the callee skips the scheduler, so it
         // must not be used to run a worse band ahead of a better one. When
@@ -610,8 +630,12 @@ unsafe fn dequeue_ready() -> Option<usize> { unsafe {
     None
 }}
 
-/// Add a task TID to the back of the ready queue.
+/// Add a task TID to the back of the ready queue. Not a held one: that is
+/// queued when its program is continued.
 unsafe fn enqueue(tid: usize) { unsafe {
+    if HELD[tid] {
+        return;
+    }
     let p = priority_of(tid);
     if READY_COUNT[p] >= MAX_TASKS {
         crate::console::puts(b"scheduler: ready queue full, dropping task\n");
@@ -624,6 +648,9 @@ unsafe fn enqueue(tid: usize) { unsafe {
 
 /// Put a task at the *front* of the ready queue, so it runs next.
 unsafe fn enqueue_front(tid: usize) { unsafe {
+    if HELD[tid] {
+        return;
+    }
     let p = priority_of(tid);
     if READY_COUNT[p] >= MAX_TASKS {
         crate::console::puts(b"scheduler: ready queue full, dropping task\n");
@@ -633,6 +660,119 @@ unsafe fn enqueue_front(tid: usize) { unsafe {
     READY_QUEUE[p][READY_HEAD[p]] = tid;
     READY_COUNT[p] += 1;
 }}
+
+/// Take a task out of every ready queue it is in.
+///
+/// # Safety
+/// Interrupts must be off.
+unsafe fn unqueue(tid: usize) { unsafe {
+    for p in 0..NUM_PRIORITIES {
+        let mut kept = 0;
+        for k in 0..READY_COUNT[p] {
+            let t = READY_QUEUE[p][(READY_HEAD[p] + k) % MAX_TASKS];
+            if t != tid {
+                READY_QUEUE[p][(READY_HEAD[p] + kept) % MAX_TASKS] = t;
+                kept += 1;
+            }
+        }
+        READY_COUNT[p] = kept;
+        READY_TAIL[p] = (READY_HEAD[p] + kept) % MAX_TASKS;
+    }
+}}
+
+/// Hold a task: it does not run again until [`release_task`]. For a program
+/// being stopped, by `job::stop`, which holds every task of it.
+///
+/// The running task can be held too. It goes on until it next gives up the
+/// processor — [`stop_here`] — and is not given it back.
+pub fn hold_task(tid: usize) {
+    if tid == 0 || tid >= MAX_TASKS {
+        return;
+    }
+    let flags = irq_save();
+    unsafe {
+        HELD[tid] = true;
+        unqueue(tid);
+    }
+    irq_restore(flags);
+}
+
+/// Let a held task run again: at once if it is ready to, and otherwise when
+/// whatever it is blocked on lets it.
+pub fn release_task(tid: usize) {
+    if tid >= MAX_TASKS {
+        return;
+    }
+    let flags = irq_save();
+    unsafe {
+        if HELD[tid] {
+            HELD[tid] = false;
+            if matches!(TASKS[tid], Some(ref t) if t.state == TaskState::Ready) {
+                enqueue(tid);
+            }
+        }
+    }
+    irq_restore(flags);
+}
+
+/// Whether a task is held.
+pub fn is_held(tid: usize) -> bool {
+    tid < MAX_TASKS && unsafe { HELD[tid] }
+}
+
+/// If the running task's program has just been stopped, stop: give up the
+/// processor, and come back when the program is continued.
+///
+/// For whoever raised the signal that did it, once it has nothing left to
+/// finish. A task is held where it is, and for the one that is running,
+/// here is where that is.
+pub fn stop_here() {
+    while is_held(current_tid()) {
+        yield_now();
+    }
+}
+
+/// Is `parent` blocked in a wait that `child` is one of the children of?
+///
+/// # Safety
+/// Interrupts must be off.
+unsafe fn waits_for(parent: usize, child: usize) -> bool { unsafe {
+    WAIT_BLOCKED[parent]
+        && match WAIT_GROUP[parent] {
+            0 => WAIT_TARGET[parent] == 0 || WAIT_TARGET[parent] == child,
+            group => crate::job::pgid_of(child) == group,
+        }
+}}
+
+/// Task `child`'s program has stopped or been continued (`kind` is one of
+/// `job::HAS_STOPPED`, `job::HAS_CONTINUED`): its parent hears SIGCHLD, as
+/// it does when a child ends, and a parent waiting to hear of exactly this
+/// is woken to look.
+///
+/// Nothing for a task whose parent is in its own program — a thread.
+pub fn child_changed(child: usize, kind: u8) {
+    if child >= MAX_TASKS {
+        return;
+    }
+    let flags = irq_save();
+    unsafe {
+        let (parent, space) = match TASKS[child] {
+            Some(ref t) => (t.parent_tid, t.space),
+            None => (0, 0),
+        };
+        let theirs = if parent == 0 { 0 } else { TASKS[parent].as_ref().map_or(0, |p| p.space) };
+        if parent != 0 && !(theirs != 0 && theirs == space) {
+            if waits_for(parent, child) && WAIT_REPORTS[parent] & kind != 0 {
+                WAIT_BLOCKED[parent] = false;
+                WAIT_RESULT[parent] = 0;
+                WAIT_AGAIN[parent] = true;
+                unblock_task(parent);
+            }
+            crate::signal::child_ended(parent);
+        }
+    }
+    irq_restore(flags);
+}
 
 /// Restore interrupt flag from saved RFLAGS.
 unsafe fn restore_flags(flags: u64) { unsafe {
@@ -710,7 +850,7 @@ unsafe fn child_exit_code(tid: usize) -> i32 { unsafe {
 /// [63:32], or u64::MAX if the caller has no children. The status used to be
 /// dropped entirely, so `process::exit(1)` was indistinguishable from success.
 pub fn sys_wait() -> u64 {
-    sys_wait_for(0, false, false)
+    sys_wait_for(0, Wait { no_wait: false, by_pid: false, group: false, reports: 0 })
 }
 
 /// The process id of the program `tid` belongs to, or 0 if there is no such
@@ -734,6 +874,8 @@ pub fn join_process(tid: usize, of: usize) {
     let flags = irq_save();
     unsafe { PROCESS_ID[tid] = PROCESS_ID[of] };
     irq_restore(flags);
+    // And in its group and its session, and stopped if it is.
+    crate::job::joined(tid, of);
 }
 
 /// A task of the process `pid`: one that is running if there is one, and
@@ -757,6 +899,26 @@ pub fn task_of_pid(pid: u64) -> Option<usize> {
     found
 }
 
+/// How a wait for a child is to be made: `SYS_WAIT_FOR`'s flags.
+#[derive(Clone, Copy)]
+pub struct Wait {
+    /// Answer 0 rather than wait.
+    pub no_wait: bool,
+    /// The child is named, there and back, by its process id — the number
+    /// that is never used twice — rather than by its task id, which is.
+    pub by_pid: bool,
+    /// What is named is a process group of children: 0 for the caller's own.
+    pub group: bool,
+    /// Besides a child ending, what to hear of: `job::HAS_STOPPED` and
+    /// `job::HAS_CONTINUED`.
+    pub reports: u8,
+}
+
+/// In the answer to a wait, beside the child's name: this is a child that
+/// has stopped or been continued, not one that has ended, and the status
+/// above it is the signal that stopped it, or 0 for a continue.
+pub const WAIT_REPORT: u64 = 1 << 31;
+
 /// Collect a child that has ended: `target`, or whichever is first if that
 /// is 0. Returns its id with its status above it.
 ///
@@ -768,95 +930,120 @@ pub fn task_of_pid(pid: u64) -> Option<usize> {
 /// that would collect, and so lose, every child that finished first. A shell
 /// with a pipeline has several, and wants each one's status.
 ///
-/// `by_pid` says the child is named, there and back, by its process id — the
-/// number that is never used twice — rather than by its task id, which is.
-pub fn sys_wait_for(target: u64, no_wait: bool, by_pid: bool) -> u64 {
+/// A shell with jobs wants to hear of more than endings. With `reports`, a
+/// child that has stopped, or been continued, is answered too — marked
+/// [`WAIT_REPORT`], and not collected: it is still there.
+pub fn sys_wait_for(target: u64, how: Wait) -> u64 {
     let parent = current_tid();
-
-    let flags = irq_save();
-    unsafe {
-        // The child meant, as a task: one of the caller's own.
-        let target = if target == 0 {
-            0
-        } else if by_pid {
-            let child = (1..MAX_TASKS).find(|&i| {
-                PROCESS_ID[i] == target && TASKS[i].as_ref().is_some_and(|t| t.parent_tid == parent)
-            });
-            match child {
-                Some(i) => i,
-                None => {
+    loop {
+        let flags = irq_save();
+        unsafe {
+            // The children meant: one, as a task; a group of them; or all.
+            let (target, group) = if how.group {
+                (0, if target == 0 { crate::job::pgid_of(parent) } else { target })
+            } else if target == 0 {
+                (0, 0)
+            } else if how.by_pid {
+                let child = (1..MAX_TASKS).find(|&i| {
+                    PROCESS_ID[i] == target && TASKS[i].as_ref().is_some_and(|t| t.parent_tid == parent)
+                });
+                match child {
+                    Some(i) => (i, 0),
+                    None => {
+                        irq_restore(flags);
+                        return u64::MAX;
+                    }
+                }
+            } else if target < MAX_TASKS as u64 {
+                (target as usize, 0)
+            } else {
+                irq_restore(flags);
+                return u64::MAX;
+            };
+            // What the child is called in the answer. Asked before it is reaped:
+            // afterwards it has no name.
+            let name = |i: usize| if how.by_pid { PROCESS_ID[i] } else { i as u64 };
+            let wanted = |i: usize| {
+                if group != 0 { crate::job::pgid_of(i) == group } else { target == 0 || target == i }
+            };
+            let mine = |i: usize| wanted(i) && TASKS[i].as_ref().is_some_and(|t| t.parent_tid == parent);
+            // Check if a child is already dead (zombie) and not yet reaped
+            for i in 1..MAX_TASKS {
+                let collectable =
+                    mine(i) && !REAPED[i] && matches!(TASKS[i], Some(ref t) if t.state == TaskState::Dead);
+                if collectable {
+                    REAPED[i] = true;
+                    let code = child_exit_code(i);
+                    let child = name(i);
+                    reap(i);
                     irq_restore(flags);
-                    return u64::MAX;
+                    return (child & 0x7FFF_FFFF) | ((code as u32 as u64) << 32);
                 }
             }
-        } else if target < MAX_TASKS as u64 {
-            target as usize
-        } else {
-            irq_restore(flags);
-            return u64::MAX;
-        };
-        // What the child is called in the answer. Asked before it is reaped:
-        // afterwards it has no name.
-        let name = |i: usize| if by_pid { PROCESS_ID[i] } else { i as u64 };
-        let wanted = |i: usize| target == 0 || target == i;
-        // Check if a child is already dead (zombie) and not yet reaped
-        for i in 1..MAX_TASKS {
-            let collectable = wanted(i)
-                && TASKS[i].as_ref().is_some_and(|t| {
-                    t.parent_tid == parent && t.state == TaskState::Dead && !REAPED[i]
-                });
-            if collectable {
-                REAPED[i] = true;
-                let code = child_exit_code(i);
-                let child = name(i);
-                reap(i);
-                irq_restore(flags);
-                return (child & 0xFFFF_FFFF) | ((code as u32 as u64) << 32);
+            // Or one that has stopped or started, if that was asked for.
+            if how.reports != 0 {
+                for i in 1..MAX_TASKS {
+                    let alive = mine(i) && matches!(TASKS[i], Some(ref t) if t.state != TaskState::Dead);
+                    if !alive {
+                        continue;
+                    }
+                    if let Some(signo) = crate::job::take_report(i, how.reports) {
+                        let child = name(i);
+                        irq_restore(flags);
+                        return (child & 0x7FFF_FFFF) | WAIT_REPORT | (signo as u64) << 32;
+                    }
+                }
             }
-        }
 
-        // Check if we have any living children of the kind asked for at all
-        let has_children = (1..MAX_TASKS).any(|i| {
-            wanted(i) && TASKS[i].as_ref().is_some_and(|t| t.parent_tid == parent)
-        });
-        if !has_children {
+            // Check if we have any living children of the kind asked for at all
+            if !(1..MAX_TASKS).any(mine) {
+                irq_restore(flags);
+                return u64::MAX;
+            }
+            if how.no_wait {
+                irq_restore(flags);
+                return 0;
+            }
+
+            // Block until a child exits. Marking and blocking must both happen
+            // before interrupts come back on, or exit() can slip in between them.
+            WAIT_BLOCKED[parent] = true;
+            WAIT_TARGET[parent] = target;
+            WAIT_GROUP[parent] = group;
+            WAIT_REPORTS[parent] = how.reports;
+            WAIT_AGAIN[parent] = false;
+            WAIT_RESULT[parent] = 0;
+            WAIT_CODE[parent] = 0;
+            block_task(parent);
             irq_restore(flags);
-            return u64::MAX;
-        }
-        if no_wait {
+            yield_now();
+
+            // Woken up — WAIT_RESULT has the dead child's TID
+            let flags = irq_save();
+            let child_tid = WAIT_RESULT[parent];
+            let again = core::mem::replace(&mut WAIT_AGAIN[parent], false);
+            WAIT_BLOCKED[parent] = false;
+            WAIT_RESULT[parent] = 0;
+            WAIT_TARGET[parent] = 0;
+            WAIT_GROUP[parent] = 0;
+            WAIT_REPORTS[parent] = 0;
+            if child_tid != 0 {
+                let code = WAIT_CODE[parent];
+                let child = if how.by_pid { PROCESS_ID[child_tid] } else { child_tid as u64 };
+                // Reaped now rather than whenever the machine next goes idle.
+                // A dead task keeps all its memory until it is reaped, and a
+                // parent running programs one after another never lets the
+                // machine idle: a test suite held every program it had run.
+                reap(child_tid);
+                irq_restore(flags);
+                return (child & 0x7FFF_FFFF) | ((code as u32 as u64) << 32);
+            }
             irq_restore(flags);
-            return 0;
+            if !again {
+                return u64::MAX;
+            }
+            // A child stopped, or started: go round and say which.
         }
-
-        // Block until a child exits. Marking and blocking must both happen
-        // before interrupts come back on, or exit() can slip in between them.
-        WAIT_BLOCKED[parent] = true;
-        WAIT_TARGET[parent] = target;
-        WAIT_RESULT[parent] = 0;
-        WAIT_CODE[parent] = 0;
-        block_task(parent);
-        irq_restore(flags);
-        yield_now();
-
-        // Woken up — WAIT_RESULT has the dead child's TID
-        let flags = irq_save();
-        let child_tid = WAIT_RESULT[parent];
-        WAIT_RESULT[parent] = 0;
-        WAIT_TARGET[parent] = 0;
-        let result = if child_tid != 0 {
-            let code = WAIT_CODE[parent];
-            let child = if by_pid { PROCESS_ID[child_tid] } else { child_tid as u64 };
-            // Reaped now rather than whenever the machine next goes idle.
-            // A dead task keeps all its memory until it is reaped, and a
-            // parent running programs one after another never lets the
-            // machine idle: a test suite held every program it had run.
-            reap(child_tid);
-            (child & 0xFFFF_FFFF) | ((code as u32 as u64) << 32)
-        } else {
-            u64::MAX
-        };
-        irq_restore(flags);
-        result
     }
 }
 
@@ -1019,10 +1206,7 @@ fn end_other(tid: usize, code: i32) -> Result<(), ()> {
                 close_descriptors(tid);
                 note_death(tid);
                 let parent = task.parent_tid;
-                if parent != 0
-                    && WAIT_BLOCKED[parent]
-                    && (WAIT_TARGET[parent] == 0 || WAIT_TARGET[parent] == tid)
-                {
+                if parent != 0 && waits_for(parent, tid) {
                     WAIT_BLOCKED[parent] = false;
                     WAIT_RESULT[parent] = tid;
                     WAIT_CODE[parent] = code;
@@ -1122,6 +1306,9 @@ unsafe fn note_death(tid: usize) { unsafe {
     let space = t.space;
     if space != 0 && !space_has_live_task(space) {
         crate::ipc::notify_space_watchers(space);
+        // The process has gone: a session it led, and a job it left
+        // stopped with nobody to continue it.
+        crate::job::process_ended(tid);
     }
 }}
 
@@ -1287,9 +1474,14 @@ unsafe fn reap_one(i: usize) -> u64 { unsafe {
     WAIT_BLOCKED[i] = false;
     WAIT_RESULT[i] = 0;
     WAIT_TARGET[i] = 0;
+    WAIT_GROUP[i] = 0;
+    WAIT_REPORTS[i] = 0;
+    WAIT_AGAIN[i] = false;
     // Every capability to it names nothing from here on, whoever holds one.
     crate::cap::close_endpoint(i);
     PROCESS_ID[i] = 0;
+    HELD[i] = false;
+    crate::job::forget(i);
     TASKS[i] = None;
 
     // Left naming this TID, its children would wait on a parent that is gone,
@@ -1507,6 +1699,10 @@ pub fn create_empty_task() -> Option<usize> {
         // started as a thread gives both up for its program's; a task
         // started as a program keeps them.
         PROCESS_ID[tid] = crate::cap::endpoint_of(tid);
+        // In its creator's process group and session: a job is whatever a
+        // shell started, and what those started.
+        HELD[tid] = false;
+        crate::job::born(tid, parent, PROCESS_ID[tid]);
         crate::fdtable::attach_new(tid);
     }
     irq_restore(flags);

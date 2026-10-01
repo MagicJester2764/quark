@@ -26,9 +26,13 @@ them struck through as done. What follows is what is true now.
   computing: one that handles a signal and then makes no call is not
   interrupted by it. That would be a frame on the user stack and a way back
   from it, and saving everything in between — the floating-point state too.
-- **Process groups, sessions and jobs.** Ctrl-C goes to every program holding
-  the terminal, the signals that stop a program do nothing, and there is no
-  foreground to hand a terminal to. A shell runs with job control off.
+- **The rest of job control.** There are process groups, sessions, a group
+  in front of a terminal and programs that stop (`docs/abi.md`, *Jobs*).
+  What a terminal does not do is stop a job for *writing* to it from behind
+  (`TOSTOP`) or for changing its settings from there; only a read and a
+  change of who is in front are checked. A session's terminal is given up
+  only by its leader ending. And nothing is hung up on when a terminal's
+  master goes: its readers see the end of the file.
 - **Signals nothing raises.** None when a terminal changes size. A pipe
   with nobody reading it is found out by the writer's runtime, which asks
   what kind of thing the descriptor is. (An alarm and a child ending are
@@ -41,7 +45,9 @@ them struck through as done. What follows is what is true now.
   cannot hold.
 - **A mask the kernel knows.** A signal a program has blocked is held back by
   its runtime, which can only hold back what it would have run: a blocked
-  signal with no handler does what it does at once.
+  signal with no handler does what it does at once — a blocked SIGTSTP
+  stops. The one place job control leans on a mask, a shell taking its
+  terminal back with SIGTTOU blocked, the runtime says so in the call.
 - **A wait list names a task by its id, and ids are reused.** A task killed
   while it is parked in a read or a write is taken off the list it was on
   (`pipe::forget_waiter`, reached through what it held), because a wake meant

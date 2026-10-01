@@ -1,6 +1,6 @@
 # Quark syscall ABI
 
-**Version 3.7.** Query the running kernel with `SYS_ABI_VERSION` (240), which
+**Version 3.8.** Query the running kernel with `SYS_ABI_VERSION` (240), which
 returns `(major << 16) | minor`.
 
 This document is the contract between the Quark kernel and everything above it.
@@ -80,7 +80,7 @@ unused slots in a block are reserved for that subsystem.
 | 0xA0  | 160–175   | Kernel debug console          |
 | 0xB0  | 176–191   | Sockets                       |
 | 0xC0  | 192–207   | Memory, continued             |
-| 0xD0  | 208–223   | Terminals                     |
+| 0xD0  | 208–223   | Terminals and jobs            |
 | 0xE0  | 224–239   | Descriptors, continued        |
 | 0xF0  | 240–255   | ABI introspection             |
 
@@ -195,6 +195,7 @@ returning at once turned that loop into a spin.
 | 3.5 | **Two signals the kernel raises itself.** `SYS_SIG_ALARM` (15) has SIGALRM raised for the caller's program after a time, once or again and again: the program's alarm, one for all its threads, kept across `SYS_EXEC_SPACE` and not copied by `SYS_FORK`. And SIGCHLD is raised for a program when a child of it ends, which does nothing to one that has not asked to hear. Nothing could stand in for either: a program waiting for a child *or* a time, whichever comes first, has to be woken by the one that came, and until now it was woken by neither. GNU `timeout` waited for ever, and a shell's `read -t` never timed out. |
 | 3.6 | **A terminal's input is UTF-8.** `IUTF8` in a terminal's `c_iflag` is acted on, and set on a new one: in canonical mode, erasing takes back a character — the byte that begins it and every byte that continues it — where it took back a byte, and left the program to read the front of a character with no end. A change of behaviour and no new number. |
 | 3.7 | **Named pipes.** `SYS_FD_SERVE_PIPE` (231): a server gives a task that is calling it one end of the pipe a key of the server's names — the same pipe for everybody who is given the same key, for as long as any of them holds an end. `SYS_PIPE_PEER` (232): wait until somebody has opened the other end. The name, its owner and its mode are a file server's; the pipe is the kernel's, because a program waits on one with `SYS_POLL`. |
+| 3.8 | **Jobs.** Every process is in a process group and a session, and a terminal has one group in front of it. `SYS_PGROUP` (211) reads and sets them. `SYS_SIG_RAISE` with arg2 = 2 raises a signal for a group. Signals 19 to 22 stop a program — every task of it held where it is — and 18 starts it again; a parent hears of both as signal 17 and, asking with flags 4 and 8, from `SYS_WAIT_FOR`, which with flag 16 also waits for a group of children. `SYS_PTY_CTL` ops 5 to 8 make a terminal a session's controlling terminal and say which group is in front; what is typed raises its signals for that group, a read by any other group of the session stops the reader (signal 21), and `VSUSP` raises signal 20. `SYS_TASK_INFO` reports a stopped task as state 4. A terminal no session has claimed behaves as before. |
 
 3.1 was a change of behaviour and no change of number, so a minor: nothing built for
 3.0 calls anything that means something else now. What it could have relied on
@@ -277,12 +278,12 @@ everything else returns promptly.
 | 4 | `SYS_WAIT` | — | `tid \| (exit_code << 32)`, or `u64::MAX` if no children. **Blocks.** | — |
 | 5 | `SYS_TASK_KILL` | arg0 = tid | 0 / `u64::MAX` | `TaskMgmt` for target, or same UID |
 | 6 | `SYS_SIGNAL` | arg0 = tid, arg1 = signal bits | 0 / `u64::MAX` | as above |
-| 7 | `SYS_TASK_INFO` | arg0 = tid | packed info, or `u64::MAX` | — |
+| 7 | `SYS_TASK_INFO` | arg0 = tid | packed info: state in bits 0–3 (0 ready, 1 running, 2 blocked, 3 dead, 4 stopped), the parent's tid in bits 4–31, the user id above / `u64::MAX` | — |
 | 8 | `SYS_EXIT_PROGRAM` | arg0 = status | does not return | — |
 | 9 | `SYS_UMASK` | arg0 = the new mask (nine bits), or `u64::MAX` to leave it | the mask as it was | — |
-| 10 | `SYS_WAIT_FOR` | arg0 = a child, or 0 for any; arg1 = flags: 1 = do not wait, 2 = the child is named by its process id, here and in the answer, rather than by its tid | `child \| (exit_code << 32)`; 0 if asked not to wait and none has ended; `u64::MAX` if there is no such child. **Blocks** unless asked not to. | — |
+| 10 | `SYS_WAIT_FOR` | arg0 = a child, or 0 for any; arg1 = flags: 1 = do not wait, 2 = the child is named by its process id, here and in the answer, rather than by its tid, 4 = answer for a child that has stopped too, 8 = and for one that has been continued, 16 = arg0 is a process group of children, 0 for the caller's own | `child \| (exit_code << 32)`; for a stop or a continue, `child \| (1 << 31) \| (signal << 32)`, the signal 0 for a continue; 0 if asked not to wait and there is nothing to say; `u64::MAX` if there is no such child. **Blocks** unless asked not to. | — |
 | 11 | `SYS_SIG_ACTION` | arg0 = signal (1 to 64), arg1 = 0 nothing said, 1 ignore, 2 handled; anything else only asks | what it was: 0, 1 or 2 / `u64::MAX` | — |
-| 12 | `SYS_SIG_RAISE` | arg0 = a task of the program to signal, or with arg2 = 1 its process id; arg1 = signal, or 0 to ask whether one could be raised | 0 / `u64::MAX` | `TaskMgmt` for target, or same UID |
+| 12 | `SYS_SIG_RAISE` | arg0 = a task of the program to signal, or with arg2 = 1 its process id, or with arg2 = 2 a process group (0 for the caller's own); arg1 = signal, or 0 to ask whether one could be raised | 0 / `u64::MAX`; for a group, `u64::MAX - 1` if it has members and none the caller may signal | `TaskMgmt` for target, or same UID |
 | 13 | `SYS_SIG_TAKE` | arg0 = where to be told of the next (a `u32` in the caller's memory), or 0 to leave that as it is | the signals waiting for a handler, bit `n - 1` for signal `n`; none is waiting afterwards | — |
 | 14 | `SYS_PID` | arg0 = a task, or 0 for the caller | the process id of the program it belongs to / `u64::MAX` | — |
 | 15 | `SYS_SIG_ALARM` | arg0 = ticks until signal 14 is raised for the caller's program, 0 for no alarm; arg1 = ticks between repeats after that, 0 for none; arg2 = 1 to ask and change nothing | how the alarm stood: `ticks left \| (repeat << 32)`, 0 if there was none / `u64::MAX` | — |
@@ -350,10 +351,9 @@ signal, with `SYS_SIG_ACTION`:
 
 - **Nothing said** (0), and the kernel does what the signal does. For nearly
   all of them that is the end of the program: every task, with the negated
-  signal number as its status — the status a fault leaves. Eight do nothing:
-  17 (a child ended), 23 (urgent data), 28 (a window changed size), and 18 to
-  22, the ones that stop a program and start it again, because stopping a job
-  needs jobs.
+  signal number as its status — the status a fault leaves. Three do nothing:
+  17 (a child ended), 23 (urgent data) and 28 (a window changed size). Four
+  stop the program, 19 to 22, and 18 starts it again: see *Jobs*.
 - **Ignored** (1).
 - **Handled** (2): the program has a handler for it. The kernel runs no
   handler. It records the signal as waiting; sets to 1 the word the program
@@ -367,7 +367,7 @@ signal, with `SYS_SIG_ACTION`:
   what is waiting, which then no longer is, and the runtime calls the
   handlers.
 
-9 cannot be ignored or handled; nor can 19, which does nothing. A forked
+9 cannot be ignored or handled; nor can 19. A forked
 child has its parent's answers and nothing waiting. `SYS_EXEC_SPACE` keeps
 what is ignored and forgets the handlers and the word, both of which were
 addresses in the program that has gone. A program started by a spawner has
@@ -377,13 +377,14 @@ So a handler runs at a system-call boundary and nowhere else. A program that
 handles a signal and then computes without making a call is not interrupted
 by it; one that has said nothing is ended wherever it is.
 
-A terminal raises two of them. With `ISIG`, its interrupt character raises 2
-and its quit character 3, for every program holding a descriptor for the
-terminal's slave: there are no process groups to pick a foreground among.
-What keeps a shell alive under its own Ctrl-C is what does on Unix when a
-shell has no job control — it handles the signal, what it starts in the
-background it starts ignoring it, and what it runs in the foreground has said
-nothing.
+A terminal raises three of them. With `ISIG`, its interrupt character
+raises 2, its quit character 3 and its suspend character 20, for the process
+group in front of it (see *Jobs*). A terminal no session has claimed has
+nothing in front, and raises them for every program holding a descriptor for
+its slave. What keeps a shell alive under its own Ctrl-C there is what does
+on Unix when a shell has no job control — it handles the signal, what it
+starts in the background it starts ignoring it, and what it runs in the
+foreground has said nothing.
 
 The kernel raises two more itself, because nothing else can.
 
@@ -397,8 +398,9 @@ has none, having set none. A count that does not fit 32 bits is taken as the
 largest that does. A program that has said nothing about signal 14 is ended
 by it, like any other.
 
-*A child ending.* When a task whose parent is in another program dies,
-signal 17 is raised for the parent's program, after the parent has been
+*A child ending.* When a task whose parent is in another program dies —
+or its program is stopped, or continued — signal 17 is raised for the
+parent's program, after the parent has been
 woken from `SYS_WAIT` if it was in one — so the child is there to collect
 when anything hears of it. A thread ending is not a child ending: its parent
 is the task that made it, in the program they share. Signal 17 does nothing
@@ -408,6 +410,69 @@ whatever its parent has said.
 
 Nothing is raised when a terminal changes size or when a pipe has nobody
 reading it; the last a runtime can find out for itself (`SYS_FD_KIND`).
+
+**Jobs.** A shell runs `a | b | c` as one thing, and has to be able to mean
+all three of them: when Ctrl-C is typed, when Ctrl-Z is, and when it wants
+them out of the way or back. So every process is in a *process group*, and
+every group in a *session*.
+
+- A group and a session are each named by a process id: that of the process
+  that began it. A task made by `SYS_TASK_CREATE` or `SYS_FORK` is in its
+  creator's group and session; `SYS_EXEC_SPACE` changes neither; a thread is
+  where its program is.
+- `SYS_PGROUP` op 0 answers with the group of process arg1 (0 for the
+  caller's own), and op 2 with its session. Op 1 puts process arg1 in group
+  arg2 (0 for a new group of its own): a process may move itself, or a child
+  of its own, within their session, into a group of its own or one already
+  there, and a session's leader stays where it is. Op 3 begins a session: the
+  caller leads it, and a group in it, both named after itself — refused for a
+  process that already leads a group. A refusal by those rules is
+  `u64::MAX - 1`; `u64::MAX` is no such process.
+- `SYS_SIG_RAISE` with arg2 = 2 raises a signal for every process in a group
+  that the caller may signal, the caller's own program last.
+
+*Stopping.* Signal 19 stops a program: none of its tasks runs, each staying
+whatever it was — blocked in a call, asleep, ready — until signal 18, which
+starts the program again whatever it has said about 18. Signals 20, 21 and
+22 stop it too if it has said nothing about them, and can be ignored or
+handled like any other. A signal raised for a stopped program does what it
+would: one that ends it ends it, and one it handles waits for it to run.
+
+Three of the four are how a terminal stops a job, and a job is stopped for
+somebody to start it again. So 20, 21 and 22 do not stop a process whose
+group is *orphaned*: one with no member whose parent is in the same session
+and a different group. A shell that runs its commands in its own group is in
+such a group, with them, and Ctrl-Z there does nothing — where otherwise it
+would stop the shell, the command and the login that started them, with
+nobody left to type `fg`. And when a process ends and leaves a group orphaned
+with a stopped member, every process in that group is sent 1 and then 18.
+
+A parent hears of a child stopping or starting as it hears of one ending:
+signal 17, and `SYS_WAIT_FOR` if it asks with flag 4 or 8. Such an answer has
+bit 31 set beside the child's name and the stopping signal above it, 0 for a
+continue; the child is not collected, and is reported once.
+
+*A terminal's.* `SYS_PTY_CTL` op 7 makes a terminal the controlling terminal
+of the caller's session, with the caller's group in front: for the session's
+leader to ask, of a terminal that is no session's, and a session has one.
+Op 5 puts group arg2 of the session in front, op 6 answers which is, and
+op 8 which session the terminal is; all three are for a caller in that
+session, and `u64::MAX` to anybody else. When the session's leader ends, the
+terminal is nobody's again.
+
+What is typed is for the group in front. Its signals are raised for that
+group, and a read of the slave by a process of the session in any *other*
+group is not a read: signal 21 is raised for the reader's group, which stops
+it, and the read answers `0xFFFF_FFFD` when it is started again — to be asked
+again, and looked at again. If the reader ignores 21, or is in an orphaned
+group, the read fails instead. A program continued while it was waiting in a
+read of a terminal is looked at again too, having perhaps been put behind.
+Writing is not restricted.
+
+Op 5 asked by a process that is itself behind raises 22 for the asker's
+group in the same way, unless it ignores 22 — or says, with bit 63 of arg2,
+that it is not to be stopped for asking: its runtime does, for a program
+that has blocked 22, which the kernel cannot see.
 
 **Task signals** are older and are not those. `SYS_SIGNAL` takes bits:
 interrupt (`1 << 16`), terminate (`1 << 17`) and kill (`1 << 18`). The kill
@@ -991,13 +1056,14 @@ the CPU ignores those bits only while protection keys are off, and the
 kernel keeps CR4.PKE clear. A pager's objects stop paging when it dies, and
 go when nothing maps them.
 
-### Terminals (0xD0)
+### Terminals and jobs (0xD0)
 
 | # | Name | Arguments | Returns | Cap |
 |---|---|---|---|---|
 | 208 | `SYS_PTY_CREATE` | — | a descriptor for a new pty's master / `u64::MAX` | — |
-| 209 | `SYS_PTY_CTL` | arg0 = a descriptor naming either end, arg1 = op (0 get termios, 1 set termios, 2 get window size, 3 set window size, 4 the pty's number), arg2 = the structure | per op / `u64::MAX` | — |
+| 209 | `SYS_PTY_CTL` | arg0 = a descriptor naming either end, arg1 = op (0 get termios, 1 set termios, 2 get window size, 3 set window size, 4 the pty's number, 5 put a group in front, 6 which group is, 7 make it the caller's controlling terminal, 8 which session's it is), arg2 = the structure, or for op 5 the group | per op / `u64::MAX`; ops 5 and 7, `u64::MAX - 1` when the rules say no, and op 5 `0xFFFF_FFFD` when the caller was signalled for asking | — |
 | 210 | `SYS_PTY_OPEN` | arg0 = a pty's number | a descriptor for its slave / `u64::MAX` | — |
+| 211 | `SYS_PGROUP` | arg0 = op: 0 the group of process arg1, 1 put process arg1 in group arg2, 2 the session of process arg1, 3 begin a session; a process of 0 is the caller's own | the group or the session; 0 for op 1 / `u64::MAX` for no such process, `u64::MAX - 1` when the rules say no | — |
 
 A pseudo-terminal is a pair of descriptors with a line discipline between
 them: what a terminal emulator holds, the master, and what the program in it
@@ -1020,7 +1086,7 @@ termios, 36 bytes: c_iflag, c_oflag, c_cflag, c_lflag (u32 each),
 winsize,  8 bytes: ws_row, ws_col, ws_xpixel, ws_ypixel (u16 each)
 ```
 
-Of a `termios` the kernel acts on seven bits and seven characters, and stores
+Of a `termios` the kernel acts on seven bits and eight characters, and stores
 the rest: `ICRNL` and `IUTF8` in `c_iflag` (a carriage return typed arrives
 as a newline; what is typed is UTF-8), `OPOST` with `ONLCR` in `c_oflag` (a
 newline written goes out as carriage return and newline), and `ICANON`,
@@ -1040,12 +1106,12 @@ reading a terminal is told there is no more. A poll reports that as readable,
 and not as a hangup. With `ECHO`, what is typed is written back to the master,
 and what is taken back is rubbed out there.
 
-With `ISIG`, `VINTR` and `VQUIT` are not input: the character is taken out,
-the line it was typed into and anything not yet read are thrown away, it is
-echoed as `^C`, and signal 2 or 3 is raised for every program holding the
-slave (see *Signals*, under process lifecycle). `VSUSP` is taken out and
-nothing else: stopping a job needs jobs. A character set to 0 in `c_cc` is
-switched off.
+With `ISIG`, `VINTR`, `VQUIT` and `VSUSP` are not input: the character is
+taken out, the line it was typed into and anything not yet read are thrown
+away, it is echoed as `^C`, and signal 2, 3 or 20 is raised for the group in
+front of the terminal — or, for a terminal no session has claimed, for every
+program holding the slave (see *Signals* and *Jobs*, under process
+lifecycle). A character set to 0 in `c_cc` is switched off.
 
 A write to the slave — what a program prints — waits for room when the pty's
 buffer (4096 bytes) is full, and returns when all of it has been taken, or
