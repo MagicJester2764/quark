@@ -20,10 +20,16 @@ them struck through as done. What follows is what is true now.
 - **Copy-on-write.** `fork` copies every page the caller owns, eagerly. Sharing
   until written needs a reference count per frame, and frames here have an
   owner and nothing else.
-- **Signals.** A fault in ring 3 ends the task with the negated Linux signal
-  number as its exit status, and that is the only place a signal number means
-  anything. Nothing is delivered to a handler, there are no process groups,
-  and a terminal's Ctrl-C reaches the program in it as a byte.
+- **POSIX signals.** The kernel has three signals of its own — interrupt,
+  terminate and kill (`SYS_SIGNAL`). Kill ends a task at once; the other two
+  arrive as bits in its notification word, abandon the call it is blocked in,
+  and end it five seconds later if it is still there. That is enough for
+  Ctrl-C at the console and for `kill`. What is missing is everything a C
+  program means by the word: nothing runs a handler in the task, there are no
+  masks and no process groups, nothing is sent when a child exits or a
+  terminal changes size, and in a pseudo-terminal Ctrl-C is a byte. A fault in
+  ring 3 ends the task with the negated Linux signal number as its status,
+  which is the only place those numbers appear.
 - **AVX.** `CR4.OSXSAVE` is clear, so an AVX instruction faults. Turning it on
   means moving the per-task floating-point state from `FXSAVE` to `XSAVE`
   first — see [`docs/fpu.md`](docs/fpu.md).

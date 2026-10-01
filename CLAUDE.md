@@ -360,10 +360,14 @@ Three things follow from that, and breaking any of them is quiet:
 - `fork` copies every page the caller owns, eagerly, and a threaded program
   cannot `exec`: POSIX has it end every other thread, and ending them means
   unwinding what they hold in a server, so it is refused rather than half done.
-- There are **no signals**. A terminal's Ctrl-C reaches the program in it as a
-  byte rather than as a signal, there are no process groups for one to go to,
-  and a task that faults ends with the negated Linux signal number as its exit
-  status because that is the only place a signal number means anything here.
+- There are **no POSIX signals**. The kernel has three of its own — interrupt,
+  terminate and kill, raised with `SYS_SIGNAL` as bits in a task's notification
+  word, with a five-second deadline before the task is ended — and nothing a C
+  program would recognise: no handler runs in the task, there are no masks and
+  no process groups, and a pseudo-terminal's Ctrl-C reaches the program in it
+  as a byte (`ISIG` is stored and not acted on). A task that faults ends with
+  the negated Linux signal number as its exit status, which is the only place
+  those numbers mean anything here.
 - A pty's window size is stored and nothing is told when it changes: Linux
   sends `SIGWINCH`, and there are no signals. A program that draws itself to
   the terminal's size reads it once.
