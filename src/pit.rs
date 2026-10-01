@@ -26,6 +26,7 @@ pub fn tick() {
     crate::ipc::check_timeouts();
     crate::futex::check_timeouts();
     crate::ipc::check_signal_deadlines();
+    crate::signal::tick(now);
     crate::scheduler::timer_tick();
 }
 

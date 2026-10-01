@@ -275,6 +275,7 @@ pub fn exit_with(code: i32) -> ! {
                 unblock_task(parent);
             }
         }
+        tell_parent(current);
         schedule_inner(false);
     }
     // Should never reach here
@@ -983,6 +984,29 @@ pub fn end_program(tid: usize, code: i32) -> Result<(), ()> {
     ended
 }
 
+/// Task `tid` has just died: tell its parent's program, as SIGCHLD.
+///
+/// Only if the parent is another program. A thread's parent is the task that
+/// made it, in the program they share, and a thread ending is that program
+/// carrying on, not a child of it ending. A program that has not asked to
+/// hear is not troubled: the signal's default is to do nothing.
+///
+/// After the parent has been woken from `sys_wait`, if it was in one, so
+/// that the child is there to collect by the time anything hears of it.
+/// Interrupts are off.
+unsafe fn tell_parent(tid: usize) { unsafe {
+    let Some(ref task) = TASKS[tid] else { return };
+    let parent = task.parent_tid;
+    if parent == 0 {
+        return;
+    }
+    let theirs = TASKS[parent].as_ref().map_or(0, |p| p.space);
+    if theirs != 0 && theirs == task.space {
+        return;
+    }
+    crate::signal::child_ended(parent);
+}}
+
 /// End a task that is not the one running, with a status.
 fn end_other(tid: usize, code: i32) -> Result<(), ()> {
     unsafe {
@@ -1005,10 +1029,11 @@ fn end_other(tid: usize, code: i32) -> Result<(), ()> {
                     REAPED[tid] = true;
                     unblock_task(parent);
                 }
-                Ok(())
             }
-            _ => Err(()),
+            _ => return Err(()),
         }
+        tell_parent(tid);
+        Ok(())
     }
 }
 

@@ -72,6 +72,10 @@ pub const SYS_SIG_TAKE: u64 = 13;
 pub const SYS_PID: u64 = 14;
 /// SYS_SIG_RAISE: the program is named by its process id.
 const RAISE_BY_PID: u64 = 1;
+/// Have SIGALRM raised for the caller's program after a time.
+pub const SYS_SIG_ALARM: u64 = 15;
+/// SYS_SIG_ALARM: say how the alarm stands and change nothing.
+const ALARM_ASK: u64 = 1;
 
 // --- 0x10  IPC ---
 pub const SYS_SEND: u64 = 16;
@@ -332,7 +336,7 @@ pub const SYS_ABI_VERSION: u64 = 240;
 /// minor when calls are added. User space can refuse to run against a major it
 /// does not know, which is the point of exposing it at all.
 pub const ABI_VERSION_MAJOR: u64 = 3;
-pub const ABI_VERSION_MINOR: u64 = 4;
+pub const ABI_VERSION_MINOR: u64 = 5;
 
 /// Threads a task may make with no capability at all.
 ///
@@ -3086,6 +3090,12 @@ extern "C" fn syscall_dispatch(
                 Ok(()) => 0,
                 Err(()) => u64::MAX,
             }
+        }
+        SYS_SIG_ALARM => {
+            // arg0 = ticks from now until SIGALRM is raised for the caller's
+            // program, 0 for no alarm; arg1 = ticks between repeats after
+            // that, 0 for none; arg2 = 1 to ask how it stands and no more.
+            crate::signal::alarm(scheduler::current_tid(), arg0, arg1, arg2 & ALARM_ASK != 0)
         }
         SYS_SIG_TAKE => {
             // arg0 = where in the caller's memory to say that there is

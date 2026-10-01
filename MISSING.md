@@ -29,10 +29,16 @@ them struck through as done. What follows is what is true now.
 - **Process groups, sessions and jobs.** Ctrl-C goes to every program holding
   the terminal, the signals that stop a program do nothing, and there is no
   foreground to hand a terminal to. A shell runs with job control off.
-- **Signals nothing raises.** None when a child ends, none when a timer runs
-  out — there is no `alarm` — and none when a terminal changes size. A pipe
+- **Signals nothing raises.** None when a terminal changes size. A pipe
   with nobody reading it is found out by the writer's runtime, which asks
-  what kind of thing the descriptor is.
+  what kind of thing the descriptor is. (An alarm and a child ending are
+  raised: `SYS_SIG_ALARM`, and SIGCHLD.) There is one alarm for a program,
+  in real time; nothing measures the time a program spends running, so there
+  is nothing to raise for that.
+- **Process ids that come round.** A process id is an endpoint number, and
+  those only go up. A C `pid_t` holds two thousand million of them; Linux
+  wraps and reuses, and here the task after that many has an id a C program
+  cannot hold.
 - **A mask the kernel knows.** A signal a program has blocked is held back by
   its runtime, which can only hold back what it would have run: a blocked
   signal with no handler does what it does at once.

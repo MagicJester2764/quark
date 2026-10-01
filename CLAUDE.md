@@ -127,7 +127,7 @@ system hung.
 
 There are no tests in this tree, and that is the shape of a microkernel rather
 than an omission: the kernel is tested from outside, through the ABI, by a
-program. `dtest` in `../quarkutils` makes 356 checks — capabilities, IPC,
+program. `dtest` in `../quarkutils` makes 374 checks — capabilities, IPC,
 memory, descriptors, signals, scheduling, `dtest calls` with three million calls in
 three seconds — and `qfuzz` throws random requests at every service.
 
@@ -451,6 +451,17 @@ no job control starts a background job that Ctrl-C does not reach.
   from. `getty`, `login` and `qsh` hold it too, and each says what it does
   about signal 2; a new program that holds a session's terminal and is not
   what the session runs has to say so too, or Ctrl-C ends it.
+- **Two signals are raised by the kernel of its own accord**, because nothing
+  else can raise them: SIGALRM when a program's alarm is due
+  (`SYS_SIG_ALARM`; the alarm is in the program's table, so `exec` keeps it
+  and `fork` does not copy it), and SIGCHLD for a program when a task that is
+  a child of it — its parent in another program, so not a thread — dies. A
+  program that waits for a child *or* a time, whichever comes first, is
+  woken by the one that came; before, GNU `timeout` sat in `sigsuspend` for
+  ever. The alarm is raised from the timer tick, one program at a time, each
+  alarm put away before its signal is raised: for a program that has said
+  nothing the signal is the end of it, and if that is the program the tick
+  interrupted, `signal::tick` does not return.
 
 ## Scheduling
 
@@ -527,8 +538,8 @@ closed:
   handler runs at a system-call boundary and nowhere else: a program that
   handles a signal and computes without making a call is not interrupted.
   There are no process groups, no sessions and no jobs — the signals that stop
-  a program do nothing. Nothing is raised when a child ends, when a timer runs
-  out (there is no `alarm`), or when a terminal changes size. A signal a
+  a program do nothing. Nothing is raised when a terminal changes size. A
+  signal a
   program has blocked and has no handler for is not held back: the mask is its
   runtime's, and the kernel does what the signal does at once. A wait for a
   child is not one of the waits a signal ends. And the three *task* signals

@@ -67,6 +67,13 @@ struct Table {
     /// a word its runtime looks at on its way out of every system call. 0
     /// until it has said where.
     sig_word: usize,
+    /// The tick at which SIGALRM is next raised for the program, 0 for never,
+    /// and how many ticks after that to raise it again, 0 for not at all.
+    /// One for the program, so one for all its threads. `exec` keeps it,
+    /// which is what lets a program be started with a time to finish in;
+    /// `fork` does not copy it, since the child set no alarm.
+    alarm_at: u64,
+    alarm_every: u32,
 }
 
 /// What a program that has said nothing leaves off: write for group and other.
@@ -82,6 +89,8 @@ const EMPTY: Table = Table {
     sig_pending: 0,
     sig_interrupt: false,
     sig_word: 0,
+    alarm_at: 0,
+    alarm_every: 0,
 };
 
 /// As many tables as tasks: each task uses exactly one.
@@ -517,6 +526,53 @@ pub fn sig_interrupted(tid: usize) -> bool {
     };
     irq_restore(flags);
     was
+}
+
+/// How the alarm of `tid`'s program stands at tick `now`: the ticks left of
+/// it, which is 0 only if there is none, and what it repeats at. With `new`
+/// it is then set to that — `(ticks from now, repeat)`, 0 ticks for no alarm.
+/// `None` for a task in no program.
+pub fn alarm(tid: usize, now: u64, new: Option<(u32, u32)>) -> Option<(u32, u32)> {
+    let flags = irq_save();
+    let was = unsafe {
+        table_mut(tid).map(|t| {
+            let left = match t.alarm_at {
+                0 => 0,
+                at => at.saturating_sub(now).clamp(1, u32::MAX as u64) as u32,
+            };
+            let was = (left, t.alarm_every);
+            if let Some((ticks, every)) = new {
+                t.alarm_at = if ticks == 0 { 0 } else { now + ticks as u64 };
+                t.alarm_every = if ticks == 0 { 0 } else { every };
+            }
+            was
+        })
+    };
+    irq_restore(flags);
+    was
+}
+
+/// A task of a program whose alarm is due at tick `now`, the alarm having
+/// been set for its next time or turned off. `None` when no program's is.
+pub fn alarm_due(now: u64) -> Option<usize> {
+    let flags = irq_save();
+    let due = unsafe {
+        let of = &*core::ptr::addr_of!(OF_TASK);
+        let mut found = None;
+        for (i, t) in tables().iter_mut().enumerate() {
+            if t.tasks == 0 || t.alarm_at == 0 || t.alarm_at > now {
+                continue;
+            }
+            t.alarm_at = if t.alarm_every == 0 { 0 } else { now + t.alarm_every as u64 };
+            found = of.iter().position(|&table| table != NONE && table as usize == i);
+            if found.is_some() {
+                break;
+            }
+        }
+        found
+    };
+    irq_restore(flags);
+    due
 }
 
 /// The tasks of `tid`'s program — every task using its table — into `out`.

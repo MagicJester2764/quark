@@ -1,6 +1,6 @@
 # Quark syscall ABI
 
-**Version 3.4.** Query the running kernel with `SYS_ABI_VERSION` (240), which
+**Version 3.5.** Query the running kernel with `SYS_ABI_VERSION` (240), which
 returns `(major << 16) | minor`.
 
 This document is the contract between the Quark kernel and everything above it.
@@ -192,6 +192,7 @@ returning at once turned that loop into a spin.
 | 3.2 | What a shell asks of a kernel that is not about descriptors. `SYS_UMASK` (9): the permission bits a program leaves off what it makes. The kernel makes no files and never reads it; it keeps it because it must follow a program across `SYS_FORK` and `SYS_EXEC_SPACE`, which a C library's memory does not. `SYS_WAIT_FOR` (10): wait for one child in particular, or ask without waiting — `waitpid` with a process id, and `WNOHANG`. Three things change with no new number. `SYS_TASK_KILL` (5), the kill bit of `SYS_SIGNAL` (6) and a signal's deadline end the *program* the task named belongs to, and so does a fault: every task in the address space, where each used to end one task and leave its threads. A task of the caller's own program is still ended alone. A pty's line discipline acts on `ISIG` and on the erase, kill, word-erase and end-of-file characters. And a write to a pty's slave waits for room and writes everything, where it used to return what fitted — which could be nothing. |
 | 3.3 | **Signals a program can handle.** `SYS_SIG_ACTION` (11) says what the caller's program does about a signal — nothing, ignore it, or run a handler — `SYS_SIG_RAISE` (12) raises one for the program a task belongs to, and `SYS_SIG_TAKE` (13) returns the ones raised that have a handler. The kernel carries out a signal's default, which is nearly always the end of the program; a handler it never runs — the program's runtime does, having been told by a word in its own memory and by the wait it was in ending early: a read of a terminal, `SYS_POLL`, `SYS_POLLSET_WAIT` and a sleep can now answer that a signal ended them. A terminal's interrupt and quit characters raise 2 and 3 for every program holding its slave. `SYS_FD_KIND` (230) says what a descriptor names and whether its other end has gone, which is how a write that failed is told apart: nobody reading, or no such descriptor. |
 | 3.4 | **A process id that is never used twice.** `SYS_PID` (14) answers with the process id of the program a task belongs to: the number of the task it began as, which no other task is ever given. `SYS_WAIT_FOR` (10) takes a flag to name the child that way, there and back, and `SYS_SIG_RAISE` (12) a third argument to name its target so. A task id is a slot, and a slot let go is the next one handed out; a program that remembers a child's number — every shell — took the next thing it started for the last thing it had. |
+| 3.5 | **Two signals the kernel raises itself.** `SYS_SIG_ALARM` (15) has SIGALRM raised for the caller's program after a time, once or again and again: the program's alarm, one for all its threads, kept across `SYS_EXEC_SPACE` and not copied by `SYS_FORK`. And SIGCHLD is raised for a program when a child of it ends, which does nothing to one that has not asked to hear. Nothing could stand in for either: a program waiting for a child *or* a time, whichever comes first, has to be woken by the one that came, and until now it was woken by neither. GNU `timeout` waited for ever, and a shell's `read -t` never timed out. |
 
 3.1 was a change of behaviour and no change of number, so a minor: nothing built for
 3.0 calls anything that means something else now. What it could have relied on
@@ -282,6 +283,7 @@ everything else returns promptly.
 | 12 | `SYS_SIG_RAISE` | arg0 = a task of the program to signal, or with arg2 = 1 its process id; arg1 = signal, or 0 to ask whether one could be raised | 0 / `u64::MAX` | `TaskMgmt` for target, or same UID |
 | 13 | `SYS_SIG_TAKE` | arg0 = where to be told of the next (a `u32` in the caller's memory), or 0 to leave that as it is | the signals waiting for a handler, bit `n - 1` for signal `n`; none is waiting afterwards | — |
 | 14 | `SYS_PID` | arg0 = a task, or 0 for the caller | the process id of the program it belongs to / `u64::MAX` | — |
+| 15 | `SYS_SIG_ALARM` | arg0 = ticks until signal 14 is raised for the caller's program, 0 for no alarm; arg1 = ticks between repeats after that, 0 for none; arg2 = 1 to ask and change nothing | how the alarm stood: `ticks left \| (repeat << 32)`, 0 if there was none / `u64::MAX` | — |
 
 A status is kept as its low eight bits, as Linux's wait status keeps it. A
 negative status is how the kernel says a task was killed — `SYS_TASK_KILL`
@@ -381,9 +383,29 @@ shell has no job control — it handles the signal, what it starts in the
 background it starts ignoring it, and what it runs in the foreground has said
 nothing.
 
-Nothing is raised when a child ends, when a terminal changes size, when a
-timer runs out or when a pipe has nobody reading it; the last a runtime can
-find out for itself (`SYS_FD_KIND`).
+The kernel raises two more itself, because nothing else can.
+
+*An alarm.* `SYS_SIG_ALARM` has signal 14 raised for the caller's program so
+many ticks from now, and then, if asked, every so many ticks after that. It
+is the program's: one for all its tasks, so setting it replaces the one there
+was, and the answer says how that one stood — the ticks left of it, which is
+0 only if there was none, and what it repeated at. `SYS_EXEC_SPACE` keeps it,
+which is how a program is started with a time to finish in; a forked child
+has none, having set none. A count that does not fit 32 bits is taken as the
+largest that does. A program that has said nothing about signal 14 is ended
+by it, like any other.
+
+*A child ending.* When a task whose parent is in another program dies,
+signal 17 is raised for the parent's program, after the parent has been
+woken from `SYS_WAIT` if it was in one — so the child is there to collect
+when anything hears of it. A thread ending is not a child ending: its parent
+is the task that made it, in the program they share. Signal 17 does nothing
+to a program that has said nothing, so only one that handles it is told, and
+ignoring it changes nothing either: a dead child waits to be collected
+whatever its parent has said.
+
+Nothing is raised when a terminal changes size or when a pipe has nobody
+reading it; the last a runtime can find out for itself (`SYS_FD_KIND`).
 
 **Task signals** are older and are not those. `SYS_SIGNAL` takes bits:
 interrupt (`1 << 16`), terminate (`1 << 17`) and kill (`1 << 18`). The kill

@@ -26,8 +26,11 @@
 //! that has asked to handle a signal and then computes for ever without a
 //! call is not interrupted by it. Everything else about signals that is
 //! missing is missing on purpose and written down in `MISSING.md`: process
-//! groups, jobs that stop, a signal when a child ends, one when a terminal
-//! changes size.
+//! groups, jobs that stop, a signal when a terminal changes size.
+//!
+//! Two signals the kernel raises of its own accord, because nothing else
+//! can: SIGALRM when a program's alarm is due ([`alarm`], [`tick`]), and
+//! SIGCHLD for a program when a child of it ends ([`child_ended`]).
 //!
 //! What a program has said lives in its descriptor table's record
 //! (`fdtable.rs`), for the reason its umask does: `fork` copies it and `exec`
@@ -56,6 +59,7 @@ pub const INTERRUPTED: u64 = 0xFFFF_FFFD;
 pub const SIGINT: u8 = 2;
 pub const SIGQUIT: u8 = 3;
 pub const SIGKILL: u8 = 9;
+const SIGALRM: u8 = 14;
 const SIGCHLD: u8 = 17;
 const SIGCONT: u8 = 18;
 pub const SIGSTOP: u8 = 19;
@@ -159,6 +163,41 @@ fn wake(tid: usize) {
         crate::ipc::wake_sleeper(t);
         crate::pty::interrupt(t);
     }
+}
+
+/// `SYS_SIG_ALARM`: have SIGALRM raised for `tid`'s program `ticks` ticks from
+/// now, and every `every` ticks after that if that is not 0; no ticks is no
+/// alarm. With `ask`, nothing is changed. Answers with how the alarm stood
+/// before: the ticks left of it, and above them what it repeated at.
+///
+/// A time further off than a count of 32 bits is that count: sixteen months.
+pub fn alarm(tid: usize, ticks: u64, every: u64, ask: bool) -> u64 {
+    let far = |t: u64| t.min(u32::MAX as u64) as u32;
+    let new = if ask { None } else { Some((far(ticks), far(every))) };
+    match fdtable::alarm(tid, crate::pit::ticks(), new) {
+        Some((left, every)) => left as u64 | (every as u64) << 32,
+        None => u64::MAX,
+    }
+}
+
+/// The timer's part in that, on every tick: SIGALRM for each program whose
+/// alarm is due.
+///
+/// One at a time, each alarm seen to before its signal is raised, because
+/// raising it may be the last thing this does: a program that has said
+/// nothing about SIGALRM is ended by it, and if that is the program the tick
+/// interrupted there is nothing to come back to. Whatever else was due is
+/// still due at the next tick.
+pub fn tick(now: u64) {
+    while let Some(tid) = fdtable::alarm_due(now) {
+        let _ = raise(tid, SIGALRM);
+    }
+}
+
+/// A child of `parent` has ended: SIGCHLD for the parent's program, which
+/// does nothing to one that has not asked to hear of it.
+pub fn child_ended(parent: usize) {
+    let _ = raise(parent, SIGCHLD);
 }
 
 /// Should the running task not wait, because a signal has arrived for a
