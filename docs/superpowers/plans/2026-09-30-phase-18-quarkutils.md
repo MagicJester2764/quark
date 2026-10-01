@@ -78,7 +78,7 @@ history.
 - Modify: `quark/tools/check-abi.sh`
 - Modify: `quark/docs/abi.md`
 
-- [ ] **Step 1: make the check fail on what is wrong now.** Add to
+- [x] **Step 1: make the check fail on what is wrong now.** Add to
   `tools/check-abi.sh`: every `SYS_*` constant in `src/syscall.rs` has a row in
   a reference table of `docs/abi.md` with the same number (either column
   order — the deprecated table lists name first), no row names a call the
@@ -86,10 +86,10 @@ history.
   `ABI_VERSION_MAJOR.ABI_VERSION_MINOR`. Run it; expect it to fail naming
   `SYS_ADDRSPACE_SELF` (41), `SYS_SET_FS_BASE` (102) and
   `SYS_TASK_START_ARG` (103).
-- [ ] **Step 2: write the three rows**, from what the kernel does: read each
+- [x] **Step 2: write the three rows**, from what the kernel does: read each
   arm of the dispatch for its arguments, its return values and what it asks
   for.
-- [ ] **Step 3: run the check; expect it to pass.** Commit.
+- [x] **Step 3: run the check; expect it to pass.** Commit.
 
 ---
 
@@ -104,12 +104,12 @@ history.
   `QUARK_ABI_VERSION_MINOR` and one `#define SYS_NAME number` per call, sorted
   by number — and `$(DESTDIR)/usr/share/doc/quark/abi.md`.
 
-- [ ] **Step 1: `tools/gen-abi-header.sh`** reads `src/syscall.rs` and writes
+- [x] **Step 1: `tools/gen-abi-header.sh`** reads `src/syscall.rs` and writes
   the header to stdout. Generated, never edited: the Rust constants stay the
   one place a number is written in this repository.
-- [ ] **Step 2: `make install`** writes both files. Check the header compiles
+- [x] **Step 2: `make install`** writes both files. Check the header compiles
   (`cc -fsyntax-only`) and carries 113 calls.
-- [ ] **Step 3:** commit.
+- [x] **Step 3:** commit.
 
 ---
 
@@ -120,10 +120,10 @@ history.
 - Create in it: `Makefile`, `rust-toolchain.toml`, `.gitignore`,
   `tools/check-abi.sh`, `README.md`, `CLAUDE.md`
 
-- [ ] **Step 1: record what the tree installs today**, to compare against:
+- [x] **Step 1: record what the tree installs today**, to compare against:
   `make -C quark install DESTDIR=/tmp/.../before`, and the sorted list of files
   with their sizes.
-- [ ] **Step 2: split.** A fresh clone of `quark`, then
+- [x] **Step 2: split.** A fresh clone of `quark`, then
   ```bash
   git filter-repo --path user/ --path x86_64-unknown-quark.json \
       --path rust-std-patches/ --path docs/vfs.md --path docs/wayland.md \
@@ -131,19 +131,19 @@ history.
   ```
   The clone's `origin` is removed by the tool, which is wanted: nothing here
   should be pushable to `quark` by accident.
-- [ ] **Step 3: the build.** A `Makefile` made from the user half of
+- [x] **Step 3: the build.** A `Makefile` made from the user half of
   `quark/Makefile` — the same programs, the same install layout
   (`drivers/init.elf`, `boot/*.ELF`, `usr/bin/*.ELF`, `etc/PASSWD`), one rule
   per kind of program instead of one per program. `rust-toolchain.toml` with
   the same pin, because a crate here no longer inherits the kernel's.
-- [ ] **Step 4: its own check.** `tools/check-abi.sh`: quark-rt and the C
+- [x] **Step 4: its own check.** `tools/check-abi.sh`: quark-rt and the C
   header agree, no number is used twice; and, given the kernel's installed
   `abi.h`, quark-rt's table equals it exactly. With no installed header it
   says it skipped that half.
-- [ ] **Step 5: build it alone and compare.** `make install` into a fresh
+- [x] **Step 5: build it alone and compare.** `make install` into a fresh
   directory, then the kernel's install into the same one; the file list must
   equal step 1's.
-- [ ] **Step 6:** `README.md`, `CLAUDE.md` (the userland half of
+- [x] **Step 6:** `README.md`, `CLAUDE.md` (the userland half of
   `quark/CLAUDE.md`, every paragraph on exactly one side), commit.
 
 ---
@@ -153,9 +153,9 @@ history.
 **Files:**
 - Modify: `rust/library/Cargo.toml` (one line)
 
-- [ ] **Step 1:** `quark-rt = { path = '../../quarkutils/quark-rt' }`, a
+- [x] **Step 1:** `quark-rt = { path = '../../quarkutils/quark-rt' }`, a
   commit on the fork's `quark` branch.
-- [ ] **Step 2:** `make` in `quarkutils` builds `hello` and `httpget` against
+- [x] **Step 2:** `make` in `quarkutils` builds `hello` and `httpget` against
   it; the stamp logic that cleans a hosted build when quark-rt changes moves
   with the rule.
 
@@ -169,16 +169,16 @@ history.
 - Modify: `explosion/toolchain/build-musl.sh`, `build.sh`,
   `build-xkbcommon.sh`, `README.md`s
 
-- [ ] **Step 1: staging.** `QUARKUTILS_DIR ?= ../quarkutils`; the kernel is
+- [x] **Step 1: staging.** `QUARKUTILS_DIR ?= ../quarkutils`; the kernel is
   installed first and the userland second, into the same stage, with the
   kernel's header required rather than optional — the integrated build is the
   one place the comparison must not be skipped.
-- [ ] **Step 2: the toolchain's paths.** The musl specs name three things
+- [x] **Step 2: the toolchain's paths.** The musl specs name three things
   inside the userland checkout — the C library's headers, `manifest.o` and
   `liblinux-abi.a`. They become `$QUARKUTILS_DIR/...`, and writing the specs
   and the two wrappers becomes a script of its own so that moving a checkout
   does not mean rebuilding musl. `QUARK_SRC` stops meaning two things.
-- [ ] **Step 3: boot.** The image assembles from the three and boots to the
+- [x] **Step 3: boot.** The image assembles from the three and boots to the
   shell; `dtest` passes. `quark/user/` is still on disk at this point and
   nothing reads it.
 
@@ -193,13 +193,13 @@ runtime compiled for ABI 3 can now meet a kernel that has moved on.
 - Modify: `quarkutils/quark-rt/src/syscall.rs`, `quarkutils/tools/check-abi.sh`,
   `quarkutils/init/src/main.rs`
 
-- [ ] **Step 1:** `quark_rt::syscall::ABI_VERSION_MAJOR` / `_MINOR`: the ABI
+- [x] **Step 1:** `quark_rt::syscall::ABI_VERSION_MAJOR` / `_MINOR`: the ABI
   this runtime was written against. The check compares them with the installed
   header: same major, and a minor the kernel has reached.
-- [ ] **Step 2:** `init` asks the kernel (`SYS_ABI_VERSION`, which has not
+- [x] **Step 2:** `init` asks the kernel (`SYS_ABI_VERSION`, which has not
   moved since 1.0) before it does anything else, says both versions, and stops
   if the major differs — every number after that is a guess.
-- [ ] **Step 3:** boot; the line is on the console. Commit.
+- [x] **Step 3:** boot; the line is on the console. Commit.
 
 ---
 
@@ -211,22 +211,22 @@ runtime compiled for ABI 3 can now meet a kernel that has moved on.
 - Modify: `quark/Makefile`, `quark/tools/check-abi.sh`, `quark/.gitignore`,
   `quark/README.md`, `quark/CLAUDE.md`
 
-- [ ] **Step 1:** `git rm`; the Makefile keeps the kernel, the two `.drv`
+- [x] **Step 1:** `git rm`; the Makefile keeps the kernel, the two `.drv`
   modules, the GRUB image and `install`.
-- [ ] **Step 2:** `tools/check-abi.sh` loses the two comparisons that moved and
+- [x] **Step 2:** `tools/check-abi.sh` loses the two comparisons that moved and
   keeps what is the kernel's: one number per call, and a document that agrees.
-- [ ] **Step 3:** `README.md` and `CLAUDE.md` say what is here now and where
+- [x] **Step 3:** `README.md` and `CLAUDE.md` say what is here now and where
   the rest went.
-- [ ] **Step 4:** `make clean && make` with no `user/` on disk. Commit.
+- [x] **Step 4:** `make clean && make` with no `user/` on disk. Commit.
 
 ---
 
 ### Task 8: Acceptance
 
-- [ ] **Step 1:** everything rebuilt from the new layout — both repos clean,
+- [x] **Step 1:** everything rebuilt from the new layout — both repos clean,
   the C world relinked against the regenerated specs.
-- [ ] **Step 2:** ext2 and ext4: `dtest`, `runtests /etc/libc.tests`,
+- [x] **Step 2:** ext2 and ext4: `dtest`, `runtests /etc/libc.tests`,
   `runtests /etc/pixman.tests`, `wm hello-world`, `check-rootfs.sh`.
-- [ ] **Step 3:** `ROADMAP.md`; the memory index's paths.
+- [x] **Step 3:** `ROADMAP.md`; the memory index's paths.
 - [ ] **Step 4:** the question that is the user's: create
   `MagicJester2764/quarkutils` and push.
