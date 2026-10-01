@@ -9,14 +9,16 @@ use alloc::alloc::{alloc, dealloc, Layout};
 pub const MAX_TASKS: usize = 64;
 pub const KERNEL_STACK_SIZE: usize = 65536; // 64 KiB per task
 const STACK_ALIGN: usize = 16;
-/// Descriptors per task.
+/// Descriptors per program.
 ///
 /// Eight was three spoken for and five left, which is not enough for a program
 /// holding a display-server connection, a memory object per buffer pool and a
-/// pipe or two. Thirty-two costs `MAX_TASKS * 32 * size_of::<FdKind>()` of
-/// kernel memory — about fifty kilobytes for the whole system — and is spent
-/// whether or not it is used, because the table is inline in the task.
-pub const MAX_FDS: usize = 32;
+/// pipe or two. Thirty-two was enough until files became descriptors too: a C
+/// program then had thirty-two of the kernel's and sixteen of its library's,
+/// and the two are one table now. Sixty-four costs about a hundred kilobytes
+/// for the whole system, spent whether or not it is used — see `fdtable.rs`,
+/// which is where the tables are.
+pub const MAX_FDS: usize = 64;
 
 /// What the syscall entry stub pushed, read back as a structure.
 ///
@@ -71,6 +73,9 @@ pub enum FdKind {
     /// every main loop is built out of, in one descriptor rather than a pipe's
     /// two.
     Event { ev: usize },
+    /// An object in a server — a file, most often — named by a number the
+    /// server chose. See `served.rs`.
+    Served { obj: usize },
     /// A network connection, held by the net server as `handle`.
     ///
     /// Unlike `Ipc`, which is one-directional and carries a fixed tag, a
@@ -135,8 +140,6 @@ pub struct Task {
     pub caps: u32,
     /// Object capability space (16 slots).
     pub cspace: CSpace,
-    /// File descriptor table. fd 0=stdin, 1=stdout, 2=stderr.
-    pub fds: [FdKind; MAX_FDS],
     /// Pager task TID for exception forwarding. 0 = no pager (kill on fault).
     pub pager_tid: usize,
     /// Parent task TID. 0 = no parent (init/kernel tasks).
@@ -226,7 +229,6 @@ impl Task {
             space: 0,
             caps: 0,
             cspace: cap::empty_cspace(),
-            fds: [FdKind::empty(); MAX_FDS],
             pager_tid: 0,
             parent_tid: 0,
             mem_pages: 0,

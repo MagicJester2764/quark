@@ -587,16 +587,8 @@ pub fn of_fd(tid: usize, fd: usize) -> Option<(usize, u8)> {
     if fd >= MAX_FDS {
         return None;
     }
-    let flags = irq_save();
-    let out = unsafe {
-        match scheduler::get_task_mut(tid) {
-            Some(t) => match t.fds[fd] {
-                FdKind::PtyEnd { pty, end } => Some((pty, end)),
-                _ => None,
-            },
-            None => None,
-        }
-    };
-    irq_restore(flags);
-    out
+    match crate::fdtable::get(tid, fd) {
+        FdKind::PtyEnd { pty, end } => Some((pty, end)),
+        _ => None,
+    }
 }

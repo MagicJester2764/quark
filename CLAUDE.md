@@ -224,6 +224,22 @@ may keep — are in `../quarkutils/CLAUDE.md`; these are the kernel's.
   `sys_call_offer` puts one on a call and `sys_cap_take` accepts it; nothing
   else can fill a server's CSpace, and a claim or registration made without
   one is refused.
+- **A descriptor is its program's, and every change to the table is one
+  step.** Every task of a program uses one table (`fdtable.rs`), so a sibling
+  can be preempted half way through anything. "Find a free number and fill
+  it" is `fdtable::install`, with interrupts off across both halves; reading a
+  descriptor and taking a reference for a copy of it is `get_retained`. A call
+  that looks a descriptor up and then acts on it in two steps has a window in
+  which a sibling closes it and somebody else is given the slot.
+- **A task about to wait on what a descriptor names holds it** (`fdtable::hold`,
+  given back by `unhold`, or by `task_gone` for a task killed where it
+  waited). Without it a sibling's `close` frees the pipe under a parked read,
+  and the read wakes up in whatever takes the slot next — another program's
+  pipe.
+- **A reference to what a descriptor names belongs to no task.**
+  `pipe::retain_fd` and `release_fd` take no owner. Shared memory used to keep
+  a count per task, which a table two threads share cannot have: the region
+  went with whichever of them died first.
 - **A program is its address space, not its task.** `SYS_TASK_SPACE` names the
   program a task belongs to with an id the kernel never reuses, and
   `SYS_SPACE_WATCH` says when its last task has gone. TIDs are recycled; space
@@ -263,12 +279,35 @@ another waits until it is not zero and takes what is there. It is what glib,
 libwayland and GTK reach for first to wake a sleeping loop; a pipe is only ever
 their fallback.
 
+And **a file is one**, though the file is not the kernel's. A *served
+descriptor* (`served.rs`) names an object in a server by a number the server
+chose; the kernel counts who holds it and nothing more. That is what makes a
+file an ordinary descriptor — copied by `fork`, kept by `exec`, put where a
+program's standard output was — instead of a number each C library made up
+and kept in memory that `exec` throws away. Three things hold it together:
+
+- A server gives one only to a task that is calling it (`SYS_FD_SERVE`), and
+  believes a request that names a cookie only after asking whether the caller
+  holds it (`SYS_FD_HOLDS`). There is no other way to come by one.
+- The last close is told to the server as a flag and collected with a call
+  (`SYS_FD_REAP`), so a busy server loses none. A queue here would be a place
+  to drop a file's last close.
+- A read or a write through one is a call the kernel makes for the task
+  (`ipc::served_call`), with the task's buffer lent. The task needs no
+  capability for the server: the descriptor is the permission, as it is for a
+  pipe.
+
+Descriptor 64 — one past the ordinary numbers — is the program's working
+directory, a served descriptor like any other. It is in the table so that it
+follows a program through `fork` and `exec` with no server being told.
+
 Adding a kind means touching every place that enumerates them, and missing one
 is quiet: `FdKind` in `task.rs`, read and write in both their blocking and
 non-blocking forms in `syscall.rs`, `pipe::release_fd` and `pipe::retain_fd`
-(a kind in one and not the other leaks or double-frees), and
-`pollset::watchable` and `readiness` — `poll` answered `POLLNVAL` for a
-terminal until the last of those knew about it.
+(a kind in one and not the other leaks or double-frees), `fdtable::hold`'s
+list of what a task can be parked on, and `pollset::watchable` and
+`readiness` — `poll` answered `POLLNVAL` for a terminal until the last of
+those knew about it.
 
 ## What a process is
 
@@ -301,6 +340,14 @@ every Unix program assumes:
   address space — and therefore a new program as far as every server is
   concerned. The thread pointer is cleared with it, or the new program's first
   thread-local reads through an address the old one had.
+- **`fork` copies the descriptor table; `exec` keeps it.** The child gets a
+  second descriptor for everything the parent has open, the working directory
+  included; `exec` closes what was marked for it (`SYS_FD_FLAGS`) and nothing
+  else. A thread does neither: it uses its program's table.
+- **A program ends as a whole** (`SYS_EXIT_PROGRAM`). `SYS_EXIT_CODE` ends one
+  task, which is what a thread wants and never what `exit` means: the other
+  threads stayed parked on locks nobody would release, holding the program's
+  descriptors, and a compositor never heard its client go.
 - **A kernel budget is per program, not per TID.** A pipe outlives its
   creator — its ends are descriptors other tasks hold — so counting the
   per-task cap by TID gave a fresh task the budget of whatever had its number
@@ -376,10 +423,12 @@ Three things follow from that, and breaking any of them is quiet:
 - The page cache for mapped files holds 8192 pages across 256 objects and
   nothing evicts them under pressure: a mapped file's pages stay until nothing
   maps the file any more.
-- A thread starts with a copy of what its creator holds — capabilities and
-  descriptors, poll sets and sockets excepted — not a share of it: what either
-  is given or closes afterwards, the other does not see. A pipe end that was
-  open when a thread started stays open until that thread closes it or exits.
+- A thread starts with a copy of its creator's *capabilities*, not a share of
+  them: what either is granted or gives up afterwards, the other does not see.
+  (Descriptors are shared: they are the program's.)
+- A poll set a task is parked on is not held the way a pipe is: a sibling
+  closing the set while another thread waits on it leaves that thread to its
+  timeout. A one-shot `SYS_POLL` makes a set of its own and is not affected.
 - **SMP.** The kernel is uniprocessor and several invariants depend on it —
   `IrqSpinLock` panics on contention precisely because on one CPU contention
   can only mean lock re-entrancy.

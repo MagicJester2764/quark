@@ -1,6 +1,6 @@
 # Quark syscall ABI
 
-**Version 3.0.** Query the running kernel with `SYS_ABI_VERSION` (240), which
+**Version 3.1.** Query the running kernel with `SYS_ABI_VERSION` (240), which
 returns `(major << 16) | minor`.
 
 This document is the contract between the Quark kernel and everything above it.
@@ -73,11 +73,12 @@ unused slots in a block are reserved for that subsystem.
 | 0xB0  | 176–191   | Sockets                       |
 | 0xC0  | 192–207   | Memory, continued             |
 | 0xD0  | 208–223   | Terminals                     |
+| 0xE0  | 224–239   | Descriptors, continued        |
 | 0xF0  | 240–255   | ABI introspection             |
 
-Block 0xE0 is unassigned and available for a new subsystem. Threads
-never needed one: a thread is a task started with its creator's address space,
-so it is built from calls that already existed.
+Every block is assigned. Threads never needed one: a thread is a task started
+with its creator's address space, so it is built from calls that already
+existed.
 
 ## Stability and deprecation
 
@@ -175,6 +176,17 @@ Also: **`SYS_POLL` with no descriptors is a sleep** rather than an immediate
 return. A main loop whose sources are all timeouts polls nothing at all, and
 returning at once turned that loop into a spin.
 
+### What each minor of 3 added
+
+| Version | Added |
+|---|---|
+| 3.1 | **A descriptor belongs to a program, and may name an object in a server.** Every task of a program uses one table, so what one thread opens its siblings see and what one closes is closed; a thread used to start on a copy of its creator's table and share nothing afterwards. Sixty-four descriptors rather than thirty-two. `SYS_EXIT_PROGRAM` (8) ends every task of the caller's program with one status, which is what `exit` means and what `SYS_EXIT_CODE` — one task — never did. Block 0xE0 opens with *served descriptors*: `SYS_FD_SERVE` (224), `SYS_FD_SERVED` (225), `SYS_FD_HOLDS` (226), `SYS_FD_COOKIE` (227) and `SYS_FD_REAP` (229) let a server give a client a descriptor for one of its own objects — a file — which the kernel then counts, copies across `SYS_FORK`, keeps across `SYS_EXEC_SPACE` and reads and writes through like any other. Descriptor 64 is the program's working directory. `SYS_FD_FLAGS` (228) marks a descriptor to close when its program becomes another, and `SYS_EXEC_SPACE` closes those. Memory named by a descriptor may be mapped by whoever holds the descriptor, and lasts as long as a descriptor names it or somebody has it mapped, whoever made it. |
+
+A change of behaviour and no change of number, so a minor: nothing built for
+3.0 calls anything that means something else now. What it could have relied on
+is a thread's copy of a descriptor outliving its sibling's `close`, and no
+program did.
+
 ### Deprecated
 
 Five calls are **deprecated as of 1.0** — the `CAP_*` object-capability calls
@@ -252,6 +264,7 @@ everything else returns promptly.
 | 5 | `SYS_TASK_KILL` | arg0 = tid | 0 / `u64::MAX` | `TaskMgmt` for target, or same UID |
 | 6 | `SYS_SIGNAL` | arg0 = tid, arg1 = signal bits | 0 / `u64::MAX` | as above |
 | 7 | `SYS_TASK_INFO` | arg0 = tid | packed info, or `u64::MAX` | — |
+| 8 | `SYS_EXIT_PROGRAM` | arg0 = status | does not return | — |
 
 A status is kept as its low eight bits, as Linux's wait status keeps it. A
 negative status is how the kernel says a task was killed — `SYS_TASK_KILL`
@@ -261,6 +274,12 @@ was.
 `SYS_EXIT` is equivalent to `SYS_EXIT_CODE(0)`; it exists separately because
 `syscall0` leaves RDI undefined, so the original call could not grow an
 argument.
+
+Both end the calling *task*. `SYS_EXIT_PROGRAM` ends the program: every other
+task in the caller's address space is ended with the same status, and then
+the caller. It is what a C library's `exit` and a Rust `main` returning mean.
+A thread ending itself uses `SYS_EXIT_CODE`, and a program whose first task
+does that goes on running in its other threads, with everything it has open.
 
 **Signals.** There are three, and they are bits: interrupt (`1 << 16`),
 terminate (`1 << 17`) and kill (`1 << 18`). `SYS_SIGNAL` with the kill bit ends
@@ -418,7 +437,14 @@ therefore not two. There are 256 regions in the system.
 
 `SYS_MEMFD_CREATE` makes the same region and names it with a descriptor, which
 is what lets it be passed over a stream, inherited across a spawn, or closed
-like anything else a program holds.
+like anything else a program holds. Such a region is mapped through the
+descriptor (`SYS_MMAP_FD`), by whoever holds one: no task is on a list for
+it, and `SYS_SHMEM_MAP`, `SYS_SHMEM_GRANT` and `SYS_SHMEM_DESTROY` by handle
+are refused. It
+lasts as long as a descriptor names it or somebody has it mapped — whichever
+task made it, and whether or not that task is still running.
+`SYS_MEMFD_TRUNCATE` works only while exactly one descriptor names the region
+and nothing has it mapped: a second descriptor is one that has been somewhere.
 
 Destruction is deferred while any mapping remains. Futexes are keyed on physical
 address, so a futex word inside a shared region is one object to every task that
@@ -426,17 +452,30 @@ maps it.
 
 ### File descriptors and pipes (0x40)
 
-Thirty-two descriptors per task. 0, 1 and 2 are stdin, stdout and stderr by
+Sixty-four descriptors per program. 0, 1 and 2 are stdin, stdout and stderr by
 convention. A descriptor is one of: unset, an IPC endpoint (a service TID plus a
 tag), a pipe read end, a pipe write end, one end of a stream, shared memory, a
 set of descriptors to wait on, one end of a pseudo-terminal, a timer, an event
-counter, or a network connection. The calls that make the last four are in the
-blocks they belong to — terminals, time, synchronisation and sockets — and
-everything here that reads, writes, waits on, copies or closes a descriptor
-takes any of them.
+counter, a network connection, or an object in a server. The calls that make
+the last five are in the blocks they belong to — terminals, time,
+synchronisation, sockets and "descriptors, continued" — and everything here
+that reads, writes, waits on, copies or closes a descriptor takes any of them.
 
 A descriptor names an object and holds a reference to it. Closing the last one
 frees the object, and is what makes a pipe's reader see end-of-file.
+
+**The table is the program's.** Every task running in one address space uses
+the same table: a descriptor one thread makes is there for the others, and one
+that a thread closes is closed. A task ending closes nothing unless it is the
+program's last. `SYS_FORK` gives the child a table of its own holding a second
+descriptor for everything in the parent's, and `SYS_EXEC_SPACE` keeps the
+table and closes what was marked for it (`SYS_FD_FLAGS`, in block 0xE0). A
+task a spawner has created and not started has an empty table, which the
+spawner fills.
+
+A call that is waiting on what a descriptor names keeps it: a read parked on
+a pipe goes on waiting on that pipe if a sibling closes the descriptor, as it
+would on Linux, and the pipe is freed when the read returns.
 
 | # | Name | Arguments | Returns | Cap |
 |---|---|---|---|---|
@@ -473,7 +512,8 @@ the task is a child the caller made and has not started, which is a spawner
 wiring up what it is about to run.
 `SYS_FD_SEND` hands one to a task that called `SYS_FD_RECV`: the sender chose to
 send and the receiver asked to take, and consent on both sides is the whole
-authorisation. Memory arriving this way admits the receiver to the region.
+authorisation. Memory arriving this way is the receiver's to map: holding the
+descriptor is the permission.
 
 **Waiting.** Events are `1` readable, `2` writable, `4` hangup, `8` invalid.
 Hangup is reported whether or not it was asked for, because waiting for readable
@@ -585,11 +625,11 @@ from the moment it exists: `SYS_TASK_SPACE` names it, a watch on the program
 counts it, and `SYS_TASK_START` refuses to start it anywhere else.
 
 A task started with `SYS_TASK_START` in its creator's own address space is a
-thread of it, and starts with a copy of what its creator holds at that moment:
-each capability in a slot the creator did not already fill for it, each
-descriptor likewise (as `SYS_FD_DUP` would copy it; poll sets and sockets stay
-behind, since neither counts its holders), and the creator's band. A copy, not
-a share: what either is given or gives up afterwards, the other does not see.
+thread of it. It uses the program's descriptors — the same table, not a copy —
+and starts with a copy of its creator's capabilities, each in a slot the
+creator did not already fill for it, and the creator's band. Capabilities are
+a task's: what either is granted or gives up afterwards, the other does not
+see.
 
 `SYS_TASK_PRIORITY` puts a task in a scheduling band: 0 drivers, 1 servers,
 2 ordinary programs, 3 the idle task. A task runs only when nothing in a better
@@ -859,6 +899,74 @@ taking a character back; what is typed is written back to the master). A new
 pty has all five set, and is 24 rows by 80 columns. The window size is stored
 and handed back, and nobody is told when it changes.
 
+### Descriptors, continued (0xE0)
+
+| # | Name | Arguments | Returns | Cap |
+|---|---|---|---|---|
+| 224 | `SYS_FD_SERVE` | arg0 = client tid, arg1 = cookie, arg2 = where: a free descriptor number, `u64::MAX - 1` for the lowest free from 3, or 64 for the working directory | the descriptor / `u64::MAX` | the client is in a call to the caller |
+| 225 | `SYS_FD_SERVED` | arg0 = one of the caller's descriptors (64 allowed), arg1 = two words to fill | 0, and `[server tid, cookie]` / `u64::MAX` if it is not a served descriptor or its server has gone | — |
+| 226 | `SYS_FD_HOLDS` | arg0 = tid, arg1 = cookie | 1 if that task's program holds a descriptor for the caller's object `cookie`, else 0 | — |
+| 227 | `SYS_FD_COOKIE` | arg0 = tid, arg1 = one of its descriptors (64 allowed) | the caller's cookie there / `u64::MAX` if what is there is not the caller's | — |
+| 228 | `SYS_FD_FLAGS` | arg0 = fd, arg1 = 0 to read or 1 to set, arg2 = flags (1 = close when the program becomes another) | the flags, or 0 on a set / `u64::MAX` | — |
+| 229 | `SYS_FD_REAP` | — | the cookie of one of the caller's objects that no descriptor names any more / `u64::MAX` when there is none | — |
+
+**A served descriptor names an object in a server**: a file, most often. The
+object is the server's, known to it by a number of its own choosing — the
+*cookie* — and the kernel's part is to count who holds a descriptor for it.
+That is what makes a file an ordinary descriptor: `SYS_FD_DUP` copies it,
+`SYS_FORK` gives the child one, `SYS_EXEC_SPACE` keeps it, `SYS_FD_SEND`
+passes it, `SYS_FD_CLOSE` drops it, and `SYS_POLL` reports it readable and
+writable, always. None of those is a message to the server.
+
+- **Making one.** `SYS_FD_SERVE` puts a descriptor for `cookie` in the table
+  of a task that is in a call to the server. The call is the consent, as it is
+  for `SYS_CAP_GRANT`: nobody is handed a descriptor unasked. The server says
+  where — a number that must be free, the lowest free from 3, or the working
+  directory, which it replaces — and tells the client in its reply.
+- **Using one.** `SYS_FD_READ` and `SYS_FD_WRITE` (and their non-blocking
+  forms, which are the same here) are a call the kernel makes to the server on
+  the task's behalf: tag `0xFFFF_0009` to read or `0xFFFF_000A` to write,
+  `data` = `[cookie, length]`, with the task's buffer lent for the server to
+  fill or to read, at most a mebibyte at a time. The server answers tag 0 with
+  the count in `data[0]`, and anything else is `u64::MAX` to the task. The
+  task needs no `Endpoint` for the server: the descriptor is the permission.
+  So anything that can write to descriptor 1 can write to a file put there.
+- **Asking about one.** For anything else a client wants of the object, it
+  finds out which server and which cookie (`SYS_FD_SERVED`) and asks the
+  server in the server's own protocol, naming the cookie.
+- **Believing a client.** A server asked to act on a cookie asks the kernel
+  whether the task asking holds it: `SYS_FD_HOLDS`. A task holds a cookie only
+  by having a descriptor for it, and gets a descriptor only from the server,
+  from a parent, or over a stream from somebody who had one. `SYS_FD_COOKIE`
+  is the same question about one particular descriptor, which is how a server
+  learns a client's working directory. Both answer only about the caller's own
+  objects.
+- **Losing one.** When the last descriptor for a cookie goes — closed, or its
+  program ended — the server is sent a notice: sender 0, tag `0xFFFF_0008`, no
+  data. It then calls `SYS_FD_REAP` until that says there is nothing; each
+  call hands back one cookie, which the kernel forgets as it does. The notice
+  is a flag rather than a queue, so a server that was busy loses nothing: the
+  cookies wait to be collected, and one notice covers however many there are.
+
+A server is known by its endpoint, which no other task is ever given. When it
+dies, every descriptor for its objects goes on existing and does nothing:
+reads, writes and `SYS_FD_SERVED` fail, and the last close simply forgets it.
+
+**Descriptor 64 is the working directory.** It is one more slot of the
+program's table, past the ordinary numbers, and holds a served descriptor for
+a directory or nothing. `SYS_FORK` copies it and `SYS_EXEC_SPACE` keeps it, so
+a program's children start where it is without anybody telling a server that
+one program became another. It can be the source or the destination of
+`SYS_FD_DUP` — onto it is `fchdir`, and a spawner gives a child its directory
+with `SYS_FD_DUP(child, 64, 64)` — and `SYS_FD_SERVED` and `SYS_FD_COOKIE`
+answer for it. It cannot be read, written, waited on or closed, and no call
+that chooses a number ever chooses it.
+
+`SYS_FD_FLAGS`: a flag is the descriptor's, not the object's. A copy made by
+`SYS_FD_DUP` starts unmarked; `SYS_FORK` carries a mark across, because the
+child's table is a copy of the whole of the parent's. Putting something else
+at a number clears its mark.
+
 ### ABI introspection (0xF0)
 
 | # | Name | Arguments | Returns | Cap |
@@ -919,7 +1027,8 @@ across the lifetime of the task it named.
 space (`SYS_TASK_CREATE` then `SYS_TASK_START_ARG`), with its own FS base
 (`SYS_SET_FS_BASE`) for thread-locals and a word the kernel clears when it
 exits (`SYS_SET_CLEAR_TID`). Each task has its own floating-point and SSE state,
-saved on every switch.
+saved on every switch, and its own capabilities; the descriptors and the
+memory are the program's.
 
 **Services are found by name.** This one is the userland's convention rather
 than the kernel's, and quarkutils' to change. The nameserver is at a well-known TID and maps

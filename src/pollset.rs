@@ -13,7 +13,7 @@
 //! entries scanned is cheaper than being wrong.
 
 use crate::task::FdKind;
-use crate::{pipe, scheduler, stream};
+use crate::{pipe, stream};
 
 const MAX_SETS: usize = 64;
 const MAX_WATCHED: usize = 32;
@@ -40,6 +40,8 @@ struct Watch {
 
 struct PollSet {
     in_use: bool,
+    /// The descriptor table its watches are numbers in — a program's, so any
+    /// thread of the program that made the set may use it.
     owner: usize,
     watches: [Watch; MAX_WATCHED],
 }
@@ -77,13 +79,17 @@ unsafe fn sets() -> &'static mut [PollSet; MAX_SETS] { unsafe {
 }}
 
 pub fn create(tid: usize) -> Option<usize> {
+    let table = crate::fdtable::table_of(tid);
+    if table == usize::MAX {
+        return None;
+    }
     let flags = irq_save();
     let out = unsafe {
         match sets().iter().position(|s| !s.in_use) {
             Some(i) => {
                 sets()[i] = PollSet::empty();
                 sets()[i].in_use = true;
-                sets()[i].owner = tid;
+                sets()[i].owner = table;
                 Some(i)
             }
             None => None,
@@ -112,20 +118,16 @@ pub fn watchable(tid: usize, fd: usize) -> bool {
     if fd >= crate::task::MAX_FDS {
         return false;
     }
-    unsafe {
-        match scheduler::get_task_mut(tid) {
-            Some(t) => matches!(
-                t.fds[fd],
-                FdKind::PipeRead(_)
-                    | FdKind::PipeWrite(_)
-                    | FdKind::StreamEnd { .. }
-                    | FdKind::PtyEnd { .. }
-                    | FdKind::Timer { .. }
-                    | FdKind::Event { .. }
-            ),
-            None => false,
-        }
-    }
+    matches!(
+        crate::fdtable::get(tid, fd),
+        FdKind::PipeRead(_)
+            | FdKind::PipeWrite(_)
+            | FdKind::StreamEnd { .. }
+            | FdKind::PtyEnd { .. }
+            | FdKind::Timer { .. }
+            | FdKind::Event { .. }
+            | FdKind::Served { .. }
+    )
 }
 
 /// op: 0 add, 1 modify, 2 remove.
@@ -133,10 +135,11 @@ pub fn ctl(set: usize, tid: usize, op: u64, fd: usize, events: u32, token: u64) 
     if set >= MAX_SETS {
         return false;
     }
+    let table = crate::fdtable::table_of(tid);
     let flags = irq_save();
     let ok = unsafe {
         let s = &mut sets()[set];
-        if !s.in_use || s.owner != tid {
+        if !s.in_use || s.owner != table {
             false
         } else {
             match op {
@@ -186,12 +189,7 @@ fn readiness(tid: usize, fd: usize) -> u32 {
     if fd >= crate::task::MAX_FDS {
         return 0;
     }
-    let kind = unsafe {
-        match scheduler::get_task_mut(tid) {
-            Some(t) => t.fds[fd],
-            None => return 0,
-        }
-    };
+    let kind = crate::fdtable::get(tid, fd);
     let mut out = 0;
     match kind {
         FdKind::PipeRead(h) => {
@@ -248,6 +246,9 @@ fn readiness(tid: usize, fd: usize) -> u32 {
                 out |= WRITABLE;
             }
         }
+        // A file never keeps anybody waiting: a read answers with what is
+        // there, the end included, and a write is taken.
+        FdKind::Served { .. } => out |= READABLE | WRITABLE,
         _ => {}
     }
     out
@@ -292,12 +293,7 @@ fn names_pipe(tid: usize, fd: usize, handle: usize) -> bool {
     if fd >= crate::task::MAX_FDS {
         return false;
     }
-    let kind = unsafe {
-        match scheduler::get_task_mut(tid) {
-            Some(t) => t.fds[fd],
-            None => return false,
-        }
-    };
+    let kind = crate::fdtable::get(tid, fd);
     match kind {
         FdKind::PipeRead(h) | FdKind::PipeWrite(h) => h == handle,
         FdKind::StreamEnd { stream: s, end } => match stream::pipes_for(s, end) {
@@ -315,7 +311,21 @@ fn names_pipe(tid: usize, fd: usize, handle: usize) -> bool {
 /// for the benefit of the rare one anybody watches. The parked check comes
 /// first, so a system with nobody waiting pays sixty-four comparisons.
 pub fn note_pipe(handle: usize) {
-    let mut wake = [usize::MAX; MAX_SETS];
+    note(|tid, fd| names_pipe(tid, fd, handle));
+}
+
+/// Wake every task parked on a set one of whose watches `names` what changed.
+///
+/// The watches are copied out with the lock held and matched without it,
+/// because matching reaches into the descriptor tables and the stream table.
+/// The set a task is parked on is the one whose watches are looked at — it
+/// used to be the first set that task owned, which is a different set for a
+/// program holding two.
+fn note(names: impl Fn(usize, usize) -> bool) {
+    // Which sets have somebody parked on them, and who. Only the pairs: a
+    // set's watches are most of a kilobyte, and this runs on the kernel stack
+    // of whatever wrote to the pipe.
+    let mut parked = [(0usize, usize::MAX); MAX_SETS];
     let mut n = 0;
 
     let flags = irq_save();
@@ -326,32 +336,21 @@ pub fn note_pipe(handle: usize) {
             if waiter == usize::MAX || !sets()[i].in_use {
                 continue;
             }
-            wake[n] = waiter;
+            parked[n] = (i, waiter);
             n += 1;
         }
     }
     irq_restore(flags);
 
-    // Deciding *which* of them care is done outside the lock, because
-    // `names_pipe` reaches into the task table and the stream table.
-    for i in 0..n {
-        let tid = wake[i];
-        let watches = {
-            let flags = irq_save();
-            let w = unsafe {
-                match sets().iter().position(|s| s.in_use && s.owner == tid) {
-                    Some(idx) => Some(sets()[idx].watches),
-                    None => None,
-                }
-            };
-            irq_restore(flags);
-            w
+    for &(set, tid) in parked[..n].iter() {
+        let flags = irq_save();
+        let watches = unsafe {
+            let s = &sets()[set];
+            if s.in_use { Some(s.watches) } else { None }
         };
+        irq_restore(flags);
         let Some(watches) = watches else { continue };
-        if watches
-            .iter()
-            .any(|w| w.used && names_pipe(tid, w.fd, handle))
-        {
+        if watches.iter().any(|w| w.used && names(tid, w.fd)) {
             crate::ipc::wake_sleeper(tid);
         }
     }
@@ -364,40 +363,7 @@ pub fn note_pipe(handle: usize) {
 /// task that is asleep, and nothing else would tell it that a shell has
 /// printed something or gone.
 pub fn note_pty(pty: usize) {
-    let mut wake = [usize::MAX; MAX_SETS];
-    let mut n = 0;
-    let flags = irq_save();
-    unsafe {
-        let waiters = &*core::ptr::addr_of!(WAITERS);
-        for i in 0..MAX_SETS {
-            let waiter = waiters[i];
-            if waiter == usize::MAX || !sets()[i].in_use {
-                continue;
-            }
-            wake[n] = waiter;
-            n += 1;
-        }
-    }
-    irq_restore(flags);
-
-    for i in 0..n {
-        let tid = wake[i];
-        let watches = {
-            let flags = irq_save();
-            let w = unsafe {
-                match sets().iter().position(|s| s.in_use && s.owner == tid) {
-                    Some(idx) => Some(sets()[idx].watches),
-                    None => None,
-                }
-            };
-            irq_restore(flags);
-            w
-        };
-        let Some(watches) = watches else { continue };
-        if watches.iter().any(|w| w.used && names_pty(tid, w.fd, pty)) {
-            crate::ipc::wake_sleeper(tid);
-        }
-    }
+    note(|tid, fd| names_pty(tid, fd, pty));
 }
 
 /// A timer fired: wake whoever is waiting on a set, and let the scan decide
@@ -434,12 +400,7 @@ fn names_pty(tid: usize, fd: usize, pty: usize) -> bool {
     if fd >= crate::task::MAX_FDS {
         return false;
     }
-    let kind = unsafe {
-        match scheduler::get_task_mut(tid) {
-            Some(t) => t.fds[fd],
-            None => return false,
-        }
-    };
+    let kind = crate::fdtable::get(tid, fd);
     matches!(kind, FdKind::PtyEnd { pty: p, .. } if p == pty)
 }
 
@@ -448,10 +409,11 @@ pub fn scan(set: usize, tid: usize, out: &mut [(u64, u32)]) -> usize {
     if set >= MAX_SETS {
         return 0;
     }
+    let table = crate::fdtable::table_of(tid);
     let flags = irq_save();
     let watches = unsafe {
         let s = &sets()[set];
-        if !s.in_use || s.owner != tid {
+        if !s.in_use || s.owner != table {
             irq_restore(flags);
             return 0;
         }

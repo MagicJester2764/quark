@@ -455,8 +455,28 @@ pub fn notify_object_idle(pager: usize, cookie: u64, id: u64) {
     }
 }
 
-/// Take one pending notice from the kernel: a task's death, a program's, or
-/// an object gone idle.
+/// Wake a server that is waiting to receive, because the kernel has a notice
+/// for it. The notice itself is found by its next receive.
+pub fn wake_for_notice(server: usize) {
+    if server >= MAX_TASKS {
+        return;
+    }
+    let flags = irq_save();
+    unsafe {
+        match TASK_IPC[server].state {
+            IpcState::RecvBlocked(from) if from == 0 || from == TID_ANY => {
+                TASK_IPC[server].state = IpcState::None;
+                TASK_TIMEOUT[server] = 0;
+                scheduler::unblock_task(server);
+            }
+            _ => {}
+        }
+    }
+    irq_restore(flags);
+}
+
+/// Take one pending notice from the kernel: a task's death, a program's, an
+/// object gone idle, or a served descriptor's last close.
 ///
 /// # Safety
 /// The caller holds interrupts off.
@@ -464,6 +484,15 @@ unsafe fn take_any_death(receiver: usize) -> Option<Message> {
     unsafe {
         if let Some(msg) = take_death(receiver) {
             return Some(msg);
+        }
+        // An object this task serves has no descriptors left. One notice
+        // however many there are: the server collects until there are none.
+        if crate::served::take_notice(receiver) {
+            return Some(Message {
+                sender: 0,
+                tag: crate::served::TAG_FD_RELEASED,
+                data: [0; 6],
+            });
         }
         if IDLES_LEN[receiver] > 0 {
             let (cookie, id) = IDLES[receiver][0];
@@ -896,6 +925,13 @@ fn call_inner(
     offer: Option<usize>,
 ) -> Result<Message, IpcError> {
     call_as(dest, msg, timeout_ticks, lent, offer, 0)
+}
+
+/// A call from the kernel, on behalf of the current task, to the server
+/// behind a descriptor it holds, lending the task's own buffer. The descriptor
+/// is the authorisation: the task needs no capability for the server.
+pub fn served_call(server: usize, msg: &Message, lent: Lent) -> Result<Message, IpcError> {
+    call_as(server, msg, 0, Some(lent), None, 0)
 }
 
 /// A call from the kernel, on behalf of the current task, to the pager of an

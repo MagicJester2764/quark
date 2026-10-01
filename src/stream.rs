@@ -217,7 +217,7 @@ pub fn close_end(stream: usize, end: u8) {
 
     let (gone, orphans, n) = gone;
     for kind in &orphans[..n] {
-        crate::pipe::release_in_flight(kind);
+        crate::pipe::release_fd(kind);
     }
 
     // Dropping the writer this end held is what gives the peer end-of-file,

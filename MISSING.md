@@ -53,12 +53,13 @@ will meet:
 | | |
 |---|---|
 | Tasks | 64, threads included |
-| Descriptors per task | 32 |
+| Descriptors per program | 64, and one more for its working directory |
 | Capability slots per task | 64 |
 | Pipes | 96 in the machine, 8 made by any one program |
 | Connected streams | 32 |
 | Poll sets | 64, each watching 32 descriptors |
 | Pseudo-terminals | 8 |
+| Objects servers serve (open files) | 1024 |
 | Timers, event counters | 16 of each |
 | Shared memory regions | 256, of at most 4096 pages |
 | Memory objects | 256, with 8192 cached pages between them |
@@ -69,9 +70,9 @@ will meet:
 
 - **`exec` in a program with threads is refused.** POSIX has it end every
   other thread, and ending them means unwinding what they hold in a server.
-- **A thread starts with a copy of what its creator holds**, not a share:
-  capabilities and descriptors are duplicated when it is made, and what either
-  is given or closes afterwards the other does not see.
+- **A thread starts with a copy of its creator's capabilities**, not a share:
+  what either is granted or gives up afterwards the other does not see.
+  Descriptors are the program's and are shared.
 - **A pty's window size is stored and nobody is told when it changes.** Linux
   sends `SIGWINCH`, and there are no signals.
 - **The page cache never shrinks under pressure.** A mapped file's pages stay

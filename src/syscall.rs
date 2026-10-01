@@ -28,7 +28,10 @@ const KERNEL_CS: u64 = 0x08;
 //   0x80  128-143  synchronisation
 //   0x90  144-159  time
 //   0xA0  160-175  kernel debug console
+//   0xB0  176-191  sockets
 //   0xC0  192-207  memory, continued: reservations and memory objects
+//   0xD0  208-223  terminals
+//   0xE0  224-239  descriptors, continued: flags, and descriptors a server serves
 //   0xF0  240-255  ABI introspection
 //
 // Numbers are stable within an ABI version: they are never reused, and a
@@ -46,6 +49,9 @@ pub const SYS_WAIT: u64 = 4;
 pub const SYS_TASK_KILL: u64 = 5;
 pub const SYS_SIGNAL: u64 = 6;
 pub const SYS_TASK_INFO: u64 = 7;
+/// End the caller's whole program: every task in its address space, with one
+/// status. `SYS_EXIT_CODE` ends the calling task and leaves its siblings.
+pub const SYS_EXIT_PROGRAM: u64 = 8;
 
 // --- 0x10  IPC ---
 pub const SYS_SEND: u64 = 16;
@@ -276,6 +282,23 @@ const OBJECT_MAP_EXEC: u64 = 4;
 /// Objects one pager may have at once, so that no one task fills the table.
 const OBJECTS_PER_PAGER: usize = 128;
 
+// --- 0xE0  descriptors, continued ---
+/// A server gives the task calling it a descriptor for one of its objects.
+pub const SYS_FD_SERVE: u64 = 224;
+/// Which server and which of its objects one of the caller's descriptors names.
+pub const SYS_FD_SERVED: u64 = 225;
+/// A server asks whether a task's program holds a descriptor for an object.
+pub const SYS_FD_HOLDS: u64 = 226;
+/// A server asks which of its objects one particular descriptor of a task names.
+pub const SYS_FD_COOKIE: u64 = 227;
+/// Read or set what is true of a descriptor rather than of what it names:
+/// whether it is closed when the program becomes another.
+pub const SYS_FD_FLAGS: u64 = 228;
+/// A server collects an object of its own that no descriptor names any more.
+pub const SYS_FD_REAP: u64 = 229;
+/// SYS_FD_FLAGS: close this descriptor on `SYS_EXEC_SPACE`.
+const FD_FLAG_CLOEXEC: u64 = 1;
+
 // --- 0xF0  ABI introspection ---
 pub const SYS_ABI_VERSION: u64 = 240;
 
@@ -285,7 +308,7 @@ pub const SYS_ABI_VERSION: u64 = 240;
 /// minor when calls are added. User space can refuse to run against a major it
 /// does not know, which is the point of exposing it at all.
 pub const ABI_VERSION_MAJOR: u64 = 3;
-pub const ABI_VERSION_MINOR: u64 = 0;
+pub const ABI_VERSION_MINOR: u64 = 1;
 
 /// Threads a task may make with no capability at all.
 ///
@@ -441,11 +464,9 @@ fn pollset_of(tid: usize, fd: usize) -> Option<usize> {
     if fd >= crate::task::MAX_FDS {
         return None;
     }
-    unsafe {
-        match scheduler::get_task_mut(tid)?.fds[fd] {
-            crate::task::FdKind::PollSet { set } => Some(set),
-            _ => None,
-        }
+    match crate::fdtable::get(tid, fd) {
+        crate::task::FdKind::PollSet { set } => Some(set),
+        _ => None,
     }
 }
 
@@ -454,11 +475,9 @@ fn stream_end_of(tid: usize, fd: usize) -> Option<(usize, u8)> {
     if fd >= crate::task::MAX_FDS {
         return None;
     }
-    unsafe {
-        match scheduler::get_task_mut(tid)?.fds[fd] {
-            crate::task::FdKind::StreamEnd { stream, end } => Some((stream, end)),
-            _ => None,
-        }
+    match crate::fdtable::get(tid, fd) {
+        crate::task::FdKind::StreamEnd { stream, end } => Some((stream, end)),
+        _ => None,
     }
 }
 
@@ -625,6 +644,135 @@ extern "C" fn syscall_dispatch(
             // it had been — and every program that reads a child's status
             // would believe it.
             scheduler::exit_with((arg0 & 0xFF) as i32)
+        }
+        SYS_EXIT_PROGRAM => {
+            scheduler::exit_program(arg0 as i32);
+        }
+        SYS_FD_SERVE => {
+            // arg0 = the client, arg1 = cookie, arg2 = where: a number,
+            // ANY_FD for the lowest free from 3, or the working directory's.
+            //
+            // Putting a descriptor into a task is handing it something, and
+            // the rule is the one a capability grant has: the task consents by
+            // being in a call to the server that is doing it.
+            let me = scheduler::current_tid();
+            let client = arg0 as usize;
+            if client == me || !crate::ipc::is_calling(client, me) {
+                return u64::MAX;
+            }
+            let obj = match crate::served::create(me, arg1) {
+                Some(o) => o,
+                None => return u64::MAX,
+            };
+            let kind = crate::task::FdKind::Served { obj };
+            let cwd = crate::fdtable::FD_CWD;
+            let placed = if arg2 == ANY_FD {
+                crate::fdtable::install(client, kind, 3)
+            } else if arg2 == cwd as u64 {
+                // The directory a program is in is replaced, not refused:
+                // that is what `chdir` is.
+                match crate::fdtable::replace(client, cwd, kind) {
+                    Ok(old) => {
+                        if !old.is_empty() {
+                            crate::pipe::release_fd(&old);
+                        }
+                        Some(cwd)
+                    }
+                    Err(()) => None,
+                }
+            } else if (arg2 as usize) < crate::task::MAX_FDS
+                && crate::fdtable::get(client, arg2 as usize).is_empty()
+            {
+                // A number of the server's choosing has to be free. It closes
+                // nothing of the client's that the client did not ask closed.
+                scheduler::set_fd(client, arg2 as usize, kind).ok().map(|_| arg2 as usize)
+            } else {
+                None
+            };
+            match placed {
+                Some(fd) => fd as u64,
+                None => {
+                    crate::served::discard(obj);
+                    u64::MAX
+                }
+            }
+        }
+        SYS_FD_SERVED => {
+            // arg0 = one of the caller's descriptors, arg1 = two words out:
+            // the server's TID and its cookie.
+            let fd = arg0 as usize;
+            if fd > crate::fdtable::FD_CWD || !validate_user_ptr_mut(arg1, 16) {
+                return u64::MAX;
+            }
+            let me = scheduler::current_tid();
+            let named = match crate::fdtable::get(me, fd) {
+                crate::task::FdKind::Served { obj } => crate::served::of(obj),
+                _ => None,
+            };
+            match named {
+                Some((server, cookie)) => {
+                    let _ua = crate::cpu::UserAccess::begin();
+                    unsafe {
+                        let out = arg1 as *mut u64;
+                        core::ptr::write_unaligned(out, server as u64);
+                        core::ptr::write_unaligned(out.add(1), cookie);
+                    }
+                    0
+                }
+                None => u64::MAX,
+            }
+        }
+        SYS_FD_HOLDS => {
+            // arg0 = a task, arg1 = one of the caller's cookies. Answers only
+            // about what the caller serves, so it says nothing about anybody
+            // else's descriptors.
+            let me = scheduler::current_tid();
+            let held = crate::fdtable::any(arg0 as usize, |kind| match kind {
+                crate::task::FdKind::Served { obj } => {
+                    crate::served::cookie_for(*obj, me) == Some(arg1)
+                }
+                _ => false,
+            });
+            held as u64
+        }
+        SYS_FD_COOKIE => {
+            // arg0 = a task, arg1 = one of its descriptors. The caller's
+            // cookie there, if what is there is the caller's.
+            let me = scheduler::current_tid();
+            let fd = arg1 as usize;
+            if fd > crate::fdtable::FD_CWD {
+                return u64::MAX;
+            }
+            match crate::fdtable::get(arg0 as usize, fd) {
+                crate::task::FdKind::Served { obj } => {
+                    crate::served::cookie_for(obj, me).unwrap_or(u64::MAX)
+                }
+                _ => u64::MAX,
+            }
+        }
+        SYS_FD_REAP => crate::served::reap(scheduler::current_tid()).unwrap_or(u64::MAX),
+        SYS_FD_FLAGS => {
+            // arg0 = fd, arg1 = 0 to read or 1 to set, arg2 = the flags
+            let fd = arg0 as usize;
+            if fd >= crate::task::MAX_FDS {
+                return u64::MAX;
+            }
+            let tid = scheduler::current_tid();
+            match arg1 {
+                0 => match crate::fdtable::cloexec(tid, fd) {
+                    Some(true) => FD_FLAG_CLOEXEC,
+                    Some(false) => 0,
+                    None => u64::MAX,
+                },
+                1 => {
+                    if crate::fdtable::set_cloexec(tid, fd, arg2 & FD_FLAG_CLOEXEC != 0) {
+                        0
+                    } else {
+                        u64::MAX
+                    }
+                }
+                _ => u64::MAX,
+            }
         }
         SYS_SET_CLEAR_TID => {
             // Register a word to clear and wake when this task exits, which is
@@ -1537,6 +1685,9 @@ extern "C" fn syscall_dispatch(
             let own_cr3 = unsafe { scheduler::get_task_mut(caller).map(|t| t.cr3) };
             if own_cr3 == Some(cr3) {
                 scheduler::inherit_from_creator(tid, caller);
+                // And uses what the program has open, rather than a copy of
+                // it: a descriptor is the program's.
+                crate::fdtable::share(tid, caller);
             }
             match scheduler::start_task(tid, rip, rsp, cr3, entry_arg) {
                 Ok(()) => 0,
@@ -1679,7 +1830,11 @@ extern "C" fn syscall_dispatch(
             if len > 0 && !validate_user_ptr(arg1, arg2) {
                 return u64::MAX;
             }
-            match scheduler::current_fd(fd) {
+            // Held for the length of the call. The descriptor is the
+            // program's, and a sibling thread may close it while this one is
+            // parked on what it names.
+            let me = scheduler::current_tid();
+            let done = match crate::fdtable::hold(me, fd) {
                 crate::task::FdKind::Ipc { target_tid, tag } => {
                     fd_write_ipc(target_tid, tag, ptr, len)
                 }
@@ -1712,6 +1867,9 @@ extern "C" fn syscall_dispatch(
                 crate::task::FdKind::Socket { net_tid, handle } => {
                     fd_write_ipc(net_tid, sock_tag(TAG_SOCK_WRITE, handle), ptr, len)
                 }
+                crate::task::FdKind::Served { obj } => {
+                    crate::served::io(obj, true, ptr as usize, len)
+                }
                 crate::task::FdKind::Empty => {
                     // fd not connected — fall back to kernel console for fd 1/2
                     if (fd == 1 || fd == 2) && len > 0 {
@@ -1723,7 +1881,9 @@ extern "C" fn syscall_dispatch(
                         u64::MAX
                     }
                 }
-            }
+            };
+            crate::fdtable::unhold(me);
+            done
         }
         SYS_FD_READ => {
             // arg0 = fd, arg1 = buf ptr, arg2 = max len
@@ -1733,7 +1893,11 @@ extern "C" fn syscall_dispatch(
             if max_len > 0 && !validate_user_ptr_mut(arg1, arg2) {
                 return u64::MAX;
             }
-            match scheduler::current_fd(fd) {
+            // Held for the length of the call. The descriptor is the
+            // program's, and a sibling thread may close it while this one is
+            // parked on what it names.
+            let me = scheduler::current_tid();
+            let done = match crate::fdtable::hold(me, fd) {
                 crate::task::FdKind::Ipc { target_tid, tag } => {
                     fd_read_ipc(target_tid, tag, ptr, max_len)
                 }
@@ -1756,8 +1920,13 @@ extern "C" fn syscall_dispatch(
                 crate::task::FdKind::Socket { net_tid, handle } => {
                     fd_read_ipc(net_tid, sock_tag(TAG_SOCK_READ, handle), ptr, max_len)
                 }
+                crate::task::FdKind::Served { obj } => {
+                    crate::served::io(obj, false, ptr as usize, max_len)
+                }
                 crate::task::FdKind::Empty => u64::MAX,
-            }
+            };
+            crate::fdtable::unhold(me);
+            done
         }
         SYS_FD_READ_NB => {
             // Non-blocking fd read. Only supports pipe fds.
@@ -1767,7 +1936,11 @@ extern "C" fn syscall_dispatch(
             if max_len > 0 && !validate_user_ptr_mut(arg1, arg2) {
                 return u64::MAX;
             }
-            match scheduler::current_fd(fd) {
+            // Held for the length of the call. The descriptor is the
+            // program's, and a sibling thread may close it while this one is
+            // parked on what it names.
+            let me = scheduler::current_tid();
+            let done = match crate::fdtable::hold(me, fd) {
                 crate::task::FdKind::PipeRead(handle) => {
                     crate::pipe::read_nonblock(handle, ptr, max_len)
                 }
@@ -1823,8 +1996,14 @@ extern "C" fn syscall_dispatch(
                         }
                     }
                 }
+                // A file answers at once whichever way it is asked.
+                crate::task::FdKind::Served { obj } => {
+                    crate::served::io(obj, false, ptr as usize, max_len)
+                }
                 _ => u64::MAX,
-            }
+            };
+            crate::fdtable::unhold(me);
+            done
         }
         SYS_FD_WRITE_NB => {
             // The mirror of SYS_FD_READ_NB. A descriptor a program has marked
@@ -1837,7 +2016,11 @@ extern "C" fn syscall_dispatch(
             if len > 0 && !validate_user_ptr(arg1, arg2) {
                 return u64::MAX;
             }
-            match scheduler::current_fd(fd) {
+            // Held for the length of the call. The descriptor is the
+            // program's, and a sibling thread may close it while this one is
+            // parked on what it names.
+            let me = scheduler::current_tid();
+            let done = match crate::fdtable::hold(me, fd) {
                 crate::task::FdKind::PipeWrite(handle) => {
                     crate::pipe::write_nonblock(handle, ptr, len)
                 }
@@ -1858,8 +2041,13 @@ extern "C" fn syscall_dispatch(
                     if n == 0 && len > 0 { crate::pipe::WOULD_BLOCK } else { n as u64 }
                 }
                 crate::task::FdKind::Event { ev } => event_write(ev, ptr, len, false),
+                crate::task::FdKind::Served { obj } => {
+                    crate::served::io(obj, true, ptr as usize, len)
+                }
                 _ => u64::MAX,
-            }
+            };
+            crate::fdtable::unhold(me);
+            done
         }
         SYS_FD_SET => {
             // arg0 = target task tid, arg1 = fd, arg2 = service tid, arg3 = tag
@@ -1904,14 +2092,6 @@ extern "C" fn syscall_dispatch(
             {
                 return u64::MAX;
             }
-            let fd = if arg1 == ANY_FD {
-                match scheduler::free_fd_at_or_above(tid, 3) {
-                    Some(f) => f,
-                    None => return u64::MAX,
-                }
-            } else {
-                arg1 as usize
-            };
             let handle = arg2 as usize;
             let is_write = arg3 != 0;
             if crate::pipe::add_ref(handle, is_write).is_err() {
@@ -1922,11 +2102,18 @@ extern "C" fn syscall_dispatch(
             } else {
                 crate::task::FdKind::PipeRead(handle)
             };
-            match scheduler::set_fd(tid, fd, kind) {
+            // Choosing a number and filling it are one step: the table is the
+            // program's, and a sibling could take the number in between.
+            let placed = if arg1 == ANY_FD {
+                crate::fdtable::install(tid, kind, 3)
+            } else {
+                scheduler::set_fd(tid, arg1 as usize, kind).ok().map(|_| arg1 as usize)
+            };
+            match placed {
                 // The number, since the caller may have let us choose it.
-                Ok(()) => fd as u64,
-                Err(()) => {
-                    crate::pipe::release_fd(&kind, tid);
+                Some(fd) => fd as u64,
+                None => {
+                    crate::pipe::release_fd(&kind);
                     u64::MAX
                 }
             }
@@ -1976,37 +2163,60 @@ extern "C" fn syscall_dispatch(
             {
                 return u64::MAX;
             }
-            let target_fd = if arg1 == ANY_FD {
-                let low = (arg3 as usize).max(3);
-                match scheduler::free_fd_at_or_above(target_tid, low) {
-                    Some(f) => f,
-                    None => return u64::MAX,
-                }
-            } else {
-                arg1 as usize
-            };
             let source_fd = arg2 as usize;
-            let kind = scheduler::current_fd(source_fd);
-            if kind.is_empty() {
+            // One past the ordinary numbers is the working directory, which
+            // can be copied to and from: `fchdir` is a copy onto it, and a
+            // spawner gives a child its directory by copying its own there.
+            // Only something a server serves can be a directory.
+            let cwd = crate::fdtable::FD_CWD;
+            if source_fd > cwd {
+                return u64::MAX;
+            }
+            if (source_fd == cwd || arg1 == cwd as u64)
+                && !matches!(
+                    crate::fdtable::get(me, source_fd),
+                    crate::task::FdKind::Served { .. }
+                )
+            {
                 return u64::MAX;
             }
             // dup2 onto itself changes nothing, and must not close the
             // descriptor on the way.
-            if target_tid == me && target_fd == source_fd {
-                return target_fd as u64;
+            if target_tid == me && arg1 != ANY_FD && arg1 as usize == source_fd {
+                return if crate::fdtable::get(me, source_fd).is_empty() {
+                    u64::MAX
+                } else {
+                    source_fd as u64
+                };
             }
-            // A second descriptor for one object is a second reference to it.
-            // `retain_fd` is `release_fd`'s mirror, and keeping the match in
-            // one place is what stops a new kind of descriptor being
-            // remembered in one of them and forgotten in the other.
-            if crate::pipe::retain_fd(&kind, target_tid).is_err() {
-                return u64::MAX;
-            }
-            match scheduler::set_fd(target_tid, target_fd, kind) {
+            // A second descriptor for one object is a second reference to it,
+            // taken in the same step as the descriptor is read: the table is
+            // the program's, and a sibling closing the source in between
+            // would leave this retaining something already freed.
+            let kind = match crate::fdtable::get_retained(me, source_fd) {
+                Some(k) => k,
+                None => return u64::MAX,
+            };
+            let placed = if arg1 == ANY_FD {
+                crate::fdtable::install(target_tid, kind, (arg3 as usize).max(3))
+            } else if arg1 == cwd as u64 {
+                match crate::fdtable::replace(target_tid, cwd, kind) {
+                    Ok(old) => {
+                        if !old.is_empty() {
+                            crate::pipe::release_fd(&old);
+                        }
+                        Some(cwd)
+                    }
+                    Err(()) => None,
+                }
+            } else {
+                scheduler::set_fd(target_tid, arg1 as usize, kind).ok().map(|_| arg1 as usize)
+            };
+            match placed {
                 // The number, since the caller may have let us choose it.
-                Ok(()) => target_fd as u64,
-                Err(()) => {
-                    crate::pipe::release_fd(&kind, target_tid);
+                Some(fd) => fd as u64,
+                None => {
+                    crate::pipe::release_fd(&kind);
                     u64::MAX
                 }
             }
@@ -2257,18 +2467,15 @@ extern "C" fn syscall_dispatch(
                 if pfd >= crate::task::MAX_FDS {
                     return u64::MAX;
                 }
-                let kind = scheduler::current_fd(pfd);
-                if kind.is_empty() {
-                    return u64::MAX;
-                }
-                // Hold it on the queue's behalf. Without this the sender
+                // Held on the queue's behalf. Without this the sender
                 // closing its own copy frees the object underneath a
                 // descriptor still travelling.
-                if crate::pipe::retain_in_flight(&kind).is_err() {
-                    return u64::MAX;
-                }
+                let kind = match crate::fdtable::get_retained(tid, pfd) {
+                    Some(k) => k,
+                    None => return u64::MAX,
+                };
                 if !crate::stream::push_fd(stream, end, kind) {
-                    crate::pipe::release_in_flight(&kind);
+                    crate::pipe::release_fd(&kind);
                     return u64::MAX;
                 }
             }
@@ -2336,50 +2543,36 @@ extern "C" fn syscall_dispatch(
             // the thing it is trying to do exactly once.
             let mut got = 0u64;
             if at != u64::MAX {
-                let slot = if at == ANY_FD {
-                    match scheduler::lowest_free_fd(tid) {
-                        Some(s) => s,
-                        None => crate::task::MAX_FDS,
-                    }
+                // Check there is somewhere to put it *before* taking the
+                // descriptor off the queue. Popping first and failing to
+                // install destroys something the sender handed over and the
+                // receiver asked for, and neither of them is told.
+                let room = if at == ANY_FD {
+                    scheduler::lowest_free_fd(tid).is_some()
                 } else {
-                    at as usize
+                    (at as usize) < crate::task::MAX_FDS
+                        && crate::fdtable::get(tid, at as usize).is_empty()
                 };
-                // Check the slot *before* taking the descriptor off the queue.
-                // Popping first and failing to install destroys something the
-                // sender handed over and the receiver asked for, and neither
-                // of them is told.
-                let free = slot < crate::task::MAX_FDS
-                    && unsafe {
-                        match scheduler::get_task_mut(tid) {
-                            Some(t) => t.fds[slot].is_empty(),
-                            None => false,
-                        }
-                    };
-                if free {
+                if room {
                     if let Some(kind) = crate::stream::pop_fd(stream, end) {
-                        let landed = slot;
-                        // Turn the queue's anonymous reference into one owned
-                        // by this task. Memory arriving this way admits the
-                        // receiver to the region: the sender chose to send and
-                        // the receiver asked to take.
-                        let installed = unsafe {
-                            match scheduler::get_task_mut(tid) {
-                                Some(t) if t.fds[slot].is_empty() => {
-                                    if crate::pipe::retain_fd(&kind, tid).is_ok() {
-                                        t.fds[slot] = kind;
-                                        true
-                                    } else {
-                                        false
-                                    }
-                                }
-                                _ => false,
-                            }
+                        // The queue's reference becomes the descriptor's:
+                        // nothing is retained and nothing released, because a
+                        // reference belongs to no task. Memory arriving this
+                        // way is the receiver's to map — the sender chose to
+                        // send and the receiver asked to take.
+                        let landed = if at == ANY_FD {
+                            crate::fdtable::install(tid, kind, 3)
+                        } else if crate::fdtable::get(tid, at as usize).is_empty() {
+                            scheduler::set_fd(tid, at as usize, kind).ok().map(|_| at as usize)
+                        } else {
+                            None
                         };
-                        crate::pipe::release_in_flight(&kind);
-                        if installed {
+                        match landed {
                             // The number, not merely the fact: a caller that
                             // asked for any slot has no other way to learn it.
-                            got = landed as u64 + 1;
+                            Some(fd) => got = fd as u64 + 1,
+                            // A sibling took the last slot in between.
+                            None => crate::pipe::release_fd(&kind),
                         }
                     }
                 }
@@ -2391,7 +2584,7 @@ extern "C" fn syscall_dispatch(
             // what SYS_SHMEM_CREATE makes; the descriptor is what lets it
             // travel, be inherited, and be closed like anything else.
             let pages = arg0 as usize;
-            let handle = crate::shmem::create(pages);
+            let handle = crate::shmem::create_fd(pages);
             if handle == u64::MAX {
                 return u64::MAX;
             }
@@ -2400,7 +2593,7 @@ extern "C" fn syscall_dispatch(
             match scheduler::install_fd(tid, kind) {
                 Some(fd) => fd as u64,
                 None => {
-                    crate::shmem::close_ref(handle as usize, tid);
+                    crate::shmem::fd_release(handle as usize);
                     u64::MAX
                 }
             }
@@ -2413,14 +2606,9 @@ extern "C" fn syscall_dispatch(
                 return u64::MAX;
             }
             let tid = scheduler::current_tid();
-            let handle = unsafe {
-                match scheduler::get_task_mut(tid) {
-                    Some(t) => match t.fds[fd] {
-                        crate::task::FdKind::MemFd { handle } => handle,
-                        _ => return u64::MAX,
-                    },
-                    None => return u64::MAX,
-                }
+            let handle = match crate::fdtable::get(tid, fd) {
+                crate::task::FdKind::MemFd { handle } => handle,
+                _ => return u64::MAX,
             };
             match crate::shmem::resize(handle, bytes.div_ceil(4096)) {
                 u64::MAX => u64::MAX,
@@ -2435,21 +2623,17 @@ extern "C" fn syscall_dispatch(
             if fd >= crate::task::MAX_FDS {
                 return u64::MAX;
             }
-            let handle = unsafe {
-                match scheduler::get_task_mut(tid) {
-                    Some(t) => match t.fds[fd] {
-                        crate::task::FdKind::MemFd { handle } => handle,
-                        _ => return u64::MAX,
-                    },
-                    None => return u64::MAX,
-                }
+            let handle = match crate::fdtable::get(tid, fd) {
+                crate::task::FdKind::MemFd { handle } => handle,
+                _ => return u64::MAX,
             };
             // The size comes back, not merely success. A receiver of a
             // descriptor knows nothing about how big the memory behind it is,
             // and the sender's word for it is the one thing it must not take:
             // a client that says its pool is sixteen megabytes when it is one
             // page is asking the compositor to read memory that is not there.
-            match crate::shmem::map(handle, vaddr) {
+            // Holding the descriptor is the permission.
+            match crate::shmem::map_held(handle, vaddr) {
                 u64::MAX => u64::MAX,
                 pages => pages * 4096,
             }
@@ -2464,18 +2648,11 @@ extern "C" fn syscall_dispatch(
                 return u64::MAX;
             }
             let tid = scheduler::current_tid();
-            // `get_task_mut` is an unsafe fn: it hands out a `&'static mut`
-            // into the task table, so every use is inside an unsafe block.
-            let kind = unsafe {
-                match scheduler::get_task_mut(tid) {
-                    Some(t) => core::mem::replace(&mut t.fds[fd], crate::task::FdKind::Empty),
-                    None => return u64::MAX,
-                }
-            };
+            let kind = crate::fdtable::take(tid, fd);
             if kind.is_empty() {
                 return u64::MAX;
             }
-            crate::pipe::release_fd(&kind, tid);
+            crate::pipe::release_fd(&kind);
             0
         }
         SYS_FUTEX_WAIT => {

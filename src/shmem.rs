@@ -57,32 +57,28 @@ struct ShmemRegion {
     run_count: usize,
     page_count: usize,
     creator: usize,
-    /// Bitmask of TIDs with access (bit N = TID N can map).
+    /// Bitmask of TIDs with access (bit N = TID N can map), for the older
+    /// interface that names a region by its handle. A region made as a
+    /// descriptor has none of these: holding the descriptor is the permission.
     access: u64,
-    /// How many descriptors each task holds for this region.
+    /// Descriptors that name this region, in any program's table or on their
+    /// way down a stream.
     ///
-    /// `access` is permission and cannot double as a reference count: it is one
-    /// bit per task, so a task holding two descriptors for one region — which
-    /// is what `dup` makes, and what every Wayland client does when libwayland
-    /// duplicates a descriptor before sending it — sets the same bit twice and
-    /// clears it on the first close. The region then went away while its owner
-    /// still held a descriptor and a mapping, and the next thing to touch it
-    /// failed a long way from here.
-    refs: [u8; MAX_TASKS],
+    /// One count for all of them, because a descriptor belongs to a table and
+    /// not to a task. It was a count per task, beside a count of its own for
+    /// descriptors in flight — which belong to no task — and the first of
+    /// those could not survive a table two threads share: neither of them is
+    /// "the" holder, and whichever died first took the region with it.
+    fd_refs: u32,
+    /// Made by `SYS_MEMFD_CREATE`: it lives as long as a descriptor names it
+    /// or somebody has it mapped, whoever made it. A region made by handle
+    /// goes with the task that made it, as it always has.
+    by_fd: bool,
     /// Bitmask of TIDs that currently have the region mapped.
     mapped: u64,
     /// Set when destroy was requested while the region was still mapped.
     /// The last task to unmap frees the frames and releases the handle.
     pending_destroy: bool,
-    /// Descriptors for this region sitting in a stream's queue, sent but not
-    /// yet received.
-    ///
-    /// The access mask is keyed by task, and a queued descriptor belongs to no
-    /// task yet — the receiver is not decided until it calls recv. Without a
-    /// count that belongs to nobody, a sender that passes a region and then
-    /// closes its own copy drops the last reference and the region is freed
-    /// under the descriptor still travelling towards its peer.
-    in_flight: u32,
 }
 
 impl ShmemRegion {
@@ -94,10 +90,10 @@ impl ShmemRegion {
             page_count: 0,
             creator: 0,
             access: 0,
-            refs: [0; MAX_TASKS],
+            fd_refs: 0,
+            by_fd: false,
             mapped: 0,
             pending_destroy: false,
-            in_flight: 0,
         }
     }
 }
@@ -176,8 +172,20 @@ unsafe fn release_frames(region: &mut ShmemRegion) -> usize {
     freed
 }
 
-/// Create a shared memory region. Returns handle (0..31) or u64::MAX on error.
+/// Create a shared memory region named by its handle, which its creator may
+/// map and may grant to others. Returns the handle, or u64::MAX.
 pub fn create(pages: usize) -> u64 {
+    create_inner(pages, false)
+}
+
+/// Create a region for a descriptor to name. It starts with one reference —
+/// the descriptor the caller is about to be given — and nobody may map it
+/// except through a descriptor.
+pub fn create_fd(pages: usize) -> u64 {
+    create_inner(pages, true)
+}
+
+fn create_inner(pages: usize, by_fd: bool) -> u64 {
     if pages == 0 || pages > MAX_PAGES_PER_REGION {
         return u64::MAX;
     }
@@ -210,11 +218,12 @@ pub fn create(pages: usize) -> u64 {
         *region = ShmemRegion::empty();
         region.in_use = true;
         region.creator = tid;
-        region.access = 1u64 << tid;
-        // Creating one hands back exactly one descriptor — a memfd — or, for
-        // the older handle-only interface, one right to map that `destroy`
-        // ends. Either way the creator holds one reference.
-        region.refs[tid] = 1;
+        region.by_fd = by_fd;
+        if by_fd {
+            region.fd_refs = 1;
+        } else {
+            region.access = 1u64 << tid;
+        }
         region.page_count = pages;
     }
     irq_restore(flags);
@@ -299,12 +308,14 @@ pub fn resize(handle: usize, pages: usize) -> u64 {
     let flags = irq_save();
     let old_pages = unsafe {
         let region = &mut regions()[handle];
+        // One descriptor names it — the caller's, which the system call
+        // checked — and nothing has it mapped. A second descriptor is one that
+        // has been somewhere, or is on its way.
         if !region.in_use
             || region.pending_destroy
             || region.mapped != 0
-            || region.in_flight != 0
-            || region.access != 1u64 << tid
-            || region.creator != tid
+            || !region.by_fd
+            || region.fd_refs != 1
         {
             irq_restore(flags);
             return u64::MAX;
@@ -319,10 +330,15 @@ pub fn resize(handle: usize, pages: usize) -> u64 {
         // resize that works and one that does not.
         release_frames(region);
         region.page_count = pages;
-        old
+        // Whoever resizes it pays for it from here on: the task that made it
+        // may be a thread that has since gone.
+        let was = region.creator;
+        region.creator = tid;
+        (old, was)
     };
     irq_restore(flags);
-    scheduler::uncharge_task_mem(tid, old_pages);
+    let (old_pages, was) = old_pages;
+    scheduler::uncharge_task_mem(was, old_pages);
 
     if !scheduler::current_task_check_mem(pages) {
         // Put it back the way it was found, so a refused resize does not also
@@ -344,6 +360,16 @@ pub fn resize(handle: usize, pages: usize) -> u64 {
 /// vaddr must be page-aligned and in user space.
 /// Map a region into the caller. Returns the number of pages, or `u64::MAX`.
 pub fn map(handle: usize, vaddr: usize) -> u64 {
+    map_inner(handle, vaddr, false)
+}
+
+/// Map a region the caller holds a descriptor for. The descriptor is the
+/// permission, and the system call has already found it in the caller's table.
+pub fn map_held(handle: usize, vaddr: usize) -> u64 {
+    map_inner(handle, vaddr, true)
+}
+
+fn map_inner(handle: usize, vaddr: usize, held: bool) -> u64 {
     if handle >= MAX_SHMEM {
         return u64::MAX;
     }
@@ -363,7 +389,7 @@ pub fn map(handle: usize, vaddr: usize) -> u64 {
         }
 
         // Check access
-        if region.access & (1u64 << tid) == 0 {
+        if !held && region.access & (1u64 << tid) == 0 {
             irq_restore(flags);
             return u64::MAX;
         }
@@ -404,23 +430,22 @@ pub fn map(handle: usize, vaddr: usize) -> u64 {
     result
 }
 
-/// Admit `tid` to a region, with no check on the caller.
-///
-/// This is not `grant`: it is reachable only when a *descriptor* for the region
-/// changes hands — received over a stream, or duplicated into a task by
-/// somebody already holding `TaskMgmt` over it. In both cases the transfer was
-/// asked for by one side and chosen by the other, which is more than `grant`
-/// requires of anybody.
-pub fn add_access(handle: usize, tid: usize) -> bool {
-    if handle >= MAX_SHMEM || tid >= MAX_TASKS {
+/// Nothing can reach the region any more: no task may map it by handle and
+/// no descriptor names it. Interrupts must be off.
+fn unreachable(r: &ShmemRegion) -> bool {
+    r.access == 0 && r.fd_refs == 0
+}
+
+/// One more descriptor names this region.
+pub fn fd_retain(handle: usize) -> bool {
+    if handle >= MAX_SHMEM {
         return false;
     }
     let flags = irq_save();
     let ok = unsafe {
         let r = &mut regions()[handle];
         if r.in_use && !r.pending_destroy {
-            r.access |= 1u64 << tid;
-            r.refs[tid] = r.refs[tid].saturating_add(1);
+            r.fd_refs += 1;
             true
         } else {
             false
@@ -430,71 +455,24 @@ pub fn add_access(handle: usize, tid: usize) -> bool {
     ok
 }
 
-/// Drop one task's descriptor reference to a region.
-///
-/// `tid` is passed rather than taken from the current task because this is
-/// reached from the reaper as well as from a task closing its own descriptor,
-/// and the reaper is not the task whose descriptors it is releasing.
-pub fn close_ref(handle: usize, tid: usize) {
-    if handle >= MAX_SHMEM || tid >= MAX_TASKS {
+/// One fewer. The last one frees the region, unless somebody has it mapped:
+/// closing a descriptor governs the right to map, not mappings that already
+/// exist, so the frames then go when the last mapper unmaps.
+pub fn fd_release(handle: usize) {
+    if handle >= MAX_SHMEM {
         return;
     }
     let flags = irq_save();
     unsafe {
         let r = &mut regions()[handle];
-        if r.in_use {
-            // Only the task's *last* descriptor gives up its permission.
-            r.refs[tid] = r.refs[tid].saturating_sub(1);
-            if r.refs[tid] == 0 {
-                r.access &= !(1u64 << tid);
-            }
-            if r.access == 0 && r.in_flight == 0 {
+        if r.in_use && r.fd_refs > 0 {
+            r.fd_refs -= 1;
+            if unreachable(r) {
                 if r.mapped == 0 {
                     release(r);
                 } else {
-                    // Somebody still has it mapped. Revocation governs the
-                    // right to map, not mappings that already exist, so the
-                    // frames go when the last mapper unmaps.
                     r.pending_destroy = true;
                 }
-            }
-        }
-    }
-    irq_restore(flags);
-}
-
-/// Take a reference held by nobody, for a descriptor in flight.
-pub fn hold_in_flight(handle: usize) -> bool {
-    if handle >= MAX_SHMEM {
-        return false;
-    }
-    let flags = irq_save();
-    let ok = unsafe {
-        let r = &mut regions()[handle];
-        if r.in_use && !r.pending_destroy {
-            r.in_flight += 1;
-            true
-        } else {
-            false
-        }
-    };
-    irq_restore(flags);
-    ok
-}
-
-/// Release an in-flight reference — the descriptor arrived, or was dropped
-/// with the stream that was carrying it.
-pub fn drop_in_flight(handle: usize) {
-    if handle >= MAX_SHMEM {
-        return;
-    }
-    let flags = irq_save();
-    unsafe {
-        let r = &mut regions()[handle];
-        if r.in_use && r.in_flight > 0 {
-            r.in_flight -= 1;
-            if r.in_flight == 0 && r.access == 0 && r.mapped == 0 {
-                release(r);
             }
         }
     }
@@ -514,7 +492,9 @@ pub fn grant(handle: usize, target_tid: usize) -> u64 {
     let flags = irq_save();
     let result = unsafe {
         let region = &mut regions()[handle];
-        if !region.in_use || region.pending_destroy {
+        if !region.in_use || region.pending_destroy || region.by_fd {
+            // A descriptor's region is reached by holding a descriptor, and
+            // handed on by handing one on.
             u64::MAX
         } else if region.creator != tid && !has_mgmt {
             // Only creator or CAP_TASK_MGMT holders can grant
@@ -550,7 +530,9 @@ pub fn unmap(handle: usize, vaddr: usize) -> u64 {
             irq_restore(flags);
             return u64::MAX;
         }
-        if region.access & (1u64 << tid) == 0 {
+        // Whoever may map it may unmap it, and so may whoever has it mapped:
+        // the right to map can have gone since.
+        if region.access & (1u64 << tid) == 0 && region.mapped & (1u64 << tid) == 0 {
             irq_restore(flags);
             return u64::MAX;
         }
@@ -598,6 +580,9 @@ pub fn destroy(handle: usize) -> u64 {
             u64::MAX
         } else if region.creator != tid && !has_mgmt {
             u64::MAX
+        } else if region.by_fd {
+            // A descriptor's region ends when its descriptors do.
+            u64::MAX
         } else {
             // No further mappings may be created.
             region.pending_destroy = true;
@@ -614,26 +599,47 @@ pub fn destroy(handle: usize) -> u64 {
 
 /// Clean up shared memory for a dead task.
 ///
-/// The task's address space is being torn down, so drop its mapping bit
-/// everywhere, then retire any region it created. A region another live task
-/// still has mapped stays alive until that task unmaps it.
-pub fn cleanup_task(tid: usize) {
+/// A mapping belongs to an address space, and is recorded against the task
+/// that made it. If that task was a thread and its program lives on, so does
+/// the mapping: it is handed to `survivor`, a task still running there.
+/// Dropping it instead let the region be freed while a live address space
+/// still mapped its frames.
+///
+/// With nobody left in the address space, the task's mapping bit goes
+/// everywhere, and any region it made by handle is retired. A region another
+/// live task still has mapped stays until that task unmaps it.
+pub fn cleanup_task(tid: usize, survivor: Option<usize>) {
     if tid >= MAX_TASKS {
         return;
     }
+    let bit = 1u64 << tid;
     let flags = irq_save();
     unsafe {
         for region in regions().iter_mut() {
             if !region.in_use {
                 continue;
             }
-            region.mapped &= !(1u64 << tid);
-            region.access &= !(1u64 << tid);
-            region.refs[tid] = 0;
+            if region.mapped & bit != 0 {
+                region.mapped &= !bit;
+                if let Some(s) = survivor {
+                    region.mapped |= 1u64 << s;
+                }
+            }
+            region.access &= !bit;
 
             if region.creator == tid {
+                if !region.by_fd {
+                    region.pending_destroy = true;
+                    region.access = 0;
+                }
+                // The quota it was charged to has gone with the task. A
+                // program that still uses the region carries it from here;
+                // with no program left there is nobody to refund, and the
+                // number must not be left to name whoever takes it next.
+                region.creator = survivor.unwrap_or(usize::MAX);
+            }
+            if unreachable(region) {
                 region.pending_destroy = true;
-                region.access = 0;
             }
             if region.pending_destroy && region.mapped == 0 {
                 release(region);

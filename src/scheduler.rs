@@ -95,7 +95,6 @@ pub fn init() {
                 crate::cap::populate_from_bitmask(&mut cs, crate::task::CAP_ALL);
                 cs
             },
-            fds: [crate::task::FdKind::empty(); crate::task::MAX_FDS],
             pager_tid: 0,
             parent_tid: 0,
             mem_pages: 0,
@@ -107,6 +106,7 @@ pub fn init() {
             gid: 0,
             fpu: crate::fpu::clean(),
         });
+        crate::fdtable::attach_new(0);
     }
     CURRENT_TID.store(0, Ordering::SeqCst);
     INITIALIZED.store(true, Ordering::SeqCst);
@@ -156,6 +156,7 @@ pub fn spawn(entry_fn: fn()) -> usize {
             }
             TASKS[tid] = Some(task);
             crate::cap::open_endpoint(tid);
+            crate::fdtable::attach_new(tid);
             enqueue(tid);
         }
         irq_restore(flags);
@@ -744,16 +745,7 @@ pub fn sys_wait() -> u64 {
 /// At or above 3 because 0, 1 and 2 are whatever a spawner wired them to, and a
 /// program allocating a descriptor never means to take stdin's place.
 pub fn install_fd(tid: usize, kind: crate::task::FdKind) -> Option<usize> {
-    unsafe {
-        let task = TASKS[tid].as_mut()?;
-        for fd in 3..crate::task::MAX_FDS {
-            if task.fds[fd].is_empty() {
-                task.fds[fd] = kind;
-                return Some(fd);
-            }
-        }
-    }
-    None
+    crate::fdtable::install(tid, kind, 3)
 }
 
 /// The lowest free descriptor at or above 3.
@@ -764,27 +756,17 @@ pub fn lowest_free_fd(tid: usize) -> Option<usize> {
 /// The lowest free descriptor at or above `floor`, which is what `dup` with a
 /// minimum asks for.
 pub fn free_fd_at_or_above(tid: usize, floor: usize) -> Option<usize> {
-    if tid >= crate::task::MAX_TASKS {
-        return None;
-    }
-    unsafe {
-        let task = TASKS[tid].as_ref()?;
-        (floor..crate::task::MAX_FDS).find(|&fd| task.fds[fd].is_empty())
-    }
+    crate::fdtable::free_at_or_above(tid, floor)
 }
 
 /// Empty one descriptor without releasing what it named.
 ///
 /// For unwinding a partial install, where the caller releases the object.
 pub fn clear_fd(tid: usize, fd: usize) -> Result<(), ()> {
-    unsafe {
-        let task = TASKS[tid].as_mut().ok_or(())?;
-        if fd >= crate::task::MAX_FDS {
-            return Err(());
-        }
-        task.fds[fd] = crate::task::FdKind::Empty;
-        Ok(())
+    if fd >= crate::task::MAX_FDS {
+        return Err(());
     }
+    crate::fdtable::replace(tid, fd, crate::task::FdKind::Empty).map(|_| ())
 }
 
 pub unsafe fn get_task_mut(tid: usize) -> Option<&'static mut Task> { unsafe {
@@ -810,11 +792,16 @@ pub fn kill_task(tid: usize) -> Result<(), ()> {
     if tid == current_tid() {
         exit_with(-9);
     }
+    end_other(tid, -9)
+}
+
+/// End a task that is not the one running, with a status.
+fn end_other(tid: usize, code: i32) -> Result<(), ()> {
     unsafe {
         match TASKS[tid].as_mut() {
             Some(task) if task.state != TaskState::Dead => {
                 task.state = TaskState::Dead;
-                task.exit_code = -9; // killed, as SIGKILL
+                task.exit_code = code;
                 crate::ipc::clear_signal_deadline(tid);
                 // As in `exit_with`: what others wait on is let go now.
                 close_descriptors(tid);
@@ -823,6 +810,7 @@ pub fn kill_task(tid: usize) -> Result<(), ()> {
                 if parent != 0 && WAIT_BLOCKED[parent] {
                     WAIT_BLOCKED[parent] = false;
                     WAIT_RESULT[parent] = tid;
+                    WAIT_CODE[parent] = code;
                     REAPED[tid] = true;
                     unblock_task(parent);
                 }
@@ -831,6 +819,32 @@ pub fn kill_task(tid: usize) -> Result<(), ()> {
             _ => Err(()),
         }
     }
+}
+
+/// End the running task's whole program: every other task in its address
+/// space, and then the caller, all with one status.
+///
+/// What `exit` means in C, and what a main thread returning means in Rust.
+/// Ending only the caller left a program's other threads behind — parked on a
+/// lock nobody would ever release — and with them everything the program had
+/// open, which is the program's and not the caller's: a pipe it was writing
+/// never reached its end, and a compositor never heard its client go.
+pub fn exit_program(code: i32) -> ! {
+    let me = current_tid();
+    let flags = irq_save();
+    let space = unsafe { TASKS[me].as_ref().map_or(0, |t| t.space) };
+    if space != 0 {
+        for tid in 2..MAX_TASKS {
+            let sibling = unsafe {
+                matches!(TASKS[tid], Some(ref t) if tid != me && t.space == space && t.state != TaskState::Dead)
+            };
+            if sibling {
+                let _ = end_other(tid, code);
+            }
+        }
+    }
+    irq_restore(flags);
+    exit_with(code)
 }
 
 /// The id of the program `tid` belongs to — its address space's — or 0 for a
@@ -989,25 +1003,15 @@ unsafe fn reap(i: usize) { unsafe {
 /// they share goes only when the last of them does.
 /// Let go of everything a task holds that somebody else can be waiting on.
 ///
-/// Called when a task dies rather than when it is reaped, and it empties the
-/// table so that reaping finds nothing left to do. What it does *not* touch is
-/// memory: a dead task keeps that until it is collected, which is what lets
-/// `sys_wait` report an exit status.
+/// Called when a task dies rather than when it is reaped. What it does *not*
+/// touch is memory: a dead task keeps that until it is collected, which is
+/// what lets `sys_wait` report an exit status.
+///
+/// The descriptors are its program's, so what goes here is the task's use of
+/// them — and the descriptors themselves only if it was the last task the
+/// program had. A thread that exits closes nothing.
 pub fn close_descriptors(tid: usize) {
-    let flags = irq_save();
-    let fds = unsafe {
-        match TASKS[tid].as_mut() {
-            Some(t) => core::mem::replace(&mut t.fds, [crate::task::FdKind::Empty; crate::task::MAX_FDS]),
-            None => {
-                irq_restore(flags);
-                return;
-            }
-        }
-    };
-    irq_restore(flags);
-    // Outside the lock: closing a pipe end wakes whoever was waiting on it,
-    // which is a scheduler operation of its own.
-    crate::pipe::cleanup_task_fds(&fds, tid);
+    crate::fdtable::task_gone(tid);
 }
 
 unsafe fn reap_one(i: usize) -> u64 { unsafe {
@@ -1022,22 +1026,33 @@ unsafe fn reap_one(i: usize) -> u64 { unsafe {
     if !can_reap {
         return 0;
     }
-    // Pipe refcounts, for a task that died before this was moved to `exit_with`
-    // — a kernel task, say, that never went through it. Ordinarily the table
-    // is already empty by now.
-    crate::pipe::cleanup_task_fds(&task.fds, i);
+    // For a task that died some way other than `exit_with` or `kill_task` —
+    // a kernel task, say. Ordinarily it left its table when it died.
+    crate::fdtable::task_gone(i);
     // Reclaim pipes it created but never attached to an fd
     crate::pipe::cleanup_orphans(i);
     // Clean up IPC state and unblock tasks waiting on this one
     crate::ipc::cleanup_task_ipc(i);
     // Objects it paged for have no pager now.
     crate::memobj::task_gone(i);
+    // And what it served has no server. Before its endpoint is closed: that
+    // is how its objects are told from the next task's with this number.
+    crate::served::server_gone(i);
     // Unregister any IRQ handlers
     crate::irq_dispatch::unregister_task_irqs(i);
     // Clean up futex waiters
     crate::futex::cleanup_task(i);
-    // Clean up shared memory regions created by this task
-    crate::shmem::cleanup_task(i);
+    // Shared memory it mapped or made. If its program lives on, so do the
+    // mappings: they are handed to a task still running there.
+    let space = task.space;
+    let survivor = if space == 0 {
+        None
+    } else {
+        (*core::ptr::addr_of!(TASKS)).iter().position(|t| {
+            matches!(t, Some(t) if t.tid != i && t.space == space && t.state != TaskState::Dead)
+        })
+    };
+    crate::shmem::cleanup_task(i, survivor);
     // Reclaim sys_phys_alloc reservations it never released
     crate::pmm::release_task_frames(i);
     // Destroy the address space only once the last task using
@@ -1254,7 +1269,6 @@ pub fn create_empty_task() -> Option<usize> {
             space: 0,
             caps: 0,
             cspace: crate::cap::empty_cspace(),
-            fds: [crate::task::FdKind::empty(); crate::task::MAX_FDS],
             pager_tid: 0,
             parent_tid: parent,
             mem_pages: 0,
@@ -1271,26 +1285,29 @@ pub fn create_empty_task() -> Option<usize> {
             fpu: crate::fpu::clean(),
         });
         crate::cap::open_endpoint(tid);
+        // A table of its own, empty. A task started as a thread gives it up
+        // for its program's; a task started as a program keeps it.
+        crate::fdtable::attach_new(tid);
     }
     irq_restore(flags);
 
     Some(tid)
 }
 
-/// Give a new thread what its creator holds.
+/// Give a new task of a program what its creator holds as a *task*: its
+/// capabilities and its band.
 ///
 /// A thread is not a new principal: it runs in its creator's address space and
 /// can already do anything its creator can. It used to start with nothing — no
 /// capability, so it could call no server, not even the VFS about a file its
-/// program had opened; no descriptors; and the ordinary band whatever its
-/// program's. So it starts with a copy of each: the capabilities as they are
-/// (a revoked original takes the copy with it, since both name the same root),
-/// the descriptors as `dup` would make them, and the band.
+/// program had opened — and the ordinary band whatever its program's. So it
+/// starts with a copy of each: the capabilities as they are (a revoked
+/// original takes the copy with it, since both name the same root), and the
+/// band. A slot the creator filled before starting it keeps what it was given.
 ///
-/// A copy, not a share. What either task is given afterwards is its own, and
-/// a slot or descriptor the creator filled before starting the thread keeps
-/// what it was given. Poll sets and sockets are left behind: neither counts
-/// its holders, so a thread closing its copy would take the creator's with it.
+/// A copy, because a CSpace is a task's. Descriptors are not here: those are
+/// the program's, and a thread shares them (`fdtable::share`) where a forked
+/// child gets copies (`fdtable::copy_into`).
 pub fn inherit_from_creator(tid: usize, creator: usize) {
     if tid >= MAX_TASKS || creator >= MAX_TASKS || tid == creator {
         return;
@@ -1304,7 +1321,6 @@ pub fn inherit_from_creator(tid: usize, creator: usize) {
         let cspace = src.cspace;
         let caps = src.caps;
         let band = src.base_priority;
-        let fds = src.fds;
         if let Some(dst) = TASKS[tid].as_mut() {
             for (slot, cap) in cspace.iter().enumerate() {
                 if dst.cspace[slot].cap_type == crate::cap::CapType::Empty {
@@ -1314,20 +1330,6 @@ pub fn inherit_from_creator(tid: usize, creator: usize) {
             dst.caps = caps;
             dst.base_priority = band;
             dst.priority = band;
-            for (i, kind) in fds.iter().enumerate() {
-                if kind.is_empty() || !dst.fds[i].is_empty() {
-                    continue;
-                }
-                if matches!(
-                    kind,
-                    crate::task::FdKind::PollSet { .. } | crate::task::FdKind::Socket { .. }
-                ) {
-                    continue;
-                }
-                if crate::pipe::retain_fd(kind, tid).is_ok() {
-                    dst.fds[i] = *kind;
-                }
-            }
         }
     }
     irq_restore(flags);
@@ -1412,17 +1414,10 @@ pub fn set_fd(tid: usize, fd: usize, entry: crate::task::FdKind) -> Result<(), (
     if tid >= MAX_TASKS || fd >= crate::task::MAX_FDS {
         return Err(());
     }
-    let old = unsafe {
-        match TASKS[tid].as_mut() {
-            Some(task) => core::mem::replace(&mut task.fds[fd], entry),
-            None => return Err(()),
-        }
-    };
-    // Whatever the descriptor named before is closed, as dup2 closes it. A
-    // task that inherited its creator's descriptors has something in slots a
-    // spawner used to find empty, and overwriting it leaked a reference.
+    let old = crate::fdtable::replace(tid, fd, entry)?;
+    // Whatever the descriptor named before is closed, as dup2 closes it.
     if !old.is_empty() {
-        crate::pipe::release_fd(&old, tid);
+        crate::pipe::release_fd(&old);
     }
     Ok(())
 }
@@ -1433,23 +1428,9 @@ pub fn set_fd(tid: usize, fd: usize, entry: crate::task::FdKind) -> Result<(), (
 /// a parent the way stdio and pipes are, so there is nobody to say which fd
 /// number to use.
 pub fn current_alloc_fd(entry: crate::task::FdKind) -> Result<usize, ()> {
-    unsafe {
-        let tid = CURRENT_TID.load(Ordering::SeqCst);
-        match TASKS[tid].as_mut() {
-            Some(task) => {
-                // 0, 1 and 2 are stdio by convention even when unset, and
-                // handing one out would silently redirect a program's output.
-                for fd in 3..crate::task::MAX_FDS {
-                    if task.fds[fd].is_empty() {
-                        task.fds[fd] = entry;
-                        return Ok(fd);
-                    }
-                }
-                Err(())
-            }
-            None => Err(()),
-        }
-    }
+    // 0, 1 and 2 are stdio by convention even when unset, and handing one out
+    // would silently redirect a program's output.
+    crate::fdtable::install(CURRENT_TID.load(Ordering::SeqCst), entry, 3).ok_or(())
 }
 
 /// Set the pager task for a given task.
@@ -1558,13 +1539,7 @@ pub fn current_fd(fd: usize) -> crate::task::FdKind {
     if fd >= crate::task::MAX_FDS {
         return crate::task::FdKind::Empty;
     }
-    unsafe {
-        let tid = CURRENT_TID.load(Ordering::SeqCst);
-        match TASKS[tid].as_ref() {
-            Some(task) => task.fds[fd],
-            None => crate::task::FdKind::Empty,
-        }
-    }
+    crate::fdtable::get(CURRENT_TID.load(Ordering::SeqCst), fd)
 }
 
 /// The top of the running task's kernel stack.
@@ -1644,6 +1619,10 @@ pub fn fork_current() -> Option<usize> {
         }
     };
     inherit_from_creator(tid, parent);
+    // A second descriptor for everything the parent has open, the working
+    // directory included: the child's own, to close without the parent
+    // noticing.
+    crate::fdtable::copy_into(tid, parent);
     {
         let flags = irq_save();
         unsafe {
@@ -1765,6 +1744,8 @@ pub fn exec_into(cr3: usize, entry: u64, rsp: u64) -> Result<(), ()> {
     if crate::userspace::addrspace_unref(old_cr3) {
         drop_unused_space(old_cr3);
     }
+    // What the old program marked as its own business goes with it.
+    crate::fdtable::close_on_exec(caller);
     unsafe {
         crate::syscall::enter_usermode(entry, rsp, 0);
     }
