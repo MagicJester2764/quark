@@ -203,6 +203,19 @@ pub fn add(ev: usize, n: u64) -> bool {
     ok
 }
 
+/// A task parked on this counter has died: it is waiting for nothing now.
+pub fn forget_waiter(ev: usize, tid: usize) {
+    if ev >= MAX_EVENTS {
+        return;
+    }
+    let flags = irq_save();
+    let e = &mut events()[ev];
+    if e.in_use {
+        crate::pipe::forget_in(&mut e.waiters, &mut e.nwaiters, tid);
+    }
+    irq_restore(flags);
+}
+
 /// Park until the counter is not zero. `false` when there was no room to be
 /// recorded as a waiter — which must not become a wait, since an unrecorded
 /// waiter is never woken.

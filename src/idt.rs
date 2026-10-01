@@ -401,7 +401,7 @@ extern "C" fn exception_handler(frame: &InterruptFrame) {
                 print_dec(tid);
                 console::puts(b" - killing task.\n");
                 unsafe { core::arch::asm!("sti", options(nostack, nomem)) };
-                scheduler::exit_with(-SIGBUS);
+                scheduler::exit_program(-SIGBUS);
             }
             Err(_) => {}
         }
@@ -458,7 +458,7 @@ extern "C" fn exception_handler(frame: &InterruptFrame) {
         unsafe { core::arch::asm!("sti", options(nostack, nomem)) };
         // Not exit(), which reports success: a parent waiting on a task that
         // died of a fault must not be told it finished.
-        scheduler::exit_with(-SIGSEGV);
+        scheduler::exit_program(-SIGSEGV);
     }
 
     // Any other exception taken in ring 3 is the task's, not the kernel's.
@@ -492,7 +492,7 @@ extern "C" fn exception_handler(frame: &InterruptFrame) {
         console::puts(b" - killing task.\n");
 
         unsafe { core::arch::asm!("sti", options(nostack, nomem)) };
-        scheduler::exit_with(-sig);
+        scheduler::exit_program(-sig);
     }
 
     // Kernel faults: fatal

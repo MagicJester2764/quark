@@ -535,6 +535,56 @@ pub fn release_fd(kind: &FdKind) {
     }
 }
 
+/// Take `tid` off the list of tasks parked on what a descriptor names.
+///
+/// For a task that died where it waited. Every list here is of task ids, and
+/// an id is given to the next task made: a wake meant for the dead one would
+/// reach whatever has its number now, and if that is blocked on something
+/// else — a call to a server — it is woken with nothing, and the call fails.
+/// A kind that parks tasks and is missing here leaves that open.
+pub fn forget_waiter(kind: &FdKind, tid: usize) {
+    match kind {
+        FdKind::PipeRead(handle) | FdKind::PipeWrite(handle) => forget_on_pipe(*handle, tid),
+        FdKind::StreamEnd { stream, end } => {
+            if let Some((rd, wr)) = crate::stream::pipes_for(*stream, *end) {
+                forget_on_pipe(rd, tid);
+                forget_on_pipe(wr, tid);
+            }
+        }
+        FdKind::PtyEnd { pty, .. } => crate::pty::forget_waiter(*pty, tid),
+        FdKind::Timer { timer } => crate::timerfd::forget_waiter(*timer, tid),
+        FdKind::Event { ev } => crate::eventfd::forget_waiter(*ev, tid),
+        _ => {}
+    }
+}
+
+/// `tid` out of a list of `count` waiters, the rest closed up.
+pub fn forget_in(list: &mut [usize], count: &mut usize, tid: usize) {
+    let mut kept = 0;
+    for i in 0..*count {
+        if list[i] != tid {
+            list[kept] = list[i];
+            kept += 1;
+        }
+    }
+    *count = kept;
+}
+
+fn forget_on_pipe(handle: usize, tid: usize) {
+    if handle >= MAX_PIPES {
+        return;
+    }
+    let flags = irq_save();
+    unsafe {
+        let pipe = &mut PIPES[handle];
+        if pipe.in_use {
+            forget_in(&mut pipe.read_waiters, &mut pipe.read_waiter_count, tid);
+            forget_in(&mut pipe.write_waiters, &mut pipe.write_waiter_count, tid);
+        }
+    }
+    irq_restore(flags);
+}
+
 /// Take a reference on whatever a descriptor names, for a copy of it.
 ///
 /// The mirror of `release_fd`, and deliberately beside it: every way of

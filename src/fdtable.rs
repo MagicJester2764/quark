@@ -179,6 +179,16 @@ fn release_all(fds: &[FdKind; SLOTS]) {
 /// leaves its table, and if it was the last task there, everything the table
 /// named is released.
 pub fn task_gone(tid: usize) {
+    // If it died where it was waiting, it is still on that list, under an id
+    // the next task will be given. Off it before the reference goes.
+    if tid < MAX_TASKS {
+        let flags = irq_save();
+        let held = unsafe { (*core::ptr::addr_of!(HELD))[tid] };
+        irq_restore(flags);
+        if !held.is_empty() {
+            crate::pipe::forget_waiter(&held, tid);
+        }
+    }
     unhold(tid);
     if let Some(fds) = leave(tid) {
         release_all(&fds);

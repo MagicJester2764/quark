@@ -3098,7 +3098,12 @@ extern "C" fn syscall_dispatch(
             if !has_cap && !same_uid {
                 return u64::MAX;
             }
-            match scheduler::kill_task(tid) {
+            // A task of the caller's own program is a thread it is ending;
+            // anybody else's is a program.
+            let own = scheduler::space_of_task(tid) != 0
+                && scheduler::space_of_task(tid) == scheduler::space_of_task(caller);
+            let ended = if own { scheduler::kill_task(tid) } else { scheduler::kill_program(tid) };
+            match ended {
                 Ok(()) => 0,
                 Err(()) => u64::MAX,
             }

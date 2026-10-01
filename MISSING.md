@@ -21,17 +21,25 @@ them struck through as done. What follows is what is true now.
   until written needs a reference count per frame, and frames here have an
   owner and nothing else.
 - **POSIX signals.** The kernel has three signals of its own — interrupt,
-  terminate and kill (`SYS_SIGNAL`). Kill ends a task at once; the other two
-  arrive as bits in its notification word, abandon the call it is blocked in,
-  and end it five seconds later if it is still there. That is enough for
-  Ctrl-C at the console and for `kill`. What is missing is everything a C
-  program means by the word: nothing runs a handler in the task, there are no
-  masks and no process groups, and nothing is sent when a child exits or a
-  terminal changes size. A pseudo-terminal knows its interrupt character — it
-  is taken out of what is typed and the line thrown away — and tells nobody.
-  A fault in
-  ring 3 ends the task with the negated Linux signal number as its status,
-  which is the only place those numbers appear.
+  terminate and kill (`SYS_SIGNAL`). Kill ends a program at once; the other
+  two arrive as bits in a task's notification word, abandon the call it is
+  blocked in, and end its program five seconds later if it is still there.
+  That is enough for Ctrl-C at the console and for `kill`. What is missing is
+  everything a C program means by the word: nothing runs a handler in the
+  task, there are no masks and no process groups, and nothing is sent when a
+  child exits or a terminal changes size. A pseudo-terminal knows its
+  interrupt character — it is taken out of what is typed and the line thrown
+  away — and tells nobody. A fault in ring 3 ends the program with the negated
+  Linux signal number as its status, which is the only place those numbers
+  appear.
+- **A wait list names a task by its id, and ids are reused.** A task killed
+  while it is parked in a read or a write is taken off the list it was on
+  (`pipe::forget_waiter`, reached through what it held), because a wake meant
+  for it would otherwise reach whatever has its number next — and a call to a
+  server that is woken with no reply fails. That covers pipes, streams,
+  terminals, timers and counters. A poll set's one waiter is not covered, and
+  the lists want to name the task rather than the number: the kernel already
+  has a number per task that is never reused, for endpoints.
 - **AVX.** `CR4.OSXSAVE` is clear, so an AVX instruction faults. Turning it on
   means moving the per-task floating-point state from `FXSAVE` to `XSAVE`
   first — see [`docs/fpu.md`](docs/fpu.md).

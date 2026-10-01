@@ -182,10 +182,12 @@ may keep — are in `../quarkutils/CLAUDE.md`; these are the kernel's.
   and free tables still in use. The kernel backs a reserved page before it
   touches it (`validate_user_range`, the futex path), and a page fault on one
   is served, so the first touch from anywhere gives it its frame.
-- **A fault in ring 3 ends the task, never the machine.** The task exits with
-  the negated Linux signal number (`idt.rs`), and only a fault taken in ring 0
-  halts. musl's `abort()` is a privileged `hlt`, so before this, one failed
-  assert stopped everything.
+- **A fault in ring 3 ends the program, never the machine.** Every task of
+  the program that faulted exits with the negated Linux signal number
+  (`idt.rs`), and only a fault taken in ring 0 halts. musl's `abort()` is a
+  privileged `hlt`, so before this, one failed assert stopped everything. The
+  program and not the task: a thread that faulted and went alone left the
+  rest parked on whatever it held.
 - **Capabilities are the authority.** There is no UID 0 bypass; `uid == 0` no
   longer short-circuits `cap::task_has_*`. A service that cannot do something
   is missing a capability, not a privilege level.
@@ -353,6 +355,13 @@ every Unix program assumes:
   task, which is what a thread wants and never what `exit` means: the other
   threads stayed parked on locks nobody would release, holding the program's
   descriptors, and a compositor never heard its client go.
+- **And is ended as a whole.** A kill from outside a program
+  (`scheduler::kill_program`: `SYS_TASK_KILL` of another program's task, the
+  kill signal, the deadline a signal carries) and a fault both end every task
+  in the address space. `kill_task` is the one-task form, for a program
+  ending a thread of its own. The first was the only form for a long time,
+  and a compositor that ended a toolkit client by its first task kept three
+  of its threads.
 - **A kernel budget is per program, not per TID.** A pipe outlives its
   creator — its ends are descriptors other tasks hold — so counting the
   per-task cap by TID gave a fresh task the budget of whatever had its number

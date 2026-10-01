@@ -810,6 +810,10 @@ pub unsafe fn get_task_mut(tid: usize) -> Option<&'static mut Task> { unsafe {
 
 /// Kill a task by TID. Marks it Dead and wakes its parent if waiting.
 /// Cannot kill TID 0 (idle) or TID 1 (init).
+///
+/// One task, whatever else is in its program: what a program ending one of
+/// its own threads means. Anything said from outside a program is said to
+/// the program, and is [`kill_program`].
 pub fn kill_task(tid: usize) -> Result<(), ()> {
     if tid <= 1 || tid >= MAX_TASKS {
         return Err(());
@@ -823,7 +827,55 @@ pub fn kill_task(tid: usize) -> Result<(), ()> {
     if tid == current_tid() {
         exit_with(-9);
     }
-    end_other(tid, -9)
+    let flags = irq_save();
+    let ended = end_other(tid, -9);
+    irq_restore(flags);
+    ended
+}
+
+/// Kill the program `tid` belongs to: every task in its address space.
+///
+/// What a kill means to whoever asks for one — a shell, a compositor ending
+/// its session, a test that ran out of time, the deadline a signal carries.
+/// Ending only the task named left a threaded program's other threads behind,
+/// parked for ever, holding everything the program had open: a compositor
+/// that ended a toolkit client by its first task kept three of its threads
+/// and its connection.
+///
+/// A task that has not been started is in no program yet, and is ended alone.
+pub fn kill_program(tid: usize) -> Result<(), ()> {
+    if tid <= 1 || tid >= MAX_TASKS {
+        return Err(());
+    }
+    let me = current_tid();
+    let flags = irq_save();
+    let (mine, theirs) = unsafe {
+        (
+            TASKS[me].as_ref().map_or(0, |t| t.space),
+            TASKS[tid].as_ref().map_or(0, |t| t.space),
+        )
+    };
+    if theirs == 0 {
+        irq_restore(flags);
+        return kill_task(tid);
+    }
+    if theirs == mine {
+        // The caller's own program, or the one that was running when its
+        // deadline passed: the caller goes with it, and last.
+        irq_restore(flags);
+        exit_program(-9);
+    }
+    let mut ended = Err(());
+    for other in 2..MAX_TASKS {
+        let theirs_too = unsafe {
+            matches!(TASKS[other], Some(ref t) if t.space == theirs && t.state != TaskState::Dead)
+        };
+        if theirs_too && end_other(other, -9).is_ok() {
+            ended = Ok(());
+        }
+    }
+    irq_restore(flags);
+    ended
 }
 
 /// End a task that is not the one running, with a status.
@@ -1678,7 +1730,7 @@ pub fn fork_current() -> Option<usize> {
     }
 
     if start_forked(tid, child_cr3, &frame).is_err() {
-        kill_task(tid);
+        let _ = kill_task(tid);
         return None;
     }
     Some(tid)

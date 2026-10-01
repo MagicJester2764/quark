@@ -181,7 +181,7 @@ returning at once turned that loop into a spin.
 | Version | Added |
 |---|---|
 | 3.1 | **A descriptor belongs to a program, and may name an object in a server.** Every task of a program uses one table, so what one thread opens its siblings see and what one closes is closed; a thread used to start on a copy of its creator's table and share nothing afterwards. Sixty-four descriptors rather than thirty-two. `SYS_EXIT_PROGRAM` (8) ends every task of the caller's program with one status, which is what `exit` means and what `SYS_EXIT_CODE` — one task — never did. Block 0xE0 opens with *served descriptors*: `SYS_FD_SERVE` (224), `SYS_FD_SERVED` (225), `SYS_FD_HOLDS` (226), `SYS_FD_COOKIE` (227) and `SYS_FD_REAP` (229) let a server give a client a descriptor for one of its own objects — a file — which the kernel then counts, copies across `SYS_FORK`, keeps across `SYS_EXEC_SPACE` and reads and writes through like any other. Descriptor 64 is the program's working directory. `SYS_FD_FLAGS` (228) marks a descriptor to close when its program becomes another, and `SYS_EXEC_SPACE` closes those. Memory named by a descriptor may be mapped by whoever holds the descriptor, and lasts as long as a descriptor names it or somebody has it mapped, whoever made it. |
-| 3.2 | What a shell asks of a kernel that is not about descriptors. `SYS_UMASK` (9): the permission bits a program leaves off what it makes. The kernel makes no files and never reads it; it keeps it because it must follow a program across `SYS_FORK` and `SYS_EXEC_SPACE`, which a C library's memory does not. `SYS_WAIT_FOR` (10): wait for one child in particular, or ask without waiting — `waitpid` with a process id, and `WNOHANG`. Two things change with no new number. A pty's line discipline acts on `ISIG` and on the erase, kill, word-erase and end-of-file characters. And a write to a pty's slave waits for room and writes everything, where it used to return what fitted — which could be nothing. |
+| 3.2 | What a shell asks of a kernel that is not about descriptors. `SYS_UMASK` (9): the permission bits a program leaves off what it makes. The kernel makes no files and never reads it; it keeps it because it must follow a program across `SYS_FORK` and `SYS_EXEC_SPACE`, which a C library's memory does not. `SYS_WAIT_FOR` (10): wait for one child in particular, or ask without waiting — `waitpid` with a process id, and `WNOHANG`. Three things change with no new number. `SYS_TASK_KILL` (5), the kill bit of `SYS_SIGNAL` (6) and a signal's deadline end the *program* the task named belongs to, and so does a fault: every task in the address space, where each used to end one task and leave its threads. A task of the caller's own program is still ended alone. A pty's line discipline acts on `ISIG` and on the erase, kill, word-erase and end-of-file characters. And a write to a pty's slave waits for room and writes everything, where it used to return what fitted — which could be nothing. |
 
 3.1 was a change of behaviour and no change of number, so a minor: nothing built for
 3.0 calls anything that means something else now. What it could have relied on
@@ -284,6 +284,13 @@ the caller. It is what a C library's `exit` and a Rust `main` returning mean.
 A thread ending itself uses `SYS_EXIT_CODE`, and a program whose first task
 does that goes on running in its other threads, with everything it has open.
 
+`SYS_TASK_KILL` ends a *program*: every task in the address space `tid`
+belongs to, each with status -9. Naming one task of another program and
+ending only that one left a threaded program's other threads behind, with
+everything it had open. The exception is a task of the caller's own program,
+which is a thread it is ending, and is ended alone; and a task that has not
+been started, which is in no program yet.
+
 `SYS_WAIT_FOR` is `SYS_WAIT` with two things said. A child named is the only
 one collected, and the only one whose ending wakes the caller: waiting for
 one child by collecting whichever ends first would lose the status of every
@@ -300,12 +307,12 @@ applies them.
 
 **Signals.** There are three, and they are bits: interrupt (`1 << 16`),
 terminate (`1 << 17`) and kill (`1 << 18`). `SYS_SIGNAL` with the kill bit ends
-the target at once, with status -9. Either of the others is raised in the
-target's notification word, where the target finds it at its next receive (see
-`SYS_NOTIFY` below); a call the target is blocked in is abandoned and returns
-failure, so that a task waiting on a server gets to look; and the task is
-killed 500 ticks later if it is still there. A second signal does not extend
-that. Tasks 0 and 1 cannot be signalled.
+the target's program at once, with status -9. Either of the others is raised
+in the target's notification word, where the target finds it at its next
+receive (see `SYS_NOTIFY` below); a call the target is blocked in is abandoned
+and returns failure, so that a task waiting on a server gets to look; and its
+program is killed 500 ticks later if the task is still there. A second signal
+does not extend that. Tasks 0 and 1 cannot be signalled.
 
 These are not POSIX signals. Nothing runs a handler in the target, there are no
 masks and no process groups, and nothing is sent when a child exits or a
@@ -316,8 +323,11 @@ signal Linux sends for the exception that did it: 4 for an invalid opcode, 5
 for a debug trap or breakpoint, 7 for an alignment check, 8 for a divide error
 or floating-point exception, and 11 for everything else — a page fault with no
 pager, a general protection fault, a stack fault. `SYS_WAIT` reports it as it
-reports any other status. A killed task never halts the machine: only a fault
-taken in ring 0 does that. `SYS_TASK_KILL` reports -9, as SIGKILL would.
+reports any other status. A fault ends the *program* the task belongs to,
+every task of it with that status, as the signal would on Linux: a thread
+that faulted and went alone left the rest of its program waiting on it. A
+killed task never halts the machine: only a fault taken in ring 0 does that.
+`SYS_TASK_KILL` reports -9, as SIGKILL would.
 
 ### IPC (0x10)
 

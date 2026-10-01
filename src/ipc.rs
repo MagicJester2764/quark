@@ -610,7 +610,8 @@ pub fn sys_signal(dest: usize, sig: u64) -> Result<(), IpcError> {
 
     // SIG_KILL: immediate termination, no grace period
     if sig & SIG_KILL != 0 {
-        let _ = scheduler::kill_task(dest);
+        // The program, not the one task: a signal is said to a program.
+        let _ = scheduler::kill_program(dest);
         return Ok(());
     }
 
@@ -657,7 +658,7 @@ pub fn check_signal_deadlines() {
             let deadline = SIGNAL_DEADLINE[tid];
             if deadline != 0 && now >= deadline {
                 SIGNAL_DEADLINE[tid] = 0;
-                let _ = scheduler::kill_task(tid);
+                let _ = scheduler::kill_program(tid);
             }
         }
     }

@@ -713,6 +713,22 @@ pub fn wait_writable(pty: usize) -> bool {
     ok
 }
 
+/// A task parked on this pty has died: it is waiting for nothing now.
+pub fn forget_waiter(pty: usize, tid: usize) {
+    if pty >= MAX_PTYS {
+        return;
+    }
+    let flags = irq_save();
+    let p = &mut ptys()[pty];
+    if p.in_use {
+        for side in [&mut p.to_slave, &mut p.to_master] {
+            crate::pipe::forget_in(&mut side.waiters, &mut side.nwaiters, tid);
+            crate::pipe::forget_in(&mut side.writers, &mut side.nwriters, tid);
+        }
+    }
+    irq_restore(flags);
+}
+
 /// Is this end writable? A pty's buffer is the only limit; when it is full a
 /// writer waits, as it would on a pipe.
 pub fn writable(pty: usize, end: u8) -> bool {

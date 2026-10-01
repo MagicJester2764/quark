@@ -187,6 +187,19 @@ pub fn take(timer: usize) -> Option<u64> {
     out
 }
 
+/// A task parked on this timer has died: it is waiting for nothing now.
+pub fn forget_waiter(timer: usize, tid: usize) {
+    if timer >= MAX_TIMERS {
+        return;
+    }
+    let flags = irq_save();
+    let t = &mut timers()[timer];
+    if t.in_use {
+        crate::pipe::forget_in(&mut t.waiters, &mut t.nwaiters, tid);
+    }
+    irq_restore(flags);
+}
+
 /// Wait for it to fire. False when there was no room to be recorded as a
 /// waiter, which must not become a wait.
 pub fn wait(timer: usize) -> bool {
