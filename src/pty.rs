@@ -21,6 +21,13 @@
 //!   back — the reason a shell does not see half a line.
 //! - `ICRNL` and `ONLCR`: Return arrives as a newline, and a newline goes out
 //!   as carriage return and newline, which is what puts the cursor at the left.
+//! - The characters a line is edited with, from `c_cc`: erase, kill the line,
+//!   erase a word — and end of file, which hands over what has been typed with
+//!   no newline, and typed on an empty line is a read of nothing. That last is
+//!   the only way a program reading a terminal is ever told there is no more.
+//! - `ISIG`: the interrupt and quit characters are not input. They are taken
+//!   out of what is typed and reported to whoever asks (`take_signal`), and
+//!   the line they interrupted is thrown away.
 //!
 //! Everything else a `termios` can say is stored and given back unchanged, so
 //! that a program which saves and restores it gets what it left.
@@ -67,6 +74,19 @@ pub const ISIG: u32 = 0o1;
 pub const ICANON: u32 = 0o2;
 pub const ECHO: u32 = 0o10;
 
+/// Where in `c_cc` each editing character is, as Linux numbers them.
+const VINTR: usize = 0;
+const VQUIT: usize = 1;
+const VERASE: usize = 2;
+const VKILL: usize = 3;
+const VEOF: usize = 4;
+const VSUSP: usize = 10;
+const VWERASE: usize = 14;
+
+/// The signals a terminal raises, by Linux's numbers.
+pub const SIGINT: u8 = 2;
+pub const SIGQUIT: u8 = 3;
+
 /// What `TCGETS` and `TCSETS` carry, in Linux's layout: four flag words, a
 /// line discipline byte and nineteen control characters.
 #[derive(Clone, Copy)]
@@ -98,13 +118,44 @@ struct Ring {
     head: usize,
     tail: usize,
     len: usize,
+    /// Tasks waiting for something to read from it.
     waiters: [usize; MAX_WAITERS],
     nwaiters: usize,
+    /// Tasks waiting for room to write into it.
+    writers: [usize; MAX_WAITERS],
+    nwriters: usize,
 }
 
 impl Ring {
     const fn new() -> Self {
-        Ring { buf: [0; BUF], head: 0, tail: 0, len: 0, waiters: [0; MAX_WAITERS], nwaiters: 0 }
+        Ring {
+            buf: [0; BUF],
+            head: 0,
+            tail: 0,
+            len: 0,
+            waiters: [0; MAX_WAITERS],
+            nwaiters: 0,
+            writers: [0; MAX_WAITERS],
+            nwriters: 0,
+        }
+    }
+
+    /// Everybody parked on this ring, either way round, into `wake`.
+    fn take_waiters(&mut self, wake: &mut [usize], n: &mut usize) {
+        for i in 0..self.nwaiters {
+            wake[*n] = self.waiters[i];
+            *n += 1;
+        }
+        self.nwaiters = 0;
+        self.take_writers(wake, n);
+    }
+
+    fn take_writers(&mut self, wake: &mut [usize], n: &mut usize) {
+        for i in 0..self.nwriters {
+            wake[*n] = self.writers[i];
+            *n += 1;
+        }
+        self.nwriters = 0;
     }
 
     fn push(&mut self, b: u8) -> bool {
@@ -154,6 +205,10 @@ struct Pty {
     /// The line being gathered, in canonical mode.
     line: [u8; LINE],
     line_len: usize,
+    /// Ends of file typed and not yet read: each is one read of nothing.
+    eofs: u32,
+    /// A signal a typed character raised and nobody has collected.
+    signal: u8,
     termios: Termios,
     size: WinSize,
 }
@@ -167,6 +222,8 @@ const NO_PTY: Pty = Pty {
     to_master: Ring::new(),
     line: [0; LINE],
     line_len: 0,
+    eofs: 0,
+    signal: 0,
     // What a terminal looks like before anybody has said otherwise: canonical
     // input with echo, Return read as a newline, newline written as carriage
     // return and newline. A program that wants raw bytes turns them off, which
@@ -239,7 +296,7 @@ pub fn release(pty: usize, end: u8) {
     if pty >= MAX_PTYS || end > 1 {
         return;
     }
-    let mut wake = [0usize; MAX_WAITERS * 2];
+    let mut wake = [0usize; MAX_WAITERS * 4];
     let mut n = 0;
     let flags = irq_save();
     {
@@ -251,12 +308,10 @@ pub fn release(pty: usize, end: u8) {
         let e = end as usize;
         p.refs[e] = p.refs[e].saturating_sub(1);
         if p.refs[e] == 0 {
+            // Readers, for whom this is the end of the file, and writers, for
+            // whom there will never be room.
             for side in [&mut p.to_slave, &mut p.to_master] {
-                for i in 0..side.nwaiters {
-                    wake[n] = side.waiters[i];
-                    n += 1;
-                }
-                side.nwaiters = 0;
+                side.take_waiters(&mut wake, &mut n);
             }
         }
         if p.refs[0] == 0 && p.refs[1] == 0 {
@@ -336,6 +391,21 @@ pub fn write(pty: usize, end: u8, bytes: &[u8]) -> usize {
     written
 }
 
+/// Take the last character of the line being gathered back, and un-draw it:
+/// a terminal that echoed it has already shown it.
+fn rub_out(p: &mut Pty, echo: bool) -> bool {
+    if p.line_len == 0 {
+        return false;
+    }
+    p.line_len -= 1;
+    if echo && p.to_master.room() >= 3 {
+        for c in *b"\x08 \x08" {
+            p.to_master.push(c);
+        }
+    }
+    true
+}
+
 /// Typing, through the line discipline.
 fn input(p: &mut Pty, bytes: &[u8]) -> usize {
     let mut done = 0;
@@ -346,20 +416,73 @@ fn input(p: &mut Pty, bytes: &[u8]) -> usize {
         }
         let canon = p.termios.c_lflag & ICANON != 0;
         let echo = p.termios.c_lflag & ECHO != 0;
+        let cc = p.termios.c_cc;
+        // A control character set to 0 is one that is switched off.
+        let is = |which: usize| cc[which] != 0 && b == cc[which];
 
-        if canon && (b == 8 || b == 127) {
-            // Backspace takes a character back, and un-draws it: a terminal
-            // that echoed it has already shown it.
-            if p.line_len > 0 {
-                p.line_len -= 1;
-                if echo && p.to_master.room() >= 3 {
-                    for c in *b"\x08 \x08" {
-                        p.to_master.push(c);
-                    }
+        // Characters that are not input at all: they say something about the
+        // program in the terminal. The line they were typed into goes, and
+        // what was waiting to be read with it, as on Linux.
+        if p.termios.c_lflag & ISIG != 0 && (is(VINTR) || is(VQUIT) || is(VSUSP)) {
+            if !is(VSUSP) {
+                p.signal = if is(VINTR) { SIGINT } else { SIGQUIT };
+                p.line_len = 0;
+                p.to_slave.head = 0;
+                p.to_slave.tail = 0;
+                p.to_slave.len = 0;
+                p.eofs = 0;
+                // Shown as `^C`, and no more: the newline after it is the
+                // shell's to print, when it finds what the signal did.
+                if echo && p.to_master.room() >= 2 {
+                    p.to_master.push(b'^');
+                    p.to_master.push(b ^ 0x40);
                 }
             }
+            // Stopping a job needs jobs. The character is dropped.
             done += 1;
             continue;
+        }
+
+        if canon {
+            // Backspace and delete both, whichever the terminal sends.
+            if is(VERASE) || b == 8 || b == 127 {
+                rub_out(p, echo);
+                done += 1;
+                continue;
+            }
+            if is(VKILL) {
+                while rub_out(p, echo) {}
+                done += 1;
+                continue;
+            }
+            if is(VWERASE) {
+                while p.line_len > 0 && p.line[p.line_len - 1] == b' ' {
+                    rub_out(p, echo);
+                }
+                while p.line_len > 0 && p.line[p.line_len - 1] != b' ' {
+                    rub_out(p, echo);
+                }
+                done += 1;
+                continue;
+            }
+            if is(VEOF) {
+                // What has been typed is handed over as it stands, with no
+                // newline; nothing typed is a read of nothing, which is what
+                // tells a program there is no more. Not echoed.
+                if p.to_slave.room() < p.line_len {
+                    break;
+                }
+                if p.line_len == 0 {
+                    p.eofs += 1;
+                }
+                for i in 0..p.line_len {
+                    let c = p.line[i];
+                    p.to_slave.push(c);
+                }
+                p.line_len = 0;
+                done += 1;
+                continue;
+            }
         }
 
         if echo {
@@ -421,22 +544,38 @@ fn output(p: &mut Pty, bytes: &[u8]) -> usize {
     done
 }
 
-/// What a read from `end` can take now: the bytes waiting, or `None` when
-/// there are none and the other end has gone — which is an end of file.
-pub fn readable(pty: usize, end: u8) -> Option<usize> {
+/// What a read from an end would find.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Pending {
+    /// This many bytes. None is a read that waits.
+    Bytes(usize),
+    /// An end of file somebody typed: a read of nothing, once, and at once.
+    End,
+    /// Nothing, and the other end has gone: the end, for good.
+    Gone,
+}
+
+fn pending(p: &Pty, end: u8) -> Pending {
+    let waiting = if end == 0 { p.to_master.len } else { p.to_slave.len };
+    if waiting > 0 {
+        Pending::Bytes(waiting)
+    } else if end == 1 && p.eofs > 0 {
+        Pending::End
+    } else if peer_gone(p, end) {
+        Pending::Gone
+    } else {
+        Pending::Bytes(0)
+    }
+}
+
+/// What a read from `end` would find now.
+pub fn readable(pty: usize, end: u8) -> Pending {
     if pty >= MAX_PTYS || end > 1 {
-        return None;
+        return Pending::Gone;
     }
     let flags = irq_save();
-    let out = {
-        let p = &ptys()[pty];
-        if !p.in_use {
-            None
-        } else {
-            let waiting = if end == 0 { p.to_master.len } else { p.to_slave.len };
-            if waiting > 0 || !peer_gone(p, end) { Some(waiting) } else { None }
-        }
-    };
+    let p = &ptys()[pty];
+    let out = if p.in_use { pending(p, end) } else { Pending::Gone };
     irq_restore(flags);
     out
 }
@@ -447,16 +586,22 @@ pub fn read(pty: usize, end: u8, buf: &mut [u8]) -> Result<usize, ()> {
     if pty >= MAX_PTYS || end > 1 {
         return Ok(0);
     }
+    let mut wake = [0usize; MAX_WAITERS];
+    let mut nwake = 0;
     let flags = irq_save();
     let out = {
         let p = &mut ptys()[pty];
         if !p.in_use {
             Ok(0)
         } else {
-            let gone = peer_gone(p, end);
+            let found = pending(p, end);
+            // An end of file somebody typed is read once, as nothing.
+            if found == Pending::End {
+                p.eofs -= 1;
+            }
             let side = if end == 0 { &mut p.to_master } else { &mut p.to_slave };
             if side.len == 0 {
-                if gone { Ok(0) } else { Err(()) }
+                if found == Pending::Bytes(0) { Err(()) } else { Ok(0) }
             } else {
                 let mut n = 0;
                 while n < buf.len() {
@@ -468,11 +613,21 @@ pub fn read(pty: usize, end: u8, buf: &mut [u8]) -> Result<usize, ()> {
                         None => break,
                     }
                 }
+                // There is room where there was none: whoever was waiting to
+                // write can.
+                side.take_writers(&mut wake, &mut nwake);
                 Ok(n)
             }
         }
     };
     irq_restore(flags);
+    if nwake > 0 {
+        for &tid in &wake[..nwake] {
+            scheduler::unblock_task(tid);
+        }
+        // And a set waiting for this end to be writable.
+        crate::pollset::note_pty(pty);
+    }
     out
 }
 
@@ -480,25 +635,33 @@ pub fn read(pty: usize, end: u8, buf: &mut [u8]) -> Result<usize, ()> {
 ///
 /// Returns false when there was no room to record the waiter, which must not
 /// become a wait: a waiter nobody knows about is never woken.
+///
+/// It looks again before it parks. The caller found nothing a moment ago,
+/// with interrupts on since: a writer that ran in between woke nobody,
+/// because nobody was recorded yet, and a wait begun then would last until
+/// the *next* thing was written — a line typed and not delivered until the
+/// key after it.
 pub fn wait_readable(pty: usize, end: u8) -> bool {
     if pty >= MAX_PTYS || end > 1 {
         return false;
     }
     let tid = scheduler::current_tid();
     let flags = irq_save();
-    let parked = {
+    let (ok, parked) = {
         let p = &mut ptys()[pty];
         if !p.in_use {
-            false
+            (false, false)
+        } else if pending(p, end) != Pending::Bytes(0) {
+            (true, false)
         } else {
             let side = if end == 0 { &mut p.to_master } else { &mut p.to_slave };
             if side.nwaiters >= MAX_WAITERS {
-                false
+                (false, false)
             } else {
                 side.waiters[side.nwaiters] = tid;
                 side.nwaiters += 1;
                 scheduler::block_task(tid);
-                true
+                (true, true)
             }
         }
     };
@@ -506,7 +669,48 @@ pub fn wait_readable(pty: usize, end: u8) -> bool {
     if parked {
         scheduler::yield_now();
     }
-    parked
+    ok
+}
+
+/// Wait for room to write what a program prints, then come back and try
+/// again. False when waiting is no use: the master has gone, and nothing will
+/// ever take what is there; or there was nowhere to record the waiter.
+///
+/// For the slave only. What the master writes is typing, which goes through
+/// the line discipline and can be refused for want of room in *either*
+/// direction — the echo comes back at the writer — so a terminal emulator
+/// writes without waiting and keeps what did not fit.
+///
+/// A write that returned nothing instead of waiting is what this replaced:
+/// `cat` of a file longer than the buffer reported "No space left on device",
+/// because a write of nothing is what a full disk looks like.
+pub fn wait_writable(pty: usize) -> bool {
+    if pty >= MAX_PTYS {
+        return false;
+    }
+    let tid = scheduler::current_tid();
+    let flags = irq_save();
+    let (ok, parked) = {
+        let p = &mut ptys()[pty];
+        if !p.in_use || peer_gone(p, 1) {
+            (false, false)
+        } else if p.to_master.room() > 0 {
+            // Somebody read between the write and this: look again.
+            (true, false)
+        } else if p.to_master.nwriters >= MAX_WAITERS {
+            (false, false)
+        } else {
+            p.to_master.writers[p.to_master.nwriters] = tid;
+            p.to_master.nwriters += 1;
+            scheduler::block_task(tid);
+            (true, true)
+        }
+    };
+    irq_restore(flags);
+    if parked {
+        scheduler::yield_now();
+    }
+    ok
 }
 
 /// Is this end writable? A pty's buffer is the only limit; when it is full a
@@ -522,6 +726,19 @@ pub fn writable(pty: usize, end: u8) -> bool {
     };
     irq_restore(flags);
     out
+}
+
+/// The signal a character typed at this terminal raised, if one has been and
+/// nobody has collected it. Collected by whoever wrote the character: the
+/// write is where it is noticed, and the caller decides who it is for.
+pub fn take_signal(pty: usize) -> Option<u8> {
+    if pty >= MAX_PTYS {
+        return None;
+    }
+    let flags = irq_save();
+    let sig = core::mem::replace(&mut ptys()[pty].signal, 0);
+    irq_restore(flags);
+    (sig != 0).then_some(sig)
 }
 
 pub fn get_termios(pty: usize) -> Option<Termios> {

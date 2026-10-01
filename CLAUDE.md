@@ -127,7 +127,7 @@ system hung.
 
 There are no tests in this tree, and that is the shape of a microkernel rather
 than an omission: the kernel is tested from outside, through the ABI, by a
-program. `dtest` in `../quarkutils` makes 267 checks — capabilities, IPC,
+program. `dtest` in `../quarkutils` makes 317 checks — capabilities, IPC,
 memory, descriptors, scheduling, `dtest calls` with three million calls in
 three seconds — and `qfuzz` throws random requests at every service.
 
@@ -262,9 +262,14 @@ terminal emulator waits on its master with `poll`, and readiness the kernel
 cannot see is readiness `poll` cannot report. `/dev/ptmx` makes a pair and
 answers with the master, `/dev/pts/N` opens its slave, and both paths are
 caught in the C layer (`../quarkutils/linux-abi`) ahead of the VFS. The line
-discipline is the part programs depend on and no more — echo, canonical input,
-and the newline translations — and the rest of a `termios` is stored and
-handed back unchanged.
+discipline is the part programs depend on and no more — echo, canonical input
+and the characters a line is edited with, end of file, the newline
+translations, and the interrupt character taken out of what is typed — and
+the rest of a `termios` is stored and handed back unchanged.
+What a program prints waits for room when the terminal is full, all of it: a
+write that came back short, or with nothing, is what a full disk looks like,
+and `cat` said so. What a terminal emulator types does not wait, because its
+echo comes back at it and a wait there is a wait on itself.
 Between the master being opened and the slave being opened the master's read
 waits rather than reporting an end of file: the program that will hold the
 slave has not been started yet. Afterwards, the last slave closing *is* the end
@@ -411,10 +416,11 @@ Three things follow from that, and breaking any of them is quiet:
   terminate and kill, raised with `SYS_SIGNAL` as bits in a task's notification
   word, with a five-second deadline before the task is ended — and nothing a C
   program would recognise: no handler runs in the task, there are no masks and
-  no process groups, and a pseudo-terminal's Ctrl-C reaches the program in it
-  as a byte (`ISIG` is stored and not acted on). A task that faults ends with
-  the negated Linux signal number as its exit status, which is the only place
-  those numbers mean anything here.
+  no process groups. A pseudo-terminal takes its interrupt character out of
+  what is typed, throws the line away and remembers that it was pressed
+  (`pty::take_signal`), and nothing is sent to anybody yet. A task that faults
+  ends with the negated Linux signal number as its exit status, which is the
+  only place those numbers mean anything here.
 - A pty's window size is stored and nothing is told when it changes: Linux
   sends `SIGWINCH`, and there are no signals. A program that draws itself to
   the terminal's size reads it once.

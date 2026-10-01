@@ -233,14 +233,15 @@ fn readiness(tid: usize, fd: usize) -> u32 {
             }
         }
         FdKind::PtyEnd { pty, end } => {
-            // `readable` says how many bytes are waiting, and `None` when
-            // there are none and the other end has gone — which a terminal
-            // emulator reads as its shell having exited, and is a hangup as
-            // much as an end of file.
+            // A read that would return at once is readable, whether it has
+            // bytes or an end of file somebody typed. The other end having
+            // gone is that and a hangup — which a terminal emulator reads as
+            // its shell having exited.
+            use crate::pty::Pending;
             match crate::pty::readable(pty, end) {
-                Some(n) if n > 0 => out |= READABLE,
-                Some(_) => {}
-                None => out |= READABLE | HANGUP,
+                Pending::Bytes(0) => {}
+                Pending::Bytes(_) | Pending::End => out |= READABLE,
+                Pending::Gone => out |= READABLE | HANGUP,
             }
             if crate::pty::writable(pty, end) {
                 out |= WRITABLE;

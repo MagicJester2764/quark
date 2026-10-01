@@ -26,8 +26,10 @@ them struck through as done. What follows is what is true now.
   and end it five seconds later if it is still there. That is enough for
   Ctrl-C at the console and for `kill`. What is missing is everything a C
   program means by the word: nothing runs a handler in the task, there are no
-  masks and no process groups, nothing is sent when a child exits or a
-  terminal changes size, and in a pseudo-terminal Ctrl-C is a byte. A fault in
+  masks and no process groups, and nothing is sent when a child exits or a
+  terminal changes size. A pseudo-terminal knows its interrupt character — it
+  is taken out of what is typed and the line thrown away — and tells nobody.
+  A fault in
   ring 3 ends the task with the negated Linux signal number as its status,
   which is the only place those numbers appear.
 - **AVX.** `CR4.OSXSAVE` is clear, so an AVX instruction faults. Turning it on

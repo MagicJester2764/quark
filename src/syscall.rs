@@ -1854,6 +1854,9 @@ extern "C" fn syscall_dispatch(
                     crate::pipe::write(handle, ptr, len)
                 }
                 crate::task::FdKind::PipeRead(_) => u64::MAX,
+                // What a program prints waits for room, all of it; what a
+                // terminal emulator types is taken or it is not.
+                crate::task::FdKind::PtyEnd { pty, end: 1 } => pty_write(pty, ptr, len),
                 crate::task::FdKind::PtyEnd { pty, end } => {
                     let _ua = crate::cpu::UserAccess::begin();
                     let slice = unsafe { core::slice::from_raw_parts(ptr, len) };
@@ -3685,6 +3688,35 @@ fn pty_read(pty: usize, end: u8, ptr: *mut u8, max_len: usize) -> u64 {
             }
         }
     }
+}
+
+/// Write to a terminal from the program in it, waiting for room.
+///
+/// All of it, as a write to a terminal is: a short count here is a program
+/// that has to loop, and a count of nothing is one that takes the terminal
+/// for a full disk. Through a kernel buffer for the reason `pty_read` gives —
+/// the wait is a reschedule, and the SMAP window must not be open across one.
+fn pty_write(pty: usize, ptr: *const u8, len: usize) -> u64 {
+    let mut buf = [0u8; 256];
+    let mut done = 0;
+    while done < len {
+        let chunk = (len - done).min(buf.len());
+        {
+            let _ua = crate::cpu::UserAccess::begin();
+            unsafe { core::ptr::copy_nonoverlapping(ptr.add(done), buf.as_mut_ptr(), chunk) };
+        }
+        let mut sent = 0;
+        while sent < chunk {
+            sent += crate::pty::write(pty, 1, &buf[sent..chunk]);
+            if sent < chunk && !crate::pty::wait_writable(pty) {
+                // Nobody is left to read it. What went, went.
+                let total = done + sent;
+                return if total > 0 { total as u64 } else { u64::MAX };
+            }
+        }
+        done += chunk;
+    }
+    done as u64
 }
 
 /// Enter user mode via iretq.

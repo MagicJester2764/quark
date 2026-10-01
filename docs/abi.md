@@ -181,7 +181,7 @@ returning at once turned that loop into a spin.
 | Version | Added |
 |---|---|
 | 3.1 | **A descriptor belongs to a program, and may name an object in a server.** Every task of a program uses one table, so what one thread opens its siblings see and what one closes is closed; a thread used to start on a copy of its creator's table and share nothing afterwards. Sixty-four descriptors rather than thirty-two. `SYS_EXIT_PROGRAM` (8) ends every task of the caller's program with one status, which is what `exit` means and what `SYS_EXIT_CODE` — one task — never did. Block 0xE0 opens with *served descriptors*: `SYS_FD_SERVE` (224), `SYS_FD_SERVED` (225), `SYS_FD_HOLDS` (226), `SYS_FD_COOKIE` (227) and `SYS_FD_REAP` (229) let a server give a client a descriptor for one of its own objects — a file — which the kernel then counts, copies across `SYS_FORK`, keeps across `SYS_EXEC_SPACE` and reads and writes through like any other. Descriptor 64 is the program's working directory. `SYS_FD_FLAGS` (228) marks a descriptor to close when its program becomes another, and `SYS_EXEC_SPACE` closes those. Memory named by a descriptor may be mapped by whoever holds the descriptor, and lasts as long as a descriptor names it or somebody has it mapped, whoever made it. |
-| 3.2 | What a shell asks of a kernel that is not about descriptors. `SYS_UMASK` (9): the permission bits a program leaves off what it makes. The kernel makes no files and never reads it; it keeps it because it must follow a program across `SYS_FORK` and `SYS_EXEC_SPACE`, which a C library's memory does not. `SYS_WAIT_FOR` (10): wait for one child in particular, or ask without waiting — `waitpid` with a process id, and `WNOHANG`. |
+| 3.2 | What a shell asks of a kernel that is not about descriptors. `SYS_UMASK` (9): the permission bits a program leaves off what it makes. The kernel makes no files and never reads it; it keeps it because it must follow a program across `SYS_FORK` and `SYS_EXEC_SPACE`, which a C library's memory does not. `SYS_WAIT_FOR` (10): wait for one child in particular, or ask without waiting — `waitpid` with a process id, and `WNOHANG`. Two things change with no new number. A pty's line discipline acts on `ISIG` and on the erase, kill, word-erase and end-of-file characters. And a write to a pty's slave waits for room and writes everything, where it used to return what fitted — which could be nothing. |
 
 3.1 was a change of behaviour and no change of number, so a minor: nothing built for
 3.0 calls anything that means something else now. What it could have relied on
@@ -908,13 +908,32 @@ termios, 36 bytes: c_iflag, c_oflag, c_cflag, c_lflag (u32 each),
 winsize,  8 bytes: ws_row, ws_col, ws_xpixel, ws_ypixel (u16 each)
 ```
 
-Of a `termios` the kernel acts on five bits and stores the rest: `ICRNL` in
-`c_iflag` (a carriage return typed arrives as a newline), `OPOST` with `ONLCR`
-in `c_oflag` (a newline written goes out as carriage return and newline), and
-`ICANON` and `ECHO` in `c_lflag` (input is held until a newline, with backspace
-taking a character back; what is typed is written back to the master). A new
-pty has all five set, and is 24 rows by 80 columns. The window size is stored
-and handed back, and nobody is told when it changes.
+Of a `termios` the kernel acts on six bits and seven characters, and stores
+the rest: `ICRNL` in `c_iflag` (a carriage return typed arrives as a newline),
+`OPOST` with `ONLCR` in `c_oflag` (a newline written goes out as carriage
+return and newline), and `ICANON`, `ECHO` and `ISIG` in `c_lflag`. A new pty
+has all six set, and is 24 rows by 80 columns. The window size is stored and
+handed back, and nobody is told when it changes.
+
+With `ICANON`, input is held until a newline, and four characters from `c_cc`
+edit what is being held: `VERASE` (and backspace and delete, whichever the
+terminal sends) takes a character back, `VKILL` the line, `VWERASE` a word.
+`VEOF` hands over what has been typed as it stands, with no newline — and
+typed on an empty line that is a read of nothing, once, which is how a program
+reading a terminal is told there is no more. A poll reports that as readable,
+and not as a hangup. With `ECHO`, what is typed is written back to the master,
+and what is taken back is rubbed out there.
+
+With `ISIG`, `VINTR` and `VQUIT` are not input: the character is taken out,
+the line it was typed into and anything not yet read are thrown away, and it
+is echoed as `^C`. `VSUSP` is taken out and nothing else: stopping a job needs
+jobs. A character set to 0 in `c_cc` is switched off.
+
+A write to the slave — what a program prints — waits for room when the pty's
+buffer (4096 bytes) is full, and returns when all of it has been taken, or
+with what was taken if the master has gone (`u64::MAX` if that is nothing). A
+write to the master is typing and never waits: it returns what was taken,
+which may be less, or nothing.
 
 ### Descriptors, continued (0xE0)
 
