@@ -631,37 +631,50 @@ pub fn read(pty: usize, end: u8, buf: &mut [u8]) -> Result<usize, ()> {
     out
 }
 
+/// What became of a wait for something to read.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Waited {
+    /// Look again: something was written, or was there all along.
+    Look,
+    /// A signal the program has a handler for arrived instead.
+    Interrupted,
+    /// There was no room to record the waiter, which must not become a wait:
+    /// a waiter nobody knows about is never woken.
+    NoRoom,
+}
+
 /// Wait for something to read at this end, then come back and look again.
-///
-/// Returns false when there was no room to record the waiter, which must not
-/// become a wait: a waiter nobody knows about is never woken.
 ///
 /// It looks again before it parks. The caller found nothing a moment ago,
 /// with interrupts on since: a writer that ran in between woke nobody,
 /// because nobody was recorded yet, and a wait begun then would last until
 /// the *next* thing was written — a line typed and not delivered until the
-/// key after it.
-pub fn wait_readable(pty: usize, end: u8) -> bool {
+/// key after it. A signal is looked for in the same place, for the same
+/// reason: one raised a moment ago is seen, and one raised a moment from now
+/// finds this task parked.
+pub fn wait_readable(pty: usize, end: u8) -> Waited {
     if pty >= MAX_PTYS || end > 1 {
-        return false;
+        return Waited::NoRoom;
     }
     let tid = scheduler::current_tid();
     let flags = irq_save();
-    let (ok, parked) = {
+    let (out, parked) = {
         let p = &mut ptys()[pty];
         if !p.in_use {
-            (false, false)
+            (Waited::NoRoom, false)
         } else if pending(p, end) != Pending::Bytes(0) {
-            (true, false)
+            (Waited::Look, false)
+        } else if crate::signal::interrupted(tid) {
+            (Waited::Interrupted, false)
         } else {
             let side = if end == 0 { &mut p.to_master } else { &mut p.to_slave };
             if side.nwaiters >= MAX_WAITERS {
-                (false, false)
+                (Waited::NoRoom, false)
             } else {
                 side.waiters[side.nwaiters] = tid;
                 side.nwaiters += 1;
                 scheduler::block_task(tid);
-                (true, true)
+                (Waited::Look, true)
             }
         }
     };
@@ -669,7 +682,7 @@ pub fn wait_readable(pty: usize, end: u8) -> bool {
     if parked {
         scheduler::yield_now();
     }
-    ok
+    out
 }
 
 /// Wait for room to write what a program prints, then come back and try
@@ -711,6 +724,39 @@ pub fn wait_writable(pty: usize) -> bool {
         scheduler::yield_now();
     }
     ok
+}
+
+/// A signal has arrived for a task that may be parked reading a terminal:
+/// if it is, it stops waiting and goes to see.
+pub fn interrupt(tid: usize) {
+    let mut found = false;
+    let flags = irq_save();
+    for p in ptys().iter_mut() {
+        if !p.in_use {
+            continue;
+        }
+        for side in [&mut p.to_slave, &mut p.to_master] {
+            let before = side.nwaiters;
+            crate::pipe::forget_in(&mut side.waiters, &mut side.nwaiters, tid);
+            found |= side.nwaiters != before;
+        }
+    }
+    irq_restore(flags);
+    if found {
+        scheduler::unblock_task(tid);
+    }
+}
+
+/// Is the other end of this one gone for good?
+pub fn other_end_gone(pty: usize, end: u8) -> bool {
+    if pty >= MAX_PTYS || end > 1 {
+        return true;
+    }
+    let flags = irq_save();
+    let p = &ptys()[pty];
+    let gone = !p.in_use || peer_gone(p, end);
+    irq_restore(flags);
+    gone
 }
 
 /// A task parked on this pty has died: it is waiting for nothing now.

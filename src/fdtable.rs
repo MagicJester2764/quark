@@ -50,13 +50,39 @@ struct Table {
     /// `fork`, kept by `exec` — and a C library's own memory does neither:
     /// `umask 077` in a shell has to be true of the `touch` it then runs.
     umask: u16,
+    /// What the program has said to do about each signal, bit `n - 1` for
+    /// signal `n`: leave it alone, or run a handler for it. Neither bit is
+    /// the default. Here for the reason the umask is — a forked child has
+    /// its parent's, and an exec keeps what is ignored — and because a
+    /// signal is said to a program, which is what a table is.
+    sig_ignore: u64,
+    sig_catch: u64,
+    /// Signals with a handler that have been raised and not yet taken.
+    sig_pending: u64,
+    /// One of those has not ended a wait yet. A signal ends one wait, the
+    /// first to look: a wait that was ended and went back to waiting without
+    /// taking anything is waiting for something else, and is left to.
+    sig_interrupt: bool,
+    /// Where in the program's own memory to say there is something to take:
+    /// a word its runtime looks at on its way out of every system call. 0
+    /// until it has said where.
+    sig_word: usize,
 }
 
 /// What a program that has said nothing leaves off: write for group and other.
 const DEFAULT_UMASK: u16 = 0o022;
 
-const EMPTY: Table =
-    Table { tasks: 0, fds: [FdKind::Empty; SLOTS], cloexec: 0, umask: DEFAULT_UMASK };
+const EMPTY: Table = Table {
+    tasks: 0,
+    fds: [FdKind::Empty; SLOTS],
+    cloexec: 0,
+    umask: DEFAULT_UMASK,
+    sig_ignore: 0,
+    sig_catch: 0,
+    sig_pending: 0,
+    sig_interrupt: false,
+    sig_word: 0,
+};
 
 /// As many tables as tasks: each task uses exactly one.
 static mut TABLES: [Table; MAX_TASKS] = [EMPTY; MAX_TASKS];
@@ -237,8 +263,8 @@ pub fn copy_into(child: usize, parent: usize) {
     // read and its being retained would have this retain something freed.
     let flags = irq_save();
     unsafe {
-        let (src_fds, src_cloexec, src_umask) = match table_mut(parent) {
-            Some(t) => (t.fds, t.cloexec, t.umask),
+        let (src_fds, src_cloexec, src_umask, src_signals) = match table_mut(parent) {
+            Some(t) => (t.fds, t.cloexec, t.umask, (t.sig_ignore, t.sig_catch, t.sig_word)),
             None => {
                 irq_restore(flags);
                 return;
@@ -246,6 +272,12 @@ pub fn copy_into(child: usize, parent: usize) {
         };
         if let Some(dst) = table_mut(child) {
             dst.umask = src_umask;
+            // The child is a copy of the program, handlers and the word they
+            // are told through included. What was raised for the parent and
+            // not yet taken is the parent's.
+            (dst.sig_ignore, dst.sig_catch, dst.sig_word) = src_signals;
+            dst.sig_pending = 0;
+            dst.sig_interrupt = false;
             for (i, kind) in src_fds.iter().enumerate() {
                 if kind.is_empty() || !dst.fds[i].is_empty() {
                     continue;
@@ -372,6 +404,168 @@ pub fn any(tid: usize, wanted: impl Fn(&FdKind) -> bool) -> bool {
     }
 }
 
+/// What a program has said to do about a signal.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Disposition {
+    /// Nothing said: the kernel does what the signal does.
+    Default = 0,
+    Ignore = 1,
+    /// The program has a handler, and is told.
+    Catch = 2,
+}
+
+fn sig_bit(signo: u8) -> u64 {
+    1u64 << (signo - 1)
+}
+
+/// What `tid`'s program does about signal `signo`, changed to `new` if that
+/// is given. Returns what it was; `None` for a task in no program, or a
+/// number that is not a signal's.
+pub fn sig_action(tid: usize, signo: u8, new: Option<Disposition>) -> Option<Disposition> {
+    if signo == 0 || signo > 64 {
+        return None;
+    }
+    let bit = sig_bit(signo);
+    let flags = irq_save();
+    let old = unsafe {
+        table_mut(tid).map(|t| {
+            let old = if t.sig_catch & bit != 0 {
+                Disposition::Catch
+            } else if t.sig_ignore & bit != 0 {
+                Disposition::Ignore
+            } else {
+                Disposition::Default
+            };
+            if let Some(new) = new {
+                t.sig_ignore &= !bit;
+                t.sig_catch &= !bit;
+                match new {
+                    Disposition::Ignore => t.sig_ignore |= bit,
+                    Disposition::Catch => t.sig_catch |= bit,
+                    Disposition::Default => {}
+                }
+                // A signal waiting for a handler that is no longer there is
+                // not waiting for anything.
+                if new != Disposition::Catch {
+                    t.sig_pending &= !bit;
+                }
+            }
+            old
+        })
+    };
+    irq_restore(flags);
+    old
+}
+
+/// Signal `signo` has been raised for `tid`'s program. Returns what the
+/// program said to do about it and, when that is to run a handler, where to
+/// tell it — with the signal now waiting to be taken.
+pub fn sig_post(tid: usize, signo: u8) -> Option<(Disposition, usize)> {
+    if signo == 0 || signo > 64 {
+        return None;
+    }
+    let bit = sig_bit(signo);
+    let flags = irq_save();
+    let out = unsafe {
+        table_mut(tid).map(|t| {
+            if t.sig_catch & bit != 0 {
+                t.sig_pending |= bit;
+                t.sig_interrupt = true;
+                (Disposition::Catch, t.sig_word)
+            } else if t.sig_ignore & bit != 0 {
+                (Disposition::Ignore, 0)
+            } else {
+                (Disposition::Default, 0)
+            }
+        })
+    };
+    irq_restore(flags);
+    out
+}
+
+/// The signals raised for `tid`'s program that it has a handler for, which
+/// are no longer waiting once this returns. `word`, if not 0, is where it
+/// wants to be told of the next.
+pub fn sig_take(tid: usize, word: usize) -> u64 {
+    let flags = irq_save();
+    let taken = unsafe {
+        match table_mut(tid) {
+            Some(t) => {
+                if word != 0 {
+                    t.sig_word = word;
+                }
+                t.sig_interrupt = false;
+                core::mem::replace(&mut t.sig_pending, 0)
+            }
+            None => 0,
+        }
+    };
+    irq_restore(flags);
+    taken
+}
+
+/// Has a signal with a handler been raised for `tid`'s program and ended no
+/// wait yet? A task about to wait asks, and if so does not wait; asking is
+/// what uses the answer up.
+pub fn sig_interrupted(tid: usize) -> bool {
+    let flags = irq_save();
+    let was = unsafe {
+        match table_mut(tid) {
+            Some(t) => core::mem::replace(&mut t.sig_interrupt, false),
+            None => false,
+        }
+    };
+    irq_restore(flags);
+    was
+}
+
+/// The tasks of `tid`'s program — every task using its table — into `out`.
+/// Returns how many.
+pub fn tasks_of(tid: usize, out: &mut [usize]) -> usize {
+    if tid >= MAX_TASKS {
+        return 0;
+    }
+    let mut n = 0;
+    let flags = irq_save();
+    unsafe {
+        let of = &*core::ptr::addr_of!(OF_TASK);
+        let table = of[tid];
+        if table != NONE {
+            for (other, &t) in of.iter().enumerate() {
+                if t == table && n < out.len() {
+                    out[n] = other;
+                    n += 1;
+                }
+            }
+        }
+    }
+    irq_restore(flags);
+    n
+}
+
+/// One task from each program holding a descriptor `wanted` says yes to,
+/// into `out`. Returns how many.
+pub fn holders(wanted: impl Fn(&FdKind) -> bool, out: &mut [usize]) -> usize {
+    let mut n = 0;
+    let flags = irq_save();
+    unsafe {
+        let of = &*core::ptr::addr_of!(OF_TASK);
+        for (i, table) in tables().iter().enumerate() {
+            if table.tasks == 0 || !table.fds[..MAX_FDS].iter().any(&wanted) {
+                continue;
+            }
+            if let Some(tid) = of.iter().position(|&t| t as usize == i && t != NONE) {
+                if n < out.len() {
+                    out[n] = tid;
+                    n += 1;
+                }
+            }
+        }
+    }
+    irq_restore(flags);
+    n
+}
+
 /// Set the program's umask and return what it was; `None` only reads it.
 pub fn umask(tid: usize, new: Option<u16>) -> u16 {
     let flags = irq_save();
@@ -441,6 +635,12 @@ pub fn close_on_exec(tid: usize) {
                 }
             }
             t.cloexec = 0;
+            // A handler is an address in the program that has just gone, and
+            // so is the word it was told through. What was ignored still is.
+            t.sig_catch = 0;
+            t.sig_pending = 0;
+            t.sig_interrupt = false;
+            t.sig_word = 0;
         }
     }
     irq_restore(flags);

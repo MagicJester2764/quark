@@ -20,18 +20,22 @@ them struck through as done. What follows is what is true now.
 - **Copy-on-write.** `fork` copies every page the caller owns, eagerly. Sharing
   until written needs a reference count per frame, and frames here have an
   owner and nothing else.
-- **POSIX signals.** The kernel has three signals of its own — interrupt,
-  terminate and kill (`SYS_SIGNAL`). Kill ends a program at once; the other
-  two arrive as bits in a task's notification word, abandon the call it is
-  blocked in, and end its program five seconds later if it is still there.
-  That is enough for Ctrl-C at the console and for `kill`. What is missing is
-  everything a C program means by the word: nothing runs a handler in the
-  task, there are no masks and no process groups, and nothing is sent when a
-  child exits or a terminal changes size. A pseudo-terminal knows its
-  interrupt character — it is taken out of what is typed and the line thrown
-  away — and tells nobody. A fault in ring 3 ends the program with the negated
-  Linux signal number as its status, which is the only place those numbers
-  appear.
+- **Signals that interrupt.** A program is told of a signal it has a handler
+  for, and its runtime runs the handler at the next system-call boundary
+  (`docs/abi.md`, *Signals*). Nothing stops a program in the middle of
+  computing: one that handles a signal and then makes no call is not
+  interrupted by it. That would be a frame on the user stack and a way back
+  from it, and saving everything in between — the floating-point state too.
+- **Process groups, sessions and jobs.** Ctrl-C goes to every program holding
+  the terminal, the signals that stop a program do nothing, and there is no
+  foreground to hand a terminal to. A shell runs with job control off.
+- **Signals nothing raises.** None when a child ends, none when a timer runs
+  out — there is no `alarm` — and none when a terminal changes size. A pipe
+  with nobody reading it is found out by the writer's runtime, which asks
+  what kind of thing the descriptor is.
+- **A mask the kernel knows.** A signal a program has blocked is held back by
+  its runtime, which can only hold back what it would have run: a blocked
+  signal with no handler does what it does at once.
 - **A wait list names a task by its id, and ids are reused.** A task killed
   while it is parked in a read or a write is taken off the list it was on
   (`pipe::forget_waiter`, reached through what it held), because a wake meant
@@ -84,7 +88,7 @@ will meet:
   what either is granted or gives up afterwards the other does not see.
   Descriptors are the program's and are shared.
 - **A pty's window size is stored and nobody is told when it changes.** Linux
-  sends `SIGWINCH`, and there are no signals.
+  sends `SIGWINCH`.
 - **The page cache never shrinks under pressure.** A mapped file's pages stay
   until nothing maps the file.
 - **Five deprecated calls still answer** — the pre-capability grants, 86 to 90

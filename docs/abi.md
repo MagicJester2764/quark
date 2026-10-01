@@ -1,6 +1,6 @@
 # Quark syscall ABI
 
-**Version 3.2.** Query the running kernel with `SYS_ABI_VERSION` (240), which
+**Version 3.3.** Query the running kernel with `SYS_ABI_VERSION` (240), which
 returns `(major << 16) | minor`.
 
 This document is the contract between the Quark kernel and everything above it.
@@ -45,7 +45,9 @@ ask; the futex waits return `1` when the word had already changed and `2` when
 the time ran out; and the calls that answer instead of waiting —
 `SYS_FD_READ_NB`, `SYS_FD_WRITE_NB`, and `SYS_FD_SEND` and `SYS_FD_RECV` when
 asked not to wait — return `0xFFFF_FFFE` for "would block", distinct from `0`,
-which is end of file.
+which is end of file. And a wait that a signal ended says so, where its count
+would be: `0xFFFF_FFFD` from `SYS_FD_READ`, `SYS_POLL` and `SYS_POLLSET_WAIT`,
+and `2` from `SYS_RECV_TIMEOUT`.
 
 This is deliberately coarse. It is enough to build a libc's `errno` on top of
 only where a call is extended to report a reason; do not assume a failing call
@@ -182,6 +184,7 @@ returning at once turned that loop into a spin.
 |---|---|
 | 3.1 | **A descriptor belongs to a program, and may name an object in a server.** Every task of a program uses one table, so what one thread opens its siblings see and what one closes is closed; a thread used to start on a copy of its creator's table and share nothing afterwards. Sixty-four descriptors rather than thirty-two. `SYS_EXIT_PROGRAM` (8) ends every task of the caller's program with one status, which is what `exit` means and what `SYS_EXIT_CODE` — one task — never did. Block 0xE0 opens with *served descriptors*: `SYS_FD_SERVE` (224), `SYS_FD_SERVED` (225), `SYS_FD_HOLDS` (226), `SYS_FD_COOKIE` (227) and `SYS_FD_REAP` (229) let a server give a client a descriptor for one of its own objects — a file — which the kernel then counts, copies across `SYS_FORK`, keeps across `SYS_EXEC_SPACE` and reads and writes through like any other. Descriptor 64 is the program's working directory. `SYS_FD_FLAGS` (228) marks a descriptor to close when its program becomes another, and `SYS_EXEC_SPACE` closes those. Memory named by a descriptor may be mapped by whoever holds the descriptor, and lasts as long as a descriptor names it or somebody has it mapped, whoever made it. |
 | 3.2 | What a shell asks of a kernel that is not about descriptors. `SYS_UMASK` (9): the permission bits a program leaves off what it makes. The kernel makes no files and never reads it; it keeps it because it must follow a program across `SYS_FORK` and `SYS_EXEC_SPACE`, which a C library's memory does not. `SYS_WAIT_FOR` (10): wait for one child in particular, or ask without waiting — `waitpid` with a process id, and `WNOHANG`. Three things change with no new number. `SYS_TASK_KILL` (5), the kill bit of `SYS_SIGNAL` (6) and a signal's deadline end the *program* the task named belongs to, and so does a fault: every task in the address space, where each used to end one task and leave its threads. A task of the caller's own program is still ended alone. A pty's line discipline acts on `ISIG` and on the erase, kill, word-erase and end-of-file characters. And a write to a pty's slave waits for room and writes everything, where it used to return what fitted — which could be nothing. |
+| 3.3 | **Signals a program can handle.** `SYS_SIG_ACTION` (11) says what the caller's program does about a signal — nothing, ignore it, or run a handler — `SYS_SIG_RAISE` (12) raises one for the program a task belongs to, and `SYS_SIG_TAKE` (13) returns the ones raised that have a handler. The kernel carries out a signal's default, which is nearly always the end of the program; a handler it never runs — the program's runtime does, having been told by a word in its own memory and by the wait it was in ending early: a read of a terminal, `SYS_POLL`, `SYS_POLLSET_WAIT` and a sleep can now answer that a signal ended them. A terminal's interrupt and quit characters raise 2 and 3 for every program holding its slave. `SYS_FD_KIND` (230) says what a descriptor names and whether its other end has gone, which is how a write that failed is told apart: nobody reading, or no such descriptor. |
 
 3.1 was a change of behaviour and no change of number, so a minor: nothing built for
 3.0 calls anything that means something else now. What it could have relied on
@@ -268,6 +271,9 @@ everything else returns promptly.
 | 8 | `SYS_EXIT_PROGRAM` | arg0 = status | does not return | — |
 | 9 | `SYS_UMASK` | arg0 = the new mask (nine bits), or `u64::MAX` to leave it | the mask as it was | — |
 | 10 | `SYS_WAIT_FOR` | arg0 = a child's tid, or 0 for any; arg1 = flags (1 = do not wait) | `tid \| (exit_code << 32)`; 0 if asked not to wait and none has ended; `u64::MAX` if there is no such child. **Blocks** unless asked not to. | — |
+| 11 | `SYS_SIG_ACTION` | arg0 = signal (1 to 64), arg1 = 0 nothing said, 1 ignore, 2 handled; anything else only asks | what it was: 0, 1 or 2 / `u64::MAX` | — |
+| 12 | `SYS_SIG_RAISE` | arg0 = a task of the program to signal, arg1 = signal, or 0 to ask whether one could be raised | 0 / `u64::MAX` | `TaskMgmt` for target, or same UID |
+| 13 | `SYS_SIG_TAKE` | arg0 = where to be told of the next (a `u32` in the caller's memory), or 0 to leave that as it is | the signals waiting for a handler, bit `n - 1` for signal `n`; none is waiting afterwards | — |
 
 A status is kept as its low eight bits, as Linux's wait status keeps it. A
 negative status is how the kernel says a task was killed — `SYS_TASK_KILL`
@@ -305,18 +311,61 @@ because they must go where the program goes: a forked child starts with its
 parent's, and `SYS_EXEC_SPACE` leaves them alone. Whatever makes the file
 applies them.
 
-**Signals.** There are three, and they are bits: interrupt (`1 << 16`),
-terminate (`1 << 17`) and kill (`1 << 18`). `SYS_SIGNAL` with the kill bit ends
-the target's program at once, with status -9. Either of the others is raised
-in the target's notification word, where the target finds it at its next
+**Signals.** `SYS_SIG_RAISE` raises one, by its Linux number, for the
+*program* a task belongs to. What happens is that program's to say, signal by
+signal, with `SYS_SIG_ACTION`:
+
+- **Nothing said** (0), and the kernel does what the signal does. For nearly
+  all of them that is the end of the program: every task, with the negated
+  signal number as its status — the status a fault leaves. Eight do nothing:
+  17 (a child ended), 23 (urgent data), 28 (a window changed size), and 18 to
+  22, the ones that stop a program and start it again, because stopping a job
+  needs jobs.
+- **Ignored** (1).
+- **Handled** (2): the program has a handler for it. The kernel runs no
+  handler. It records the signal as waiting; sets to 1 the word the program
+  named in its own memory, which its runtime looks at on its way out of every
+  system call; and ends one wait early, if the program is in one of the three
+  a program sits in at a prompt — a read of a terminal, a poll, a sleep (a
+  receive from the caller's own id). `SYS_FD_READ`, `SYS_POLL` and
+  `SYS_POLLSET_WAIT` answer `0xFFFF_FFFD` then, and `SYS_RECV_TIMEOUT` answers
+  2. One signal ends one wait, the first to look: a wait that was ended and
+  goes back to waiting without taking anything waits. `SYS_SIG_TAKE` returns
+  what is waiting, which then no longer is, and the runtime calls the
+  handlers.
+
+9 cannot be ignored or handled; nor can 19, which does nothing. A forked
+child has its parent's answers and nothing waiting. `SYS_EXEC_SPACE` keeps
+what is ignored and forgets the handlers and the word, both of which were
+addresses in the program that has gone. A program started by a spawner has
+said nothing.
+
+So a handler runs at a system-call boundary and nowhere else. A program that
+handles a signal and then computes without making a call is not interrupted
+by it; one that has said nothing is ended wherever it is.
+
+A terminal raises two of them. With `ISIG`, its interrupt character raises 2
+and its quit character 3, for every program holding a descriptor for the
+terminal's slave: there are no process groups to pick a foreground among.
+What keeps a shell alive under its own Ctrl-C is what does on Unix when a
+shell has no job control — it handles the signal, what it starts in the
+background it starts ignoring it, and what it runs in the foreground has said
+nothing.
+
+Nothing is raised when a child ends, when a terminal changes size, when a
+timer runs out or when a pipe has nobody reading it; the last a runtime can
+find out for itself (`SYS_FD_KIND`).
+
+**Task signals** are older and are not those. `SYS_SIGNAL` takes bits:
+interrupt (`1 << 16`), terminate (`1 << 17`) and kill (`1 << 18`). The kill
+bit ends the target's program at once, with status -9. Either of the others is
+raised in the target *task's* notification word, where it finds it at its next
 receive (see `SYS_NOTIFY` below); a call the target is blocked in is abandoned
 and returns failure, so that a task waiting on a server gets to look; and its
 program is killed 500 ticks later if the task is still there. A second signal
-does not extend that. Tasks 0 and 1 cannot be signalled.
-
-These are not POSIX signals. Nothing runs a handler in the target, there are no
-masks and no process groups, and nothing is sent when a child exits or a
-terminal changes size.
+does not extend that. Tasks 0 and 1 cannot be signalled. They are what a
+program written for this system is asked to stop with, and nothing a C
+library knows about.
 
 **A negative exit code means the kernel killed the task.** Its magnitude is the
 signal Linux sends for the exception that did it: 4 for an invalid opcode, 5
@@ -340,7 +389,7 @@ Messages are fixed size: sender TID, a `u64` tag, and six `u64` payload words.
 | 18 | `SYS_CALL` | arg0 = dest, arg1 = msg, arg2 = reply out | 0 / `u64::MAX`. **Blocks** until replied. | `Endpoint` for dest |
 | 19 | `SYS_REPLY` | arg0 = dest, arg1 = msg | 0 / `u64::MAX` | — |
 | 20 | `SYS_CALL_TIMEOUT` | arg0 = dest, arg1 = msg, arg2 = reply out, arg3 = ticks | **0 = replied, 1 = timed out**, `u64::MAX` = failed. **Blocks** up to the deadline. | `Endpoint` for dest |
-| 21 | `SYS_RECV_TIMEOUT` | arg0 = from, arg1 = msg out, arg2 = ticks | 0 / `u64::MAX`. **Blocks** up to the deadline. | — |
+| 21 | `SYS_RECV_TIMEOUT` | arg0 = from, arg1 = msg out, arg2 = ticks | 0 a message, 1 the time ran out, 2 a sleep — a receive from the caller's own id — that a signal ended / `u64::MAX`. **Blocks** up to the deadline. | — |
 | 22 | `SYS_NOTIFY` | arg0 = dest, arg1 = badge | 0 / `u64::MAX` | `Endpoint` for dest |
 | 23 | `SYS_CALL_LEND` | arg0 = dest, arg1 = msg, arg2 = reply out, arg3 = buffer, arg4 = length \| access bits | as `SYS_CALL` | `Endpoint` for dest |
 | 24 | `SYS_CALL_OFFER` | arg0 = dest, arg1 = msg, arg2 = reply out, arg3 = slot | as `SYS_CALL`; `u64::MAX` without calling if the slot holds no valid capability | `Endpoint` for dest |
@@ -506,7 +555,7 @@ would on Linux, and the pipe is freed when the read returns.
 
 | # | Name | Arguments | Returns | Cap |
 |---|---|---|---|---|
-| 64 | `SYS_FD_READ` | arg0 = fd, arg1 = buf, arg2 = max len | bytes read, `0` = EOF, `u64::MAX` = error. **Blocks.** | — |
+| 64 | `SYS_FD_READ` | arg0 = fd, arg1 = buf, arg2 = max len | bytes read, `0` = EOF, `0xFFFF_FFFD` = a read of a terminal that a signal ended, `u64::MAX` = error. **Blocks.** | — |
 | 65 | `SYS_FD_WRITE` | arg0 = fd, arg1 = buf, arg2 = len | bytes written / `u64::MAX` | — |
 | 66 | `SYS_FD_READ_NB` | arg0 = fd, arg1 = buf, arg2 = max len | bytes, `0` = EOF, **`0xFFFF_FFFE` = would block**, `u64::MAX` = error | — |
 | 67 | `SYS_FD_SET` | arg0 = target tid, arg1 = fd, arg2 = service tid, arg3 = tag | 0 / `u64::MAX` | `TaskMgmt` |
@@ -519,8 +568,8 @@ would on Linux, and the pipe is freed when the read returns.
 | 74 | `SYS_FD_RECV` | arg0 = stream fd, arg1 = buf, arg2 = len, arg3 = fd to install a passed descriptor at, `u64::MAX - 1` for any free one, or `u64::MAX` to leave it queued, arg4 = flags (1 = do not wait) | `((fd + 1) << 32) \| bytes`, high half 0 if none arrived, `0xFFFF_FFFE` if it would have blocked / `u64::MAX` | — |
 | 75 | `SYS_POLLSET_CREATE` | — | fd naming the set / `u64::MAX` | — |
 | 76 | `SYS_POLLSET_CTL` | arg0 = set fd, arg1 = op (0 add, 1 modify, 2 remove), arg2 = fd, arg3 = events, arg4 = token | 0 / `u64::MAX` | — |
-| 77 | `SYS_POLLSET_WAIT` | arg0 = set fd, arg1 = array of `(u64 token, u32 events, u32 pad)`, arg2 = capacity, arg3 = timeout in ticks | entries filled, 0 = timed out / `u64::MAX` | — |
-| 78 | `SYS_POLL` | arg0 = array of `(u32 fd, u32 events, u32 revents, u32 pad)`, arg1 = count, arg2 = timeout in ticks | entries with non-zero `revents` / `u64::MAX` | — |
+| 77 | `SYS_POLLSET_WAIT` | arg0 = set fd, arg1 = array of `(u64 token, u32 events, u32 pad)`, arg2 = capacity, arg3 = timeout in ticks | entries filled, 0 = timed out, `0xFFFF_FFFD` = a signal ended the wait / `u64::MAX` | — |
+| 78 | `SYS_POLL` | arg0 = array of `(u32 fd, u32 events, u32 revents, u32 pad)`, arg1 = count, arg2 = timeout in ticks | entries with non-zero `revents`, `0xFFFF_FFFD` = a signal ended the wait / `u64::MAX` | — |
 | 79 | `SYS_FD_WRITE_NB` | arg0 = fd, arg1 = buf, arg2 = len | bytes written, **`0xFFFF_FFFE` = would block**, `u64::MAX` = error | — |
 
 **Streams.** `SYS_SOCKETPAIR` makes two connected ends and puts both in the
@@ -935,9 +984,11 @@ and not as a hangup. With `ECHO`, what is typed is written back to the master,
 and what is taken back is rubbed out there.
 
 With `ISIG`, `VINTR` and `VQUIT` are not input: the character is taken out,
-the line it was typed into and anything not yet read are thrown away, and it
-is echoed as `^C`. `VSUSP` is taken out and nothing else: stopping a job needs
-jobs. A character set to 0 in `c_cc` is switched off.
+the line it was typed into and anything not yet read are thrown away, it is
+echoed as `^C`, and signal 2 or 3 is raised for every program holding the
+slave (see *Signals*, under process lifecycle). `VSUSP` is taken out and
+nothing else: stopping a job needs jobs. A character set to 0 in `c_cc` is
+switched off.
 
 A write to the slave — what a program prints — waits for room when the pty's
 buffer (4096 bytes) is full, and returns when all of it has been taken, or
@@ -955,6 +1006,17 @@ which may be less, or nothing.
 | 227 | `SYS_FD_COOKIE` | arg0 = tid, arg1 = one of its descriptors (64 allowed) | the caller's cookie there / `u64::MAX` if what is there is not the caller's | — |
 | 228 | `SYS_FD_FLAGS` | arg0 = fd, arg1 = 0 to read or 1 to set, arg2 = flags (1 = close when the program becomes another) | the flags, or 0 on a set / `u64::MAX` | — |
 | 229 | `SYS_FD_REAP` | — | the cookie of one of the caller's objects that no descriptor names any more / `u64::MAX` when there is none | — |
+| 230 | `SYS_FD_KIND` | arg0 = one of the caller's descriptors (64 allowed) | what it names, `\| 0x100` if its other end has gone / `u64::MAX` if it names nothing | — |
+
+`SYS_FD_KIND` answers 1 for an IPC endpoint, 2 and 3 for the reading and
+writing ends of a pipe, 4 for a stream, 5 and 6 for a terminal's master and
+slave, 7 for a timer, 8 for a counter, 9 for a poll set, 10 for memory, 11 for
+a socket and 12 for a served descriptor. The bit above says nothing is left at
+the other end: a pipe with no writers, or no readers; a stream or a terminal
+whose peer has closed; a served descriptor whose server has gone. A failed
+write says only that it failed, and this is how its caller tells a pipe
+nobody is reading — which a C library must answer with `EPIPE` — from a
+number that names nothing.
 
 **A served descriptor names an object in a server**: a file, most often. The
 object is the server's, known to it by a number of its own choosing — the

@@ -18,6 +18,8 @@ pub enum IpcError {
     WouldBlock,
     NotWaiting,
     Timeout,
+    /// A sleep ended by a signal the program has a handler for.
+    Interrupted,
 }
 
 /// Fixed-size IPC message: sender TID, tag, and 6 payload words.
@@ -1171,6 +1173,15 @@ pub fn sys_recv_timeout(from: usize, timeout_ticks: u64) -> Result<Message, IpcE
             return Err(IpcError::Timeout);
         }
 
+        // A receive from oneself is a sleep, and a sleep is one of the waits
+        // a signal ends. One already waiting for a handler means there is no
+        // sleep to begin: looked at here, with interrupts off, so that one
+        // raised a moment from now finds a sleeper to wake.
+        if from == receiver && crate::signal::interrupted(receiver) {
+            irq_restore(flags);
+            return Err(IpcError::Interrupted);
+        }
+
         // Set deadline and block
         TASK_TIMEOUT[receiver] = crate::pit::ticks() + timeout_ticks;
         TASK_IPC[receiver].state = IpcState::RecvBlocked(from);
@@ -1224,10 +1235,13 @@ pub fn sys_recv_timeout(from: usize, timeout_ticks: u64) -> Result<Message, IpcE
             }
         }
 
-        // No message — must have been a timeout
+        // No message — a timeout, or a sleeper woken for a signal.
         TASK_IPC[receiver].state = IpcState::None;
     }
     irq_restore(flags);
+    if from == receiver && crate::signal::interrupted(receiver) {
+        return Err(IpcError::Interrupted);
+    }
     Err(IpcError::Timeout)
 }
 

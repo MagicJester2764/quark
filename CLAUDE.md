@@ -127,8 +127,8 @@ system hung.
 
 There are no tests in this tree, and that is the shape of a microkernel rather
 than an omission: the kernel is tested from outside, through the ABI, by a
-program. `dtest` in `../quarkutils` makes 317 checks — capabilities, IPC,
-memory, descriptors, scheduling, `dtest calls` with three million calls in
+program. `dtest` in `../quarkutils` makes 346 checks — capabilities, IPC,
+memory, descriptors, signals, scheduling, `dtest calls` with three million calls in
 three seconds — and `qfuzz` throws random requests at every service.
 
 So a kernel change is verified by booting an image:
@@ -377,6 +377,39 @@ every Unix program assumes:
 - **A descriptor sent over a stream outlives the sender's end.** It is in the
   stream rather than in the sender, and the peer can still take it.
 
+## Signals
+
+A signal is said to a program (`signal.rs`), and what the program has said
+about each one lives in its descriptor table's record — because `fork` copies
+that and `exec` keeps what is ignored, which is the whole of how a shell with
+no job control starts a background job that Ctrl-C does not reach.
+
+- **The kernel runs no handler.** Nothing is pushed on a user stack and
+  nothing is returned from. A program that has said nothing is ended, here
+  (`scheduler::end_program`, with the negated signal number, as a fault does).
+  One with a handler is *told*: the signal is recorded as waiting, a word in
+  the program's own memory is set through its page tables, and one wait is
+  ended early. Its runtime takes what is waiting (`SYS_SIG_TAKE`) and calls
+  the handler as a function. Making the kernel deliver one — a frame, a
+  trampoline, a return — is a change of design, not a fix.
+- **One signal ends one wait: the first to look.** `fdtable::sig_interrupted`
+  is true once. Held as a level — "a signal is waiting, do not wait" — it
+  turns every loop that sleeps and looks again into a spin for as long as the
+  program has not taken the signal, and three of those loops are in the
+  kernel: a poll sleeps by receiving from its own id.
+- **Asking whether to wait and parking are one step**, with interrupts off
+  (`pty::wait_readable`, `ipc::sys_recv_timeout`). A signal raised between
+  the two finds nobody parked, and the wait outlasts it.
+- **A signal ends only a wait that looks again when it is woken**: a read of
+  a terminal, a poll, a sleep. A call to a server is not one — woken with no
+  reply, it fails — so `signal::wake` reaches for sleepers and terminal
+  readers by what they are, and never for a task by its state.
+- **Ctrl-C is for every program holding the terminal's slave**
+  (`signal::from_terminal`). There are no process groups to pick a foreground
+  from. `getty`, `login` and `qsh` hold it too, and each says what it does
+  about signal 2; a new program that holds a session's terminal and is not
+  what the session runs has to say so too, or Ctrl-C ends it.
+
 ## Scheduling
 
 Four bands, best first: drivers, servers, ordinary programs, idle. A task runs
@@ -421,18 +454,20 @@ Three things follow from that, and breaking any of them is quiet:
 - `fork` copies every page the caller owns, eagerly, and a threaded program
   cannot `exec`: POSIX has it end every other thread, and ending them means
   unwinding what they hold in a server, so it is refused rather than half done.
-- There are **no POSIX signals**. The kernel has three of its own — interrupt,
-  terminate and kill, raised with `SYS_SIGNAL` as bits in a task's notification
-  word, with a five-second deadline before the task is ended — and nothing a C
-  program would recognise: no handler runs in the task, there are no masks and
-  no process groups. A pseudo-terminal takes its interrupt character out of
-  what is typed, throws the line away and remembers that it was pressed
-  (`pty::take_signal`), and nothing is sent to anybody yet. A task that faults
-  ends with the negated Linux signal number as its exit status, which is the
-  only place those numbers mean anything here.
+- **Signals are told to a program, not delivered to it** (see *Signals*). So a
+  handler runs at a system-call boundary and nowhere else: a program that
+  handles a signal and computes without making a call is not interrupted.
+  There are no process groups, no sessions and no jobs — the signals that stop
+  a program do nothing. Nothing is raised when a child ends, when a timer runs
+  out (there is no `alarm`), or when a terminal changes size. A signal a
+  program has blocked and has no handler for is not held back: the mask is its
+  runtime's, and the kernel does what the signal does at once. A wait for a
+  child is not one of the waits a signal ends. And the three *task* signals
+  of `SYS_SIGNAL` — bits in one task's notification word, with a deadline —
+  are still what a program written for this system is asked to stop with.
 - A pty's window size is stored and nothing is told when it changes: Linux
-  sends `SIGWINCH`, and there are no signals. A program that draws itself to
-  the terminal's size reads it once.
+  sends `SIGWINCH`. A program that draws itself to the terminal's size reads
+  it once.
 - The clock is read once, from the CMOS clock at boot, as UTC. Nothing sets it,
   and there is no time zone.
 - The page cache for mapped files holds 8192 pages across 256 objects and

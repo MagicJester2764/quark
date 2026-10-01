@@ -833,7 +833,13 @@ pub fn kill_task(tid: usize) -> Result<(), ()> {
     ended
 }
 
-/// Kill the program `tid` belongs to: every task in its address space.
+/// Kill the program `tid` belongs to: [`end_program`], as SIGKILL would.
+pub fn kill_program(tid: usize) -> Result<(), ()> {
+    end_program(tid, -9)
+}
+
+/// End the program `tid` belongs to: every task in its address space, each
+/// with `code` as its status.
 ///
 /// What a kill means to whoever asks for one — a shell, a compositor ending
 /// its session, a test that ran out of time, the deadline a signal carries.
@@ -843,7 +849,10 @@ pub fn kill_task(tid: usize) -> Result<(), ()> {
 /// and its connection.
 ///
 /// A task that has not been started is in no program yet, and is ended alone.
-pub fn kill_program(tid: usize) -> Result<(), ()> {
+///
+/// `code` is the negated number of the signal that did it — -9 for a kill —
+/// which is the status a fault leaves too.
+pub fn end_program(tid: usize, code: i32) -> Result<(), ()> {
     if tid <= 1 || tid >= MAX_TASKS {
         return Err(());
     }
@@ -856,21 +865,25 @@ pub fn kill_program(tid: usize) -> Result<(), ()> {
         )
     };
     if theirs == 0 {
+        if tid == me {
+            exit_with(code);
+        }
+        let ended = end_other(tid, code);
         irq_restore(flags);
-        return kill_task(tid);
+        return ended;
     }
     if theirs == mine {
         // The caller's own program, or the one that was running when its
         // deadline passed: the caller goes with it, and last.
         irq_restore(flags);
-        exit_program(-9);
+        exit_program(code);
     }
     let mut ended = Err(());
     for other in 2..MAX_TASKS {
         let theirs_too = unsafe {
             matches!(TASKS[other], Some(ref t) if t.space == theirs && t.state != TaskState::Dead)
         };
-        if theirs_too && end_other(other, -9).is_ok() {
+        if theirs_too && end_other(other, code).is_ok() {
             ended = Ok(());
         }
     }
