@@ -1,7 +1,7 @@
 # Working on Quark
 
 Quark is an x86-64 microkernel, and this repository is the kernel and nothing
-else. It is one of six that build together and must be checked out as
+else. It is one of seven that build together and must be checked out as
 siblings:
 
 ```
@@ -10,9 +10,10 @@ repos/
   quarkutils/  everything that runs on it: the runtime, init, the drivers, the
                servers, the C library, the shell and the programs
   bang/        UEFI bootloader, and nothing else
-  explosion/   the distro: stages the other three and assembles the image
-  gnu-quark/   the other distro: this kernel, the least of quarkutils that
-               boots, and GNU's bash and coreutils built unpatched on top
+  quark-toolchain/  the cross compilers: gcc, binutils and musl for Quark
+  explosion/   a distro: stages the other three and assembles the image
+  gnu-quark/   another: this kernel, the least of quarkutils that boots, and
+               GNU's programs built unpatched on top
   rust/        fork of rust-lang/rust carrying the x86_64-unknown-quark std PAL
 ```
 
