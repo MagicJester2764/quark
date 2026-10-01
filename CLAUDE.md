@@ -1,7 +1,7 @@
 # Working on Quark
 
 Quark is an x86-64 microkernel, and this repository is the kernel and nothing
-else. It is one of five that build together and must be checked out as
+else. It is one of six that build together and must be checked out as
 siblings:
 
 ```
@@ -11,6 +11,8 @@ repos/
                servers, the C library, the shell and the programs
   bang/        UEFI bootloader, and nothing else
   explosion/   the distro: stages the other three and assembles the image
+  gnu-quark/   the other distro: this kernel, the least of quarkutils that
+               boots, and GNU's bash and coreutils built unpatched on top
   rust/        fork of rust-lang/rust carrying the x86_64-unknown-quark std PAL
 ```
 
@@ -18,12 +20,16 @@ repos/
 The screen, the filesystem, the C library, the toolkits and every server's
 rules are written down there. This file is about ring 0.
 
-The dependency runs one way: ExplOSion reaches down to the kernel, the userland
+The dependency runs one way: a distro reaches down to the kernel, the userland
 and the bootloader, and nothing reaches up. The kernel and the userland do not
 reach sideways either — neither names the other's checkout, and neither builds
 against the other's source. What crosses between them is what this repository
-*installs*, and `../explosion`'s stage directory is the only place the two
-meet.
+*installs*, and a distro's stage directory is the only place the two meet.
+
+GNU/Quark is why a good deal of this kernel is as it is. Its rule is that
+nothing in a GNU program is patched, so what bash and coreutils needed and
+did not find, the kernel grew: descriptors a program keeps across `exec`,
+signals, a terminal's line discipline, process ids, an alarm.
 
 ## The ABI is the interface
 

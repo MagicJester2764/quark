@@ -4,7 +4,9 @@ A minimal x86-64 microkernel. This repository is the kernel and nothing else:
 what runs on it is [quarkutils](https://github.com/MagicJester2764/quarkutils),
 what boots it is [Bang](https://github.com/MagicJester2764/bang), and what
 assembles the three into an image is
-[ExplOSion](https://github.com/MagicJester2764/explosion).
+[ExplOSion](https://github.com/MagicJester2764/explosion) — or
+[GNU/Quark](https://github.com/MagicJester2764/gnu-quark), which puts GNU's
+shell and programs on this kernel in place of Quark's own.
 
 ## What it does
 
