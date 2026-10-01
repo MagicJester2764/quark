@@ -1,64 +1,86 @@
-# Missing Features
+# What the kernel is missing
 
-> A list from the first months, kept as it was. The user-space pieces it names
-> (`user/net`, `user/shell`, `libquark`) left this repository for
-> [quarkutils](https://github.com/MagicJester2764/quarkutils), some of them
-> under new names, and the system call numbers it quotes predate the ABI
-> freeze — `docs/abi.md` has the real ones.
+The kernel's own list. What the *system* lacks above the ABI — a filesystem
+that cannot shorten a file, a compositor with no drag and drop — is under
+"Known gaps" in [quarkutils](https://github.com/MagicJester2764/quarkutils)'
+`CLAUDE.md`.
 
-## What Quark has
-Scheduler, synchronous IPC, address spaces, capabilities, fd table, IRQ delegation, PMM, heap, futex/mutex, ELF loading, nameserver, console, keyboard, input, disk, VFS, network, signals
+This file was once a list of twenty-three things Quark needed, twenty-one of
+them struck through as done. What follows is what is true now.
 
-## High impact (blocking real programs)
+## Not there
 
-1. ~~**User-space memory allocation**~~ — **Done.** `sys_mmap(vaddr, pages)` (syscall 70) allocates+maps frames. `libquark::allocator` provides `#[global_allocator]` backed by sys_mmap, enabling `Vec`, `String`, etc.
+- **A second CPU.** The kernel is uniprocessor, and several of its invariants
+  lean on that: `IrqSpinLock` panics on contention precisely because, on one
+  CPU, contention can only mean a lock taken twice. SMP invalidates that
+  reasoning across the kernel and is its own project.
+- **Paging anything out.** Anonymous memory gets its frames when first touched
+  and keeps them; a machine that runs out ends whichever task touched the page
+  it could not give, not the biggest one. There is no swap.
+- **Copy-on-write.** `fork` copies every page the caller owns, eagerly. Sharing
+  until written needs a reference count per frame, and frames here have an
+  owner and nothing else.
+- **Signals.** A fault in ring 3 ends the task with the negated Linux signal
+  number as its exit status, and that is the only place a signal number means
+  anything. Nothing is delivered to a handler, there are no process groups,
+  and a terminal's Ctrl-C reaches the program in it as a byte.
+- **AVX.** `CR4.OSXSAVE` is clear, so an AVX instruction faults. Turning it on
+  means moving the per-task floating-point state from `FXSAVE` to `XSAVE`
+  first — see [`docs/fpu.md`](docs/fpu.md).
+- **A clock finer than the tick.** Time is the PIT at 100 Hz: a timer, a sleep
+  and a futex deadline all round up to ten milliseconds. There is no HPET, no
+  APIC timer and no use of the TSC.
+- **An interrupt controller newer than the 8259.** Sixteen lines, no APIC, no
+  MSI. A driver for a device that only speaks MSI has nothing to be given.
+- **ACPI.** The kernel reads none of it. Powering off is a user program
+  writing to a port QEMU happens to listen on.
+- **Memory above 4 GiB.** The frame allocator's bitmap covers the first four
+  gigabytes and the rest of what the firmware reports is left alone.
+- **Setting the clock.** The date is read once, from the CMOS clock at boot,
+  as UTC. There is no call to change it and no time zone.
 
-2. ~~**Async notifications / non-blocking IPC**~~ — **Done.** `sys_recv_timeout(from, msg, ticks)` (syscall 80) adds non-blocking poll and timed receive. `sys_notify(dest, badge)` (syscall 85) provides seL4-style async notifications: badge bits are OR'd into a per-task notification word, delivered as `TAG_NOTIFICATION` messages via `sys_recv`. Enables true multiplexed wait over IPC + IRQs + notifications.
+## Fixed tables
 
-3. ~~**Timers for userspace**~~ — **Done.** `sys_ticks()` (syscall 81) reads PIT counter. `libquark::syscall::sleep_ms(ms)` and `sleep_ticks(ticks)` provide blocking sleep via recv_timeout.
+Everything here is an array with a size, and each size is a limit somebody
+will meet:
 
-4. ~~**Page fault / exception forwarding**~~ — **Done.** User page faults are forwarded to a pager task via IPC (`TAG_PAGE_FAULT`, `sys_set_pager` syscall 82). If no pager, the faulting task is killed cleanly instead of triple-faulting. Enables demand paging, COW, and stack growth.
+| | |
+|---|---|
+| Tasks | 64, threads included |
+| Descriptors per task | 32 |
+| Capability slots per task | 64 |
+| Pipes | 96 in the machine, 8 made by any one program |
+| Connected streams | 32 |
+| Poll sets | 64, each watching 32 descriptors |
+| Pseudo-terminals | 8 |
+| Timers, event counters | 16 of each |
+| Shared memory regions | 256, of at most 4096 pages |
+| Memory objects | 256, with 8192 cached pages between them |
+| Futex waiters | 64 at once |
+| Kernel heap | 1 GiB of address space |
 
-## Medium impact (needed for real workloads)
+## Half done
 
-5. ~~**Write support in VFS/disk**~~ — **Done.** Disk driver supports `TAG_WRITE_SECTOR` (ATA PIO write). VFS supports `TAG_WRITE` (write file data with auto-extend) and `TAG_CREATE` (create files/directories with FAT32 8.3 entries). `libquark::vfs::write()` and `create()` provide the client API.
+- **`exec` in a program with threads is refused.** POSIX has it end every
+  other thread, and ending them means unwinding what they hold in a server.
+- **A thread starts with a copy of what its creator holds**, not a share:
+  capabilities and descriptors are duplicated when it is made, and what either
+  is given or closes afterwards the other does not see.
+- **A pty's window size is stored and nobody is told when it changes.** Linux
+  sends `SIGWINCH`, and there are no signals.
+- **The page cache never shrinks under pressure.** A mapped file's pages stay
+  until nothing maps the file.
+- **Five deprecated calls still answer** — the pre-capability grants, 86 to 90
+  — and the two debug-console calls (160, 161) are marked for withdrawal once
+  early output is handled another way. `docs/abi.md` says which.
 
-6. ~~**Process groups / wait**~~ — **Done.** `sys_wait()` (syscall 83) blocks parent until a child exits, returns child TID. Tasks track `parent_tid`; dead tasks become zombies until collected. `reap_dead()` respects parent/child relationships.
+## Left over
 
-7. ~~**Per-task memory limits / quotas**~~ — **Done.** Tasks track `mem_pages` (current usage) and `mem_limit` (max, 0=unlimited). `sys_mmap` and `sys_phys_alloc` check the quota before allocating. `sys_set_mem_limit` (syscall 84) lets init set limits per task.
-
-8. ~~**Proper `exec` / program arguments**~~ — **Done.** Init maps an argument page at `0x80_8000_0000` in child address spaces. `libquark::args::argc()` / `argv(n)` read from it. Init passes program name as argv[0] for all spawned tasks.
-
-## Lower priority (completeness)
-
-9. **SMP support** — Single-core only. Would need per-CPU scheduler state, IPI for cross-core scheduling, lock-aware context switch.
-
-10. ~~**Network stack**~~ — **Done.** RTL8139 NIC driver as userspace service (`user/net`). PCI enumeration, DMA ring buffers, Ethernet framing, ARP (request/reply/cache), IPv4, ICMP echo reply (ping), UDP send/receive via IPC. `libquark::net` provides client API (`udp_send`, `udp_recv`, `configure`, `info`). Registers as "net" with nameserver. QEMU: add `-device rtl8139,netdev=n -netdev user,id=n`.
-
-11. ~~**Shared memory**~~ — **Done.** `sys_shmem_create(pages)` (syscall 90) allocates a shared region, `sys_shmem_grant(handle, tid)` (92) grants access, `sys_shmem_map(handle, vaddr)` (91) maps into caller's space. Up to 32 regions, 16 pages each. Access tracked via per-region bitmask.
-
-12. ~~**Capability transfer over IPC**~~ — **Done.** `sys_cap_transfer(dest, caps)` (syscall 93) lets any task transfer capabilities it holds to another task, without requiring CAP_TASK_MGMT. Services can now delegate their own capabilities to clients dynamically.
-
-## Next features
-
-13. ~~**Shell**~~ — **Done.** Interactive command interpreter (`user/shell`). Reads input, parses commands, loads ELFs from `/usr/bin/` via VFS, spawns tasks with fd wiring, waits for exit. Only builtin: `exit`. Loaded last by init so auto-run programs finish first.
-
-14. ~~**`sys_kill` / signals**~~ — **Partially done.** `sys_task_kill(tid)` (syscall 104) terminates tasks from userspace. Requires `CAP_TASK_MGMT` or same UID. Shell has `kill <tid>` builtin. POSIX signals not implemented.
-
-15. ~~**Pipes**~~ — **Partially done.** Kernel pipes (`sys_pipe_create`, `sys_pipe_fd_set`) exist and are used for console I/O transport. Shell `cmd1 | cmd2` syntax not yet implemented.
-
-16. ~~**Userspace utilities (`ls`, `cat`, `echo`)**~~ — **Done.** `echo` prints arguments; `ls` lists directories via VFS (default `/usr/bin`); `cat` reads and prints files via VFS with phys page buffer. All loadable from shell.
-
-17. ~~**Signal delivery**~~ — **Done.** `sys_signal(tid, sig)` (syscall 106) sends signals via the notification system. `SIG_INT` (Ctrl+C) and `SIG_TERM` deliver async notifications with a 2-second grace period before force-kill; `SIG_KILL` terminates immediately. Input server sends `SIG_INT` on Ctrl+C instead of instant kill. Shell `kill` builtin sends `SIG_TERM` by default, `kill -9` for `SIG_KILL`. `libquark::signal` provides `poll_signal()`, `extract_signal()`, and `default_handler()` for userspace signal handling.
-
-18. ~~**TCP**~~ — **Done.** TCP protocol implemented in the net driver. 3-way handshake (active connect + passive listen/accept), data transfer with sequence numbers and ACKs, retransmission on timeout (3s), graceful close (FIN handshake), RST handling, TIME_WAIT. Up to 8 concurrent connections with 4 KiB send/receive buffers each. IPC: `TAG_TCP_CONNECT` (10), `TAG_TCP_LISTEN` (11), `TAG_TCP_SEND` (13), `TAG_TCP_RECV` (14), `TAG_TCP_CLOSE` (15). `libquark::net` provides `tcp_connect()`, `tcp_listen()`, `tcp_send()`, `tcp_recv()`, `tcp_close()`. `httpget` utility demonstrates TCP with HTTP/1.0 GET requests. QEMU: connect to external hosts via user-mode NAT.
-
-19. ~~**DHCP client**~~ — **Done.** Built into net driver. Sends DHCP DISCOVER at startup, negotiates OFFER→REQUEST→ACK, applies IP/netmask/gateway. Falls back to static 10.0.2.15 after 5-second timeout. `TAG_NET_DHCP` (6) IPC for renewal. `libquark::net::dhcp_renew()` client API.
-
-20. ~~**DNS resolver**~~ — **Done.** Built into net driver. Sends DNS A-record queries via UDP to configured DNS server (from DHCP option 6, default 10.0.2.3). 8-entry cache. `TAG_DNS_RESOLVE` (7) IPC with 48-byte hostname. `libquark::net::dns_resolve()` client API. `httpget` and `ping` accept hostnames via DNS fallback. 3-second query timeout.
-
-21. ~~**Task listing (`ps`)**~~ — **Done.** `sys_task_info(tid)` (syscall 105) returns task state, UID, and parent TID. `ps` command lists all running tasks.
-
-22. ~~**Filesystem permissions / ext2 driver**~~ — **Done.** VFS supports ext2 filesystem alongside FAT32 with auto-detection (superblock magic 0xEF53). ext2 provides native uid/gid/mode permission enforcement: VFS queries sender UID/GID via `sys_get_tuid()` and checks against inode permissions on open/write/create. Root (UID 0) bypasses all checks. Read-write support with block/inode allocation, indirect blocks, directory creation. New modules: `ext2.rs` (on-disk structures, inode/block operations), `ext2_dir.rs` (directory entries, path resolution), `ext2_alloc.rs` (bitmap allocation). FAT32 remains permissionless for backward compatibility. `ERR_PERMISSION(8)` error code added to VFS and libquark.
-
-23. ~~**`shutdown` program**~~ — **Done.** Userspace utility (`user/shutdown`) for clean system shutdown. Phase 1: sends `SIG_TERM` to all user tasks (skip TID 0-1 and self), waits 2.5s for graceful exit. Phase 2: `SIG_KILL` any survivors. Phase 3: ACPI S5 power-off via PM1a_CNT port (0x604 / 0xB004). `-f` flag skips graceful phase and sends `SIG_KILL` immediately. Init grants `CAP_TASK_MGMT` + `CAP_IOPORT` (ports 0x604, 0xB004).
+- **`fat32.drv`** is loaded at boot, announced on the console, and called by
+  nothing: `init` reads the boot image itself. `vga.drv` is still the text
+  console on a machine with no framebuffer. Both are from the months when
+  drivers were flat binaries the kernel loaded; every driver that matters is
+  an ordinary program now.
+- **A driver ABI.** Drivers are user programs that speak the system call ABI
+  like any other, which is the right answer; there is nothing separate to
+  stabilise until somebody outside these repositories writes one.

@@ -215,6 +215,7 @@ UID 0 bypass in the kernel. Each task has a CSpace of 64 slots holding
 | 6 | `SetUid` | — | — |
 | 7 | *withdrawn at 2.0* | — | — |
 | 8 | `Endpoint` | the destination's endpoint number | — |
+| 9 | `MemObject` | the object's id | access: 1 read, 2 write |
 
 Delegation may narrow a capability but never widen it; delegating at equal
 breadth is allowed, since a set is a subset of itself.
@@ -261,6 +262,19 @@ was.
 `syscall0` leaves RDI undefined, so the original call could not grow an
 argument.
 
+**Signals.** There are three, and they are bits: interrupt (`1 << 16`),
+terminate (`1 << 17`) and kill (`1 << 18`). `SYS_SIGNAL` with the kill bit ends
+the target at once, with status -9. Either of the others is raised in the
+target's notification word, where the target finds it at its next receive (see
+`SYS_NOTIFY` below); a call the target is blocked in is abandoned and returns
+failure, so that a task waiting on a server gets to look; and the task is
+killed 500 ticks later if it is still there. A second signal does not extend
+that. Tasks 0 and 1 cannot be signalled.
+
+These are not POSIX signals. Nothing runs a handler in the target, there are no
+masks and no process groups, and nothing is sent when a child exits or a
+terminal changes size.
+
 **A negative exit code means the kernel killed the task.** Its magnitude is the
 signal Linux sends for the exception that did it: 4 for an invalid opcode, 5
 for a debug trap or breakpoint, 7 for an alignment check, 8 for a divide error
@@ -292,6 +306,12 @@ The `Endpoint` check applies to calls where the sender names its own
 destination. IPC the kernel performs on a task's behalf through an installed
 file descriptor bypasses it deliberately: the fd is itself the authorisation,
 and only a `TaskMgmt` holder can install one.
+
+**Notifications.** Every task has a notification word. `SYS_NOTIFY` ORs
+`badge` into the destination's and does not wait; the destination receives the
+word, and clears it, at its next `SYS_RECV` from sender 0 or from anybody, as a
+message from sender 0 with tag `0xFFFF_0002` and the bits in `data[0]`. Bits
+that were raised more than once before being collected arrive once.
 
 `SYS_NOTIFY` rejects the reserved signal bits; those may only be raised through
 `SYS_SIGNAL`, which checks the caller's authority over the target.
@@ -408,8 +428,12 @@ maps it.
 
 Thirty-two descriptors per task. 0, 1 and 2 are stdin, stdout and stderr by
 convention. A descriptor is one of: unset, an IPC endpoint (a service TID plus a
-tag), a pipe read end, a pipe write end, one end of a stream, shared memory, or
-a set of descriptors to wait on.
+tag), a pipe read end, a pipe write end, one end of a stream, shared memory, a
+set of descriptors to wait on, one end of a pseudo-terminal, a timer, an event
+counter, or a network connection. The calls that make the last four are in the
+blocks they belong to — terminals, time, synchronisation and sockets — and
+everything here that reads, writes, waits on, copies or closes a descriptor
+takes any of them.
 
 A descriptor names an object and holds a reference to it. Closing the last one
 frees the object, and is what makes a pipe's reader see end-of-file.
@@ -444,7 +468,9 @@ copying a descriptor onto itself changes nothing. A poll set cannot be copied or
 sent at all: it counts no holders, so it has exactly one.
 
 **Passing a descriptor needs no authority over the peer.** `SYS_FD_DUP` puts one
-into a task that never asked, so it requires `TaskMgmt` over that task.
+into a task that never asked, so it requires `TaskMgmt` over that task — unless
+the task is a child the caller made and has not started, which is a spawner
+wiring up what it is about to run.
 `SYS_FD_SEND` hands one to a task that called `SYS_FD_RECV`: the sender chose to
 send and the receiver asked to take, and consent on both sides is the whole
 authorisation. Memory arriving this way admits the receiver to the region.
@@ -461,10 +487,6 @@ others.
 Pipes are reference counted through the descriptors that hold them; a read
 returns EOF once the last writer closes, and a pipe is freed when both counts
 reach zero.
-
-Note that `SYS_PIPE_FD_SET` **overwrites** the target slot without releasing
-what was there. Install pipe ends onto a descriptor a task has not already
-inherited, or the previous endpoint's reference is stranded.
 
 ### Capabilities (0x50)
 
@@ -641,6 +663,14 @@ it returns 1 if the value already differs and 2 if it does not, without
 blocking. There is no way to ask for an unbounded wait through this call; that
 is what `SYS_FUTEX_WAIT` is.
 
+**Event counters.** `SYS_EVENT_CREATE` makes a 64-bit counter and returns a
+descriptor for it. A write is eight bytes and adds them; a read is eight bytes
+and takes the whole count, leaving zero — or takes one, leaving the rest, if
+the counter was made with the semaphore flag. A read waits while the count is
+zero and `SYS_FD_READ_NB` answers "would block" instead. The descriptor is
+readable while the count is not zero. The largest count is `u64::MAX - 1`;
+writing `u64::MAX`, or zero, is refused. There are sixteen in the machine.
+
 A timed wait that expires leaves its wait slot claimed until the woken task
 returns through the kernel and reads why it woke, so a task blocked on a futex
 holds its slot from the moment it waits to the moment it runs again. With
@@ -660,6 +690,13 @@ it as a resource limit rather than as a bad argument.
 The PIT runs at 100 Hz, so one tick is 10 ms. Every timeout argument in this
 ABI is in ticks. The time of day is `SYS_BOOT_TIME + SYS_TICKS / 100`: the
 kernel reads the PC's battery-backed clock once, at boot, and never again.
+
+**Timers.** A timer is a descriptor that becomes readable when its deadline
+passes. A read is eight bytes: the number of times it has fired since it was
+last read, which a read clears. It waits while that is zero, and
+`SYS_FD_READ_NB` answers "would block" instead. A repeating timer that fell
+behind its reader does not fire in a burst to catch up: the next deadline is
+one interval after the tick it fired on. There are sixteen in the machine.
 
 ### Sockets (0xB0)
 
@@ -785,14 +822,51 @@ the CPU ignores those bits only while protection keys are off, and the
 kernel keeps CR4.PKE clear. A pager's objects stop paging when it dies, and
 go when nothing maps them.
 
-### ABI introspection (0xF0)
+### Terminals (0xD0)
 
 | # | Name | Arguments | Returns | Cap |
 |---|---|---|---|---|
 | 208 | `SYS_PTY_CREATE` | — | a descriptor for a new pty's master / `u64::MAX` | — |
-| 210 | `SYS_PTY_OPEN` | arg0 = a pty's number | a descriptor for its slave / `u64::MAX` | — |
 | 209 | `SYS_PTY_CTL` | arg0 = a descriptor naming either end, arg1 = op (0 get termios, 1 set termios, 2 get window size, 3 set window size, 4 the pty's number), arg2 = the structure | per op / `u64::MAX` | — |
+| 210 | `SYS_PTY_OPEN` | arg0 = a pty's number | a descriptor for its slave / `u64::MAX` | — |
+
+A pseudo-terminal is a pair of descriptors with a line discipline between
+them: what a terminal emulator holds, the master, and what the program in it
+holds, the slave. `SYS_PTY_CREATE` makes the pair and returns the master; its
+number comes from `SYS_PTY_CTL` op 4, and `SYS_PTY_OPEN` on that number returns
+a slave, which any holder of the number may open while the master is held.
+There are eight in the machine.
+
+Either end is read, written, waited on and closed as any descriptor is. Before
+a slave has been opened, a read of the master waits rather than reporting end
+of file: the program that will hold the slave has not been started yet. After,
+the last slave closing *is* end of file at the master, and a poll reports it as
+readable with hangup.
+
+The structures are Linux's, so a C library hands them through unchanged:
+
+```
+termios, 36 bytes: c_iflag, c_oflag, c_cflag, c_lflag (u32 each),
+                   c_line (u8), c_cc (19 bytes)
+winsize,  8 bytes: ws_row, ws_col, ws_xpixel, ws_ypixel (u16 each)
+```
+
+Of a `termios` the kernel acts on five bits and stores the rest: `ICRNL` in
+`c_iflag` (a carriage return typed arrives as a newline), `OPOST` with `ONLCR`
+in `c_oflag` (a newline written goes out as carriage return and newline), and
+`ICANON` and `ECHO` in `c_lflag` (input is held until a newline, with backspace
+taking a character back; what is typed is written back to the master). A new
+pty has all five set, and is 24 rows by 80 columns. The window size is stored
+and handed back, and nobody is told when it changes.
+
+### ABI introspection (0xF0)
+
+| # | Name | Arguments | Returns | Cap |
+|---|---|---|---|---|
 | 240 | `SYS_ABI_VERSION` | — | `(major << 16) \| minor` | — |
+
+Its number has not moved since 1.0 and its block holds nothing else, so it is
+the one call a program can make before it knows which ABI it is talking to.
 
 ## User pointers
 
@@ -847,7 +921,8 @@ space (`SYS_TASK_CREATE` then `SYS_TASK_START_ARG`), with its own FS base
 exits (`SYS_SET_CLEAR_TID`). Each task has its own floating-point and SSE state,
 saved on every switch.
 
-**Services are found by name.** The nameserver is at a well-known TID and maps
+**Services are found by name.** This one is the userland's convention rather
+than the kernel's, and quarkutils' to change. The nameserver is at a well-known TID and maps
 names to TIDs (`TAG_LOOKUP`), and back (`TAG_LOOKUP_TID`). Every IPC server also
 answers `TAG_PING` with an empty reply, which is the portable way to ask whether
 one is alive. Note that not every service is an IPC server — the text console,

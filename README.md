@@ -100,6 +100,8 @@ drivers/
   vga/  fat32/        Flat modules the kernel loads itself, in ring 0
 
 docs/abi.md           The system call ABI
+docs/fpu.md           How floating-point state is kept, one copy per task
+MISSING.md            What the kernel has not got
 tools/                The ABI check and the header generator
 ```
 
