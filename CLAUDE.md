@@ -127,7 +127,7 @@ system hung.
 
 There are no tests in this tree, and that is the shape of a microkernel rather
 than an omission: the kernel is tested from outside, through the ABI, by a
-program. `dtest` in `../quarkutils` makes 346 checks — capabilities, IPC,
+program. `dtest` in `../quarkutils` makes 356 checks — capabilities, IPC,
 memory, descriptors, signals, scheduling, `dtest calls` with three million calls in
 three seconds — and `qfuzz` throws random requests at every service.
 
@@ -404,6 +404,20 @@ every Unix program assumes:
   to the end and then waits — had each half waiting for the other.
 - **A descriptor sent over a stream outlives the sender's end.** It is in the
   stream rather than in the sender, and the peer can still take it.
+- **A process is named by a number that is never used twice** (`SYS_PID`). A
+  task id is a slot, and the next task made is given the lowest one free —
+  usually the one just let go. Every Unix program that remembers a child
+  assumes a number it was told a moment ago is not somebody else by now:
+  bash, without job control, decides whether to wait for a command by
+  comparing its pid with the last background job's, and after `sleep 2 &`
+  every command that was given that task id ran unwaited-for. A process id
+  is the endpoint number of the task the program began as — assigned when
+  the slot is filled and never given out again — kept per task, shared with
+  the program's threads and left alone by `exec`. `SYS_WAIT_FOR` and
+  `SYS_SIG_RAISE` take either and are told which by a flag; everything else
+  in the ABI takes a task id, as before. The C layer's `getpid`, `fork`,
+  `wait4` and `kill` speak process ids and its `gettid` a task id; `ps`
+  shows both.
 
 ## Signals
 

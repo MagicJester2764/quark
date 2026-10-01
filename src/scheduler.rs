@@ -50,6 +50,22 @@ static mut WAIT_RESULT: [usize; MAX_TASKS] = [0; MAX_TASKS];
 /// first. Another child going is not what it asked to be woken for.
 static mut WAIT_TARGET: [usize; MAX_TASKS] = [0; MAX_TASKS];
 
+/// The process id of the program each task belongs to: the number, never
+/// given out twice, of the task the program began as.
+///
+/// A task id is a slot in a table, and the next task made is given the lowest
+/// one free — usually the one that has just been let go. Every Unix program
+/// that remembers a child assumes the opposite: that a number it was told a
+/// moment ago does not come back as somebody else. A shell would not wait
+/// for a command because it had been given the number of the last thing it
+/// had run in the background.
+///
+/// A program started by a spawner or by `fork` has its first task's number,
+/// which `exec` leaves alone; a thread has its program's. Kept by task and
+/// not with the program's table, because the table goes when the program
+/// dies and a parent asks about a child after that.
+static mut PROCESS_ID: [u64; MAX_TASKS] = [0; MAX_TASKS];
+
 /// Exit code of the child that woke a waiter, captured at wake time.
 ///
 /// It cannot be read from the task afterwards: waking the parent also sets
@@ -159,6 +175,7 @@ pub fn spawn(entry_fn: fn()) -> usize {
             }
             TASKS[tid] = Some(task);
             crate::cap::open_endpoint(tid);
+            PROCESS_ID[tid] = crate::cap::endpoint_of(tid);
             crate::fdtable::attach_new(tid);
             enqueue(tid);
         }
@@ -692,7 +709,51 @@ unsafe fn child_exit_code(tid: usize) -> i32 { unsafe {
 /// [63:32], or u64::MAX if the caller has no children. The status used to be
 /// dropped entirely, so `process::exit(1)` was indistinguishable from success.
 pub fn sys_wait() -> u64 {
-    sys_wait_for(0, false)
+    sys_wait_for(0, false, false)
+}
+
+/// The process id of the program `tid` belongs to, or 0 if there is no such
+/// task.
+pub fn pid_of(tid: usize) -> u64 {
+    if tid >= MAX_TASKS {
+        return 0;
+    }
+    let flags = irq_save();
+    let pid = unsafe { PROCESS_ID[tid] };
+    irq_restore(flags);
+    pid
+}
+
+/// A task that has just been started in its creator's address space is a
+/// thread of the creator's program, and is in that process.
+pub fn join_process(tid: usize, of: usize) {
+    if tid >= MAX_TASKS || of >= MAX_TASKS {
+        return;
+    }
+    let flags = irq_save();
+    unsafe { PROCESS_ID[tid] = PROCESS_ID[of] };
+    irq_restore(flags);
+}
+
+/// A task of the process `pid`: one that is running if there is one, and
+/// else one that has ended and not been collected. `None` if the id names
+/// nothing — which, since an id is never used twice, means it has gone.
+pub fn task_of_pid(pid: u64) -> Option<usize> {
+    if pid == 0 {
+        return None;
+    }
+    let flags = irq_save();
+    let found = unsafe {
+        let is = |want_dead: bool| {
+            (2..MAX_TASKS).find(|&i| {
+                PROCESS_ID[i] == pid
+                    && matches!(TASKS[i], Some(ref t) if (t.state == TaskState::Dead) == want_dead)
+            })
+        };
+        is(false).or_else(|| is(true))
+    };
+    irq_restore(flags);
+    found
 }
 
 /// Collect a child that has ended: `target`, or whichever is first if that
@@ -705,14 +766,37 @@ pub fn sys_wait() -> u64 {
 /// Waiting for one child in particular is not a loop around waiting for any:
 /// that would collect, and so lose, every child that finished first. A shell
 /// with a pipeline has several, and wants each one's status.
-pub fn sys_wait_for(target: usize, no_wait: bool) -> u64 {
+///
+/// `by_pid` says the child is named, there and back, by its process id — the
+/// number that is never used twice — rather than by its task id, which is.
+pub fn sys_wait_for(target: u64, no_wait: bool, by_pid: bool) -> u64 {
     let parent = current_tid();
-    if target >= MAX_TASKS {
-        return u64::MAX;
-    }
 
     let flags = irq_save();
     unsafe {
+        // The child meant, as a task: one of the caller's own.
+        let target = if target == 0 {
+            0
+        } else if by_pid {
+            let child = (1..MAX_TASKS).find(|&i| {
+                PROCESS_ID[i] == target && TASKS[i].as_ref().is_some_and(|t| t.parent_tid == parent)
+            });
+            match child {
+                Some(i) => i,
+                None => {
+                    irq_restore(flags);
+                    return u64::MAX;
+                }
+            }
+        } else if target < MAX_TASKS as u64 {
+            target as usize
+        } else {
+            irq_restore(flags);
+            return u64::MAX;
+        };
+        // What the child is called in the answer. Asked before it is reaped:
+        // afterwards it has no name.
+        let name = |i: usize| if by_pid { PROCESS_ID[i] } else { i as u64 };
         let wanted = |i: usize| target == 0 || target == i;
         // Check if a child is already dead (zombie) and not yet reaped
         for i in 1..MAX_TASKS {
@@ -723,9 +807,10 @@ pub fn sys_wait_for(target: usize, no_wait: bool) -> u64 {
             if collectable {
                 REAPED[i] = true;
                 let code = child_exit_code(i);
+                let child = name(i);
                 reap(i);
                 irq_restore(flags);
-                return (i as u64) | ((code as u32 as u64) << 32);
+                return (child & 0xFFFF_FFFF) | ((code as u32 as u64) << 32);
             }
         }
 
@@ -759,12 +844,13 @@ pub fn sys_wait_for(target: usize, no_wait: bool) -> u64 {
         WAIT_TARGET[parent] = 0;
         let result = if child_tid != 0 {
             let code = WAIT_CODE[parent];
+            let child = if by_pid { PROCESS_ID[child_tid] } else { child_tid as u64 };
             // Reaped now rather than whenever the machine next goes idle.
             // A dead task keeps all its memory until it is reaped, and a
             // parent running programs one after another never lets the
             // machine idle: a test suite held every program it had run.
             reap(child_tid);
-            (child_tid as u64) | ((code as u32 as u64) << 32)
+            (child & 0xFFFF_FFFF) | ((code as u32 as u64) << 32)
         } else {
             u64::MAX
         };
@@ -1178,6 +1264,7 @@ unsafe fn reap_one(i: usize) -> u64 { unsafe {
     WAIT_TARGET[i] = 0;
     // Every capability to it names nothing from here on, whoever holds one.
     crate::cap::close_endpoint(i);
+    PROCESS_ID[i] = 0;
     TASKS[i] = None;
 
     // Left naming this TID, its children would wait on a parent that is gone,
@@ -1391,8 +1478,10 @@ pub fn create_empty_task() -> Option<usize> {
             fpu: crate::fpu::clean(),
         });
         crate::cap::open_endpoint(tid);
-        // A table of its own, empty. A task started as a thread gives it up
-        // for its program's; a task started as a program keeps it.
+        // A process id of its own, and a table of its own, empty. A task
+        // started as a thread gives both up for its program's; a task
+        // started as a program keeps them.
+        PROCESS_ID[tid] = crate::cap::endpoint_of(tid);
         crate::fdtable::attach_new(tid);
     }
     irq_restore(flags);

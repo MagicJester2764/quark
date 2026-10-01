@@ -1,6 +1,6 @@
 # Quark syscall ABI
 
-**Version 3.3.** Query the running kernel with `SYS_ABI_VERSION` (240), which
+**Version 3.4.** Query the running kernel with `SYS_ABI_VERSION` (240), which
 returns `(major << 16) | minor`.
 
 This document is the contract between the Quark kernel and everything above it.
@@ -191,6 +191,7 @@ returning at once turned that loop into a spin.
 | 3.1 | **A descriptor belongs to a program, and may name an object in a server.** Every task of a program uses one table, so what one thread opens its siblings see and what one closes is closed; a thread used to start on a copy of its creator's table and share nothing afterwards. Sixty-four descriptors rather than thirty-two. `SYS_EXIT_PROGRAM` (8) ends every task of the caller's program with one status, which is what `exit` means and what `SYS_EXIT_CODE` — one task — never did. Block 0xE0 opens with *served descriptors*: `SYS_FD_SERVE` (224), `SYS_FD_SERVED` (225), `SYS_FD_HOLDS` (226), `SYS_FD_COOKIE` (227) and `SYS_FD_REAP` (229) let a server give a client a descriptor for one of its own objects — a file — which the kernel then counts, copies across `SYS_FORK`, keeps across `SYS_EXEC_SPACE` and reads and writes through like any other. Descriptor 64 is the program's working directory. `SYS_FD_FLAGS` (228) marks a descriptor to close when its program becomes another, and `SYS_EXEC_SPACE` closes those. Memory named by a descriptor may be mapped by whoever holds the descriptor, and lasts as long as a descriptor names it or somebody has it mapped, whoever made it. |
 | 3.2 | What a shell asks of a kernel that is not about descriptors. `SYS_UMASK` (9): the permission bits a program leaves off what it makes. The kernel makes no files and never reads it; it keeps it because it must follow a program across `SYS_FORK` and `SYS_EXEC_SPACE`, which a C library's memory does not. `SYS_WAIT_FOR` (10): wait for one child in particular, or ask without waiting — `waitpid` with a process id, and `WNOHANG`. Three things change with no new number. `SYS_TASK_KILL` (5), the kill bit of `SYS_SIGNAL` (6) and a signal's deadline end the *program* the task named belongs to, and so does a fault: every task in the address space, where each used to end one task and leave its threads. A task of the caller's own program is still ended alone. A pty's line discipline acts on `ISIG` and on the erase, kill, word-erase and end-of-file characters. And a write to a pty's slave waits for room and writes everything, where it used to return what fitted — which could be nothing. |
 | 3.3 | **Signals a program can handle.** `SYS_SIG_ACTION` (11) says what the caller's program does about a signal — nothing, ignore it, or run a handler — `SYS_SIG_RAISE` (12) raises one for the program a task belongs to, and `SYS_SIG_TAKE` (13) returns the ones raised that have a handler. The kernel carries out a signal's default, which is nearly always the end of the program; a handler it never runs — the program's runtime does, having been told by a word in its own memory and by the wait it was in ending early: a read of a terminal, `SYS_POLL`, `SYS_POLLSET_WAIT` and a sleep can now answer that a signal ended them. A terminal's interrupt and quit characters raise 2 and 3 for every program holding its slave. `SYS_FD_KIND` (230) says what a descriptor names and whether its other end has gone, which is how a write that failed is told apart: nobody reading, or no such descriptor. |
+| 3.4 | **A process id that is never used twice.** `SYS_PID` (14) answers with the process id of the program a task belongs to: the number of the task it began as, which no other task is ever given. `SYS_WAIT_FOR` (10) takes a flag to name the child that way, there and back, and `SYS_SIG_RAISE` (12) a third argument to name its target so. A task id is a slot, and a slot let go is the next one handed out; a program that remembers a child's number — every shell — took the next thing it started for the last thing it had. |
 
 3.1 was a change of behaviour and no change of number, so a minor: nothing built for
 3.0 calls anything that means something else now. What it could have relied on
@@ -276,10 +277,11 @@ everything else returns promptly.
 | 7 | `SYS_TASK_INFO` | arg0 = tid | packed info, or `u64::MAX` | — |
 | 8 | `SYS_EXIT_PROGRAM` | arg0 = status | does not return | — |
 | 9 | `SYS_UMASK` | arg0 = the new mask (nine bits), or `u64::MAX` to leave it | the mask as it was | — |
-| 10 | `SYS_WAIT_FOR` | arg0 = a child's tid, or 0 for any; arg1 = flags (1 = do not wait) | `tid \| (exit_code << 32)`; 0 if asked not to wait and none has ended; `u64::MAX` if there is no such child. **Blocks** unless asked not to. | — |
+| 10 | `SYS_WAIT_FOR` | arg0 = a child, or 0 for any; arg1 = flags: 1 = do not wait, 2 = the child is named by its process id, here and in the answer, rather than by its tid | `child \| (exit_code << 32)`; 0 if asked not to wait and none has ended; `u64::MAX` if there is no such child. **Blocks** unless asked not to. | — |
 | 11 | `SYS_SIG_ACTION` | arg0 = signal (1 to 64), arg1 = 0 nothing said, 1 ignore, 2 handled; anything else only asks | what it was: 0, 1 or 2 / `u64::MAX` | — |
-| 12 | `SYS_SIG_RAISE` | arg0 = a task of the program to signal, arg1 = signal, or 0 to ask whether one could be raised | 0 / `u64::MAX` | `TaskMgmt` for target, or same UID |
+| 12 | `SYS_SIG_RAISE` | arg0 = a task of the program to signal, or with arg2 = 1 its process id; arg1 = signal, or 0 to ask whether one could be raised | 0 / `u64::MAX` | `TaskMgmt` for target, or same UID |
 | 13 | `SYS_SIG_TAKE` | arg0 = where to be told of the next (a `u32` in the caller's memory), or 0 to leave that as it is | the signals waiting for a handler, bit `n - 1` for signal `n`; none is waiting afterwards | — |
+| 14 | `SYS_PID` | arg0 = a task, or 0 for the caller | the process id of the program it belongs to / `u64::MAX` | — |
 
 A status is kept as its low eight bits, as Linux's wait status keeps it. A
 negative status is how the kernel says a task was killed — `SYS_TASK_KILL`
@@ -309,6 +311,27 @@ one child by collecting whichever ends first would lose the status of every
 other, and a shell running a pipeline wants each. And a caller that asks not
 to wait is told 0 — nothing has ended yet — which is different from having no
 children at all. `SYS_WAIT` is this with neither.
+
+**A process id** is what a program is called by something that will ask
+about it later. It is the number of the task the program began as — the same
+never-reused number an `Endpoint` capability records — so it is the program's
+from a `SYS_FORK` or a spawner's `SYS_TASK_CREATE` on, through every
+`SYS_EXEC_SPACE`, and is shared by its threads. It is 64 or more, so it is
+never mistaken for a task id.
+
+A task id is not that. It is a slot in a table of 64, and the task made next
+is given the lowest slot free, which is usually the one just let go: a parent
+that collects a child and starts another has, as often as not, two children
+with one tid. Nothing written for this system minds — a task is named while
+it is held, and a capability names a task by its number. Everything written
+for Unix does: a shell remembers the number of what it last ran in the
+background precisely so as to tell it from what it runs next.
+
+So a wait and a signal can each be asked by process id. A child named by one
+in `SYS_WAIT_FOR` is named by one in the answer, in the low 32 bits. A signal
+raised for one reaches the program if any task of it is running; if it has
+ended and not been collected the call succeeds and does nothing, which is
+what it would do on Unix; and if the id names nothing, it has gone, for good.
 
 `SYS_UMASK` holds nine bits for the program and does nothing with them. They
 are the permission bits its runtime leaves off a file or a directory it makes
@@ -644,10 +667,10 @@ cannot resurrect a revoked capability in practice.
 | 96 | `SYS_TASK_CREATE` | — | TID / `u64::MAX` | — for up to sixteen children at once; `TaskMgmt` for more |
 | 97 | `SYS_TASK_START` | arg0 = tid, arg1 = rip, arg2 = rsp, arg3 = cr3 | 0 / `u64::MAX` | `TaskMgmt`; or none, for a child of the caller's started in the caller's own address space (a thread) or in one the caller made (a spawn) |
 | 103 | `SYS_TASK_START_ARG` | as `SYS_TASK_START`, and arg4 = the value the task finds in RDI | 0 / `u64::MAX` | as `SYS_TASK_START` |
-| 98 | `SYS_GET_UID` | — | current UID | — |
+| 98 | `SYS_GET_UID` | — | `uid << 32 \| gid` of the caller | — |
 | 99 | `SYS_SET_UID` | arg0 = tid, arg1 = uid | 0 / `u64::MAX` | `SetUid` |
 | 100 | `SYS_SET_GID` | arg0 = tid, arg1 = gid | 0 / `u64::MAX` | `SetUid` |
-| 101 | `SYS_GET_TUID` | arg0 = tid | that task's UID | — |
+| 101 | `SYS_GET_TUID` | arg0 = tid | `uid << 32 \| gid` of that task / `u64::MAX` | — |
 | 102 | `SYS_SET_FS_BASE` | arg0 = the caller's new FS base, a user address | 0 / `u64::MAX` | — |
 | 104 | `SYS_TASK_WATCH` | arg0 = tid | 0, or `u64::MAX` if that task is already gone | — |
 | 106 | `SYS_SET_CLEAR_TID` | arg0 = address of a `u32`, or 0 | this task's id / `u64::MAX` | — |

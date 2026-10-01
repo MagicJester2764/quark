@@ -59,6 +59,8 @@ pub const SYS_UMASK: u64 = 9;
 pub const SYS_WAIT_FOR: u64 = 10;
 /// SYS_WAIT_FOR: answer 0 rather than wait for a child that has not ended.
 const WAIT_NO_WAIT: u64 = 1;
+/// SYS_WAIT_FOR: the child is named by its process id, there and back.
+const WAIT_BY_PID: u64 = 2;
 /// What the caller's program does about a signal: default, ignore, or run a
 /// handler of its own.
 pub const SYS_SIG_ACTION: u64 = 11;
@@ -66,6 +68,10 @@ pub const SYS_SIG_ACTION: u64 = 11;
 pub const SYS_SIG_RAISE: u64 = 12;
 /// The signals raised for the caller's program that it has a handler for.
 pub const SYS_SIG_TAKE: u64 = 13;
+/// The process id of the program a task belongs to: a number never reused.
+pub const SYS_PID: u64 = 14;
+/// SYS_SIG_RAISE: the program is named by its process id.
+const RAISE_BY_PID: u64 = 1;
 
 // --- 0x10  IPC ---
 pub const SYS_SEND: u64 = 16;
@@ -326,7 +332,7 @@ pub const SYS_ABI_VERSION: u64 = 240;
 /// minor when calls are added. User space can refuse to run against a major it
 /// does not know, which is the point of exposing it at all.
 pub const ABI_VERSION_MAJOR: u64 = 3;
-pub const ABI_VERSION_MINOR: u64 = 3;
+pub const ABI_VERSION_MINOR: u64 = 4;
 
 /// Threads a task may make with no capability at all.
 ///
@@ -1732,8 +1738,9 @@ extern "C" fn syscall_dispatch(
             if own_cr3 == Some(cr3) {
                 scheduler::inherit_from_creator(tid, caller);
                 // And uses what the program has open, rather than a copy of
-                // it: a descriptor is the program's.
+                // it: a descriptor is the program's. So is its process id.
                 crate::fdtable::share(tid, caller);
+                scheduler::join_process(tid, caller);
             }
             match scheduler::start_task(tid, rip, rsp, cr3, entry_arg) {
                 Ok(()) => 0,
@@ -3024,7 +3031,15 @@ extern "C" fn syscall_dispatch(
         }
         SYS_WAIT_FOR => {
             // arg0 = the child to wait for, or 0 for any; arg1 = flags.
-            scheduler::sys_wait_for(arg0 as usize, arg1 & WAIT_NO_WAIT != 0)
+            scheduler::sys_wait_for(arg0, arg1 & WAIT_NO_WAIT != 0, arg1 & WAIT_BY_PID != 0)
+        }
+        SYS_PID => {
+            // arg0 = a task, or 0 for the caller.
+            let tid = if arg0 == 0 { scheduler::current_tid() } else { arg0 as usize };
+            match scheduler::pid_of(tid) {
+                0 => u64::MAX,
+                pid => pid,
+            }
         }
         SYS_SIG_ACTION => {
             // arg0 = signal, arg1 = 0 default / 1 ignore / 2 handled, or
@@ -3032,18 +3047,34 @@ extern "C" fn syscall_dispatch(
             crate::signal::action(scheduler::current_tid(), arg0, arg1)
         }
         SYS_SIG_RAISE => {
-            // arg0 = a task of the program to signal, arg1 = the signal, or 0
-            // to ask only whether it could be. Whoever may kill a task may
-            // signal it: TaskMgmt for the target, or the same user.
-            let tid = arg0 as usize;
+            // arg0 = a task of the program to signal — or, with arg2 = 1, the
+            // program's process id — and arg1 = the signal, or 0 to ask only
+            // whether it could be. Whoever may kill a task may signal it:
+            // TaskMgmt for the target, or the same user.
+            let by_pid = arg2 & RAISE_BY_PID != 0;
+            let tid = if by_pid {
+                match scheduler::task_of_pid(arg0) {
+                    Some(tid) => tid,
+                    None => return u64::MAX,
+                }
+            } else {
+                arg0 as usize
+            };
             let caller = scheduler::current_tid();
             let caller_uid = scheduler::current_task_uid();
             let has_cap = crate::cap::task_has_task_mgmt(caller, tid);
             let same_uid = scheduler::task_uid_gid(tid)
                 .map(|(uid, _)| uid == caller_uid)
                 .unwrap_or(false);
-            if (!has_cap && !same_uid) || !scheduler::task_is_live(tid) {
+            if !has_cap && !same_uid {
                 return u64::MAX;
+            }
+            if !scheduler::task_is_live(tid) {
+                // By its process id, a program that has ended and not been
+                // collected is still there to be named, and there is nothing
+                // left of it to tell. A task id says nothing of the kind: it
+                // may be anybody's by now.
+                return if by_pid { 0 } else { u64::MAX };
             }
             if arg1 == 0 {
                 return 0;
