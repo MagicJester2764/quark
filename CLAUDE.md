@@ -140,8 +140,18 @@ tools/boot-test.sh <keys-file> <shot.ppm> # type `dtest`, screenshot the result
 tools/check-rootfs.sh hdimage.bin         # e2fsck on what the boot left
 ```
 
-A kernel fault prints to serial (`[UPFAULT ...]` for ring 3, a halt for ring
-0); a failed check prints to the screen. Look at both.
+A fault prints to serial: `[UPFAULT ...]` or `[UFAULT ...]` for ring 3, which
+ends the program, and `[KFAULT ...]` for ring 0, which halts the machine. A
+failed check prints to the screen. Look at both.
+
+A kernel fault says three things: where (`rip`, `rsp`, the task and its kernel
+stack), the registers, and `calls` — every word on the kernel stack that is an
+address in the kernel's own code, innermost first, as an offset from `rsp`.
+The kernel is built without frame pointers, so that list is the backtrace,
+with the odd stale entry from a frame since left;
+`nm -n target/x86_64-unknown-none/release/quark` says which function each is
+in. It is what turned `rip=0x1029`, which names nothing, into "in
+`timerfd::tick`, from the timer interrupt, with the direction flag set".
 
 ## Invariants that must not regress
 

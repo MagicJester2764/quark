@@ -9,8 +9,10 @@ SECTIONS {
     }
 
     .text : ALIGN(4K) {
+        __text_start = .;
         KEEP(*(.text.boot))
         *(.text .text.*)
+        __text_end = .;
     }
 
     .rodata : ALIGN(4K) {

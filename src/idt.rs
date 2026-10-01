@@ -363,6 +363,77 @@ fn signal_for(vec: usize) -> i32 {
     }
 }
 
+unsafe extern "C" {
+    static __text_start: u8;
+    static __text_end: u8;
+}
+
+/// The rest of what a kernel fault says to serial: the registers, and the
+/// words on the kernel stack that are addresses in the kernel's own code.
+///
+/// The kernel is built without frame pointers, so there is no chain to walk.
+/// But a return address is a word on the stack that points into `.text`, and
+/// nearly every such word is one: read from the faulting stack pointer
+/// upwards, they are the calls that were under way, innermost first, with the
+/// odd stale one from a frame since left. That is the difference between a
+/// fault that names the function it happened in and `rip=0x1029`, which names
+/// nothing: a jump through something that was not an address leaves only the
+/// caller's return address to say where it was made.
+///
+/// Printed to serial and not the screen, because the screen may be a
+/// compositor's by now and serial is what a test keeps.
+fn report_kernel_state(frame: &InterruptFrame, kbase: usize, ktop: usize) {
+    use crate::serial::{put_hex_usize, puts};
+    let regs: [(&[u8], u64); 16] = [
+        (b"rax", frame.rax), (b"rbx", frame.rbx), (b"rcx", frame.rcx), (b"rdx", frame.rdx),
+        (b"rsi", frame.rsi), (b"rdi", frame.rdi), (b"rbp", frame.rbp), (b"r8", frame.r8),
+        (b"r9", frame.r9), (b"r10", frame.r10), (b"r11", frame.r11), (b"r12", frame.r12),
+        (b"r13", frame.r13), (b"r14", frame.r14), (b"r15", frame.r15), (b"rflags", frame.rflags),
+    ];
+    puts(b"[KFAULT regs");
+    for (name, value) in regs {
+        puts(b" ");
+        puts(name);
+        puts(b"=0x");
+        put_hex_usize(value as usize);
+    }
+    puts(b"]\n");
+
+    // Only a stack pointer inside the task's own kernel stack is read from:
+    // one that is not is part of what went wrong, and reading through it
+    // would fault again inside the report.
+    let rsp = frame.rsp as usize & !7;
+    if kbase == 0 || rsp < kbase || rsp >= ktop {
+        puts(b"[KFAULT stack: rsp is not in the task's kernel stack]\n");
+        return;
+    }
+    let text = core::ptr::addr_of!(__text_start) as usize..core::ptr::addr_of!(__text_end) as usize;
+    puts(b"[KFAULT stack top:");
+    for i in 0..8 {
+        let at = rsp + i * 8;
+        if at >= ktop {
+            break;
+        }
+        puts(b" 0x");
+        put_hex_usize(unsafe { core::ptr::read_volatile(at as *const usize) });
+    }
+    puts(b"]\n[KFAULT calls:");
+    let mut at = rsp;
+    let mut shown = 0;
+    while at < ktop && shown < 48 {
+        let word = unsafe { core::ptr::read_volatile(at as *const usize) };
+        if text.contains(&word) {
+            puts(b" +0x");
+            put_hex_usize(at - rsp);
+            puts(b"=0x");
+            put_hex_usize(word);
+            shown += 1;
+        }
+        at += 8;
+    }
+    puts(b"]\n");
+}
+
 #[unsafe(no_mangle)]
 extern "C" fn exception_handler(frame: &InterruptFrame) {
     let vec = frame.vector as usize;
@@ -523,6 +594,7 @@ extern "C" fn exception_handler(frame: &InterruptFrame) {
     crate::serial::puts(b"..0x");
     crate::serial::put_hex_usize(ktop);
     crate::serial::puts(b"]\n");
+    report_kernel_state(frame, kbase, ktop);
     console::puts(b"\n!!! EXCEPTION: ");
     if vec < 32 {
         console::puts(EXCEPTION_NAMES[vec]);
