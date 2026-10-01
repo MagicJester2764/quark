@@ -2,13 +2,9 @@
 /kernel.bin
 /quark.iso
 /isodir
+/dist
 /drivers/*/target
 /drivers/*/*.drv
-/user/*/target
-/user/*/Cargo.lock
-/rootfs
-/rootfs/etc
-/rootfs/etc/passwd
 
 # Editor scratch files. One of these was committed once.
 *.swp

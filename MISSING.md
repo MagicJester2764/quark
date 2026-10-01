@@ -1,5 +1,11 @@
 # Missing Features
 
+> A list from the first months, kept as it was. The user-space pieces it names
+> (`user/net`, `user/shell`, `libquark`) left this repository for
+> [quarkutils](https://github.com/MagicJester2764/quarkutils), some of them
+> under new names, and the system call numbers it quotes predate the ABI
+> freeze — `docs/abi.md` has the real ones.
+
 ## What Quark has
 Scheduler, synchronous IPC, address spaces, capabilities, fd table, IRQ delegation, PMM, heap, futex/mutex, ELF loading, nameserver, console, keyboard, input, disk, VFS, network, signals
 

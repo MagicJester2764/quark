@@ -1,21 +1,14 @@
+# Quark — the kernel.
+#
+# This builds kernel.bin and the two flat modules the kernel loads itself, and
+# installs them with the ABI: the system call numbers as a header and the
+# document that says what they mean. What runs on the kernel is another
+# repository (quarkutils), and nothing here knows where it is.
+
 KERNEL := kernel.bin
 TARGET := x86_64-unknown-none
 BINARY := target/$(TARGET)/release/quark
 
-# Hosted target (requires std fork at QUARK_RUST_STD_PATH)
-HOSTED_TARGET := x86_64-unknown-quark
-QUARK_RUST_STD_PATH ?= $(CURDIR)/../rust/library
-
-# Programs that need the std fork next door. Built when the fork is present and
-# skipped when it is not, so this tree stands alone: a kernel should not require
-# a patched rustc checkout to compile at all.
-HOSTED_PROGRAMS := hello httpget
-HAVE_STD_FORK := $(wildcard $(QUARK_RUST_STD_PATH)/std/Cargo.toml)
-ifeq ($(HAVE_STD_FORK),)
-HOSTED_ELFS :=
-else
-HOSTED_ELFS := $(foreach p,$(HOSTED_PROGRAMS),user/$(p)/target/$(HOSTED_TARGET)/release/$(p))
-endif
 GRUB_MKRESCUE := $(shell command -v grub-mkrescue 2>/dev/null || command -v grub2-mkrescue 2>/dev/null)
 
 VGA_DRV_DIR := drivers/vga
@@ -26,119 +19,20 @@ FAT32_DRV_DIR := drivers/fat32
 FAT32_DRV_ELF := $(FAT32_DRV_DIR)/target/$(TARGET)/release/fat32-driver
 FAT32_DRV_BIN := $(FAT32_DRV_DIR)/fat32.drv
 
-# User-space programs (ELF binaries, not flat)
-INIT_DIR := user/init
-INIT_ELF := $(INIT_DIR)/target/$(TARGET)/release/init
-
-NS_DIR := user/nameserver
-NS_ELF := $(NS_DIR)/target/$(TARGET)/release/nameserver
-
-KBD_DIR := user/keyboard
-KBD_ELF := $(KBD_DIR)/target/$(TARGET)/release/keyboard
-
-QTTY_DIR := user/qtty
-FB_DIR := user/fb
-WM_DIR := user/wm
-WMDEMO_DIR := user/wmdemo
-WMTYPE_DIR := user/wmtype
-QTTY_ELF := $(QTTY_DIR)/target/$(TARGET)/release/qtty
-FB_ELF := $(FB_DIR)/target/$(TARGET)/release/fb
-WM_ELF := $(WM_DIR)/target/$(TARGET)/release/wm
-WMDEMO_ELF := $(WMDEMO_DIR)/target/$(TARGET)/release/wmdemo
-WMTYPE_ELF := $(WMTYPE_DIR)/target/$(TARGET)/release/wmtype
-
-INP_DIR := user/input
-INP_ELF := $(INP_DIR)/target/$(TARGET)/release/input
-
-DISK_DIR := user/disk
-DISK_ELF := $(DISK_DIR)/target/$(TARGET)/release/disk
-
-DISKTEST_DIR := user/disktest
-DISKTEST_ELF := $(DISKTEST_DIR)/target/$(TARGET)/release/disktest
-
-VFS_DIR := user/vfs
-VFS_ELF := $(VFS_DIR)/target/$(TARGET)/release/vfs
-
-NET_DIR := user/net
-NET_ELF := $(NET_DIR)/target/$(TARGET)/release/net
-
-QSH_DIR := user/qsh
-QSH_ELF := $(QSH_DIR)/target/$(TARGET)/release/qsh
-
-ECHO_DIR := user/echo
-ECHO_ELF := $(ECHO_DIR)/target/$(TARGET)/release/echo
-
-LS_DIR := user/ls
-LS_ELF := $(LS_DIR)/target/$(TARGET)/release/ls
-
-CAT_DIR := user/cat
-CAPDEMO_DIR := user/capdemo
-THREADTEST_DIR := user/threadtest
-SOCKTEST_DIR := user/socktest
-FSTEST_DIR := user/fstest
-
-# C programs, built against the C library rather than quark-rt.
-LIBC_DIR := user/libc
-# The Linux system call surface, which musl programs are linked against by the
-# cross toolchain's specs file. Built here even though nothing in this tree
-# links it: the specs file names the archive by path, so a stale one is linked
-# into every musl program silently, and the symptom is a bug you already fixed
-# still happening.
-LINUX_ABI_DIR := user/linux-abi
-LINUX_ABI_A := $(LINUX_ABI_DIR)/liblinux-abi.a
-CWC_DIR := user/cwc
-CAT_ELF := $(CAT_DIR)/target/$(TARGET)/release/cat
-CAPDEMO_ELF := $(CAPDEMO_DIR)/target/$(TARGET)/release/capdemo
-THREADTEST_ELF := $(THREADTEST_DIR)/target/$(TARGET)/release/threadtest
-SOCKTEST_ELF := $(SOCKTEST_DIR)/target/$(TARGET)/release/socktest
-FSTEST_ELF := $(FSTEST_DIR)/target/$(TARGET)/release/fstest
-LIBC_A := $(LIBC_DIR)/libquark.a
-CWC_ELF := $(CWC_DIR)/cwc
-ENVTEST_DIR := user/envtest
-ENVTEST_ELF := $(ENVTEST_DIR)/envtest
-
-LOGIN_DIR := user/login
-LOGIN_ELF := $(LOGIN_DIR)/target/$(TARGET)/release/login
-
-PS_DIR := user/ps
-PS_ELF := $(PS_DIR)/target/$(TARGET)/release/ps
-
-IPCPING_DIR := user/ipcping
-IPCPING_ELF := $(IPCPING_DIR)/target/$(TARGET)/release/ipcping
-
-PING_DIR := user/ping
-PING_ELF := $(PING_DIR)/target/$(TARGET)/release/ping
-
-DTEST_DIR := user/dtest
-DTEST_ELF := $(DTEST_DIR)/target/$(TARGET)/release/dtest
-MOUSETEST_DIR := user/mousetest
-MOUSETEST_ELF := $(MOUSETEST_DIR)/target/$(TARGET)/release/mousetest
-RUNTESTS_DIR := user/runtests
-RUNTESTS_ELF := $(RUNTESTS_DIR)/target/$(TARGET)/release/runtests
-NETTEST_DIR := user/nettest
-NETTEST_ELF := $(NETTEST_DIR)/target/$(TARGET)/release/nettest
-DCHILD_DIR := user/dchild
-DCHILD_ELF := $(DCHILD_DIR)/target/$(TARGET)/release/dchild
-QFUZZ_DIR := user/qfuzz
-QFUZZ_ELF := $(QFUZZ_DIR)/target/$(TARGET)/release/qfuzz
-
-SHUTDOWN_DIR := user/shutdown
-SHUTDOWN_ELF := $(SHUTDOWN_DIR)/target/$(TARGET)/release/shutdown
-
-.PHONY: check-abi install all clean iso run run-uefi drivers user rootfs FORCE
+.PHONY: check-abi install all clean iso run run-uefi drivers FORCE
 
 # `all` is not the first target in this file, so say which one is: plain `make`
 # otherwise builds nothing but the ABI check, which passes and looks like a
 # successful build of a tree that was never compiled.
 .DEFAULT_GOAL := all
 
+# One number per call, a row in docs/abi.md for every call, and a document
+# that describes the version the kernel reports. First, because a kernel whose
+# contract is wrong should not be built and handed to anybody.
 check-abi:
 	@./tools/check-abi.sh
 
-all: check-abi $(KERNEL) drivers user $(LINUX_ABI_A) rootfs
-ifeq ($(HAVE_STD_FORK),)
-	@echo "note: no std fork at $(QUARK_RUST_STD_PATH); skipped $(HOSTED_PROGRAMS)"
-endif
+all: check-abi $(KERNEL) drivers
 
 $(KERNEL): FORCE
 	cargo rustc --release -- -C link-arg=-Tlinker.ld
@@ -154,160 +48,8 @@ $(FAT32_DRV_BIN): FORCE
 	cd $(FAT32_DRV_DIR) && cargo build --release
 	objcopy -O binary $(FAT32_DRV_ELF) $(FAT32_DRV_BIN)
 
-user: $(INIT_ELF) $(HOSTED_ELFS) $(NS_ELF) $(KBD_ELF) $(QTTY_ELF) $(FB_ELF) $(WM_ELF) $(INP_ELF) $(DISK_ELF) $(DISKTEST_ELF) $(VFS_ELF) $(NET_ELF) $(QSH_ELF) $(ECHO_ELF) $(LS_ELF) $(CAT_ELF) $(LOGIN_ELF) $(PS_ELF) $(IPCPING_ELF) $(PING_ELF) $(SHUTDOWN_ELF) $(CAPDEMO_ELF) $(THREADTEST_ELF) $(SOCKTEST_ELF) $(FSTEST_ELF) $(WMDEMO_ELF) $(WMTYPE_ELF) $(CWC_ELF) $(DTEST_ELF) $(DCHILD_ELF) $(QFUZZ_ELF) $(MOUSETEST_ELF) $(RUNTESTS_ELF) $(NETTEST_ELF) $(ENVTEST_ELF)
-
-$(INIT_ELF): FORCE
-	cd $(INIT_DIR) && cargo build --release
-
-# quark-rt reaches a hosted binary only through the fork's library/Cargo.toml
-# patch, and `cargo -Z build-std` does not propagate that dependency into its
-# fingerprints: editing quark-rt leaves the program linked against the previous
-# copy, and cargo reports "Finished" without rebuilding. That silently produced
-# a hello carrying the pre-Phase-0 syscall numbers while the kernel had moved to
-# the new ones, which faulted as #UD out of the alloc error handler.
-#
-# Hash the quark-rt sources and clean the hosted build when they change. std
-# genuinely has to be recompiled in that case — it links quark-rt — so the cost
-# is inherent, not overhead. The stamp is written only after a successful
-# build, so an interrupted one does not mark itself current.
-# The whole of the fork's `sys` tree, not just its quark-named files. Listing
-# those by hand missed sys/net/connection/mod.rs, which is where a platform is
-# routed to its own module: adding Quark there changed nothing, cargo reported
-# "Finished", and httpget went on linking std's `unsupported` socket stubs —
-# compiling perfectly and failing at run time.
-QUARK_RT_SRCS := $(wildcard user/quark-rt/src/*.rs) user/quark-rt/Cargo.toml \
-                 $(shell find $(QUARK_RUST_STD_PATH)/std/src/sys -name '*.rs' 2>/dev/null | sort)
-
-# One recipe, instantiated per hosted program. A pattern rule cannot do this:
-# the program name appears twice in the path, and make allows a single % in a
-# target. The program name is also its directory and its binary, so $(1) is the
-# only thing that varies.
-define HOSTED_BUILD_RULE
-user/$(1)/target/$$(HOSTED_TARGET)/release/$(1): FORCE
-	@new=`cat $$(QUARK_RT_SRCS) | md5sum | cut -d' ' -f1`; \
-	 old=`cat user/$(1)/target/.quark-rt-stamp 2>/dev/null || echo none`; \
-	 if [ "$$$$new" != "$$$$old" ]; then \
-	   echo "  quark-rt changed since the last hosted build - cleaning std for $(1)"; \
-	   (cd user/$(1) && cargo clean); \
-	 fi
-	cd user/$(1) && __CARGO_TESTS_ONLY_SRC_ROOT=$$(realpath $$(QUARK_RUST_STD_PATH)) cargo build --release --target ../../x86_64-unknown-quark.json -Z build-std=std,panic_abort -Z build-std-features=compiler-builtins-mem -Z json-target-spec
-	@cat $$(QUARK_RT_SRCS) | md5sum | cut -d' ' -f1 > user/$(1)/target/.quark-rt-stamp
-endef
-
-$(foreach p,$(HOSTED_PROGRAMS),$(eval $(call HOSTED_BUILD_RULE,$(p))))
-
-$(DTEST_ELF): FORCE
-	cd $(DTEST_DIR) && cargo build --release
-
-$(DCHILD_ELF): FORCE
-	cd $(DCHILD_DIR) && cargo build --release
-
-$(QFUZZ_ELF): FORCE
-	cd $(QFUZZ_DIR) && cargo build --release
-
-$(MOUSETEST_ELF): FORCE
-	cd $(MOUSETEST_DIR) && cargo build --release
-
-$(RUNTESTS_ELF): FORCE
-	cd $(RUNTESTS_DIR) && cargo build --release
-
-$(NETTEST_ELF): FORCE
-	cd $(NETTEST_DIR) && cargo build --release
-
-$(NS_ELF): FORCE
-	cd $(NS_DIR) && cargo build --release
-
-$(KBD_ELF): FORCE
-	cd $(KBD_DIR) && cargo build --release
-
-$(QTTY_ELF): FORCE
-	cd $(QTTY_DIR) && cargo build --release
-
-$(FB_ELF): FORCE
-	cd $(FB_DIR) && cargo build --release
-
-$(WM_ELF): FORCE
-	cd $(WM_DIR) && cargo build --release
-
-$(WMDEMO_ELF): FORCE
-	cd $(WMDEMO_DIR) && cargo build --release
-
-$(WMTYPE_ELF): FORCE
-	cd $(WMTYPE_DIR) && cargo build --release
-
-$(INP_ELF): FORCE
-	cd $(INP_DIR) && cargo build --release
-
-$(DISK_ELF): FORCE
-	cd $(DISK_DIR) && cargo build --release
-
-$(DISKTEST_ELF): FORCE
-	cd $(DISKTEST_DIR) && cargo build --release
-
-$(VFS_ELF): FORCE
-	cd $(VFS_DIR) && cargo build --release
-
-$(NET_ELF): FORCE
-	cd $(NET_DIR) && cargo build --release
-
-$(QSH_ELF): FORCE
-	cd $(QSH_DIR) && cargo build --release
-
-$(ECHO_ELF): FORCE
-	cd $(ECHO_DIR) && cargo build --release
-
-$(LS_ELF): FORCE
-	cd $(LS_DIR) && cargo build --release
-
-$(CAT_ELF): FORCE
-	cd $(CAT_DIR) && cargo build --release
-
-$(CAPDEMO_ELF): FORCE
-	cd $(CAPDEMO_DIR) && cargo build --release
-
-$(THREADTEST_ELF): FORCE
-	cd $(THREADTEST_DIR) && cargo build --release
-
-$(SOCKTEST_ELF): FORCE
-	cd $(SOCKTEST_DIR) && cargo build --release
-
-$(FSTEST_ELF): FORCE
-	cd $(FSTEST_DIR) && cargo build --release
-
-# The C library, and a C program built against it. A libc is a consumer of the
-# Quark ABI exactly as the Rust runtime is; neither is privileged over the
-# other, and both are built here.
-$(LIBC_A): FORCE
-	$(MAKE) -C $(LIBC_DIR)
-
-$(LINUX_ABI_A): FORCE
-	$(MAKE) -C $(LINUX_ABI_DIR)
-
-$(CWC_ELF): $(LIBC_A) FORCE
-	$(MAKE) -C $(CWC_DIR)
-
-$(ENVTEST_ELF): $(LIBC_A) FORCE
-	$(MAKE) -C $(ENVTEST_DIR)
-
-$(LOGIN_ELF): FORCE
-	cd $(LOGIN_DIR) && cargo build --release
-
-$(PS_ELF): FORCE
-	cd $(PS_DIR) && cargo build --release
-
-$(IPCPING_ELF): FORCE
-	cd $(IPCPING_DIR) && cargo build --release
-
-$(PING_ELF): FORCE
-	cd $(PING_DIR) && cargo build --release
-
-$(SHUTDOWN_ELF): FORCE
-	cd $(SHUTDOWN_DIR) && cargo build --release
-
-rootfs:
-	@mkdir -p rootfs/etc
-	@echo 'root:0:0:/home/root:/usr/bin/QSH.ELF' > rootfs/etc/passwd
-
+# The kernel alone, under GRUB. There is no init on this image, so it boots as
+# far as looking for one.
 iso: $(KERNEL)
 	@mkdir -p isodir/boot/grub
 	@cp $(KERNEL) isodir/boot/kernel.bin
@@ -325,37 +67,22 @@ run-uefi: iso
 
 # Stage build artifacts for whoever assembles an image out of them.
 #
-# Quark builds a kernel and the programs that run on it; it does not know what
-# an image looks like or where one is mounted. `make install DESTDIR=<dir>`
-# lays the artifacts out in the shape a distro consumes, and nothing here
-# reaches into a sibling repo to put them somewhere.
+# Quark builds a kernel; it does not know what an image looks like, where one
+# is mounted or what will run on it. `make install DESTDIR=<dir>` lays the
+# artifacts out in the shape a distro consumes, and nothing here reaches into
+# a sibling repo to put them somewhere.
 #
 #   $(DESTDIR)/kernel.bin
+#   $(DESTDIR)/drivers/vga.drv, fat32.drv   loaded by the bootloader beside it
 #   $(DESTDIR)/usr/include/quark/abi.h      the system call numbers
 #   $(DESTDIR)/usr/share/doc/quark/abi.md   and what they mean
-#   $(DESTDIR)/drivers/      loaded by the bootloader from the ESP
-#   $(DESTDIR)/boot/         essential services, staged into boot.img
-#   $(DESTDIR)/usr/bin/      everything else, staged into the root filesystem
-#   $(DESTDIR)/etc/
+#
+# The userland installs into the same directory from its own repository —
+# init, the services, the programs — and the two do not overlap.
 DESTDIR ?= dist
 
-BOOT_SERVICES := nameserver:NAMESRVR keyboard:KEYBOARD qtty:QTTY \
-                 input:INPUT disk:DISK vfs:VFS net:NET fb:FB
-USR_PROGRAMS  := disktest:DISKTEST qsh:QSH echo:ECHO ls:LS cat:CAT \
-                 login:LOGIN ps:PS ipcping:IPCPING ping:PING \
-                 shutdown:SHUTDOWN dtest:DTEST dchild:DCHILD qfuzz:QFUZZ capdemo:CAPDEMO threadtest:THREADTEST socktest:SOCKTEST fstest:FSTEST wm:WM wmdemo:WMDEMO wmtype:WMTYPE mousetest:MOUSETEST runtests:RUNTESTS nettest:NETTEST
-
-# Programs written in C, built against user/libc.
-C_PROGRAMS    := cwc:CWC envtest:ENVTEST
-
 install: all
-	@mkdir -p $(DESTDIR)/drivers $(DESTDIR)/boot $(DESTDIR)/usr/bin $(DESTDIR)/etc
-	@# Take back what a previous install put there, so that a program renamed
-	@# or removed here does not linger in a staging directory for ever. Only
-	@# `.ELF` is cleared, which is exactly the set this target owns: coreutils
-	@# and the Wayland clients are staged by ExplOSion afterwards, under their
-	@# own names, and must survive this.
-	@rm -f $(DESTDIR)/boot/*.ELF $(DESTDIR)/usr/bin/*.ELF
+	@mkdir -p $(DESTDIR)/drivers
 	@cp $(KERNEL) $(DESTDIR)/kernel.bin
 	@cp $(VGA_DRV_BIN) $(FAT32_DRV_BIN) $(DESTDIR)/drivers/
 	@# The ABI, which is what a kernel installs for the programs that will run
@@ -366,60 +93,12 @@ install: all
 	@mkdir -p $(DESTDIR)/usr/include/quark $(DESTDIR)/usr/share/doc/quark
 	@./tools/gen-abi-header.sh > $(DESTDIR)/usr/include/quark/abi.h
 	@cp docs/abi.md $(DESTDIR)/usr/share/doc/quark/abi.md
-	@cp $(INIT_ELF) $(DESTDIR)/drivers/init.elf
-	@for p in $(BOOT_SERVICES); do \
-		src=$${p%%:*}; dst=$${p##*:}; \
-		cp user/$$src/target/$(TARGET)/release/$$src $(DESTDIR)/boot/$$dst.ELF; \
-	done
-	@for p in $(USR_PROGRAMS); do \
-		src=$${p%%:*}; dst=$${p##*:}; \
-		cp user/$$src/target/$(TARGET)/release/$$src $(DESTDIR)/usr/bin/$$dst.ELF; \
-	done
-	@# C programs are not cargo crates, so their binaries sit beside their
-	@# sources rather than under a target directory.
-	@for p in $(C_PROGRAMS); do \
-		src=$${p%%:*}; dst=$${p##*:}; \
-		cp user/$$src/$$src $(DESTDIR)/usr/bin/$$dst.ELF; \
-	done
-	@# Gate on the fork, not on the files: a hosted binary left over from an
-	@# earlier build cannot be shown to match the current tree, and shipping a
-	@# stale one is how hello ended up calling pre-Phase-0 syscall numbers.
-ifeq ($(HAVE_STD_FORK),)
-	@echo "  (no std fork - $(HOSTED_PROGRAMS) omitted rather than shipped stale)"
-else
-	@for p in $(HOSTED_PROGRAMS); do \
-	   cp user/$$p/target/$(HOSTED_TARGET)/release/$$p \
-	      $(DESTDIR)/usr/bin/`echo $$p | tr a-z A-Z`.ELF; \
-	 done
-endif
-	@cp rootfs/etc/passwd $(DESTDIR)/etc/PASSWD
 	@echo "installed to $(DESTDIR)"
 
 clean:
 	cargo clean
 	cd $(VGA_DRV_DIR) && cargo clean
 	cd $(FAT32_DRV_DIR) && cargo clean
-	cd $(INIT_DIR) && cargo clean
-	cd $(NS_DIR) && cargo clean
-	cd $(KBD_DIR) && cargo clean
-	cd $(QTTY_DIR) && cargo clean
-	cd $(INP_DIR) && cargo clean
-	cd $(DISK_DIR) && cargo clean
-	cd $(DISKTEST_DIR) && cargo clean
-	cd $(VFS_DIR) && cargo clean
-	cd $(NET_DIR) && cargo clean
-	cd $(QSH_DIR) && cargo clean
-	cd $(ECHO_DIR) && cargo clean
-	cd $(LS_DIR) && cargo clean
-	cd $(CAT_DIR) && cargo clean
-	cd $(LOGIN_DIR) && cargo clean
-	cd $(PS_DIR) && cargo clean
-	cd $(IPCPING_DIR) && cargo clean
-	cd $(PING_DIR) && cargo clean
-	cd $(SHUTDOWN_DIR) && cargo clean
-	@for p in $(HOSTED_PROGRAMS); do (cd user/$$p && cargo clean); done
-	$(MAKE) -C $(LIBC_DIR) clean
-	$(MAKE) -C $(CWC_DIR) clean
 	rm -rf $(KERNEL) $(VGA_DRV_BIN) $(FAT32_DRV_BIN) quark.iso isodir
 
 FORCE:

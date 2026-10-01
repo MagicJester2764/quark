@@ -7,6 +7,13 @@ This document is the contract between the Quark kernel and everything above it.
 A service, a language runtime, or a C library should be buildable against this
 document alone, without reading kernel source.
 
+The kernel installs it. `make install` in the kernel's tree puts a copy at
+`usr/share/doc/quark/abi.md` and, beside it, `usr/include/quark/abi.h`:
+`QUARK_ABI_VERSION_MAJOR`, `QUARK_ABI_VERSION_MINOR` and one `#define` per
+call, generated from the constants the dispatch is compiled from. A consumer
+that keeps its own copy of the numbers — as a runtime and a C library must —
+checks it against that header rather than against anybody's source.
+
 ## Calling convention
 
 ```
@@ -32,9 +39,12 @@ There is no `errno`. Each call returns a single `u64`:
 - Everything else is call-specific: a handle, a count, a packed struct, or `0`
   for "succeeded, nothing to report".
 
-Two calls deviate deliberately and say so below: `SYS_CALL_TIMEOUT` returns `1`
-for a timeout, because timing out is an answer rather than a failure to ask; and
-`SYS_FD_READ_NB` returns `0xFFFF_FFFE` for "would block", distinct from `0`,
+A few calls deviate deliberately and say so below: `SYS_CALL_TIMEOUT` returns
+`1` for a timeout, because timing out is an answer rather than a failure to
+ask; the futex waits return `1` when the word had already changed and `2` when
+the time ran out; and the calls that answer instead of waiting —
+`SYS_FD_READ_NB`, `SYS_FD_WRITE_NB`, and `SYS_FD_SEND` and `SYS_FD_RECV` when
+asked not to wait — return `0xFFFF_FFFE` for "would block", distinct from `0`,
 which is end of file.
 
 This is deliberately coarse. It is enough to build a libc's `errno` on top of
@@ -150,9 +160,9 @@ space mapped physical memory instead, and the leak it was written to close was
 never closed. Nothing could have depended on the old number — it did not do
 what its name said — so this is a correction rather than a change of
 interface, but it is a number that moved and the major version says so.
-`tools/check-abi.sh` now fails on two names sharing a number, on the C header
-disagreeing with the kernel, and not only on the kernel and quark-rt drifting
-apart.
+`tools/check-abi.sh` fails on two names sharing a number now, and on this
+document lacking a row for a call or describing a version the kernel does not
+report.
 
 Added with it:
 
