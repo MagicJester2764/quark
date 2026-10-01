@@ -227,11 +227,42 @@ irq_stub!(13);
 irq_stub!(14);
 irq_stub!(15);
 
+// The direction flag, on the way in.
+//
+// The processor delivers an interrupt or an exception with RFLAGS.DF as the
+// interrupted code had it, and code may have it set: a C library sets it for
+// as long as a copy that has to run backwards takes (musl's `memmove` is
+// `std; rep movsb; cld`), and an interrupt or a page fault arrives where it
+// arrives. The kernel is compiled to the ABI every compiler assumes, in
+// which the flag is clear on entry to a function, and its `memset` and
+// `memcpy` are string instructions. Entered with the flag set they run
+// backwards: a tick's first `memset`, of an array on the stack, went down
+// the stack over its own return address and the kernel jumped to zero; a
+// page fault cleared the frame *below* the one it was handing out — somebody
+// else's page — and handed over the new one still holding what its last
+// owner left.
+//
+// So both stubs clear it before anything compiled runs. `iretq` gives the
+// interrupted code its own flags back, set or not. A system call needs none
+// of this: SFMASK clears the flag on `syscall`.
+//
+// And AC, for the same reason one flag along. It is what suspends SMAP, and
+// ring 3 may set it: `popfq` there changes it like any arithmetic flag. A
+// program that had would run every interrupt and fault it took with the
+// kernel free to touch user pages — the protection switched off by the code
+// it is there to protect against. `clac` exists only where SMAP does, so it
+// is skipped where the kernel did not turn SMAP on.
+//
 // IRQ common handler: save GPRs, call Rust handler, restore, iretq
 // Stack at entry: [vector, error_code, RIP, CS, RFLAGS, RSP, SS]
 // If from user mode (CS & 3 != 0), swapgs to get kernel GS.
 core::arch::global_asm!(
     "irq_common:",
+    "    cld",
+    "    cmpb $0, {smap}(%rip)",
+    "    je 3f",
+    "    clac",
+    "3:",
     "    testl $3, 0x18(%rsp)",       // check CS RPL (at RSP+0x18)
     "    jz 1f",
     "    swapgs",                      // from user: swap to kernel GS
@@ -276,6 +307,7 @@ core::arch::global_asm!(
     "    swapgs",                      // returning to user: restore user GS
     "2:",
     "    iretq",
+    smap = sym crate::cpu::SMAP_ENABLED,
     options(att_syntax)
 );
 
@@ -284,6 +316,11 @@ core::arch::global_asm!(
 // If from user mode (CS & 3 != 0), swapgs to get kernel GS.
 core::arch::global_asm!(
     "exception_common:",
+    "    cld",                         // both as in irq_common
+    "    cmpb $0, {smap}(%rip)",
+    "    je 3f",
+    "    clac",
+    "3:",
     "    testl $3, 0x18(%rsp)",       // check CS RPL (at RSP+0x18)
     "    jz 1f",
     "    swapgs",                      // from user: swap to kernel GS
@@ -328,6 +365,7 @@ core::arch::global_asm!(
     "    swapgs",                      // returning to user: restore user GS
     "2:",
     "    iretq",
+    smap = sym crate::cpu::SMAP_ENABLED,
     options(att_syntax)
 );
 

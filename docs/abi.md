@@ -27,8 +27,14 @@ return address.
 
 The kernel clobbers RDI, RSI, RDX, R8, R9 and R10; callers must treat them as
 volatile. Caller-saved scratch registers are scrubbed before `sysret` so kernel
-values do not leak back to user space. RFLAGS.AC is cleared on entry by SFMASK,
-so a task cannot pre-open the SMAP window before trapping in.
+values do not leak back to user space.
+
+Two flags are cleared on every entry to the kernel, by SFMASK for a system
+call and by the interrupt and exception stubs for everything else: AC, so a
+task cannot pre-open the SMAP window before trapping in, and DF, so the
+kernel's own copies run forwards whatever the program was in the middle of.
+They are cleared for the kernel and not for the program: a system call, an
+interrupt and a page fault all return with both as the program had them.
 
 ## Return encoding
 

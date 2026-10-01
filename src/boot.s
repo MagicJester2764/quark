@@ -88,6 +88,10 @@ tss:
 .global _start
 _start:
     cli
+    // Multiboot2 leaves every flag but IF and VM undefined, and compiled code
+    // assumes string instructions run forwards. Every way into the kernel
+    // clears the direction flag; this is the first.
+    cld
     mov $stack_top, %esp
 
     // Save multiboot2 info pointer (ebx) on the stack

@@ -18,7 +18,10 @@ const CR4_SMAP: u64 = 1 << 21;
 // 59–62 of a present entry as the page's key.
 
 /// Whether SMAP was enabled, and therefore whether `stac`/`clac` are legal.
-static SMAP_ENABLED: AtomicBool = AtomicBool::new(false);
+///
+/// The interrupt and exception stubs read it too, as the byte it is: they
+/// clear AC on the way in, where there is a `clac` to do it with.
+pub static SMAP_ENABLED: AtomicBool = AtomicBool::new(false);
 
 /// CPUID leaf 7 subleaf 0: EBX bit 7 = SMEP, bit 20 = SMAP.
 fn cpuid_7_0_ebx() -> u32 {

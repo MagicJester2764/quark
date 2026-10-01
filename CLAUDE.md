@@ -211,6 +211,24 @@ may keep — are in `../quarkutils/CLAUDE.md`; these are the kernel's.
   with the task's saved flags, so a guard held across a reschedule leaves the
   SMAP window open in whatever runs next. Copy into a kernel buffer first — see
   `fd_write_ipc`.
+- **The kernel runs with its own flags, whatever it was entered with.** The
+  processor delivers an interrupt or a fault with RFLAGS as the interrupted
+  code had them, and two of those bits are the kernel's business. *DF:*
+  compiled code assumes string instructions run forwards, and a C library
+  sets the flag for as long as a copy that must run backwards takes — musl's
+  `memmove` is `std; rep movsb; cld` — so a tick or a page fault can arrive
+  with it set. Entered that way, a tick's first `memset` ran down the stack
+  over its own return address and the machine halted at `rip=0x1029`, about
+  once in ten starts of a GTK program; a page fault cleared the frame *below*
+  the one it was handing out, somebody else's, and handed the new one over
+  with what its last owner left in it. *AC:* it suspends SMAP, and ring 3 can
+  set it with `popfq`, so a program could have every interrupt and fault it
+  took handled with the protection off. Both stubs in `idt.rs` clear both
+  before anything compiled runs (`cld`, and `clac` where SMAP is on),
+  `SFMASK` does it for `syscall`, and `_start` clears DF for the boot. A new
+  way into the kernel does the same. `dtest flags` takes page faults and
+  ticks with DF set; nothing outside the kernel can see AC being cleared, so
+  that one is kept by reading the stub.
 - **Validate user pointers with `validate_user_ptr{,_mut}`, not a range check.**
   The kernel runs on the caller's CR3; an in-range but unmapped address faults
   *inside* the kernel, sometimes with a lock held and interrupts off.
