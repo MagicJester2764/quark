@@ -1,6 +1,6 @@
 # Quark syscall ABI
 
-**Version 3.1.** Query the running kernel with `SYS_ABI_VERSION` (240), which
+**Version 3.2.** Query the running kernel with `SYS_ABI_VERSION` (240), which
 returns `(major << 16) | minor`.
 
 This document is the contract between the Quark kernel and everything above it.
@@ -181,8 +181,9 @@ returning at once turned that loop into a spin.
 | Version | Added |
 |---|---|
 | 3.1 | **A descriptor belongs to a program, and may name an object in a server.** Every task of a program uses one table, so what one thread opens its siblings see and what one closes is closed; a thread used to start on a copy of its creator's table and share nothing afterwards. Sixty-four descriptors rather than thirty-two. `SYS_EXIT_PROGRAM` (8) ends every task of the caller's program with one status, which is what `exit` means and what `SYS_EXIT_CODE` — one task — never did. Block 0xE0 opens with *served descriptors*: `SYS_FD_SERVE` (224), `SYS_FD_SERVED` (225), `SYS_FD_HOLDS` (226), `SYS_FD_COOKIE` (227) and `SYS_FD_REAP` (229) let a server give a client a descriptor for one of its own objects — a file — which the kernel then counts, copies across `SYS_FORK`, keeps across `SYS_EXEC_SPACE` and reads and writes through like any other. Descriptor 64 is the program's working directory. `SYS_FD_FLAGS` (228) marks a descriptor to close when its program becomes another, and `SYS_EXEC_SPACE` closes those. Memory named by a descriptor may be mapped by whoever holds the descriptor, and lasts as long as a descriptor names it or somebody has it mapped, whoever made it. |
+| 3.2 | What a shell asks of a kernel that is not about descriptors. `SYS_UMASK` (9): the permission bits a program leaves off what it makes. The kernel makes no files and never reads it; it keeps it because it must follow a program across `SYS_FORK` and `SYS_EXEC_SPACE`, which a C library's memory does not. `SYS_WAIT_FOR` (10): wait for one child in particular, or ask without waiting — `waitpid` with a process id, and `WNOHANG`. |
 
-A change of behaviour and no change of number, so a minor: nothing built for
+3.1 was a change of behaviour and no change of number, so a minor: nothing built for
 3.0 calls anything that means something else now. What it could have relied on
 is a thread's copy of a descriptor outliving its sibling's `close`, and no
 program did.
@@ -265,6 +266,8 @@ everything else returns promptly.
 | 6 | `SYS_SIGNAL` | arg0 = tid, arg1 = signal bits | 0 / `u64::MAX` | as above |
 | 7 | `SYS_TASK_INFO` | arg0 = tid | packed info, or `u64::MAX` | — |
 | 8 | `SYS_EXIT_PROGRAM` | arg0 = status | does not return | — |
+| 9 | `SYS_UMASK` | arg0 = the new mask (nine bits), or `u64::MAX` to leave it | the mask as it was | — |
+| 10 | `SYS_WAIT_FOR` | arg0 = a child's tid, or 0 for any; arg1 = flags (1 = do not wait) | `tid \| (exit_code << 32)`; 0 if asked not to wait and none has ended; `u64::MAX` if there is no such child. **Blocks** unless asked not to. | — |
 
 A status is kept as its low eight bits, as Linux's wait status keeps it. A
 negative status is how the kernel says a task was killed — `SYS_TASK_KILL`
@@ -280,6 +283,20 @@ task in the caller's address space is ended with the same status, and then
 the caller. It is what a C library's `exit` and a Rust `main` returning mean.
 A thread ending itself uses `SYS_EXIT_CODE`, and a program whose first task
 does that goes on running in its other threads, with everything it has open.
+
+`SYS_WAIT_FOR` is `SYS_WAIT` with two things said. A child named is the only
+one collected, and the only one whose ending wakes the caller: waiting for
+one child by collecting whichever ends first would lose the status of every
+other, and a shell running a pipeline wants each. And a caller that asks not
+to wait is told 0 — nothing has ended yet — which is different from having no
+children at all. `SYS_WAIT` is this with neither.
+
+`SYS_UMASK` holds nine bits for the program and does nothing with them. They
+are the permission bits its runtime leaves off a file or a directory it makes
+— 022 until it says otherwise — and they are the kernel's to keep only
+because they must go where the program goes: a forked child starts with its
+parent's, and `SYS_EXEC_SPACE` leaves them alone. Whatever makes the file
+applies them.
 
 **Signals.** There are three, and they are bits: interrupt (`1 << 16`),
 terminate (`1 << 17`) and kill (`1 << 18`). `SYS_SIGNAL` with the kill bit ends

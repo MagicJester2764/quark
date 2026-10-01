@@ -52,6 +52,13 @@ pub const SYS_TASK_INFO: u64 = 7;
 /// End the caller's whole program: every task in its address space, with one
 /// status. `SYS_EXIT_CODE` ends the calling task and leaves its siblings.
 pub const SYS_EXIT_PROGRAM: u64 = 8;
+/// Read or set the permission bits the caller's program leaves off what it
+/// makes. Kept for it across `SYS_FORK` and `SYS_EXEC_SPACE`.
+pub const SYS_UMASK: u64 = 9;
+/// `SYS_WAIT` for one child in particular, or without waiting.
+pub const SYS_WAIT_FOR: u64 = 10;
+/// SYS_WAIT_FOR: answer 0 rather than wait for a child that has not ended.
+const WAIT_NO_WAIT: u64 = 1;
 
 // --- 0x10  IPC ---
 pub const SYS_SEND: u64 = 16;
@@ -308,7 +315,7 @@ pub const SYS_ABI_VERSION: u64 = 240;
 /// minor when calls are added. User space can refuse to run against a major it
 /// does not know, which is the point of exposing it at all.
 pub const ABI_VERSION_MAJOR: u64 = 3;
-pub const ABI_VERSION_MINOR: u64 = 1;
+pub const ABI_VERSION_MINOR: u64 = 2;
 
 /// Threads a task may make with no capability at all.
 ///
@@ -647,6 +654,11 @@ extern "C" fn syscall_dispatch(
         }
         SYS_EXIT_PROGRAM => {
             scheduler::exit_program(arg0 as i32);
+        }
+        SYS_UMASK => {
+            // arg0 = the new mask, or u64::MAX to leave it. Returns the old.
+            let new = if arg0 == u64::MAX { None } else { Some(arg0 as u16) };
+            crate::fdtable::umask(scheduler::current_tid(), new) as u64
         }
         SYS_FD_SERVE => {
             // arg0 = the client, arg1 = cookie, arg2 = where: a number,
@@ -2958,6 +2970,10 @@ extern "C" fn syscall_dispatch(
         SYS_WAIT => {
             // Block until a child task exits. Returns child TID or u64::MAX.
             scheduler::sys_wait()
+        }
+        SYS_WAIT_FOR => {
+            // arg0 = the child to wait for, or 0 for any; arg1 = flags.
+            scheduler::sys_wait_for(arg0 as usize, arg1 & WAIT_NO_WAIT != 0)
         }
         SYS_SET_MEM_LIMIT => {
             // arg0 = tid, arg1 = limit in pages (0 = unlimited)

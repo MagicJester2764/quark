@@ -43,9 +43,20 @@ struct Table {
     fds: [FdKind; SLOTS],
     /// One bit per slot: closed when the program becomes another (`exec`).
     cloexec: u128,
+    /// The permission bits this program does not want on what it makes.
+    ///
+    /// The kernel makes no files and never reads this. It is here because it
+    /// has to follow a program exactly as its descriptors do — copied by
+    /// `fork`, kept by `exec` — and a C library's own memory does neither:
+    /// `umask 077` in a shell has to be true of the `touch` it then runs.
+    umask: u16,
 }
 
-const EMPTY: Table = Table { tasks: 0, fds: [FdKind::Empty; SLOTS], cloexec: 0 };
+/// What a program that has said nothing leaves off: write for group and other.
+const DEFAULT_UMASK: u16 = 0o022;
+
+const EMPTY: Table =
+    Table { tasks: 0, fds: [FdKind::Empty; SLOTS], cloexec: 0, umask: DEFAULT_UMASK };
 
 /// As many tables as tasks: each task uses exactly one.
 static mut TABLES: [Table; MAX_TASKS] = [EMPTY; MAX_TASKS];
@@ -216,14 +227,15 @@ pub fn copy_into(child: usize, parent: usize) {
     // read and its being retained would have this retain something freed.
     let flags = irq_save();
     unsafe {
-        let (src_fds, src_cloexec) = match table_mut(parent) {
-            Some(t) => (t.fds, t.cloexec),
+        let (src_fds, src_cloexec, src_umask) = match table_mut(parent) {
+            Some(t) => (t.fds, t.cloexec, t.umask),
             None => {
                 irq_restore(flags);
                 return;
             }
         };
         if let Some(dst) = table_mut(child) {
+            dst.umask = src_umask;
             for (i, kind) in src_fds.iter().enumerate() {
                 if kind.is_empty() || !dst.fds[i].is_empty() {
                     continue;
@@ -348,6 +360,25 @@ pub fn any(tid: usize, wanted: impl Fn(&FdKind) -> bool) -> bool {
         Some(fds) => fds.iter().any(|k| !k.is_empty() && wanted(k)),
         None => false,
     }
+}
+
+/// Set the program's umask and return what it was; `None` only reads it.
+pub fn umask(tid: usize, new: Option<u16>) -> u16 {
+    let flags = irq_save();
+    let old = unsafe {
+        match table_mut(tid) {
+            Some(t) => {
+                let old = t.umask;
+                if let Some(mask) = new {
+                    t.umask = mask & 0o777;
+                }
+                old
+            }
+            None => DEFAULT_UMASK,
+        }
+    };
+    irq_restore(flags);
+    old
 }
 
 /// Whether `fd` is closed when the program becomes another.

@@ -46,6 +46,9 @@ static INITIALIZED: AtomicBool = AtomicBool::new(false);
 static mut WAIT_BLOCKED: [bool; MAX_TASKS] = [false; MAX_TASKS];
 /// TID of the dead child collected for a waiting parent. 0 = none yet.
 static mut WAIT_RESULT: [usize; MAX_TASKS] = [0; MAX_TASKS];
+/// Which child a task blocked in a wait is waiting for: 0 for whichever goes
+/// first. Another child going is not what it asked to be woken for.
+static mut WAIT_TARGET: [usize; MAX_TASKS] = [0; MAX_TASKS];
 
 /// Exit code of the child that woke a waiter, captured at wake time.
 ///
@@ -238,7 +241,10 @@ pub fn exit_with(code: i32) -> ! {
             note_death(current);
             let parent = task.parent_tid;
             // If parent is blocked in sys_wait, wake it with our TID
-            if parent != 0 && WAIT_BLOCKED[parent] {
+            if parent != 0
+                && WAIT_BLOCKED[parent]
+                && (WAIT_TARGET[parent] == 0 || WAIT_TARGET[parent] == current)
+            {
                 WAIT_BLOCKED[parent] = false;
                 WAIT_RESULT[parent] = current;
                 WAIT_CODE[parent] = code;
@@ -680,15 +686,34 @@ unsafe fn child_exit_code(tid: usize) -> i32 { unsafe {
 /// [63:32], or u64::MAX if the caller has no children. The status used to be
 /// dropped entirely, so `process::exit(1)` was indistinguishable from success.
 pub fn sys_wait() -> u64 {
+    sys_wait_for(0, false)
+}
+
+/// Collect a child that has ended: `target`, or whichever is first if that
+/// is 0. Returns its id with its status above it.
+///
+/// With `no_wait`, a child that has not ended yet is answered with 0 rather
+/// than waited for. `u64::MAX` means there is nothing to wait for: no
+/// children, or `target` is not one.
+///
+/// Waiting for one child in particular is not a loop around waiting for any:
+/// that would collect, and so lose, every child that finished first. A shell
+/// with a pipeline has several, and wants each one's status.
+pub fn sys_wait_for(target: usize, no_wait: bool) -> u64 {
     let parent = current_tid();
+    if target >= MAX_TASKS {
+        return u64::MAX;
+    }
 
     let flags = irq_save();
     unsafe {
-        // Check if any child is already dead (zombie) and not yet reaped
+        let wanted = |i: usize| target == 0 || target == i;
+        // Check if a child is already dead (zombie) and not yet reaped
         for i in 1..MAX_TASKS {
-            let collectable = TASKS[i].as_ref().is_some_and(|t| {
-                t.parent_tid == parent && t.state == TaskState::Dead && !REAPED[i]
-            });
+            let collectable = wanted(i)
+                && TASKS[i].as_ref().is_some_and(|t| {
+                    t.parent_tid == parent && t.state == TaskState::Dead && !REAPED[i]
+                });
             if collectable {
                 REAPED[i] = true;
                 let code = child_exit_code(i);
@@ -698,18 +723,23 @@ pub fn sys_wait() -> u64 {
             }
         }
 
-        // Check if we have any living children at all
+        // Check if we have any living children of the kind asked for at all
         let has_children = (1..MAX_TASKS).any(|i| {
-            TASKS[i].as_ref().is_some_and(|t| t.parent_tid == parent)
+            wanted(i) && TASKS[i].as_ref().is_some_and(|t| t.parent_tid == parent)
         });
         if !has_children {
             irq_restore(flags);
             return u64::MAX;
         }
+        if no_wait {
+            irq_restore(flags);
+            return 0;
+        }
 
         // Block until a child exits. Marking and blocking must both happen
         // before interrupts come back on, or exit() can slip in between them.
         WAIT_BLOCKED[parent] = true;
+        WAIT_TARGET[parent] = target;
         WAIT_RESULT[parent] = 0;
         WAIT_CODE[parent] = 0;
         block_task(parent);
@@ -720,6 +750,7 @@ pub fn sys_wait() -> u64 {
         let flags = irq_save();
         let child_tid = WAIT_RESULT[parent];
         WAIT_RESULT[parent] = 0;
+        WAIT_TARGET[parent] = 0;
         let result = if child_tid != 0 {
             let code = WAIT_CODE[parent];
             // Reaped now rather than whenever the machine next goes idle.
@@ -807,7 +838,10 @@ fn end_other(tid: usize, code: i32) -> Result<(), ()> {
                 close_descriptors(tid);
                 note_death(tid);
                 let parent = task.parent_tid;
-                if parent != 0 && WAIT_BLOCKED[parent] {
+                if parent != 0
+                    && WAIT_BLOCKED[parent]
+                    && (WAIT_TARGET[parent] == 0 || WAIT_TARGET[parent] == tid)
+                {
                     WAIT_BLOCKED[parent] = false;
                     WAIT_RESULT[parent] = tid;
                     WAIT_CODE[parent] = code;
@@ -1070,6 +1104,7 @@ unsafe fn reap_one(i: usize) -> u64 { unsafe {
     // Clean up wait state if this task was a parent
     WAIT_BLOCKED[i] = false;
     WAIT_RESULT[i] = 0;
+    WAIT_TARGET[i] = 0;
     // Every capability to it names nothing from here on, whoever holds one.
     crate::cap::close_endpoint(i);
     TASKS[i] = None;
