@@ -12,9 +12,12 @@
 //! - **The way the others are started**: INIT and STARTUP are messages sent
 //!   through it.
 //!
-//! Devices still interrupt through the 8259, on the first processor, as
-//! they always have: its local APIC passes them on as the firmware set it
-//! up to, and nothing here changes that. The I/O APIC is not used.
+//! And a fourth, which is about devices: an I/O APIC delivers a device's
+//! interrupt as a message to a local APIC (`ioapic.rs`), so on a machine
+//! with one this is how every device interrupt arrives, even with one
+//! processor. Where there is none, devices interrupt through the 8259 and
+//! the first processor's local APIC passes them on as the firmware set it
+//! up to.
 //!
 //! Registers are reached through memory, or through MSRs where the firmware
 //! left the APIC in x2APIC mode — which it must on a machine with more than
@@ -93,6 +96,11 @@ pub fn present() -> bool {
 /// # Safety
 /// Once, on the first processor, interrupts off.
 pub unsafe fn init() -> bool {
+    // Asked for twice: by whoever sets up devices' interrupts, and by
+    // whoever starts the other processors.
+    if PRESENT.load(Ordering::Relaxed) {
+        return true;
+    }
     if !crate::cpu::has_apic() {
         return false;
     }
@@ -139,6 +147,16 @@ pub unsafe fn init_local(first: bool) {
     // The error register is read by writing it first; twice clears it.
     write(REG_ERROR, 0);
     write(REG_ERROR, 0);
+}
+
+/// Stop taking the 8259's interrupts through this processor's local APIC:
+/// the pin they came in on is masked. For the first processor, once devices
+/// interrupt through the I/O APIC instead.
+///
+/// # Safety
+/// On the first processor, interrupts off.
+pub unsafe fn no_legacy_wire() {
+    write(REG_LVT_LINT0, LVT_MASKED);
 }
 
 /// The id this processor's local APIC answers to.

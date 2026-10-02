@@ -69,11 +69,13 @@ them struck through as done. What follows is what is true now.
 - **A clock finer than the tick.** Time is the PIT at 100 Hz: a timer, a sleep
   and a futex deadline all round up to ten milliseconds. There is no HPET, no
   APIC timer and no use of the TSC.
-- **An interrupt controller newer than the 8259, for devices.** Each
-  processor's local APIC is used for its own tick and for what one
-  processor says to another; every device still interrupts the first
-  processor through the 8259's sixteen lines. No I/O APIC, no MSI: a driver
-  for a device that only speaks MSI has nothing to be given.
+- **MSI, and an interrupt of a device's own.** Devices interrupt through
+  the I/O APIC where there is one, but only on the sixteen ISA interrupts,
+  wherever the firmware says each comes in. The lines above those — where
+  a PCI device on a newer machine is wired — need the firmware's bytecode
+  to say which device is on which, and are not used; and there is no MSI,
+  so a driver for a device that speaks only that has nothing to be given.
+  Every interrupt goes to the first processor.
 - **ACPI, for power.** The kernel reads two of its tables at boot
   (`acpi.rs`). What they say about processors it acts on. What they say
   about restarting the machine and turning it off it does not yet: powering

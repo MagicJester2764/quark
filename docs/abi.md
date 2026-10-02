@@ -931,8 +931,25 @@ to hear from.
 `SYS_IOPORT` ops: 0 = read8, 1 = write8, 2 = read16, 3 = write16, 4 = read32,
 5 = write32. `SYS_IOPORT_REP` ops: 0 = `rep insw`, 1 = `rep outsw`.
 
-Interrupts are delivered to the registered task as notifications through a
-per-IRQ ring buffer, polled in `SYS_RECV`.
+**Interrupts.** A driver is told of its device's interrupt as a message from
+the kernel — sender 0, the tag the interrupt's number — found by its next
+`SYS_RECV` from anybody; eight are kept for a driver that has not looked.
+
+The numbers are the sixteen ISA interrupts, 0 to 15: lines of the machine's
+interrupt controller, and a driver asks for one by number
+(`SYS_IRQ_REGISTER`), the number its device's configuration gives. Having
+dealt with the device, the driver says so (`SYS_IRQ_ACK`), and has to: a
+device that holds its line until it is answered is kept from interrupting
+again, in the meantime, by whichever means the controller has, and
+`SYS_IRQ_ACK` is what ends the meantime. On a machine with an I/O APIC that
+means is the line's own mask, and a slow driver holds up nobody else; with
+only 8259s it is the 8259's order of importance, and it holds up every line
+below its own. Either way the rule for a driver is the one rule: quieten
+the device, then acknowledge. A line whose driver has gone is masked until
+another registers for it; the clock and the keyboard, which are the kernel's
+when they are nobody's, are not.
+
+Every interrupt is delivered to the first processor.
 
 `SYS_GETRANDOM` never blocks and needs nothing. The generator is ChaCha20
 (RFC 8439) with fast key erasure: each call's first block replaces the key

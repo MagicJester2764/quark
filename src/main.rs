@@ -13,7 +13,9 @@ mod fat32;
 mod fpu;
 mod heap;
 mod idt;
+mod intc;
 mod io;
+mod ioapic;
 pub mod ipc;
 pub mod irq_dispatch;
 mod lend;
@@ -105,15 +107,22 @@ pub extern "C" fn kernel_main(multiboot_info: usize) -> ! {
     // Must follow paging setup and precede the first user-mode entry.
     unsafe { cpu::init_protections() };
 
-    // Initialize hardware interrupts
+    // Initialize hardware interrupts: through the I/O APIC where the
+    // firmware lists one, and the 8259s where it does not.
     unsafe {
-        pic::init();
+        intc::init();
         pit::init(100); // 100 Hz timer
-        pic::enable_irq(0); // timer
-        pic::enable_irq(1); // keyboard
+        intc::enable(0); // timer
+        intc::enable(1); // keyboard
         core::arch::asm!("sti", options(nostack, nomem));
     }
     console::puts(b"Interrupts enabled.\n");
+    if ioapic::in_use() {
+        serial::puts(b"Interrupts: through the I/O APIC, to the first processor.\n");
+        ioapic::describe();
+    } else {
+        serial::puts(b"Interrupts: through the 8259.\n");
+    }
     rtc::init();
     random::init();
 

@@ -769,6 +769,20 @@ breaking any of them is quiet until it is a machine that stops.
   have a tick of their own from their local APIC, and it does one thing:
   `scheduler::timer_tick`. `pit::tick` — timeouts, alarms, the count of
   ticks — runs once a tick, not once a tick a processor.
+- **A device's interrupt is spoken of by its ISA number, and the controller
+  is spoken to through `intc.rs`.** It is the I/O APIC where the firmware
+  lists one and the 8259s where it does not, and the two differ in the one
+  thing a driver in user space leans on: what keeps a device that holds its
+  line from interrupting again before its driver has run. An 8259 that has
+  not been told an interrupt is over delivers nothing of that importance
+  or less. A local APIC does the same by vector, and every device's is in
+  one class — so there the end of the interrupt is said at once
+  (`intc::held`), and a line that is a level is masked until the driver
+  answers (`SYS_IRQ_ACK`, `intc::ack`). An edge is never masked: the I/O
+  APIC forgets one that arrives while it is, where the 8259 remembered.
+  Which lines are levels is the firmware's to say (the MADT's overrides).
+  A new place that takes an interrupt says one of `done`, `held` or
+  `dropped` about it, and never writes to a controller itself.
 - **The other processors are started before there is a task** (`smp::start`
   in `kernel_main`), with what the first processor has turned on: CR0, CR4,
   EFER, the `syscall` MSRs. Something turned on later on the first — a CR4
@@ -825,7 +839,8 @@ breaking any of them is quiet until it is a machine that stops.
   is, a better task waking that interrupts whichever processor is running
   the worst rather than waiting for its tick, and an idle processor that
   takes no ticks.
-- Every device interrupts the first processor, through the 8259. There is
-  no I/O APIC and no MSI.
+- Every device interrupts the first processor. There is no MSI, and the
+  I/O APIC's lines above the sixteen ISA interrupts are not used: which
+  device is on which is in the firmware's bytecode, not its tables.
 - Sixteen processors at most, and local APIC ids below 256 unless the
   firmware left the APICs in x2APIC mode.

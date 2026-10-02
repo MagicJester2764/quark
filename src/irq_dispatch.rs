@@ -97,22 +97,22 @@ pub fn dispatch_irq(irq: u8) -> bool {
     let queued = state.rings[idx].push(msg);
     // Drop lock before calling scheduler (avoids potential ordering issues)
     drop(state);
-    scheduler::unblock_task(tid);
-
-    if !queued {
+    if queued {
+        crate::intc::held(irq);
+    } else {
         // The ring was full, so this notification is gone — and with it the
-        // `sys_irq_ack` that would have acknowledged this interrupt. Lines
-        // delegated to user space are acknowledged by the driver, so an
-        // interrupt nobody is told about is one the PIC never hears the end
-        // of: its in-service bit stays set and the line delivers nothing
-        // again, ever. A keyboard that stops mid-sentence and never comes
-        // back is what that looks like.
+        // `sys_irq_ack` that would have answered it. An interrupt nobody is
+        // told about is one an 8259 never hears the end of: its in-service
+        // bit stays set and the line delivers nothing again, ever. A
+        // keyboard that stops mid-sentence and never comes back is what
+        // that looks like.
         //
         // Losing the notification is survivable — a driver that drains its
-        // device collects the work on the next one. Losing the EOI is not,
-        // so it is sent here.
-        unsafe { crate::pic::send_eoi(irq) };
+        // device collects the work on the next one. Losing the end of the
+        // interrupt is not, so it is said here.
+        crate::intc::dropped(irq);
     }
+    scheduler::unblock_task(tid);
 
     true
 }
@@ -125,6 +125,13 @@ pub fn unregister_task_irqs(tid: usize) {
             state.has_handler[irq] = false;
             state.handlers[irq] = 0;
             state.rings[irq] = IrqRing::new();
+            // Nobody is left to deal with the device, and one that holds
+            // its line until it is answered would interrupt for ever. The
+            // clock and the keyboard are the kernel's when they are
+            // nobody's, and stay on.
+            if irq > 1 {
+                crate::intc::disable(irq as u8);
+            }
         }
     }
 }

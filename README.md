@@ -88,7 +88,9 @@ src/
   userspace.rs        Starting init, address space helpers
   elf.rs              ELF64 loader, for init
   idt.rs              Interrupt descriptor table and exceptions
-  pit.rs  pic.rs      Timer and interrupt controller
+  pit.rs              The clock that ticks
+  intc.rs             The interrupt controller devices come in through:
+  ioapic.rs  pic.rs     the I/O APIC, or the 8259s
   acpi.rs             The firmware's tables: processors, interrupt controllers
   percpu.rs           What each processor has of its own
   klock.rs            The kernel lock: one processor in the kernel at a time

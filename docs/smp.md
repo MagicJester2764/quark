@@ -84,8 +84,11 @@ processor with an 8259, as every machine was.
 
 ## Interrupts
 
-Devices and the clock interrupt the first processor, through the 8259, as
-they always did. Its tick is the system's time.
+Devices and the clock interrupt the first processor. Its tick is the
+system's time. They come in through the I/O APIC where the firmware lists
+one (`ioapic.rs`) — which could send each to any processor, and sends all
+of them to the first, because nothing yet gives a reason for another — and
+through the 8259 where it does not. `intc.rs` is whichever there is.
 
 Every other processor has its local APIC's timer, at the same hundred times
 a second, and it does one thing: ends a task's turn.
@@ -171,5 +174,6 @@ uses them well, and the difference is a list:
 - **A better task waking that interrupts the processor running the worst**,
   instead of waiting for a tick.
 - **A processor that takes no ticks while it has nothing to do.**
-- **Interrupts from devices on any processor**: the I/O APIC, and MSI.
+- **Interrupts from devices on any processor.** The I/O APIC can send one
+  anywhere; every one still goes to the first.
 - **More than sixteen processors**, and x2APIC ids above 255.

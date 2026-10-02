@@ -1392,18 +1392,18 @@ fn dispatch(
             }
             let tid = scheduler::current_tid();
             crate::irq_dispatch::register_irq_handler(irq, tid);
-            unsafe { crate::pic::enable_irq(irq) };
+            crate::intc::enable(irq);
             0
         }
         SYS_IRQ_ACK => {
             // arg0 = IRQ number
             let irq = arg0 as u8;
             // Acking an IRQ you do not own lets any task interfere with the
-            // PIC's in-service state and stall another driver's interrupts.
+            // controller's state and stall another driver's interrupts.
             if !crate::cap::task_has_irq(scheduler::current_tid(), irq) {
                 return u64::MAX;
             }
-            unsafe { crate::pic::send_eoi(irq) };
+            crate::intc::ack(irq);
             0
         }
         SYS_IOPORT => {

@@ -7,7 +7,7 @@
 //! processor's task state segment (`percpu.rs`). The table itself is one
 //! for the machine; every processor loads it.
 
-use crate::{console, io, ipc, pic, pit, scheduler};
+use crate::{console, io, ipc, pit, scheduler};
 
 // ---------------------------------------------------------------------------
 // Structures
@@ -832,53 +832,37 @@ fn irq(frame: &InterruptFrame) {
             scheduler::kicked();
             return;
         }
-        0 => {
-            // Send EOI BEFORE pit::tick() because tick() may context-switch
-            // via schedule_inner.  If the preempted task blocks, the deferred
-            // EOI would stall the timer indefinitely.
-            unsafe { pic::send_eoi(0) };
-            pit::tick();
-            return; // EOI already sent
-        }
-        1 => {
-            // Check if a user-space handler is registered.
-            // Do NOT send EOI here — the user-space driver sends EOI via
-            // sys_irq_ack after clearing the device condition.  Sending EOI
-            // before the device ISR is cleared causes an IRQ storm because
-            // level-triggered PCI interrupts re-fire immediately.
-            if crate::irq_dispatch::dispatch_irq(1) {
-                return;
-            }
-            // No user-space handler — consume and discard the scancode
-            unsafe { io::inb(0x60) };
-        }
-        7 => {
-            // Spurious IRQ check for master PIC
-            let isr = unsafe { pic::read_isr() };
-            if isr & (1 << 7) == 0 {
-                return; // spurious — no EOI
-            }
-        }
-        15 => {
-            // Spurious IRQ check for slave PIC
-            let isr = unsafe { pic::read_isr() };
-            if isr & (1 << 15) == 0 {
-                // Spurious from slave — still send EOI to master
-                unsafe { pic::send_eoi(0) };
-                return;
-            }
-        }
-        _ => {
-            // Try user-space dispatch for all other IRQs.
-            // Do NOT send EOI — user-space driver does it via sys_irq_ack
-            // after clearing the device ISR (prevents IRQ storm).
-            if crate::irq_dispatch::dispatch_irq(irq) {
-                return;
-            }
-        }
+        _ => {}
     }
-
-    unsafe { pic::send_eoi(irq) };
+    // A device, by its ISA number: that is what the sixteen stubs leave in
+    // the frame.
+    match irq {
+        0 => {
+            // The controller is told before pit::tick(), because tick() may
+            // switch away: told afterwards, a task that then blocked would
+            // leave the clock stopped until it ran again.
+            crate::intc::done(0);
+            pit::tick();
+            return;
+        }
+        // An 8259 with nothing to say.
+        7 | 15 if crate::intc::spurious(irq) => return,
+        _ => {}
+    }
+    // A driver's, if one has asked for it. The controller is told the
+    // driver has it (`intc::held`), and hears that the device has been
+    // dealt with when the driver says so (`SYS_IRQ_ACK`): told sooner, a
+    // device that holds its line until it is answered interrupts again at
+    // once, and for ever.
+    if crate::irq_dispatch::dispatch_irq(irq) {
+        return;
+    }
+    if irq == 1 {
+        // Nobody is reading the keyboard: what was typed is thrown away, so
+        // that the controller can say when the next key is.
+        unsafe { io::inb(0x60) };
+    }
+    crate::intc::done(irq);
 }
 
 // ---------------------------------------------------------------------------
