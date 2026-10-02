@@ -25,10 +25,18 @@
 //! stores puts this task's stack where this task's processor keeps it, and
 //! a processor the task has left was given the next task's by the switch
 //! that took it away.
+//!
+//! **What one processor knows about another** is the rest of what is here:
+//! how many there are, the id each one's local APIC answers to, which
+//! address space each has loaded, whether it is asleep with nothing to do,
+//! and whether it has been asked to forget its translations. Those are
+//! atomics, read and written from outside; everything above is touched by
+//! its own processor and nobody else.
 
 use crate::context::CpuContext;
 use core::arch::asm;
 use core::mem::offset_of;
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
 /// How many processors the kernel will run on. The table of them is this
 /// long; a machine with more has the rest left stopped.
@@ -88,6 +96,20 @@ pub struct PerCpu {
     /// The stack the idle loop runs on, for a fault report to check a stack
     /// pointer against.
     idle_stack: (usize, usize),
+    /// The address space it has loaded: what is in its CR3. Written by the
+    /// processor itself (`paging::write_cr3`), and read by one that has
+    /// changed a space's tables and needs to know who may be holding the
+    /// old ones (`tlb.rs`).
+    cr3: AtomicUsize,
+    /// The id its local APIC answers to: where an interrupt for it is sent.
+    apic_id: AtomicU32,
+    /// It has nothing to run and is waiting for an interrupt, or is about
+    /// to. Set under the kernel lock by the processor itself; taken by
+    /// whoever wakes it, so that two tasks made ready wake two processors.
+    napping: AtomicBool,
+    /// Another processor has taken mappings away and asks this one to
+    /// forget what it has cached. Cleared by this one when it has.
+    flush: AtomicBool,
 }
 
 const USER_RSP: usize = offset_of!(PerCpu, user_rsp);
@@ -95,6 +117,7 @@ const KERNEL_RSP: usize = offset_of!(PerCpu, kernel_rsp);
 const INDEX: usize = offset_of!(PerCpu, index);
 const CURRENT: usize = offset_of!(PerCpu, current);
 const TSS_RSP0: usize = offset_of!(PerCpu, tss) + offset_of!(Tss, rsp0);
+const CR3: usize = offset_of!(PerCpu, cr3);
 // The stub in `syscall.rs` says `%gs:0` and `%gs:8`.
 const _: () = assert!(USER_RSP == 0 && KERNEL_RSP == 8);
 
@@ -117,9 +140,18 @@ const EMPTY: PerCpu = PerCpu {
     gdt: [0; GDT_ENTRIES],
     idle_context: CpuContext::empty(),
     idle_stack: (0, 0),
+    cr3: AtomicUsize::new(0),
+    apic_id: AtomicU32::new(0),
+    napping: AtomicBool::new(false),
+    flush: AtomicBool::new(false),
 };
 
 static mut CPUS: [PerCpu; MAX_CPUS] = [EMPTY; MAX_CPUS];
+
+/// How many processors are running the kernel: the first, and each of the
+/// others once it has arrived (`smp.rs`). They are numbered in the order
+/// they came, so the processors are `0..count()` with no gaps.
+static ONLINE: AtomicUsize = AtomicUsize::new(1);
 
 #[repr(C, align(16))]
 struct DfStack([u8; DF_STACK_SIZE]);
@@ -213,6 +245,109 @@ pub fn idle_stack() -> (usize, usize) {
     }
 }
 
+/// How many processors are running the kernel.
+#[inline]
+pub fn count() -> usize {
+    ONLINE.load(Ordering::Relaxed)
+}
+
+/// Processor `index` has arrived, and its local APIC answers to `apic_id`.
+/// Said by the first processor as it starts each of the others in turn.
+pub fn came_online(index: usize, apic_id: u32) {
+    unsafe { (*(&raw const CPUS[index].apic_id)).store(apic_id, Ordering::Relaxed) };
+    ONLINE.store(index + 1, Ordering::Release);
+}
+
+/// Say what this processor's local APIC answers to.
+///
+/// # Safety
+/// Interrupts off.
+pub unsafe fn set_apic_id(apic_id: u32) {
+    unsafe { (*(&raw const (*this()).apic_id)).store(apic_id, Ordering::Relaxed) };
+}
+
+/// What processor `cpu`'s local APIC answers to.
+pub fn apic_id(cpu: usize) -> u32 {
+    unsafe { (*(&raw const CPUS[cpu].apic_id)).load(Ordering::Relaxed) }
+}
+
+/// This processor has loaded address space `cr3`.
+///
+/// # Safety
+/// Interrupts off, between this and the load itself: the two are one fact.
+#[inline(always)]
+pub unsafe fn note_cr3(cr3: usize) {
+    unsafe {
+        asm!("mov gs:[{at}], {}", in(reg) cr3, at = const CR3,
+             options(nostack, preserves_flags));
+    }
+}
+
+/// The address space processor `cpu` has loaded. It does not change while
+/// the caller holds the kernel lock: a processor loads another only in the
+/// kernel.
+pub fn cr3_of(cpu: usize) -> usize {
+    unsafe { (*(&raw const CPUS[cpu].cr3)).load(Ordering::Relaxed) }
+}
+
+/// This processor has nothing to run and is about to wait for an interrupt.
+/// Said while it still holds the kernel lock, so that whoever next makes a
+/// task ready — which takes the lock — finds it said.
+///
+/// # Safety
+/// Interrupts off.
+pub unsafe fn nap() {
+    unsafe { (*(&raw const (*this()).napping)).store(true, Ordering::Release) };
+}
+
+/// This processor is awake again, whatever woke it.
+///
+/// # Safety
+/// Interrupts off.
+pub unsafe fn woke() {
+    unsafe { (*(&raw const (*this()).napping)).store(false, Ordering::Release) };
+}
+
+/// If processor `cpu` is waiting with nothing to do, it is now the caller's
+/// to wake: true once, for one caller.
+pub fn wake_from_nap(cpu: usize) -> bool {
+    // Read first: every task made ready asks this of every processor, and
+    // nearly always the answer is no, which should not cost a write to a
+    // line of memory the processor asked about is using.
+    unsafe {
+        let napping = &*(&raw const CPUS[cpu].napping);
+        napping.load(Ordering::Acquire) && napping.swap(false, Ordering::AcqRel)
+    }
+}
+
+/// Ask processor `cpu` to forget the translations it has cached. It is
+/// asked again with an interrupt, and has answered when
+/// [`flush_pending`] says no.
+pub fn ask_flush(cpu: usize) {
+    unsafe { (*(&raw const CPUS[cpu].flush)).store(true, Ordering::Release) };
+}
+
+/// Whether processor `cpu` has still to answer [`ask_flush`].
+pub fn flush_pending(cpu: usize) -> bool {
+    unsafe { (*(&raw const CPUS[cpu].flush)).load(Ordering::Acquire) }
+}
+
+/// Whether this processor has been asked to forget its translations.
+///
+/// # Safety
+/// Interrupts off.
+pub unsafe fn flush_asked() -> bool {
+    unsafe { (*(&raw const (*this()).flush)).load(Ordering::Acquire) }
+}
+
+/// This processor has forgotten them.
+///
+/// # Safety
+/// Interrupts off, and after the translations have gone.
+pub unsafe fn flush_done() {
+    unsafe { (*(&raw const (*this()).flush)).store(false, Ordering::Release) };
+}
+
 /// Make processor `index` this one: from here on GS finds its state.
 ///
 /// The first thing a processor does in Rust, before anything asks which
@@ -228,6 +363,7 @@ pub unsafe fn init(index: usize, stack: (usize, usize)) {
         (*cpu).index = index as u64;
         (*cpu).current = 0;
         (*cpu).idle_stack = stack;
+        (*(&raw const (*cpu).cr3)).store(crate::paging::read_cr3(), Ordering::Relaxed);
         // In the kernel, this processor's state; in a program, nothing. The
         // second is what `swapgs` leaves in GS on the way out to ring 3.
         crate::cpu::wrmsr(MSR_GS_BASE, cpu as u64);

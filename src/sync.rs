@@ -26,11 +26,16 @@ impl<T> IrqSpinLock<T> {
 
     /// Acquire the lock with interrupts disabled.
     ///
-    /// Quark is uniprocessor and this lock holds `cli` for its whole lifetime,
-    /// so no other execution context can be running while it is held. Finding
-    /// it already taken therefore means *this* code path is re-entering a lock
-    /// it already owns — which as a spin would be an unbreakable hang with
-    /// interrupts off and no output. Report it instead.
+    /// Only one processor is ever in the kernel (`klock.rs`), and this lock
+    /// holds `cli` for its whole lifetime, so no other execution context can
+    /// be running kernel code while it is held. Finding it already taken
+    /// therefore means *this* code path is re-entering a lock it already
+    /// owns — which as a spin would be an unbreakable hang with interrupts
+    /// off and no output. Report it instead.
+    ///
+    /// That was first true because there was one processor. It is the
+    /// kernel lock's to keep true now, and the day two processors may be in
+    /// the kernel at once this has to become a lock that waits.
     pub fn lock(&self) -> IrqSpinLockGuard<'_, T> {
         let saved_flags: u64;
         unsafe {

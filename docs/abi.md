@@ -1,6 +1,6 @@
 # Quark syscall ABI
 
-**Version 3.9.** Query the running kernel with `SYS_ABI_VERSION` (240), which
+**Version 3.10.** Query the running kernel with `SYS_ABI_VERSION` (240), which
 returns `(major << 16) | minor`.
 
 This document is the contract between the Quark kernel and everything above it.
@@ -28,6 +28,18 @@ return address.
 The kernel clobbers RDI, RSI, RDX, R8, R9 and R10; callers must treat them as
 volatile. Caller-saved scratch registers are scrubbed before `sysret` so kernel
 values do not leak back to user space.
+
+**An argument a caller does not pass is passed as zero.** The kernel reads
+the registers a call's row names, whatever is in them. A call that is given
+another argument in a later version — which is how most of them have grown:
+a flag that says what the first argument names, an option that zero means
+"as before" for — reads it from every caller there is, including the ones
+written when the call took fewer. So a caller clears the argument registers
+it does not use, RDI to R8, on every call; a wrapper that only marks them
+clobbered leaves in them whatever the program had last computed.
+`SYS_SIG_RAISE` took a third argument from 3.4, a C library went on passing
+two, and for as long as the third register happened to hold nothing
+`raise(SIGSTOP)` stopped the caller.
 
 Two flags are cleared on every entry to the kernel, by SFMASK for a system
 call and by the interrupt and exception stubs for everything else: AC, so a
@@ -197,6 +209,8 @@ returning at once turned that loop into a spin.
 | 3.7 | **Named pipes.** `SYS_FD_SERVE_PIPE` (231): a server gives a task that is calling it one end of the pipe a key of the server's names — the same pipe for everybody who is given the same key, for as long as any of them holds an end. `SYS_PIPE_PEER` (232): wait until somebody has opened the other end. The name, its owner and its mode are a file server's; the pipe is the kernel's, because a program waits on one with `SYS_POLL`. |
 | 3.8 | **Jobs.** Every process is in a process group and a session, and a terminal has one group in front of it. `SYS_PGROUP` (211) reads and sets them. `SYS_SIG_RAISE` with arg2 = 2 raises a signal for a group. Signals 19 to 22 stop a program — every task of it held where it is — and 18 starts it again; a parent hears of both as signal 17 and, asking with flags 4 and 8, from `SYS_WAIT_FOR`, which with flag 16 also waits for a group of children. `SYS_PTY_CTL` ops 5 to 8 make a terminal a session's controlling terminal and say which group is in front; what is typed raises its signals for that group, a read by any other group of the session stops the reader (signal 21), and `VSUSP` raises signal 20. `SYS_TASK_INFO` reports a stopped task as state 4. A terminal no session has claimed behaves as before. |
 | 3.9 | **Who a task is.** A task is in up to sixteen groups besides its own: `SYS_GROUPS` (212) reads them for anybody and sets them for a holder of `SetUid`, they are inherited as the user and group are, and a file server reads them to decide whether a file's group is one of the caller's. `SYS_IDENTIFY` (213) is how a server that holds `SetUid` says who somebody is: the user, the group and the groups of a task that is in a call to it, or of a child that task has created and not started, set in one step and checked by the kernel at that step. `SYS_SET_UID` and `SYS_SET_GID` are unchanged. Also, with no new number: a task waiting on one that ends — sending to it, in a call to it, receiving from it alone — stops waiting when it *ends*, where it used to when the dead task was collected. Its collector may be the one waiting: a parent in a call to a child that exited without answering waited for itself. And: a terminal's slave is for the session that has claimed the terminal — for the user who made the pair, until one has — and no longer for whoever holds a descriptor for it or knows its number. `SYS_PTY_OPEN`, a read or a write of a slave, and `SYS_PTY_CTL` ops 1 and 3 through one are refused to anybody else. A program left running by somebody who then logged out went on holding the console. |
+
+| 3.10 | **More than one processor.** The kernel starts every processor the machine's ACPI tables list and runs tasks on all of them, with itself on one at a time. `SYS_CPUS` (117) says how many there are and which the caller is on. Nothing else has a new number, and what changes is when things happen: tasks run at once; a task ended or stopped from outside while it runs on another processor goes on in ring 3 until that processor is interrupted; `SYS_WAIT_FOR` asked not to wait may answer 0 for a child ended an instant ago; and what a task starts may run before the call that started it returns. See *Processors* under block 0x70. |
 
 3.1 was a change of behaviour and no change of number, so a minor: nothing built for
 3.0 calls anything that means something else now. What it could have relied on
@@ -882,6 +896,7 @@ to hear from.
 | 114 | `SYS_IOPORT` | arg0 = port, arg1 = op, arg2 = value | read value, or 0 / `u64::MAX` | `IoPort` covering the port |
 | 115 | `SYS_IOPORT_REP` | arg0 = port, arg1 = buf, arg2 = words, arg3 = op | 0 / `u64::MAX` | `IoPort` covering the port |
 | 116 | `SYS_GETRANDOM` | arg0 = buf, arg1 = len, arg2 = flags (none yet) | bytes written, at most 1 MiB / `u64::MAX` | — |
+| 117 | `SYS_CPUS` | — | `(the processor the caller is on << 32) \| how many processors there are` | — |
 
 `SYS_IOPORT` ops: 0 = read8, 1 = write8, 2 = read16, 3 = write16, 4 = read32,
 5 = write32. `SYS_IOPORT_REP` ops: 0 = `rep insw`, 1 = `rep outsw`.
@@ -899,6 +914,44 @@ timing alone, which is guessable, and the kernel says so on the serial line
 (`[random] no RDRAND or RDSEED; seeded from timing`). The kernel checks the
 block function against the RFC's test vector at boot and will not start if it
 is wrong.
+
+**Processors.** `SYS_CPUS` says how many processors are running the system:
+the ones the firmware listed that could be started, sixteen at most, and 1
+on a machine with no ACPI tables or no local APIC. They are numbered from 0,
+and the upper half of the answer is the one the caller was on when it asked
+— which is true of that instant and no other, since a task is run by
+whichever processor takes it next and nothing yet says which.
+
+With more than one, tasks run at the same time: the threads of a program,
+and a client and the server it is not waiting for. What the rest of this
+document says about one task and another still holds, with these
+differences, all of which are a matter of *when*:
+
+- **A task ended or stopped from outside while it is running goes on for a
+  moment.** `SYS_TASK_KILL`, a signal that ends or stops a program, and a
+  fault in another thread are all acted on at once as far as the kernel is
+  concerned — the task is dead, or held, and makes no further call — but a
+  task in ring 3 on another processor runs until that processor is
+  interrupted, which is asked for at once and takes microseconds. Memory it
+  shares with somebody may be written in that time.
+- **So a child that has just been ended may not be there to collect yet.**
+  `SYS_WAIT_FOR` waits for it as it would for any child that has not
+  finished; asked not to wait, it may answer 0 where a moment later it will
+  answer with the child.
+- **What a task starts may run before the call that started it returns.**
+  `SYS_TASK_START`, `SYS_FORK` and waking a task with a message put it
+  where an idle processor will take it at once. On one processor the caller
+  went on until it waited; code that gave a child something *after*
+  starting it, and worked, was relying on that.
+- **A band is a rule about one processor's choice.** A task runs only when
+  nothing in a better band is waiting *for that processor*: with four
+  processors, the four best tasks run, and a driver that spins takes one
+  processor and not the machine.
+
+The kernel itself runs on one processor at a time: a system call, a fault
+or an interrupt on a second processor waits for the first to leave. Two
+programs computing run side by side; two programs making calls take turns
+at the calls.
 
 ### Synchronisation (0x80)
 

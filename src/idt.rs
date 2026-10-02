@@ -1,8 +1,11 @@
 //! IDT (Interrupt Descriptor Table) and exception handling for x86-64.
 //!
-//! Sets up handlers for all 32 CPU exceptions and the sixteen interrupt
-//! lines. The stack a double fault is taken on, and the one an interrupt
-//! from ring 3 is, are in each processor's task state segment (`percpu.rs`).
+//! Sets up handlers for all 32 CPU exceptions, the sixteen interrupt lines
+//! of the 8259, and the interrupts a processor's local APIC raises: its
+//! timer, and what another processor sends it. The stack a double fault is
+//! taken on, and the one an interrupt from ring 3 is, are in each
+//! processor's task state segment (`percpu.rs`). The table itself is one
+//! for the machine; every processor loads it.
 
 use crate::{console, io, ipc, pic, pit, scheduler};
 
@@ -228,6 +231,46 @@ irq_stub!(13);
 irq_stub!(14);
 irq_stub!(15);
 
+// What comes through a processor's local APIC rather than the 8259. Each
+// stub pushes its own vector, which is how `irq_handler` tells these from
+// the sixteen lines above and from each other.
+
+/// A processor's own timer: its tick (`lapic::start_timer`). Every
+/// processor but the first has one; the first is ticked by the 8254.
+pub const VEC_TIMER: u8 = 0xE0;
+/// From another processor: look at what you are running, and at what is
+/// waiting to run (`smp.rs`).
+pub const VEC_RESCHED: u8 = 0xE1;
+/// From another processor: forget your translations (`tlb.rs`). Answered
+/// without the kernel lock.
+pub const VEC_FLUSH: u8 = 0xF0;
+/// From another processor: the kernel has faulted, stop.
+pub const VEC_HALT: u8 = 0xF1;
+/// What a local APIC raises when an interrupt went away before it could be
+/// delivered. Nothing is owed for it, not even an acknowledgement.
+pub const VEC_SPURIOUS: u8 = 0xFF;
+
+macro_rules! apic_stub {
+    ($name:literal, $vector:literal) => {
+        core::arch::global_asm!(
+            concat!(
+                ".global ", $name, "\n",
+                $name, ":\n",
+                "    pushq $0\n",
+                "    pushq $", $vector, "\n",
+                "    jmp irq_common\n"
+            ),
+            options(att_syntax)
+        );
+    };
+}
+
+apic_stub!("apic_stub_timer", "0xE0");
+apic_stub!("apic_stub_resched", "0xE1");
+apic_stub!("apic_stub_flush", "0xF0");
+apic_stub!("apic_stub_halt", "0xF1");
+apic_stub!("apic_stub_spurious", "0xFF");
+
 // The direction flag, on the way in.
 //
 // The processor delivers an interrupt or an exception with RFLAGS.DF as the
@@ -378,6 +421,9 @@ core::arch::global_asm!(
 const PF_PRESENT: u64 = 1 << 0;
 const PF_WRITE: u64 = 1 << 1;
 const PF_USER: u64 = 1 << 2;
+/// A reserved bit was set in a page-table entry: never a fault that goes
+/// away by itself.
+const PF_RESERVED: u64 = 1 << 3;
 const PF_INSN_FETCH: u64 = 1 << 4;
 
 /// IPC tag for page fault messages sent to pager tasks.
@@ -477,9 +523,17 @@ fn report_kernel_state(frame: &InterruptFrame, kbase: usize, ktop: usize) {
 /// lock is taken unless what faulted was the kernel holding it, and what
 /// was taken is given back (`klock.rs`). A fault that ends the task does
 /// not come back, and one in the kernel does not come back at all.
+///
+/// A fault taken in ring 3 may have waited at the door for the lock, and
+/// the task may have been ended or stopped by whoever held it: that is
+/// looked at first (`scheduler::arrived`), and a task that was ended has
+/// no fault to be told about.
 #[unsafe(no_mangle)]
 extern "C" fn exception_handler(frame: &InterruptFrame) {
     let took = crate::klock::enter();
+    if frame.cs & 3 != 0 {
+        scheduler::arrived();
+    }
     exception(frame);
     crate::klock::leave(took);
 }
@@ -487,6 +541,25 @@ extern "C" fn exception_handler(frame: &InterruptFrame) {
 fn exception(frame: &InterruptFrame) {
     let vec = frame.vector as usize;
     let from_user = frame.cs & 3 != 0;
+
+    // A page fault that the page tables no longer agree with. The fault was
+    // taken in ring 3 and then waited for the kernel; meanwhile another
+    // thread of the program, on another processor, faulted on the same new
+    // page and was given its memory, or the page was made writable while
+    // this processor still remembered that it was not. Either way what was
+    // asked for is allowed now, and the instruction is run again. Before
+    // there was a second processor a fault and its handling were one step,
+    // and the next thing below would call this page's reservation gone and
+    // end the program.
+    if vec == 14 && from_user && frame.error_code & PF_RESERVED == 0 {
+        let cr2: u64;
+        unsafe { core::arch::asm!("mov {}, cr2", out(reg) cr2, options(nostack, nomem)) };
+        let write = frame.error_code & PF_WRITE != 0;
+        let exec = frame.error_code & PF_INSN_FETCH != 0;
+        if unsafe { crate::paging::permits(crate::paging::read_cr3(), cr2 as usize, write, exec) } {
+            return;
+        }
+    }
 
     // A fault on a page a mapping reserved is served, not fatal: the page is
     // given its memory and the instruction runs again. The kernel's own copies
@@ -615,9 +688,14 @@ fn exception(frame: &InterruptFrame) {
         scheduler::exit_program(-sig);
     }
 
-    // Kernel faults: fatal
-    // DEBUG: serial trace for kernel exceptions
-    crate::serial::puts(b"[KFAULT vec=");
+    // Kernel faults: fatal, and for the whole machine. The other processors
+    // are stopped first: this one has the kernel lock and is keeping it, so
+    // they would get no further than the door anyway, and what follows on
+    // the serial line should be one processor's account.
+    crate::smp::halt_others();
+    crate::serial::puts(b"[KFAULT cpu=");
+    crate::serial::put_usize(crate::percpu::index());
+    crate::serial::puts(b" vec=");
     crate::serial::put_usize(vec);
     crate::serial::puts(b" rip=0x");
     crate::serial::put_hex_usize(frame.rip as usize);
@@ -709,10 +787,31 @@ fn exception(frame: &InterruptFrame) {
 /// `exception_handler` is for a fault. One that arrives in ring 3 takes
 /// the lock; one that arrives in the kernel finds it held — unless the
 /// kernel was a processor with nothing to do, waiting in `hlt` without it.
+///
+/// Three interrupts are not ways into the kernel at all and take nothing:
+/// what another processor asks that cannot wait for the lock, because the
+/// one asking has it.
+///
+/// On the way back to ring 3 the task that was interrupted is looked at
+/// again (`scheduler::arrived`): another processor may have ended it or
+/// stopped it, and sent this interrupt to say so.
 #[unsafe(no_mangle)]
 extern "C" fn irq_handler(frame: &InterruptFrame) {
+    match frame.vector as u8 {
+        VEC_FLUSH => {
+            crate::tlb::answer();
+            crate::lapic::eoi();
+            return;
+        }
+        VEC_HALT => crate::smp::halt_here(),
+        VEC_SPURIOUS => return,
+        _ => {}
+    }
     let took = crate::klock::enter();
     irq(frame);
+    if frame.cs & 3 != 0 {
+        scheduler::arrived();
+    }
     crate::klock::leave(took);
 }
 
@@ -720,6 +819,19 @@ fn irq(frame: &InterruptFrame) {
     let irq = frame.vector as u8;
 
     match irq {
+        VEC_TIMER => {
+            // Acknowledged first, as the 8254's is and for its reason: the
+            // tick may switch away, and whatever is switched to must be
+            // able to be ticked.
+            crate::lapic::eoi();
+            scheduler::timer_tick();
+            return;
+        }
+        VEC_RESCHED => {
+            crate::lapic::eoi();
+            scheduler::kicked();
+            return;
+        }
         0 => {
             // Send EOI BEFORE pit::tick() because tick() may context-switch
             // via schedule_inner.  If the preempted task blocks, the deferred
@@ -873,6 +985,12 @@ unsafe extern "C" {
     fn irq_stub_13();
     fn irq_stub_14();
     fn irq_stub_15();
+
+    fn apic_stub_timer();
+    fn apic_stub_resched();
+    fn apic_stub_flush();
+    fn apic_stub_halt();
+    fn apic_stub_spurious();
 }
 
 // ---------------------------------------------------------------------------
@@ -953,6 +1071,26 @@ unsafe fn setup_idt() { unsafe {
     for i in 0..16 {
         (*idt_ptr).entries[32 + i].set_handler(irq_stubs[i] as u64, 0x08, 0);
     }
+
+    let apic_stubs: [(u8, unsafe extern "C" fn()); 5] = [
+        (VEC_TIMER, apic_stub_timer),
+        (VEC_RESCHED, apic_stub_resched),
+        (VEC_FLUSH, apic_stub_flush),
+        (VEC_HALT, apic_stub_halt),
+        (VEC_SPURIOUS, apic_stub_spurious),
+    ];
+    for (vector, stub) in apic_stubs {
+        (*idt_ptr).entries[vector as usize].set_handler(stub as u64, 0x08, 0);
+    }
+}}
+
+/// Load the table of handlers on this processor. It is one table, made by
+/// the first processor ([`init`]).
+///
+/// # Safety
+/// After [`init`] has run on the first processor.
+pub unsafe fn load() { unsafe {
+    load_idt();
 }}
 
 unsafe fn load_idt() { unsafe {

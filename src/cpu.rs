@@ -88,6 +88,43 @@ pub unsafe fn wrmsr(msr: u32, value: u64) {
     }
 }
 
+/// CPUID leaf 1: EDX bit 9 = the processor has a local APIC.
+pub fn has_apic() -> bool {
+    let edx: u32;
+    unsafe {
+        core::arch::asm!(
+            "mov {tmp:r}, rbx",
+            "cpuid",
+            "mov rbx, {tmp:r}",
+            tmp = out(reg) _,
+            inout("eax") 1 => _,
+            inout("ecx") 0 => _,
+            out("edx") edx,
+            options(nostack),
+        );
+    }
+    edx & (1 << 9) != 0
+}
+
+/// CR0 and CR4 as this processor has them: what it has turned on.
+pub fn control_registers() -> (u64, u64) {
+    let cr0: u64;
+    unsafe { core::arch::asm!("mov {}, cr0", out(reg) cr0, options(nomem, nostack)) };
+    (cr0, read_cr4())
+}
+
+/// Turn on, on this processor, what another has: CR0 and CR4 as
+/// [`control_registers`] read them there. For a processor being started,
+/// which begins with only what long mode needs.
+///
+/// # Safety
+/// The values must be another processor's of the same machine, and this
+/// one must already be in long mode with paging on.
+pub unsafe fn set_control_registers((cr0, cr4): (u64, u64)) { unsafe {
+    write_cr4(cr4);
+    core::arch::asm!("mov cr0, {}", in(reg) cr0, options(nomem, nostack));
+}}
+
 fn read_cr4() -> u64 {
     let val: u64;
     unsafe { core::arch::asm!("mov {}, cr4", out(reg) val, options(nomem, nostack)) };

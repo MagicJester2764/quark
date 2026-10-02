@@ -215,10 +215,22 @@ pub fn read_cr3() -> usize {
 
 /// Load a new PML4 physical address into CR3.
 ///
+/// And say so where the other processors can read it (`percpu::cr3_of`):
+/// one that takes a mapping out of an address space asks every processor
+/// that has the space loaded to forget it. The two are done with interrupts
+/// off, so that no switch comes between them and finds one without the
+/// other.
+///
 /// # Safety
 /// The address must point to a valid, identity-mapped PML4 table.
 pub unsafe fn write_cr3(addr: usize) { unsafe {
+    let flags: u64;
+    asm!("pushfq; pop {}; cli", out(reg) flags, options(nostack));
     asm!("mov cr3, {}", in(reg) addr as u64, options(nomem, nostack));
+    crate::percpu::note_cr3(addr);
+    if flags & (1 << 9) != 0 {
+        asm!("sti", options(nomem, nostack));
+    }
 }}
 
 /// Invalidate the TLB entry for a virtual address.
@@ -356,6 +368,11 @@ pub unsafe fn map_page(
     let old = pt.entries[pti];
     if old.is_present() && old.raw() & OWNED != 0 && old.frame_address() != phys_addr {
         pmm::free(pmm::PhysFrame::from_address(old.frame_address()));
+    }
+    if old.is_present() {
+        // What was here is still in the cache of any other processor that
+        // has this address space loaded.
+        crate::tlb::stale(pml4_phys);
     }
     crate::memobj::drop_entry(old.raw());
 
@@ -726,6 +743,7 @@ pub unsafe fn clear_range(pml4_phys: usize, virt: usize, pages: usize) -> usize 
                 }
                 pt.entries[pti].clear();
                 invlpg(va);
+                crate::tlb::stale(pml4_phys);
             } else if e.raw() != 0 {
                 pt.entries[pti].clear();
             }
@@ -780,6 +798,53 @@ pub unsafe fn walk_flags(pml4_phys: usize, virt: usize) -> Option<u64> { unsafe 
 
     let _ = descend!(table_at(e.frame_address()).entries[pti]);
     Some(synth_flags(user, writable))
+}}
+
+/// Whether the tables of `pml4_phys`, as they are now, let ring 3 do what
+/// it has just faulted trying to do at `virt`: read it, or write it, or run
+/// it.
+///
+/// A fault says what the tables were when the processor looked. By the time
+/// the kernel is looking they may say something else: another thread of the
+/// program, on another processor, touched the same new page a moment
+/// sooner and has been given its memory; or was given leave to write where
+/// this one's processor still remembered it could not. There is nothing to
+/// do for such a fault but run the instruction again.
+///
+/// # Safety
+/// `pml4_phys` must point to a valid, identity-mapped PML4 table.
+pub unsafe fn permits(pml4_phys: usize, virt: usize, write: bool, exec: bool) -> bool { unsafe {
+    if (virt as u64) < USER_MIN_ADDR || (virt as u64) >= USER_ADDR_LIMIT {
+        return false;
+    }
+    let (pml4i, pdpti, pdi, pti) = table_indices(virt);
+    // Every level has to agree: present, for ring 3, writable if it is a
+    // write, and not marked as data if it is being run.
+    let allows = |e: PageTableEntry| {
+        e.is_present()
+            && e.raw() & USER != 0
+            && (!write || e.raw() & WRITABLE != 0)
+            && (!exec || e.raw() & NO_EXECUTE == 0)
+    };
+    let e = table_at(pml4_phys).entries[pml4i];
+    if !allows(e) {
+        return false;
+    }
+    let e = table_at(e.frame_address()).entries[pdpti];
+    if !allows(e) {
+        return false;
+    }
+    if e.is_huge() {
+        return true;
+    }
+    let e = table_at(e.frame_address()).entries[pdi];
+    if !allows(e) {
+        return false;
+    }
+    if e.is_huge() {
+        return true;
+    }
+    allows(table_at(e.frame_address()).entries[pti])
 }}
 
 /// Build a flags word carrying just the effective PRESENT/USER/WRITABLE bits
@@ -1027,6 +1092,7 @@ pub unsafe fn unmap_page(
     pt.entries[pti].clear();
 
     invlpg(virt_addr);
+    crate::tlb::stale(pml4_phys);
 
     // Release page tables that just became empty. Restricted to the per-address
     // -space user window: the tables under PML4[0] are shared with the kernel

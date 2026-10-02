@@ -282,6 +282,9 @@ pub const SYS_IOPORT: u64 = 114;
 pub const SYS_IOPORT_REP: u64 = 115;
 /// Random bytes from the kernel's generator.
 pub const SYS_GETRANDOM: u64 = 116;
+/// How many processors the system is running on, and which of them the
+/// caller was on when it asked.
+pub const SYS_CPUS: u64 = 117;
 
 // --- 0x80  synchronisation ---
 pub const SYS_FUTEX_WAIT: u64 = 128;
@@ -385,7 +388,7 @@ pub const SYS_ABI_VERSION: u64 = 240;
 /// minor when calls are added. User space can refuse to run against a major it
 /// does not know, which is the point of exposing it at all.
 pub const ABI_VERSION_MAJOR: u64 = 3;
-pub const ABI_VERSION_MINOR: u64 = 9;
+pub const ABI_VERSION_MINOR: u64 = 10;
 
 /// Threads a task may make with no capability at all.
 ///
@@ -468,6 +471,16 @@ unsafe extern "C" {
 /// # Safety
 /// Must be called after GDT is set up with user segments.
 pub unsafe fn init() {
+    unsafe { init_processor() };
+    console::puts(b"Syscall/sysret initialized.\n");
+}
+
+/// What `syscall` does is said in MSRs, and a processor has its own: every
+/// one that will run a program is told the same.
+///
+/// # Safety
+/// As [`init`], on the processor being set up.
+pub unsafe fn init_processor() {
     let efer = read_msr(MSR_EFER);
     write_msr(MSR_EFER, efer | 1); // SCE
 
@@ -491,8 +504,6 @@ pub unsafe fn init() {
 
     write_msr(MSR_LSTAR, syscall_entry as *const () as u64);
     write_msr(MSR_SFMASK, SFMASK_VALUE);
-
-    console::puts(b"Syscall/sysret initialized.\n");
 }
 
 const USER_ADDR_LIMIT: u64 = paging::USER_ADDR_LIMIT;
@@ -721,6 +732,9 @@ extern "C" fn syscall_dispatch(
     arg4: u64,
 ) -> u64 {
     crate::klock::acquire();
+    // It may have waited at the door for that, and whoever had the lock may
+    // have ended this task or stopped it. One that was ended makes no call.
+    scheduler::arrived();
     unsafe { core::arch::asm!("sti", options(nostack, nomem)) };
     let answer = dispatch(nr, arg0, arg1, arg2, arg3, arg4);
     unsafe { core::arch::asm!("cli", options(nostack, nomem)) };
@@ -3208,6 +3222,14 @@ fn dispatch(
             crate::pit::ticks()
         }
         SYS_BOOT_TIME => crate::rtc::boot_time(),
+        SYS_CPUS => {
+            // No capability: it is a number every program is entitled to
+            // divide its work by. The processor the caller is on is true of
+            // the instant it was read and of no other: a task is moved
+            // wherever it can be preempted, which here is the next line.
+            let on = crate::percpu::index() as u64;
+            (on << 32) | crate::percpu::count() as u64
+        }
         SYS_GETRANDOM => {
             // arg0 = buffer, arg1 = length, arg2 = flags (none yet). No
             // capability: a random number is nobody's secret until it has

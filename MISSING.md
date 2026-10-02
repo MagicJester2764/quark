@@ -10,10 +10,17 @@ them struck through as done. What follows is what is true now.
 
 ## Not there
 
-- **A second CPU.** The kernel is uniprocessor, and several of its invariants
-  lean on that: `IrqSpinLock` panics on contention precisely because, on one
-  CPU, contention can only mean a lock taken twice. SMP invalidates that
-  reasoning across the kernel and is its own project.
+- **A second processor in the kernel.** Programs run on every processor
+  the machine has; the kernel runs on one at a time
+  ([`docs/smp.md`](docs/smp.md)). A system call, a fault or an interrupt on
+  a second processor waits for the first to leave, so four programs making
+  calls make no more calls than one. Taking that lock apart is its own
+  project, and with it go the rest of what using several processors well
+  means: a ready queue for each rather than one for the machine, a task kept
+  where its cache is, a task that can say where it runs, a better task
+  waking that interrupts the processor running the worst rather than
+  waiting for a tick, and an idle processor that takes no ticks. Sixteen
+  processors at most.
 - **Paging anything out.** Anonymous memory gets its frames when first touched
   and keeps them; a machine that runs out ends whichever task touched the page
   it could not give, not the biggest one. There is no swap.
@@ -62,13 +69,15 @@ them struck through as done. What follows is what is true now.
 - **A clock finer than the tick.** Time is the PIT at 100 Hz: a timer, a sleep
   and a futex deadline all round up to ten milliseconds. There is no HPET, no
   APIC timer and no use of the TSC.
-- **An interrupt controller newer than the 8259.** Sixteen lines, no APIC, no
-  MSI. A driver for a device that only speaks MSI has nothing to be given.
-- **ACPI, acted on.** The kernel reads two of its tables at boot
-  (`acpi.rs`) — how many processors there are and where the interrupt
-  controllers are, how the machine is restarted and turned off — says what
-  it found on the serial line, and does nothing with it yet. Powering off is
-  still a user program writing to a port QEMU happens to listen on.
+- **An interrupt controller newer than the 8259, for devices.** Each
+  processor's local APIC is used for its own tick and for what one
+  processor says to another; every device still interrupts the first
+  processor through the 8259's sixteen lines. No I/O APIC, no MSI: a driver
+  for a device that only speaks MSI has nothing to be given.
+- **ACPI, for power.** The kernel reads two of its tables at boot
+  (`acpi.rs`). What they say about processors it acts on. What they say
+  about restarting the machine and turning it off it does not yet: powering
+  off is still a user program writing to a port QEMU happens to listen on.
 - **Memory above 4 GiB.** The frame allocator's bitmap covers the first four
   gigabytes and the rest of what the firmware reports is left alone.
 - **Setting the clock.** The date is read once, from the CMOS clock at boot,
@@ -81,6 +90,7 @@ will meet:
 
 | | |
 |---|---|
+| Processors | 16 |
 | Tasks | 64, threads included |
 | Descriptors per program | 64, and one more for its working directory |
 | Capability slots per task | 64 |

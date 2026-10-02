@@ -37,12 +37,15 @@ mod shmem;
 mod pollset;
 mod served;
 mod signal;
+mod smp;
 mod job;
 mod klock;
+mod lapic;
 mod stream;
 pub mod pipe;
 mod pty;
 mod timerfd;
+mod tlb;
 mod eventfd;
 mod fdtable;
 pub mod serial;
@@ -132,6 +135,11 @@ pub extern "C" fn kernel_main(multiboot_info: usize) -> ! {
     // Initialize syscall/sysret mechanism
     unsafe { syscall::init() };
 
+    // The other processors, if the machine has any. Here: after everything a
+    // processor is given has been decided on this one, and before there is
+    // a task for a tick to switch to.
+    unsafe { smp::start(&mmap_regions[..mmap_count], (multiboot_info, mb_info_size)) };
+
     // Initialize scheduler
     scheduler::init();
     console::puts(b"Scheduler initialized.\n");
@@ -214,7 +222,22 @@ fn panic(_info: &PanicInfo) -> ! {
     // panic — running the rest of the system on top of whatever inconsistent
     // kernel state caused it.
     unsafe { core::arch::asm!("cli", options(nostack, nomem)) };
-    serial::puts(b"\nKERNEL PANIC!\n");
+    // And the other processors with it, before they can do more with
+    // whatever state this one found itself unable to go on with.
+    smp::halt_others();
+    serial::puts(b"\nKERNEL PANIC!");
+    // Where, and what was said: every panic in the kernel is a sentence.
+    if let Some(at) = _info.location() {
+        serial::puts(b" at ");
+        serial::puts(at.file().as_bytes());
+        serial::puts(b":");
+        serial::put_usize(at.line() as usize);
+    }
+    if let Some(said) = _info.message().as_str() {
+        serial::puts(b": ");
+        serial::puts(said.as_bytes());
+    }
+    serial::puts(b"\n");
     console::puts(b"\nKERNEL PANIC!");
     loop {
         unsafe { core::arch::asm!("hlt", options(nostack, nomem)) };

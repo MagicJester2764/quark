@@ -7,6 +7,23 @@
 /// task 0 is what a processor runs when it has nothing to: the idle loop,
 /// one task with a saved context per processor. It is in no ready queue.
 /// It is what is left when the queues are empty.
+///
+/// **More than one processor.** The queues are the machine's, under the
+/// kernel lock (`klock.rs`), and every processor takes from them: on its
+/// tick, when it has nothing to do, and when it is woken because a task was
+/// made ready while it slept. Nothing here says which processor a task
+/// runs on, and a task that is preempted may be run next by another.
+///
+/// What a second processor changes is that a task which is not the caller
+/// may be *running* — in ring 3, on another processor — at the moment the
+/// kernel does something to it. Two things are done to tasks from outside,
+/// ending them and stopping them, and for both the rule is the same: the
+/// task is marked, its processor is interrupted, and the task is looked at
+/// again every time it comes into the kernel from ring 3 ([`arrived`]). So
+/// a task that has been ended may run a little longer in ring 3, and never
+/// again in the kernel; and two things wait for it to be off its
+/// processor ([`ON_CPU`]): being collected by its parent, and being taken
+/// apart.
 
 use crate::context;
 use crate::task::{Task, TaskState, KERNEL_STACK_SIZE, MAX_TASKS};
@@ -114,6 +131,34 @@ const QUANTUM_TICKS: u32 = 3;
 /// Ticks left in each task's slice.
 static mut SLICE_LEFT: [u32; MAX_TASKS] = [0; MAX_TASKS];
 
+/// The processor each task is running on, or [`NO_CPU`].
+///
+/// A task is on a processor from the switch to it until the switch away
+/// from it — in ring 3, in the kernel, or waiting at the kernel's door for
+/// the lock. Both switches are made with the kernel lock held, and whoever
+/// holds the lock afterwards finds the second one complete: the lock is
+/// not given up half way through a switch.
+///
+/// It is what "this task is not running" has to mean with more than one
+/// processor. A dead task's state says nothing about it: ended from
+/// another processor, a task goes on in ring 3 until the interrupt that
+/// tells its processor arrives, on its own kernel stack and in its own
+/// address space. Neither may be freed under it.
+static mut ON_CPU: [u8; MAX_TASKS] = [NO_CPU; MAX_TASKS];
+const NO_CPU: u8 = u8::MAX;
+
+/// Dead, ended from another processor while it ran, and still on its own:
+/// what is said when a task dies — its parent woken to collect it, SIGCHLD
+/// — has not been said yet, and is said by its processor when it leaves
+/// the task ([`schedule_inner`]). A parent told sooner would collect a
+/// child that is still running.
+static mut UNANNOUNCED: [bool; MAX_TASKS] = [false; MAX_TASKS];
+
+/// A dead task could not be taken apart because it was still on a
+/// processor. Whoever next comes into the kernel from ring 3, or has
+/// nothing to do, tries again.
+static REAP_WANTED: AtomicBool = AtomicBool::new(false);
+
 /// Initialize the scheduler. Creates the idle task (TID 0) which represents
 /// the current execution context (kernel_main's continuation).
 pub fn init() {
@@ -203,6 +248,7 @@ pub fn spawn(entry_fn: fn()) -> usize {
             PROCESS_ID[tid] = crate::cap::endpoint_of(tid);
             crate::fdtable::attach_new(tid);
             enqueue(tid);
+            crate::smp::wake_idle();
         }
         irq_restore(flags);
         return tid;
@@ -291,17 +337,8 @@ pub fn exit_with(code: i32) -> ! {
             // may never call sys_wait, and whatever this task was holding
             // needs reclaiming when it stops, not when it is tidied away.
             note_death(current);
-            let parent = task.parent_tid;
-            // If parent is blocked in sys_wait, wake it with our TID
-            if parent != 0 && waits_for(parent, current) {
-                WAIT_BLOCKED[parent] = false;
-                WAIT_RESULT[parent] = current;
-                WAIT_CODE[parent] = code;
-                REAPED[current] = true;
-                unblock_task(parent);
-            }
         }
-        tell_parent(current);
+        announce(current);
         schedule_inner(false);
     }
     // Should never reach here
@@ -318,6 +355,14 @@ pub fn timer_tick() {
     }
     unsafe {
         let current = crate::percpu::current();
+
+        // A processor with nothing to do: whatever is ready is its to run.
+        if current == 0 {
+            if best_ready_band().is_some() {
+                schedule_inner(true);
+            }
+            return;
+        }
 
         // A task in a better band is waiting, so the running one has had its
         // turn whether or not its slice is spent. Without this a driver woken
@@ -357,11 +402,17 @@ unsafe fn schedule_inner(from_irq: bool) { unsafe {
     // Put current task back in ready queue if it's still runnable. Not the
     // idle loop: that is what runs when the queues are empty, and is in none.
     if current_tid != 0 {
-        if let Some(ref mut task) = TASKS[current_tid] {
-            if task.state == TaskState::Running {
+        let state = TASKS[current_tid].as_ref().map(|t| t.state);
+        if state == Some(TaskState::Running) {
+            if let Some(ref mut task) = TASKS[current_tid] {
                 task.state = TaskState::Ready;
-                enqueue(current_tid);
             }
+            enqueue(current_tid);
+        } else if state == Some(TaskState::Dead) && UNANNOUNCED[current_tid] {
+            // Ended from another processor, and this is the one it was
+            // running on, leaving it: now its parent may be told.
+            UNANNOUNCED[current_tid] = false;
+            announce(current_tid);
         }
     }
 
@@ -371,6 +422,13 @@ unsafe fn schedule_inner(from_irq: bool) { unsafe {
         // Already idle, restore flags and return
         restore_flags(flags);
         return;
+    }
+    // More is ready than this processor is about to run: one that is
+    // asleep can have it. This is how a task that was preempted, or woken
+    // by a reply and left for its waker to make way for, comes to run
+    // somewhere else.
+    if best_ready_band().is_some() {
+        crate::smp::wake_idle();
     }
 
     // A slice of its own, since this is the scheduler choosing it rather than
@@ -396,18 +454,33 @@ unsafe fn switch_to(current_tid: usize, next_tid: usize, flags: u64) { unsafe {
         return;
     }
 
-    // Mark next task as running
+    // Mark next task as running, and here; and the one being left as on no
+    // processor. The lock is held until the switch is done, so nobody sees
+    // the second said before it is true.
     if next_tid != 0 {
         if let Some(ref mut task) = TASKS[next_tid] {
             task.state = TaskState::Running;
         }
+        ON_CPU[next_tid] = crate::percpu::index() as u8;
+    }
+    if current_tid != 0 {
+        ON_CPU[current_tid] = NO_CPU;
+    } else {
+        // Leaving the idle loop — from an interrupt it was woken by, as
+        // often as not, and so before the loop itself can say it is awake.
+        // Left saying it slept, this processor would be "woken" for the
+        // next task made ready, while it ran this one, and that task would
+        // wait for a tick.
+        crate::percpu::woke();
     }
     crate::percpu::set_current(next_tid);
 
-    // Switch CR3 if address spaces differ
-    let old_cr3 = TASKS[current_tid].as_ref().unwrap().cr3;
+    // Switch CR3 if address spaces differ. From what the register holds,
+    // not from the task being left: a task that has just become another
+    // program, or one that has not been to ring 3 yet, is not in the
+    // address space its record names.
     let new_cr3 = TASKS[next_tid].as_ref().unwrap().cr3;
-    if new_cr3 != 0 && new_cr3 != old_cr3 {
+    if new_cr3 != 0 && new_cr3 != crate::paging::read_cr3() {
         crate::paging::write_cr3(new_cr3);
     }
 
@@ -719,8 +792,88 @@ pub fn hold_task(tid: usize) {
     unsafe {
         HELD[tid] = true;
         unqueue(tid);
+        // Running on another processor, it goes on until that processor is
+        // brought into the kernel to look.
+        interrupt_if_elsewhere(tid);
     }
     irq_restore(flags);
+}
+
+/// If `tid` is running on a processor other than this one, interrupt that
+/// processor: the task has been ended or stopped, and in ring 3 it does
+/// not know.
+///
+/// # Safety
+/// Interrupts off.
+unsafe fn interrupt_if_elsewhere(tid: usize) { unsafe {
+    let cpu = ON_CPU[tid];
+    if cpu != NO_CPU && cpu as usize != crate::percpu::index() {
+        crate::smp::interrupt(cpu as usize);
+    }
+}}
+
+/// Whether `tid` is running on a processor other than this one.
+///
+/// # Safety
+/// Interrupts off.
+unsafe fn runs_elsewhere(tid: usize) -> bool { unsafe {
+    ON_CPU[tid] != NO_CPU && ON_CPU[tid] as usize != crate::percpu::index()
+}}
+
+/// A task has come into the kernel from ring 3, or is about to go back
+/// there, and the kernel lock is held: look at what another processor may
+/// have done to it while it ran.
+///
+/// - **Ended**: it does not go on. This processor leaves it, and whoever
+///   was waiting to collect it is told then.
+/// - **Stopped**: it waits here until its program is continued.
+///
+/// Called at each of the kernel's three doors — a system call, a fault and
+/// an interrupt taken in ring 3. With one processor neither can have
+/// happened: a task that is running is the one doing things.
+///
+/// And if a dead task was left waiting to be taken apart because it was
+/// still running somewhere, this is as good a moment as the idle loop.
+pub fn arrived() {
+    // Looked at before it is taken: this is on the way into every system
+    // call, and taking it is a write every processor would wait its turn at.
+    if REAP_WANTED.load(Ordering::Relaxed) && REAP_WANTED.swap(false, Ordering::Relaxed) {
+        reap_dead();
+    }
+    let me = crate::percpu::current();
+    if me == 0 {
+        return;
+    }
+    let flags = irq_save();
+    let (dead, held) = unsafe {
+        (matches!(TASKS[me], Some(ref t) if t.state == TaskState::Dead), HELD[me])
+    };
+    if dead {
+        unsafe { schedule_inner(false) };
+        // A dead task is never switched back to.
+        loop {
+            core::hint::spin_loop();
+        }
+    }
+    irq_restore(flags);
+    if held {
+        stop_here();
+    }
+}
+
+/// Another processor has interrupted this one to have it look at what it
+/// is doing. For a task in ring 3 the looking is [`arrived`], on the way
+/// back there. For a processor with nothing to do, it is this: something
+/// has been made ready.
+pub fn kicked() {
+    if !INITIALIZED.load(Ordering::SeqCst) {
+        return;
+    }
+    unsafe {
+        if crate::percpu::current() == 0 && best_ready_band().is_some() {
+            schedule_inner(true);
+        }
+    }
 }
 
 /// Let a held task run again: at once if it is ready to, and otherwise when
@@ -733,8 +886,12 @@ pub fn release_task(tid: usize) {
     unsafe {
         if HELD[tid] {
             HELD[tid] = false;
-            if matches!(TASKS[tid], Some(ref t) if t.state == TaskState::Ready) {
+            // Ready, and not running: one that was stopped from another
+            // processor and has not been reached yet is still running, and
+            // simply goes on.
+            if matches!(TASKS[tid], Some(ref t) if t.state == TaskState::Ready) && ON_CPU[tid] == NO_CPU {
                 enqueue(tid);
+                crate::smp::wake_idle();
             }
         }
     }
@@ -825,6 +982,9 @@ pub fn block_task(tid: usize) {
 }
 
 /// Unblock a task and put it back in the ready queue. Used by IPC.
+///
+/// And wake a processor that is asleep, if one is, to run it: whoever woke
+/// it is going on with what it was doing.
 pub fn unblock_task(tid: usize) {
     if tid >= MAX_TASKS {
         return;
@@ -834,6 +994,7 @@ pub fn unblock_task(tid: usize) {
             if task.state == TaskState::Blocked {
                 task.state = TaskState::Ready;
                 enqueue(tid);
+                crate::smp::wake_idle();
             }
         }
     }
@@ -851,6 +1012,14 @@ pub fn unblock_task(tid: usize) {
 ///
 /// Fairness is unaffected: the woken task still yields at the end of its
 /// timeslice, and a task that never blocks is never overtaken by this.
+///
+/// No processor is woken for it, where [`unblock_task`] wakes one. Whoever
+/// answers a call is about to wait for the next, and the caller runs here
+/// in its place; waking another processor for it would send the two of
+/// them back and forth between processors, an interrupt each way for every
+/// call. If the answerer does not wait after all, the caller is found by
+/// the next processor to look — this one when it next reschedules, or any
+/// that is idle, on its tick.
 pub fn unblock_task_next(tid: usize) {
     if tid >= MAX_TASKS {
         return;
@@ -993,10 +1162,15 @@ pub fn sys_wait_for(target: u64, how: Wait) -> u64 {
                 if group != 0 { crate::job::pgid_of(i) == group } else { target == 0 || target == i }
             };
             let mine = |i: usize| wanted(i) && TASKS[i].as_ref().is_some_and(|t| t.parent_tid == parent);
-            // Check if a child is already dead (zombie) and not yet reaped
+            // Check if a child is already dead (zombie) and not yet reaped.
+            // Not one that was ended from another processor and is still
+            // running there: it is collected when that processor has left
+            // it, and the wait below is woken then.
             for i in 1..MAX_TASKS {
-                let collectable =
-                    mine(i) && !REAPED[i] && matches!(TASKS[i], Some(ref t) if t.state == TaskState::Dead);
+                let collectable = mine(i)
+                    && !REAPED[i]
+                    && !UNANNOUNCED[i]
+                    && matches!(TASKS[i], Some(ref t) if t.state == TaskState::Dead);
                 if collectable {
                     REAPED[i] = true;
                     let code = child_exit_code(i);
@@ -1233,21 +1407,47 @@ fn end_other(tid: usize, code: i32) -> Result<(), ()> {
                 close_descriptors(tid);
                 crate::ipc::fail_waiters(tid);
                 note_death(tid);
-                let parent = task.parent_tid;
-                if parent != 0 && waits_for(parent, tid) {
-                    WAIT_BLOCKED[parent] = false;
-                    WAIT_RESULT[parent] = tid;
-                    WAIT_CODE[parent] = code;
-                    REAPED[tid] = true;
-                    unblock_task(parent);
-                }
             }
             _ => return Err(()),
         }
-        tell_parent(tid);
+        if runs_elsewhere(tid) {
+            // It is running, in ring 3, on another processor, and goes on
+            // until that processor comes into the kernel: which this makes
+            // it do. It has not finished dying until then — it is on its
+            // kernel stack and in its address space — so its parent is
+            // told by that processor as it leaves ([`schedule_inner`]).
+            UNANNOUNCED[tid] = true;
+            interrupt_if_elsewhere(tid);
+        } else {
+            announce(tid);
+        }
         Ok(())
     }
 }
+
+/// Say that `tid`, which is dead and on no processor, has died: wake its
+/// parent if it is waiting to collect it, and raise SIGCHLD for it.
+///
+/// The last thing a death does, and for a task ended from another
+/// processor it is done later than the rest, by the processor the task was
+/// on: a parent woken sooner would collect — and take apart — a task that
+/// was still running.
+///
+/// # Safety
+/// Interrupts off.
+unsafe fn announce(tid: usize) { unsafe {
+    let Some(ref task) = TASKS[tid] else { return };
+    let (parent, code) = (task.parent_tid, task.exit_code);
+    // If parent is blocked in sys_wait, wake it with the dead child's TID
+    if parent != 0 && waits_for(parent, tid) {
+        WAIT_BLOCKED[parent] = false;
+        WAIT_RESULT[parent] = tid;
+        WAIT_CODE[parent] = code;
+        REAPED[tid] = true;
+        unblock_task(parent);
+    }
+    tell_parent(tid);
+}}
 
 /// End the running task's whole program: every other task in its address
 /// space, and then the caller, all with one status.
@@ -1411,16 +1611,24 @@ pub fn idle() -> ! {
     loop {
         // Here the lock is held and interrupts are off.
         loop {
+            REAP_WANTED.store(false, Ordering::Relaxed);
             reap_dead();
             if !run_ready() {
                 break;
             }
         }
+        // Said before the lock goes, so that whoever makes a task ready
+        // next — which takes the lock — knows there is a processor to wake
+        // for it (`smp::wake_idle`).
+        unsafe { crate::percpu::nap() };
         crate::klock::release();
         // An interrupt is not taken between `sti` and the instruction after
         // it, so nothing can arrive after the look above and before the
         // wait: it arrives during the wait, and ends it.
-        unsafe { core::arch::asm!("sti; hlt; cli", options(nostack, nomem)) };
+        unsafe {
+            core::arch::asm!("sti; hlt; cli", options(nostack, nomem));
+            crate::percpu::woke();
+        }
         crate::klock::acquire();
     }
 }
@@ -1501,6 +1709,23 @@ unsafe fn reap_one(i: usize) -> u64 { unsafe {
     if !can_reap {
         return 0;
     }
+    // Its parent was waiting for it, has been woken to collect it, and has
+    // not run yet. The parent reads the child's name when it does, and takes
+    // it apart itself (`sys_wait_for`); this is somebody else — a processor
+    // with nothing to do — and must not get there first. With one processor
+    // nothing could: the parent was ready, and the idle loop runs when
+    // nothing is. With two, the parent was told its child was process 0.
+    if parent != 0 && WAIT_RESULT[parent] == i {
+        return 0;
+    }
+    // Ended from another processor, and still running there: what is freed
+    // below is what it is standing on. That processor has been interrupted
+    // and will leave it; whoever next comes into the kernel, or has nothing
+    // to do, tries again.
+    if ON_CPU[i] != NO_CPU {
+        REAP_WANTED.store(true, Ordering::Relaxed);
+        return 0;
+    }
     // For a task that died some way other than `exit_with` or `kill_task` —
     // a kernel task, say. Ordinarily it left its table when it died.
     crate::fdtable::task_gone(i);
@@ -1553,6 +1778,7 @@ unsafe fn reap_one(i: usize) -> u64 { unsafe {
     crate::cap::close_endpoint(i);
     PROCESS_ID[i] = 0;
     HELD[i] = false;
+    UNANNOUNCED[i] = false;
     crate::job::forget(i);
     TASKS[i] = None;
 
@@ -1829,6 +2055,8 @@ pub fn create_empty_task() -> Option<usize> {
         // In its creator's process group and session: a job is whatever a
         // shell started, and what those started.
         HELD[tid] = false;
+        UNANNOUNCED[tid] = false;
+        ON_CPU[tid] = NO_CPU;
         crate::job::born(tid, parent, PROCESS_ID[tid]);
         crate::fdtable::attach_new(tid);
     }
@@ -1943,6 +2171,7 @@ unsafe fn start_task_locked(tid: usize, rip: u64, rsp: u64, cr3: usize, arg: u64
 
         task.state = TaskState::Ready;
         enqueue(tid);
+        crate::smp::wake_idle();
         Ok(())
     }
 }
@@ -2206,12 +2435,22 @@ pub fn fork_current() -> Option<usize> {
 }
 
 /// Is any task running in the address space with this id?
+///
+/// Or still on a processor in it, having been ended from another: that one
+/// is dead, and is executing there all the same until its processor is
+/// brought into the kernel. This is what is asked before an address space
+/// is thrown away.
 pub fn space_in_use(space: u64) -> bool {
     if space == 0 {
         return false;
     }
     let flags = irq_save();
-    let used = unsafe { space_has_live_task(space) };
+    let used = unsafe {
+        space_has_live_task(space)
+            || (1..MAX_TASKS).any(|i| {
+                ON_CPU[i] != NO_CPU && matches!(TASKS[i], Some(ref t) if t.space == space)
+            })
+    };
     irq_restore(flags);
     used
 }
@@ -2351,6 +2590,7 @@ fn start_forked(tid: usize, cr3: usize, frame: &crate::task::UserFrame) -> Resul
         task.context.r14 = cr3 as u64;
         task.state = TaskState::Ready;
         enqueue(tid);
+        crate::smp::wake_idle();
     }
     irq_restore(flags);
     Ok(())

@@ -138,9 +138,10 @@ system hung.
 
 There are no tests in this tree, and that is the shape of a microkernel rather
 than an omission: the kernel is tested from outside, through the ABI, by a
-program. `dtest` in `../quarkutils` makes 662 checks — capabilities, IPC,
-memory, descriptors, signals, scheduling, users and terminals, `dtest calls` with three million calls in
-three seconds — and `qfuzz` throws random requests at every service.
+program. `dtest` in `../quarkutils` makes 678 checks — capabilities, IPC,
+memory, descriptors, signals, scheduling, users and terminals, `dtest calls`
+with three million calls in three seconds, `dtest smp` for what a second
+processor changes — and `qfuzz` throws random requests at every service.
 
 So a kernel change is verified by booting an image:
 
@@ -150,6 +151,13 @@ make hd                                   # or hd-ext4
 tools/boot-test.sh <keys-file> <shot.ppm> # type `dtest`, screenshot the result
 tools/check-rootfs.sh hdimage.bin         # e2fsck on what the boot left
 ```
+
+**On one processor and on several.** `SMP=4 tools/boot-test.sh …` gives the
+machine four, and a kernel change is not verified until it has passed on
+both: one processor is still a machine people have, and it is the only one
+on which nothing runs at the same time as anything, which hides and shows
+different mistakes. Under KVM the four are four real processors, and a race
+is a real race.
 
 A fault prints to serial: `[UPFAULT ...]` or `[UFAULT ...]` for ring 3, which
 ends the program, and `[KFAULT ...]` for ring 0, which halts the machine. A
@@ -656,6 +664,73 @@ closed:
   `start_task` did that from a system call. Every caller of `unblock_task`
   holds interrupts off, or is an interrupt.
 
+## More than one processor
+
+`docs/smp.md` is the design. These are the rules it leaves behind, and
+breaking any of them is quiet until it is a machine that stops.
+
+- **One processor is in the kernel at a time** (`klock.rs`), and that is
+  what keeps every other rule in this file true: "interrupts off" still
+  means nothing else is in here. The lock is taken at the kernel's three
+  doors — `syscall_dispatch`, `exception_handler`, `irq_handler` — and by
+  nothing else; it is the *processor's*, carried across a switch; and it is
+  given up on every way out to ring 3 and by the idle loop around its `hlt`.
+  A handler remembers in its own frame whether it took the lock
+  (`klock::enter`, `leave`) and gives back exactly that. A new way into the
+  kernel takes it; a new way out — a new trampoline to ring 3 — gives it
+  up. Either mistake panics rather than hangs: the lock knows who has it.
+- **"Which processor is this" has an answer only with interrupts off.** A
+  task in a system call is moved wherever it can be preempted. Nothing reads
+  `percpu::index()` and acts on it later. `percpu::current()` is one
+  instruction through GS, and is right whenever it is asked.
+- **A task that is not the caller may be running.** In ring 3, on another
+  processor, while the kernel ends it or stops it. So: it is marked, its
+  processor is interrupted (`smp::interrupt`), and every task is looked at
+  again at each door, with the lock held (`scheduler::arrived`) — one that
+  was ended goes no further. A new door calls it.
+- **A dead task's state does not say it has stopped running;
+  `scheduler::ON_CPU` does.** Ended from another processor, a task is on its
+  kernel stack and in its address space until its processor leaves it. Its
+  parent is told only then (`UNANNOUNCED`, `announce`), `reap_one` will not
+  take it apart before, and `space_in_use` — what is asked before an address
+  space is thrown away — counts it. Anything new that frees what a task
+  stands on asks `ON_CPU`, not `TaskState::Dead`. `SYS_ADDRSPACE_DESTROY`
+  asked only whether a task was alive.
+- **A mapping taken away is taken away on every processor** (`tlb.rs`),
+  before its frame can be anybody else's (`pmm::alloc` settles first) and
+  before the kernel lock is given up (`klock::release` does). The three
+  functions that clear or replace a present entry — `map_page`,
+  `unmap_page`, `clear_range` — say so (`tlb::stale`); anything new that
+  does must too, or a thread on another processor goes on writing to a
+  frame that is now another program's. Adding a mapping where there was
+  none needs nothing.
+- **What one processor asks of another without the lock is answered without
+  it**, and from the wait for the lock as well as from an interrupt
+  (`smp::while_waiting`): whoever asks is holding the lock, and whoever is
+  asked may be waiting for it with interrupts off. Forgetting translations
+  and halting are the only two. An interrupt that needs the kernel takes the
+  lock like everything else.
+- **A page fault the tables no longer agree with is not a fault**
+  (`paging::permits`). Two threads touch a new page at once; one is given
+  it; the other's fault is heard after. Only for a fault taken in ring 3: in
+  ring 0 the same check would turn the kernel touching what it should not
+  into a loop.
+- **A processor says it is going to sleep before it gives up the lock**
+  (`percpu::nap`), so that whoever next makes a task ready — which takes the
+  lock — knows to wake it (`smp::wake_idle`), and stops saying so the moment
+  it runs anything. `unblock_task` wakes one. `unblock_task_next`, which is
+  a reply to a call, wakes nobody: the answerer is about to wait, and the
+  caller runs in its place.
+- **The clock and every device interrupt the first processor.** The others
+  have a tick of their own from their local APIC, and it does one thing:
+  `scheduler::timer_tick`. `pit::tick` — timeouts, alarms, the count of
+  ticks — runs once a tick, not once a tick a processor.
+- **The other processors are started before there is a task** (`smp::start`
+  in `kernel_main`), with what the first processor has turned on: CR0, CR4,
+  EFER, the `syscall` MSRs. Something turned on later on the first — a CR4
+  bit, an MSR — has to be turned on on the others, or a task that moves
+  finds it gone.
+
 ## Known gaps
 
 - Nothing is ever paged out: anonymous memory is given its frames when first
@@ -693,6 +768,16 @@ closed:
 - A poll set a task is parked on is not held the way a pipe is: a sibling
   closing the set while another thread waits on it leaves that thread to its
   timeout. A one-shot `SYS_POLL` makes a set of its own and is not affected.
-- **SMP.** The kernel is uniprocessor and several invariants depend on it —
-  `IrqSpinLock` panics on contention precisely because on one CPU contention
-  can only mean lock re-entrancy.
+- **The kernel is one processor's at a time.** Programs run on every
+  processor; a system call, a fault or an interrupt waits for the kernel to
+  be empty. So `IrqSpinLock` still panics on contention, and rightly: under
+  the kernel lock, contention can still only mean re-entrancy. Taking the
+  lock apart is its own project. With it go: a ready queue for each
+  processor rather than one for the machine, a task kept where its cache
+  is, a better task waking that interrupts whichever processor is running
+  the worst rather than waiting for its tick, and an idle processor that
+  takes no ticks.
+- Every device interrupts the first processor, through the 8259. There is
+  no I/O APIC and no MSI.
+- Sixteen processors at most, and local APIC ids below 256 unless the
+  firmware left the APICs in x2APIC mode.

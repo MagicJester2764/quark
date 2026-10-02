@@ -140,7 +140,12 @@ pub unsafe fn init(
 }}
 
 /// Allocate a single 4 KiB physical frame.
+///
+/// Not before every processor has forgotten the mappings taken away since
+/// they were last told (`tlb.rs`): the frame handed out here may be one of
+/// those, and a thread on another processor could still reach it.
 pub fn alloc() -> Option<PhysFrame> {
+    crate::tlb::sync();
     let mut pmm = PMM.lock();
     for byte_idx in 0..BITMAP_SIZE {
         if pmm.bitmap[byte_idx] != 0xFF {
@@ -166,6 +171,7 @@ pub fn alloc_contiguous(count: usize) -> Option<PhysFrame> {
     if count == 1 {
         return alloc();
     }
+    crate::tlb::sync();
     let mut pmm = PMM.lock();
     let max_frame = BITMAP_SIZE * 8;
     let mut run_start = 0;

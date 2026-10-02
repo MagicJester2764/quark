@@ -30,7 +30,6 @@ const SDT_HEADER: usize = 36;
 const SDT_MAX: usize = 1 << 20;
 
 #[derive(Clone, Copy)]
-#[allow(dead_code)] // what the tables say is kept whole; not all of it is acted on yet
 pub struct Cpu {
     /// The id its local APIC answers to, which is what an interrupt is
     /// addressed to.
@@ -38,7 +37,7 @@ pub struct Cpu {
 }
 
 #[derive(Clone, Copy)]
-#[allow(dead_code)]
+#[allow(dead_code)] // what the tables say is kept whole; not all of it is acted on yet
 pub struct IoApic {
     pub id: u8,
     pub addr: u32,
@@ -111,7 +110,6 @@ static mut INFO: Info = Info {
 };
 
 /// What the tables said. Unchanged after [`init`].
-#[allow(dead_code)]
 pub fn info() -> &'static Info {
     unsafe { &*core::ptr::addr_of!(INFO) }
 }

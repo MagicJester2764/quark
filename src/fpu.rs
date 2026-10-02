@@ -57,6 +57,23 @@ pub fn init() {
     }
 }
 
+/// Reset the unit on a processor other than the first. What a clean state
+/// is was captured there; a task's own is loaded before it runs here.
+///
+/// # Safety
+/// CR0.EM clear and CR4.OSFXSR set, as on the first processor.
+pub unsafe fn init_processor() {
+    let mxcsr = MXCSR_DEFAULT;
+    unsafe {
+        core::arch::asm!(
+            "fninit",
+            "ldmxcsr [{m}]",
+            m = in(reg) &mxcsr as *const u32,
+            options(nostack, preserves_flags),
+        );
+    }
+}
+
 /// A copy of the state a new task should start in.
 pub fn clean() -> FpuState {
     unsafe { CLEAN }

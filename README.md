@@ -21,6 +21,8 @@ The kernel provides:
 - Preemptive scheduling in four bands (100 Hz PIT), where a synchronous call
   hands the CPU straight to its callee and a task runs at the band of whoever
   is waiting on it
+- Every processor the machine has, up to sixteen: programs run on all of
+  them at once, and the kernel on one at a time
 - Synchronous IPC — send, receive, call and reply with fixed-size messages —
   plus notifications, deadlines, and buffers lent with a call so that no server
   has to map a client's memory
@@ -87,6 +89,12 @@ src/
   elf.rs              ELF64 loader, for init
   idt.rs              Interrupt descriptor table and exceptions
   pit.rs  pic.rs      Timer and interrupt controller
+  acpi.rs             The firmware's tables: processors, interrupt controllers
+  percpu.rs           What each processor has of its own
+  klock.rs            The kernel lock: one processor in the kernel at a time
+  lapic.rs            The local APIC: a tick, and a word to another processor
+  smp.rs  ap_boot.s   Starting the other processors
+  tlb.rs              A mapping taken away, on every processor
   irq_dispatch.rs     IRQ delivery to user-space tasks
   cpu.rs              SMEP, SMAP and the FS base
   random.rs  rtc.rs   Random bytes; the date
@@ -103,6 +111,7 @@ drivers/
 
 docs/abi.md           The system call ABI
 docs/fpu.md           How floating-point state is kept, one copy per task
+docs/smp.md           How it runs on more than one processor
 MISSING.md            What the kernel has not got
 tools/                The ABI check and the header generator
 ```
@@ -143,8 +152,9 @@ make run
 ## Testing
 
 The kernel is tested from outside, through the ABI, by a program: `dtest` in
-quarkutils makes 662 checks from user space. A kernel change is verified by
-booting an image and running it — `tools/boot-test.sh` in ExplOSion.
+quarkutils makes 678 checks from user space. A kernel change is verified by
+booting an image and running it — `tools/boot-test.sh` in ExplOSion — on one
+processor and on four.
 
 ## Disclaimer
 

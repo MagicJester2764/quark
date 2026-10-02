@@ -36,12 +36,41 @@
 //! `hlt` aside, and every context switch happens with it held.
 //!
 //! Waiting for it is spinning with interrupts off. Whoever waits has
-//! nothing else it may do: it is on its way into the kernel.
+//! nothing else it may do: it is on its way into the kernel. Two things
+//! cannot wait for it, though, and it looks for both each time round
+//! (`smp::while_waiting`): the holder may be waiting for *this* processor
+//! to forget a mapping, and the kernel may have faulted and be stopping
+//! the machine.
+//!
+//! **It is not a queue, and it is not unfair either.** A processor that
+//! makes one system call after another gives the lock up and asks for it
+//! back within a few dozen instructions, and would beat a processor that
+//! has been waiting to it every time: the waiter has to see that the lock
+//! is free before it can ask. The clock is an interrupt on one processor,
+//! and a clock that cannot get into the kernel stops. So a processor that
+//! had the lock last, and finds somebody waiting, stands aside for a
+//! moment first. A queue would be fairer still and worse here: a processor
+//! in it that the machine underneath has stopped running — this is usually
+//! a virtual machine — holds up everybody behind it.
+//!
+//! **`IrqSpinLock` still means what it says.** The locks inside the kernel
+//! (`sync.rs`) panic if they are found taken, on the reasoning that with
+//! interrupts off nobody else could have taken them. Under this lock that
+//! is still so: only one processor is in the kernel.
 
 use core::sync::atomic::{AtomicU32, Ordering};
 
 /// The processor in the kernel: its index and one, or 0 for none.
 static OWNER: AtomicU32 = AtomicU32::new(0);
+/// How many processors are waiting for it.
+static WAITERS: AtomicU32 = AtomicU32::new(0);
+/// Who had it last.
+static LAST: AtomicU32 = AtomicU32::new(0);
+
+/// How long a processor that had the lock last stands aside for one that
+/// is waiting: this many turns of a loop, and no longer. The waiter may be
+/// a processor that is not running at all just now.
+const STAND_ASIDE: u32 = 4096;
 
 /// What this processor is called here.
 ///
@@ -61,9 +90,19 @@ pub fn held() -> bool {
 /// Take the lock, waiting for it. Interrupts must be off, and stay off.
 pub fn acquire() {
     let me = me();
+    // Let whoever is waiting go first, if this processor went last.
+    if LAST.load(Ordering::Relaxed) == me {
+        let mut turns = 0;
+        while WAITERS.load(Ordering::Relaxed) != 0 && turns < STAND_ASIDE {
+            crate::smp::while_waiting();
+            core::hint::spin_loop();
+            turns += 1;
+        }
+    }
+    WAITERS.fetch_add(1, Ordering::Relaxed);
     loop {
         match OWNER.compare_exchange_weak(0, me, Ordering::Acquire, Ordering::Relaxed) {
-            Ok(_) => return,
+            Ok(_) => break,
             // Twice by one processor is a way out to ring 3 that forgot to
             // give it up, or a way in that did not ask. Waiting would be
             // waiting for itself, with interrupts off and nothing said.
@@ -71,16 +110,25 @@ pub fn acquire() {
             Err(_) => {}
         }
         while OWNER.load(Ordering::Relaxed) != 0 {
+            crate::smp::while_waiting();
             core::hint::spin_loop();
         }
     }
+    WAITERS.fetch_sub(1, Ordering::Relaxed);
 }
 
 /// Give the lock up. Interrupts must be off.
+///
+/// Not before every other processor has been told of the mappings this one
+/// took away while it had it (`tlb.rs`): once the lock is free they may be
+/// anywhere.
 pub fn release() {
-    if OWNER.load(Ordering::Relaxed) != me() {
+    let me = me();
+    if OWNER.load(Ordering::Relaxed) != me {
         panic!("kernel lock: given up by a processor that does not have it");
     }
+    crate::tlb::sync();
+    LAST.store(me, Ordering::Relaxed);
     OWNER.store(0, Ordering::Release);
 }
 
