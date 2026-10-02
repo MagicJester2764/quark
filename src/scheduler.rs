@@ -143,6 +143,8 @@ pub fn init() {
             clear_child_tid: 0,
             uid: 0,
             gid: 0,
+            groups: [0; crate::task::MAX_GROUPS],
+            ngroups: 0,
             fpu: crate::fpu::clean(),
         });
         crate::fdtable::attach_new(0);
@@ -1579,6 +1581,59 @@ pub fn set_task_uid(tid: usize, uid: u32) -> Result<(), ()> {
     }
 }
 
+/// The groups a task is in besides its own, into `out`. How many there are.
+pub fn task_groups(tid: usize, out: &mut [u32; crate::task::MAX_GROUPS]) -> Result<usize, ()> {
+    if tid >= MAX_TASKS {
+        return Err(());
+    }
+    let flags = irq_save();
+    let got = unsafe {
+        TASKS[tid].as_ref().map(|t| {
+            *out = t.groups;
+            t.ngroups as usize
+        })
+    };
+    irq_restore(flags);
+    got.ok_or(())
+}
+
+/// Say which groups a task is in besides its own.
+pub fn set_task_groups(tid: usize, groups: &[u32]) -> Result<(), ()> {
+    if tid >= MAX_TASKS || groups.len() > crate::task::MAX_GROUPS {
+        return Err(());
+    }
+    let flags = irq_save();
+    let set = unsafe {
+        TASKS[tid].as_mut().map(|t| {
+            t.groups = [0; crate::task::MAX_GROUPS];
+            t.groups[..groups.len()].copy_from_slice(groups);
+            t.ngroups = groups.len() as u8;
+        })
+    };
+    irq_restore(flags);
+    set.ok_or(())
+}
+
+/// Say who a task is: its user, its group and the groups it is in, in one
+/// step.
+pub fn identify(tid: usize, uid: u32, gid: u32, groups: &[u32]) -> Result<(), ()> {
+    if tid >= MAX_TASKS || groups.len() > crate::task::MAX_GROUPS {
+        return Err(());
+    }
+    let flags = irq_save();
+    let set = unsafe {
+        TASKS[tid].as_mut().map(|t| {
+            t.uid = uid;
+            t.gid = gid;
+            t.groups = [0; crate::task::MAX_GROUPS];
+            t.groups[..groups.len()].copy_from_slice(groups);
+            t.ngroups = groups.len() as u8;
+        })
+    };
+    irq_restore(flags);
+    set.ok_or(())
+}
+
 /// Set a task's GID.
 pub fn set_task_gid(tid: usize, gid: u32) -> Result<(), ()> {
     if tid >= MAX_TASKS { return Err(()); }
@@ -1660,10 +1715,10 @@ pub fn create_empty_task() -> Option<usize> {
     };
 
     let parent = current_tid();
-    let (parent_uid, parent_gid) = unsafe {
+    let (parent_uid, parent_gid, parent_groups, parent_ngroups) = unsafe {
         match TASKS[parent].as_ref() {
-            Some(t) => (t.uid, t.gid),
-            None => (0, 0),
+            Some(t) => (t.uid, t.gid, t.groups, t.ngroups),
+            None => (0, 0, [0; crate::task::MAX_GROUPS], 0),
         }
     };
     unsafe {
@@ -1688,6 +1743,8 @@ pub fn create_empty_task() -> Option<usize> {
             clear_child_tid: 0,
             uid: parent_uid,
             gid: parent_gid,
+            groups: parent_groups,
+            ngroups: parent_ngroups,
             // Clean, not the parent's. A new task inheriting whatever the
             // registers held when it was created would be reading its
             // creator's data, and a thread has no more right to that than a

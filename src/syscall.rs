@@ -237,6 +237,18 @@ const SESSION_NEW: u64 = 3;
 /// What a call about groups, sessions or a terminal's answers when the rules
 /// say no, as distinct from there being nothing of the kind (`u64::MAX`).
 const NOT_ALLOWED: u64 = u64::MAX - 1;
+/// Who a task is, continued: block 0x60 is full.
+///
+/// The groups a task is in besides its own. Anybody may read them; a holder
+/// of `SetUid` may set them, for itself or for a child it is preparing.
+pub const SYS_GROUPS: u64 = 212;
+/// `SYS_GROUPS` operations.
+const GROUPS_GET: u64 = 0;
+const GROUPS_SET: u64 = 1;
+/// A holder of `SetUid` says who a task is — its user, its group and the
+/// groups it is in, in one step — where that task is in a call to the
+/// holder, or is a child such a task is still preparing.
+pub const SYS_IDENTIFY: u64 = 213;
 /// Timers, in the time block.
 pub const SYS_TIMER_CREATE: u64 = 146;
 pub const SYS_TIMER_SET: u64 = 147;
@@ -373,7 +385,7 @@ pub const SYS_ABI_VERSION: u64 = 240;
 /// minor when calls are added. User space can refuse to run against a major it
 /// does not know, which is the point of exposing it at all.
 pub const ABI_VERSION_MAJOR: u64 = 3;
-pub const ABI_VERSION_MINOR: u64 = 8;
+pub const ABI_VERSION_MINOR: u64 = 9;
 
 /// Threads a task may make with no capability at all.
 ///
@@ -3429,6 +3441,95 @@ extern "C" fn syscall_dispatch(
             let tid = arg0 as usize;
             match scheduler::task_uid_gid(tid) {
                 Ok((uid, gid)) => ((uid as u64) << 32) | (gid as u64),
+                Err(()) => u64::MAX,
+            }
+        }
+        SYS_GROUPS => {
+            // arg0 = op, arg1 = a task (0 for the caller), arg2 = where the
+            // ids are or go, arg3 = how many.
+            let caller = scheduler::current_tid();
+            let tid = if arg1 == 0 { caller } else { arg1 as usize };
+            let count = arg3 as usize;
+            match arg0 {
+                GROUPS_GET => {
+                    let mut groups = [0u32; crate::task::MAX_GROUPS];
+                    let Ok(n) = scheduler::task_groups(tid, &mut groups) else {
+                        return u64::MAX;
+                    };
+                    // As many as there is room for; the answer is how many
+                    // there are, so a caller with no room at all can ask.
+                    let give = n.min(count);
+                    if give > 0 {
+                        if !validate_user_ptr_mut(arg2, (give * 4) as u64) {
+                            return u64::MAX;
+                        }
+                        let _ua = crate::cpu::UserAccess::begin();
+                        for (i, group) in groups[..give].iter().enumerate() {
+                            unsafe { core::ptr::write_unaligned((arg2 as *mut u32).add(i), *group) };
+                        }
+                    }
+                    n as u64
+                }
+                GROUPS_SET => {
+                    if !crate::cap::task_has_set_uid(caller)
+                        || count > crate::task::MAX_GROUPS
+                        || !(tid == caller || may_prepare(caller, tid))
+                    {
+                        return u64::MAX;
+                    }
+                    let mut groups = [0u32; crate::task::MAX_GROUPS];
+                    if count > 0 {
+                        if !validate_user_ptr(arg2, (count * 4) as u64) {
+                            return u64::MAX;
+                        }
+                        let _ua = crate::cpu::UserAccess::begin();
+                        for (i, group) in groups[..count].iter_mut().enumerate() {
+                            *group = unsafe { core::ptr::read_unaligned((arg2 as *const u32).add(i)) };
+                        }
+                    }
+                    match scheduler::set_task_groups(tid, &groups[..count]) {
+                        Ok(()) => 0,
+                        Err(()) => u64::MAX,
+                    }
+                }
+                _ => u64::MAX,
+            }
+        }
+        SYS_IDENTIFY => {
+            // arg0 = a task in a call to the caller, arg1 = that task or a
+            // child it is preparing, arg2 = uid << 32 | gid (as SYS_GET_UID
+            // answers), arg3 = the groups it is in besides, arg4 = how many.
+            //
+            // Saying who a task is, is something done to it; and as with a
+            // descriptor put in its table or a capability in its CSpace, it
+            // consents by being in a call to whoever does it. Whose child
+            // the target is, is checked here and not by the caller
+            // beforehand: a TID is recycled, and "this was its child a moment
+            // ago" names whatever has the number now.
+            let me = scheduler::current_tid();
+            let client = arg0 as usize;
+            let target = arg1 as usize;
+            let count = arg4 as usize;
+            if !crate::cap::task_has_set_uid(me)
+                || client == me
+                || !crate::ipc::is_calling(client, me)
+                || !(target == client || may_prepare(client, target))
+                || count > crate::task::MAX_GROUPS
+            {
+                return u64::MAX;
+            }
+            let mut groups = [0u32; crate::task::MAX_GROUPS];
+            if count > 0 {
+                if !validate_user_ptr(arg3, (count * 4) as u64) {
+                    return u64::MAX;
+                }
+                let _ua = crate::cpu::UserAccess::begin();
+                for (i, group) in groups[..count].iter_mut().enumerate() {
+                    *group = unsafe { core::ptr::read_unaligned((arg3 as *const u32).add(i)) };
+                }
+            }
+            match scheduler::identify(target, (arg2 >> 32) as u32, arg2 as u32, &groups[..count]) {
+                Ok(()) => 0,
                 Err(()) => u64::MAX,
             }
         }

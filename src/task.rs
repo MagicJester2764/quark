@@ -19,6 +19,8 @@ const STACK_ALIGN: usize = 16;
 /// for the whole system, spent whether or not it is used — see `fdtable.rs`,
 /// which is where the tables are.
 pub const MAX_FDS: usize = 64;
+/// How many groups a task may be in besides its own.
+pub const MAX_GROUPS: usize = 16;
 
 /// What the syscall entry stub pushed, read back as a structure.
 ///
@@ -170,6 +172,10 @@ pub struct Task {
     pub uid: u32,
     /// Group ID. 0 = root.
     pub gid: u32,
+    /// The groups it is in besides `gid`, and how many of them there are.
+    /// A file's group may be any of these: what a file server checks.
+    pub groups: [u32; MAX_GROUPS],
+    pub ngroups: u8,
     /// This task's floating-point and SSE registers while it is not running.
     /// See `fpu.rs` for why this exists and why it is only as wide as FXSAVE.
     pub fpu: crate::fpu::FpuState,
@@ -238,6 +244,8 @@ impl Task {
             clear_child_tid: 0,
             uid: 0,
             gid: 0,
+            groups: [0; MAX_GROUPS],
+            ngroups: 0,
             fpu: crate::fpu::clean(),
         }
     }

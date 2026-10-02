@@ -138,7 +138,7 @@ system hung.
 
 There are no tests in this tree, and that is the shape of a microkernel rather
 than an omission: the kernel is tested from outside, through the ABI, by a
-program. `dtest` in `../quarkutils` makes 566 checks — capabilities, IPC,
+program. `dtest` in `../quarkutils` makes 588 checks — capabilities, IPC,
 memory, descriptors, signals, scheduling, `dtest calls` with three million calls in
 three seconds — and `qfuzz` throws random requests at every service.
 
@@ -217,6 +217,16 @@ may keep — are in `../quarkutils/CLAUDE.md`; these are the kernel's.
   was reported as a hangup, and a program that wanted to be believed killed
   had only to say so. A sweep that runs every program with arguments nobody
   would give it found it, in a terminal that could not find its display.
+- **Who a task is, is said by a holder of `SetUid`, and about somebody else
+  only while they are asking.** A task has a user, a group and up to sixteen
+  groups besides; they are inherited, copied by `fork`, kept by `exec`, and
+  the kernel acts on none of them except to let one user's task end
+  another of the same user's. `SYS_IDENTIFY` is how a *server* says them: of
+  a task in a call to it, or of a child that task has made and not started,
+  with the kernel checking which at the moment it acts. A server that
+  checked a TID's parent and then called `SYS_SET_UID` would be naming a
+  number, and numbers are recycled. There is no setuid bit and there cannot
+  be one: a program is loaded by whoever starts it.
 - **Capabilities are the authority.** There is no UID 0 bypass; `uid == 0` no
   longer short-circuits `cap::task_has_*`. A service that cannot do something
   is missing a capability, not a privilege level.

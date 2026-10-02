@@ -1,6 +1,6 @@
 # Quark syscall ABI
 
-**Version 3.8.** Query the running kernel with `SYS_ABI_VERSION` (240), which
+**Version 3.9.** Query the running kernel with `SYS_ABI_VERSION` (240), which
 returns `(major << 16) | minor`.
 
 This document is the contract between the Quark kernel and everything above it.
@@ -196,6 +196,7 @@ returning at once turned that loop into a spin.
 | 3.6 | **A terminal's input is UTF-8.** `IUTF8` in a terminal's `c_iflag` is acted on, and set on a new one: in canonical mode, erasing takes back a character — the byte that begins it and every byte that continues it — where it took back a byte, and left the program to read the front of a character with no end. A change of behaviour and no new number. |
 | 3.7 | **Named pipes.** `SYS_FD_SERVE_PIPE` (231): a server gives a task that is calling it one end of the pipe a key of the server's names — the same pipe for everybody who is given the same key, for as long as any of them holds an end. `SYS_PIPE_PEER` (232): wait until somebody has opened the other end. The name, its owner and its mode are a file server's; the pipe is the kernel's, because a program waits on one with `SYS_POLL`. |
 | 3.8 | **Jobs.** Every process is in a process group and a session, and a terminal has one group in front of it. `SYS_PGROUP` (211) reads and sets them. `SYS_SIG_RAISE` with arg2 = 2 raises a signal for a group. Signals 19 to 22 stop a program — every task of it held where it is — and 18 starts it again; a parent hears of both as signal 17 and, asking with flags 4 and 8, from `SYS_WAIT_FOR`, which with flag 16 also waits for a group of children. `SYS_PTY_CTL` ops 5 to 8 make a terminal a session's controlling terminal and say which group is in front; what is typed raises its signals for that group, a read by any other group of the session stops the reader (signal 21), and `VSUSP` raises signal 20. `SYS_TASK_INFO` reports a stopped task as state 4. A terminal no session has claimed behaves as before. |
+| 3.9 | **Who a task is.** A task is in up to sixteen groups besides its own: `SYS_GROUPS` (212) reads them for anybody and sets them for a holder of `SetUid`, they are inherited as the user and group are, and a file server reads them to decide whether a file's group is one of the caller's. `SYS_IDENTIFY` (213) is how a server that holds `SetUid` says who somebody is: the user, the group and the groups of a task that is in a call to it, or of a child that task has created and not started, set in one step and checked by the kernel at that step. `SYS_SET_UID` and `SYS_SET_GID` are unchanged. |
 
 3.1 was a change of behaviour and no change of number, so a minor: nothing built for
 3.0 calls anything that means something else now. What it could have relied on
@@ -786,7 +787,16 @@ caller is running and will use the register before it is scheduled again. A
 base in the kernel's half of the address space is refused.
 
 `SYS_GET_TUID` exists for servers doing permission checks on behalf of a
-caller: the VFS uses it to evaluate file modes against the requester.
+caller: the VFS uses it to evaluate file modes against the requester, with
+`SYS_GROUPS` (212, in block 0xD0: this one is full) for the groups the
+requester is in besides its own.
+
+**Nothing is setuid.** A program is loaded by whoever starts it — the image
+is read and the address space built in user space — so nothing can vouch that
+what runs is the file whose mode said to run it as somebody else, and the bit
+means nothing here. Who a task is, is said by a holder of `SetUid`:
+`SYS_SET_UID` and `SYS_SET_GID`, for a holder acting on its own account, and
+`SYS_IDENTIFY` (213) for a server asked by somebody else.
 
 `SYS_TASK_WATCH` asks to be told when a task dies. The notification arrives at
 the watcher's next `SYS_RECV` as a message from the kernel — sender 0, tag
@@ -1118,6 +1128,30 @@ buffer (4096 bytes) is full, and returns when all of it has been taken, or
 with what was taken if the master has gone (`u64::MAX` if that is nothing). A
 write to the master is typing and never waits: it returns what was taken,
 which may be less, or nothing.
+
+### Identity, continued (0xD0)
+
+Block 0x60 is full; these two are its overflow.
+
+| # | Name | Arguments | Returns | Cap |
+|---|---|---|---|---|
+| 212 | `SYS_GROUPS` | arg0 = op: 0 read, 1 set; arg1 = a task, 0 for the caller; arg2 = where the group ids are, or go: `u32`s; arg3 = how many (sixteen at most) | reading, how many groups the task is in — as many as there was room for are written; setting, 0 / `u64::MAX` | — to read; `SetUid` to set, and the task is the caller or a child it has created and not started |
+| 213 | `SYS_IDENTIFY` | arg0 = a task that is in a call to the caller; arg1 = that task, or a child it has created and not started; arg2 = `uid << 32 \| gid`; arg3 = the groups it is in besides, `u32`s; arg4 = how many (sixteen at most) | 0 / `u64::MAX` | `SetUid` |
+
+A task has a user, a group, and the groups it is in besides: sixteen at
+most. All three are inherited by a task from its creator, copied by
+`SYS_FORK` and kept by `SYS_EXEC_SPACE`. Reading with no room (arg3 = 0) is
+how to ask how many there are.
+
+`SYS_IDENTIFY` exists because the program that may say who somebody is, is a
+server, and a server is asked. The task it is asked about consents the way a
+task consents to a descriptor being put in its table (`SYS_FD_SERVE`) or a
+capability in its CSpace (`SYS_CAP_TAKE`): by being in a call to the server.
+It may name itself, or a child it is still preparing — one it created, and
+has not started — and the kernel checks which at the moment it acts. A server
+that checked first and called `SYS_SET_UID` after would be naming a TID, and
+a TID is given to another task once its owner has been reaped. The three are
+set together or not at all.
 
 ### Descriptors, continued (0xE0)
 
