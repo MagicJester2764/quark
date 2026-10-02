@@ -192,6 +192,19 @@ may keep — are in `../quarkutils/CLAUDE.md`; these are the kernel's.
   mapped in exactly one place — that is what makes freeing it on unmap safe —
   so a new mapping path either leaves the bit off or moves the page, as
   `sys_addrspace_give` does, rather than copying the mapping.
+- **A scrap of memory between the firmware's own is not used**
+  (`pmm::scrap`). A restart does not clear memory, and a firmware that
+  reads a page it did not keep for itself finds what the last system left:
+  OVMF reads such a page, in the megabyte it starts from, for what a
+  confidential guest's loader would have said, and after `shutdown -r` took
+  a program's text for a count of 116 processors and waited seventy-one
+  minutes for them. Whether it did depended on what happened to be in the
+  page — of the two installations in one acceptance run, the one on four
+  processors restarted and the one on one did not — so a restart that
+  "sometimes hangs in the firmware" is this, and the firmware's own log
+  says so (`-debugcon file:fw.log -global isa-debugcon.iobase=0x402`).
+  The allocator gives out the lowest free frame, so what is low is used
+  first and is always dirty.
 - **A dead task holds all its memory until it is reaped.** `sys_wait` reaps the
   child it returns; the idle loop reaps the rest. Anything that collects a
   child some other way must reap it too, or a parent running programs back to

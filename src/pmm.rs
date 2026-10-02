@@ -30,6 +30,35 @@ impl PhysFrame {
     }
 }
 
+/// A stretch of ordinary memory shorter than this, with memory the firmware
+/// keeps for itself on both sides of it, is a scrap ([`scrap`]).
+const SCRAP: u64 = 1 << 20;
+
+/// Whether `r`, which the firmware says is ordinary memory, is a scrap left
+/// between two stretches the firmware keeps for itself — and so memory the
+/// kernel leaves alone.
+///
+/// What a firmware keeps is what it uses while the machine starts, and it
+/// starts again without the memory having been cleared: a restart is not a
+/// power cycle. One that reads a page it did not keep finds what the last
+/// system left there. OVMF does: a page in the middle of its own megabyte
+/// (0x813000) is where a confidential guest's loader would have told it how
+/// many processors there are, it gives that page out as ordinary memory, and
+/// after a restart it read a program's text there as a count of 116 and
+/// waited seventy-one minutes for them to arrive. This kernel gives out the
+/// lowest frame that is free, so that page was among the first it used.
+///
+/// The memory map cannot say which pages a firmware reads and does not
+/// keep. It can say where a firmware's own memory is, and a scrap in the
+/// middle of that is forty kilobytes not worth the question.
+fn scrap(regions: &[MemoryRegion], r: &MemoryRegion) -> bool {
+    let end = r.base.saturating_add(r.length);
+    let firmware = |o: &&MemoryRegion| o.region_type != MMAP_TYPE_AVAILABLE && o.length != 0;
+    r.length < SCRAP
+        && regions.iter().filter(firmware).any(|o| o.base.saturating_add(o.length) == r.base)
+        && regions.iter().filter(firmware).any(|o| o.base == end)
+}
+
 struct PmmInner {
     bitmap: [u8; BITMAP_SIZE],
     total_frames: usize,
@@ -85,9 +114,14 @@ pub unsafe fn init(
     let mut pmm = PMM.lock();
 
     // Step 1: For each available region, clear bits (mark free).
+    let mut scraps = 0u64;
     for i in 0..count {
         let r = &regions[i];
         if r.region_type != MMAP_TYPE_AVAILABLE {
+            continue;
+        }
+        if scrap(&regions[..count], r) {
+            scraps += r.length;
             continue;
         }
 
@@ -136,6 +170,12 @@ pub unsafe fn init(
         if let Some(m) = crate::modules::get(i) {
             pmm.mark_range_used(m.start, m.end);
         }
+    }
+    drop(pmm);
+    if scraps != 0 {
+        crate::serial::puts(b"Memory: ");
+        crate::serial::put_usize((scraps / 1024) as usize);
+        crate::serial::puts(b" KiB in scraps between the firmware's own, left alone.\n");
     }
 }}
 
