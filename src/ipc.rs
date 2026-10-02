@@ -219,15 +219,17 @@ static mut TASK_NOTIFY: [u64; MAX_TASKS] = [0; MAX_TASKS];
 /// there are only 64 of them.
 static mut WATCHERS: [u64; MAX_TASKS] = [0; MAX_TASKS];
 
-/// Deaths a watcher has been told about and has not yet collected.
+/// Deaths a watcher is owed and has not yet collected: for each watcher, the
+/// tasks, one bit each.
 ///
-/// Shallow on purpose. A watcher exists to reclaim something the dead task
-/// held — a display, a window, a keyboard — and one that has let eight deaths
-/// pile up unread is not doing that. Dropping the ninth loses a reclaim; a
-/// deeper queue would only lose the twenty-fifth.
-const DEATH_QUEUE: usize = 8;
-static mut DEATHS: [[u8; DEATH_QUEUE]; MAX_TASKS] = [[0; DEATH_QUEUE]; MAX_TASKS];
-static mut DEATHS_LEN: [usize; MAX_TASKS] = [0; MAX_TASKS];
+/// A set and not a list, because a list has an end. It was eight long, on
+/// the reasoning that a watcher eight deaths behind is not doing its job —
+/// but one call can end more tasks than that with nobody having had a turn
+/// between: a signal for a process group ends every program in it, and
+/// that is every member of a pipeline when it is interrupted. The ninth
+/// was not told of, and whatever a server held for it, it held for good.
+static mut DEATHS: [u64; MAX_TASKS] = [0; MAX_TASKS];
+const _: () = assert!(MAX_TASKS <= 64, "a watcher's deaths are a u64");
 
 /// Who has asked to be told when each program — each address space — dies.
 ///
@@ -237,8 +239,15 @@ static mut DEATHS_LEN: [usize; MAX_TASKS] = [0; MAX_TASKS];
 /// entry is freed when its program dies or its last watcher does.
 const MAX_SPACE_WATCHES: usize = MAX_TASKS * 2;
 static mut SPACE_WATCHES: [(u64, u64); MAX_SPACE_WATCHES] = [(0, 0); MAX_SPACE_WATCHES];
-/// Program deaths a watcher has not collected yet.
-static mut SPACE_DEATHS: [[u64; DEATH_QUEUE]; MAX_TASKS] = [[0; DEATH_QUEUE]; MAX_TASKS];
+/// Program deaths a watcher has not collected yet, oldest first.
+///
+/// A program's id is too wide for a set of them to be a word, so this is a
+/// list, and as long as there can be tasks: one call cannot end more
+/// programs than there are, and a watcher that collects what it is owed
+/// before it watches anything else is never owed more. One that does not
+/// loses what does not fit, as it always did.
+const SPACE_DEATH_QUEUE: usize = MAX_TASKS;
+static mut SPACE_DEATHS: [[u64; SPACE_DEATH_QUEUE]; MAX_TASKS] = [[0; SPACE_DEATH_QUEUE]; MAX_TASKS];
 static mut SPACE_DEATHS_LEN: [usize; MAX_TASKS] = [0; MAX_TASKS];
 
 /// Tag for a program's death: `data[0]` is its space id.
@@ -322,7 +331,14 @@ pub fn sys_task_watch(watcher: usize, target: usize) -> Result<(), IpcError> {
         return Err(IpcError::DeadTask);
     }
     let flags = irq_save();
-    unsafe { WATCHERS[target] |= 1u64 << watcher };
+    unsafe {
+        WATCHERS[target] |= 1u64 << watcher;
+        // A death it is owed under this number and has not collected is of
+        // whoever had the number before, and it has just said it knows
+        // somebody else is there now. Left, it would be taken for this
+        // one's.
+        DEATHS[watcher] &= !(1u64 << target);
+    }
     irq_restore(flags);
     Ok(())
 }
@@ -368,7 +384,7 @@ pub fn notify_space_watchers(space: u64) {
         while mask != 0 {
             let w = mask.trailing_zeros() as usize;
             mask &= mask - 1;
-            if SPACE_DEATHS_LEN[w] < DEATH_QUEUE {
+            if SPACE_DEATHS_LEN[w] < SPACE_DEATH_QUEUE {
                 SPACE_DEATHS[w][SPACE_DEATHS_LEN[w]] = space;
                 SPACE_DEATHS_LEN[w] += 1;
             }
@@ -400,10 +416,7 @@ pub fn notify_watchers(dead: usize) {
         while mask != 0 {
             let w = mask.trailing_zeros() as usize;
             mask &= mask - 1;
-            if DEATHS_LEN[w] < DEATH_QUEUE {
-                DEATHS[w][DEATHS_LEN[w]] = dead as u8;
-                DEATHS_LEN[w] += 1;
-            }
+            DEATHS[w] |= 1u64 << dead;
             // Wake it if it is sitting in a receive that would take this.
             match TASK_IPC[w].state {
                 IpcState::RecvBlocked(from) if from == 0 || from == TID_ANY => {
@@ -423,14 +436,11 @@ pub fn notify_watchers(dead: usize) {
 /// The caller holds interrupts off.
 unsafe fn take_death(receiver: usize) -> Option<Message> {
     unsafe {
-        if DEATHS_LEN[receiver] == 0 {
+        if DEATHS[receiver] == 0 {
             return None;
         }
-        let dead = DEATHS[receiver][0] as u64;
-        for i in 1..DEATHS_LEN[receiver] {
-            DEATHS[receiver][i - 1] = DEATHS[receiver][i];
-        }
-        DEATHS_LEN[receiver] -= 1;
+        let dead = DEATHS[receiver].trailing_zeros() as u64;
+        DEATHS[receiver] &= DEATHS[receiver] - 1;
         Some(Message { sender: 0, tag: TAG_TASK_DIED, data: [dead, 0, 0, 0, 0, 0] })
     }
 }
@@ -1387,7 +1397,7 @@ pub fn cleanup_task_ipc(dead_tid: usize) {
         // recycled, so a registration left behind would fire for whoever
         // lands in the slot next.
         WATCHERS[dead_tid] = 0;
-        DEATHS_LEN[dead_tid] = 0;
+        DEATHS[dead_tid] = 0;
         SPACE_DEATHS_LEN[dead_tid] = 0;
         IDLES_LEN[dead_tid] = 0;
         let bit = !(1u64 << dead_tid);

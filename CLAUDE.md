@@ -328,6 +328,27 @@ may keep — are in `../quarkutils/CLAUDE.md`; these are the kernel's.
   `SYS_SPACE_WATCH` says when its last task has gone. TIDs are recycled; space
   ids are not. Anything in the kernel that remembers a number should remember
   that one — see the budget rule under *What a process is*.
+- **A program that has gone is said to have gone, however it went.**
+  `ipc::notify_space_watchers` is called where a program's last task dies
+  (`note_death`) and where its only task leaves it for another
+  (`exec_into`). The second was not there. What a server kept for a program
+  that then exec'd — a lock, a file a C library had open for the length of
+  one call — it kept until the machine was turned off, and the kernel kept
+  the watch: a hundred and twenty-eight commands filled the table, and from
+  then on `SYS_SPACE_WATCH` failed for every program and no server heard of
+  any of them ending. Nothing showed until a program was ended half way
+  through a call — which a second processor made ordinary — and a removed
+  directory it had been looking at stayed on the disk. A new way for a
+  program to stop being one is a new place to say so.
+- **What a watcher is owed is kept until it collects it.** Task deaths are a
+  set, one bit a task (`ipc::DEATHS`); program deaths a list as long as
+  there can be programs. Both were lists eight long, on the reasoning that
+  a watcher eight behind is not doing its job — but one call ends more than
+  eight with nobody having had a turn: a signal for a process group ends
+  every member of a pipeline. The ninth was not told of. A notice the
+  kernel owes somebody needs somewhere to wait that cannot be full, as a
+  served descriptor's last close has (`served.rs`: a flag, and a call that
+  collects); a pager's idle objects are still a list, thirty-two long.
 - **A call from the kernel to a pager carries `PAGER_BIT` in its sender**, and
   nothing else can: the bit is set by `call_as` and by no syscall. The reply
   strips the bit and reaches the faulting task.

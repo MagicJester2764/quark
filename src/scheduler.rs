@@ -2608,6 +2608,17 @@ pub fn exec_into(cr3: usize, entry: u64, rsp: u64) -> Result<(), ()> {
                 t.mem_pages = 0;
                 t.fpu = crate::fpu::clean();
             }
+            // The program it was has no task now, and that is a program
+            // gone: whoever watched it is told, as when a program's last
+            // task dies. They were not. What a server kept for the old
+            // program it kept until the machine was turned off — a lock, a
+            // file a C library had open for the length of one call — and
+            // the kernel went on counting the program as watched: a
+            // hundred and twenty-eight commands filled the table, and from
+            // then on no server could be told of any program ending.
+            if old_space != 0 && !space_has_live_task(old_space) {
+                crate::ipc::notify_space_watchers(old_space);
+            }
         }
         crate::userspace::addrspace_ref(cr3);
         irq_restore(flags);

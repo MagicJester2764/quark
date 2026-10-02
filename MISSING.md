@@ -112,6 +112,11 @@ will meet:
 - **A child is its creator task's to wait for, not its program's.** A thread
   cannot collect a child another thread of its program forked; POSIX lets
   any thread. The children of a thread that has ended are nobody's.
+- **A pager's idle objects are told to it in a list thirty-two long.** More
+  of a pager's objects than that going idle before it has looked — every
+  mapped file of several programs ended together — and the rest are not
+  told of: they stay until the pager lets them go some other way. Deaths of
+  tasks and of programs are not lost; this still can be.
 - **A thread starts with a copy of its creator's capabilities**, not a share:
   what either is granted or gives up afterwards the other does not see.
   Descriptors are the program's and are shared.

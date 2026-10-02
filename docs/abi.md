@@ -1,6 +1,6 @@
 # Quark syscall ABI
 
-**Version 3.11.** Query the running kernel with `SYS_ABI_VERSION` (240), which
+**Version 3.12.** Query the running kernel with `SYS_ABI_VERSION` (240), which
 returns `(major << 16) | minor`.
 
 This document is the contract between the Quark kernel and everything above it.
@@ -212,6 +212,7 @@ returning at once turned that loop into a spin.
 
 | 3.10 | **More than one processor.** The kernel starts every processor the machine's ACPI tables list and runs tasks on all of them, with itself on one at a time. `SYS_CPUS` (117) says how many there are and which the caller is on. Nothing else has a new number, and what changes is when things happen: tasks run at once; a task ended or stopped from outside while it runs on another processor goes on in ring 3 until that processor is interrupted; `SYS_WAIT_FOR` asked not to wait may answer 0 for a child ended an instant ago; and what a task starts may run before the call that started it returns. See *Processors* under block 0x70. |
 | 3.11 | **A thread joined through a word is not waited for.** A task made by a task of its own program, which has been given a word by `SYS_SET_CLEAR_TID` (106), is collected by the kernel when it ends and is no child to `SYS_WAIT` or `SYS_WAIT_FOR`: not answered with, and not counted among the children a wait could be for. It was both, so a C program's `waitpid(-1)` could answer with one of its own threads, a program with threads and no children was told to go on waiting, and a thread that had ended kept its place among the system's sixty-four tasks until its program did — a program that made threads one after another came to where nothing in the system could make a task. And the call takes a second argument: the task whose word it is, which may be one the caller has made and not started, so that a thread's creator says it before the thread exists to be asked about. A thread with no such word is waited for as before. |
+| 3.12 | **A program that has gone is said to have gone.** No new number. A task that becomes another program with `SYS_EXEC_SPACE` was its old program's last, and whoever watched that program (`SYS_SPACE_WATCH`) is now told it has gone, as when a program's last task dies. They were not: what a server kept for the old program it kept for good, and the kernel went on counting the program as watched — a hundred and twenty-eight of them filled its table, and after that `SYS_SPACE_WATCH` failed for every program, so no server heard of any program ending. And what a watcher is owed is no longer a list eight long: a death of a task is kept for as long as it takes to collect it, however many there are, and of a program for as many as there can be programs. One call can end more than eight — a signal for a process group ends every member of a pipeline — and the ninth was not told of. |
 
 3.1 was a change of behaviour and no change of number, so a minor: nothing built for
 3.0 calls anything that means something else now. What it could have relied on
@@ -836,9 +837,11 @@ what it lent out. Failure means the task was already gone, which is an answer:
 the caller may reclaim immediately.
 
 Registrations are dropped when either task dies, so a watcher is never told
-about the next occupant of a recycled TID. A watcher that lets eight
-notifications go uncollected loses the ninth; a server whose whole job is to
-reclaim on death should not be one of them.
+about the next occupant of a recycled TID. What a watcher is owed and has not
+collected is kept, however many deaths that is: one call can end every task
+of a process group, and none of them goes untold. A watch begun on a TID
+withdraws an uncollected notice about that TID — it was about whoever had
+the number before, and the watcher has just said it knows of somebody else.
 
 A program is its address space. `SYS_TASK_SPACE` names it: every address
 space gets an id when it is made, counting up from 1 for as long as the machine
@@ -847,7 +850,15 @@ same one. A server that keeps something for a client — an open file, a lock, a
 working directory — keeps it for the space, so any thread of the program may
 use it. `SYS_SPACE_WATCH` is `SYS_TASK_WATCH` for a program: the notice is sender
 0, tag `0xFFFF_0004`, `data[0]` the space id, and it comes once, when the last
-live task of that space dies. Failure means none is alive.
+live task of that space dies — or leaves: a task that becomes another program
+with `SYS_EXEC_SPACE` was the old program's only one, and the old program has
+gone. Failure means none is alive, or that the kernel is watching as many
+programs as it can (128); either way nothing will be said, and a server keeps
+nothing for a program it could not watch. A program can be gone while a call
+it made is still waiting to be served, or being served: it was ended from
+outside. A watcher is owed as many of these notices as there can be programs
+(64), which is more than one call can end; one that falls further behind than
+that loses what does not fit.
 
 A task made with `SYS_TASK_CREATE_IN` belongs to that address space's program
 from the moment it exists: `SYS_TASK_SPACE` names it, a watch on the program
