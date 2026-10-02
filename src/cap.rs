@@ -340,6 +340,31 @@ pub fn slot_is_valid(cap: &CapSlot) -> bool {
     is_valid(cap)
 }
 
+/// Whether a task that is alive, and not of `pager`'s program, holds a
+/// capability for memory object `id`: somebody who may be about to map it.
+/// The pager's own threads hold copies of whatever it held when they were
+/// made, and are the pager.
+///
+/// Looked for, not counted. Capabilities are plain words in each task's
+/// table, deleted and overwritten in half a dozen places; a count kept
+/// beside them would be one more thing for each of those to get wrong, and
+/// this is asked only when a pager lets go of an object.
+pub fn memobject_held_elsewhere(id: u64, pager: usize) -> bool {
+    let own = crate::scheduler::space_of_task(pager);
+    (1..MAX_TASKS).any(|tid| {
+        tid != pager
+            && crate::scheduler::task_is_live(tid)
+            && (own == 0 || crate::scheduler::space_of_task(tid) != own)
+            && unsafe {
+                crate::scheduler::get_task_mut(tid).is_some_and(|t| {
+                    t.cspace.iter().any(|c| {
+                        c.cap_type as u8 == CapType::MemObject as u8 && c.param0 == id && is_valid(c)
+                    })
+                })
+            }
+    })
+}
+
 /// Insert a typed capability into the first free slot of `tid`'s CSpace,
 /// rooted at `granter` so it can be revoked later.
 ///

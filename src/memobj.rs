@@ -32,6 +32,9 @@ pub const CTL_READ_PAGE: u64 = 1;
 pub const CTL_WRITE_PAGE: u64 = 2;
 pub const CTL_TAKE_DIRTY: u64 = 3;
 pub const CTL_RELEASE: u64 = 4;
+/// `CTL_RELEASE`'s answer while a task other than the pager holds a
+/// capability for the object: not now, and nothing will say when.
+pub const RELEASE_LATER: u64 = 1;
 
 const PAGE: usize = 4096;
 /// Page indices fit in the 40 bits a reservation keeps them in.
@@ -419,6 +422,17 @@ fn ctl_locked(caller: usize, id: u64, op: u64, a: u64, b: u64) -> u64 {
         CTL_RELEASE => {
             if o.mapped != 0 {
                 return u64::MAX;
+            }
+            // Somebody has been given a capability for it and has not
+            // mapped it yet: the pager answered one program's request to
+            // map a file as another unmapped the last of it. Released now,
+            // the capability names nothing and the first program is told
+            // there is no memory — which two threads mapping one file did
+            // to each other, on two processors, a few times in a hundred.
+            // The pager asks again; nothing tells it when the capability
+            // has been used or given up.
+            if crate::cap::memobject_held_elsewhere(id, caller) {
+                return RELEASE_LATER;
             }
             release(slot);
             0

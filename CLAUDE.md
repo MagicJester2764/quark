@@ -138,7 +138,7 @@ system hung.
 
 There are no tests in this tree, and that is the shape of a microkernel rather
 than an omission: the kernel is tested from outside, through the ABI, by a
-program. `dtest` in `../quarkutils` makes 684 checks — capabilities, IPC,
+program. `dtest` in `../quarkutils` makes 686 checks — capabilities, IPC,
 memory, descriptors, signals, scheduling, users and terminals, `dtest calls`
 with three million calls in three seconds, `dtest smp` for what a second
 processor changes — and `qfuzz` throws random requests at every service.
@@ -204,6 +204,15 @@ may keep — are in `../quarkutils/CLAUDE.md`; these are the kernel's.
   reference back (`memobj::unmap_ref`). Miss one and the object is never
   released. Protection keys would give bits 59–62 a meaning, so CR4.PKE stays
   clear.
+- **An object is kept for whoever was promised it.** A pager gives a program
+  a capability and the program maps with it: two steps by two programs, and
+  the object's last mapping can go between them. So `CTL_RELEASE` answers
+  "later" while a living task of another program holds a capability for the
+  object (`cap::memobject_held_elsewhere`), and the pager asks again. It
+  released, and the capability named nothing: two threads mapping one file
+  on two processors told each other there was no memory, a few times in a
+  hundred. Capabilities are looked for there and not counted — they are
+  plain words in a table, written from half a dozen places.
 - **A reserved page is a non-present entry with `paging::MARKER` set**, in a
   page table or, for 2 MiB at once, a page directory. It is not empty: the
   walks that free tables and the checks that an address is free test for an

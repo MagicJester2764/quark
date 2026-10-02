@@ -1,6 +1,6 @@
 # Quark syscall ABI
 
-**Version 3.12.** Query the running kernel with `SYS_ABI_VERSION` (240), which
+**Version 3.13.** Query the running kernel with `SYS_ABI_VERSION` (240), which
 returns `(major << 16) | minor`.
 
 This document is the contract between the Quark kernel and everything above it.
@@ -213,6 +213,7 @@ returning at once turned that loop into a spin.
 | 3.10 | **More than one processor.** The kernel starts every processor the machine's ACPI tables list and runs tasks on all of them, with itself on one at a time. `SYS_CPUS` (117) says how many there are and which the caller is on. Nothing else has a new number, and what changes is when things happen: tasks run at once; a task ended or stopped from outside while it runs on another processor goes on in ring 3 until that processor is interrupted; `SYS_WAIT_FOR` asked not to wait may answer 0 for a child ended an instant ago; and what a task starts may run before the call that started it returns. See *Processors* under block 0x70. |
 | 3.11 | **A thread joined through a word is not waited for.** A task made by a task of its own program, which has been given a word by `SYS_SET_CLEAR_TID` (106), is collected by the kernel when it ends and is no child to `SYS_WAIT` or `SYS_WAIT_FOR`: not answered with, and not counted among the children a wait could be for. It was both, so a C program's `waitpid(-1)` could answer with one of its own threads, a program with threads and no children was told to go on waiting, and a thread that had ended kept its place among the system's sixty-four tasks until its program did — a program that made threads one after another came to where nothing in the system could make a task. And the call takes a second argument: the task whose word it is, which may be one the caller has made and not started, so that a thread's creator says it before the thread exists to be asked about. A thread with no such word is waited for as before. |
 | 3.12 | **A program that has gone is said to have gone.** No new number. A task that becomes another program with `SYS_EXEC_SPACE` was its old program's last, and whoever watched that program (`SYS_SPACE_WATCH`) is now told it has gone, as when a program's last task dies. They were not: what a server kept for the old program it kept for good, and the kernel went on counting the program as watched — a hundred and twenty-eight of them filled its table, and after that `SYS_SPACE_WATCH` failed for every program, so no server heard of any program ending. And what a watcher is owed is no longer a list eight long: a death of a task is kept for as long as it takes to collect it, however many there are, and of a program for as many as there can be programs. One call can end more than eight — a signal for a process group ends every member of a pipeline — and the ninth was not told of. |
+| 3.13 | **An object is kept for whoever was promised it.** `SYS_OBJECT_CTL` op 4, release, answers 1 and releases nothing while a living task of another program holds a capability for the object. A pager gives a program a capability and the program maps with it — two steps, and the last mapping of the object could go between them, the pager be told it was idle, and release it: the program's `SYS_OBJECT_MAP` then named nothing. Two threads mapping one file did it to each other. A pager written for 3.12 takes 1 for "still mapped" and keeps the object, which is safe; one written for this asks again. |
 
 3.1 was a change of behaviour and no change of number, so a minor: nothing built for
 3.0 calls anything that means something else now. What it could have relied on
@@ -1138,7 +1139,7 @@ hears `TAG_OBJECT_IDLE` (`0xFFFF_0006`, sender 0, `data` = `[cookie, id]`).
 | 1 | read a cached page | a page to fill | page | 1 if cached, 0 if not |
 | 2 | write a cached page | a page to copy | page | 1 if cached, 0 if not |
 | 3 | take a dirty page | a page to fill | the lowest page to consider | the page's index, `u64::MAX` if none |
-| 4 | release | — | — | 0, or `u64::MAX` while anything maps it |
+| 4 | release | — | — | 0; `u64::MAX` while anything maps it; 1 while a task of another program holds a capability for it |
 
 A page mapped shared and writable is the cached frame itself, so every
 mapping sees every other's writes at once; the page is dirty from its first
@@ -1149,6 +1150,15 @@ calls each one's pager with `TAG_OBJECT_SYNC` (`0xFFFF_0007`, `sender` marked
 as for a page-in, `data` = `[cookie, object id]`), returning once all have
 answered. A pager writes back what is dirty then, and again when the object
 goes idle, before it releases it.
+
+A capability a pager has granted keeps the object: op 4 answers 1, and
+releases nothing, while any living task of another program holds one. Granting
+and mapping are two steps by two programs, and an object can go idle
+between them — another program unmaps the last of it — so a pager that
+released on hearing so left the first program holding a capability for
+nothing, and its mapping failed. Nothing is said when that capability is
+used or deleted: a pager answered 1 asks again later, and a program given
+one to map with deletes it once it has.
 
 The cache belongs to the object and lasts until it is released; nothing
 records where a cached frame is mapped, so a shrinking object keeps the
