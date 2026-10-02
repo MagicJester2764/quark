@@ -27,7 +27,13 @@ pub fn get(index: usize) -> Option<&'static ModuleInfo> {
     }
 }
 
-/// Find a module by name prefix match.
+/// Find a module by the beginning of its name, in either case.
+///
+/// A module's name is a file's name on the partition the bootloader read it
+/// from, and that partition is FAT, which keeps a short name in capitals:
+/// whether `init.elf` comes back as that or as `INIT.ELF` depends on what
+/// wrote the file. A system installed by its own tools has the second, and
+/// stopped at "No init module found."
 pub fn find(name: &[u8]) -> Option<&'static ModuleInfo> {
     let count = unsafe { MODULE_COUNT };
     for i in 0..count {
@@ -48,13 +54,14 @@ pub unsafe fn data(module: &ModuleInfo) -> &'static [u8] { unsafe {
     core::slice::from_raw_parts(module.start as *const u8, len)
 }}
 
-/// Check if `haystack` starts with `needle` (stops at null in haystack).
+/// Check if `haystack` starts with `needle`, whatever the case of either
+/// (stops at null in haystack).
 fn starts_with(haystack: &[u8], needle: &[u8]) -> bool {
     if needle.len() > haystack.len() {
         return false;
     }
     for i in 0..needle.len() {
-        if haystack[i] == 0 || haystack[i] != needle[i] {
+        if haystack[i] == 0 || !haystack[i].eq_ignore_ascii_case(&needle[i]) {
             return false;
         }
     }

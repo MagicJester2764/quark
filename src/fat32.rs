@@ -54,8 +54,7 @@ unsafe fn init_from_driver(module_start: usize) { unsafe {
 
 /// Try to load the FAT32 driver from boot modules.
 pub fn init() {
-    let m = modules::find(b"FAT32.DRV")
-        .or_else(|| modules::find(b"fat32.drv"));
+    let m = modules::find(b"fat32.drv");
 
     if let Some(module) = m {
         unsafe { init_from_driver(module.start) };

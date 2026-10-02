@@ -78,8 +78,9 @@ reason for the exact date: `../quarkutils` must match the commit the std fork
 is based on (its `CLAUDE.md` says how to check), and `../bang` pins because
 newer toolchains rewrite the uefi crate's UCS-2 loops into a `wcslen` libcall
 it has to supply. The kernel depends on neither; it pins the same nightly
-because that is the compiler it is tested with, and because three equal pins
-are one download. Move them together.
+because that is the compiler it is tested with, and because equal pins are
+one download. `../explosion` carries it too, for its own programs. Move them
+together.
 
 A floating `nightly` channel is what to avoid: it drifts forward and leaves
 the other two behind.
@@ -115,8 +116,11 @@ $(DESTDIR)/usr/share/doc/quark/abi.md    and what they mean
 
 `drivers/` is the kernel's: flat binaries with no access to kernel symbols,
 loaded from boot modules and called through a table (`services.rs` is what
-they are handed). The drivers that matter — disk, keyboard, network — are
-ordinary programs in `../quarkutils`.
+they are handed). A module is found by its name in either case
+(`modules::find`): the name is a file's on a FAT partition, and a system
+installed by its own tools has `INIT.ELF` where an image built on another
+machine has `init.elf`. The drivers that matter — disk, keyboard, network —
+are ordinary programs in `../quarkutils`.
 
 `make iso` and `make run` boot the kernel alone under GRUB, with nothing to
 run: useful for the first hundred lines of boot and for nothing after.
