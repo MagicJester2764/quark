@@ -578,6 +578,26 @@ extern "C" fn exception_handler(frame: &InterruptFrame) {
     crate::klock::leave(took);
 }
 
+/// End the program that touched a page it was promised and cannot be given:
+/// there is no memory for it, or it is a page of a file that cannot be had.
+fn no_page(cr2: u64, oom: bool) -> ! {
+    let tid = scheduler::current_tid();
+    crate::serial::puts(if oom { b"[OOM tid=" } else { b"[BUS tid=" });
+    crate::serial::put_usize(tid);
+    crate::serial::puts(b" cr2=0x");
+    crate::serial::put_hex_usize(cr2 as usize);
+    crate::serial::puts(b"]\n");
+    console::puts(if oom {
+        b"\n[kernel] Out of memory in task "
+    } else {
+        b"\n[kernel] Bus error in task "
+    });
+    print_dec(tid);
+    console::puts(b" - killing task.\n");
+    unsafe { core::arch::asm!("sti", options(nostack, nomem)) };
+    scheduler::exit_program(-SIGBUS)
+}
+
 fn exception(frame: &InterruptFrame) {
     let vec = frame.vector as usize;
     let from_user = frame.cs & 3 != 0;
@@ -619,24 +639,30 @@ fn exception(frame: &InterruptFrame) {
                 // Promised and not there to give: Linux's overcommit bargain,
                 // and its answer. A page of a file that cannot be had is
                 // SIGBUS too.
-                let tid = scheduler::current_tid();
-                let oom = matches!(fault, crate::paging::Fault::NoMemory);
-                crate::serial::puts(if oom { b"[OOM tid=" } else { b"[BUS tid=" });
-                crate::serial::put_usize(tid);
-                crate::serial::puts(b" cr2=0x");
-                crate::serial::put_hex_usize(cr2 as usize);
-                crate::serial::puts(b"]\n");
-                console::puts(if oom {
-                    b"\n[kernel] Out of memory in task "
-                } else {
-                    b"\n[kernel] Bus error in task "
-                });
-                print_dec(tid);
-                console::puts(b" - killing task.\n");
-                unsafe { core::arch::asm!("sti", options(nostack, nomem)) };
-                scheduler::exit_program(-SIGBUS);
+                no_page(cr2, matches!(fault, crate::paging::Fault::NoMemory));
             }
             Err(_) => {}
+        }
+    }
+
+    // A write to a page shared since a fork is served too: the writer is
+    // given a copy of its own, or the page back if nobody shares it any
+    // more, and the instruction runs again. From ring 0 as from ring 3:
+    // the kernel owns a page before it writes it where it can say so first
+    // (`paging::back_range`), and CR0.WP is what brings the writes that
+    // could not here, rather than letting them through to a frame that is
+    // somebody else's as well.
+    if vec == 14
+        && frame.error_code & (PF_PRESENT | PF_WRITE | PF_RESERVED) == PF_PRESENT | PF_WRITE
+    {
+        let cr2: u64;
+        unsafe { core::arch::asm!("mov {}, cr2", out(reg) cr2, options(nostack, nomem)) };
+        let cr3 = crate::paging::read_cr3();
+        match unsafe { crate::paging::own(cr3, cr2 as usize) } {
+            Ok(true) => return,
+            // The same bargain: a fork promised a page it had not got.
+            Err(_) if from_user => no_page(cr2, true),
+            _ => {}
         }
     }
 

@@ -23,10 +23,9 @@ them struck through as done. What follows is what is true now.
   processors at most.
 - **Paging anything out.** Anonymous memory gets its frames when first touched
   and keeps them; a machine that runs out ends whichever task touched the page
-  it could not give, not the biggest one. There is no swap.
-- **Copy-on-write.** `fork` copies every page the caller owns, eagerly. Sharing
-  until written needs a reference count per frame, and frames here have an
-  owner and nothing else.
+  it could not give, not the biggest one. A `fork` promises a copy of every
+  page the same way, and is refused none: the write that needs a frame there
+  is not ends the program that made it. There is no swap.
 - **Signals that interrupt.** A program is told of a signal it has a handler
   for, and its runtime runs the handler at the next system-call boundary
   (`docs/abi.md`, *Signals*). Nothing stops a program in the middle of

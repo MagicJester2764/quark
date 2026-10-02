@@ -526,6 +526,22 @@ pub unsafe fn init_processor() {
 
 const USER_ADDR_LIMIT: u64 = paging::USER_ADDR_LIMIT;
 
+#[inline(always)]
+fn irq_save() -> u64 {
+    let flags: u64;
+    unsafe {
+        core::arch::asm!("pushfq; pop {}; cli", out(reg) flags, options(nostack));
+    }
+    flags
+}
+
+#[inline(always)]
+fn irq_restore(flags: u64) {
+    unsafe {
+        core::arch::asm!("push {}; popfq", in(reg) flags, options(nostack));
+    }
+}
+
 /// Validate that a user pointer range is entirely in user space *and* actually
 /// mapped in the calling task's address space.
 ///
@@ -1366,23 +1382,33 @@ fn dispatch(
             if !local_ok {
                 return u64::MAX;
             }
-            let Some((lent, cr3)) = crate::ipc::lent_to(client, me) else {
-                return u64::MAX;
-            };
-            let need = if into_lent { crate::lend::LEND_WRITE } else { crate::lend::LEND_READ };
-            if lent.access & need == 0 {
-                return u64::MAX;
-            }
-            match offset.checked_add(len) {
-                Some(end) if end <= lent.len => {}
-                _ => return u64::MAX,
-            }
-            // Syscalls run with interrupts off, and nothing here blocks.
-            let copied = if lent.frame {
-                unsafe { crate::lend::copy_frame(lent.addr + offset, local as usize, len, into_lent) }
-            } else {
-                unsafe { crate::lend::copy(cr3, lent.addr + offset, local as usize, len, into_lent) }
-            };
+            // From finding what was lent to the end of the copy is one
+            // step, with interrupts off: the lender's pages are found in
+            // its tables and reached by their frames, and a thread of the
+            // lender run in between could unmap one, and the frame be
+            // somebody else's by the time it was written. (A system call
+            // had interrupts off when this was written, and said so here
+            // long after it had stopped being true.)
+            let flags = irq_save();
+            let copied = (|| {
+                let Some((lent, cr3)) = crate::ipc::lent_to(client, me) else {
+                    return false;
+                };
+                let need = if into_lent { crate::lend::LEND_WRITE } else { crate::lend::LEND_READ };
+                if lent.access & need == 0 {
+                    return false;
+                }
+                match offset.checked_add(len) {
+                    Some(end) if end <= lent.len => {}
+                    _ => return false,
+                }
+                if lent.frame {
+                    unsafe { crate::lend::copy_frame(lent.addr + offset, local as usize, len, into_lent) }
+                } else {
+                    unsafe { crate::lend::copy(cr3, lent.addr + offset, local as usize, len, into_lent) }
+                }
+            })();
+            irq_restore(flags);
             if copied {
                 len as u64
             } else {
@@ -1944,6 +1970,11 @@ fn dispatch(
             let mut moved = 0;
             for i in 0..pages {
                 let here = from + i * 4096;
+                // A page the caller shares since a fork is its alone before
+                // it goes, or what is moved is somebody else's page too.
+                if unsafe { paging::unshare(own, here) }.is_err() {
+                    break;
+                }
                 let Some(frame) = (unsafe { paging::translate(own, here) }) else {
                     break;
                 };

@@ -713,9 +713,9 @@ task made it, and whether or not that task is still running.
 `SYS_MEMFD_TRUNCATE` works only while exactly one descriptor names the region
 and nothing has it mapped: a second descriptor is one that has been somewhere.
 
-Destruction is deferred while any mapping remains. Futexes are keyed on physical
-address, so a futex word inside a shared region is one object to every task that
-maps it.
+Destruction is deferred while any mapping remains. A futex word inside a
+shared region is one object to every task that maps it, wherever each has it
+(see *Futexes*).
 
 ### File descriptors and pipes (0x40)
 
@@ -850,7 +850,12 @@ its own to fill — nobody else can name it, it holds nothing and it cannot run 
 so none of that asks for `TaskMgmt`; the capability buys more than sixteen
 children at once, and the right to touch a task that is already running. Or a
 task may `SYS_FORK`, which copies it, and `SYS_EXEC_SPACE`, which keeps the
-task and replaces the program it runs. TIDs are reused once a task is reaped,
+task and replaces the program it runs. The copy is of the caller's memory as
+it is at the call, and is made when it is needed: the two share a page until
+one of them writes it, and that one has a copy from then on. Nothing either
+can see says so, except what a fork costs, and that neither is charged for
+the copy — so the write that needs a frame the machine has not got ends the
+program that made it, with `-7`, as the first touch of reserved memory does. TIDs are reused once a task is reaped,
 so a TID identifies a task only for as long as that task lives — see the note
 on TID reuse below.
 
@@ -1088,8 +1093,13 @@ at the calls.
 | 130 | `SYS_FUTEX_WAIT_TIMEOUT` | arg0 = addr, arg1 = expected, arg2 = how long to wait, a span | 0 = woken, 1 = value already differed, 2 = timed out, `u64::MAX` = bad address or no wait slot. **Blocks.** | — |
 | 131 | `SYS_EVENT_CREATE` | arg0 = the count it starts at, arg1 = flags (1 = semaphore) | a descriptor readable while the counter is not zero / `u64::MAX` | — |
 
-Futexes are keyed on **physical** address, so a word in shared memory is one
-futex to every task that maps it, whatever virtual address each uses.
+A word in shared memory — a region, or a file mapped shared — is one futex
+to every task that maps it, whatever virtual address each uses: it is named
+by where it is in physical memory. A word in memory of the program's own is
+that program's and nobody else's, and is named by the program and the
+address. The difference shows after `SYS_FORK`: the child has the parent's
+memory at the parent's addresses, and for a time in the parent's frames, and
+a wake in one is not a wake in the other.
 
 A timeout of no time makes `SYS_FUTEX_WAIT_TIMEOUT` a check rather than a wait:
 it returns 1 if the value already differs and 2 if it does not, without

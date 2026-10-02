@@ -8,15 +8,50 @@ use crate::sync::IrqSpinLock;
 
 const MAX_FUTEX_WAITERS: usize = 64;
 
+/// Which word a task is waiting on.
+///
+/// A word in memory the program does not own — shared memory, a file mapped
+/// shared — is the same word in every program that maps it, wherever each
+/// has it: it is named by its frame. Keying on (cr3, vaddr) made a futex
+/// inside a shared-memory region a *different* object in every task that
+/// mapped it, so cross-process synchronisation through shmem silently never
+/// woke anyone.
+///
+/// A word in memory the program owns is that program's and nobody else's:
+/// it is named by the address space and the address. Its frame says less
+/// than that and more. After a `fork` the parent and the child have the
+/// page in one frame until one of them writes it, and are not waiting on
+/// one word; and the one that writes has it in another frame from then on,
+/// so a thread that waited before the write was never found by the wake
+/// that came after it — which is every wake, since what is waited for is a
+/// write to that word.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Key {
+    /// The address space, for a word in memory it owns; 0 for a frame.
+    space: usize,
+    /// The address there, or the frame's.
+    at: usize,
+}
+
+const NO_KEY: Key = Key { space: 0, at: 0 };
+
+/// The key of the word at `addr` in `cr3`, if there is a page there.
+fn key_of(cr3: usize, addr: u64) -> Option<Key> {
+    unsafe {
+        let own = crate::paging::leaf_flags(cr3, addr as usize)
+            .is_some_and(|f| f & crate::paging::OWNED != 0);
+        if own {
+            return Some(Key { space: cr3, at: addr as usize });
+        }
+        crate::paging::translate(cr3, addr as usize).map(|at| Key { space: 0, at })
+    }
+}
+
 #[derive(Clone, Copy)]
 struct FutexWaiter {
     tid: usize,
-    /// Physical address of the futex word.
-    ///
-    /// Keying on (cr3, vaddr) made a futex inside a shared-memory region a
-    /// *different* object in every task that mapped it, so cross-process
-    /// synchronisation through shmem silently never woke anyone.
-    paddr: usize,
+    /// The word it waits on.
+    key: Key,
     active: bool,
     /// When to give up, in the clock's nanoseconds. 0 = wait indefinitely.
     deadline: u64,
@@ -33,7 +68,7 @@ struct FutexState {
 static FUTEX: IrqSpinLock<FutexState> = IrqSpinLock::new(FutexState {
     waiters: [FutexWaiter {
         tid: 0,
-        paddr: 0,
+        key: NO_KEY,
         active: false,
         deadline: 0,
         expired: false,
@@ -84,8 +119,8 @@ fn wait(addr: u64, expected: u32, timeout_ns: Option<u64>) -> u64 {
     if !usable {
         return u64::MAX;
     }
-    let paddr = match unsafe { crate::paging::translate(cr3, addr as usize) } {
-        Some(p) => p,
+    let key = match key_of(cr3, addr) {
+        Some(k) => k,
         None => return u64::MAX,
     };
 
@@ -123,7 +158,7 @@ fn wait(addr: u64, expected: u32, timeout_ns: Option<u64>) -> u64 {
 
     state.waiters[slot] = FutexWaiter {
         tid,
-        paddr,
+        key,
         active: true,
         deadline,
         expired: false,
@@ -151,7 +186,7 @@ fn wait(addr: u64, expected: u32, timeout_ns: Option<u64>) -> u64 {
     if let Some(w) = state
         .waiters
         .iter_mut()
-        .find(|w| w.active && w.tid == tid && w.paddr == paddr)
+        .find(|w| w.active && w.tid == tid && w.key == key)
     {
         timed_out = w.expired;
         w.active = false;
@@ -173,8 +208,10 @@ pub fn futex_wake(addr: u64, max_wake: u64) -> u64 {
     }
 
     let cr3 = scheduler::current_task_cr3();
-    let paddr = match unsafe { crate::paging::translate(cr3, addr as usize) } {
-        Some(p) => p,
+    // No page there is no waiter there: a wait gives the page its memory
+    // before it waits.
+    let key = match key_of(cr3, addr) {
+        Some(k) => k,
         None => return 0,
     };
     let mut woken = 0u64;
@@ -187,7 +224,7 @@ pub fn futex_wake(addr: u64, max_wake: u64) -> u64 {
         // Skip one whose deadline already fired: it is awake and on its way
         // to reading `expired`, and counting it here would spend a wake that
         // another waiter is still blocked for.
-        if waiter.active && !waiter.expired && waiter.paddr == paddr {
+        if waiter.active && !waiter.expired && waiter.key == key {
             waiter.active = false;
             scheduler::unblock_task(waiter.tid);
             woken += 1;

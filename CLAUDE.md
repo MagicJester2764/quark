@@ -138,11 +138,12 @@ system hung.
 
 There are no tests in this tree, and that is the shape of a microkernel rather
 than an omission: the kernel is tested from outside, through the ABI, by a
-program. `dtest` in `../quarkutils` makes 720 checks — capabilities, IPC,
+program. `dtest` in `../quarkutils` makes 747 checks — capabilities, IPC,
 memory, descriptors, signals, scheduling, users and terminals, `dtest calls`
 with three million calls in three seconds, `dtest smp` for what a second
 processor changes, `dtest clock` for what time it is and whether a wait ends
-when it should, and seven more (`dtest msi`) on a machine with a device that
+when it should, `dtest fork` for what a fork shares and who a write is seen
+by, and seven more (`dtest msi`) on a machine with a device that
 interrupts by message and its driver running — and `qfuzz` throws random
 requests at every service.
 
@@ -211,9 +212,51 @@ may keep — are in `../quarkutils/CLAUDE.md`; these are the kernel's.
 - **`paging::OWNED` (PTE bit 9) decides what may be freed.** Only frames the
   address space owns go back to the allocator. Device MMIO, shared memory and
   frames another task still holds are mapped *without* it. An owned frame is
-  mapped in exactly one place — that is what makes freeing it on unmap safe —
-  so a new mapping path either leaves the bit off or moves the page, as
-  `sys_addrspace_give` does, rather than copying the mapping.
+  mapped in exactly one place, or it is counted: a `fork` leaves a page in
+  two address spaces, and the frame keeps how many besides one have it as
+  their own (`pmm::share`). `pmm::free` is the one way back for a frame and
+  gives it to the allocator only when the last of them lets go — that is
+  what makes freeing it on unmap safe. So a new mapping path leaves the bit
+  off, or moves the page, as `sys_addrspace_give` does, or counts it;
+  it never copies the mapping and says nothing.
+- **A page shared since a `fork` is the writer's own before it is written,
+  whoever writes it and however it is reached.** What could be written is
+  marked (`paging::COPY_ON_WRITE`, bit 10 of a present entry — `MARKER`'s,
+  when the entry is not) and is not `WRITABLE` in either address space; the
+  write is a fault, and `paging::own` gives the writer a copy, or the page
+  back if nobody shares it any more. Nothing a program can see says any of
+  this happened. What has to be kept is every way to a page that is not a
+  write by its program through its own tables:
+  - *The kernel writing for a program.* It owns the page first where it can
+    say so first (`paging::back_range`, which is what `validate_user_ptr_mut`
+    comes to), and **ring 0 honours write protection** (CR0.WP, set in
+    `boot.s`), so a write that was checked, waited, and found the page shared
+    again — another thread forked meanwhile — is a fault that is served and
+    not a write to the child's page as well. Without WP the kernel writes
+    through a read-only entry and nothing says so.
+  - *A page reached by its frame.* `signal::tell` sets a word in another
+    program's memory, `lend::copy` writes what a server was lent, and
+    `SYS_ADDRSPACE_GIVE` moves a page out: each makes the page its address
+    space's own first (`own`, and `unshare` for one that is going away).
+    Anything new that finds a frame through somebody's tables and writes it
+    does the same.
+  - *A name for a page.* A futex word is named by its address space and
+    address where the program owns the page, and by its frame only where it
+    does not (`futex::Key`). By the frame alone, a child's wake reached its
+    parent's thread; and the program that then wrote the word — which is
+    what a wake follows — had it in another frame, and woke nobody: a
+    semaphore two threads shared stopped working the moment a third forked.
+  - *One step.* Looking at an entry and changing it are done with
+    interrupts off (`back`, `own`): a system call is preempted wherever a
+    tick finds it, and a thread of the same program doing the same to the
+    same page in between has the frame given back twice — the second time
+    from under whoever still shares it. `fork` itself walks and changes
+    the parent's tables in one step for the same reason, and tells every
+    processor that has the parent loaded before it does anything else
+    (`tlb::sync`): a thread of the parent on another processor would
+    otherwise go on writing, through what it remembered, pages the child
+    now has too. `dtest fork` has a check for each of these, and each was
+    seen to fail with its line taken out.
 - **A scrap of memory between the firmware's own is not used**
   (`pmm::scrap`). A restart does not clear memory, and a firmware that
   reads a page it did not keep for itself finds what the last system left:
@@ -249,7 +292,13 @@ may keep — are in `../quarkutils/CLAUDE.md`; these are the kernel's.
   52–62, present or not, and every path that clears or replaces an entry —
   `clear_range`, `unmap_page`, `map_page`, `free_pt_leaves` — hands the
   reference back (`memobj::unmap_ref`). Miss one and the object is never
-  released. Protection keys would give bits 59–62 a meaning, so CR4.PKE stays
+  released. And every path that copies an entry takes one (`copy_pt`, for a
+  fork): a page of a file mapped privately and since touched is the
+  program's own copy and *still names the file*, and a child's entry for it
+  was not counted — and was given back all the same when the child went.
+  Two children later the file's server was told nothing mapped it, let it
+  go, and the parent's next touch of a page it had not yet read was a bus
+  error. Protection keys would give bits 59–62 a meaning, so CR4.PKE stays
   clear.
 - **An object is kept for whoever was promised it.** A pager gives a program
   a capability and the program maps with it: two steps by two programs, and
@@ -527,15 +576,21 @@ is also how many threads it may have.
 Or a program **forks** and **execs**, which is what a C program does and what
 every Unix program assumes:
 
-- **`fork` copies eagerly.** The child is a task in a copy of the caller's
-  address space that returns 0 from the same system call — which works because
-  the syscall stub's eleven pushes always land at `kernel_stack_top - 88`, so a
-  task inside a call has its whole register frame at a known place. A page the
-  parent owns becomes a page of the child's own; a page it does not own —
-  shared memory, a device, a file's page — is shared, because `OWNED` is what
-  decides who may free a frame. Copy-on-write would save all of the copying and
-  none of the correctness, and it needs reference counts frames here have not
-  got.
+- **`fork` shares, and a write copies.** The child is a task in a copy of
+  the caller's address space that returns 0 from the same system call — which
+  works because the syscall stub's eleven pushes always land at
+  `kernel_stack_top - 88`, so a task inside a call has its whole register
+  frame at a known place. The copy is of the page tables: a page the parent
+  owns is one both own until one of them writes it, and that one is given a
+  copy then (see the invariant). A page that could not be written is shared
+  for good; a page the parent does not own — shared memory, a device, a
+  file's page — is shared as it always was. It copied every page for a long
+  time, for a child whose first act is nearly always to become another
+  program and throw them away: four megabytes cost a thousand frames and
+  now cost fifteen. Neither is charged for a copy when it comes — the page
+  was counted as its own when it came to have it — so a fork can promise
+  memory the machine has not got, and the write that finds that out ends its
+  program, as touching a reserved page does.
 - **`exec` keeps the task and changes the program.** The ELF is loaded in user
   space, into an address space the caller made, and `SYS_EXEC_SPACE` swaps the
   task into it: same id, same descriptors, same capabilities, same parent, new
@@ -946,9 +1001,9 @@ breaking any of them is quiet until it is a machine that stops.
   give (SIGBUS), not the biggest. Reading an untouched page gives it a frame
   of its own, where Linux maps one shared page of zeroes. Rust programs' heaps
   still come from `SYS_MMAP`, backed at once.
-- `fork` copies every page the caller owns, eagerly, and a threaded program
-  cannot `exec`: POSIX has it end every other thread, and ending them means
-  unwinding what they hold in a server, so it is refused rather than half done.
+- A threaded program cannot `exec`: POSIX has it end every other thread, and
+  ending them means unwinding what they hold in a server, so it is refused
+  rather than half done.
 - **Signals are told to a program, not delivered to it** (see *Signals*). So a
   handler runs at a system-call boundary and nowhere else: a program that
   handles a signal and computes without making a call is not interrupted.

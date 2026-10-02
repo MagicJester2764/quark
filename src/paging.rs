@@ -30,9 +30,20 @@ pub const NO_EXECUTE: u64 = 1 << 63;
 /// still holds (`sys_addrspace_map`) — freeing those would hand device
 /// addresses or still-shared frames back to the frame allocator.
 ///
-/// An owned frame is mapped in exactly one place. Everything that sets this
-/// bit keeps that true, and it is what makes freeing on unmap safe.
+/// An owned frame is mapped in exactly one place, or is counted: a `fork`
+/// leaves a page in the child that the parent has too, and the frame keeps
+/// a count of how many address spaces have it as their own (`pmm::share`).
+/// Everything that sets this bit keeps that true, and `pmm::free` gives a
+/// frame back to the allocator only when the last of them has let it go.
+/// That is what makes freeing on unmap safe.
 pub const OWNED: u64 = 1 << 9;
+
+/// With `PRESENT` and `OWNED`: the page was writable, is shared since a
+/// `fork`, and is to be copied before it is written ([`own`]). The entry is
+/// not `WRITABLE` while this is set, so the write is a fault. (The bit is
+/// [`MARKER`]'s, which means something only in an entry that is not
+/// present.)
+pub const COPY_ON_WRITE: u64 = 1 << 10;
 
 /// A reservation: a non-present entry with this bit set stands for memory a
 /// mapping promised and nothing has touched yet. In a page table it reserves
@@ -58,6 +69,22 @@ pub fn marker_entry(writable: bool, exec: bool) -> u64 {
 
 fn is_marker(raw: u64) -> bool {
     raw & PRESENT == 0 && raw & MARKER != 0
+}
+
+#[inline(always)]
+fn irq_save() -> u64 {
+    let flags: u64;
+    unsafe {
+        asm!("pushfq; pop {}; cli", out(reg) flags, options(nostack));
+    }
+    flags
+}
+
+#[inline(always)]
+fn irq_restore(flags: u64) {
+    unsafe {
+        asm!("push {}; popfq", in(reg) flags, options(nostack));
+    }
 }
 
 /// Why a page could not be backed.
@@ -534,10 +561,24 @@ pub unsafe fn marker(pml4_phys: usize, virt: usize) -> Option<u64> { unsafe {
 /// current task, mapped as its reservation said. `write` is whether the access
 /// that wants it is a write.
 ///
+/// Looking at the entry and filling it are one step, with interrupts off:
+/// a system call is preempted wherever a tick finds it, and another thread
+/// of the program, run in between, may fault on the same page and be given
+/// it. Done in two steps, the second frame replaced the first, which was
+/// never freed, and what the other thread had written to it by then was
+/// gone. (A page of an object waits for its pager in the middle, and looks
+/// again when it has it.)
+///
 /// # Safety
-/// `pml4_phys` must be the current task's address space; interrupts off, so
-/// nothing else changes its tables in between.
+/// `pml4_phys` must be the current task's address space.
 pub unsafe fn back(pml4_phys: usize, virt: usize, write: bool, may_block: bool) -> Result<(), Fault> { unsafe {
+    let flags = irq_save();
+    let result = back_one(pml4_phys, virt, write, may_block);
+    irq_restore(flags);
+    result
+}}
+
+unsafe fn back_one(pml4_phys: usize, virt: usize, write: bool, may_block: bool) -> Result<(), Fault> { unsafe {
     let (pml4i, pdpti, pdi, pti) = table_indices(virt);
     if (virt as u64) < USER_MIN_ADDR || (virt as u64) >= USER_ADDR_LIMIT {
         return Err(Fault::Invalid);
@@ -659,8 +700,107 @@ pub unsafe fn back_range(pml4_phys: usize, addr: u64, len: u64, write: bool) -> 
     while page < end {
         if marker(pml4_phys, page as usize).is_some() {
             back(pml4_phys, page as usize, write, true)?;
+        } else if write {
+            // A page shared since a fork is the writer's own before the
+            // kernel writes it, as it would be before the program did.
+            own(pml4_phys, page as usize)?;
         }
         page += PAGE_SIZE as u64;
+    }
+    Ok(())
+}}
+
+/// Make the page at `virt` this address space's alone and writable, if it
+/// is one shared since a `fork` and waiting to be copied. Whether it was.
+///
+/// If nobody else has the frame any more — the other side copied its own,
+/// or is gone — the page is simply made writable again. Otherwise this
+/// address space is given a copy and the frame is one fewer's. Nothing is
+/// charged: the page was counted as this address space's when it came to
+/// have it.
+///
+/// It is called for a write that faulted, from ring 3 or from the kernel;
+/// before the kernel writes a program's memory where it can say so first
+/// ([`back_range`]); and for another address space's page, where the kernel
+/// is about to write it through its frame. Wherever the frame changes,
+/// every processor with the address space loaded is told (`tlb::stale`).
+///
+/// Looking at the entry, copying the page and changing the entry are one
+/// step, with interrupts off. In two, another thread of the program run in
+/// between could do the same: the frame would be given back twice, once
+/// more than this address space had it, and the second time it is freed
+/// from under whoever it is still shared with.
+///
+/// # Safety
+/// `pml4_phys` must point to a valid, identity-mapped PML4 table.
+pub unsafe fn own(pml4_phys: usize, virt: usize) -> Result<bool, Fault> { unsafe {
+    let flags = irq_save();
+    let result = own_one(pml4_phys, virt);
+    irq_restore(flags);
+    result
+}}
+
+unsafe fn own_one(pml4_phys: usize, virt: usize) -> Result<bool, Fault> { unsafe {
+    if (virt as u64) < USER_MIN_ADDR || (virt as u64) >= USER_ADDR_LIMIT {
+        return Ok(false);
+    }
+    let (_, _, _, pti) = table_indices(virt);
+    let Some(pt) = leaf_table(pml4_phys, virt) else { return Ok(false) };
+    let raw = pt.entries[pti].raw();
+    if raw & PRESENT == 0 || raw & OWNED == 0 || raw & COPY_ON_WRITE == 0 {
+        return Ok(false);
+    }
+    let frame = pt.entries[pti].frame_address();
+    let flags = (raw & !ADDR_MASK & !COPY_ON_WRITE) | WRITABLE;
+    if pmm::shared(frame) == 0 {
+        pt.entries[pti].set(frame, flags);
+    } else {
+        let copy = pmm::alloc().ok_or(Fault::NoMemory)?.address();
+        core::ptr::copy_nonoverlapping(frame as *const u8, copy as *mut u8, PAGE_SIZE);
+        pt.entries[pti].set(copy, flags);
+        pmm::free(pmm::PhysFrame::from_address(frame));
+        // Another thread of the program, on another processor, may still be
+        // reading the page it was.
+        crate::tlb::stale(pml4_phys);
+    }
+    if pml4_phys == read_cr3() {
+        invlpg(virt & !0xFFF);
+    }
+    Ok(true)
+}}
+
+/// Make the page at `virt` this address space's alone, whether or not it
+/// was waiting to be copied: for a page about to be given away
+/// (`SYS_ADDRSPACE_GIVE`), which must not go on being somebody else's too.
+///
+/// # Safety
+/// As [`own`].
+pub unsafe fn unshare(pml4_phys: usize, virt: usize) -> Result<(), Fault> { unsafe {
+    let flags = irq_save();
+    let result = unshare_one(pml4_phys, virt);
+    irq_restore(flags);
+    result
+}}
+
+unsafe fn unshare_one(pml4_phys: usize, virt: usize) -> Result<(), Fault> { unsafe {
+    if own_one(pml4_phys, virt)? {
+        return Ok(());
+    }
+    let (_, _, _, pti) = table_indices(virt);
+    let Some(pt) = leaf_table(pml4_phys, virt) else { return Ok(()) };
+    let raw = pt.entries[pti].raw();
+    let frame = pt.entries[pti].frame_address();
+    if raw & PRESENT == 0 || raw & OWNED == 0 || pmm::shared(frame) == 0 {
+        return Ok(());
+    }
+    // Shared for good, being read-only: a copy is this one's alone.
+    let copy = pmm::alloc().ok_or(Fault::NoMemory)?.address();
+    core::ptr::copy_nonoverlapping(frame as *const u8, copy as *mut u8, PAGE_SIZE);
+    pt.entries[pti].set(copy, raw & !ADDR_MASK);
+    pmm::free(pmm::PhysFrame::from_address(frame));
+    crate::tlb::stale(pml4_phys);
+    if pml4_phys == read_cr3() {
+        invlpg(virt & !0xFFF);
     }
     Ok(())
 }}
@@ -743,7 +883,9 @@ pub unsafe fn range_is_free(pml4_phys: usize, virt: usize, pages: usize) -> bool
 
 /// Clear `[virt, virt + pages)` of mappings and reservations alike, freeing
 /// the frames this address space owns and the tables left empty. Returns how
-/// many frames went back to the allocator.
+/// many pages of its own the address space had there, which is what it is
+/// no longer charged for: a frame shared since a fork is given up, and goes
+/// back to the allocator when the last to have it does.
 ///
 /// # Safety
 /// `pml4_phys` must point to a valid, identity-mapped user PML4 table, and the
@@ -1219,21 +1361,27 @@ pub unsafe fn unmap_page_owned(pml4_phys: usize, virt_addr: usize) -> bool { uns
 
 /// Copy the user half of an address space, for a fork.
 ///
-/// A page the source owns becomes a page of its own with the same bytes; a
-/// page it does not own — shared memory, a device, a file's page — is mapped
-/// at the same frame, because that is what sharing means and because `OWNED`
-/// is what decides who may free a frame. A reservation is copied as a
-/// reservation: the promise is inherited, and whoever touches the page first
-/// gets a frame for it.
+/// A page the source owns becomes a page both own: the same frame, counted
+/// once more (`pmm::share`), and — if it could be written — writable by
+/// neither until one of them does, at which point that one is given a copy
+/// ([`own`]). A page that could not be written is shared for good. A page
+/// the source does not own — shared memory, a device, a file's page — is
+/// mapped at the same frame, because that is what sharing means and because
+/// `OWNED` is what decides who may free a frame. A reservation is copied as
+/// a reservation: the promise is inherited, and whoever touches the page
+/// first gets a frame for it.
 ///
-/// Eager, and not copy-on-write. A frame here has no reference count, so
-/// sharing one writable between two address spaces would need one; the
-/// immediate use of `fork` is a child that immediately execs, where
-/// copy-on-write saves all of the copying and none of the correctness.
+/// It was eager for a long time: every page copied, for a child whose first
+/// act is nearly always to become another program and throw them away.
+///
+/// The source's own entries are changed — what was writable is not, until
+/// it is written — so whoever calls this tells every processor that has
+/// the source loaded (`tlb::stale`) and reloads its own.
 ///
 /// Returns the pages charged to the child, or `None` if anything ran out. On
-/// failure the caller destroys the half-built space, which frees exactly what
-/// this made: everything it allocated carries `OWNED`.
+/// failure the caller destroys the half-built space, which gives back
+/// exactly what this took: a table it allocated, and a count on each frame
+/// it shared.
 ///
 /// # Safety
 /// Both must be valid, identity-mapped PML4 tables, and `dst_pml4` must be a
@@ -1315,14 +1463,31 @@ unsafe fn copy_pt(src_phys: usize, dst_phys: usize) -> Option<usize> { unsafe {
             continue;
         }
         if raw & PRESENT != 0 && raw & OWNED != 0 {
-            // The child's own copy of the page, and the only one it may free.
-            let frame = pmm::alloc()?.address();
-            core::ptr::copy_nonoverlapping(
-                src.entries[i].frame_address() as *const u8,
-                frame as *mut u8,
-                PAGE_SIZE,
-            );
-            dst.entries[i].set(frame, raw & !ADDR_MASK);
+            let frame = src.entries[i].frame_address();
+            if pmm::share(frame) {
+                // Both have it. What could be written is to be copied by
+                // whichever writes first; what could not is simply shared.
+                let both = if raw & (WRITABLE | COPY_ON_WRITE) != 0 {
+                    (raw & !WRITABLE) | COPY_ON_WRITE
+                } else {
+                    raw
+                };
+                src.entries[i] = PageTableEntry(both);
+                dst.entries[i] = PageTableEntry(both);
+            } else {
+                // More sharers than the count can say: a copy of the
+                // child's own, as every page once was.
+                let copy = pmm::alloc()?.address();
+                core::ptr::copy_nonoverlapping(frame as *const u8, copy as *mut u8, PAGE_SIZE);
+                dst.entries[i].set(copy, raw & !ADDR_MASK);
+            }
+            // A private copy of a file's page still names the file, and the
+            // child's entry is one more that does. It was not counted for a
+            // long time, and was given back all the same when the child
+            // went: an object lost a reference for every such page of every
+            // child, and was called idle while its first mapper still had
+            // pages of it to touch.
+            crate::memobj::map_ref(object_slot(raw), 1);
             pages += 1;
             continue;
         }

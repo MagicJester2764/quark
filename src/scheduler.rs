@@ -308,6 +308,11 @@ pub fn exit_with(code: i32) -> ! {
         let clear_at = TASKS[current].as_ref().map_or(0, |t| t.clear_child_tid);
         if clear_at != 0 {
             let cr3 = read_cr3_of(current);
+            // On a page shared since a fork it is this program's own word
+            // that is cleared, and a write that would not be allowed until
+            // the page is its own. (The word is four bytes at a multiple
+            // of four: it is in one page.)
+            let _ = crate::paging::own(cr3, clear_at as usize);
             if crate::paging::user_range_accessible(cr3, clear_at, 4, true) {
                 let _ua = crate::cpu::UserAccess::begin();
                 core::ptr::write_volatile(clear_at as *mut u32, 0);
@@ -2500,7 +2505,20 @@ pub fn fork_current() -> Option<usize> {
     // The address space first: it is the part that can run out, and it is the
     // part that is worth doing before a task slot is taken.
     let child_cr3 = crate::userspace::create_address_space()?;
-    let pages = match unsafe { crate::paging::copy_user_space(parent_cr3, child_cr3) } {
+    // In one step, with interrupts off. The parent's own tables are walked
+    // and changed — what it could write it cannot, until it has a copy —
+    // and another thread of it, run half way through, could unmap what is
+    // being walked. And before anything else happens, every processor is
+    // made to forget what it remembers of the parent: this one, and any
+    // that is running another of its threads, which would otherwise go on
+    // writing to pages the child now has too.
+    let flags = irq_save();
+    let copied = unsafe { crate::paging::copy_user_space(parent_cr3, child_cr3) };
+    crate::tlb::stale(parent_cr3);
+    crate::tlb::sync();
+    unsafe { crate::paging::write_cr3(crate::paging::read_cr3()) };
+    irq_restore(flags);
+    let pages = match copied {
         Some(n) => n,
         None => {
             drop_unused_space(child_cr3);

@@ -167,6 +167,10 @@ fn tell(tid: usize, word: usize) {
     }
     let flags = irq_save();
     unsafe {
+        // The page is reached by its frame, so one the program shares since
+        // a fork is made its own first: the other side was not sent this.
+        // With no memory to do that the word is not written, as below.
+        let _ = crate::paging::own(cr3, word);
         let writable = crate::paging::walk_flags(cr3, word)
             .is_some_and(|f| f & crate::paging::USER != 0 && f & crate::paging::WRITABLE != 0);
         if writable {

@@ -60,6 +60,12 @@ pub unsafe fn copy(cr3: usize, at: usize, local: usize, len: usize, into_lent: b
                 None => return false,
             };
             let n = (4096 - (va & 0xFFF)).min(len - done);
+            // What is written reaches the lender's page by its frame, not
+            // through its tables: a page it shares since a fork has to be
+            // its own first, or the other side is written too.
+            if into_lent && paging::own(cr3, va).is_err() {
+                return false;
+            }
             let Some(flags) = paging::walk_flags(cr3, va) else {
                 return false;
             };

@@ -143,9 +143,11 @@ _start:
     or $((1 << 8) | (1 << 11)), %eax
     wrmsr
 
-    // Enable paging + SSE setup in CR0: set PG+MP, clear EM
+    // Enable paging + SSE setup in CR0: set PG+MP, clear EM. And WP: ring 0
+    // honours a page's write protection, which is what lets a page be
+    // shared until it is written whoever the writer is.
     mov %cr0, %eax
-    or $((1 << 31) | (1 << 1)), %eax   // PG + MP
+    or $((1 << 31) | (1 << 16) | (1 << 1)), %eax   // PG + WP + MP
     and $~(1 << 2), %eax               // clear EM
     mov %eax, %cr0
 

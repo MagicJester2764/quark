@@ -141,6 +141,16 @@ forget, and answers — before a frame is given out again and before the
 kernel lock is given up. Between those, nothing can come of it. A call that
 unmaps a thousand pages interrupts the program's other threads once.
 
+**Taking leave to write away.** A `fork` leaves the parent's pages in the
+child as well, and neither may write one until it has a copy. The parent's
+other threads, on other processors, remember that they may. For a page
+unmapped it is enough that they forget before the frame is anybody else's;
+here the frame is somebody else's already — the child's — so they are asked
+at once, in the fork, before it does anything else. Until they have
+forgotten, what they write is in the child too, and that is harmless only
+while the child has not run: it is a write that came just before the fork
+rather than just after.
+
 **Two threads touching a new page at once.** Both fault; one is given the
 page; by the time the kernel hears the other's fault the page is there. A
 fault the page tables no longer agree with is no fault, and the instruction

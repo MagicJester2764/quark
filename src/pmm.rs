@@ -87,6 +87,10 @@ struct PmmInner {
     /// [`init`] has found it room.
     bitmap: *mut u8,
     frames: usize,
+    /// For each frame, how many address spaces besides one have it as
+    /// their own: nought for nearly every frame, and more for a page a
+    /// `fork` left in two of them until one writes to it.
+    shares: *mut u8,
     total_frames: usize,
     free_frames: usize,
     /// No byte of the bitmap above this one has a free frame in it, and
@@ -108,6 +112,13 @@ impl PmmInner {
             return &mut [];
         }
         unsafe { core::slice::from_raw_parts_mut(self.bitmap, self.frames.div_ceil(8)) }
+    }
+
+    fn sharers(&mut self) -> &mut [u8] {
+        if self.shares.is_null() {
+            return &mut [];
+        }
+        unsafe { core::slice::from_raw_parts_mut(self.shares, self.frames) }
     }
 
     fn set_used(&mut self, frame_idx: usize) {
@@ -219,6 +230,7 @@ impl PmmInner {
 static PMM: IrqSpinLock<PmmInner> = IrqSpinLock::new(PmmInner {
     bitmap: core::ptr::null_mut(),
     frames: 0,
+    shares: core::ptr::null_mut(),
     total_frames: 0,
     free_frames: 0,
     top: 0,
@@ -250,11 +262,12 @@ pub unsafe fn init(
         .min(MAX_PHYS) as usize;
     let frames = top / PAGE_SIZE;
 
-    // Room for a bit a frame and then a byte a frame, in memory the boot
-    // map reaches — below four gigabytes — that nothing else is in: not the
-    // first megabyte, the kernel, what the bootloader passed or a module.
+    // Room for a bit a frame and then two bytes a frame — who owns it, and
+    // how many share it — in memory the boot map reaches, below four
+    // gigabytes, that nothing else is in: not the first megabyte, the
+    // kernel, what the bootloader passed or a module.
     let bitmap_len = frames.div_ceil(8);
-    let room = (bitmap_len + frames + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+    let room = (bitmap_len + 2 * frames + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
     let in_the_way = |start: usize, end: usize| -> Option<usize> {
         let hits = |a: usize, b: usize| (start < b && a < end).then_some(b);
         let mut past = hits(0, 0x100000)
@@ -285,7 +298,7 @@ pub unsafe fn init(
         panic!("no room below four gigabytes for the table of frames");
     };
     core::ptr::write_bytes(place as *mut u8, 0xFF, bitmap_len);
-    core::ptr::write_bytes((place + bitmap_len) as *mut u8, 0, frames);
+    core::ptr::write_bytes((place + bitmap_len) as *mut u8, 0, 2 * frames);
     {
         let mut owners = FRAME_OWNER.lock();
         owners.table = (place + bitmap_len) as *mut u8;
@@ -295,6 +308,7 @@ pub unsafe fn init(
     let mut pmm = PMM.lock();
     pmm.bitmap = place as *mut u8;
     pmm.frames = frames;
+    pmm.shares = (place + bitmap_len + frames) as *mut u8;
 
     // Step 1: For each available region, clear bits (mark free).
     let mut scraps = 0u64;
@@ -401,11 +415,45 @@ pub fn alloc_contiguous(count: usize, low: bool) -> Option<PhysFrame> {
     PMM.lock().take_run(count, low)
 }
 
-/// Free a previously allocated physical frame.
+/// One more address space has `frame` as its own: a `fork` has left a page
+/// in the child that the parent has too. False if that many have it already
+/// that the count cannot say one more, and the caller must copy instead.
+pub fn share(frame: usize) -> bool {
+    let mut pmm = PMM.lock();
+    let idx = PmmInner::frame_index(frame);
+    match pmm.sharers().get_mut(idx) {
+        Some(count) if *count < u8::MAX => {
+            *count += 1;
+            true
+        }
+        _ => false,
+    }
+}
+
+/// How many address spaces besides one have `frame` as their own.
+pub fn shared(frame: usize) -> u8 {
+    let mut pmm = PMM.lock();
+    let idx = PmmInner::frame_index(frame);
+    pmm.sharers().get(idx).copied().unwrap_or(0)
+}
+
+/// Give a frame back: whoever had it has it no longer.
+///
+/// It goes back to the allocator if nobody else has it, and is one fewer's
+/// if somebody does ([`share`]). There is one way back for a frame and this
+/// is it, so that nothing can free one out from under whoever it is shared
+/// with by not knowing that it was.
 pub fn free(frame: PhysFrame) {
     let mut pmm = PMM.lock();
     let idx = PmmInner::frame_index(frame.address());
-    if idx < pmm.frames && pmm.is_used(idx) {
+    if idx >= pmm.frames {
+        return;
+    }
+    if pmm.sharers()[idx] > 0 {
+        pmm.sharers()[idx] -= 1;
+        return;
+    }
+    if pmm.is_used(idx) {
         pmm.set_free(idx);
         pmm.free_frames += 1;
     }

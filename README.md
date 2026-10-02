@@ -36,8 +36,9 @@ The kernel provides:
   file is mapped
 - A per-task descriptor table: IPC endpoints, pipes, connected streams that
   can carry descriptors, poll sets, pseudo-terminals, timers and event counters
-- Tasks, threads, `fork` and `exec`; futexes with deadlines; every task's
-  own floating-point and vector registers, as wide as the processor has
+- Tasks, threads, a `fork` that shares memory until one side writes it, and
+  `exec`; futexes with deadlines; every task's own floating-point and vector
+  registers, as wide as the processor has
 - IRQ delivery to user-space drivers, and page faults forwarded to a pager
 - Random bytes (ChaCha20, seeded from RDSEED or RDRAND and the machine's
   timing), and the date, which a holder of the capability may set
@@ -165,7 +166,7 @@ make run
 ## Testing
 
 The kernel is tested from outside, through the ABI, by a program: `dtest` in
-quarkutils makes 720 checks from user space. A kernel change is verified by
+quarkutils makes 747 checks from user space. A kernel change is verified by
 booting an image and running it — `tools/boot-test.sh` in ExplOSion — on one
 processor and on four.
 
