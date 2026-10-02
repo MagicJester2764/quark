@@ -59,6 +59,9 @@ struct FutexWaiter {
     /// tell why it woke. The slot stays `active` until the waiter reads this,
     /// or it could be handed to a new waiter first and the answer lost.
     expired: bool,
+    /// Set by [`interrupt`]: a signal with a handler for the kernel to run
+    /// ended the wait. Kept until the waiter reads it, as `expired` is.
+    interrupted: bool,
 }
 
 struct FutexState {
@@ -72,6 +75,7 @@ static FUTEX: IrqSpinLock<FutexState> = IrqSpinLock::new(FutexState {
         active: false,
         deadline: 0,
         expired: false,
+        interrupted: false,
     }; MAX_FUTEX_WAITERS],
 });
 
@@ -160,12 +164,20 @@ fn wait(addr: u64, expected: u32, timeout_ns: Option<u64>) -> u64 {
         None => 0,
     };
 
+    // A signal the kernel runs a handler for ends the wait, or stops it
+    // beginning: looked for with the lock held, which is the same step as
+    // being recorded, so that one raised a moment later finds this parked.
+    if crate::signal::ends_wait(tid) {
+        return crate::signal::INTERRUPTED;
+    }
+
     state.waiters[slot] = FutexWaiter {
         tid,
         key,
         active: true,
         deadline,
         expired: false,
+        interrupted: false,
     };
 
     // Block the task while holding the lock to prevent wake races
@@ -187,18 +199,40 @@ fn wait(addr: u64, expected: u32, timeout_ns: Option<u64>) -> u64 {
     // precisely so this can read `expired` out of it.
     let mut state = FUTEX.lock();
     let mut timed_out = false;
+    let mut interrupted = false;
     if let Some(w) = state
         .waiters
         .iter_mut()
         .find(|w| w.active && w.tid == tid && w.key == key)
     {
         timed_out = w.expired;
+        interrupted = w.interrupted;
         w.active = false;
         w.expired = false;
+        w.interrupted = false;
     }
     drop(state);
 
-    if timed_out { TIMED_OUT } else { 0 }
+    if timed_out {
+        TIMED_OUT
+    } else if interrupted {
+        crate::signal::INTERRUPTED
+    } else {
+        0
+    }
+}
+
+/// A signal has arrived for `tid`, which may be waiting on a futex: if it
+/// is, it is woken to say so. True if it was.
+pub fn interrupt(tid: usize) -> bool {
+    let mut state = FUTEX.lock();
+    let Some(w) = state.waiters.iter_mut().find(|w| w.active && w.tid == tid && !w.expired && !w.interrupted)
+    else {
+        return false;
+    };
+    w.interrupted = true;
+    scheduler::unblock_task(tid);
+    true
 }
 
 /// Returned by a timed wait whose deadline passed.
@@ -271,6 +305,7 @@ pub fn cleanup_task(tid: usize) {
         if waiter.active && waiter.tid == tid {
             waiter.active = false;
             waiter.expired = false;
+            waiter.interrupted = false;
             waiter.deadline = 0;
         }
     }

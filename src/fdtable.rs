@@ -57,8 +57,27 @@ struct Table {
     /// signal is said to a program, which is what a table is.
     sig_ignore: u64,
     sig_catch: u64,
-    /// Signals with a handler that have been raised and not yet taken.
+    /// The signals it has a handler for that the kernel is to run
+    /// (`Disposition::Run`): for each, a bit here, and below what is held
+    /// back while its handler runs and how it is to be run. One place in
+    /// the program is entered for all of them (`sig_entry`).
+    sig_run: u64,
+    sig_masks: [u64; 64],
+    sig_flags: [u32; 64],
+    sig_cookies: [u64; 64],
+    sig_entry: usize,
+    /// It has said that a call a signal cuts short is to answer as Unix
+    /// would have it (`signal::handle` for signal 0).
+    sig_unix: bool,
+    /// What came with each signal when it was last raised: who raised it.
+    sig_values: [u64; 64],
+    /// Signals with a handler that have been raised and not yet taken, or
+    /// not yet run.
     sig_pending: u64,
+    /// Signals the program has said nothing about that were raised while
+    /// every task of it held them back: what each does, it does when one
+    /// of them lets it through.
+    sig_held: u64,
     /// One of those has not ended a wait yet. A signal ends one wait, the
     /// first to look: a wait that was ended and went back to waiting without
     /// taking anything is waiting for something else, and is left to.
@@ -86,7 +105,15 @@ const EMPTY: Table = Table {
     umask: DEFAULT_UMASK,
     sig_ignore: 0,
     sig_catch: 0,
+    sig_run: 0,
+    sig_masks: [0; 64],
+    sig_flags: [0; 64],
+    sig_cookies: [0; 64],
+    sig_entry: 0,
+    sig_unix: false,
+    sig_values: [0; 64],
     sig_pending: 0,
+    sig_held: 0,
     sig_interrupt: false,
     sig_word: 0,
     alarm_at: 0,
@@ -280,8 +307,14 @@ pub fn copy_into(child: usize, parent: usize) {
     // read and its being retained would have this retain something freed.
     let flags = irq_save();
     unsafe {
-        let (src_fds, src_cloexec, src_umask, src_signals) = match table_mut(parent) {
-            Some(t) => (t.fds, t.cloexec, t.umask, (t.sig_ignore, t.sig_catch, t.sig_word)),
+        let (src_fds, src_cloexec, src_umask, src_signals, src_run) = match table_mut(parent) {
+            Some(t) => (
+                t.fds,
+                t.cloexec,
+                t.umask,
+                (t.sig_ignore, t.sig_catch, t.sig_word),
+                (t.sig_run, t.sig_masks, t.sig_flags, t.sig_cookies, t.sig_entry, t.sig_unix),
+            ),
             None => {
                 irq_restore(flags);
                 return;
@@ -293,7 +326,9 @@ pub fn copy_into(child: usize, parent: usize) {
             // are told through included. What was raised for the parent and
             // not yet taken is the parent's.
             (dst.sig_ignore, dst.sig_catch, dst.sig_word) = src_signals;
+            (dst.sig_run, dst.sig_masks, dst.sig_flags, dst.sig_cookies, dst.sig_entry, dst.sig_unix) = src_run;
             dst.sig_pending = 0;
+            dst.sig_held = 0;
             dst.sig_interrupt = false;
             for (i, kind) in src_fds.iter().enumerate() {
                 if kind.is_empty() || !dst.fds[i].is_empty() {
@@ -429,6 +464,23 @@ pub enum Disposition {
     Ignore = 1,
     /// The program has a handler, and is told.
     Catch = 2,
+    /// The program has a handler, and the kernel runs it.
+    Run = 3,
+}
+
+/// How a handler the kernel runs is to be run.
+#[derive(Clone, Copy)]
+pub struct Handler {
+    /// The signals held back while it runs, besides its own.
+    pub mask: u64,
+    /// `signal::NODEFER`, `RESETHAND`, `ONSTACK`, `RESTARTS` in the low
+    /// byte; above it, the program's own, handed back in the frame.
+    pub flags: u32,
+    /// The program's word for the handler, handed back in the frame: which
+    /// function it is, usually.
+    pub cookie: u64,
+    /// Where the program is entered: the same for every signal.
+    pub entry: usize,
 }
 
 fn sig_bit(signo: u8) -> u64 {
@@ -446,20 +498,27 @@ pub fn sig_action(tid: usize, signo: u8, new: Option<Disposition>) -> Option<Dis
     let flags = irq_save();
     let old = unsafe {
         table_mut(tid).map(|t| {
-            let old = if t.sig_catch & bit != 0 {
-                Disposition::Catch
-            } else if t.sig_ignore & bit != 0 {
-                Disposition::Ignore
-            } else {
-                Disposition::Default
-            };
+            let old = said(t, bit);
             if let Some(new) = new {
+                // A signal waiting for a handler the kernel was to run, and
+                // held back, is still waiting when the handler has gone: it
+                // does what it does by default when it is let through.
+                let waiting = t.sig_run & t.sig_pending & bit;
                 t.sig_ignore &= !bit;
                 t.sig_catch &= !bit;
+                t.sig_run &= !bit;
                 match new {
-                    Disposition::Ignore => t.sig_ignore |= bit,
-                    Disposition::Catch => t.sig_catch |= bit,
-                    Disposition::Default => {}
+                    Disposition::Ignore => {
+                        t.sig_ignore |= bit;
+                        t.sig_held &= !bit;
+                    }
+                    Disposition::Catch => {
+                        t.sig_catch |= bit;
+                        t.sig_held &= !bit;
+                    }
+                    Disposition::Default => t.sig_held |= waiting,
+                    // Said with what to run: `sig_handle`.
+                    Disposition::Run => {}
                 }
                 // A signal waiting for a handler that is no longer there is
                 // not waiting for anything.
@@ -474,10 +533,216 @@ pub fn sig_action(tid: usize, signo: u8, new: Option<Disposition>) -> Option<Dis
     old
 }
 
-/// Signal `signo` has been raised for `tid`'s program. Returns what the
-/// program said to do about it and, when that is to run a handler, where to
-/// tell it — with the signal now waiting to be taken.
-pub fn sig_post(tid: usize, signo: u8) -> Option<(Disposition, usize)> {
+/// `tid`'s program enters its handlers at `entry`, and — with `unix` — a
+/// call a signal cuts short answers it as Unix would have it.
+pub fn sig_enter_at(tid: usize, entry: usize, unix: bool) -> bool {
+    let flags = irq_save();
+    let done = unsafe {
+        table_mut(tid).map(|t| {
+            t.sig_entry = entry;
+            t.sig_unix = unix;
+        })
+    };
+    irq_restore(flags);
+    done.is_some()
+}
+
+/// Whether `tid`'s program has said where its handlers are entered.
+pub fn sig_has_entry(tid: usize) -> bool {
+    let flags = irq_save();
+    let has = unsafe { table_mut(tid).is_some_and(|t| t.sig_entry != 0) };
+    irq_restore(flags);
+    has
+}
+
+/// Whether `tid`'s program has said so.
+pub fn sig_unix(tid: usize) -> bool {
+    let flags = irq_save();
+    let unix = unsafe { table_mut(tid).is_some_and(|t| t.sig_unix) };
+    irq_restore(flags);
+    unix
+}
+
+/// What a table says about the signal whose bit is `bit`.
+fn said(t: &Table, bit: u64) -> Disposition {
+    if t.sig_run & bit != 0 {
+        Disposition::Run
+    } else if t.sig_catch & bit != 0 {
+        Disposition::Catch
+    } else if t.sig_ignore & bit != 0 {
+        Disposition::Ignore
+    } else {
+        Disposition::Default
+    }
+}
+
+/// `tid`'s program has a handler for `signo` that the kernel is to run, as
+/// `how` says. Returns what it said before.
+pub fn sig_handle(tid: usize, signo: u8, how: Handler) -> Option<Disposition> {
+    if signo == 0 || signo > 64 {
+        return None;
+    }
+    let bit = sig_bit(signo);
+    let flags = irq_save();
+    let old = unsafe {
+        table_mut(tid).map(|t| {
+            let old = said(t, bit);
+            t.sig_ignore &= !bit;
+            t.sig_catch &= !bit;
+            t.sig_run |= bit;
+            // Raised while it was held back with nothing said: it is for
+            // the handler now.
+            if t.sig_held & bit != 0 {
+                t.sig_held &= !bit;
+                t.sig_pending |= bit;
+            }
+            t.sig_masks[signo as usize - 1] = how.mask;
+            t.sig_flags[signo as usize - 1] = how.flags;
+            t.sig_cookies[signo as usize - 1] = how.cookie;
+            old
+        })
+    };
+    irq_restore(flags);
+    old
+}
+
+/// Whether `tid`'s program has anything a task of it with `mask` should be
+/// doing something about on its way out of the kernel: a handler to be run,
+/// or a signal that was held back and is not by this task.
+pub fn sig_ready(tid: usize, mask: u64) -> bool {
+    let flags = irq_save();
+    let ready = unsafe {
+        table_mut(tid).is_some_and(|t| ((t.sig_pending & t.sig_run) | t.sig_held) & !mask != 0)
+    };
+    irq_restore(flags);
+    ready
+}
+
+/// Take the lowest signal waiting for a handler the kernel runs that `mask`
+/// does not hold back: the signal, how to run its handler, and what came
+/// with it. It is no longer waiting.
+pub fn sig_run_take(tid: usize, mask: u64) -> Option<(u8, Handler, u64)> {
+    let flags = irq_save();
+    let out = unsafe {
+        table_mut(tid).and_then(|t| {
+            let ready = t.sig_pending & t.sig_run & !mask;
+            if ready == 0 || t.sig_entry == 0 {
+                return None;
+            }
+            let signo = ready.trailing_zeros() as u8 + 1;
+            t.sig_pending &= !sig_bit(signo);
+            Some((signo, begin(t, signo), t.sig_values[signo as usize - 1]))
+        })
+    };
+    irq_restore(flags);
+    out
+}
+
+/// How the handler for `signo` is to be run, with what running it changes
+/// done: one that is to run once is not there for the next.
+fn begin(t: &mut Table, signo: u8) -> Handler {
+    let i = signo as usize - 1;
+    let how = Handler { mask: t.sig_masks[i], flags: t.sig_flags[i], cookie: t.sig_cookies[i], entry: t.sig_entry };
+    if how.flags & crate::signal::RESETHAND as u32 != 0 {
+        t.sig_run &= !sig_bit(signo);
+    }
+    how
+}
+
+/// The handler `tid`'s program has for `signo`, if it has one the kernel
+/// runs: for a signal that is not raised but happens — a fault.
+pub fn sig_run_begin(tid: usize, signo: u8) -> Option<Handler> {
+    if signo == 0 || signo > 64 {
+        return None;
+    }
+    let flags = irq_save();
+    let out = unsafe {
+        table_mut(tid).and_then(|t| {
+            (t.sig_run & sig_bit(signo) != 0 && t.sig_entry != 0).then(|| begin(t, signo))
+        })
+    };
+    irq_restore(flags);
+    out
+}
+
+/// Take the lowest signal that was held back with nothing said about it and
+/// that `mask` does not hold back.
+pub fn sig_held_take(tid: usize, mask: u64) -> Option<u8> {
+    let flags = irq_save();
+    let out = unsafe {
+        table_mut(tid).and_then(|t| {
+            let ready = t.sig_held & !mask;
+            if ready == 0 {
+                return None;
+            }
+            let signo = ready.trailing_zeros() as u8 + 1;
+            t.sig_held &= !sig_bit(signo);
+            Some(signo)
+        })
+    };
+    irq_restore(flags);
+    out
+}
+
+/// `signo` was raised for `tid`'s program, by `value`, which has said
+/// nothing about it, while every task of it held it back or one waited to
+/// take it.
+pub fn sig_hold(tid: usize, signo: u8, value: u64) {
+    let flags = irq_save();
+    unsafe {
+        if let Some(t) = table_mut(tid) {
+            t.sig_held |= sig_bit(signo);
+            t.sig_values[signo as usize - 1] = value;
+        }
+    }
+    irq_restore(flags);
+}
+
+/// `signo` is no longer held for `tid`'s program.
+pub fn sig_unhold(tid: usize, signo: u8) {
+    let flags = irq_save();
+    unsafe {
+        if let Some(t) = table_mut(tid) {
+            t.sig_held &= !sig_bit(signo);
+        }
+    }
+    irq_restore(flags);
+}
+
+/// Every signal waiting for `tid`'s program: to be told of, to be run, or
+/// held back with nothing said.
+pub fn sig_pending_set(tid: usize) -> u64 {
+    let flags = irq_save();
+    let set = unsafe { table_mut(tid).map_or(0, |t| (t.sig_pending & (t.sig_run | t.sig_catch)) | t.sig_held) };
+    irq_restore(flags);
+    set
+}
+
+/// Take the lowest of `set` waiting for `tid`'s program, whatever was said
+/// about it, without anything being done about it: the signal and who
+/// raised it.
+pub fn sig_take_one(tid: usize, set: u64) -> Option<(u8, u64)> {
+    let flags = irq_save();
+    let out = unsafe {
+        table_mut(tid).and_then(|t| {
+            let waiting = ((t.sig_pending & (t.sig_run | t.sig_catch)) | t.sig_held) & set;
+            if waiting == 0 {
+                return None;
+            }
+            let signo = waiting.trailing_zeros() as u8 + 1;
+            t.sig_pending &= !sig_bit(signo);
+            t.sig_held &= !sig_bit(signo);
+            Some((signo, t.sig_values[signo as usize - 1]))
+        })
+    };
+    irq_restore(flags);
+    out
+}
+
+/// Signal `signo` has been raised for `tid`'s program, by `value`. Returns
+/// what the program said to do about it and, when that is to tell it, where
+/// — with the signal now waiting to be taken, or to be run.
+pub fn sig_post(tid: usize, signo: u8, value: u64) -> Option<(Disposition, usize)> {
     if signo == 0 || signo > 64 {
         return None;
     }
@@ -485,7 +750,11 @@ pub fn sig_post(tid: usize, signo: u8) -> Option<(Disposition, usize)> {
     let flags = irq_save();
     let out = unsafe {
         table_mut(tid).map(|t| {
-            if t.sig_catch & bit != 0 {
+            if t.sig_run & bit != 0 {
+                t.sig_pending |= bit;
+                t.sig_values[signo as usize - 1] = value;
+                (Disposition::Run, 0)
+            } else if t.sig_catch & bit != 0 {
                 t.sig_pending |= bit;
                 t.sig_interrupt = true;
                 (Disposition::Catch, t.sig_word)
@@ -512,7 +781,11 @@ pub fn sig_take(tid: usize, word: usize) -> u64 {
                     t.sig_word = word;
                 }
                 t.sig_interrupt = false;
-                core::mem::replace(&mut t.sig_pending, 0)
+                // Those the program is told of. One the kernel runs a
+                // handler for is taken by running it.
+                let taken = t.sig_pending & t.sig_catch;
+                t.sig_pending &= !taken;
+                taken
             }
             None => 0,
         }
@@ -732,6 +1005,9 @@ pub fn close_on_exec(tid: usize) {
             // A handler is an address in the program that has just gone, and
             // so is the word it was told through. What was ignored still is.
             t.sig_catch = 0;
+            t.sig_run = 0;
+            t.sig_entry = 0;
+            t.sig_unix = false;
             t.sig_pending = 0;
             t.sig_interrupt = false;
             t.sig_word = 0;
@@ -739,6 +1015,23 @@ pub fn close_on_exec(tid: usize) {
     }
     irq_restore(flags);
     release_all(&gone);
+}
+
+/// A signal has arrived for `tid`, which may be parked on what it is using:
+/// if it is, it is taken off that list and woken, and goes to see. True if
+/// it was.
+pub fn interrupt(tid: usize) -> bool {
+    if tid >= MAX_TASKS {
+        return false;
+    }
+    let flags = irq_save();
+    let held = unsafe { (*core::ptr::addr_of!(HELD))[tid] };
+    let found = !held.is_empty() && crate::pipe::forget_waiter(&held, tid);
+    if found {
+        crate::scheduler::unblock_task(tid);
+    }
+    irq_restore(flags);
+    found
 }
 
 /// What `fd` names, held for as long as the calling task is using it.

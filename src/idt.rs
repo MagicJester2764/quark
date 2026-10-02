@@ -598,13 +598,32 @@ fn report_kernel_state(tag: &[u8], frame: &InterruptFrame, kbase: usize, ktop: u
 /// looked at first (`scheduler::arrived`), and a task that was ended has
 /// no fault to be told about.
 #[unsafe(no_mangle)]
-extern "C" fn exception_handler(frame: &InterruptFrame) {
+extern "C" fn exception_handler(frame: &mut InterruptFrame) {
     let took = crate::klock::enter();
     if frame.cs & 3 != 0 {
         scheduler::arrived();
     }
     exception(frame);
+    // Back to ring 3, by way of a handler if there is one to run.
+    if frame.cs & 3 != 0 {
+        crate::signal::leaving_interrupt(frame);
+    }
     crate::klock::leave(took);
+}
+
+/// A fault in ring 3 that is a signal to a program on Unix: if the program
+/// has a handler the kernel runs for it, and the task is not holding it
+/// back, the task goes back to that handler and not to the instruction
+/// that faulted. True if it does. If not, the fault is the end of the
+/// program, as it always was.
+fn handed_to_program(frame: &mut InterruptFrame, signo: i32, addr: u64) -> bool {
+    let mut regs = crate::signal::regs_of(frame);
+    if crate::signal::fault(&mut regs, signo as u8, addr) {
+        crate::signal::enter(frame, &regs);
+        true
+    } else {
+        false
+    }
 }
 
 /// End the program that touched a page it was promised and cannot be given:
@@ -627,7 +646,7 @@ fn no_page(cr2: u64, oom: bool) -> ! {
     scheduler::exit_program(-SIGBUS)
 }
 
-fn exception(frame: &InterruptFrame) {
+fn exception(frame: &mut InterruptFrame) {
     let vec = frame.vector as usize;
     let from_user = frame.cs & 3 != 0;
 
@@ -683,7 +702,11 @@ fn exception(frame: &InterruptFrame) {
                 ) if from_user => {
                     // Promised and not there to give: Linux's overcommit
                     // bargain, and its answer. A page of a file that cannot
-                    // be had is SIGBUS too.
+                    // be had is SIGBUS too — to the program's handler, if it
+                    // has one.
+                    if handed_to_program(frame, SIGBUS, cr2) {
+                        return;
+                    }
                     no_page(cr2, !matches!(fault, crate::paging::Fault::Bus));
                 }
                 Err(_) => break,
@@ -710,7 +733,12 @@ fn exception(frame: &InterruptFrame) {
                 Ok(false) => break,
                 Err(_) if may_wait && crate::reclaim::wait() => {}
                 // The same bargain: a fork promised a page it had not got.
-                Err(_) if from_user => no_page(cr2, true),
+                Err(_) if from_user => {
+                    if handed_to_program(frame, SIGBUS, cr2) {
+                        return;
+                    }
+                    no_page(cr2, true)
+                }
                 Err(_) => break,
             }
         }
@@ -748,6 +776,12 @@ fn exception(frame: &InterruptFrame) {
             return;
         }
 
+        // A program that has said what to do about touching what is not
+        // there does that.
+        if handed_to_program(frame, SIGSEGV, cr2) {
+            return;
+        }
+
         // No pager — kill the faulting task
         crate::serial::puts(b"[UPFAULT tid=");
         crate::serial::put_usize(tid);
@@ -781,6 +815,10 @@ fn exception(frame: &InterruptFrame) {
     if from_user {
         let tid = scheduler::current_tid();
         let sig = signal_for(vec);
+        // The program's own handler for it, if it has one.
+        if handed_to_program(frame, sig, frame.rip) {
+            return;
+        }
         crate::serial::puts(b"[UFAULT vec=");
         crate::serial::put_usize(vec);
         crate::serial::puts(b" tid=");
@@ -912,7 +950,7 @@ fn exception(frame: &InterruptFrame) {
 /// again (`scheduler::arrived`): another processor may have ended it or
 /// stopped it, and sent this interrupt to say so.
 #[unsafe(no_mangle)]
-extern "C" fn irq_handler(frame: &InterruptFrame) {
+extern "C" fn irq_handler(frame: &mut InterruptFrame) {
     match frame.vector as u8 {
         VEC_FLUSH => {
             crate::tlb::answer();
@@ -934,6 +972,9 @@ extern "C" fn irq_handler(frame: &InterruptFrame) {
     irq(frame);
     if frame.cs & 3 != 0 {
         scheduler::arrived();
+        // A handler the kernel runs is run on the way back: this is what
+        // interrupts a program that is computing and makes no call.
+        crate::signal::leaving_interrupt(frame);
     }
     crate::klock::leave(took);
 }

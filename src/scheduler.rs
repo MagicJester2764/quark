@@ -1137,6 +1137,28 @@ pub fn sys_wait() -> u64 {
     sys_wait_for(0, Wait { no_wait: false, by_pid: false, group: false, reports: 0 })
 }
 
+/// A signal has arrived for `tid`, which may be waiting for a child: if it
+/// is, it goes round and looks again — at its children first, and then at
+/// what arrived. True if it was waiting.
+pub fn interrupt_wait(tid: usize) -> bool {
+    if tid >= MAX_TASKS {
+        return false;
+    }
+    let flags = irq_save();
+    let waiting = unsafe {
+        let blocked = matches!(TASKS[tid], Some(ref t) if t.state == TaskState::Blocked);
+        if WAIT_BLOCKED[tid] && blocked && WAIT_RESULT[tid] == 0 {
+            WAIT_AGAIN[tid] = true;
+            unblock_task(tid);
+            true
+        } else {
+            false
+        }
+    };
+    irq_restore(flags);
+    waiting
+}
+
 /// The process id of the program `tid` belongs to, or 0 if there is no such
 /// task.
 pub fn pid_of(tid: usize) -> u64 {
@@ -1296,6 +1318,14 @@ pub fn sys_wait_for(target: u64, how: Wait) -> u64 {
             if how.no_wait {
                 irq_restore(flags);
                 return 0;
+            }
+            // A signal with a handler for the kernel to run ends the wait,
+            // or stops it beginning: asked here, in the same step as the
+            // marking below, so that one raised a moment later finds this
+            // parked and ends it (`interrupt_wait`).
+            if crate::signal::ends_wait(parent) {
+                irq_restore(flags);
+                return crate::signal::INTERRUPTED;
             }
 
             // Block until a child exits. Marking and blocking must both happen
@@ -2149,6 +2179,7 @@ pub fn create_empty_task() -> Option<usize> {
     };
     unsafe {
         NPINNED[tid] = 0;
+        crate::signal::task_made(tid);
         TASKS[tid] = Some(Task {
             tid,
             state: TaskState::Blocked,
@@ -2438,6 +2469,16 @@ pub fn pinned(space: u64, va: u64) -> bool {
     false
 }
 
+/// The processor task `tid` is running on, if it is running and that is not
+/// this one. Interrupts must be off.
+pub fn running_elsewhere(tid: usize) -> Option<usize> {
+    if tid >= MAX_TASKS {
+        return None;
+    }
+    let cpu = unsafe { ON_CPU[tid] };
+    (cpu != NO_CPU && cpu as usize != crate::percpu::index()).then_some(cpu as usize)
+}
+
 /// Whether the current task is a driver or a server: what memory is taken
 /// from others for, and not from.
 pub fn current_is_privileged() -> bool {
@@ -2564,6 +2605,17 @@ pub fn current_kernel_stack_top() -> u64 {
     top
 }
 
+/// The same, where it is: for what changes where a task goes back to — a
+/// handler the kernel runs on its way out of the call (`signal.rs`).
+pub fn current_user_frame_mut() -> Option<&'static mut crate::task::UserFrame> {
+    let top = current_kernel_stack_top();
+    if top == 0 {
+        return None;
+    }
+    let at = top as usize - core::mem::size_of::<crate::task::UserFrame>();
+    Some(unsafe { &mut *(at as *mut crate::task::UserFrame) })
+}
+
 /// The register state the running task will return to user mode with.
 ///
 /// Only meaningful inside a system call, which is the only time this is asked.
@@ -2654,6 +2706,8 @@ pub fn fork_current() -> Option<usize> {
                 // rather than copied from where the last switch left it.
                 crate::fpu::save(&raw mut t.fpu);
             }
+            // And it holds back the signals its parent does.
+            crate::signal::task_like(tid, parent);
         }
         irq_restore(flags);
     }
@@ -2750,6 +2804,7 @@ pub fn exec_into(cr3: usize, entry: u64, rsp: u64) -> Result<(), ()> {
             }
             // What this call checked was memory of the program it was.
             NPINNED[caller] = 0;
+            crate::signal::task_became(caller);
             // The program it was has no task now, and that is a program
             // gone: whoever watched it is told, as when a program's last
             // task dies. They were not. What a server kept for the old

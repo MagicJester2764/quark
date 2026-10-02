@@ -81,6 +81,9 @@ const RAISE_BY_PID: u64 = 1;
 /// SYS_SIG_RAISE: what is named is a process group, and the signal is for
 /// every program in it.
 const RAISE_GROUP: u64 = 2;
+/// SYS_SIG_RAISE: the signal is for the task named and no other — its
+/// handler is run there, and held back there it waits there.
+const RAISE_THREAD: u64 = 4;
 /// Have SIGALRM raised for the caller's program after a time.
 pub const SYS_SIG_ALARM: u64 = 15;
 /// SYS_SIG_ALARM: say how the alarm stands and change nothing.
@@ -290,6 +293,14 @@ pub const SYS_MSI_ALLOC: u64 = 118;
 const PHYS_LOW: u64 = 1;
 /// Turn the machine off, or start it again. For a holder of `Power`.
 pub const SYS_POWER: u64 = 119;
+/// What signals the calling task holds back.
+pub const SYS_SIG_MASK: u64 = 120;
+/// A handler the kernel ran has finished.
+pub const SYS_SIG_RETURN: u64 = 121;
+/// A stack for handlers to be run on.
+pub const SYS_SIG_STACK: u64 = 122;
+/// Take a signal that is waiting, or wait for one, without its handler.
+pub const SYS_SIG_WAIT: u64 = 123;
 /// `SYS_POWER`: which.
 const POWER_OFF: u64 = 0;
 const POWER_RESTART: u64 = 1;
@@ -409,7 +420,7 @@ pub const SYS_ABI_VERSION: u64 = 240;
 /// minor when calls are added. User space can refuse to run against a major it
 /// does not know, which is the point of exposing it at all.
 pub const ABI_VERSION_MAJOR: u64 = 3;
-pub const ABI_VERSION_MINOR: u64 = 19;
+pub const ABI_VERSION_MINOR: u64 = 20;
 
 /// Threads a task may make with no capability at all.
 ///
@@ -621,7 +632,7 @@ fn validate_user_ptr(addr: u64, len: u64) -> bool {
 }
 
 /// Writable user buffer check.
-fn validate_user_ptr_mut(addr: u64, len: u64) -> bool {
+pub(crate) fn validate_user_ptr_mut(addr: u64, len: u64) -> bool {
     validate_user_range(addr, len, true)
 }
 
@@ -787,6 +798,10 @@ extern "C" fn syscall_dispatch(
     unsafe { core::arch::asm!("cli", options(nostack, nomem)) };
     // What the call checked of its program's memory is its to lose again.
     scheduler::unpin();
+    // A handler the kernel runs is run on the way out: the task goes back
+    // to the handler, with where it was going on its stack.
+    let answer = crate::signal::leaving_call(answer);
+    unsafe { core::arch::asm!("cli", options(nostack, nomem)) };
     crate::klock::release();
     answer
 }
@@ -1757,6 +1772,12 @@ fn dispatch(
             if changes && end == 1 && !crate::pty::slave_is_for(pty, tid) {
                 return u64::MAX;
             }
+            // And not by a job behind, which is stopped for trying.
+            if changes && end == 1 {
+                if let Some(answer) = change_from_behind(pty) {
+                    return answer;
+                }
+            }
             match arg1 {
                 PTY_NUMBER => pty as u64,
                 PTY_GET_TERMIOS => {
@@ -1803,7 +1824,22 @@ fn dispatch(
                     let _ua = crate::cpu::UserAccess::begin();
                     let w = unsafe { core::ptr::read_unaligned(arg2 as *const crate::pty::WinSize) };
                     drop(_ua);
-                    if crate::pty::set_winsize(pty, &w) { 0 } else { u64::MAX }
+                    let was = crate::pty::get_winsize(pty);
+                    if !crate::pty::set_winsize(pty, &w) {
+                        return u64::MAX;
+                    }
+                    // A program that draws itself to the terminal's size is
+                    // told it has changed: SIGWINCH, for whoever is in
+                    // front, which does nothing to one that has not asked.
+                    let same = was.is_some_and(|was| {
+                        let a = unsafe { core::slice::from_raw_parts(&was as *const _ as *const u8, size) };
+                        let b = unsafe { core::slice::from_raw_parts(&w as *const _ as *const u8, size) };
+                        a == b
+                    });
+                    if !same {
+                        crate::signal::from_terminal(pty, crate::signal::SIGWINCH);
+                    }
+                    0
                 }
                 PTY_SET_SESSION => {
                     // The caller's session takes this terminal as its own,
@@ -1845,7 +1881,11 @@ fn dispatch(
                     if mine != front && arg2 & PTY_FRONT_QUIETLY == 0 {
                         let ttou = crate::signal::SIGTTOU;
                         let ignored = crate::signal::action(tid, ttou as u64, u64::MAX) == 1;
-                        if !ignored {
+                        // Or held back by the task that asks, which is how
+                        // a shell says it on Unix, and which the kernel can
+                        // see now that the mask is the kernel's to keep.
+                        let held = crate::signal::mask_of(tid) & (1 << (ttou - 1)) != 0;
+                        if !ignored && !held {
                             if crate::job::orphaned(mine) {
                                 return NOT_ALLOWED;
                             }
@@ -2068,6 +2108,8 @@ fn dispatch(
                 // it: a descriptor is the program's. So is its process id.
                 crate::fdtable::share(tid, caller);
                 scheduler::join_process(tid, caller);
+                // It holds back the signals the thread that made it does.
+                crate::signal::task_like(tid, caller);
             }
             match scheduler::start_task(tid, rip, rsp, cr3, entry_arg) {
                 Ok(()) => 0,
@@ -2222,7 +2264,10 @@ fn dispatch(
                 // What a program prints waits for room, all of it; what a
                 // terminal emulator types is taken or it is not.
                 crate::task::FdKind::PtyEnd { pty, end: 1 } if !crate::pty::slave_is_for(pty, me) => u64::MAX,
-                crate::task::FdKind::PtyEnd { pty, end: 1 } => pty_write(pty, ptr, len),
+                crate::task::FdKind::PtyEnd { pty, end: 1 } => match write_from_behind(pty) {
+                    Some(answer) => answer,
+                    None => pty_write(pty, ptr, len),
+                },
                 crate::task::FdKind::PtyEnd { pty, .. } => pty_type(pty, ptr, len) as u64,
                 // A timer is armed, not written to.
                 crate::task::FdKind::Timer { .. } => u64::MAX,
@@ -2410,6 +2455,9 @@ fn dispatch(
                 // end; a write that does not fit returns what did, which is a
                 // short write and not a block.
                 crate::task::FdKind::PtyEnd { pty, end: 1 } if !crate::pty::slave_is_for(pty, me) => u64::MAX,
+                crate::task::FdKind::PtyEnd { pty, end: 1 } if write_from_behind(pty).is_some() => {
+                    crate::signal::INTERRUPTED
+                }
                 crate::task::FdKind::PtyEnd { pty, end } => {
                     let n = if end == 0 {
                         pty_type(pty, ptr, len)
@@ -2629,7 +2677,13 @@ fn dispatch(
         }
         SYS_POLL => {
             // arg0 = array of (u32 fd, u32 events, u32 revents, u32 pad),
-            // arg1 = count, arg2 = how long to wait.
+            // arg1 = count, arg2 = how long to wait, and with arg4 = 1 the
+            // signals to hold back while it waits in arg3 (ppoll, pselect):
+            // put on in the same step as the wait begins, and taken off as
+            // the call ends — after a handler it let through has run.
+            if arg4 & 1 != 0 {
+                crate::signal::wait_under(scheduler::current_tid(), arg3);
+            }
             //
             // A set built inside the kernel and thrown away. The saving is in
             // the syscall count, which is where it is actually spent:
@@ -2773,8 +2827,14 @@ fn dispatch(
         }
         SYS_POLLSET_WAIT => {
             // arg0 = set fd, arg1 = out array of (u64 token, u32 events,
-            // u32 pad), arg2 = capacity, arg3 = how long to wait.
+            // u32 pad), arg2 = capacity, arg3 = how long to wait, and arg4
+            // the signals to hold back while it waits (epoll_pwait), with
+            // signal 9's bit set to say there are some: that one is never
+            // held back, so it is free to mean that.
             let tid = scheduler::current_tid();
+            if arg4 & (1 << 8) != 0 {
+                crate::signal::wait_under(tid, arg4 & !(1 << 8));
+            }
             let set = match pollset_of(tid, arg0 as usize) {
                 Some(s) => s,
                 None => return u64::MAX,
@@ -2857,6 +2917,7 @@ fn dispatch(
             // The descriptor goes on the queue before the bytes, so a peer
             // that reads the bytes never has to wonder whether the handle is
             // still coming.
+            let mut passed = None;
             if pass != u64::MAX {
                 let pfd = pass as usize;
                 if pfd >= crate::task::MAX_FDS {
@@ -2873,17 +2934,28 @@ fn dispatch(
                     crate::pipe::release_fd(&kind);
                     return u64::MAX;
                 }
+                passed = Some(kind);
             }
 
             let (_, wr) = match crate::stream::pipes_for(stream, end) {
                 Some(p) => p,
                 None => return u64::MAX,
             };
-            if arg4 & FD_DONTWAIT != 0 {
+            let sent = if arg4 & FD_DONTWAIT != 0 {
                 crate::pipe::write_nonblock(wr, arg1 as *const u8, len)
             } else {
                 crate::pipe::write(wr, arg1 as *const u8, len)
+            };
+            // A signal ended the wait with nothing sent: nor is the
+            // descriptor, which the call made again would send a second time.
+            if sent == crate::signal::INTERRUPTED {
+                if let Some(kind) = passed {
+                    if crate::stream::take_back_fd(stream, end, kind) {
+                        crate::pipe::release_fd(&kind);
+                    }
+                }
             }
+            sent
         }
         SYS_FD_RECV => {
             // arg0 = stream fd, arg1 = buf, arg2 = len, arg3 = where to
@@ -2929,6 +3001,10 @@ fn dispatch(
             // having delivered nothing.
             if n == crate::pipe::WOULD_BLOCK {
                 return crate::pipe::WOULD_BLOCK;
+            }
+            // Nor, for the same reason, when a signal ended the wait.
+            if n == crate::signal::INTERRUPTED {
+                return n;
             }
 
             // `at` names a slot, or asks for any free one. Asking is what a
@@ -3518,9 +3594,43 @@ fn dispatch(
             }
         }
         SYS_SIG_ACTION => {
-            // arg0 = signal, arg1 = 0 default / 1 ignore / 2 handled, or
-            // anything else to ask. Returns what it was.
-            crate::signal::action(scheduler::current_tid(), arg0, arg1)
+            // arg0 = signal, arg1 = 0 default / 1 ignore / 2 handled, the
+            // program being told / 3 handled, the kernel running the
+            // handler — with arg2 what else to hold back while it runs,
+            // arg3 how (`signal::NODEFER` and the rest), arg4 where the
+            // program is entered — or anything else to ask. Returns what it
+            // was.
+            if arg1 == 3 {
+                crate::signal::handle(scheduler::current_tid(), arg0, arg2, arg3, arg4)
+            } else {
+                crate::signal::action(scheduler::current_tid(), arg0, arg1)
+            }
+        }
+        SYS_SIG_MASK => {
+            // arg0 = how: 0 hold these back too, 1 let these through, 2
+            // hold back exactly these, 3 the same and wait for one that is
+            // not, 4 say what is waiting that is held back; anything else
+            // asks. arg1 = the signals, bit n - 1 for signal n. Returns what
+            // was held back before.
+            crate::signal::mask(scheduler::current_tid(), arg0, arg1)
+        }
+        SYS_SIG_WAIT => {
+            // arg0 = the signals to take, arg1 = how long to wait for one, a
+            // span (0 not at all, u64::MAX for ever), arg2 = where to say
+            // who raised it, or 0. Returns the signal, or 0 if none came.
+            crate::signal::wait_for(scheduler::current_tid(), arg0, arg1, arg2)
+        }
+        SYS_SIG_STACK => {
+            // arg0 = where, arg1 = how long: the stack for handlers that
+            // ask to be run on one. No length is no stack; arg0 = u64::MAX
+            // changes nothing. arg2 = where to write the one it replaces,
+            // where and how long, or 0.
+            crate::signal::stack(scheduler::current_tid(), arg0, arg1, arg2)
+        }
+        SYS_SIG_RETURN => {
+            // arg0 = the record a handler was entered with. Does not come
+            // back here: the task goes on from where the record says.
+            crate::signal::ret(arg0)
         }
         SYS_SIG_RAISE => {
             // arg0 = a task of the program to signal — or, with arg2 = 1, the
@@ -3558,14 +3668,14 @@ fn dispatch(
                     if scheduler::pid_of(tid) == mine {
                         own = Some(tid);
                     } else {
-                        let _ = crate::signal::raise(tid, arg1 as u8);
+                        let _ = crate::signal::raise_by(tid, arg1 as u8, mine);
                     }
                 }
                 if !any {
                     return NOT_ALLOWED;
                 }
                 if let Some(tid) = own {
-                    let _ = crate::signal::raise(tid, arg1 as u8);
+                    let _ = crate::signal::raise_by(tid, arg1 as u8, mine);
                 }
                 return 0;
             }
@@ -3594,7 +3704,12 @@ fn dispatch(
             if arg1 > crate::signal::NSIG as u64 {
                 return u64::MAX;
             }
-            match crate::signal::raise(tid, arg1 as u8) {
+            let raised = if arg2 & RAISE_THREAD != 0 && !by_pid {
+                crate::signal::raise_task(tid, arg1 as u8, scheduler::pid_of(caller))
+            } else {
+                crate::signal::raise_by(tid, arg1 as u8, scheduler::pid_of(caller))
+            };
+            match raised {
                 Ok(()) => 0,
                 Err(()) => u64::MAX,
             }
@@ -4335,6 +4450,50 @@ pub unsafe fn enter_usermode_frame(frame: *const crate::task::UserFrame) -> ! { 
     );
 }}
 
+/// Go back to user mode with every register given: what `SYS_SIG_RETURN`
+/// does, for a task that a handler interrupted anywhere at all — in the
+/// middle of arithmetic, where RCX and R11 are its own and `sysret` would
+/// take them.
+///
+/// # Safety
+/// `regs` are a program's: RIP and RSP in the user half, RFLAGS what a
+/// program may have.
+pub fn enter_usermode_regs(regs: &crate::signal::Regs) -> ! {
+    // The call that led here checked the record; it is over.
+    scheduler::unpin();
+    unsafe {
+        // Out of the kernel, as in `enter_usermode`.
+        core::arch::asm!("cli", options(nostack, nomem));
+        crate::klock::release();
+        core::arch::asm!(
+            "pushq $0x2B",                 // SS
+            "pushq 136(%rax)",             // RSP
+            "pushq 128(%rax)",             // RFLAGS
+            "pushq $0x33",                 // CS
+            "pushq 120(%rax)",             // RIP
+            "movq 8(%rax), %rbx",
+            "movq 16(%rax), %rcx",
+            "movq 24(%rax), %rdx",
+            "movq 32(%rax), %rsi",
+            "movq 40(%rax), %rdi",
+            "movq 48(%rax), %rbp",
+            "movq 56(%rax), %r8",
+            "movq 64(%rax), %r9",
+            "movq 72(%rax), %r10",
+            "movq 80(%rax), %r11",
+            "movq 88(%rax), %r12",
+            "movq 96(%rax), %r13",
+            "movq 104(%rax), %r14",
+            "movq 112(%rax), %r15",
+            "movq 0(%rax), %rax",
+            "swapgs",
+            "iretq",
+            in("rax") regs.as_ptr(),
+            options(att_syntax, noreturn)
+        );
+    }
+}
+
 /// Read a timer: the number of times it has fired, as a `u64`, waiting for
 /// the first if it has not fired yet. That is the shape Linux gives it, and
 /// what a toolkit's event loop reads to find out how many blinks it missed.
@@ -4353,7 +4512,15 @@ fn event_read(ev: usize, ptr: *mut u8, max_len: usize) -> u64 {
             drop(_ua);
             return 8;
         }
-        if !crate::eventfd::wait(ev) && !crate::eventfd::readable(ev) {
+        // A signal the kernel runs a handler for ends the wait, or stops
+        // it beginning — `wait` looks too, in the same step as it parks.
+        if crate::signal::ends_wait(scheduler::current_tid()) {
+            return crate::signal::INTERRUPTED;
+        }
+        if !crate::eventfd::wait(ev)
+            && !crate::eventfd::readable(ev)
+            && !crate::signal::ends_wait(scheduler::current_tid())
+        {
             // Either it was added to while we were looking, or there was no
             // room to be recorded as a waiter. The loop takes the first; the
             // second must return rather than sleep unwoken.
@@ -4384,7 +4551,10 @@ fn event_write(ev: usize, ptr: *const u8, len: usize, block: bool) -> u64 {
         if !block {
             return crate::pipe::WOULD_BLOCK;
         }
-        if !crate::eventfd::wait(ev) {
+        if crate::signal::ends_wait(scheduler::current_tid()) {
+            return crate::signal::INTERRUPTED;
+        }
+        if !crate::eventfd::wait(ev) && !crate::signal::ends_wait(scheduler::current_tid()) {
             return u64::MAX;
         }
     }
@@ -4401,11 +4571,15 @@ fn timer_read(timer: usize, ptr: *mut u8, max_len: usize) -> u64 {
             drop(_ua);
             return 8;
         }
+        if crate::signal::ends_wait(scheduler::current_tid()) {
+            return crate::signal::INTERRUPTED;
+        }
         if !crate::timerfd::wait(timer) {
             // Either it fired while we were looking, or there was no room to
             // be recorded — the loop takes the first and this returns for the
-            // second rather than sleeping unwoken.
-            if crate::timerfd::pending(timer) == 0 {
+            // second rather than sleeping unwoken. Or a signal came, which
+            // the loop answers.
+            if crate::timerfd::pending(timer) == 0 && !crate::signal::ends_wait(scheduler::current_tid()) {
                 return u64::MAX;
             }
         }
@@ -4436,11 +4610,44 @@ fn read_from_behind(pty: usize) -> Option<u64> {
         return None;
     }
     let ttin = crate::signal::SIGTTIN;
-    if crate::signal::action(me, ttin as u64, u64::MAX) == 1 || crate::job::orphaned(group) {
+    // Ignored or held back, the signal cannot stop it, and the read fails.
+    let held = crate::signal::mask_of(me) & (1 << (ttin - 1)) != 0;
+    if crate::signal::action(me, ttin as u64, u64::MAX) == 1 || held || crate::job::orphaned(group) {
         return Some(u64::MAX);
     }
     crate::job::raise_for_group(group, ttin);
     Some(crate::signal::INTERRUPTED)
+}
+
+/// A change to a terminal by a program its session has put behind — its
+/// settings, its size — or a write, where the terminal asks for that
+/// (`TOSTOP`): not made. The program is stopped (SIGTTOU) and asked again
+/// when it is continued, as a read from behind is — unless it ignores the
+/// signal or holds it back, which is how a shell says that it may, and then
+/// it goes ahead. One nobody could continue fails. `None` if it goes ahead.
+fn change_from_behind(pty: usize) -> Option<u64> {
+    let me = scheduler::current_tid();
+    let (session, front) = crate::pty::job(pty)?;
+    let group = crate::job::pgid_of(me);
+    if session == 0 || crate::job::sid_of(me) != session || group == front {
+        return None;
+    }
+    let ttou = crate::signal::SIGTTOU;
+    let held = crate::signal::mask_of(me) & (1 << (ttou - 1)) != 0;
+    if crate::signal::action(me, ttou as u64, u64::MAX) == 1 || held {
+        return None;
+    }
+    if crate::job::orphaned(group) {
+        return Some(u64::MAX);
+    }
+    crate::job::raise_for_group(group, ttou);
+    Some(crate::signal::INTERRUPTED)
+}
+
+/// The same for a write to the slave, which only a terminal that asks for
+/// it stops.
+fn write_from_behind(pty: usize) -> Option<u64> {
+    if crate::pty::stops_writers(pty) { change_from_behind(pty) } else { None }
 }
 
 fn pty_read(pty: usize, end: u8, ptr: *mut u8, max_len: usize) -> u64 {
@@ -4514,10 +4721,22 @@ fn pty_write(pty: usize, ptr: *const u8, len: usize) -> u64 {
         let mut sent = 0;
         while sent < chunk {
             sent += crate::pty::write(pty, 1, &buf[sent..chunk]);
-            if sent < chunk && !crate::pty::wait_writable(pty, buf[sent]) {
-                // Nobody is left to read it. What went, went.
-                let total = done + sent;
-                return if total > 0 { total as u64 } else { u64::MAX };
+            if sent < chunk {
+                match crate::pty::wait_writable(pty, buf[sent]) {
+                    crate::pty::Waited::Look => {}
+                    // Nobody is left to read it, or a signal came first.
+                    // What went, went.
+                    waited => {
+                        let total = done + sent;
+                        return if total > 0 {
+                            total as u64
+                        } else if waited == crate::pty::Waited::Interrupted {
+                            crate::signal::INTERRUPTED
+                        } else {
+                            u64::MAX
+                        };
+                    }
+                }
             }
         }
         done += chunk;

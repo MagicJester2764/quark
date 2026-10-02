@@ -253,6 +253,29 @@ pub fn push_fd(stream: usize, end: u8, kind: FdKind) -> bool {
     ok
 }
 
+/// Take back the descriptor this end last put on its peer's queue, if it is
+/// still there and is `kind`: a send that sent nothing sends no descriptor
+/// either. Its in-flight reference is the caller's to release.
+pub fn take_back_fd(stream: usize, end: u8, kind: FdKind) -> bool {
+    if stream >= MAX_STREAMS || end > 1 {
+        return false;
+    }
+    let to = 1 - end as usize;
+    let flags = irq_save();
+    let taken = unsafe {
+        let s = &mut streams()[stream];
+        let n = s.q_len[to];
+        if s.in_use && n > 0 && s.q[to][n - 1] == kind {
+            s.q_len[to] -= 1;
+            true
+        } else {
+            false
+        }
+    };
+    irq_restore(flags);
+    taken
+}
+
 /// Take the descriptor at the head of this end's queue, if any.
 ///
 /// Its in-flight reference comes with it and is the caller's to convert into

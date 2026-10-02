@@ -49,7 +49,7 @@ pub struct UserFrame {
 const _: () = assert!(core::mem::size_of::<UserFrame>() == 88);
 
 /// File descriptor kind — routes I/O to either an IPC service or a kernel pipe.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FdKind {
     Empty,
     Ipc { target_tid: usize, tag: u64 },

@@ -82,6 +82,8 @@ pub const ONLCR: u32 = 0o4;
 pub const ISIG: u32 = 0o1;
 pub const ICANON: u32 = 0o2;
 pub const ECHO: u32 = 0o10;
+/// A job behind that writes is stopped, as one that reads is.
+pub const TOSTOP: u32 = 0o400;
 
 /// Where in `c_cc` each editing character is, as Linux numbers them.
 const VINTR: usize = 0;
@@ -788,26 +790,28 @@ pub fn wait_readable(pty: usize, end: u8) -> Waited {
 /// A write that returned nothing instead of waiting is what this replaced:
 /// `cat` of a file longer than the buffer reported "No space left on device",
 /// because a write of nothing is what a full disk looks like.
-pub fn wait_writable(pty: usize, next: u8) -> bool {
+pub fn wait_writable(pty: usize, next: u8) -> Waited {
     if pty >= MAX_PTYS {
-        return false;
+        return Waited::NoRoom;
     }
     let tid = scheduler::current_tid();
     let flags = irq_save();
     let (ok, parked) = {
         let p = &mut ptys()[pty];
         if !p.in_use || peer_gone(p, 1) {
-            (false, false)
+            (Waited::NoRoom, false)
         } else if p.to_master.room() >= takes(p, next) {
             // Somebody read between the write and this: look again.
-            (true, false)
+            (Waited::Look, false)
+        } else if crate::signal::ends_wait(tid) {
+            (Waited::Interrupted, false)
         } else if p.to_master.nwriters >= MAX_WAITERS {
-            (false, false)
+            (Waited::NoRoom, false)
         } else {
             p.to_master.writers[p.to_master.nwriters] = tid;
             p.to_master.nwriters += 1;
             scheduler::block_task(tid);
-            (true, true)
+            (Waited::Look, true)
         }
     };
     irq_restore(flags);
@@ -819,7 +823,7 @@ pub fn wait_writable(pty: usize, next: u8) -> bool {
 
 /// A signal has arrived for a task that may be parked reading a terminal:
 /// if it is, it stops waiting and goes to see.
-pub fn interrupt(tid: usize) {
+pub fn interrupt(tid: usize) -> bool {
     let mut found = false;
     let flags = irq_save();
     for p in ptys().iter_mut() {
@@ -836,6 +840,7 @@ pub fn interrupt(tid: usize) {
     if found {
         scheduler::unblock_task(tid);
     }
+    found
 }
 
 /// Is the other end of this one gone for good?
@@ -851,19 +856,26 @@ pub fn other_end_gone(pty: usize, end: u8) -> bool {
 }
 
 /// A task parked on this pty has died: it is waiting for nothing now.
-pub fn forget_waiter(pty: usize, tid: usize) {
+pub fn forget_waiter(pty: usize, tid: usize) -> bool {
     if pty >= MAX_PTYS {
-        return;
+        return false;
     }
     let flags = irq_save();
     let p = &mut ptys()[pty];
+    let mut found = false;
     if p.in_use {
         for side in [&mut p.to_slave, &mut p.to_master] {
-            crate::pipe::forget_in(&mut side.waiters, &mut side.nwaiters, tid);
-            crate::pipe::forget_in(&mut side.writers, &mut side.nwriters, tid);
+            found |= crate::pipe::forget_in(&mut side.waiters, &mut side.nwaiters, tid);
+            found |= crate::pipe::forget_in(&mut side.writers, &mut side.nwriters, tid);
         }
     }
     irq_restore(flags);
+    found
+}
+
+/// Whether a job behind is stopped for writing to the terminal (`TOSTOP`).
+pub fn stops_writers(pty: usize) -> bool {
+    get_termios(pty).is_some_and(|t| t.c_lflag & TOSTOP != 0)
 }
 
 /// Is this end writable? A pty's buffer is the only limit; when it is full a

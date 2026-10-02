@@ -40,6 +40,10 @@ The kernel provides:
 - Tasks, threads, a `fork` that shares memory until one side writes it, and
   `exec`; futexes with deadlines; every task's own floating-point and vector
   registers, as wide as the processor has
+- Unix's signals: handlers the kernel runs wherever it finds a program, a
+  mask for each thread, a signal for one thread, faults handed to a
+  program's handler, waits a signal ends saying whether to make the call
+  again, and process groups, sessions and a terminal's job control
 - IRQ delivery to user-space drivers, and page faults forwarded to a pager
 - Random bytes (ChaCha20, seeded from RDSEED or RDRAND and the machine's
   timing), and the date, which a holder of the capability may set
@@ -167,7 +171,7 @@ make run
 ## Testing
 
 The kernel is tested from outside, through the ABI, by a program: `dtest` in
-quarkutils makes 750 checks from user space. A kernel change is verified by
+quarkutils makes 796 checks from user space. A kernel change is verified by
 booting an image and running it — `tools/boot-test.sh` in ExplOSion — on one
 processor and on four.
 

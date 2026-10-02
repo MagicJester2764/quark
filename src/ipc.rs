@@ -600,19 +600,23 @@ unsafe fn take_any_death(receiver: usize) -> Option<Message> {
 /// waiting on `TID_ANY`, because a notification is a message and that task
 /// asked for one. This is not a message: it is a sleeper being told that its
 /// deadline no longer matters.
-pub fn wake_sleeper(tid: usize) {
+pub fn wake_sleeper(tid: usize) -> bool {
     if tid >= MAX_TASKS {
-        return;
+        return false;
     }
     let flags = irq_save();
-    unsafe {
+    let woke = unsafe {
         if matches!(TASK_IPC[tid].state, IpcState::RecvBlocked(t) if t == tid) {
             TASK_IPC[tid].state = IpcState::None;
             TASK_TIMEOUT[tid] = 0;
             scheduler::unblock_task(tid);
+            true
+        } else {
+            false
         }
-    }
+    };
     irq_restore(flags);
+    woke
 }
 
 pub fn sys_notify(dest: usize, badge: u64) -> Result<(), IpcError> {

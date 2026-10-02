@@ -1,6 +1,6 @@
 # Quark syscall ABI
 
-**Version 3.19.** Query the running kernel with `SYS_ABI_VERSION` (240), which
+**Version 3.20.** Query the running kernel with `SYS_ABI_VERSION` (240), which
 returns `(major << 16) | minor`.
 
 This document is the contract between the Quark kernel and everything above it.
@@ -64,8 +64,9 @@ the time ran out; and the calls that answer instead of waiting —
 `SYS_FD_READ_NB`, `SYS_FD_WRITE_NB`, and `SYS_FD_SEND` and `SYS_FD_RECV` when
 asked not to wait — return `0xFFFF_FFFE` for "would block", distinct from `0`,
 which is end of file. And a wait that a signal ended says so, where its count
-would be: `0xFFFF_FFFD` from `SYS_FD_READ`, `SYS_POLL` and `SYS_POLLSET_WAIT`,
-and `2` from `SYS_RECV_TIMEOUT`.
+would be: `0xFFFF_FFFD` — and, to a program that has asked for Unix's answers,
+`0xFFFF_FFFC` or `0xFFFF_FFFB` to say what was run (see *Signals*) — except a
+sleep on `SYS_RECV_TIMEOUT`, which answers `2`.
 
 This is deliberately coarse. It is enough to build a libc's `errno` on top of
 only where a call is extended to report a reason; do not assume a failing call
@@ -219,6 +220,7 @@ returning at once turned that loop into a spin.
 | 3.16 | **Off, and on again, by the firmware's tables.** `SYS_POWER` (119) turns the machine off or restarts it, for a holder of the new capability `Power` (type 12): by ACPI's control and reset registers, where a program used to write to the three ports QEMU listens on. |
 | 3.17 | **Memory above four gigabytes.** All of a machine's memory is used, up to 511 GiB, where the kernel used the first four gigabytes of it. `SYS_PHYS_ALLOC` takes a flag (arg1 = 1) for frames below four gigabytes, which is what a device that is told an address in thirty-two bits needs; without it a frame is ordinary memory and comes from the top. `SYS_MEM_INFO` takes what to say (arg0): 1 for how much memory the machine has and 2 for where it ends. |
 | 3.18 | **The wide registers.** A program may use AVX, AVX2 and AVX-512 where the processor has them: the kernel turns them on (`OSXSAVE`, XCR0) and saves all of each task's with `XSAVE`. Before, an AVX instruction was a fault. No call changed. |
+| 3.20 | **The kernel runs handlers.** `SYS_SIG_ACTION` (11) with 3 has the kernel run a program's handler for a signal: a task that does not hold it back is turned aside on its way out of a call, an interrupt or a fault, and enters the program at the place said with signal 0, with a record of where it was on its stack; `SYS_SIG_RETURN` (121) puts it back. A fault that is a signal goes to the program's handler for it the same way. Each task holds back a set of signals of its own (`SYS_SIG_MASK`, 120): a signal every task holds back waits, whatever it would do; `SYS_SIG_WAIT` (123) takes one without anything being done about it; `SYS_SIG_STACK` (122) names a stack for handlers. `SYS_SIG_RAISE` with arg2 = 4 raises a signal for one task. Every wait a task sits in is ended by a signal it is to run — a pipe's, a stream's, a counter's, a timer's, a futex's, a wait for a child, as well as the ones a signal ended before — and a program that asks is answered `0xFFFF_FFFC` and `0xFFFF_FFFB` as well as `0xFFFF_FFFD`, to say what ran. `SYS_POLL` and `SYS_POLLSET_WAIT` wait under a mask they are given. A terminal raises 28 when its size changes, and stops a job behind that changes its settings or its size, or writes to it where `TOSTOP` says to. |
 | 3.19 | **Memory is given back.** When no frame is free the kernel gives up pages of files that nothing maps, takes pages programs have not used lately, and makes whoever wanted the frame wait while they are written out, where it used to end it. A page of a program's own goes to the object a pager has said memory may be written out to: `SYS_OBJECT_CTL` op 5, for a holder of the new capability `Swap` (type 13), with ops 6 and 7 to take a page out and say how the writing went. `TAG_OBJECT_CLEAN` (`0xFFFF_000B`) asks a pager to write what it has that is dirty. `SYS_PAGE_OUT` (198) has pages of the caller's own written out at once. `SYS_MEM_INFO` with arg0 = 3 says how much room there is to write memory out to and how much is used, and with 4 how many pages have gone out and come back. |
 
 3.1 was a change of behaviour and no change of number, so a minor: nothing built for
@@ -340,8 +342,8 @@ everything else returns promptly.
 | 8 | `SYS_EXIT_PROGRAM` | arg0 = status | does not return | — |
 | 9 | `SYS_UMASK` | arg0 = the new mask (nine bits), or `u64::MAX` to leave it | the mask as it was | — |
 | 10 | `SYS_WAIT_FOR` | arg0 = a child, or 0 for any; arg1 = flags: 1 = do not wait, 2 = the child is named by its process id, here and in the answer, rather than by its tid, 4 = answer for a child that has stopped too, 8 = and for one that has been continued, 16 = arg0 is a process group of children, 0 for the caller's own | `child \| (exit_code << 32)`; for a stop or a continue, `child \| (1 << 31) \| (signal << 32)`, the signal 0 for a continue; 0 if asked not to wait and there is nothing to say; `u64::MAX` if there is no such child. **Blocks** unless asked not to. | — |
-| 11 | `SYS_SIG_ACTION` | arg0 = signal (1 to 64), arg1 = 0 nothing said, 1 ignore, 2 handled; anything else only asks | what it was: 0, 1 or 2 / `u64::MAX` | — |
-| 12 | `SYS_SIG_RAISE` | arg0 = a task of the program to signal, or with arg2 = 1 its process id, or with arg2 = 2 a process group (0 for the caller's own); arg1 = signal, or 0 to ask whether one could be raised | 0 / `u64::MAX`; for a group, `u64::MAX - 1` if it has members and none the caller may signal | `TaskMgmt` for target, or same UID |
+| 11 | `SYS_SIG_ACTION` | arg0 = signal (1 to 64), arg1 = 0 nothing said, 1 ignore, 2 told, 3 run by the kernel — with arg2 what to hold back besides while it runs, arg3 how (1, 2, 4, 8, and the program's own bits 8–31), arg4 the program's word for the handler; anything else only asks. With signal 0 and 3: arg4 is where handlers are entered, and bit 0 of arg3 asks for Unix's answers | what it was: 0 to 3 / `u64::MAX`; for signal 0, 0 | — |
+| 12 | `SYS_SIG_RAISE` | arg0 = a task of the program to signal, or with arg2 = 1 its process id, or with arg2 = 2 a process group (0 for the caller's own), or with arg2 = 4 the task alone; arg1 = signal, or 0 to ask whether one could be raised | 0 / `u64::MAX`; for a group, `u64::MAX - 1` if it has members and none the caller may signal | `TaskMgmt` for target, or same UID |
 | 13 | `SYS_SIG_TAKE` | arg0 = where to be told of the next (a `u32` in the caller's memory), or 0 to leave that as it is | the signals waiting for a handler, bit `n - 1` for signal `n`; none is waiting afterwards | — |
 | 14 | `SYS_PID` | arg0 = a task, or 0 for the caller | the process id of the program it belongs to / `u64::MAX` | — |
 | 15 | `SYS_SIG_ALARM` | arg0 = how long until signal 14 is raised for the caller's program, a span, 0 for no alarm; arg1 = how long between repeats after that, a span, 0 for none; arg2 = 1 to ask and change nothing; arg3 = where to write how the alarm stood as two `u64` of nanoseconds, what was left and the repeat, or 0 | how the alarm stood, in ticks: `ticks left \| (repeat << 32)`, 0 if there was none / `u64::MAX` | — |
@@ -404,8 +406,8 @@ parent's, and `SYS_EXEC_SPACE` leaves them alone. Whatever makes the file
 applies them.
 
 **Signals.** `SYS_SIG_RAISE` raises one, by its Linux number, for the
-*program* a task belongs to. What happens is that program's to say, signal by
-signal, with `SYS_SIG_ACTION`:
+*program* a task belongs to — or, with arg2 = 4, for that task alone. What
+happens is the program's to say, signal by signal, with `SYS_SIG_ACTION`:
 
 - **Nothing said** (0), and the kernel does what the signal does. For nearly
   all of them that is the end of the program: every task, with the negated
@@ -413,27 +415,100 @@ signal, with `SYS_SIG_ACTION`:
   17 (a child ended), 23 (urgent data) and 28 (a window changed size). Four
   stop the program, 19 to 22, and 18 starts it again: see *Jobs*.
 - **Ignored** (1).
-- **Handled** (2): the program has a handler for it. The kernel runs no
-  handler. It records the signal as waiting; sets to 1 the word the program
-  named in its own memory, which its runtime looks at on its way out of every
-  system call; and ends one wait early, if the program is in one of the three
-  a program sits in at a prompt — a read of a terminal, a poll, a sleep (a
+- **Told** (2): the program has a handler, and runs it itself. The kernel
+  records the signal as waiting; sets to 1 the word the program named in its
+  own memory, which its runtime looks at on its way out of every system
+  call; and ends one wait early, if the program is in one of the three a
+  program sits in at a prompt — a read of a terminal, a poll, a sleep (a
   receive from the caller's own id). `SYS_FD_READ`, `SYS_POLL` and
   `SYS_POLLSET_WAIT` answer `0xFFFF_FFFD` then, and `SYS_RECV_TIMEOUT` answers
   2. One signal ends one wait, the first to look: a wait that was ended and
   goes back to waiting without taking anything waits. `SYS_SIG_TAKE` returns
   what is waiting, which then no longer is, and the runtime calls the
-  handlers.
+  handlers — at a system-call boundary, and nowhere else.
+- **Run** (3): the kernel runs the handler, as Linux's does. Said with arg2
+  the signals to hold back besides while it runs; arg3 how — 1 its own
+  signal is not held back, 2 it is run once and the signal is then as if
+  nothing had been said, 4 on the stack the task named (`SYS_SIG_STACK`), 8
+  a call it cuts short is made again — with bits 8 to 31 the program's own,
+  handed back; and arg4 the program's word for the handler, handed back too.
+  The program says first, with signal 0 and 3, where every handler is
+  entered (arg4) and whether it wants Unix's answers (bit 0 of arg3,
+  below); one that has not said where is refused.
 
-9 cannot be ignored or handled; nor can 19. A forked
-child has its parent's answers and nothing waiting. `SYS_EXEC_SPACE` keeps
-what is ignored and forgets the handlers and the word, both of which were
-addresses in the program that has gone. A program started by a spawner has
-said nothing.
+*Running a handler.* When a signal the kernel is to run is raised, a task of
+the program that does not hold it back is turned aside on its way out of the
+kernel — out of a system call, an interrupt or a fault, so within a tick
+whatever it is doing. One running on another processor is interrupted to
+make it, and one in a wait is woken (*Waits*, below). The kernel writes a
+record on the task's stack — below the 128 bytes a function may be using
+under its stack pointer, or at the top of the stack the task named, for a
+handler that asks — and enters the program at its place, with RDI pointing
+at the record and the stack as a function finds it:
 
-So a handler runs at a system-call boundary and nowhere else. A program that
-handles a signal and then computes without making a call is not interrupted
-by it; one that has said nothing is ended wherever it is.
+| offset | what |
+|---|---|
+| 0 | the signal |
+| 8 | why: 0 a program raised it, 1 the kernel did, 2 the task faulted |
+| 16 | the process id of the program that raised it, with bit 63 set; for a fault, the address |
+| 24 | what the task held back before, which it holds back again afterwards |
+| 32 | bit 0: the record is on the stack named for handlers; bits 8–31 as the handler was said with |
+| 40 | the program's word for the handler |
+| 48 | eighteen words: RAX RBX RCX RDX RSI RDI RBP R8–R15 RIP RFLAGS RSP — where the task was |
+
+The handler runs holding back its own signal unless it asked otherwise, and
+what it asked to besides. When it has done, the program gives the record back
+with `SYS_SIG_RETURN` (121), and the task goes on as the record says —
+registers, mask and all, as the handler left them, within what a program may
+have: an address in its own half, its own flags. A record that cannot be
+written or read back is the end of the program, with status -11. The kernel
+does not keep the floating-point registers for a handler: the place the
+program is entered does that, before it calls anything, with `XSAVE` where
+the processor has more than SSE turned on and `FXSAVE` where it has not.
+
+A fault that is a signal on Unix — 11 for touching what is not there, 7 for a
+page that cannot be had, and 4, 5 and 8 — goes the same way to the program's
+handler for it, if it has one the kernel runs and the faulting task does not
+hold the signal back, with the address in the record. Otherwise it is the end
+of the program, as it always was.
+
+*Masks.* Each task holds back signals of its own (`SYS_SIG_MASK`, 120): 0
+adds to what it holds back, 1 takes from it, 2 sets it, each answering with
+what it was; 3 sets it and waits until a signal it then lets through has
+been dealt with, and puts it back as it was (sigsuspend); 4 answers with what
+is waiting that it holds back. A thread begins holding back what its maker
+does, a forked child what its parent did, and `SYS_EXEC_SPACE` keeps it. 9
+and 19 cannot be held back. A signal waits while every task holds it back,
+whatever it would do — one that would end the program ends it when a task
+lets it through — and one raised for a task alone waits while that task
+holds it back. `SYS_SIG_WAIT` (123) takes one of a set that is waiting, or
+waits for one to arrive, without anything being done about it: it answers
+with the signal, or 0 if the time ran out, and writes who raised it where
+arg2 says; a program that waits so holds the signals back.
+
+*Waits.* A signal the kernel is to run ends any wait the task that will run
+it is in: a sleep, a poll, a read or a write of a terminal, a pipe or a
+stream, a read of a counter or a timer, a futex, a wait for a child, a wait
+for the other end of a named pipe, `SYS_SIG_MASK` 3 and `SYS_SIG_WAIT`. A
+call to a server is not one: woken with no answer it would fail, and the
+handler runs when the answer has come. The wait answers `0xFFFF_FFFD`, the
+handler having run on the way out — or, to a program that said it wants
+Unix's answers, `0xFFFF_FFFD` if the first handler run did not ask for its
+calls to be made again, `0xFFFF_FFFC` if it did, and `0xFFFF_FFFB` if nothing
+was run here: another task took the signal, it did nothing, or the task was
+stopped and continued. A sleep on `SYS_RECV_TIMEOUT` answers 2 whatever was
+run; a program that wants to know sleeps with `SYS_SIG_WAIT` and no
+signals. `SYS_POLL` waits under the mask in arg3 when arg4 is 1, and
+`SYS_POLLSET_WAIT` under the one in arg4 when that has bit 8 set — signal
+9's, which no mask holds back: put on as the wait begins, and taken off as
+the call ends, so that a signal it lets through ends the wait even if it was
+waiting already (ppoll, pselect, epoll_pwait).
+
+9 cannot be ignored or handled; nor can 19. A forked child has its parent's
+answers, its handlers and where they are entered, and nothing waiting.
+`SYS_EXEC_SPACE` keeps what is ignored and forgets the handlers, the word and
+where handlers were entered, all of which were addresses in the program that
+has gone. A program started by a spawner has said nothing.
 
 A terminal raises three of them. With `ISIG`, its interrupt character
 raises 2, its quit character 3 and its suspend character 20, for the process
@@ -468,8 +543,10 @@ to a program that has said nothing, so only one that handles it is told, and
 ignoring it changes nothing either: a dead child waits to be collected
 whatever its parent has said.
 
-Nothing is raised when a terminal changes size or when a pipe has nobody
-reading it; the last a runtime can find out for itself (`SYS_FD_KIND`).
+A terminal raises 28 when its size is changed (`SYS_PTY_CTL` op 3) to a
+size it was not, for the group in front of it — or for every program holding
+its slave, where no session has it. Nothing is raised when a pipe has nobody
+reading it; a runtime can find that out for itself (`SYS_FD_KIND`).
 
 **Jobs.** A shell runs `a | b | c` as one thing, and has to be able to mean
 all three of them: when Ctrl-C is typed, when Ctrl-Z is, and when it wants
@@ -525,15 +602,19 @@ What is typed is for the group in front. Its signals are raised for that
 group, and a read of the slave by a process of the session in any *other*
 group is not a read: signal 21 is raised for the reader's group, which stops
 it, and the read answers `0xFFFF_FFFD` when it is started again — to be asked
-again, and looked at again. If the reader ignores 21, or is in an orphaned
-group, the read fails instead. A program continued while it was waiting in a
-read of a terminal is looked at again too, having perhaps been put behind.
-Writing is not restricted.
+again, and looked at again. If the reader ignores 21, holds it back, or is in
+an orphaned group, the read fails instead. A program continued while it was
+waiting in a read of a terminal is looked at again too, having perhaps been
+put behind.
 
-Op 5 asked by a process that is itself behind raises 22 for the asker's
-group in the same way, unless it ignores 22 — or says, with bit 63 of arg2,
-that it is not to be stopped for asking: its runtime does, for a program
-that has blocked 22, which the kernel cannot see.
+A change to the terminal by a process behind — its settings, its size (ops 1
+and 3), which group is in front (op 5) — raises 22 for the changer's group in
+the same way, and is answered `0xFFFF_FFFD` when it is started again; one in
+an orphaned group fails. One that ignores 22 or holds it back makes the
+change: that is how a shell takes its terminal back. A write by a process
+behind is stopped the same way only if the terminal's settings have `TOSTOP`
+(`0o400` in `c_lflag`). Op 5 also takes bit 63 of arg2 to say the asker is
+not to be stopped, from a runtime that keeps a mask of its own.
 
 **Task signals** are older and are not those. `SYS_SIGNAL` takes bits:
 interrupt (`1 << 16`), terminate (`1 << 17`) and kill (`1 << 18`). The kill
@@ -550,8 +631,9 @@ library knows about.
 signal Linux sends for the exception that did it: 4 for an invalid opcode, 5
 for a debug trap or breakpoint, 7 for an alignment check, 8 for a divide error
 or floating-point exception, and 11 for everything else — a page fault with no
-pager, a general protection fault, a stack fault. `SYS_WAIT` reports it as it
-reports any other status. A fault ends the *program* the task belongs to,
+pager, a general protection fault, a stack fault — unless the program has a
+handler the kernel runs for that signal (see *Signals*). `SYS_WAIT` reports
+it as it reports any other status. A fault ends the *program* the task belongs to,
 every task of it with that status, as the signal would on Linux: a thread
 that faulted and went alone left the rest of its program waiting on it. A
 killed task never halts the machine: only a fault taken in ring 0 does that.
@@ -754,8 +836,8 @@ would on Linux, and the pipe is freed when the read returns.
 
 | # | Name | Arguments | Returns | Cap |
 |---|---|---|---|---|
-| 64 | `SYS_FD_READ` | arg0 = fd, arg1 = buf, arg2 = max len | bytes read, `0` = EOF, `0xFFFF_FFFD` = a read of a terminal that a signal ended, `u64::MAX` = error. **Blocks.** | — |
-| 65 | `SYS_FD_WRITE` | arg0 = fd, arg1 = buf, arg2 = len | bytes written / `u64::MAX` | — |
+| 64 | `SYS_FD_READ` | arg0 = fd, arg1 = buf, arg2 = max len | bytes read, `0` = EOF, `0xFFFF_FFFD` = a read that a signal ended (see *Signals*), `u64::MAX` = error. **Blocks.** | — |
+| 65 | `SYS_FD_WRITE` | arg0 = fd, arg1 = buf, arg2 = len | bytes written, `0xFFFF_FFFD` = a write a signal ended with nothing written / `u64::MAX` | — |
 | 66 | `SYS_FD_READ_NB` | arg0 = fd, arg1 = buf, arg2 = max len | bytes, `0` = EOF, **`0xFFFF_FFFE` = would block**, `u64::MAX` = error | — |
 | 67 | `SYS_FD_SET` | arg0 = target tid, arg1 = fd, arg2 = service tid, arg3 = tag | 0 / `u64::MAX` | `TaskMgmt` |
 | 68 | `SYS_FD_DUP` | arg0 = target tid, arg1 = target fd or `u64::MAX - 1` for any free one, arg2 = source fd, arg3 = lowest acceptable fd when arg1 asks for any | the fd it took / `u64::MAX` | `TaskMgmt` over the target, unless the target is the caller or a child it has not started |
@@ -763,12 +845,12 @@ would on Linux, and the pipe is freed when the read returns.
 | 70 | `SYS_PIPE_FD_SET` | arg0 = target tid, arg1 = fd or `u64::MAX - 1` for any free one, arg2 = pipe handle, arg3 = 1 for write end | the fd it took / `u64::MAX` | `TaskMgmt` over the target, unless the target is the caller or a child it has not started |
 | 71 | `SYS_FD_CLOSE` | arg0 = fd | 0 / `u64::MAX` | — |
 | 72 | `SYS_SOCKETPAIR` | — | `(fd0 << 32) \| fd1`, both in the caller's table / `u64::MAX` | — |
-| 73 | `SYS_FD_SEND` | arg0 = stream fd, arg1 = buf, arg2 = len, arg3 = fd to pass or `u64::MAX`, arg4 = flags (1 = do not wait) | bytes written, `0xFFFF_FFFE` if it would have blocked / `u64::MAX` | — |
-| 74 | `SYS_FD_RECV` | arg0 = stream fd, arg1 = buf, arg2 = len, arg3 = fd to install a passed descriptor at, `u64::MAX - 1` for any free one, or `u64::MAX` to leave it queued, arg4 = flags (1 = do not wait) | `((fd + 1) << 32) \| bytes`, high half 0 if none arrived, `0xFFFF_FFFE` if it would have blocked / `u64::MAX` | — |
+| 73 | `SYS_FD_SEND` | arg0 = stream fd, arg1 = buf, arg2 = len, arg3 = fd to pass or `u64::MAX`, arg4 = flags (1 = do not wait) | bytes written, `0xFFFF_FFFE` if it would have blocked, `0xFFFF_FFFD` if a signal ended the wait — nothing sent, the descriptor included / `u64::MAX` | — |
+| 74 | `SYS_FD_RECV` | arg0 = stream fd, arg1 = buf, arg2 = len, arg3 = fd to install a passed descriptor at, `u64::MAX - 1` for any free one, or `u64::MAX` to leave it queued, arg4 = flags (1 = do not wait) | `((fd + 1) << 32) \| bytes`, high half 0 if none arrived, `0xFFFF_FFFE` if it would have blocked, `0xFFFF_FFFD` if a signal ended the wait — nothing taken / `u64::MAX` | — |
 | 75 | `SYS_POLLSET_CREATE` | — | fd naming the set / `u64::MAX` | — |
 | 76 | `SYS_POLLSET_CTL` | arg0 = set fd, arg1 = op (0 add, 1 modify, 2 remove), arg2 = fd, arg3 = events, arg4 = token | 0 / `u64::MAX` | — |
-| 77 | `SYS_POLLSET_WAIT` | arg0 = set fd, arg1 = array of `(u64 token, u32 events, u32 pad)`, arg2 = capacity, arg3 = how long to wait, a span | entries filled, 0 = timed out, `0xFFFF_FFFD` = a signal ended the wait / `u64::MAX` | — |
-| 78 | `SYS_POLL` | arg0 = array of `(u32 fd, u32 events, u32 revents, u32 pad)`, arg1 = count, arg2 = how long to wait, a span | entries with non-zero `revents`, `0xFFFF_FFFD` = a signal ended the wait / `u64::MAX` | — |
+| 77 | `SYS_POLLSET_WAIT` | arg0 = set fd, arg1 = array of `(u64 token, u32 events, u32 pad)`, arg2 = capacity, arg3 = how long to wait, a span, arg4 = the signals to hold back while it waits, with bit 8 set to say there are some | entries filled, 0 = timed out, `0xFFFF_FFFD` = a signal ended the wait / `u64::MAX` | — |
+| 78 | `SYS_POLL` | arg0 = array of `(u32 fd, u32 events, u32 revents, u32 pad)`, arg1 = count, arg2 = how long to wait, a span; arg3 = the signals to hold back while it waits, if arg4 = 1 | entries with non-zero `revents`, `0xFFFF_FFFD` = a signal ended the wait / `u64::MAX` | — |
 | 79 | `SYS_FD_WRITE_NB` | arg0 = fd, arg1 = buf, arg2 = len | bytes written, **`0xFFFF_FFFE` = would block**, `u64::MAX` = error | — |
 
 **Streams.** `SYS_SOCKETPAIR` makes two connected ends and puts both in the
@@ -1092,13 +1174,25 @@ or an interrupt on a second processor waits for the first to leave. Two
 programs computing run side by side; two programs making calls take turns
 at the calls.
 
+### Signals, continued (0x78)
+
+The calls a program uses to have the kernel run its handlers, numbered after
+the rest: what they do is under *Signals*, with the process calls.
+
+| # | Name | Arguments | Returns | Cap |
+|---|---|---|---|---|
+| 120 | `SYS_SIG_MASK` | arg0 = how: 0 hold these back too, 1 let these through, 2 hold back exactly these, 3 the same and wait, 4 say what is waiting that is held back; anything else asks. arg1 = the signals, bit `n - 1` for signal `n` | what the calling task held back before; with 3, `0xFFFF_FFFD` when a signal ended the wait; with 4, what is waiting | — |
+| 121 | `SYS_SIG_RETURN` | arg0 = the record a handler was entered with | does not return: the task goes on from where the record says | — |
+| 122 | `SYS_SIG_STACK` | arg0 = address, or `u64::MAX` to change nothing; arg1 = bytes (0 for none); arg2 = where to write the stack it replaces, address and bytes, or 0 | 0 / `u64::MAX` | — |
+| 123 | `SYS_SIG_WAIT` | arg0 = the signals to take, arg1 = how long to wait for one, a span (0 not at all, `u64::MAX` for ever), arg2 = where to write who raised it, or 0 | the signal; 0 when the time ran out; `0xFFFF_FFFD` when another signal ended the wait with a handler run | — |
+
 ### Synchronisation (0x80)
 
 | # | Name | Arguments | Returns | Cap |
 |---|---|---|---|---|
-| 128 | `SYS_FUTEX_WAIT` | arg0 = addr (4-byte aligned), arg1 = expected | 0 = woken, 1 = value already differed, `u64::MAX` = bad address or no wait slot. **Blocks.** | — |
+| 128 | `SYS_FUTEX_WAIT` | arg0 = addr (4-byte aligned), arg1 = expected | 0 = woken, 1 = value already differed, `0xFFFF_FFFD` = a signal ended the wait, `u64::MAX` = bad address or no wait slot. **Blocks.** | — |
 | 129 | `SYS_FUTEX_WAKE` | arg0 = addr, arg1 = max to wake | number woken | — |
-| 130 | `SYS_FUTEX_WAIT_TIMEOUT` | arg0 = addr, arg1 = expected, arg2 = how long to wait, a span | 0 = woken, 1 = value already differed, 2 = timed out, `u64::MAX` = bad address or no wait slot. **Blocks.** | — |
+| 130 | `SYS_FUTEX_WAIT_TIMEOUT` | arg0 = addr, arg1 = expected, arg2 = how long to wait, a span | 0 = woken, 1 = value already differed, 2 = timed out, `0xFFFF_FFFD` = a signal ended the wait, `u64::MAX` = bad address or no wait slot. **Blocks.** | — |
 | 131 | `SYS_EVENT_CREATE` | arg0 = the count it starts at, arg1 = flags (1 = semaphore) | a descriptor readable while the counter is not zero / `u64::MAX` | — |
 
 A word in shared memory — a region, or a file mapped shared — is one futex
@@ -1382,7 +1476,7 @@ go when nothing maps them.
 | # | Name | Arguments | Returns | Cap |
 |---|---|---|---|---|
 | 208 | `SYS_PTY_CREATE` | — | a descriptor for a new pty's master / `u64::MAX` | — |
-| 209 | `SYS_PTY_CTL` | arg0 = a descriptor naming either end, arg1 = op (0 get termios, 1 set termios, 2 get window size, 3 set window size, 4 the pty's number, 5 put a group in front, 6 which group is, 7 make it the caller's controlling terminal, 8 which session's it is), arg2 = the structure, or for op 5 the group | per op / `u64::MAX`; ops 5 and 7, `u64::MAX - 1` when the rules say no, and op 5 `0xFFFF_FFFD` when the caller was signalled for asking | — |
+| 209 | `SYS_PTY_CTL` | arg0 = a descriptor naming either end, arg1 = op (0 get termios, 1 set termios, 2 get window size, 3 set window size, 4 the pty's number, 5 put a group in front, 6 which group is, 7 make it the caller's controlling terminal, 8 which session's it is), arg2 = the structure, or for op 5 the group | per op / `u64::MAX`; ops 5 and 7, `u64::MAX - 1` when the rules say no, and ops 1, 3 and 5 `0xFFFF_FFFD` when the caller was signalled for asking from behind | — |
 | 210 | `SYS_PTY_OPEN` | arg0 = a pty's number | a descriptor for its slave / `u64::MAX` | — |
 | 211 | `SYS_PGROUP` | arg0 = op: 0 the group of process arg1, 1 put process arg1 in group arg2, 2 the session of process arg1, 3 begin a session; a process of 0 is the caller's own | the group or the session; 0 for op 1 / `u64::MAX` for no such process, `u64::MAX - 1` when the rules say no | — |
 

@@ -29,34 +29,27 @@ them struck through as done. What follows is what is true now.
   a margin free in the background, and nothing notices that a page was
   written out a moment before it was wanted again and was not worth
   writing.
-- **Signals that interrupt.** A program is told of a signal it has a handler
-  for, and its runtime runs the handler at the next system-call boundary
-  (`docs/abi.md`, *Signals*). Nothing stops a program in the middle of
-  computing: one that handles a signal and then makes no call is not
-  interrupted by it. That would be a frame on the user stack and a way back
-  from it, and saving everything in between — the floating-point state too.
-- **The rest of job control.** There are process groups, sessions, a group
-  in front of a terminal and programs that stop (`docs/abi.md`, *Jobs*).
-  What a terminal does not do is stop a job for *writing* to it from behind
-  (`TOSTOP`) or for changing its settings from there; only a read and a
-  change of who is in front are checked. A session's terminal is given up
-  only by its leader ending. And nothing is hung up on when a terminal's
-  master goes: its readers see the end of the file.
-- **Signals nothing raises.** None when a terminal changes size. A pipe
-  with nobody reading it is found out by the writer's runtime, which asks
-  what kind of thing the descriptor is. (An alarm and a child ending are
-  raised: `SYS_SIG_ALARM`, and SIGCHLD.) There is one alarm for a program,
-  in real time; nothing measures the time a program spends running, so there
-  is nothing to raise for that.
+- **A call to a server that a signal cuts short.** The kernel runs a
+  handler wherever it finds a program (`docs/abi.md`, *Signals*), and every
+  wait the kernel keeps is ended by one. A call to a server is not: woken
+  with no reply it would fail, so the handler runs when the server answers
+  — a read of a file, a wait for a lock. Ending one would be a word to the
+  server that its caller has gone away, and an answer that says so.
+- **Signals queued.** One raised twice before it is run is run once — the
+  real-time signals too, which Linux queues with a value each. A handler is
+  told who raised a signal by process id; not by user, and for SIGCHLD not
+  with the child's status.
+- **The rest of job control.** A session's terminal is given up only by its
+  leader ending. And nothing is hung up on when a terminal's master goes:
+  its readers see the end of the file.
+- **Signals nothing raises.** A pipe with nobody reading it is found out by
+  the writer's runtime, which asks what kind of thing the descriptor is.
+  There is one alarm for a program, in real time; nothing measures the time
+  a program spends running, so there is nothing to raise for that.
 - **Process ids that come round.** A process id is an endpoint number, and
   those only go up. A C `pid_t` holds two thousand million of them; Linux
   wraps and reuses, and here the task after that many has an id a C program
   cannot hold.
-- **A mask the kernel knows.** A signal a program has blocked is held back by
-  its runtime, which can only hold back what it would have run: a blocked
-  signal with no handler does what it does at once — a blocked SIGTSTP
-  stops. The one place job control leans on a mask, a shell taking its
-  terminal back with SIGTTOU blocked, the runtime says so in the call.
 - **A wait list names a task by its id, and ids are reused.** A task killed
   while it is parked in a read or a write is taken off the list it was on
   (`pipe::forget_waiter`, reached through what it held), because a wake meant
@@ -144,8 +137,6 @@ will meet:
 - **A thread starts with a copy of its creator's capabilities**, not a share:
   what either is granted or gives up afterwards the other does not see.
   Descriptors are the program's and are shared.
-- **A pty's window size is stored and nobody is told when it changes.** Linux
-  sends `SIGWINCH`.
 - **Memory is written out through the file server, a page a call**, to a
   file, on a disk driven a word at a time. It is correct and it is slow:
   about a hundred pages a second in a virtual machine. A partition of its

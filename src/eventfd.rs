@@ -204,16 +204,15 @@ pub fn add(ev: usize, n: u64) -> bool {
 }
 
 /// A task parked on this counter has died: it is waiting for nothing now.
-pub fn forget_waiter(ev: usize, tid: usize) {
+pub fn forget_waiter(ev: usize, tid: usize) -> bool {
     if ev >= MAX_EVENTS {
-        return;
+        return false;
     }
     let flags = irq_save();
     let e = &mut events()[ev];
-    if e.in_use {
-        crate::pipe::forget_in(&mut e.waiters, &mut e.nwaiters, tid);
-    }
+    let found = e.in_use && crate::pipe::forget_in(&mut e.waiters, &mut e.nwaiters, tid);
     irq_restore(flags);
+    found
 }
 
 /// Park until the counter is not zero. `false` when there was no room to be
@@ -227,7 +226,7 @@ pub fn wait(ev: usize) -> bool {
     let flags = irq_save();
     let parked = {
         let e = &mut events()[ev];
-        if !e.in_use || e.count > 0 || e.nwaiters >= MAX_WAITERS {
+        if !e.in_use || e.count > 0 || e.nwaiters >= MAX_WAITERS || crate::signal::ends_wait(tid) {
             false
         } else {
             e.waiters[e.nwaiters] = tid;

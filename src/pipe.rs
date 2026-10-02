@@ -266,7 +266,7 @@ pub fn wait_peer(handle: usize, is_write: bool, since: u64) -> Peer {
 
 /// A signal has arrived for a task that may be waiting for the other end of
 /// a pipe: if it is, it stops waiting and goes to see.
-pub fn interrupt(tid: usize) {
+pub fn interrupt(tid: usize) -> bool {
     let mut found = false;
     let flags = irq_save();
     unsafe {
@@ -283,6 +283,7 @@ pub fn interrupt(tid: usize) {
     if found {
         scheduler::unblock_task(tid);
     }
+    found
 }
 
 static mut PIPES: [Pipe; MAX_PIPES] = {
@@ -539,10 +540,17 @@ fn read_inner(handle: usize, buf: *mut u8, max_len: usize) -> u64 {
                 return 0; // EOF
             }
 
+            // A signal with a handler for the kernel to run ends the wait,
+            // or stops it beginning: looked for here, with interrupts off.
+            let tid = scheduler::current_tid();
+            if crate::signal::ends_wait(tid) {
+                irq_restore(flags);
+                return crate::signal::INTERRUPTED;
+            }
+
             // Block until data is available. If the waiter table is full we
             // must NOT block -- an unregistered waiter is never woken, so the
             // 9th reader used to sleep forever.
-            let tid = scheduler::current_tid();
             if pipe.read_waiter_count >= MAX_WAITERS {
                 irq_restore(flags);
                 return u64::MAX;
@@ -728,7 +736,13 @@ fn write_inner(handle: usize, buf: *const u8, len: usize) -> u64 {
             } else {
                 // Buffer full — block until space available. Same rule as the
                 // read path: no waiter slot means no wakeup, so fail instead.
+                // And a signal ends the wait as it ends a read's, unless some
+                // of it went: then that is the answer.
                 let tid = scheduler::current_tid();
+                if crate::signal::ends_wait(tid) {
+                    irq_restore(flags);
+                    return if offset > 0 { offset as u64 } else { crate::signal::INTERRUPTED };
+                }
                 if pipe.write_waiter_count >= MAX_WAITERS {
                     irq_restore(flags);
                     return if offset > 0 { offset as u64 } else { u64::MAX };
@@ -774,24 +788,23 @@ pub fn release_fd(kind: &FdKind) {
 /// reach whatever has its number now, and if that is blocked on something
 /// else — a call to a server — it is woken with nothing, and the call fails.
 /// A kind that parks tasks and is missing here leaves that open.
-pub fn forget_waiter(kind: &FdKind, tid: usize) {
+pub fn forget_waiter(kind: &FdKind, tid: usize) -> bool {
     match kind {
         FdKind::PipeRead(handle) | FdKind::PipeWrite(handle) => forget_on_pipe(*handle, tid),
-        FdKind::StreamEnd { stream, end } => {
-            if let Some((rd, wr)) = crate::stream::pipes_for(*stream, *end) {
-                forget_on_pipe(rd, tid);
-                forget_on_pipe(wr, tid);
-            }
-        }
+        FdKind::StreamEnd { stream, end } => match crate::stream::pipes_for(*stream, *end) {
+            Some((rd, wr)) => forget_on_pipe(rd, tid) | forget_on_pipe(wr, tid),
+            None => false,
+        },
         FdKind::PtyEnd { pty, .. } => crate::pty::forget_waiter(*pty, tid),
         FdKind::Timer { timer } => crate::timerfd::forget_waiter(*timer, tid),
         FdKind::Event { ev } => crate::eventfd::forget_waiter(*ev, tid),
-        _ => {}
+        _ => false,
     }
 }
 
-/// `tid` out of a list of `count` waiters, the rest closed up.
-pub fn forget_in(list: &mut [usize], count: &mut usize, tid: usize) {
+/// `tid` out of a list of `count` waiters, the rest closed up. True if it
+/// was on it.
+pub fn forget_in(list: &mut [usize], count: &mut usize, tid: usize) -> bool {
     let mut kept = 0;
     for i in 0..*count {
         if list[i] != tid {
@@ -799,23 +812,25 @@ pub fn forget_in(list: &mut [usize], count: &mut usize, tid: usize) {
             kept += 1;
         }
     }
+    let found = kept != *count;
     *count = kept;
+    found
 }
 
-fn forget_on_pipe(handle: usize, tid: usize) {
+fn forget_on_pipe(handle: usize, tid: usize) -> bool {
     if handle >= MAX_PIPES {
-        return;
+        return false;
     }
     let flags = irq_save();
-    unsafe {
+    let found = unsafe {
         let pipe = &mut PIPES[handle];
-        if pipe.in_use {
-            forget_in(&mut pipe.read_waiters, &mut pipe.read_waiter_count, tid);
-            forget_in(&mut pipe.write_waiters, &mut pipe.write_waiter_count, tid);
-            forget_in(&mut pipe.peer_waiters, &mut pipe.peer_waiter_count, tid);
-        }
-    }
+        pipe.in_use
+            && (forget_in(&mut pipe.read_waiters, &mut pipe.read_waiter_count, tid)
+                | forget_in(&mut pipe.write_waiters, &mut pipe.write_waiter_count, tid)
+                | forget_in(&mut pipe.peer_waiters, &mut pipe.peer_waiter_count, tid))
+    };
     irq_restore(flags);
+    found
 }
 
 /// Take a reference on whatever a descriptor names, for a copy of it.
