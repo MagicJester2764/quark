@@ -84,8 +84,10 @@ processor with an 8259, as every machine was.
 
 ## Interrupts
 
-Devices and the clock interrupt the first processor. Its tick is the
-system's time. They come in through the I/O APIC where the firmware lists
+Devices and the clock interrupt the first processor. What time it is, is a
+counter any processor reads (`clock.rs`); seeing to what is due is the
+first processor's, on its tick and between ticks by its own local APIC's
+timer. They come in through the I/O APIC where the firmware lists
 one (`ioapic.rs`) — which could send each to any processor, and sends all
 of them to the first, because nothing yet gives a reason for another — and
 through the 8259 where it does not. `intc.rs` is whichever there is.
@@ -94,7 +96,9 @@ Every other processor has its local APIC's timer, at the same hundred times
 a second, and it does one thing: ends a task's turn.
 
 One processor tells another something by interrupting it, and there are
-three things to say:
+three things to say — and a fourth that only the first processor is told,
+that something is due before its timer is set to look (`idt::VEC_CLOCK`),
+which is heard like the first:
 
 - **Look at what you are running, and at what is waiting.** To a processor
   asleep with nothing to do when a task is made ready, and to the processor

@@ -32,7 +32,7 @@
 
 use crate::multiboot2::{MemoryRegion, MMAP_TYPE_AVAILABLE};
 use crate::percpu::{self, MAX_CPUS};
-use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 
 /// The stack a processor's idle loop runs on, and an interrupt taken there.
 const IDLE_STACK_SIZE: usize = 65536;
@@ -66,6 +66,11 @@ const ARRIVED: u8 = 1;
 const TAKEN_ON: u8 = 2;
 const GIVEN_UP_ON: u8 = 3;
 static STARTED: [AtomicU8; MAX_CPUS] = [const { AtomicU8::new(WAITED_FOR) }; MAX_CPUS];
+
+/// What the time-stamp counter of the processor being started read, the
+/// moment it was told it had been taken on: for the first to compare with
+/// its own (`clock.rs`).
+static COUNTER_READ: AtomicU64 = AtomicU64::new(0);
 
 /// The stack the processor being started was given, for it to record, and
 /// the first processor's control registers, for it to match.
@@ -224,12 +229,29 @@ pub unsafe fn start(regions: &[MemoryRegion], mb_info: (usize, usize)) {
             // was given this stack and this place in the table, and if it
             // arrives late nothing would know to wake it or to tell it a
             // mapping had gone.
+            COUNTER_READ.store(0, Ordering::Release);
+            let before = crate::clock::raw();
             if STARTED[index]
                 .compare_exchange(ARRIVED, TAKEN_ON, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
             {
                 percpu::came_online(index, cpu.apic_id);
                 index += 1;
+                // The clock is one counter read on whichever processor is
+                // asked, so every processor's has to read the same. This
+                // one's, read between two readings of the first's: if it
+                // is not between them, the counter is not a clock here.
+                if crate::clock::fine() {
+                    let give_up = crate::pit::ticks() + 20;
+                    while COUNTER_READ.load(Ordering::Acquire) == 0 && crate::pit::ticks() < give_up {
+                        core::hint::spin_loop();
+                    }
+                    let theirs = COUNTER_READ.load(Ordering::Acquire);
+                    let after = crate::clock::raw();
+                    if theirs < before || theirs > after {
+                        crate::clock::distrust();
+                    }
+                }
             } else {
                 STARTED[index].store(GIVEN_UP_ON, Ordering::Release);
                 puts(b"SMP: a processor did not start.\n");
@@ -273,6 +295,7 @@ extern "C" fn arrive(index: usize) -> ! {
     if STARTED[index].load(Ordering::Acquire) != TAKEN_ON {
         halt_here();
     }
+    COUNTER_READ.store(crate::clock::raw().max(1), Ordering::Release);
     // The first processor is still starting the system and has the lock;
     // this waits here until it has nothing to do, or goes to ring 3.
     crate::klock::acquire();

@@ -66,9 +66,15 @@ them struck through as done. What follows is what is true now.
 - **AVX.** `CR4.OSXSAVE` is clear, so an AVX instruction faults. Turning it on
   means moving the per-task floating-point state from `FXSAVE` to `XSAVE`
   first — see [`docs/fpu.md`](docs/fpu.md).
-- **A clock finer than the tick.** Time is the PIT at 100 Hz: a timer, a sleep
-  and a futex deadline all round up to ten milliseconds. There is no HPET, no
-  APIC timer and no use of the TSC.
+- **A clock that is kept right.** The clock is the processor's counter, to
+  the nanosecond, at the rate it was measured at when the machine started —
+  good to a few parts in ten thousand, and nothing corrects it afterwards.
+  A machine whose counter cannot be trusted keeps time by the tick. There is
+  no HPET, and the local APIC's timer is not used in the mode that takes a
+  time on the counter itself.
+- **A waking that preempts.** A task whose wait ends on time runs at once
+  if it is of a better band than what is running where the clock is, or if
+  a processor is idle; one of the same band waits its turn.
 - **An interrupt for every device, wherever it is.** Devices interrupt
   through the I/O APIC where there is one, on the sixteen ISA interrupts,
   wherever the firmware says each comes in; and a device that can send its
@@ -87,8 +93,8 @@ them struck through as done. What follows is what is true now.
   off is still a user program writing to a port QEMU happens to listen on.
 - **Memory above 4 GiB.** The frame allocator's bitmap covers the first four
   gigabytes and the rest of what the firmware reports is left alone.
-- **Setting the clock.** The date is read once, from the CMOS clock at boot,
-  as UTC. There is no call to change it and no time zone.
+- **A time zone.** The date is UTC. `SYS_CLOCK_SET` sets it, for a holder
+  of `Clock`, and writes it to the CMOS clock.
 
 ## Fixed tables
 

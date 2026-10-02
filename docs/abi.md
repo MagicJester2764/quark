@@ -1,6 +1,6 @@
 # Quark syscall ABI
 
-**Version 3.14.** Query the running kernel with `SYS_ABI_VERSION` (240), which
+**Version 3.15.** Query the running kernel with `SYS_ABI_VERSION` (240), which
 returns `(major << 16) | minor`.
 
 This document is the contract between the Quark kernel and everything above it.
@@ -215,6 +215,7 @@ returning at once turned that loop into a spin.
 | 3.12 | **A program that has gone is said to have gone.** No new number. A task that becomes another program with `SYS_EXEC_SPACE` was its old program's last, and whoever watched that program (`SYS_SPACE_WATCH`) is now told it has gone, as when a program's last task dies. They were not: what a server kept for the old program it kept for good, and the kernel went on counting the program as watched — a hundred and twenty-eight of them filled its table, and after that `SYS_SPACE_WATCH` failed for every program, so no server heard of any program ending. And what a watcher is owed is no longer a list eight long: a death of a task is kept for as long as it takes to collect it, however many there are, and of a program for as many as there can be programs. One call can end more than eight — a signal for a process group ends every member of a pipeline — and the ninth was not told of. |
 | 3.13 | **An object is kept for whoever was promised it.** `SYS_OBJECT_CTL` op 4, release, answers 1 and releases nothing while a living task of another program holds a capability for the object. A pager gives a program a capability and the program maps with it — two steps, and the last mapping of the object could go between them, the pager be told it was idle, and release it: the program's `SYS_OBJECT_MAP` then named nothing. Two threads mapping one file did it to each other. A pager written for 3.12 takes 1 for "still mapped" and keeps the object, which is safe; one written for this asks again. |
 | 3.14 | **An interrupt of a device's own.** `SYS_MSI_ALLOC` (118) gives a driver an interrupt number from 16 up and the address and data to program a device's MSI capability with; the device's messages then arrive as that interrupt. `SYS_IRQ_REGISTER` is for the sixteen below. Also, and no new number: devices interrupt through the I/O APIC on a machine that has one, where `SYS_IRQ_ACK` unmasks the line of a device that holds it and one slow driver no longer holds up the lines below its own; and there is a capability for the registers of the machine's devices, `DeviceMemory` (type 10), which the first task is started with: its holder mints a `PhysRange` for what lies in the addresses below four gigabytes that the firmware's memory map does not list, so that a driver can map its device. |
+| 3.15 | **A clock finer than a tick, and one that can be set.** `SYS_CLOCK` (149) says the time in nanoseconds, since boot or since 1970; `SYS_CLOCK_SET` (150) sets the date, for a holder of the new capability `Clock` (type 11), and writes it to the battery-backed clock. Every span of time a call takes may be given in nanoseconds, by setting its top bit — no number changed and a count of ticks means what it did — and is kept to the nanosecond and seen to when it is due rather than on the next tick, where the machine has a counter to keep time by and a timer to wake by. `SYS_SIG_ALARM` (arg3) and `SYS_TIMER_GET` (arg1) take somewhere to write their answer in nanoseconds; both still answer in ticks, now rounded up. A repeating timer or alarm keeps its beat, and a timer counts every interval that went by. `SYS_TICKS` is the clock's time in ticks rather than a count of interrupts. |
 
 3.1 was a change of behaviour and no change of number, so a minor: nothing built for
 3.0 calls anything that means something else now. What it could have relied on
@@ -263,6 +264,7 @@ UID 0 bypass in the kernel. Each task has a CSpace of 64 slots holding
 | 8 | `Endpoint` | the destination's endpoint number | — |
 | 9 | `MemObject` | the object's id | access: 1 read, 2 write |
 | 10 | `DeviceMemory` | — | — |
+| 11 | `Clock` | — | — |
 
 Delegation may narrow a capability but never widen it; delegating at equal
 breadth is allowed, since a set is a subset of itself.
@@ -280,6 +282,12 @@ where its device is out of the device's configuration and mints that. It
 is one authority for every device, as the I/O ports are. The kernel hands
 it to the first task, and only on a machine whose memory map it could keep
 whole.
+
+**The clock.** What time it is, is the machine's to say and one thing for
+every program on it: the date a file is given, what `SYS_CLOCK` answers,
+and what the machine believes when it is next started. A holder of `Clock`
+may set it (`SYS_CLOCK_SET`), and nobody else. The kernel hands it to the
+first task.
 
 **Endpoints.** Every task has an endpoint, with a number the kernel never gives
 to anything else, even once the task is gone. An `Endpoint` capability records
@@ -320,7 +328,7 @@ everything else returns promptly.
 | 12 | `SYS_SIG_RAISE` | arg0 = a task of the program to signal, or with arg2 = 1 its process id, or with arg2 = 2 a process group (0 for the caller's own); arg1 = signal, or 0 to ask whether one could be raised | 0 / `u64::MAX`; for a group, `u64::MAX - 1` if it has members and none the caller may signal | `TaskMgmt` for target, or same UID |
 | 13 | `SYS_SIG_TAKE` | arg0 = where to be told of the next (a `u32` in the caller's memory), or 0 to leave that as it is | the signals waiting for a handler, bit `n - 1` for signal `n`; none is waiting afterwards | — |
 | 14 | `SYS_PID` | arg0 = a task, or 0 for the caller | the process id of the program it belongs to / `u64::MAX` | — |
-| 15 | `SYS_SIG_ALARM` | arg0 = ticks until signal 14 is raised for the caller's program, 0 for no alarm; arg1 = ticks between repeats after that, 0 for none; arg2 = 1 to ask and change nothing | how the alarm stood: `ticks left \| (repeat << 32)`, 0 if there was none / `u64::MAX` | — |
+| 15 | `SYS_SIG_ALARM` | arg0 = how long until signal 14 is raised for the caller's program, a span, 0 for no alarm; arg1 = how long between repeats after that, a span, 0 for none; arg2 = 1 to ask and change nothing; arg3 = where to write how the alarm stood as two `u64` of nanoseconds, what was left and the repeat, or 0 | how the alarm stood, in ticks: `ticks left \| (repeat << 32)`, 0 if there was none / `u64::MAX` | — |
 
 A status is kept as its low eight bits, as Linux's wait status keeps it. A
 negative status is how the kernel says a task was killed — `SYS_TASK_KILL`
@@ -423,14 +431,16 @@ foreground has said nothing.
 The kernel raises two more itself, because nothing else can.
 
 *An alarm.* `SYS_SIG_ALARM` has signal 14 raised for the caller's program so
-many ticks from now, and then, if asked, every so many ticks after that. It
-is the program's: one for all its tasks, so setting it replaces the one there
-was, and the answer says how that one stood — the ticks left of it, which is
-0 only if there was none, and what it repeated at. `SYS_EXEC_SPACE` keeps it,
-which is how a program is started with a time to finish in; a forked child
-has none, having set none. A count that does not fit 32 bits is taken as the
-largest that does. A program that has said nothing about signal 14 is ended
-by it, like any other.
+long from now, and then, if asked, every so long after that — on its own
+beat: a repeat that is seen to late is not late for the one after. It is the
+program's: one for all its tasks, so setting it replaces the one there was,
+and the answer says how that one stood — what was left of it, which is 0
+only if there was none, and what it repeated at. The answer is in ticks,
+each rounded up, and one that does not fit 32 bits is the largest that does;
+a caller that wants it exactly passes somewhere to write it in nanoseconds.
+`SYS_EXEC_SPACE` keeps the alarm, which is how a program is started with a
+time to finish in; a forked child has none, having set none. A program that
+has said nothing about signal 14 is ended by it, like any other.
 
 *A child ending.* When a task whose parent is in another program dies —
 or its program is stopped, or continued — signal 17 is raised for the
@@ -515,7 +525,7 @@ bit ends the target's program at once, with status -9. Either of the others is
 raised in the target *task's* notification word, where it finds it at its next
 receive (see `SYS_NOTIFY` below); a call the target is blocked in is abandoned
 and returns failure, so that a task waiting on a server gets to look; and its
-program is killed 500 ticks later if the task is still there. A second signal
+program is killed five seconds later if the task is still there. A second signal
 does not extend that. Tasks 0 and 1 cannot be signalled. They are what a
 program written for this system is asked to stop with, and nothing a C
 library knows about.
@@ -541,8 +551,8 @@ Messages are fixed size: sender TID, a `u64` tag, and six `u64` payload words.
 | 17 | `SYS_RECV` | arg0 = from (`TID_ANY` for any), arg1 = msg out | 0 / `u64::MAX`. **Blocks.** | — |
 | 18 | `SYS_CALL` | arg0 = dest, arg1 = msg, arg2 = reply out | 0 / `u64::MAX`. **Blocks** until replied. | `Endpoint` for dest |
 | 19 | `SYS_REPLY` | arg0 = dest, arg1 = msg | 0 / `u64::MAX` | — |
-| 20 | `SYS_CALL_TIMEOUT` | arg0 = dest, arg1 = msg, arg2 = reply out, arg3 = ticks | **0 = replied, 1 = timed out**, `u64::MAX` = failed. **Blocks** up to the deadline. | `Endpoint` for dest |
-| 21 | `SYS_RECV_TIMEOUT` | arg0 = from, arg1 = msg out, arg2 = ticks | 0 a message, 1 the time ran out, 2 a sleep — a receive from the caller's own id — that a signal ended / `u64::MAX`. **Blocks** up to the deadline. | — |
+| 20 | `SYS_CALL_TIMEOUT` | arg0 = dest, arg1 = msg, arg2 = reply out, arg3 = how long to wait, a span, 0 for ever | **0 = replied, 1 = timed out**, `u64::MAX` = failed. **Blocks** up to the deadline. | `Endpoint` for dest |
+| 21 | `SYS_RECV_TIMEOUT` | arg0 = from, arg1 = msg out, arg2 = how long to wait, a span, 0 to look and not wait | 0 a message, 1 the time ran out, 2 a sleep — a receive from the caller's own id — that a signal ended / `u64::MAX`. **Blocks** up to the deadline. | — |
 | 22 | `SYS_NOTIFY` | arg0 = dest, arg1 = badge | 0 / `u64::MAX` | `Endpoint` for dest |
 | 23 | `SYS_CALL_LEND` | arg0 = dest, arg1 = msg, arg2 = reply out, arg3 = buffer, arg4 = length \| access bits | as `SYS_CALL` | `Endpoint` for dest |
 | 24 | `SYS_CALL_OFFER` | arg0 = dest, arg1 = msg, arg2 = reply out, arg3 = slot | as `SYS_CALL`; `u64::MAX` without calling if the slot holds no valid capability | `Endpoint` for dest |
@@ -599,7 +609,7 @@ would derive it, so revoking the original revokes it too.
 **All of them at once.** `SYS_CALL_WITH` takes a pointer to four words:
 the buffer's address, its length with the lending bits as `SYS_CALL_LEND`'s
 arg4 has them (0 lends nothing), the slot to offer (`u64::MAX` for none), and
-the ticks to wait for the reply (0 for ever). Each part is checked as the call
+how long to wait for the reply, a span (0 for ever). Each part is checked as the call
 with only that part checks it, and the result is `SYS_CALL_TIMEOUT`'s. It is
 what a caller that cannot trust the task it calls uses to lend or offer with a
 deadline.
@@ -730,8 +740,8 @@ would on Linux, and the pipe is freed when the read returns.
 | 74 | `SYS_FD_RECV` | arg0 = stream fd, arg1 = buf, arg2 = len, arg3 = fd to install a passed descriptor at, `u64::MAX - 1` for any free one, or `u64::MAX` to leave it queued, arg4 = flags (1 = do not wait) | `((fd + 1) << 32) \| bytes`, high half 0 if none arrived, `0xFFFF_FFFE` if it would have blocked / `u64::MAX` | — |
 | 75 | `SYS_POLLSET_CREATE` | — | fd naming the set / `u64::MAX` | — |
 | 76 | `SYS_POLLSET_CTL` | arg0 = set fd, arg1 = op (0 add, 1 modify, 2 remove), arg2 = fd, arg3 = events, arg4 = token | 0 / `u64::MAX` | — |
-| 77 | `SYS_POLLSET_WAIT` | arg0 = set fd, arg1 = array of `(u64 token, u32 events, u32 pad)`, arg2 = capacity, arg3 = timeout in ticks | entries filled, 0 = timed out, `0xFFFF_FFFD` = a signal ended the wait / `u64::MAX` | — |
-| 78 | `SYS_POLL` | arg0 = array of `(u32 fd, u32 events, u32 revents, u32 pad)`, arg1 = count, arg2 = timeout in ticks | entries with non-zero `revents`, `0xFFFF_FFFD` = a signal ended the wait / `u64::MAX` | — |
+| 77 | `SYS_POLLSET_WAIT` | arg0 = set fd, arg1 = array of `(u64 token, u32 events, u32 pad)`, arg2 = capacity, arg3 = how long to wait, a span | entries filled, 0 = timed out, `0xFFFF_FFFD` = a signal ended the wait / `u64::MAX` | — |
+| 78 | `SYS_POLL` | arg0 = array of `(u32 fd, u32 events, u32 revents, u32 pad)`, arg1 = count, arg2 = how long to wait, a span | entries with non-zero `revents`, `0xFFFF_FFFD` = a signal ended the wait / `u64::MAX` | — |
 | 79 | `SYS_FD_WRITE_NB` | arg0 = fd, arg1 = buf, arg2 = len | bytes written, **`0xFFFF_FFFE` = would block**, `u64::MAX` = error | — |
 
 **Streams.** `SYS_SOCKETPAIR` makes two connected ends and puts both in the
@@ -1038,13 +1048,13 @@ at the calls.
 |---|---|---|---|---|
 | 128 | `SYS_FUTEX_WAIT` | arg0 = addr (4-byte aligned), arg1 = expected | 0 = woken, 1 = value already differed, `u64::MAX` = bad address or no wait slot. **Blocks.** | — |
 | 129 | `SYS_FUTEX_WAKE` | arg0 = addr, arg1 = max to wake | number woken | — |
-| 130 | `SYS_FUTEX_WAIT_TIMEOUT` | arg0 = addr, arg1 = expected, arg2 = ticks | 0 = woken, 1 = value already differed, 2 = timed out, `u64::MAX` = bad address or no wait slot. **Blocks.** | — |
+| 130 | `SYS_FUTEX_WAIT_TIMEOUT` | arg0 = addr, arg1 = expected, arg2 = how long to wait, a span | 0 = woken, 1 = value already differed, 2 = timed out, `u64::MAX` = bad address or no wait slot. **Blocks.** | — |
 | 131 | `SYS_EVENT_CREATE` | arg0 = the count it starts at, arg1 = flags (1 = semaphore) | a descriptor readable while the counter is not zero / `u64::MAX` | — |
 
 Futexes are keyed on **physical** address, so a word in shared memory is one
 futex to every task that maps it, whatever virtual address each uses.
 
-A timeout of 0 ticks makes `SYS_FUTEX_WAIT_TIMEOUT` a check rather than a wait:
+A timeout of no time makes `SYS_FUTEX_WAIT_TIMEOUT` a check rather than a wait:
 it returns 1 if the value already differs and 2 if it does not, without
 blocking. There is no way to ask for an unbounded wait through this call; that
 is what `SYS_FUTEX_WAIT` is.
@@ -1067,22 +1077,59 @@ it as a resource limit rather than as a bad argument.
 
 | # | Name | Arguments | Returns | Cap |
 |---|---|---|---|---|
-| 144 | `SYS_TICKS` | — | ticks since boot | — |
-| 145 | `SYS_BOOT_TIME` | — | seconds since 1970 when tick 0 was counted; 0 if the machine has no clock | — |
+| 144 | `SYS_TICKS` | — | the time since boot, in ticks | — |
+| 145 | `SYS_BOOT_TIME` | — | seconds since 1970 when the machine was started; 0 if it has no clock | — |
 | 146 | `SYS_TIMER_CREATE` | — | a descriptor that becomes readable when its deadline passes / `u64::MAX` | — |
-| 147 | `SYS_TIMER_SET` | arg0 = fd, arg1 = ticks until it fires (0 disarms), arg2 = ticks between firings | 0 / `u64::MAX` | — |
-| 148 | `SYS_TIMER_GET` | arg0 = fd | `(interval << 32) \| ticks left` / `u64::MAX` | — |
+| 147 | `SYS_TIMER_SET` | arg0 = fd, arg1 = how long until it fires, a span (0 disarms), arg2 = how long between firings, a span | 0 / `u64::MAX` | — |
+| 148 | `SYS_TIMER_GET` | arg0 = fd, arg1 = where to write two `u64` of nanoseconds, what is left and the interval, or 0 | in ticks, `(interval << 32) \| ticks left` / `u64::MAX` | — |
+| 149 | `SYS_CLOCK` | arg0 = which: 0 since boot, 1 since 1970 | nanoseconds; 0 since 1970 if the machine has no clock / `u64::MAX` for a clock there is not | — |
+| 150 | `SYS_CLOCK_SET` | arg0 = nanoseconds since 1970, now | 0 / `u64::MAX` | `Clock` |
 
-The PIT runs at 100 Hz, so one tick is 10 ms. Every timeout argument in this
-ABI is in ticks. The time of day is `SYS_BOOT_TIME + SYS_TICKS / 100`: the
-kernel reads the PC's battery-backed clock once, at boot, and never again.
+**A span of time is a count of ticks, or — with its top bit set — of
+nanoseconds.** A tick is a hundredth of a second, and for a long time it was
+the only unit there was. Every argument in this ABI that says how long is a
+span: `SYS_SIG_ALARM`'s two, the timeouts of `SYS_CALL_TIMEOUT`,
+`SYS_CALL_WITH`, `SYS_RECV_TIMEOUT`, `SYS_POLL`, `SYS_POLLSET_WAIT` and
+`SYS_FUTEX_WAIT_TIMEOUT`, and `SYS_TIMER_SET`'s two. `500` is five seconds;
+`(1 << 63) | 1_500_000` is a millisecond and a half. No time is no time in
+either — and means what each call says 0 means, which for a call's timeout
+is "for ever": a caller counting a time down passes at least a nanosecond
+of it. A time too long to count is the longest there is, so all the bits
+set is still "for ever", and is 292 years.
+
+**The clock.** `SYS_CLOCK` says what time it is to the nanosecond: since
+boot, which only ever goes forward and is what a wait is measured by, or
+since 1970, which is that plus when the machine was started and moves when
+somebody sets it. `SYS_TICKS` is the first of those in ticks, and
+`SYS_BOOT_TIME + SYS_TICKS / 100` is still the date, to the second.
+
+How fine the clock is depends on the machine. Where the processor has a
+counter that can be trusted to count at one rate — it says so, or the
+machine is a hypervisor's guest — that is the clock, and a time is good to
+well under a microsecond. Where it has not, the clock is the count of the
+8254's interrupts and every answer is a multiple of ten milliseconds.
+
+How promptly a wait ends depends on it too. With the fine clock and a local
+APIC, whatever is due is seen to when it is due, by a timer set for it; an
+interrupt for that is taken no more often than every fifty microseconds,
+however short a time a program asks for, so a timer that repeats faster
+than that counts several firings at once. Without, a wait ends on the first
+tick at or after its time. Either way a wait never ends early.
+
+The kernel reads the PC's battery-backed clock once, at boot, as UTC.
+`SYS_CLOCK_SET` changes the date for everything that asks afterwards and
+writes it to that clock, so that it is still the date after the machine has
+been off. It moves no deadline: every wait is by the time since boot. A date
+before 1970 was a second old, or after 2199, is refused.
 
 **Timers.** A timer is a descriptor that becomes readable when its deadline
 passes. A read is eight bytes: the number of times it has fired since it was
 last read, which a read clears. It waits while that is zero, and
-`SYS_FD_READ_NB` answers "would block" instead. A repeating timer that fell
-behind its reader does not fire in a burst to catch up: the next deadline is
-one interval after the tick it fired on. There are sixteen in the machine.
+`SYS_FD_READ_NB` answers "would block" instead. A repeating timer fires on
+its own beat — every interval after the first firing, however late any one
+of them was seen to — and one that fell behind its reader does not fire in
+a burst to catch up: the intervals that went by are counted, and the next
+deadline is the first one still to come. There are sixteen in the machine.
 
 ### Sockets (0xB0)
 
@@ -1490,6 +1537,7 @@ authority, and what it is started holding bounds what anything can hold:
 - `DeviceMemory`, in the last slot of its table — unless the kernel could
   not keep the firmware's memory map whole, and so cannot say where there
   is no memory;
+- `Clock`, in the last slot that leaves free;
 - the driver band, which is what lets it put a driver there;
 - and no physical memory besides: it could once map the kernel.
 

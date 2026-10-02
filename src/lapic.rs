@@ -9,6 +9,8 @@
 //!   longer true.
 //! - **A timer of its own.** The 8254 interrupts one processor. Every other
 //!   needs a tick to end a task's turn with, and its local APIC has one.
+//!   The first processor's is set, a shot at a time, for whatever is due
+//!   before the next tick (`clock.rs`).
 //! - **The way the others are started**: INIT and STARTUP are messages sent
 //!   through it.
 //!
@@ -219,11 +221,17 @@ pub fn send_startup(apic_id: u32, page: u8) {
     send_raw(apic_id, ICR_STARTUP | ICR_ASSERT | page as u32);
 }
 
-/// Find out how far the timer counts in one tick of the 8254, which is the
-/// clock the rest of the kernel keeps time by. `false` if it does not count.
+/// Find out how far the timer counts in one tick of the 8254. `false` if it
+/// does not count.
 ///
-/// Interrupts must be on: it watches the tick count change.
+/// Against the tick itself, for a machine with no finer clock to measure it
+/// by: one that has was measured when the clock was started
+/// ([`start_one_shot`]). Interrupts must be on: it watches the tick count
+/// change.
 pub fn calibrate() -> bool {
+    if PER_TICK.load(Ordering::Relaxed) != 0 {
+        return true;
+    }
     const OVER: u64 = 5;
     write(REG_TIMER_DIVIDE, TIMER_DIVIDE_16);
     // From the edge of one tick to the edge of the fifth after it.
@@ -251,4 +259,75 @@ pub unsafe fn start_timer() {
     write(REG_TIMER_DIVIDE, TIMER_DIVIDE_16);
     write(REG_LVT_TIMER, TIMER_PERIODIC | crate::idt::VEC_TIMER as u32);
     write(REG_TIMER_INITIAL, PER_TICK.load(Ordering::Relaxed));
+}
+
+/// How far the timer counts in a tick, by the clock: the most of three
+/// short measurements. Whatever goes wrong with one — this processor taken
+/// away between starting the timer and reading the time, or between reading
+/// the timer and reading the time — makes it come out too few, never too
+/// many.
+fn measure_by_clock() -> u32 {
+    use crate::clock::{now, TICK_NS};
+    const OVER_NS: u64 = 4_000_000;
+    write(REG_TIMER_DIVIDE, TIMER_DIVIDE_16);
+    write(REG_LVT_TIMER, LVT_MASKED);
+    let mut most = 0u64;
+    for _ in 0..3 {
+        let from = now();
+        write(REG_TIMER_INITIAL, u32::MAX);
+        while now() < from + OVER_NS {
+            core::hint::spin_loop();
+        }
+        let counted = (u32::MAX - read(REG_TIMER_CURRENT)) as u64;
+        let took = now() - from;
+        write(REG_TIMER_INITIAL, 0);
+        most = most.max(counted * TICK_NS / took.max(1));
+    }
+    most.min(u32::MAX as u64) as u32
+}
+
+/// Make this processor's timer one that is set a shot at a time and raises
+/// `idt::VEC_CLOCK` when the shot is spent. `false` if there is no timer to
+/// do it with. Leaves it not set.
+///
+/// The first processor's, which is ticked by the 8254 and has no other use
+/// for its own.
+///
+/// # Safety
+/// On the first processor, interrupts off, with the clock already fine.
+pub unsafe fn start_one_shot() -> bool {
+    if !present() {
+        return false;
+    }
+    if PER_TICK.load(Ordering::Relaxed) == 0 {
+        PER_TICK.store(measure_by_clock(), Ordering::Relaxed);
+    }
+    if PER_TICK.load(Ordering::Relaxed) == 0 {
+        return false;
+    }
+    write(REG_TIMER_DIVIDE, TIMER_DIVIDE_16);
+    write(REG_TIMER_INITIAL, 0);
+    // Neither periodic nor masked: it counts down once and interrupts.
+    write(REG_LVT_TIMER, crate::idt::VEC_CLOCK as u32);
+    true
+}
+
+/// Set this processor's timer to interrupt `ns` nanoseconds from now,
+/// instead of whenever it was set for. No more than two ticks away: the
+/// tick sets it again.
+///
+/// A thousandth late rather than at all early: an interrupt before the time
+/// finds nothing due and has to be taken again.
+pub fn one_shot(ns: u64) {
+    let per_tick = PER_TICK.load(Ordering::Relaxed) as u64;
+    let ns = ns.min(2 * crate::clock::TICK_NS);
+    let count = ns * per_tick / crate::clock::TICK_NS;
+    write(REG_TIMER_INITIAL, (count + count / 1024 + 1).min(u32::MAX as u64) as u32);
+}
+
+/// Take back whatever this processor's timer was set for.
+pub fn cancel_one_shot() {
+    if present() {
+        write(REG_TIMER_INITIAL, 0);
+    }
 }

@@ -298,10 +298,20 @@ pub const SYS_FUTEX_WAIT_TIMEOUT: u64 = 130;
 pub const SYS_EVENT_CREATE: u64 = 131;
 
 // --- 0x90  time ---
+//
+// A span of time handed to any call is a count of ticks, hundredths of a
+// second, or with its top bit set a count of nanoseconds (`clock::span`).
 pub const SYS_TICKS: u64 = 144;
-/// Seconds since 1970 when tick 0 was counted, from the CMOS clock; 0 if the
-/// machine has none. The time now is this plus `SYS_TICKS / 100`.
+/// Seconds since 1970 when the clock was started, from the CMOS clock; 0 if
+/// the machine has none. The time now is this plus `SYS_TICKS / 100`, to
+/// the second; `SYS_CLOCK` says it to the nanosecond.
 pub const SYS_BOOT_TIME: u64 = 145;
+/// What time it is, in nanoseconds: since boot, or since 1970.
+pub const SYS_CLOCK: u64 = 149;
+/// `SYS_CLOCK`: the time since 1970, rather than since boot.
+const CLOCK_WALL: u64 = 1;
+/// Say what time it is. For a holder of `Clock`.
+pub const SYS_CLOCK_SET: u64 = 150;
 
 // --- 0xB0  sockets ---
 /// Bind a net-server connection handle to a file descriptor.
@@ -389,7 +399,7 @@ pub const SYS_ABI_VERSION: u64 = 240;
 /// minor when calls are added. User space can refuse to run against a major it
 /// does not know, which is the point of exposing it at all.
 pub const ABI_VERSION_MAJOR: u64 = 3;
-pub const ABI_VERSION_MINOR: u64 = 14;
+pub const ABI_VERSION_MINOR: u64 = 15;
 
 /// Threads a task may make with no capability at all.
 ///
@@ -1144,7 +1154,7 @@ fn dispatch(
             }
         }
         SYS_CALL_TIMEOUT => {
-            // arg0 = dest, arg1 = msg, arg2 = reply, arg3 = timeout in ticks.
+            // arg0 = dest, arg1 = msg, arg2 = reply, arg3 = how long to wait.
             // Returns 0 on reply, 1 on timeout, u64::MAX on error — a timeout
             // is an answer ("nobody responded"), not a failure to ask.
             let dest = arg0 as usize;
@@ -1160,7 +1170,7 @@ fn dispatch(
                 let _ua = crate::cpu::UserAccess::begin();
                 unsafe { *msg_ptr }
             };
-            match crate::ipc::sys_call_timeout(dest, &msg, arg3) {
+            match crate::ipc::sys_call_timeout(dest, &msg, crate::clock::span(arg3)) {
                 Ok(reply) => {
                     let _ua = crate::cpu::UserAccess::begin();
                     unsafe { *reply_ptr = reply };
@@ -1313,7 +1323,7 @@ fn dispatch(
                 }
                 Some(slot)
             };
-            match crate::ipc::sys_call_with(dest, &msg, with.ticks, lent, offer) {
+            match crate::ipc::sys_call_with(dest, &msg, crate::clock::span(with.ticks), lent, offer) {
                 Ok(reply) => {
                     let _ua = crate::cpu::UserAccess::begin();
                     unsafe { *(arg2 as *mut crate::ipc::Message) = reply };
@@ -1609,22 +1619,39 @@ fn dispatch(
             }
         }
         SYS_TIMER_SET => {
-            // arg0 = fd, arg1 = ticks until the first expiration (0 disarms),
-            // arg2 = ticks between them afterwards.
+            // arg0 = fd, arg1 = how long until the first expiration (no time
+            // disarms), arg2 = how long between them afterwards.
             let tid = scheduler::current_tid();
             let Some(timer) = crate::timerfd::of_fd(tid, arg0 as usize) else {
                 return u64::MAX;
             };
-            if crate::timerfd::set(timer, arg1, arg2) { 0 } else { u64::MAX }
+            if crate::timerfd::set(timer, crate::clock::span(arg1), crate::clock::span(arg2)) {
+                0
+            } else {
+                u64::MAX
+            }
         }
         SYS_TIMER_GET => {
-            // arg0 = fd: what is left, packed as (interval << 32) | until.
+            // arg0 = fd, arg1 = where to write what is left and the interval,
+            // in nanoseconds, or 0. Answers with both in ticks, packed as
+            // (interval << 32) | until, each rounded up and no more than
+            // thirty-two bits of it.
             let tid = scheduler::current_tid();
             let Some(timer) = crate::timerfd::of_fd(tid, arg0 as usize) else {
                 return u64::MAX;
             };
+            if arg1 != 0 && (arg1 & 7 != 0 || !validate_user_ptr_mut(arg1, 16)) {
+                return u64::MAX;
+            }
             match crate::timerfd::get(timer) {
-                Some((left, interval)) => (interval << 32) | (left & 0xFFFF_FFFF),
+                Some((left, interval)) => {
+                    if arg1 != 0 {
+                        let _ua = crate::cpu::UserAccess::begin();
+                        unsafe { *(arg1 as *mut [u64; 2]) = [left, interval] };
+                    }
+                    let ticks = |ns: u64| crate::clock::ticks_of(ns).min(u32::MAX as u64);
+                    (ticks(interval) << 32) | ticks(left)
+                }
                 None => u64::MAX,
             }
         }
@@ -2546,7 +2573,7 @@ fn dispatch(
         }
         SYS_POLL => {
             // arg0 = array of (u32 fd, u32 events, u32 revents, u32 pad),
-            // arg1 = count, arg2 = timeout in ticks.
+            // arg1 = count, arg2 = how long to wait.
             //
             // A set built inside the kernel and thrown away. The saving is in
             // the syscall count, which is where it is actually spent:
@@ -2560,9 +2587,9 @@ fn dispatch(
                 // sources are all timeouts does exactly that. Returning at once
                 // turned that loop into a spin.
                 let tid = scheduler::current_tid();
-                let deadline = crate::pit::ticks().saturating_add(arg2);
+                let deadline = crate::clock::now().saturating_add(crate::clock::span(arg2));
                 loop {
-                    let now = crate::pit::ticks();
+                    let now = crate::clock::now();
                     if now >= deadline {
                         break;
                     }
@@ -2606,7 +2633,7 @@ fn dispatch(
                 }
             }
 
-            let deadline = crate::pit::ticks().saturating_add(arg2);
+            let deadline = crate::clock::now().saturating_add(crate::clock::span(arg2));
             let mut found = [(0u64, 0u32); 32];
             let mut hits = 0usize;
             let mut interrupted = false;
@@ -2626,7 +2653,7 @@ fn dispatch(
                 if invalid > 0 {
                     break;
                 }
-                let now = crate::pit::ticks();
+                let now = crate::clock::now();
                 if now >= deadline {
                     break;
                 }
@@ -2690,7 +2717,7 @@ fn dispatch(
         }
         SYS_POLLSET_WAIT => {
             // arg0 = set fd, arg1 = out array of (u64 token, u32 events,
-            // u32 pad), arg2 = capacity, arg3 = timeout in ticks.
+            // u32 pad), arg2 = capacity, arg3 = how long to wait.
             let tid = scheduler::current_tid();
             let set = match pollset_of(tid, arg0 as usize) {
                 Some(s) => s,
@@ -2701,14 +2728,14 @@ fn dispatch(
                 return u64::MAX;
             }
 
-            let deadline = crate::pit::ticks().saturating_add(arg3);
+            let deadline = crate::clock::now().saturating_add(crate::clock::span(arg3));
             let mut found = [(0u64, 0u32); 64];
             let out = loop {
                 let n = crate::pollset::scan(set, tid, &mut found[..cap]);
                 if n > 0 {
                     break n as u64;
                 }
-                let now = crate::pit::ticks();
+                let now = crate::clock::now();
                 if now >= deadline {
                     break 0;
                 }
@@ -2976,8 +3003,8 @@ fn dispatch(
             crate::futex::futex_wake(arg0, arg1)
         }
         SYS_FUTEX_WAIT_TIMEOUT => {
-            // arg0 = addr, arg1 = expected value, arg2 = timeout in ticks
-            crate::futex::futex_wait_timeout(arg0, arg1 as u32, arg2)
+            // arg0 = addr, arg1 = expected value, arg2 = how long to wait
+            crate::futex::futex_wait_timeout(arg0, arg1 as u32, crate::clock::span(arg2))
         }
         SYS_MMAP => {
             // arg0 = vaddr, arg1 = pages
@@ -3222,10 +3249,10 @@ fn dispatch(
             (free.min(u32::MAX as u64) << 32) | charged.min(u32::MAX as u64)
         }
         SYS_RECV_TIMEOUT => {
-            // arg0 = from, arg1 = msg_ptr, arg2 = timeout_ticks
+            // arg0 = from, arg1 = msg_ptr, arg2 = how long to wait
             let from = arg0 as usize;
             let msg_ptr = arg1 as *mut crate::ipc::Message;
-            let timeout = arg2;
+            let timeout = crate::clock::span(arg2);
             let msg_size = core::mem::size_of::<crate::ipc::Message>() as u64;
             if !validate_user_ptr_mut(arg1, msg_size) { return u64::MAX; }
             match crate::ipc::sys_recv_timeout(from, timeout) {
@@ -3241,9 +3268,38 @@ fn dispatch(
             }
         }
         SYS_TICKS => {
-            crate::pit::ticks()
+            // The clock's time in the unit a tick is, which on a machine with
+            // no finer clock is the count of them.
+            crate::clock::now() / crate::clock::TICK_NS
         }
-        SYS_BOOT_TIME => crate::rtc::boot_time(),
+        SYS_BOOT_TIME => crate::clock::boot_seconds(),
+        SYS_CLOCK => {
+            // arg0 = which: nanoseconds since boot, or with 1 since 1970 —
+            // which is 0 on a machine with no clock to have said.
+            match arg0 {
+                0 => crate::clock::now(),
+                CLOCK_WALL => crate::clock::wall(),
+                _ => u64::MAX,
+            }
+        }
+        SYS_CLOCK_SET => {
+            // arg0 = nanoseconds since 1970, now. The clock is the machine's,
+            // so this is for whoever holds the right to set it; and it is
+            // written through to the clock that keeps time while the machine
+            // is off, or the next boot would undo it.
+            if !crate::cap::task_has_clock(scheduler::current_tid()) {
+                return u64::MAX;
+            }
+            // Not before 1970 was a second old, and not after the year 2200:
+            // the first is how "no clock" is written, and the second is
+            // further than the clock that is written through to can say.
+            if !(1_000_000_000..7_258_118_400_000_000_000).contains(&arg0) {
+                return u64::MAX;
+            }
+            crate::clock::set_wall(arg0);
+            crate::rtc::write(arg0 / 1_000_000_000);
+            0
+        }
         SYS_MSI_ALLOC => {
             // No arguments. An interrupt of the caller's own, for a device
             // that sends its interrupts as messages: a number from 16 up,
@@ -3434,10 +3490,33 @@ fn dispatch(
             }
         }
         SYS_SIG_ALARM => {
-            // arg0 = ticks from now until SIGALRM is raised for the caller's
-            // program, 0 for no alarm; arg1 = ticks between repeats after
-            // that, 0 for none; arg2 = 1 to ask how it stands and no more.
-            crate::signal::alarm(scheduler::current_tid(), arg0, arg1, arg2 & ALARM_ASK != 0)
+            // arg0 = how long from now until SIGALRM is raised for the
+            // caller's program, no time for no alarm; arg1 = how long between
+            // repeats after that, none for none; arg2 = 1 to ask how it
+            // stands and no more; arg3 = where to write how it stood, in
+            // nanoseconds — what was left of it and what it repeated at — or
+            // 0. Answers with both in ticks, each rounded up and no more
+            // than thirty-two bits of it: sixteen months.
+            if arg3 != 0 && (arg3 & 7 != 0 || !validate_user_ptr_mut(arg3, 16)) {
+                return u64::MAX;
+            }
+            let was = crate::signal::alarm(
+                scheduler::current_tid(),
+                crate::clock::span(arg0),
+                crate::clock::span(arg1),
+                arg2 & ALARM_ASK != 0,
+            );
+            match was {
+                Some((left, every)) => {
+                    if arg3 != 0 {
+                        let _ua = crate::cpu::UserAccess::begin();
+                        unsafe { *(arg3 as *mut [u64; 2]) = [left, every] };
+                    }
+                    let ticks = |ns: u64| crate::clock::ticks_of(ns).min(u32::MAX as u64);
+                    ticks(left) | ticks(every) << 32
+                }
+                None => u64::MAX,
+            }
         }
         SYS_SIG_TAKE => {
             // arg0 = where in the caller's memory to say that there is
@@ -3727,6 +3806,7 @@ fn dispatch(
                 8 => crate::cap::CapType::Endpoint,
                 9 => crate::cap::CapType::MemObject,
                 10 => crate::cap::CapType::DeviceMemory,
+                11 => crate::cap::CapType::Clock,
                 _ => return u64::MAX,
             };
             let tid = scheduler::current_tid();

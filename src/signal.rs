@@ -194,35 +194,33 @@ fn wake(tid: usize) {
     }
 }
 
-/// `SYS_SIG_ALARM`: have SIGALRM raised for `tid`'s program `ticks` ticks from
-/// now, and every `every` ticks after that if that is not 0; no ticks is no
-/// alarm. With `ask`, nothing is changed. Answers with how the alarm stood
-/// before: the ticks left of it, and above them what it repeated at.
-///
-/// A time further off than a count of 32 bits is that count: sixteen months.
-pub fn alarm(tid: usize, ticks: u64, every: u64, ask: bool) -> u64 {
-    let far = |t: u64| t.min(u32::MAX as u64) as u32;
-    let new = if ask { None } else { Some((far(ticks), far(every))) };
-    match fdtable::alarm(tid, crate::pit::ticks(), new) {
-        Some((left, every)) => left as u64 | (every as u64) << 32,
-        None => u64::MAX,
+/// `SYS_SIG_ALARM`: have SIGALRM raised for `tid`'s program `first`
+/// nanoseconds from now, and every `every` after that if that is not 0; no
+/// time is no alarm. With `ask`, nothing is changed. Answers with how the
+/// alarm stood before: the nanoseconds left of it, and what it repeated at.
+/// `None` for a task in no program.
+pub fn alarm(tid: usize, first: u64, every: u64, ask: bool) -> Option<(u64, u64)> {
+    let new = if ask { None } else { Some((first, every)) };
+    let now = crate::clock::now();
+    let was = fdtable::alarm(tid, now, new);
+    if was.is_some() && !ask && first != 0 {
+        crate::clock::due(now.saturating_add(first));
     }
+    was
 }
 
-/// The timer's part in that, on every tick: SIGALRM for each program whose
-/// alarm is due.
+/// The clock's part in that: SIGALRM for each program whose alarm is due at
+/// `now`.
 ///
 /// One at a time, each alarm seen to before its signal is raised, because
 /// raising it may be the last thing this does: a program that has said
-/// nothing about SIGALRM is ended by it, and if that is the program the tick
-/// interrupted there is nothing to come back to. Whatever else was due is
-/// still due at the next tick.
-pub fn tick(now: u64) {
+/// nothing about SIGALRM is ended by it, and if that is the program the
+/// clock interrupted there is nothing to come back to. Whatever else was
+/// due is still due the next time the clock looks.
+pub fn alarms(now: u64) {
     while let Some(tid) = fdtable::alarm_due(now) {
         let _ = raise(tid, SIGALRM);
     }
-    // And the groups a death left stopped with nobody to start them.
-    crate::job::hang_up();
 }
 
 /// A child of `parent` has ended: SIGCHLD for the parent's program, which

@@ -379,8 +379,10 @@ pub fn spawn_init(elf_data: &[u8], fb: Option<crate::multiboot2::FramebufferInfo
         // And the right to map a device's registers, to hand to drivers:
         // if the machine has anywhere that is known to be only devices.
         if !crate::devmem::ranges().is_empty() {
-            crate::cap::insert_device_memory(&mut task.cspace);
+            crate::cap::insert_last(&mut task.cspace, crate::cap::CapType::DeviceMemory);
         }
+        // And the right to say what time it is, for whoever it decides may.
+        crate::cap::insert_last(&mut task.cspace, crate::cap::CapType::Clock);
         task.context.rip = enter_user_trampoline as *const () as u64;
         task.context.r12 = entry;
         task.context.r13 = stack_top;

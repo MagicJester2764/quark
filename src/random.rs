@@ -201,7 +201,7 @@ pub fn init() {
     }
     words[4] = rdtsc();
     words[5] = pit_count() ^ (crate::pit::ticks() << 16);
-    words[6] = crate::rtc::boot_time();
+    words[6] = crate::clock::boot_seconds();
     words[7] = rdtsc();
 
     let mut seed = [0u8; 32];

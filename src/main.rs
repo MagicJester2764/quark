@@ -6,6 +6,7 @@ extern crate alloc;
 
 mod acpi;
 pub mod cap;
+mod clock;
 mod console;
 mod cpu;
 mod context;
@@ -117,6 +118,9 @@ pub extern "C" fn kernel_main(multiboot_info: usize) -> ! {
         if lapic::present() {
             percpu::set_apic_id(lapic::id());
         }
+        // The clock, started before the first tick is counted, so that the
+        // two count from the same moment.
+        clock::init();
         pit::init(100); // 100 Hz timer
         intc::enable(0); // timer
         intc::enable(1); // keyboard

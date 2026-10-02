@@ -885,6 +885,27 @@ pub fn kicked() {
     }
 }
 
+/// The clock has woken what was due, on this processor and between two
+/// ticks: if what is now ready is better than what is running, it runs now,
+/// as it would have at the next tick — which is the wait it was woken on
+/// time to be spared. What is of the running task's own band waits for the
+/// turn to end, as it does at a tick.
+pub fn woken() {
+    if !INITIALIZED.load(Ordering::SeqCst) {
+        return;
+    }
+    unsafe {
+        let current = crate::percpu::current();
+        let Some(best) = best_ready_band() else { return };
+        if current == 0 {
+            schedule_inner(true);
+        } else if best < priority_of(current) {
+            SLICE_LEFT[current] = 0;
+            schedule_inner(true);
+        }
+    }
+}
+
 /// Let a held task run again: at once if it is ready to, and otherwise when
 /// whatever it is blocked on lets it.
 pub fn release_task(tid: usize) {

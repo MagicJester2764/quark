@@ -18,20 +18,29 @@ pub unsafe fn init(hz: u32) { unsafe {
     io::outb(PIT_CH0_DATA, ((divisor >> 8) & 0xFF) as u8);
 }}
 
-/// Called from the IRQ 0 handler to bump the tick counter and trigger scheduling.
+/// Called from the IRQ 0 handler: count the tick, see to what is due, and
+/// charge the running task for its turn.
+///
+/// What time it is, is the clock's to say (`clock.rs`), and so is what is
+/// due; the tick is when everything is looked at whether or not anything
+/// asked to be.
+///
+/// The order is that of what may not come back. Raising an alarm may end
+/// the program this interrupted, and so may hanging up on a group a death
+/// left stopped: what follows either is then left for the next tick, which
+/// is why each is something that can wait for one.
 pub fn tick() {
-    let now = TICKS.fetch_add(1, Ordering::Relaxed) + 1;
+    TICKS.fetch_add(1, Ordering::Relaxed);
     crate::random::stir();
-    crate::timerfd::tick(now);
-    crate::ipc::check_timeouts();
-    crate::futex::check_timeouts();
     crate::ipc::check_signal_deadlines();
-    crate::signal::tick(now);
+    crate::clock::expire(false);
+    // The groups a death left stopped with nobody to start them.
+    crate::job::hang_up();
     crate::scheduler::timer_tick();
 }
 
-/// Return the current tick count.
-#[allow(dead_code)]
+/// How many times the 8254 has interrupted. Not the time — `clock::now` is
+/// — though on a machine with no finer clock the time is made of it.
 pub fn ticks() -> u64 {
     TICKS.load(Ordering::Relaxed)
 }

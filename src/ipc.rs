@@ -188,7 +188,7 @@ pub fn withdraw_offer(client: usize) {
     }
 }
 
-/// Per-task timeout deadline (PIT tick count). 0 = no timeout.
+/// Per-task timeout deadline, in the clock's nanoseconds. 0 = no timeout.
 static mut TASK_TIMEOUT: [u64; MAX_TASKS] = [0; MAX_TASKS];
 
 /// Set by `check_timeouts` when it abandons a task's blocking call, so the
@@ -269,8 +269,8 @@ pub const SIG_TERM: u64 = 1 << 17;
 pub const SIG_KILL: u64 = 1 << 18;
 pub const SIG_MASK: u64 = SIG_INT | SIG_TERM | SIG_KILL;
 
-/// Ticks before a signaled task is force-killed (5 seconds at 100 Hz).
-const SIGNAL_KILL_TIMEOUT: u64 = 500;
+/// How long a signaled task has before it is force-killed: five seconds.
+const SIGNAL_KILL_TIMEOUT: u64 = 500 * crate::clock::TICK_NS;
 
 /// Save RFLAGS and disable interrupts. Returns saved flags.
 #[inline(always)]
@@ -653,7 +653,7 @@ pub fn sys_signal(dest: usize, sig: u64) -> Result<(), IpcError> {
     // Set force-kill deadline (only if not already set — don't extend)
     unsafe {
         if SIGNAL_DEADLINE[dest] == 0 {
-            SIGNAL_DEADLINE[dest] = crate::pit::ticks() + SIGNAL_KILL_TIMEOUT;
+            SIGNAL_DEADLINE[dest] = crate::clock::after(SIGNAL_KILL_TIMEOUT);
         }
     }
 
@@ -661,10 +661,11 @@ pub fn sys_signal(dest: usize, sig: u64) -> Result<(), IpcError> {
 }
 
 /// Check signal deadlines and force-kill unresponsive tasks.
-/// Called from `pit::tick()` on every timer interrupt.
+/// Called from `pit::tick()` on every timer interrupt: five seconds is not
+/// a time anybody needs kept to better than a tick.
 pub fn check_signal_deadlines() {
     // Already in interrupt context (IRQ handler), so no need for irq_save.
-    let now = crate::pit::ticks();
+    let now = crate::clock::now();
     unsafe {
         for tid in 2..MAX_TASKS {
             let deadline = SIGNAL_DEADLINE[tid];
@@ -900,7 +901,7 @@ pub fn sys_call_offer(dest: usize, msg: &Message, slot: usize) -> Result<Message
     call_inner(dest, msg, 0, None, Some(slot))
 }
 
-/// Synchronous call that gives up after `timeout_ticks`.
+/// Synchronous call that gives up after `timeout_ns` nanoseconds.
 ///
 /// A call has two blocking points and a target that is alive but not serving
 /// can hang either one: it may never reach sys_recv, leaving us in
@@ -913,31 +914,31 @@ pub fn sys_call_offer(dest: usize, msg: &Message, slot: usize) -> Result<Message
 pub fn sys_call_timeout(
     dest: usize,
     msg: &Message,
-    timeout_ticks: u64,
+    timeout_ns: u64,
 ) -> Result<Message, IpcError> {
-    call_inner(dest, msg, timeout_ticks, None, None)
+    call_inner(dest, msg, timeout_ns, None, None)
 }
 
 /// A call with any of a buffer lent, a capability offered and a deadline.
 pub fn sys_call_with(
     dest: usize,
     msg: &Message,
-    timeout_ticks: u64,
+    timeout_ns: u64,
     lent: Option<Lent>,
     offer: Option<usize>,
 ) -> Result<Message, IpcError> {
-    call_inner(dest, msg, timeout_ticks, lent, offer)
+    call_inner(dest, msg, timeout_ns, lent, offer)
 }
 
-/// `timeout_ticks` of 0 means block indefinitely.
+/// `timeout_ns` of 0 means block indefinitely.
 fn call_inner(
     dest: usize,
     msg: &Message,
-    timeout_ticks: u64,
+    timeout_ns: u64,
     lent: Option<Lent>,
     offer: Option<usize>,
 ) -> Result<Message, IpcError> {
-    call_as(dest, msg, timeout_ticks, lent, offer, 0)
+    call_as(dest, msg, timeout_ns, lent, offer, 0)
 }
 
 /// A call from the kernel, on behalf of the current task, to the server
@@ -963,7 +964,7 @@ pub fn pager_call(pager: usize, msg: &Message, frame: Option<usize>) -> Result<M
 fn call_as(
     dest: usize,
     msg: &Message,
-    timeout_ticks: u64,
+    timeout_ns: u64,
     lent: Option<Lent>,
     offer: Option<usize>,
     sender_bits: u64,
@@ -1019,11 +1020,14 @@ fn call_as(
         scheduler::refresh_priority(dest);
 
         TASK_TIMED_OUT[caller] = false;
-        TASK_TIMEOUT[caller] = if timeout_ticks == 0 {
+        TASK_TIMEOUT[caller] = if timeout_ns == 0 {
             0
         } else {
-            crate::pit::ticks() + timeout_ticks
+            crate::clock::after(timeout_ns)
         };
+        if TASK_TIMEOUT[caller] != 0 {
+            crate::clock::due(TASK_TIMEOUT[caller]);
+        }
     }
     match hand_over_to {
         // Straight across, on what is left of this task's slice, with
@@ -1100,8 +1104,8 @@ pub fn sys_reply(dest: usize, msg: &Message) -> Result<(), IpcError> {
 
 /// Synchronous receive with timeout: blocks until a message arrives or deadline expires.
 /// `from` is the expected sender TID, or TID_ANY for any sender.
-/// `timeout_ticks` is the number of PIT ticks to wait (0 = non-blocking poll).
-pub fn sys_recv_timeout(from: usize, timeout_ticks: u64) -> Result<Message, IpcError> {
+/// `timeout_ns` is how long to wait, in nanoseconds (0 = non-blocking poll).
+pub fn sys_recv_timeout(from: usize, timeout_ns: u64) -> Result<Message, IpcError> {
     let receiver = scheduler::current_tid();
 
     let flags = irq_save();
@@ -1178,7 +1182,7 @@ pub fn sys_recv_timeout(from: usize, timeout_ticks: u64) -> Result<Message, IpcE
         }
 
         // Non-blocking poll: return immediately if timeout is 0
-        if timeout_ticks == 0 {
+        if timeout_ns == 0 {
             irq_restore(flags);
             return Err(IpcError::Timeout);
         }
@@ -1193,7 +1197,8 @@ pub fn sys_recv_timeout(from: usize, timeout_ticks: u64) -> Result<Message, IpcE
         }
 
         // Set deadline and block
-        TASK_TIMEOUT[receiver] = crate::pit::ticks() + timeout_ticks;
+        TASK_TIMEOUT[receiver] = crate::clock::after(timeout_ns);
+        crate::clock::due(TASK_TIMEOUT[receiver]);
         TASK_IPC[receiver].state = IpcState::RecvBlocked(from);
         scheduler::block_task(receiver);
     }
@@ -1300,14 +1305,18 @@ pub fn fault_call(faulting_tid: usize, pager_tid: usize, msg: Message) {
     irq_restore(flags);
 }
 
-/// Check all task timeouts and unblock expired ones.
-/// Called from `pit::tick()` on every timer interrupt.
-pub fn check_timeouts() {
+/// Check all task timeouts at `now` and unblock expired ones; say when the
+/// next one is, or `u64::MAX` if nobody is waiting on a time.
+/// Called from the clock (`clock::expire`).
+pub fn check_timeouts(now: u64) -> u64 {
     // Already in interrupt context (IRQ handler), interrupts are implicitly off.
-    let now = crate::pit::ticks();
+    let mut next = u64::MAX;
     unsafe {
         for tid in 0..MAX_TASKS {
             let deadline = TASK_TIMEOUT[tid];
+            if deadline != 0 && now < deadline {
+                next = next.min(deadline);
+            }
             if deadline != 0 && now >= deadline {
                 TASK_TIMEOUT[tid] = 0;
                 // Only unblock if still blocked on the thing we timed (it could
@@ -1333,6 +1342,7 @@ pub fn check_timeouts() {
             }
         }
     }
+    next
 }
 
 /// Fail every task that is blocked on `dead_tid`: sending to it, in a call to

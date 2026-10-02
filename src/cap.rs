@@ -98,6 +98,12 @@ pub enum CapType {
     /// configuration, and that is its driver: so the driver holds this and
     /// mints the one range it needs.
     DeviceMemory = 10,
+    /// Permission to say what time it is (`SYS_CLOCK_SET`). No parameters.
+    ///
+    /// The clock is the machine's: every program's idea of the date, every
+    /// file's, and what the machine believes when it is next started. Who
+    /// may set it is nobody by default and whoever is handed this.
+    Clock = 11,
 }
 
 /// A `MemObject`'s access bits.
@@ -346,6 +352,17 @@ pub fn task_has_set_uid(tid: usize) -> bool {
     }
 }
 
+/// Check if a task has the Clock capability.
+pub fn task_has_clock(tid: usize) -> bool {
+    if tid >= MAX_TASKS { return false; }
+    unsafe {
+        match task_cspace(tid) {
+            Some(cs) => cs.iter().any(|cap| cap.cap_type as u8 == CapType::Clock as u8 && is_valid(cap)),
+            None => false,
+        }
+    }
+}
+
 /// Public wrapper over the revocation check, for callers outside this module.
 pub fn slot_is_valid(cap: &CapSlot) -> bool {
     is_valid(cap)
@@ -552,17 +569,19 @@ pub fn insert_kernel_range(cspace: &mut CSpace, base: usize, len: usize) -> bool
     }
 }
 
-/// Give `cspace` the unrevocable right to map the machine's devices'
-/// registers ([`CapType::DeviceMemory`]), in its last free slot. The first
-/// task names its low slots itself — where it keeps the nameserver's
-/// endpoint, where it mints what it hands on — and counts on the ones it
-/// has not filled being empty; what the kernel adds to what it starts with
-/// goes where the task will not look for room.
-pub fn insert_device_memory(cspace: &mut CSpace) -> bool {
+/// Give `cspace` an unrevocable capability of a kind that has no
+/// parameters — the right to map the machine's devices' registers
+/// ([`CapType::DeviceMemory`]), the right to set its clock
+/// ([`CapType::Clock`]) — in its last free slot. The first task names its
+/// low slots itself — where it keeps the nameserver's endpoint, where it
+/// mints what it hands on — and counts on the ones it has not filled being
+/// empty; what the kernel adds to what it starts with goes where the task
+/// will not look for room.
+pub fn insert_last(cspace: &mut CSpace, cap_type: CapType) -> bool {
     match cspace.iter().rposition(|cap| cap.cap_type as u8 == CapType::Empty as u8) {
         Some(slot) => {
             cspace[slot] = CapSlot {
-                cap_type: CapType::DeviceMemory,
+                cap_type,
                 generation: 0,
                 root_slot: 0,
                 root_tid: KERNEL_ROOT_TID,
@@ -632,6 +651,7 @@ pub fn validate_attenuation(source: &CapSlot, new_type: CapType, new_p0: u64, ne
         // One endpoint: the same one, or nothing.
         CapType::Endpoint => new_p0 == source.param0,
         CapType::DeviceMemory => true,
+        CapType::Clock => true,
         // The same object, with no access the source lacks.
         CapType::MemObject => {
             new_p0 == source.param0

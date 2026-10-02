@@ -6,9 +6,9 @@
 //! key to repeat would otherwise need a second kind of waiting, and the two
 //! would have to be reconciled at every call.
 //!
-//! The resolution is the tick, which is ten milliseconds here. A timer asked
-//! for less than that gets the next tick, because that is the next time
-//! anything happens.
+//! Its times are the clock's (`clock.rs`): nanoseconds, kept exactly and
+//! fired when they are due where the machine has a timer to fire them with,
+//! and on the next tick where it has not.
 
 use crate::scheduler;
 use crate::task::{FdKind, MAX_FDS};
@@ -21,9 +21,10 @@ struct Timer {
     in_use: bool,
     creator: usize,
     refs: usize,
-    /// The tick it next expires on, or 0 for a timer that is not armed.
+    /// When it next expires, in the clock's nanoseconds, or 0 for a timer
+    /// that is not armed.
     deadline: u64,
-    /// Ticks between expirations, or 0 for a timer that fires once.
+    /// Nanoseconds between expirations, or 0 for a timer that fires once.
     interval: u64,
     /// Expirations not yet read. A read takes them all and clears it, which
     /// is what makes a slow reader see "it fired four times" rather than four
@@ -113,22 +114,24 @@ pub fn cleanup_orphans(creator: usize) {
     irq_restore(flags);
 }
 
-/// Arm or disarm. `first` is ticks from now (0 disarms), `interval` ticks
-/// between expirations after that.
+/// Arm or disarm. `first` is nanoseconds from now (0 disarms), `interval`
+/// nanoseconds between expirations after that.
 pub fn set(timer: usize, first: u64, interval: u64) -> bool {
     if timer >= MAX_TIMERS {
         return false;
     }
-    let now = crate::pit::ticks();
     let flags = irq_save();
     let ok = {
         let t = &mut timers()[timer];
         if !t.in_use {
             false
         } else {
-            t.deadline = if first == 0 { 0 } else { now + first };
+            t.deadline = if first == 0 { 0 } else { crate::clock::after(first) };
             t.interval = interval;
             t.count = 0;
+            if t.deadline != 0 {
+                crate::clock::due(t.deadline);
+            }
             true
         }
     };
@@ -136,12 +139,12 @@ pub fn set(timer: usize, first: u64, interval: u64) -> bool {
     ok
 }
 
-/// What is left: ticks until the next expiration, and the interval.
+/// What is left: nanoseconds until the next expiration, and the interval.
 pub fn get(timer: usize) -> Option<(u64, u64)> {
     if timer >= MAX_TIMERS {
         return None;
     }
-    let now = crate::pit::ticks();
+    let now = crate::clock::now();
     let flags = irq_save();
     let out = {
         let t = &timers()[timer];
@@ -154,6 +157,34 @@ pub fn get(timer: usize) -> Option<(u64, u64)> {
     };
     irq_restore(flags);
     out
+}
+
+/// Count what `t` has fired by `now` and has not been counted for, and set
+/// it for the next time. Whether there was anything to count.
+///
+/// Done by the clock when it looks ([`expire`]), which is what makes a
+/// timer readable and wakes whoever is waiting for that; and by a read
+/// ([`take`]), which is answered as of when it asks — how many times a
+/// timer has fired is a matter of what time it is, not of when the clock
+/// last looked. A read takes what it counts, so nobody is owed a wake for
+/// it.
+fn catch_up(t: &mut Timer, now: u64) -> bool {
+    if t.deadline == 0 || now < t.deadline {
+        return false;
+    }
+    if t.interval > 0 {
+        // Every interval that has gone by is counted, and the next deadline
+        // is the next one after now on the timer's own beat: a timer that
+        // fell behind does not fire in a burst catching up, and one that is
+        // looked at late does not drift.
+        let periods = (now - t.deadline) / t.interval + 1;
+        t.count = t.count.saturating_add(periods);
+        t.deadline = t.deadline.saturating_add(periods.saturating_mul(t.interval));
+    } else {
+        t.count = t.count.saturating_add(1);
+        t.deadline = 0;
+    }
+    true
 }
 
 /// How many times it has fired since the last read.
@@ -172,9 +203,13 @@ pub fn take(timer: usize) -> Option<u64> {
     if timer >= MAX_TIMERS {
         return None;
     }
+    let now = crate::clock::now();
     let flags = irq_save();
     let out = {
         let t = &mut timers()[timer];
+        if t.in_use {
+            catch_up(t, now);
+        }
         if !t.in_use || t.count == 0 {
             None
         } else {
@@ -226,34 +261,32 @@ pub fn wait(timer: usize) -> bool {
     parked
 }
 
-/// The tick handler: fire what is due.
+/// Fire what is due at `now`, and say when the next one is: the earliest
+/// deadline left, or `u64::MAX` if no timer is armed.
 ///
-/// Called with interrupts already off, from the timer interrupt, so it takes
-/// the waiters out and wakes them after — waking is a scheduler operation and
-/// this is not the place for one.
-pub fn tick(now: u64) {
+/// Called with interrupts already off, from the clock (`clock::expire`), so
+/// it takes the waiters out and wakes them after — waking is a scheduler
+/// operation and this is not the place for one.
+pub fn expire(now: u64) -> u64 {
     let mut wake = [0usize; MAX_TIMERS * MAX_WAITERS];
     let mut n = 0;
     let mut fired = false;
+    let mut next = u64::MAX;
     for t in timers().iter_mut() {
-        if !t.in_use || t.deadline == 0 || now < t.deadline {
+        if !t.in_use {
             continue;
         }
-        t.count += 1;
-        fired = true;
-        if t.interval > 0 {
-            // However long the reader took, the next deadline is the next one
-            // after now: a timer that fell behind does not then fire in a
-            // burst catching up.
-            t.deadline = now + t.interval;
-        } else {
-            t.deadline = 0;
+        if catch_up(t, now) {
+            fired = true;
+            for i in 0..t.nwaiters {
+                wake[n] = t.waiters[i];
+                n += 1;
+            }
+            t.nwaiters = 0;
         }
-        for i in 0..t.nwaiters {
-            wake[n] = t.waiters[i];
-            n += 1;
+        if t.deadline != 0 {
+            next = next.min(t.deadline);
         }
-        t.nwaiters = 0;
     }
     for &tid in &wake[..n] {
         scheduler::unblock_task(tid);
@@ -261,6 +294,7 @@ pub fn tick(now: u64) {
     if fired {
         crate::pollset::note_timer();
     }
+    next
 }
 
 /// The timer a descriptor names.

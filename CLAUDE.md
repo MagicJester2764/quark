@@ -138,12 +138,13 @@ system hung.
 
 There are no tests in this tree, and that is the shape of a microkernel rather
 than an omission: the kernel is tested from outside, through the ABI, by a
-program. `dtest` in `../quarkutils` makes 686 checks — capabilities, IPC,
+program. `dtest` in `../quarkutils` makes 708 checks — capabilities, IPC,
 memory, descriptors, signals, scheduling, users and terminals, `dtest calls`
 with three million calls in three seconds, `dtest smp` for what a second
-processor changes, and seven more (`dtest msi`) on a machine with a device
-that interrupts by message and its driver running — and `qfuzz` throws
-random requests at every service.
+processor changes, `dtest clock` for what time it is and whether a wait ends
+when it should, and seven more (`dtest msi`) on a machine with a device that
+interrupts by message and its driver running — and `qfuzz` throws random
+requests at every service.
 
 So a kernel change is verified by booting an image:
 
@@ -621,10 +622,13 @@ background job that ignores what its terminal raises.
   a child of it — its parent in another program, so not a thread — dies. A
   program that waits for a child *or* a time, whichever comes first, is
   woken by the one that came; before, GNU `timeout` sat in `sigsuspend` for
-  ever. The alarm is raised from the timer tick, one program at a time, each
-  alarm put away before its signal is raised: for a program that has said
-  nothing the signal is the end of it, and if that is the program the tick
-  interrupted, `signal::tick` does not return.
+  ever. The alarm is raised by the clock (`clock::expire`, from the tick
+  and from the timer between ticks), one program at a time, each alarm put
+  away before its signal is raised: for a program that has said nothing the
+  signal is the end of it, and if that is the program the clock interrupted,
+  `signal::alarms` does not return. So it is the last thing the clock does,
+  and what it does before — setting the timer for what is due next — counts
+  the alarms as they will stand afterwards (`fdtable::alarm_after`).
 
 ## Jobs
 
@@ -738,6 +742,50 @@ closed:
   `start_task` did that from a system call. Every caller of `unblock_task`
   holds interrupts off, or is an interrupt.
 
+## Time
+
+`clock.rs` is the whole of it, and `docs/abi.md` says what a program sees.
+The rules it leaves behind:
+
+- **A time the kernel keeps is nanoseconds since boot, by `clock::now`.**
+  Never a count of ticks: `pit::ticks` counts interrupts, for the scheduler
+  and for a machine with no finer clock. 0 is "no deadline" wherever one is
+  kept, and `clock::after` never answers it.
+- **A span of time from a program goes through `clock::span`**: ticks, or
+  with the top bit set nanoseconds. A new call that takes a time takes a
+  span — that is why no call's number had to change, and why a program
+  written for ticks still means what it meant.
+- **Whoever writes a deadline down says so** (`clock::due`), after it has.
+  Nothing else sets the timer between two ticks: a deadline nobody
+  mentioned is seen to at the next tick, which is every test passing and
+  every wait ten milliseconds long. `dtest clock` asks that most of twenty
+  waits end on time, not that one does — a wait that ends on a tick is on
+  time once in a while, by where in the tick it began.
+- **Everything about time passing is `clock::expire`.** A new kind of
+  deadline is looked at there and answers with its earliest still to come,
+  so that the timer is set for it. Alarms last: raising one may not return.
+- **A wait never ends early.** The timer is set a thousandth late on
+  purpose (`lapic::one_shot`): an interrupt before the time finds nothing
+  due and has to be taken again.
+- **The timer interrupts no more often than every fifty microseconds**
+  (`clock::MIN_GAP_NS`), whatever is asked. A timer that repeats every
+  nanosecond is a program's to ask for and not the machine's to be stopped
+  by; it counts the intervals that went by.
+- **How many times a timer has fired is a matter of what time it is**, not
+  of when the clock last looked: a read counts as of the read
+  (`timerfd::catch_up`). Only a read — it takes what it counts, so nobody
+  is owed a wake for it. Whether a timer is *readable* is the clock's to
+  say, because saying it is what wakes whoever is waiting.
+- **Setting the date moves no deadline.** Every wait is by the time since
+  boot; the date is that plus a number (`clock::wall`), and
+  `SYS_CLOCK_SET` changes the number and writes the battery-backed clock.
+- **The counter is trusted where the processor says it is invariant, or
+  under a hypervisor**, and its rate is measured once against the 8254's
+  second channel, by reading both — no interrupt, so before the first tick,
+  so that the clock and the count of ticks start together. The middle of
+  three measurements: a guest's processor is sometimes somewhere else for
+  one.
+
 ## More than one processor
 
 `docs/smp.md` is the design. These are the rules it leaves behind, and
@@ -797,8 +845,17 @@ breaking any of them is quiet until it is a machine that stops.
   caller runs in its place.
 - **The clock and every device interrupt the first processor.** The others
   have a tick of their own from their local APIC, and it does one thing:
-  `scheduler::timer_tick`. `pit::tick` — timeouts, alarms, the count of
-  ticks — runs once a tick, not once a tick a processor.
+  `scheduler::timer_tick`. What is due — timeouts, timers, alarms — is seen
+  to in one place, by the first processor (`clock::expire`): on its tick,
+  and between ticks from its own local APIC's timer, which it has no other
+  use for. A deadline written down on another processor that is due before
+  the next tick is said to the first with an interrupt (`idt::VEC_CLOCK`),
+  an ordinary one, which takes the lock.
+- **Every processor's counter reads the same, or the counter is not the
+  clock.** Time is one counter read on whichever processor is asked. Each
+  processor's is compared with the first's as it is started (`smp::start`),
+  and one that disagrees puts the whole machine back on the tick
+  (`clock::distrust`) — before there is a task to have been told a time.
 - **A device's interrupt is spoken of by its ISA number, and the controller
   is spoken to through `intc.rs`.** It is the I/O APIC where the firmware
   lists one and the 8259s where it does not, and the two differ in the one
@@ -855,8 +912,17 @@ breaking any of them is quiet until it is a machine that stops.
 - A pty's window size is stored and nothing is told when it changes: Linux
   sends `SIGWINCH`. A program that draws itself to the terminal's size reads
   it once.
-- The clock is read once, from the CMOS clock at boot, as UTC. Nothing sets it,
-  and there is no time zone.
+- The date is UTC, and there is no time zone: what keeps one is a C library.
+  Nothing keeps the clock right once it is set — it runs at the rate the
+  processor's counter was measured at when the machine started, which is good
+  to a few parts in ten thousand.
+- A machine whose processor has no counter that can be trusted — one that is
+  not *invariant*, on hardware that is not a hypervisor's — keeps time by the
+  tick, ten milliseconds wide, as every machine did. One with no local APIC
+  has the fine clock and wakes on ticks.
+- A task woken on time runs at once only if it is of a better band than what
+  the first processor is running, or a processor is idle: one of the same
+  band waits its turn, as any woken task does.
 - The page cache for mapped files holds 8192 pages across 256 objects and
   nothing evicts them under pressure: a mapped file's pages stay until nothing
   maps the file any more.

@@ -67,13 +67,13 @@ struct Table {
     /// a word its runtime looks at on its way out of every system call. 0
     /// until it has said where.
     sig_word: usize,
-    /// The tick at which SIGALRM is next raised for the program, 0 for never,
-    /// and how many ticks after that to raise it again, 0 for not at all.
-    /// One for the program, so one for all its threads. `exec` keeps it,
-    /// which is what lets a program be started with a time to finish in;
-    /// `fork` does not copy it, since the child set no alarm.
+    /// When SIGALRM is next raised for the program, in the clock's
+    /// nanoseconds, 0 for never; and how long after that to raise it again,
+    /// 0 for not at all. One for the program, so one for all its threads.
+    /// `exec` keeps it, which is what lets a program be started with a time
+    /// to finish in; `fork` does not copy it, since the child set no alarm.
     alarm_at: u64,
-    alarm_every: u32,
+    alarm_every: u64,
 }
 
 /// What a program that has said nothing leaves off: write for group and other.
@@ -528,22 +528,22 @@ pub fn sig_interrupted(tid: usize) -> bool {
     was
 }
 
-/// How the alarm of `tid`'s program stands at tick `now`: the ticks left of
-/// it, which is 0 only if there is none, and what it repeats at. With `new`
-/// it is then set to that — `(ticks from now, repeat)`, 0 ticks for no alarm.
-/// `None` for a task in no program.
-pub fn alarm(tid: usize, now: u64, new: Option<(u32, u32)>) -> Option<(u32, u32)> {
+/// How the alarm of `tid`'s program stands at `now`: the nanoseconds left
+/// of it, which is 0 only if there is none, and what it repeats at. With
+/// `new` it is then set to that — `(nanoseconds from now, repeat)`, 0 from
+/// now for no alarm. `None` for a task in no program.
+pub fn alarm(tid: usize, now: u64, new: Option<(u64, u64)>) -> Option<(u64, u64)> {
     let flags = irq_save();
     let was = unsafe {
         table_mut(tid).map(|t| {
             let left = match t.alarm_at {
                 0 => 0,
-                at => at.saturating_sub(now).clamp(1, u32::MAX as u64) as u32,
+                at => at.saturating_sub(now).max(1),
             };
             let was = (left, t.alarm_every);
-            if let Some((ticks, every)) = new {
-                t.alarm_at = if ticks == 0 { 0 } else { now + ticks as u64 };
-                t.alarm_every = if ticks == 0 { 0 } else { every };
+            if let Some((first, every)) = new {
+                t.alarm_at = if first == 0 { 0 } else { now.saturating_add(first) };
+                t.alarm_every = if first == 0 { 0 } else { every };
             }
             was
         })
@@ -552,8 +552,18 @@ pub fn alarm(tid: usize, now: u64, new: Option<(u32, u32)>) -> Option<(u32, u32)
     was
 }
 
-/// A task of a program whose alarm is due at tick `now`, the alarm having
-/// been set for its next time or turned off. `None` when no program's is.
+/// When an alarm that was due at `at` and is seen to at `now` is next due:
+/// on its own beat, the first time after now, or never for one that does
+/// not repeat.
+fn alarm_next(at: u64, every: u64, now: u64) -> u64 {
+    if every == 0 {
+        return 0;
+    }
+    at.saturating_add(((now - at) / every + 1).saturating_mul(every))
+}
+
+/// A task of a program whose alarm is due at `now`, the alarm having been
+/// set for its next time or turned off. `None` when no program's is.
 pub fn alarm_due(now: u64) -> Option<usize> {
     let flags = irq_save();
     let due = unsafe {
@@ -563,7 +573,7 @@ pub fn alarm_due(now: u64) -> Option<usize> {
             if t.tasks == 0 || t.alarm_at == 0 || t.alarm_at > now {
                 continue;
             }
-            t.alarm_at = if t.alarm_every == 0 { 0 } else { now + t.alarm_every as u64 };
+            t.alarm_at = alarm_next(t.alarm_at, t.alarm_every, now);
             found = of.iter().position(|&table| table != NONE && table as usize == i);
             if found.is_some() {
                 break;
@@ -573,6 +583,26 @@ pub fn alarm_due(now: u64) -> Option<usize> {
     };
     irq_restore(flags);
     due
+}
+
+/// When the earliest alarm will be due once those due at `now` have been
+/// seen to ([`alarm_due`]), or `u64::MAX` if no program will have one.
+pub fn alarm_after(now: u64) -> u64 {
+    let flags = irq_save();
+    let mut next = u64::MAX;
+    unsafe {
+        for t in tables().iter() {
+            if t.tasks == 0 || t.alarm_at == 0 {
+                continue;
+            }
+            let at = if t.alarm_at > now { t.alarm_at } else { alarm_next(t.alarm_at, t.alarm_every, now) };
+            if at != 0 {
+                next = next.min(at);
+            }
+        }
+    }
+    irq_restore(flags);
+    next
 }
 
 /// The tasks of `tid`'s program — every task using its table — into `out`.

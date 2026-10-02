@@ -18,9 +18,12 @@ the display, the shell.
 
 The kernel provides:
 
-- Preemptive scheduling in four bands (100 Hz PIT), where a synchronous call
-  hands the CPU straight to its callee and a task runs at the band of whoever
-  is waiting on it
+- Preemptive scheduling in four bands, where a synchronous call hands the CPU
+  straight to its callee and a task runs at the band of whoever is waiting on
+  it
+- A clock in nanoseconds — the processor's counter, where it can be trusted —
+  and waits, timers and alarms that end when they are due rather than on the
+  next of a hundred ticks a second
 - Every processor the machine has, up to sixteen: programs run on all of
   them at once, and the kernel on one at a time
 - Synchronous IPC — send, receive, call and reply with fixed-size messages —
@@ -36,7 +39,7 @@ The kernel provides:
 - Tasks, threads, `fork` and `exec`; futexes with deadlines
 - IRQ delivery to user-space drivers, and page faults forwarded to a pager
 - Random bytes (ChaCha20, seeded from RDSEED or RDRAND and the machine's
-  timing) and the date
+  timing), and the date, which a holder of the capability may set
 
 ## The ABI
 
@@ -88,19 +91,21 @@ src/
   userspace.rs        Starting init, address space helpers
   elf.rs              ELF64 loader, for init
   idt.rs              Interrupt descriptor table and exceptions
-  pit.rs              The clock that ticks
+  clock.rs            What time it is, and waking what is due when it is due
+  pit.rs              The tick: a hundred interrupts a second
+  rtc.rs              The date, from the battery-backed clock and back to it
   intc.rs             The interrupt controller devices come in through:
   ioapic.rs  pic.rs     the I/O APIC, or the 8259s
   acpi.rs             The firmware's tables: processors, interrupt controllers
   devmem.rs           Device memory: the addresses that are not memory
   percpu.rs           What each processor has of its own
   klock.rs            The kernel lock: one processor in the kernel at a time
-  lapic.rs            The local APIC: a tick, and a word to another processor
+  lapic.rs            The local APIC: a tick, a timer, a word to another processor
   smp.rs  ap_boot.s   Starting the other processors
   tlb.rs              A mapping taken away, on every processor
   irq_dispatch.rs     IRQ delivery to user-space tasks
   cpu.rs              SMEP, SMAP and the FS base
-  random.rs  rtc.rs   Random bytes; the date
+  random.rs           Random bytes
   serial.rs           COM1 debug output
   sync.rs             IrqSpinLock<T>
   multiboot2.rs       Multiboot2 tag parser
@@ -155,7 +160,7 @@ make run
 ## Testing
 
 The kernel is tested from outside, through the ABI, by a program: `dtest` in
-quarkutils makes 686 checks from user space. A kernel change is verified by
+quarkutils makes 708 checks from user space. A kernel change is verified by
 booting an image and running it — `tools/boot-test.sh` in ExplOSion — on one
 processor and on four.
 

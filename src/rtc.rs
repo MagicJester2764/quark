@@ -1,12 +1,15 @@
 //! The date, from the PC's battery-backed clock.
 //!
-//! The PIT counts ticks from boot and knows nothing else. The CMOS clock knows
-//! the date to the second; it is read once at boot, and the boot time it gives
-//! plus the ticks since is the time for as long as the machine runs. Without
-//! it every file written here was dated a few seconds after 1970, which fsck
-//! reads as something else entirely.
-
-use core::sync::atomic::{AtomicU64, Ordering};
+//! The kernel's clock counts from boot and knows nothing else (`clock.rs`).
+//! The CMOS clock knows the date to the second; it is read once at boot,
+//! and the time it gives then plus the time since is the date for as long
+//! as the machine runs. Without it every file written here was dated a few
+//! seconds after 1970, which fsck reads as something else entirely.
+//!
+//! And written when somebody who may says what time it is
+//! (`SYS_CLOCK_SET`): it is the only clock that goes on while the machine
+//! is off, so a date set and not written here is a date the next boot does
+//! not have.
 
 use crate::io::{inb, outb};
 
@@ -24,13 +27,21 @@ const STATUS_B: u8 = 0x0B;
 /// Where the century usually is. ACPI's FADT says so; nothing else does.
 const CENTURY: u8 = 0x32;
 
-/// Seconds since 1970 when tick 0 was counted; 0 if the clock was unreadable.
-static BOOT_TIME: AtomicU64 = AtomicU64::new(0);
+/// Status B: no updates while this is set, so that what is written is not
+/// counted on from half way through.
+const SET: u8 = 0x80;
 
 fn read(reg: u8) -> u8 {
     unsafe {
         outb(INDEX, reg);
         inb(DATA)
+    }
+}
+
+fn put(reg: u8, value: u8) {
+    unsafe {
+        outb(INDEX, reg);
+        outb(DATA, value);
     }
 }
 
@@ -121,9 +132,8 @@ pub fn init() {
     }
 
     let unix = days_from_civil(year, month, day) * 86_400 + hour * 3_600 + min * 60 + sec;
-    let since_boot = (crate::pit::ticks() / 100) as i64;
-    if unix > since_boot {
-        BOOT_TIME.store((unix - since_boot) as u64, Ordering::Relaxed);
+    if unix > 0 {
+        crate::clock::set_wall(unix as u64 * 1_000_000_000);
     }
     crate::serial::puts(b"[rtc] ");
     crate::serial::put_usize(year as usize);
@@ -147,7 +157,63 @@ fn two_digits(v: i64) {
     crate::serial::put_usize(v as usize);
 }
 
-/// Seconds since 1970 when tick 0 was counted, or 0 if there is no clock.
-pub fn boot_time() -> u64 {
-    BOOT_TIME.load(Ordering::Relaxed)
+/// The date `days` days after 1970-01-01: year, month, day. The other way
+/// round from [`days_from_civil`].
+fn civil_from_days(days: i64) -> (i64, i64, i64) {
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + if month <= 2 { 1 } else { 0 };
+    (year, month, day)
+}
+
+/// Set the battery-backed clock to `unix` seconds after 1970, UTC, in
+/// whichever of its forms it keeps time in: binary or decimal digits,
+/// twenty-four hours or twelve.
+///
+/// The century is written only where one was read, which is the only way
+/// there is to know the register is the century and not something else's.
+pub fn write(unix: u64) {
+    let days = (unix / 86_400) as i64;
+    let rest = unix % 86_400;
+    let (year, month, day) = civil_from_days(days);
+    let (hour, min, sec) = (rest / 3_600, rest % 3_600 / 60, rest % 60);
+
+    let flags: u64;
+    unsafe { core::arch::asm!("pushfq; pop {}; cli", out(reg) flags, options(nostack)) };
+    let status = read(STATUS_B);
+    let binary = status & 0x04 != 0;
+    let hours_24 = status & 0x02 != 0;
+    let form = |v: u64| -> u8 {
+        if binary { v as u8 } else { ((v / 10) << 4 | v % 10) as u8 }
+    };
+    let value = |v: u8| -> u64 {
+        if binary { v as u64 } else { ((v >> 4) * 10 + (v & 0x0F)) as u64 }
+    };
+    let hour = if hours_24 {
+        form(hour)
+    } else {
+        // Twelve is twelve; the afternoon is the top bit.
+        let pm = if hour >= 12 { 0x80 } else { 0 };
+        form(match hour % 12 { 0 => 12, h => h }) | pm
+    };
+    let had_century = (19..=21).contains(&value(read(CENTURY)));
+
+    put(STATUS_B, status | SET);
+    put(SECONDS, form(sec));
+    put(MINUTES, form(min));
+    put(HOURS, hour);
+    put(DAY, form(day as u64));
+    put(MONTH, form(month as u64));
+    put(YEAR, form(year as u64 % 100));
+    if had_century {
+        put(CENTURY, form(year as u64 / 100));
+    }
+    put(STATUS_B, status);
+    unsafe { core::arch::asm!("push {}; popfq", in(reg) flags, options(nostack)) };
 }

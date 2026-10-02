@@ -18,7 +18,7 @@ struct FutexWaiter {
     /// synchronisation through shmem silently never woke anyone.
     paddr: usize,
     active: bool,
-    /// PIT tick at which to give up. 0 = wait indefinitely.
+    /// When to give up, in the clock's nanoseconds. 0 = wait indefinitely.
     deadline: u64,
     /// Set by [`check_timeouts`] when the deadline passed, so the waiter can
     /// tell why it woke. The slot stays `active` until the waiter reads this,
@@ -48,7 +48,7 @@ pub fn futex_wait(addr: u64, expected: u32) -> u64 {
     wait(addr, expected, None)
 }
 
-/// As [`futex_wait`], giving up after `timeout_ticks`.
+/// As [`futex_wait`], giving up after `timeout_ns` nanoseconds.
 ///
 /// Returns 2 if the deadline passed before anything woke the task. A timeout
 /// of 0 makes this a plain check of the word: it returns 1 immediately if the
@@ -58,11 +58,11 @@ pub fn futex_wait(addr: u64, expected: u32) -> u64 {
 /// which burns a core for the length of the wait and cannot see a wake any
 /// sooner than the next poll. That is what `Condvar::wait_timeout` and
 /// `thread::park_timeout` are.
-pub fn futex_wait_timeout(addr: u64, expected: u32, timeout_ticks: u64) -> u64 {
-    wait(addr, expected, Some(timeout_ticks))
+pub fn futex_wait_timeout(addr: u64, expected: u32, timeout_ns: u64) -> u64 {
+    wait(addr, expected, Some(timeout_ns))
 }
 
-fn wait(addr: u64, expected: u32, timeout_ticks: Option<u64>) -> u64 {
+fn wait(addr: u64, expected: u32, timeout_ns: Option<u64>) -> u64 {
     // Validate user pointer
     if addr == 0 || addr.checked_add(4).map_or(true, |end| end > USER_ADDR_LIMIT) {
         return u64::MAX;
@@ -103,7 +103,7 @@ fn wait(addr: u64, expected: u32, timeout_ticks: Option<u64>) -> u64 {
     // A zero timeout means "check, do not wait". The value still matches, so
     // there is nothing to report but the expiry — and blocking here, with no
     // time to wait, would mean never waking.
-    if timeout_ticks == Some(0) {
+    if timeout_ns == Some(0) {
         return TIMED_OUT;
     }
 
@@ -116,8 +116,8 @@ fn wait(addr: u64, expected: u32, timeout_ticks: Option<u64>) -> u64 {
     // 0 in the slot means "no deadline", which is why the arithmetic saturates
     // rather than wrapping: a far-future deadline must stay far-future, not
     // land back on the sentinel.
-    let deadline = match timeout_ticks {
-        Some(t) => crate::pit::ticks().saturating_add(t),
+    let deadline = match timeout_ns {
+        Some(t) => crate::clock::after(t),
         None => 0,
     };
 
@@ -131,6 +131,9 @@ fn wait(addr: u64, expected: u32, timeout_ticks: Option<u64>) -> u64 {
 
     // Block the task while holding the lock to prevent wake races
     scheduler::block_task(tid);
+    if deadline != 0 {
+        crate::clock::due(deadline);
+    }
     drop(state);
 
     // Yield to let the scheduler pick another task
@@ -194,22 +197,30 @@ pub fn futex_wake(addr: u64, max_wake: u64) -> u64 {
     woken
 }
 
-/// Expire waits whose deadline has passed. Called from `pit::tick`.
+/// Expire waits whose deadline has passed at `now`, and say when the next
+/// one does: `u64::MAX` if none is waiting on a time. Called from the clock
+/// (`clock::expire`).
 ///
 /// The slot is left active on purpose: the waiter needs to find it to learn
 /// that it timed out rather than being woken, and freeing it here could hand
 /// it to a new waiter before the old one has run.
-pub fn check_timeouts() {
+pub fn check_timeouts(now: u64) -> u64 {
     // Interrupt context, so interrupts are already off.
-    let now = crate::pit::ticks();
+    let mut next = u64::MAX;
     let mut state = FUTEX.lock();
     for waiter in state.waiters.iter_mut() {
-        if waiter.active && !waiter.expired && waiter.deadline != 0 && now >= waiter.deadline {
+        if !waiter.active || waiter.expired || waiter.deadline == 0 {
+            continue;
+        }
+        if now >= waiter.deadline {
             waiter.deadline = 0;
             waiter.expired = true;
             scheduler::unblock_task(waiter.tid);
+        } else {
+            next = next.min(waiter.deadline);
         }
     }
+    next
 }
 
 /// Clean up futex waiters for a dead task.
