@@ -38,6 +38,7 @@ mod pollset;
 mod served;
 mod signal;
 mod job;
+mod klock;
 mod stream;
 pub mod pipe;
 mod pty;
@@ -63,6 +64,9 @@ pub extern "C" fn kernel_main(multiboot_info: usize) -> ! {
         }
         percpu::init(0, (&raw const boot_stack_bottom as usize, &raw const boot_stack_top as usize));
     }
+    // This processor is in the kernel, and until it has nothing to do it
+    // stays there.
+    klock::acquire();
 
     // Initialize serial debug output early
     serial::init();
@@ -154,11 +158,9 @@ pub extern "C" fn kernel_main(multiboot_info: usize) -> ! {
 
     console::puts(b"Welcome to Quark (v0.1.0)\n");
 
-    // Idle loop — the scheduler returns here when no tasks are ready
-    loop {
-        unsafe { core::arch::asm!("sti; hlt", options(nostack, nomem)) };
-        scheduler::reap_dead();
-    }
+    // What a processor does when nothing is ready: the scheduler comes back
+    // to here.
+    scheduler::idle()
 }
 
 #[allow(dead_code)] // panic/exception diagnostic helper

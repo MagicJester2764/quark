@@ -1393,6 +1393,50 @@ pub fn current_kernel_stack() -> (usize, usize) {
     }
 }
 
+/// What a processor does when there is nothing for it to run. Does not
+/// return: this is task 0, on this processor.
+///
+/// Entered holding the kernel lock. A processor with nothing to do must not
+/// keep it — nothing else could get into the kernel — so it is given up
+/// around the `hlt` and taken again when something has woken the
+/// processor. The interrupt that does the waking arrives while it is not
+/// held, takes it for itself and gives it back (`klock::enter`).
+///
+/// Before waiting, whatever is ready is run. It used not to be: an
+/// interrupt that woke a driver while the machine was idle left the driver
+/// in the queue until the next tick found it there, up to ten milliseconds
+/// later.
+pub fn idle() -> ! {
+    unsafe { core::arch::asm!("cli", options(nostack, nomem)) };
+    loop {
+        // Here the lock is held and interrupts are off.
+        loop {
+            reap_dead();
+            if !run_ready() {
+                break;
+            }
+        }
+        crate::klock::release();
+        // An interrupt is not taken between `sti` and the instruction after
+        // it, so nothing can arrive after the look above and before the
+        // wait: it arrives during the wait, and ends it.
+        unsafe { core::arch::asm!("sti; hlt; cli", options(nostack, nomem)) };
+        crate::klock::acquire();
+    }
+}
+
+/// From the idle loop: run whatever is ready, and say whether anything was.
+/// Comes back when this processor next has nothing to do.
+fn run_ready() -> bool {
+    unsafe {
+        if best_ready_band().is_none() {
+            return false;
+        }
+        schedule_inner(false);
+        true
+    }
+}
+
 /// Reap every dead task that nobody still has a claim on.
 ///
 /// Run from the idle loop, which picks up tasks nobody collects: those with no

@@ -473,8 +473,18 @@ fn report_kernel_state(frame: &InterruptFrame, kbase: usize, ktop: usize) {
     puts(b"]\n");
 }
 
+/// The way into the kernel for a fault, and the way back out: the kernel
+/// lock is taken unless what faulted was the kernel holding it, and what
+/// was taken is given back (`klock.rs`). A fault that ends the task does
+/// not come back, and one in the kernel does not come back at all.
 #[unsafe(no_mangle)]
 extern "C" fn exception_handler(frame: &InterruptFrame) {
+    let took = crate::klock::enter();
+    exception(frame);
+    crate::klock::leave(took);
+}
+
+fn exception(frame: &InterruptFrame) {
     let vec = frame.vector as usize;
     let from_user = frame.cs & 3 != 0;
 
@@ -695,8 +705,18 @@ extern "C" fn exception_handler(frame: &InterruptFrame) {
 // IRQ handler
 // ---------------------------------------------------------------------------
 
+/// The way into the kernel for an interrupt, and the way back out, as
+/// `exception_handler` is for a fault. One that arrives in ring 3 takes
+/// the lock; one that arrives in the kernel finds it held — unless the
+/// kernel was a processor with nothing to do, waiting in `hlt` without it.
 #[unsafe(no_mangle)]
 extern "C" fn irq_handler(frame: &InterruptFrame) {
+    let took = crate::klock::enter();
+    irq(frame);
+    crate::klock::leave(took);
+}
+
+fn irq(frame: &InterruptFrame) {
     let irq = frame.vector as u8;
 
     match irq {

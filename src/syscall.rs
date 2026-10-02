@@ -701,8 +701,35 @@ fn fd_read_ipc(target_tid: usize, tag: u64, ptr: *mut u8, max_len: usize) -> u64
 }
 
 /// Called from assembly with 6 args mapped from user registers.
+///
+/// This is the way into the kernel from a program, and the way back out:
+/// the kernel lock is taken before anything is looked at and given up when
+/// there is an answer (`klock.rs`). Interrupts are off on arrival — `SFMASK`
+/// saw to that — and are turned on only once the lock is held; they are off
+/// again before it is let go, and stay off through the stub's `sysretq`.
+///
+/// A call that does not come back this way gives the lock up where it
+/// leaves: `exec` in `enter_usermode`. One that ends the task never does,
+/// and the lock goes on with the processor to whatever it runs next.
 #[unsafe(no_mangle)]
 extern "C" fn syscall_dispatch(
+    nr: u64,
+    arg0: u64,
+    arg1: u64,
+    arg2: u64,
+    arg3: u64,
+    arg4: u64,
+) -> u64 {
+    crate::klock::acquire();
+    unsafe { core::arch::asm!("sti", options(nostack, nomem)) };
+    let answer = dispatch(nr, arg0, arg1, arg2, arg3, arg4);
+    unsafe { core::arch::asm!("cli", options(nostack, nomem)) };
+    crate::klock::release();
+    answer
+}
+
+/// The system calls.
+fn dispatch(
     nr: u64,
     arg0: u64,
     arg1: u64,
@@ -3943,7 +3970,8 @@ core::arch::global_asm!(
     "    pushq %rdi",                  // arg0
     "    pushq %rsi",                  // arg1
 
-    "    sti",                          // enable interrupts in kernel
+    // Interrupts stay off: `syscall_dispatch` turns them on once it holds
+    // the kernel lock.
 
     // Set up 6-arg C ABI: syscall_dispatch(nr, arg0, arg1, arg2, arg3, arg4)
     // User regs: rax=nr, rdi=arg0, rsi=arg1, rdx=arg2, r10=arg3, r8=arg4
@@ -3999,6 +4027,9 @@ core::arch::global_asm!(
 /// `frame` must be a `UserFrame` in memory this address space has mapped, and
 /// its RIP and RSP must be a user address.
 pub unsafe fn enter_usermode_frame(frame: *const crate::task::UserFrame) -> ! { unsafe {
+    // Out of the kernel, as in `enter_usermode`.
+    core::arch::asm!("cli", options(nostack, nomem));
+    crate::klock::release();
     core::arch::asm!(
         // The iretq frame, built from the saved one.
         "pushq $0x2B",                 // SS
@@ -4219,6 +4250,12 @@ fn pty_write(pty: usize, ptr: *const u8, len: usize) -> u64 {
 /// # Safety
 /// `rip` must point to valid user code, `rsp` to a valid user stack.
 pub unsafe fn enter_usermode(rip: u64, rsp: u64, arg: u64) -> ! { unsafe {
+    // Out of the kernel: the lock is given up here, since this does not
+    // return through anything that would. Interrupts off first, and off
+    // until the `iretq` — between the two this processor is in the kernel
+    // without the lock, and after the `swapgs` without its own GS.
+    core::arch::asm!("cli", options(nostack, nomem));
+    crate::klock::release();
     core::arch::asm!(
         "pushq {user_ss}",             // SS
         "pushq {user_rsp}",            // RSP
