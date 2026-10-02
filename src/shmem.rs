@@ -251,7 +251,7 @@ fn fill(handle: usize, pages: usize) -> bool {
     let mut run_count = 0usize;
     while got < pages && run_count < MAX_RUNS && want > 0 {
         let ask = want.min(pages - got);
-        match pmm::alloc_contiguous(ask) {
+        match pmm::alloc_contiguous(ask, false) {
             Some(frame) => {
                 runs[run_count] = Run { base: frame.address(), pages: ask };
                 run_count += 1;

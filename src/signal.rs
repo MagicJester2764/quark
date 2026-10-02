@@ -158,7 +158,6 @@ pub fn raise(tid: usize, signo: u8) -> Result<(), ()> {
 /// that is not there to write — unmapped since it was named — is not written;
 /// the signal is still waiting, and a wait it ends says so.
 fn tell(tid: usize, word: usize) {
-    const IDENTITY_END: usize = 0x1_0000_0000;
     if word == 0 || word & 3 != 0 || !crate::paging::user_range_ok(word & !0xFFF, 1) {
         return;
     }
@@ -172,7 +171,7 @@ fn tell(tid: usize, word: usize) {
             .is_some_and(|f| f & crate::paging::USER != 0 && f & crate::paging::WRITABLE != 0);
         if writable {
             if let Some(phys) = crate::paging::translate(cr3, word) {
-                if phys + 4 <= IDENTITY_END {
+                if phys + 4 <= crate::paging::identity_end() {
                     core::ptr::write_volatile(phys as *mut u32, 1);
                 }
             }

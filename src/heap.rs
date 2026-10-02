@@ -1,8 +1,11 @@
 /// Kernel heap allocator — linked-list free-list with sorted-address coalescing.
 ///
-/// Heap lives at virtual address 0x1_0000_0000 (above the boot identity-mapped
-/// 4 GiB), so `paging::map_page` can allocate fresh intermediate tables without
-/// hitting any huge-page conflicts from boot.s.
+/// Heap lives in the last gigabyte of the first entry of the top-level page
+/// table: above the kernel's own map of memory, which is the rest of that
+/// entry (`paging::map_all_memory`), so `paging::map_page` can allocate
+/// fresh intermediate tables without hitting any huge-page conflicts from
+/// it. It used to be at four gigabytes, just above a map that ended there —
+/// which is where the fifth gigabyte of a machine's memory is.
 ///
 /// Uses an interrupt-safe spin lock (cli/sti around critical sections) to
 /// prevent deadlock if an IRQ handler ever triggers allocation.
@@ -15,7 +18,7 @@ use crate::pmm;
 use crate::sync::IrqSpinLock;
 
 const PAGE_SIZE: usize = 4096;
-const HEAP_START: usize = 0x1_0000_0000;
+const HEAP_START: usize = 0x7F_C000_0000;
 /// One PDPT entry covers 1 GiB. Keeping the heap inside a single entry means
 /// every page directory it grows into is one `create_address_space` already
 /// shares, so a page mapped after an address space was created still appears in

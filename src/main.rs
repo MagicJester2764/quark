@@ -89,8 +89,13 @@ pub extern "C" fn kernel_main(multiboot_info: usize) -> ! {
     let mb_info_size = unsafe { *(multiboot_info as *const u32) } as usize;
     unsafe { pmm::init(&mmap_regions, mmap_count, multiboot_info, mb_info_size) };
 
-    // Initialize console (VGA driver receives kernel services)
+    // The kernel's own map, over all the memory there is: before the heap,
+    // which is above it, and before anything is given a frame it could not
+    // otherwise reach.
     paging::save_kernel_cr3();
+    unsafe { paging::map_all_memory(pmm::top_of_memory()) };
+
+    // Initialize console (VGA driver receives kernel services)
     console::init(fb);
     console::clear();
     unsafe { heap::init() };
@@ -142,6 +147,15 @@ pub extern "C" fn kernel_main(multiboot_info: usize) -> ! {
     if fat32::is_loaded() {
         console::puts(b"FAT32 driver loaded.\n");
     }
+
+    // How much memory there is and how far the kernel's map of it goes.
+    serial::puts(b"Memory: ");
+    serial::put_usize(pmm::total_count() / 256);
+    serial::puts(b" MiB, the last of it at ");
+    serial::put_hex_usize(pmm::top_of_memory());
+    serial::puts(b"; the kernel's map reaches ");
+    serial::put_hex_usize(paging::identity_end());
+    serial::puts(b".\n");
 
     // Print PMM stats
     console::puts(b"PMM initialized: ");

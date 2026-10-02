@@ -138,7 +138,7 @@ system hung.
 
 There are no tests in this tree, and that is the shape of a microkernel rather
 than an omission: the kernel is tested from outside, through the ABI, by a
-program. `dtest` in `../quarkutils` makes 710 checks — capabilities, IPC,
+program. `dtest` in `../quarkutils` makes 716 checks — capabilities, IPC,
 memory, descriptors, signals, scheduling, users and terminals, `dtest calls`
 with three million calls in three seconds, `dtest smp` for what a second
 processor changes, `dtest clock` for what time it is and whether a wait ends
@@ -187,6 +187,27 @@ may keep — are in `../quarkutils/CLAUDE.md`; these are the kernel's.
   address space shares and promotes them to USER everywhere. It is also what
   makes SMAP safe: no USER bit exists anywhere in the kernel's identity map.
   Validate with `paging::user_range_ok`.
+- **The kernel's own map of memory is made once, at boot, and is all of
+  PML4[0] but its last gigabyte.** `boot.s` maps four gigabytes;
+  `paging::map_all_memory` extends that over all the memory the firmware
+  reports, before the heap exists and before any address space is made —
+  because every address space is made with a *copy* of the table under
+  PML4[0], and a gigabyte mapped afterwards is one that only the kernel's
+  own table has. The heap is the last gigabyte of that entry (`heap.rs`):
+  it used to sit at four gigabytes, just past a map that ended there, which
+  is where a machine's fifth gigabyte of memory is. What the kernel can
+  touch as itself ends at `paging::identity_end()`, not at a constant: a
+  check against `1 << 32` is a signal that is silently not told on a
+  machine with more memory than that.
+- **Ordinary memory comes from the top, and memory a device is told the
+  address of from below four gigabytes** (`pmm::alloc`, `pmm::alloc_low`).
+  A network card's ring is named in a register thirty-two bits wide; given
+  a frame above that, it is handed half an address and writes somewhere
+  else. `SYS_PHYS_ALLOC` takes a flag for it, and a driver with a device
+  that does DMA passes it. `dtest frames` holds the kernel to both ends;
+  nothing holds a *driver* to asking — the network test fails on a machine
+  with six gigabytes when it does not, and passes on every machine with
+  four or fewer.
 - **`paging::OWNED` (PTE bit 9) decides what may be freed.** Only frames the
   address space owns go back to the allocator. Device MMIO, shared memory and
   frames another task still holds are mapped *without* it. An owned frame is
@@ -204,8 +225,10 @@ may keep — are in `../quarkutils/CLAUDE.md`; these are the kernel's.
   processors restarted and the one on one did not — so a restart that
   "sometimes hangs in the firmware" is this, and the firmware's own log
   says so (`-debugcon file:fw.log -global isa-debugcon.iobase=0x402`).
-  The allocator gives out the lowest free frame, so what is low is used
-  first and is always dirty.
+  The allocator gave out the lowest free frame then, so what was low was
+  used first and was always dirty; ordinary memory comes from the top now,
+  and what is low is still what a driver's device and the kernel's own
+  tables are given.
 - **A dead task holds all its memory until it is reaped.** `sys_wait` reaps the
   child it returns; the idle loop reaps the rest. Anything that collects a
   child some other way must reap it too, or a parent running programs back to

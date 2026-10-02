@@ -94,8 +94,10 @@ them struck through as done. What follows is what is true now.
   interpreter for them — so there is no sleeping, no button that asks the
   machine to turn off, no battery or lid or temperature, and a control
   register that is memory rather than a port is not written.
-- **Memory above 4 GiB.** The frame allocator's bitmap covers the first four
-  gigabytes and the rest of what the firmware reports is left alone.
+- **Memory above 511 GiB**, which is as far as the kernel's own map of
+  memory goes: the first entry of the top-level page table, less a gigabyte
+  for the heap. And the table of frames — a bit and a byte for each — has
+  to fit below four gigabytes, which it does for any machine that small.
 - **A time zone.** The date is UTC. `SYS_CLOCK_SET` sets it, for a holder
   of `Clock`, and writes it to the CMOS clock.
 
@@ -122,6 +124,7 @@ will meet:
 | Memory objects | 256, with 8192 cached pages between them |
 | Futex waiters | 64 at once |
 | Kernel heap | 1 GiB of address space |
+| Memory | 511 GiB |
 
 ## Half done
 

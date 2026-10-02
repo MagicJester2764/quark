@@ -192,6 +192,59 @@ impl PageTable {
 
 static mut KERNEL_CR3: usize = 0;
 
+/// Where the kernel's own map of memory ends: every physical address below
+/// this is one the kernel can touch as itself. Four gigabytes as the
+/// machine starts (`boot.s`), and as much memory as there is once
+/// [`map_all_memory`] has run.
+static IDENTITY_END: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(1 << 32);
+
+/// Where the kernel's own map of memory ends.
+pub fn identity_end() -> usize {
+    IDENTITY_END.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Extend the kernel's own map over all of the machine's memory, up to
+/// `top`: a gigabyte at a time, as one page where the processor has pages
+/// that large and as a directory of two-megabyte ones where it has not.
+///
+/// The map is the first entry of the top-level table, and every address
+/// space is made with a copy of the table under it
+/// (`userspace::create_address_space`): so this is done once, at boot,
+/// before there is an address space to have missed it. The last gigabyte of
+/// that entry is the kernel's heap (`heap.rs`), which is why memory past
+/// `pmm::MAX_PHYS` is not used.
+///
+/// # Safety
+/// Once, on the first processor, before the heap, before any address space
+/// is made and before another processor is started; `save_kernel_cr3` has
+/// run.
+pub unsafe fn map_all_memory(top: usize) { unsafe {
+    const GIB: usize = 1 << 30;
+    let pml4 = table_at(kernel_cr3());
+    let pdpt = table_at(pml4.entries[0].frame_address());
+    // CPUID 8000_0001, EDX bit 26: pages of a gigabyte.
+    let whole = core::arch::x86_64::__cpuid(0x8000_0000).eax >= 0x8000_0001
+        && core::arch::x86_64::__cpuid(0x8000_0001).edx & (1 << 26) != 0;
+    let mut end = identity_end();
+    for i in end / GIB..top.div_ceil(GIB).min(511) {
+        if !pdpt.entries[i].is_present() {
+            if whole {
+                pdpt.entries[i].set(i * GIB, PRESENT | WRITABLE | HUGE_PAGE);
+            } else {
+                // A directory, in memory the map already reaches.
+                let Some(frame) = pmm::alloc_low() else { break };
+                let pd = table_at(frame.address());
+                for (j, entry) in pd.entries.iter_mut().enumerate() {
+                    entry.set(i * GIB + j * (2 << 20), PRESENT | WRITABLE | HUGE_PAGE);
+                }
+                pdpt.entries[i].set(frame.address(), PRESENT | WRITABLE);
+            }
+        }
+        end = (i + 1) * GIB;
+    }
+    IDENTITY_END.store(end, core::sync::atomic::Ordering::Relaxed);
+}}
+
 /// Save the kernel's CR3 during boot. Must be called before creating
 /// any user address spaces so `create_address_space` can always copy
 /// from the kernel's clean page tables.

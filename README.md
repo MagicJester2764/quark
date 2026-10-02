@@ -79,7 +79,7 @@ src/
   lend.rs             Memory lent with a call
   cap.rs              Object capabilities
   paging.rs           Page tables, address spaces, memory on demand
-  pmm.rs              Physical memory manager (bitmap allocator)
+  pmm.rs              Physical memory: a bitmap, given out from both ends
   heap.rs             Kernel heap
   memobj.rs           Memory objects: pages a pager provides
   shmem.rs            Shared memory regions
@@ -164,7 +164,7 @@ make run
 ## Testing
 
 The kernel is tested from outside, through the ABI, by a program: `dtest` in
-quarkutils makes 710 checks from user space. A kernel change is verified by
+quarkutils makes 716 checks from user space. A kernel change is verified by
 booting an image and running it — `tools/boot-test.sh` in ExplOSion — on one
 processor and on four.
 

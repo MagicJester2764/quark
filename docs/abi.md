@@ -1,6 +1,6 @@
 # Quark syscall ABI
 
-**Version 3.16.** Query the running kernel with `SYS_ABI_VERSION` (240), which
+**Version 3.17.** Query the running kernel with `SYS_ABI_VERSION` (240), which
 returns `(major << 16) | minor`.
 
 This document is the contract between the Quark kernel and everything above it.
@@ -217,6 +217,7 @@ returning at once turned that loop into a spin.
 | 3.14 | **An interrupt of a device's own.** `SYS_MSI_ALLOC` (118) gives a driver an interrupt number from 16 up and the address and data to program a device's MSI capability with; the device's messages then arrive as that interrupt. `SYS_IRQ_REGISTER` is for the sixteen below. Also, and no new number: devices interrupt through the I/O APIC on a machine that has one, where `SYS_IRQ_ACK` unmasks the line of a device that holds it and one slow driver no longer holds up the lines below its own; and there is a capability for the registers of the machine's devices, `DeviceMemory` (type 10), which the first task is started with: its holder mints a `PhysRange` for what lies in the addresses below four gigabytes that the firmware's memory map does not list, so that a driver can map its device. |
 | 3.15 | **A clock finer than a tick, and one that can be set.** `SYS_CLOCK` (149) says the time in nanoseconds, since boot or since 1970; `SYS_CLOCK_SET` (150) sets the date, for a holder of the new capability `Clock` (type 11), and writes it to the battery-backed clock. Every span of time a call takes may be given in nanoseconds, by setting its top bit — no number changed and a count of ticks means what it did — and is kept to the nanosecond and seen to when it is due rather than on the next tick, where the machine has a counter to keep time by and a timer to wake by. `SYS_SIG_ALARM` (arg3) and `SYS_TIMER_GET` (arg1) take somewhere to write their answer in nanoseconds; both still answer in ticks, now rounded up. A repeating timer or alarm keeps its beat, and a timer counts every interval that went by. `SYS_TICKS` is the clock's time in ticks rather than a count of interrupts. |
 | 3.16 | **Off, and on again, by the firmware's tables.** `SYS_POWER` (119) turns the machine off or restarts it, for a holder of the new capability `Power` (type 12): by ACPI's control and reset registers, where a program used to write to the three ports QEMU listens on. |
+| 3.17 | **Memory above four gigabytes.** All of a machine's memory is used, up to 511 GiB, where the kernel used the first four gigabytes of it. `SYS_PHYS_ALLOC` takes a flag (arg1 = 1) for frames below four gigabytes, which is what a device that is told an address in thirty-two bits needs; without it a frame is ordinary memory and comes from the top. `SYS_MEM_INFO` takes what to say (arg0): 1 for how much memory the machine has and 2 for where it ends. |
 
 3.1 was a change of behaviour and no change of number, so a minor: nothing built for
 3.0 calls anything that means something else now. What it could have relied on
@@ -631,7 +632,7 @@ call to a task that never reaches `SYS_RECV` blocks forever.
 | 32 | `SYS_MMAP` | arg0 = vaddr, arg1 = pages | 0 / `u64::MAX` | — (quota enforced) |
 | 42 | `SYS_MMAP_FD` | arg0 = fd naming memory, arg1 = vaddr | bytes mapped / `u64::MAX` | — |
 | 33 | `SYS_MUNMAP` | arg0 = vaddr, arg1 = pages | 0 / `u64::MAX` | — |
-| 34 | `SYS_PHYS_ALLOC` | arg0 = pages | physical address / `u64::MAX` | `PhysAlloc` |
+| 34 | `SYS_PHYS_ALLOC` | arg0 = pages, arg1 = 1 for frames below four gigabytes | physical address / `u64::MAX` | `PhysAlloc` |
 | 35 | `SYS_PHYS_FREE` | arg0 = phys, arg1 = count | 0 / `u64::MAX` | `PhysAlloc` + frame ownership |
 | 36 | `SYS_ADDRSPACE_CREATE` | — | CR3 / `u64::MAX` | — |
 | 41 | `SYS_ADDRSPACE_SELF` | — | the address space the caller is running in, as the CR3 the other address-space calls take / `u64::MAX` | — |
@@ -653,6 +654,17 @@ no server needs a range for that — and none is given one.
 **All user mappings must be at or above `USER_MIN_ADDR` (0x80_0000_0000).**
 Lower addresses are rejected: address spaces share the page directories beneath
 PML4[0], so a low mapping would write into tables every address space shares.
+
+**Where a frame is.** `SYS_PHYS_ALLOC` answers with a physical address,
+and what the address is for decides which it should be. Ordinary memory —
+which is what the call gives unless told otherwise, and what every page a
+program is given without asking for an address is made of — comes from the
+top of the machine's memory. A frame a *device* is to be told the address
+of is asked for with arg1 = 1 and is below four gigabytes, or the call
+fails: a network card or a disk controller is told where its buffers are
+in registers thirty-two bits wide, and on a machine with more memory than
+that a frame from the top is one it cannot be told of. A driver for a
+device that does its own reading and writing of memory passes the flag.
 
 **Giving memory moves it.** `SYS_ADDRSPACE_GIVE` takes pages the caller got
 from `SYS_MMAP` and moves them into an address space the caller created. They
@@ -1205,7 +1217,7 @@ ordinary programs should use file descriptor 1.
 | # | Name | Arguments | Returns | Cap |
 |---|---|---|---|---|
 | 192 | `SYS_MAP_ANON` | arg0 = address, arg1 = pages (at most 2^27), arg2 = flags (1 = back every page now, 2 = no more pages than the machine has) | 0 / `u64::MAX` | — |
-| 193 | `SYS_MEM_INFO` | — | `(free frames << 32) \| pages charged to the caller` | — |
+| 193 | `SYS_MEM_INFO` | arg0 = what: 0, 1 or 2 | 0: `(free frames << 32) \| pages charged to the caller`; 1: how many frames of memory the machine has; 2: the number of the frame after its last / `u64::MAX` | — |
 | 194 | `SYS_OBJECT_CREATE` | arg0 = cookie, arg1 = bytes, arg2 = slot | object id / `u64::MAX` | — |
 | 195 | `SYS_OBJECT_MAP` | arg0 = slot, arg1 = address, arg2 = pages, arg3 = first page, arg4 = flags (1 write, 2 shared, 4 exec) | 0 / `u64::MAX` | `MemObject`: read; write too for a shared writable mapping |
 | 196 | `SYS_OBJECT_CTL` | arg0 = object id, arg1 = op, arg2, arg3 | per op / `u64::MAX` | the object's pager |

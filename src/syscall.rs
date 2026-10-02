@@ -286,6 +286,8 @@ pub const SYS_GETRANDOM: u64 = 116;
 /// caller was on when it asked.
 pub const SYS_CPUS: u64 = 117;
 pub const SYS_MSI_ALLOC: u64 = 118;
+/// `SYS_PHYS_ALLOC`: frames below four gigabytes.
+const PHYS_LOW: u64 = 1;
 /// Turn the machine off, or start it again. For a holder of `Power`.
 pub const SYS_POWER: u64 = 119;
 /// `SYS_POWER`: which.
@@ -404,7 +406,7 @@ pub const SYS_ABI_VERSION: u64 = 240;
 /// minor when calls are added. User space can refuse to run against a major it
 /// does not know, which is the point of exposing it at all.
 pub const ABI_VERSION_MAJOR: u64 = 3;
-pub const ABI_VERSION_MINOR: u64 = 16;
+pub const ABI_VERSION_MINOR: u64 = 17;
 
 /// Threads a task may make with no capability at all.
 ///
@@ -2021,7 +2023,11 @@ fn dispatch(
             }
         }
         SYS_PHYS_ALLOC => {
-            // arg0 = number of contiguous pages to allocate
+            // arg0 = number of contiguous pages to allocate; arg1 = 1 for
+            // frames below four gigabytes, which is what a device that is
+            // told their address in a register of thirty-two bits can
+            // reach. Without it they come from wherever ordinary memory
+            // does, which on a machine with more memory than that is above.
             if !crate::cap::task_has_phys_alloc(scheduler::current_tid()) {
                 return u64::MAX;
             }
@@ -2033,14 +2039,7 @@ fn dispatch(
             if !scheduler::current_task_check_mem(count) {
                 return u64::MAX;
             }
-            // For simplicity, allocate pages one at a time and return the first
-            // (Only single-page alloc is reliable with bitmap allocator)
-            let frame = if count == 1 {
-                crate::pmm::alloc()
-            } else {
-                // Allocate count physically contiguous pages
-                crate::pmm::alloc_contiguous(count)
-            };
+            let frame = crate::pmm::alloc_contiguous(count, arg1 & PHYS_LOW != 0);
             let base = match frame {
                 Some(f) => f.address(),
                 None => return u64::MAX,
@@ -3249,9 +3248,21 @@ fn dispatch(
             if ok { 0 } else { u64::MAX }
         }
         SYS_MEM_INFO => {
-            let free = crate::pmm::free_count() as u64;
-            let charged = scheduler::current_task_mem() as u64;
-            (free.min(u32::MAX as u64) << 32) | charged.min(u32::MAX as u64)
+            // arg0 = what to say: 0, the frames that are free and the pages
+            // charged to the caller; 1, how many frames of memory the
+            // machine has; 2, where its memory ends, as the number of the
+            // frame after the last — more than a million of them is memory
+            // above four gigabytes.
+            match arg0 {
+                0 => {
+                    let free = crate::pmm::free_count() as u64;
+                    let charged = scheduler::current_task_mem() as u64;
+                    (free.min(u32::MAX as u64) << 32) | charged.min(u32::MAX as u64)
+                }
+                1 => crate::pmm::total_count() as u64,
+                2 => (crate::pmm::top_of_memory() / 4096) as u64,
+                _ => u64::MAX,
+            }
         }
         SYS_RECV_TIMEOUT => {
             // arg0 = from, arg1 = msg_ptr, arg2 = how long to wait

@@ -18,8 +18,6 @@ pub const LEND_LEN_MASK: u64 = LEND_READ - 1;
 pub const LEND_MAX: usize = 16 << 20;
 /// The most one read or write copies, so interrupts are never off for long.
 pub const COPY_MAX: usize = 1 << 20;
-/// Every frame the allocator hands out is below this, inside the identity map.
-const IDENTITY_END: usize = 0x1_0000_0000;
 
 /// Copy `len` bytes between `local` in the current task and `at` in a frame
 /// the kernel lent, through the identity map.
@@ -28,7 +26,7 @@ const IDENTITY_END: usize = 0x1_0000_0000;
 /// `at..at + len` lies inside the lent frame; `local` has been validated as
 /// for [`copy`].
 pub unsafe fn copy_frame(at: usize, local: usize, len: usize, into_lent: bool) -> bool {
-    if at.checked_add(len).is_none_or(|end| end > IDENTITY_END) {
+    if at.checked_add(len).is_none_or(|end| end > paging::identity_end()) {
         return false;
     }
     let _ua = crate::cpu::UserAccess::begin();
@@ -71,7 +69,9 @@ pub unsafe fn copy(cr3: usize, at: usize, local: usize, len: usize, into_lent: b
             let Some(phys) = paging::translate(cr3, va) else {
                 return false;
             };
-            if phys + n > IDENTITY_END {
+            // What the kernel can touch as itself: every frame the
+            // allocator hands out, and no device above four gigabytes.
+            if phys + n > paging::identity_end() {
                 return false;
             }
             let _ua = crate::cpu::UserAccess::begin();

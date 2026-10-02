@@ -25,7 +25,9 @@ pub const MAX_CPUS: usize = 16;
 pub const MAX_IOAPICS: usize = 4;
 pub const MAX_OVERRIDES: usize = 16;
 
-/// The kernel's identity map ends here, and so does what it can read.
+/// The kernel's map of memory as the machine starts ends here, and so does
+/// what it can read: the tables are read before the map is made longer, and
+/// a firmware keeps them below this in any case.
 const MAP_LIMIT: u64 = 1 << 32;
 /// The header every table but the root pointer begins with.
 const SDT_HEADER: usize = 36;
