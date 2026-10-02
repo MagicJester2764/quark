@@ -138,8 +138,8 @@ system hung.
 
 There are no tests in this tree, and that is the shape of a microkernel rather
 than an omission: the kernel is tested from outside, through the ABI, by a
-program. `dtest` in `../quarkutils` makes 588 checks — capabilities, IPC,
-memory, descriptors, signals, scheduling, `dtest calls` with three million calls in
+program. `dtest` in `../quarkutils` makes 662 checks — capabilities, IPC,
+memory, descriptors, signals, scheduling, users and terminals, `dtest calls` with three million calls in
 three seconds — and `qfuzz` throws random requests at every service.
 
 So a kernel change is verified by booting an image:
