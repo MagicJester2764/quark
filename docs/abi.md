@@ -196,7 +196,7 @@ returning at once turned that loop into a spin.
 | 3.6 | **A terminal's input is UTF-8.** `IUTF8` in a terminal's `c_iflag` is acted on, and set on a new one: in canonical mode, erasing takes back a character — the byte that begins it and every byte that continues it — where it took back a byte, and left the program to read the front of a character with no end. A change of behaviour and no new number. |
 | 3.7 | **Named pipes.** `SYS_FD_SERVE_PIPE` (231): a server gives a task that is calling it one end of the pipe a key of the server's names — the same pipe for everybody who is given the same key, for as long as any of them holds an end. `SYS_PIPE_PEER` (232): wait until somebody has opened the other end. The name, its owner and its mode are a file server's; the pipe is the kernel's, because a program waits on one with `SYS_POLL`. |
 | 3.8 | **Jobs.** Every process is in a process group and a session, and a terminal has one group in front of it. `SYS_PGROUP` (211) reads and sets them. `SYS_SIG_RAISE` with arg2 = 2 raises a signal for a group. Signals 19 to 22 stop a program — every task of it held where it is — and 18 starts it again; a parent hears of both as signal 17 and, asking with flags 4 and 8, from `SYS_WAIT_FOR`, which with flag 16 also waits for a group of children. `SYS_PTY_CTL` ops 5 to 8 make a terminal a session's controlling terminal and say which group is in front; what is typed raises its signals for that group, a read by any other group of the session stops the reader (signal 21), and `VSUSP` raises signal 20. `SYS_TASK_INFO` reports a stopped task as state 4. A terminal no session has claimed behaves as before. |
-| 3.9 | **Who a task is.** A task is in up to sixteen groups besides its own: `SYS_GROUPS` (212) reads them for anybody and sets them for a holder of `SetUid`, they are inherited as the user and group are, and a file server reads them to decide whether a file's group is one of the caller's. `SYS_IDENTIFY` (213) is how a server that holds `SetUid` says who somebody is: the user, the group and the groups of a task that is in a call to it, or of a child that task has created and not started, set in one step and checked by the kernel at that step. `SYS_SET_UID` and `SYS_SET_GID` are unchanged. Also, with no new number: a task waiting on one that ends — sending to it, in a call to it, receiving from it alone — stops waiting when it *ends*, where it used to when the dead task was collected. Its collector may be the one waiting: a parent in a call to a child that exited without answering waited for itself. |
+| 3.9 | **Who a task is.** A task is in up to sixteen groups besides its own: `SYS_GROUPS` (212) reads them for anybody and sets them for a holder of `SetUid`, they are inherited as the user and group are, and a file server reads them to decide whether a file's group is one of the caller's. `SYS_IDENTIFY` (213) is how a server that holds `SetUid` says who somebody is: the user, the group and the groups of a task that is in a call to it, or of a child that task has created and not started, set in one step and checked by the kernel at that step. `SYS_SET_UID` and `SYS_SET_GID` are unchanged. Also, with no new number: a task waiting on one that ends — sending to it, in a call to it, receiving from it alone — stops waiting when it *ends*, where it used to when the dead task was collected. Its collector may be the one waiting: a parent in a call to a child that exited without answering waited for itself. And: a terminal's slave is for the session that has claimed the terminal — for the user who made the pair, until one has — and no longer for whoever holds a descriptor for it or knows its number. `SYS_PTY_OPEN`, a read or a write of a slave, and `SYS_PTY_CTL` ops 1 and 3 through one are refused to anybody else. A program left running by somebody who then logged out went on holding the console. |
 
 3.1 was a change of behaviour and no change of number, so a minor: nothing built for
 3.0 calls anything that means something else now. What it could have relied on
@@ -459,7 +459,8 @@ leader to ask, of a terminal that is no session's, and a session has one.
 Op 5 puts group arg2 of the session in front, op 6 answers which is, and
 op 8 which session the terminal is; all three are for a caller in that
 session, and `u64::MAX` to anybody else. When the session's leader ends, the
-terminal is nobody's again.
+terminal is nobody's again — and its slave is no longer for what that session
+left running (see *Whose a slave is*, under the terminal calls).
 
 What is typed is for the group in front. Its signals are raised for that
 group, and a read of the slave by a process of the session in any *other*
@@ -1088,8 +1089,20 @@ A pseudo-terminal is a pair of descriptors with a line discipline between
 them: what a terminal emulator holds, the master, and what the program in it
 holds, the slave. `SYS_PTY_CREATE` makes the pair and returns the master; its
 number comes from `SYS_PTY_CTL` op 4, and `SYS_PTY_OPEN` on that number returns
-a slave, which any holder of the number may open while the master is held.
-There are eight in the machine.
+a slave, while the master is held. There are eight in the machine.
+
+**Whose a slave is.** A terminal is its session's. Once a session has made
+one its controlling terminal (op 7), the slave is for the members of that
+session; until one has, and again after its leader ends, it is for the user
+who made the pair — which is how a terminal emulator hands its shell a
+terminal, and how the console's is kept between logins. A holder of
+`TaskMgmt` for every task is not asked. Anybody else is refused: by
+`SYS_PTY_OPEN`, by a read or a write of a slave they hold a descriptor for,
+and by ops 1 and 3 (which change the terminal) through one. Holding the
+descriptor is not enough, on purpose: a descriptor is inherited by
+everything a session starts, and a program that outlives its session would
+otherwise go on reading what the next one types. The master is its
+holder's, as any descriptor is.
 
 Either end is read, written, waited on and closed as any descriptor is. Before
 a slave has been opened, a read of the master waits rather than reporting end

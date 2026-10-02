@@ -1593,6 +1593,10 @@ extern "C" fn syscall_dispatch(
             if !crate::pty::slave_openable(pty) {
                 return u64::MAX;
             }
+            // A number is not a key: the terminal is its session's.
+            if !crate::pty::slave_is_for(pty, scheduler::current_tid()) {
+                return u64::MAX;
+            }
             match scheduler::current_alloc_fd(crate::task::FdKind::PtyEnd { pty, end: 1 }) {
                 Ok(fd) => {
                     crate::pty::retain(pty, 1);
@@ -1605,9 +1609,16 @@ extern "C" fn syscall_dispatch(
             // arg0 = a descriptor naming either end, arg1 = operation,
             // arg2 = a structure to read or write.
             let tid = scheduler::current_tid();
-            let Some((pty, _)) = crate::pty::of_fd(tid, arg0 as usize) else {
+            let Some((pty, end)) = crate::pty::of_fd(tid, arg0 as usize) else {
                 return u64::MAX;
             };
+            // How a terminal behaves and how big it is are changed through
+            // its master, or by whoever its slave is for: a program left
+            // holding the slave of a session that has ended may still ask.
+            let changes = matches!(arg1, PTY_SET_TERMIOS | PTY_SET_WINSIZE);
+            if changes && end == 1 && !crate::pty::slave_is_for(pty, tid) {
+                return u64::MAX;
+            }
             match arg1 {
                 PTY_NUMBER => pty as u64,
                 PTY_GET_TERMIOS => {
@@ -2064,6 +2075,7 @@ extern "C" fn syscall_dispatch(
                 crate::task::FdKind::PipeRead(_) => u64::MAX,
                 // What a program prints waits for room, all of it; what a
                 // terminal emulator types is taken or it is not.
+                crate::task::FdKind::PtyEnd { pty, end: 1 } if !crate::pty::slave_is_for(pty, me) => u64::MAX,
                 crate::task::FdKind::PtyEnd { pty, end: 1 } => pty_write(pty, ptr, len),
                 crate::task::FdKind::PtyEnd { pty, .. } => pty_type(pty, ptr, len) as u64,
                 // A timer is armed, not written to.
@@ -2163,6 +2175,7 @@ extern "C" fn syscall_dispatch(
                 }
                 // A terminal without waiting, which is what a program that
                 // polls first and reads second asks for.
+                crate::task::FdKind::PtyEnd { pty, end: 1 } if !crate::pty::slave_is_for(pty, me) => u64::MAX,
                 crate::task::FdKind::PtyEnd { pty, end } => {
                     let mut buf = [0u8; 256];
                     let want = max_len.min(buf.len());
@@ -2250,6 +2263,7 @@ extern "C" fn syscall_dispatch(
                 // A terminal's buffer is drained by whoever is at the other
                 // end; a write that does not fit returns what did, which is a
                 // short write and not a block.
+                crate::task::FdKind::PtyEnd { pty, end: 1 } if !crate::pty::slave_is_for(pty, me) => u64::MAX,
                 crate::task::FdKind::PtyEnd { pty, end } => {
                     let n = if end == 0 {
                         pty_type(pty, ptr, len)
@@ -4154,8 +4168,12 @@ fn pty_read(pty: usize, end: u8, ptr: *mut u8, max_len: usize) -> u64 {
     }
     loop {
         // Every time round: a job that was in front when it began to wait
-        // may have been stopped and put behind since.
+        // may have been stopped and put behind since — and the session that
+        // made this terminal the reader's to read may have ended.
         if end == 1 {
+            if !crate::pty::slave_is_for(pty, scheduler::current_tid()) {
+                return u64::MAX;
+            }
             if let Some(answer) = read_from_behind(pty) {
                 return answer;
             }

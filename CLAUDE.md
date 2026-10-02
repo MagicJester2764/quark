@@ -221,12 +221,28 @@ may keep — are in `../quarkutils/CLAUDE.md`; these are the kernel's.
   only while they are asking.** A task has a user, a group and up to sixteen
   groups besides; they are inherited, copied by `fork`, kept by `exec`, and
   the kernel acts on none of them except to let one user's task end
-  another of the same user's. `SYS_IDENTIFY` is how a *server* says them: of
+  another of the same user's, and to say whose a terminal nobody has
+  claimed is. `SYS_IDENTIFY` is how a *server* says them: of
   a task in a call to it, or of a child that task has made and not started,
   with the kernel checking which at the moment it acts. A server that
   checked a TID's parent and then called `SYS_SET_UID` would be naming a
   number, and numbers are recycled. There is no setuid bit and there cannot
   be one: a program is loaded by whoever starts it.
+- **A terminal's slave is for its session, not for whoever holds a
+  descriptor for it.** `pty::slave_is_for` is asked at `SYS_PTY_OPEN`, at
+  every read and write of a slave, and when a slave is used to change the
+  terminal: a member of the session that has claimed it; the user who made
+  the pair, while no session has; a holder of `TaskMgmt` for every task.
+  A descriptor is inherited by everything a session starts, so a program
+  that outlived its session — left running by somebody who logged out — went
+  on holding the console's: the next person's keystrokes were its to read,
+  their password among them, and a slave could be opened by its number by
+  anybody at all. Unix takes the descriptor away at a hangup; here the
+  question is asked each time, and the answer changes when the session
+  ends. A new way to reach a slave asks it. It works only because each
+  login is a session of its own (`login` in `../quarkutils` begins one, and
+  ends with it): one session for as long as the machine is up is one that
+  everybody who ever logged in is a member of.
 - **Capabilities are the authority.** There is no UID 0 bypass; `uid == 0` no
   longer short-circuits `cap::task_has_*`. A service that cannot do something
   is missing a capability, not a privilege level.
@@ -511,9 +527,11 @@ background job that ignores what its terminal raises.
   terminal no session has claimed has no group in front, and there the
   signal is for every program holding the slave. Either way a shell that
   does nothing about groups is in one group with what started it and what
-  it starts: `getty`, `login` and `qsh` all hear Ctrl-C, and each says what
-  it does about signal 2. A new program that holds a session's terminal and
-  is not what the session runs has to say so too, or Ctrl-C ends it.
+  it starts: `login` and `qsh` both hear Ctrl-C — and `getty`, which keeps
+  the terminal between sessions, hears it when no session has it — and each
+  says what it does about signal 2. A new program that holds a session's
+  terminal and is not what the session runs has to say so too, or Ctrl-C
+  ends it.
 - **Two signals are raised by the kernel of its own accord**, because nothing
   else can raise them: SIGALRM when a program's alarm is due
   (`SYS_SIG_ALARM`; the alarm is in the program's table, so `exec` keeps it

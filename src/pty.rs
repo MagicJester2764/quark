@@ -197,6 +197,9 @@ struct Pty {
     in_use: bool,
     /// Who made it, so that one never wired to a descriptor can be reclaimed.
     creator: usize,
+    /// And which user that was: until a session claims the terminal, its
+    /// slave is that user's.
+    creator_uid: u32,
     /// Descriptors naming each end: 0 is the master, 1 the slave.
     refs: [usize; 2],
     /// Whether the slave has ever been opened.
@@ -231,6 +234,7 @@ struct Pty {
 const NO_PTY: Pty = Pty {
     in_use: false,
     creator: 0,
+    creator_uid: 0,
     refs: [0; 2],
     slave_opened: false,
     to_slave: Ring::new(),
@@ -270,6 +274,7 @@ pub fn create(creator: usize) -> Option<usize> {
         ptys()[i] = NO_PTY;
         ptys()[i].in_use = true;
         ptys()[i].creator = creator;
+        ptys()[i].creator_uid = scheduler::task_uid_gid(creator).map_or(0, |(uid, _)| uid);
     });
     irq_restore(flags);
     out
@@ -302,6 +307,43 @@ pub fn slave_openable(pty: usize) -> bool {
         let p = &ptys()[pty];
         p.in_use && p.refs[0] > 0
     };
+    irq_restore(flags);
+    ok
+}
+
+/// Whether task `tid` may use this terminal's slave: open it by its number,
+/// read what is typed at it, write to it, change how it behaves.
+///
+/// A terminal is its session's. Once a session has claimed one, its slave
+/// is for the members of that session; until one has, for the user who made
+/// the pair, which is how a terminal emulator hands its shell a terminal.
+/// And for whoever holds authority over every task: what may end a program
+/// may look at what is typed to it. Not for user 0 as such — being user 0
+/// opens nothing in this kernel, and the programs that keep a terminal
+/// between sessions and take it for one are user 0 and hold nothing.
+///
+/// Holding a descriptor for it is not enough, and that is the point. A
+/// descriptor is inherited by everything a session starts, and a program
+/// that outlives its session — started in the background by somebody who
+/// then logged out — went on holding the console's: the next person's
+/// keystrokes were its to read, their password among them. Unix takes the
+/// descriptor away (`vhangup`); here the question is asked each time, and
+/// the answer changed when the session that was the program's ended. And a
+/// slave could be opened by its number by anybody at all.
+pub fn slave_is_for(pty: usize, tid: usize) -> bool {
+    if pty >= MAX_PTYS {
+        return false;
+    }
+    if crate::cap::task_has_task_mgmt(tid, 0) {
+        return true;
+    }
+    let Ok((uid, _)) = scheduler::task_uid_gid(tid) else {
+        return false;
+    };
+    let session = crate::job::sid_of(tid);
+    let flags = irq_save();
+    let p = &ptys()[pty];
+    let ok = p.in_use && if p.session != 0 { p.session == session } else { p.creator_uid == uid };
     irq_restore(flags);
     ok
 }
