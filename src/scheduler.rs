@@ -280,6 +280,10 @@ pub fn exit_with(code: i32) -> ! {
             task.state = TaskState::Dead;
             task.exit_code = code;
             crate::ipc::clear_signal_deadline(current);
+            // Whoever is in a call to it is answered now, with a failure. Its
+            // parent may be one of them, and a parent waiting for an answer
+            // is not waiting to collect anybody.
+            crate::ipc::fail_waiters(current);
             // Told now rather than at reaping: reaping waits on a parent that
             // may never call sys_wait, and whatever this task was holding
             // needs reclaiming when it stops, not when it is tidied away.
@@ -1204,8 +1208,10 @@ fn end_other(tid: usize, code: i32) -> Result<(), ()> {
                 task.state = TaskState::Dead;
                 task.exit_code = code;
                 crate::ipc::clear_signal_deadline(tid);
-                // As in `exit_with`: what others wait on is let go now.
+                // As in `exit_with`: what others wait on is let go now, and
+                // whoever is in a call to it is answered.
                 close_descriptors(tid);
+                crate::ipc::fail_waiters(tid);
                 note_death(tid);
                 let parent = task.parent_tid;
                 if parent != 0 && waits_for(parent, tid) {

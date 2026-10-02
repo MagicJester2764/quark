@@ -453,6 +453,15 @@ every Unix program assumes:
   lives; a descriptor is something another task can be *waiting on*, and the
   oldest idiom in Unix — a child writes down a pipe and exits, a parent reads
   to the end and then waits — had each half waiting for the other.
+- **And so is whoever is waiting on it.** `ipc::fail_waiters` runs where a
+  task is marked dead (`exit_with`, `end_other`), beside the release of its
+  descriptors and for the same reason: a dead task waits for its parent, and
+  a parent in a call to it is not collecting anybody. `mount` starts a file
+  server and calls it to see whether it found a filesystem; one that found
+  none exits without answering, and the two waited on each other for ever —
+  unless the server was already dead when the call was made, which fails at
+  once. It was a race, and it was won in every test until a user's `mount`
+  lost it. Reaping does it again for a task that died some other way.
 - **A descriptor sent over a stream outlives the sender's end.** It is in the
   stream rather than in the sender, and the peer can still take it.
 - **A process is named by a number that is never used twice** (`SYS_PID`). A

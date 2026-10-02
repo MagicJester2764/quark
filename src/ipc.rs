@@ -1325,8 +1325,54 @@ pub fn check_timeouts() {
     }
 }
 
-/// Clean up IPC state when a task dies.
-/// Unblocks any tasks that were blocked waiting on the dead task.
+/// Fail every task that is blocked on `dead_tid`: sending to it, in a call to
+/// it, or receiving from it alone. Each is answered with an error and runs.
+///
+/// Done when a task *dies*, not when it is reaped — for the reason its
+/// descriptors are let go then. A dead task waits to be collected by its
+/// parent, and a parent that is in a call to it is not going to collect
+/// anything: `mount` starts a file server, calls it to see whether it found
+/// a filesystem, and the server that found none exits without answering.
+/// Left to reaping, the two waited for each other for ever — and whether
+/// they did was a race, lost only when the child was slow enough to still
+/// be alive when its parent called. Anybody else's caller waited on a
+/// parent that might never look.
+///
+/// The caller has interrupts off.
+pub fn fail_waiters(dead_tid: usize) {
+    if dead_tid >= MAX_TASKS {
+        return;
+    }
+    let error_msg = Message { sender: dead_tid, tag: u64::MAX, data: [0; 6] };
+    unsafe {
+        for tid in 0..MAX_TASKS {
+            if tid == dead_tid {
+                continue;
+            }
+            match TASK_IPC[tid].state {
+                IpcState::SendBlocked(dest) if dest == dead_tid => {
+                    TASK_IPC[tid].state = IpcState::None;
+                    scheduler::unblock_task(tid);
+                }
+                IpcState::CallSendBlocked(dest) | IpcState::CallBlocked(dest) if dest == dead_tid => {
+                    TASK_IPC[tid].pending_msg = Some(error_msg);
+                    TASK_IPC[tid].state = IpcState::None;
+                    scheduler::unblock_task(tid);
+                }
+                IpcState::RecvBlocked(from) if from == dead_tid => {
+                    TASK_IPC[tid].pending_msg = Some(error_msg);
+                    TASK_IPC[tid].state = IpcState::None;
+                    scheduler::unblock_task(tid);
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+/// Clean up IPC state when a task is reaped.
+/// Whoever was blocked on it was failed when it died ([`fail_waiters`]);
+/// this is done again here for a task that died some other way.
 pub fn cleanup_task_ipc(dead_tid: usize) {
     if dead_tid >= MAX_TASKS {
         return;
@@ -1364,41 +1410,9 @@ pub fn cleanup_task_ipc(dead_tid: usize) {
         TASK_NOTIFY[dead_tid] = 0;
         SIGNAL_DEADLINE[dead_tid] = 0;
 
-        // Scan all tasks for those blocked on the dead task
-        let error_msg = Message {
-            sender: dead_tid,
-            tag: u64::MAX,
-            data: [0; 6],
-        };
-
-        for tid in 0..MAX_TASKS {
-            if tid == dead_tid {
-                continue;
-            }
-            match TASK_IPC[tid].state {
-                IpcState::SendBlocked(dest) if dest == dead_tid => {
-                    TASK_IPC[tid].state = IpcState::None;
-                    scheduler::unblock_task(tid);
-                }
-                IpcState::CallSendBlocked(dest) if dest == dead_tid => {
-                    TASK_IPC[tid].pending_msg = Some(error_msg);
-                    TASK_IPC[tid].state = IpcState::None;
-                    scheduler::unblock_task(tid);
-                }
-                IpcState::CallBlocked(dest) if dest == dead_tid => {
-                    TASK_IPC[tid].pending_msg = Some(error_msg);
-                    TASK_IPC[tid].state = IpcState::None;
-                    scheduler::unblock_task(tid);
-                }
-                IpcState::RecvBlocked(from) if from == dead_tid => {
-                    TASK_IPC[tid].pending_msg = Some(error_msg);
-                    TASK_IPC[tid].state = IpcState::None;
-                    scheduler::unblock_task(tid);
-                }
-                _ => {}
-            }
-        }
+        // And whoever is blocked on it, if its death did not already.
     }
+    fail_waiters(dead_tid);
     irq_restore(flags);
     if let Some(target) = waiting_on {
         scheduler::refresh_priority(target);

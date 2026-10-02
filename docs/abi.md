@@ -196,7 +196,7 @@ returning at once turned that loop into a spin.
 | 3.6 | **A terminal's input is UTF-8.** `IUTF8` in a terminal's `c_iflag` is acted on, and set on a new one: in canonical mode, erasing takes back a character — the byte that begins it and every byte that continues it — where it took back a byte, and left the program to read the front of a character with no end. A change of behaviour and no new number. |
 | 3.7 | **Named pipes.** `SYS_FD_SERVE_PIPE` (231): a server gives a task that is calling it one end of the pipe a key of the server's names — the same pipe for everybody who is given the same key, for as long as any of them holds an end. `SYS_PIPE_PEER` (232): wait until somebody has opened the other end. The name, its owner and its mode are a file server's; the pipe is the kernel's, because a program waits on one with `SYS_POLL`. |
 | 3.8 | **Jobs.** Every process is in a process group and a session, and a terminal has one group in front of it. `SYS_PGROUP` (211) reads and sets them. `SYS_SIG_RAISE` with arg2 = 2 raises a signal for a group. Signals 19 to 22 stop a program — every task of it held where it is — and 18 starts it again; a parent hears of both as signal 17 and, asking with flags 4 and 8, from `SYS_WAIT_FOR`, which with flag 16 also waits for a group of children. `SYS_PTY_CTL` ops 5 to 8 make a terminal a session's controlling terminal and say which group is in front; what is typed raises its signals for that group, a read by any other group of the session stops the reader (signal 21), and `VSUSP` raises signal 20. `SYS_TASK_INFO` reports a stopped task as state 4. A terminal no session has claimed behaves as before. |
-| 3.9 | **Who a task is.** A task is in up to sixteen groups besides its own: `SYS_GROUPS` (212) reads them for anybody and sets them for a holder of `SetUid`, they are inherited as the user and group are, and a file server reads them to decide whether a file's group is one of the caller's. `SYS_IDENTIFY` (213) is how a server that holds `SetUid` says who somebody is: the user, the group and the groups of a task that is in a call to it, or of a child that task has created and not started, set in one step and checked by the kernel at that step. `SYS_SET_UID` and `SYS_SET_GID` are unchanged. |
+| 3.9 | **Who a task is.** A task is in up to sixteen groups besides its own: `SYS_GROUPS` (212) reads them for anybody and sets them for a holder of `SetUid`, they are inherited as the user and group are, and a file server reads them to decide whether a file's group is one of the caller's. `SYS_IDENTIFY` (213) is how a server that holds `SetUid` says who somebody is: the user, the group and the groups of a task that is in a call to it, or of a child that task has created and not started, set in one step and checked by the kernel at that step. `SYS_SET_UID` and `SYS_SET_GID` are unchanged. Also, with no new number: a task waiting on one that ends — sending to it, in a call to it, receiving from it alone — stops waiting when it *ends*, where it used to when the dead task was collected. Its collector may be the one waiting: a parent in a call to a child that exited without answering waited for itself. |
 
 3.1 was a change of behaviour and no change of number, so a minor: nothing built for
 3.0 calls anything that means something else now. What it could have relied on
@@ -520,6 +520,15 @@ The `Endpoint` check applies to calls where the sender names its own
 destination. IPC the kernel performs on a task's behalf through an installed
 file descriptor bypasses it deliberately: the fd is itself the authorisation,
 and only a `TaskMgmt` holder can install one.
+
+**A task that ends** takes nobody with it. Whoever is waiting on it stops
+waiting as it ends: a send to it fails, and a call to it or a receive from it
+alone is answered — by the kernel, as a message from the task that went, with
+tag `u64::MAX` and nothing in its data, which by every server's convention is
+a refusal that gives no reason. The call itself returns 0, since there was an
+answer; a caller that asks a new server whether it is there looks at the tag.
+This happens at the task's end and not when its parent collects it, because
+the parent may be the caller.
 
 **Notifications.** Every task has a notification word. `SYS_NOTIFY` ORs
 `badge` into the destination's and does not wait; the destination receives the
