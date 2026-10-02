@@ -285,6 +285,7 @@ pub const SYS_GETRANDOM: u64 = 116;
 /// How many processors the system is running on, and which of them the
 /// caller was on when it asked.
 pub const SYS_CPUS: u64 = 117;
+pub const SYS_MSI_ALLOC: u64 = 118;
 
 // --- 0x80  synchronisation ---
 pub const SYS_FUTEX_WAIT: u64 = 128;
@@ -388,7 +389,7 @@ pub const SYS_ABI_VERSION: u64 = 240;
 /// minor when calls are added. User space can refuse to run against a major it
 /// does not know, which is the point of exposing it at all.
 pub const ABI_VERSION_MAJOR: u64 = 3;
-pub const ABI_VERSION_MINOR: u64 = 13;
+pub const ABI_VERSION_MINOR: u64 = 14;
 
 /// Threads a task may make with no capability at all.
 ///
@@ -1386,8 +1387,12 @@ fn dispatch(
             }
         }
         SYS_IRQ_REGISTER => {
+            // One of the sixteen ISA interrupts. The numbers above them are
+            // given out, not asked for (`SYS_MSI_ALLOC`).
             let irq = arg0 as u8;
-            if !crate::cap::task_has_irq(scheduler::current_tid(), irq) {
+            if arg0 >= crate::irq_dispatch::FIRST_MESSAGE as u64
+                || !crate::cap::task_has_irq(scheduler::current_tid(), irq)
+            {
                 return u64::MAX;
             }
             let tid = scheduler::current_tid();
@@ -3239,6 +3244,32 @@ fn dispatch(
             crate::pit::ticks()
         }
         SYS_BOOT_TIME => crate::rtc::boot_time(),
+        SYS_MSI_ALLOC => {
+            // No arguments. An interrupt of the caller's own, for a device
+            // that sends its interrupts as messages: a number from 16 up,
+            // which the caller is registered for as `SYS_IRQ_REGISTER`
+            // would have registered it, and the two words to program the
+            // device with — where to send, and what.
+            //
+            // It takes the capability for any interrupt (0xFF): one for a
+            // particular line is for that line. And a local APIC, which is
+            // what such a message is sent to.
+            let tid = scheduler::current_tid();
+            if !crate::cap::task_has_irq(tid, 0xFF) || !crate::lapic::present() {
+                return u64::MAX;
+            }
+            let to = crate::percpu::apic_id(0) as u64;
+            // The address has eight bits for a processor.
+            if to > 0xFF {
+                return u64::MAX;
+            }
+            let Some(irq) = crate::irq_dispatch::allocate_message(tid) else {
+                return u64::MAX;
+            };
+            let address = 0xFEE0_0000u64 | (to << 12);
+            let data = crate::ioapic::FIRST_VECTOR as u64 + irq as u64;
+            ((irq as u64) << 48) | (data << 32) | address
+        }
         SYS_CPUS => {
             // No capability: it is a number every program is entitled to
             // divide its work by. The processor the caller is on is true of
@@ -3695,6 +3726,7 @@ fn dispatch(
                 // 7, a set of task IDs, was withdrawn at 2.0.
                 8 => crate::cap::CapType::Endpoint,
                 9 => crate::cap::CapType::MemObject,
+                10 => crate::cap::CapType::DeviceMemory,
                 _ => return u64::MAX,
             };
             let tid = scheduler::current_tid();

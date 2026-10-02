@@ -7,7 +7,11 @@ use crate::ipc::Message;
 use crate::scheduler;
 use crate::sync::IrqSpinLock;
 
-const MAX_IRQS: usize = 16;
+/// The sixteen ISA interrupts, and after them the ones a device sends for
+/// itself as a message (MSI): numbers the kernel gives out, one driver each.
+const MAX_IRQS: usize = 48;
+/// The first of the second kind.
+pub const FIRST_MESSAGE: usize = 16;
 const IRQ_RING_SIZE: usize = 8;
 
 /// Per-IRQ ring buffer for pending messages.
@@ -64,13 +68,29 @@ static IRQ_STATE: IrqSpinLock<IrqDispatchState> = IrqSpinLock::new(IrqDispatchSt
     },
 });
 
-/// Register a user-space task to handle an IRQ.
+/// Register a user-space task to handle one of the sixteen ISA interrupts.
 pub fn register_irq_handler(irq: u8, tid: usize) {
-    if (irq as usize) < MAX_IRQS {
+    if (irq as usize) < FIRST_MESSAGE {
         let mut state = IRQ_STATE.lock();
         state.handlers[irq as usize] = tid;
         state.has_handler[irq as usize] = true;
     }
+}
+
+/// Give `tid` an interrupt number of its own, for a device to send as a
+/// message: the lowest nobody has. `None` when all thirty-two are taken.
+///
+/// It is the task's until the task is gone (`unregister_task_irqs`). A
+/// device that goes on sending after that is told to nobody, and one given
+/// the number later hears a stray: a driver looks at its device to see
+/// whether it has anything to say, as it does for a line it shares.
+pub fn allocate_message(tid: usize) -> Option<u8> {
+    let mut state = IRQ_STATE.lock();
+    let n = (FIRST_MESSAGE..MAX_IRQS).find(|&n| !state.has_handler[n])?;
+    state.handlers[n] = tid;
+    state.has_handler[n] = true;
+    state.rings[n] = IrqRing::new();
+    Some(n as u8)
 }
 
 /// Called from the kernel IRQ handler. If a user task is registered for
@@ -129,7 +149,7 @@ pub fn unregister_task_irqs(tid: usize) {
             // its line until it is answered would interrupt for ever. The
             // clock and the keyboard are the kernel's when they are
             // nobody's, and stay on.
-            if irq > 1 {
+            if irq > 1 && irq < FIRST_MESSAGE {
                 crate::intc::disable(irq as u8);
             }
         }

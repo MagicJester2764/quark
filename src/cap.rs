@@ -87,6 +87,17 @@ pub enum CapType {
     /// Permission to map a memory object. param0 is the object's id, which is
     /// never reused; param1 the access, 1 read and 2 write.
     MemObject = 9,
+    /// Permission to map the registers of the machine's devices: its holder
+    /// may mint a `PhysRange` over any stretch of device memory
+    /// (`devmem.rs`), which is where no memory is. No parameters.
+    ///
+    /// A kind of its own rather than a `PhysRange` over all of it, because
+    /// a `PhysRange` is what a task *may map* and is kept as narrow as what
+    /// it does map — a device, never a quarter of the address space. Which
+    /// address a device is at is known only to whoever reads the device's
+    /// configuration, and that is its driver: so the driver holds this and
+    /// mints the one range it needs.
+    DeviceMemory = 10,
 }
 
 /// A `MemObject`'s access bits.
@@ -541,6 +552,29 @@ pub fn insert_kernel_range(cspace: &mut CSpace, base: usize, len: usize) -> bool
     }
 }
 
+/// Give `cspace` the unrevocable right to map the machine's devices'
+/// registers ([`CapType::DeviceMemory`]), in its last free slot. The first
+/// task names its low slots itself — where it keeps the nameserver's
+/// endpoint, where it mints what it hands on — and counts on the ones it
+/// has not filled being empty; what the kernel adds to what it starts with
+/// goes where the task will not look for room.
+pub fn insert_device_memory(cspace: &mut CSpace) -> bool {
+    match cspace.iter().rposition(|cap| cap.cap_type as u8 == CapType::Empty as u8) {
+        Some(slot) => {
+            cspace[slot] = CapSlot {
+                cap_type: CapType::DeviceMemory,
+                generation: 0,
+                root_slot: 0,
+                root_tid: KERNEL_ROOT_TID,
+                param0: 0,
+                param1: 0,
+            };
+            true
+        }
+        None => false,
+    }
+}
+
 /// Get a reference to a task's CSpace via the scheduler.
 ///
 /// # Safety
@@ -597,6 +631,7 @@ pub fn validate_attenuation(source: &CapSlot, new_type: CapType, new_p0: u64, ne
         CapType::SetUid => true,
         // One endpoint: the same one, or nothing.
         CapType::Endpoint => new_p0 == source.param0,
+        CapType::DeviceMemory => true,
         // The same object, with no access the source lacks.
         CapType::MemObject => {
             new_p0 == source.param0
@@ -621,6 +656,11 @@ pub fn revoke(tid: usize, slot: usize) {
 /// ownership instead; see `endpoint_to_mint`.
 pub fn can_mint(cspace: &CSpace, cap_type: CapType, param0: u64, param1: u64) -> bool {
     cspace.iter().any(|cap| validate_attenuation(cap, cap_type, param0, param1))
+        // Or a range of physical memory from the right to device memory:
+        // one that lies in it, whole.
+        || (cap_type as u8 == CapType::PhysRange as u8
+            && cspace.iter().any(|cap| cap.cap_type as u8 == CapType::DeviceMemory as u8 && is_valid(cap))
+            && crate::devmem::covers(param0, param1))
 }
 
 /// Get the current generation for a given tid/slot pair (for creating derived caps).

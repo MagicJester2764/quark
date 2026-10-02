@@ -230,6 +230,40 @@ irq_stub!(12);
 irq_stub!(13);
 irq_stub!(14);
 irq_stub!(15);
+// Interrupts 16 to 47: not lines of any controller but messages a device
+// sends for itself (MSI), on the vectors that follow the sixteen.
+irq_stub!(16);
+irq_stub!(17);
+irq_stub!(18);
+irq_stub!(19);
+irq_stub!(20);
+irq_stub!(21);
+irq_stub!(22);
+irq_stub!(23);
+irq_stub!(24);
+irq_stub!(25);
+irq_stub!(26);
+irq_stub!(27);
+irq_stub!(28);
+irq_stub!(29);
+irq_stub!(30);
+irq_stub!(31);
+irq_stub!(32);
+irq_stub!(33);
+irq_stub!(34);
+irq_stub!(35);
+irq_stub!(36);
+irq_stub!(37);
+irq_stub!(38);
+irq_stub!(39);
+irq_stub!(40);
+irq_stub!(41);
+irq_stub!(42);
+irq_stub!(43);
+irq_stub!(44);
+irq_stub!(45);
+irq_stub!(46);
+irq_stub!(47);
 
 // What comes through a processor's local APIC rather than the 8259. Each
 // stub pushes its own vector, which is how `irq_handler` tells these from
@@ -969,6 +1003,38 @@ unsafe extern "C" {
     fn irq_stub_13();
     fn irq_stub_14();
     fn irq_stub_15();
+    fn irq_stub_16();
+    fn irq_stub_17();
+    fn irq_stub_18();
+    fn irq_stub_19();
+    fn irq_stub_20();
+    fn irq_stub_21();
+    fn irq_stub_22();
+    fn irq_stub_23();
+    fn irq_stub_24();
+    fn irq_stub_25();
+    fn irq_stub_26();
+    fn irq_stub_27();
+    fn irq_stub_28();
+    fn irq_stub_29();
+    fn irq_stub_30();
+    fn irq_stub_31();
+    fn irq_stub_32();
+    fn irq_stub_33();
+    fn irq_stub_34();
+    fn irq_stub_35();
+    fn irq_stub_36();
+    fn irq_stub_37();
+    fn irq_stub_38();
+    fn irq_stub_39();
+    fn irq_stub_40();
+    fn irq_stub_41();
+    fn irq_stub_42();
+    fn irq_stub_43();
+    fn irq_stub_44();
+    fn irq_stub_45();
+    fn irq_stub_46();
+    fn irq_stub_47();
 
     fn apic_stub_timer();
     fn apic_stub_resched();
@@ -1033,7 +1099,7 @@ unsafe fn setup_idt() { unsafe {
     }
 
     // IRQ stubs at vectors 32–47
-    let irq_stubs: [unsafe extern "C" fn(); 16] = [
+    let irq_stubs: [unsafe extern "C" fn(); 48] = [
         irq_stub_0,
         irq_stub_1,
         irq_stub_2,
@@ -1050,10 +1116,42 @@ unsafe fn setup_idt() { unsafe {
         irq_stub_13,
         irq_stub_14,
         irq_stub_15,
+        irq_stub_16,
+        irq_stub_17,
+        irq_stub_18,
+        irq_stub_19,
+        irq_stub_20,
+        irq_stub_21,
+        irq_stub_22,
+        irq_stub_23,
+        irq_stub_24,
+        irq_stub_25,
+        irq_stub_26,
+        irq_stub_27,
+        irq_stub_28,
+        irq_stub_29,
+        irq_stub_30,
+        irq_stub_31,
+        irq_stub_32,
+        irq_stub_33,
+        irq_stub_34,
+        irq_stub_35,
+        irq_stub_36,
+        irq_stub_37,
+        irq_stub_38,
+        irq_stub_39,
+        irq_stub_40,
+        irq_stub_41,
+        irq_stub_42,
+        irq_stub_43,
+        irq_stub_44,
+        irq_stub_45,
+        irq_stub_46,
+        irq_stub_47,
     ];
 
-    for i in 0..16 {
-        (*idt_ptr).entries[32 + i].set_handler(irq_stubs[i] as u64, 0x08, 0);
+    for (i, stub) in irq_stubs.iter().enumerate() {
+        (*idt_ptr).entries[32 + i].set_handler(*stub as u64, 0x08, 0);
     }
 
     let apic_stubs: [(u8, unsafe extern "C" fn()); 5] = [

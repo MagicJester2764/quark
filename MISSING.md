@@ -69,13 +69,18 @@ them struck through as done. What follows is what is true now.
 - **A clock finer than the tick.** Time is the PIT at 100 Hz: a timer, a sleep
   and a futex deadline all round up to ten milliseconds. There is no HPET, no
   APIC timer and no use of the TSC.
-- **MSI, and an interrupt of a device's own.** Devices interrupt through
-  the I/O APIC where there is one, but only on the sixteen ISA interrupts,
-  wherever the firmware says each comes in. The lines above those — where
-  a PCI device on a newer machine is wired — need the firmware's bytecode
-  to say which device is on which, and are not used; and there is no MSI,
-  so a driver for a device that speaks only that has nothing to be given.
-  Every interrupt goes to the first processor.
+- **An interrupt for every device, wherever it is.** Devices interrupt
+  through the I/O APIC where there is one, on the sixteen ISA interrupts,
+  wherever the firmware says each comes in; and a device that can send its
+  interrupt as a message (MSI) is given a number of its own. What is not
+  there: the I/O APIC's lines above the sixteen — where a PCI device that
+  cannot send messages is wired on a newer machine, which the firmware's
+  bytecode says and its tables do not; more than one message for a device
+  (MSI-X); and anywhere to deliver one but the first processor.
+- **A device's registers above four gigabytes**, and an authority for one
+  device. A driver maps its device's registers by the `DeviceMemory`
+  capability, which covers what the firmware's map leaves out below four
+  gigabytes — all of it: a driver that holds it may map any device's.
 - **ACPI, for power.** The kernel reads two of its tables at boot
   (`acpi.rs`). What they say about processors it acts on. What they say
   about restarting the machine and turning it off it does not yet: powering
@@ -94,6 +99,8 @@ will meet:
 |---|---|
 | Processors | 16 |
 | Tasks | 64, threads included |
+| Interrupts of a device's own (MSI) | 32 |
+| Entries of the firmware's memory map | 64, once neighbours are joined |
 | Descriptors per program | 64, and one more for its working directory |
 | Capability slots per task | 64 |
 | Pipes | 96 in the machine, 8 made by any one program |

@@ -376,6 +376,11 @@ pub fn spawn_init(elf_data: &[u8], fb: Option<crate::multiboot2::FramebufferInfo
                 crate::cap::insert_kernel_range(&mut task.cspace, m.start, m.end - m.start);
             }
         }
+        // And the right to map a device's registers, to hand to drivers:
+        // if the machine has anywhere that is known to be only devices.
+        if !crate::devmem::ranges().is_empty() {
+            crate::cap::insert_device_memory(&mut task.cspace);
+        }
         task.context.rip = enter_user_trampoline as *const () as u64;
         task.context.r12 = entry;
         task.context.r13 = stack_top;

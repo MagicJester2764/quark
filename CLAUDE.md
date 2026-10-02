@@ -141,7 +141,9 @@ than an omission: the kernel is tested from outside, through the ABI, by a
 program. `dtest` in `../quarkutils` makes 686 checks — capabilities, IPC,
 memory, descriptors, signals, scheduling, users and terminals, `dtest calls`
 with three million calls in three seconds, `dtest smp` for what a second
-processor changes — and `qfuzz` throws random requests at every service.
+processor changes, and seven more (`dtest msi`) on a machine with a device
+that interrupts by message and its driver running — and `qfuzz` throws
+random requests at every service.
 
 So a kernel change is verified by booting an image:
 
@@ -365,8 +367,23 @@ may keep — are in `../quarkutils/CLAUDE.md`; these are the kernel's.
   the one for a program) is a message from sender 0, and no syscall can forge
   that; any program can send the *tag*. Servers depend on the difference.
 - **`init` is started with the framebuffer and its boot modules, and nothing
-  wider.** Every other `PhysRange` in the machine is derived from those, so
+  wider.** Every other `PhysRange` over memory is derived from those, so
   what the kernel hands the first task bounds what any task can map.
+- **A `PhysRange` over a device's registers is minted from `DeviceMemory`,
+  and only where there is no memory.** *Device memory* (`devmem.rs`) is
+  every address below four gigabytes that the firmware's memory map does
+  not list at all, less the first megabyte and the interrupt controllers'
+  own pages — a program that could write to a local APIC could stop the
+  clock. The capability is a kind of its own so that no task holds a
+  `PhysRange` wider than what it maps: a driver reads where its device is
+  and mints that (`cap::can_mint`). It is worked out from the *whole* map
+  or not at all: a hole in what the kernel kept of the map is not a hole in
+  the map, and RAM handed out as device memory is the kernel handed out.
+  The map is kept whole by joining neighbours of one kind as it is read
+  (`multiboot2::parse_memory_map`); kept one for one, a UEFI machine's
+  hundred entries did not fit in sixty-four and the last of its memory was
+  never seen. `init`'s capability goes in its *last* free slot: it names
+  its low ones itself and counts on the rest of them being empty.
 
 ## Descriptors the kernel owns
 
@@ -783,6 +800,16 @@ breaking any of them is quiet until it is a machine that stops.
   Which lines are levels is the firmware's to say (the MADT's overrides).
   A new place that takes an interrupt says one of `done`, `held` or
   `dropped` about it, and never writes to a controller itself.
+- **Interrupts 16 to 47 are no controller's lines**: they are messages a
+  device sends straight to a local APIC (MSI), given out one driver each
+  (`SYS_MSI_ALLOC`, `irq_dispatch::allocate_message`) and taken back when
+  the driver is gone. `intc` says nothing to any controller about one but
+  that it was taken. Nothing in the kernel can stop a device sending — that
+  is the device's switch, in configuration the kernel does not read — so a
+  number given out again can still be sent to by whatever had it before,
+  and the kernel tells the new driver: a stray, which a driver has to
+  expect. `SYS_IRQ_REGISTER` is for the sixteen and refuses the rest, or a
+  driver with the capability for any line could take another's.
 - **The other processors are started before there is a task** (`smp::start`
   in `kernel_main`), with what the first processor has turned on: CR0, CR4,
   EFER, the `syscall` MSRs. Something turned on later on the first — a CR4
@@ -839,8 +866,15 @@ breaking any of them is quiet until it is a machine that stops.
   is, a better task waking that interrupts whichever processor is running
   the worst rather than waiting for its tick, and an idle processor that
   takes no ticks.
-- Every device interrupts the first processor. There is no MSI, and the
+- Every device interrupts the first processor, a message included. The
   I/O APIC's lines above the sixteen ISA interrupts are not used: which
-  device is on which is in the firmware's bytecode, not its tables.
+  device is on which is in the firmware's bytecode, not its tables. A
+  device that wants an interrupt of its own sends a message. One message
+  each: nothing gives a device several (MSI-X, or MSI's multiple
+  messages).
+- `DeviceMemory` is one authority for all devices, as the I/O ports are: a
+  driver that holds it may map any device's registers. Above four
+  gigabytes there is none, so a device the firmware put there cannot be
+  driven.
 - Sixteen processors at most, and local APIC ids below 256 unless the
   firmware left the APICs in x2APIC mode.

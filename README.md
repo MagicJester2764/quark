@@ -92,6 +92,7 @@ src/
   intc.rs             The interrupt controller devices come in through:
   ioapic.rs  pic.rs     the I/O APIC, or the 8259s
   acpi.rs             The firmware's tables: processors, interrupt controllers
+  devmem.rs           Device memory: the addresses that are not memory
   percpu.rs           What each processor has of its own
   klock.rs            The kernel lock: one processor in the kernel at a time
   lapic.rs            The local APIC: a tick, and a word to another processor

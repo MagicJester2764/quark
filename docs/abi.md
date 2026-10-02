@@ -1,6 +1,6 @@
 # Quark syscall ABI
 
-**Version 3.13.** Query the running kernel with `SYS_ABI_VERSION` (240), which
+**Version 3.14.** Query the running kernel with `SYS_ABI_VERSION` (240), which
 returns `(major << 16) | minor`.
 
 This document is the contract between the Quark kernel and everything above it.
@@ -214,6 +214,7 @@ returning at once turned that loop into a spin.
 | 3.11 | **A thread joined through a word is not waited for.** A task made by a task of its own program, which has been given a word by `SYS_SET_CLEAR_TID` (106), is collected by the kernel when it ends and is no child to `SYS_WAIT` or `SYS_WAIT_FOR`: not answered with, and not counted among the children a wait could be for. It was both, so a C program's `waitpid(-1)` could answer with one of its own threads, a program with threads and no children was told to go on waiting, and a thread that had ended kept its place among the system's sixty-four tasks until its program did — a program that made threads one after another came to where nothing in the system could make a task. And the call takes a second argument: the task whose word it is, which may be one the caller has made and not started, so that a thread's creator says it before the thread exists to be asked about. A thread with no such word is waited for as before. |
 | 3.12 | **A program that has gone is said to have gone.** No new number. A task that becomes another program with `SYS_EXEC_SPACE` was its old program's last, and whoever watched that program (`SYS_SPACE_WATCH`) is now told it has gone, as when a program's last task dies. They were not: what a server kept for the old program it kept for good, and the kernel went on counting the program as watched — a hundred and twenty-eight of them filled its table, and after that `SYS_SPACE_WATCH` failed for every program, so no server heard of any program ending. And what a watcher is owed is no longer a list eight long: a death of a task is kept for as long as it takes to collect it, however many there are, and of a program for as many as there can be programs. One call can end more than eight — a signal for a process group ends every member of a pipeline — and the ninth was not told of. |
 | 3.13 | **An object is kept for whoever was promised it.** `SYS_OBJECT_CTL` op 4, release, answers 1 and releases nothing while a living task of another program holds a capability for the object. A pager gives a program a capability and the program maps with it — two steps, and the last mapping of the object could go between them, the pager be told it was idle, and release it: the program's `SYS_OBJECT_MAP` then named nothing. Two threads mapping one file did it to each other. A pager written for 3.12 takes 1 for "still mapped" and keeps the object, which is safe; one written for this asks again. |
+| 3.14 | **An interrupt of a device's own.** `SYS_MSI_ALLOC` (118) gives a driver an interrupt number from 16 up and the address and data to program a device's MSI capability with; the device's messages then arrive as that interrupt. `SYS_IRQ_REGISTER` is for the sixteen below. Also, and no new number: devices interrupt through the I/O APIC on a machine that has one, where `SYS_IRQ_ACK` unmasks the line of a device that holds it and one slow driver no longer holds up the lines below its own; and there is a capability for the registers of the machine's devices, `DeviceMemory` (type 10), which the first task is started with: its holder mints a `PhysRange` for what lies in the addresses below four gigabytes that the firmware's memory map does not list, so that a driver can map its device. |
 
 3.1 was a change of behaviour and no change of number, so a minor: nothing built for
 3.0 calls anything that means something else now. What it could have relied on
@@ -261,9 +262,24 @@ UID 0 bypass in the kernel. Each task has a CSpace of 64 slots holding
 | 7 | *withdrawn at 2.0* | — | — |
 | 8 | `Endpoint` | the destination's endpoint number | — |
 | 9 | `MemObject` | the object's id | access: 1 read, 2 write |
+| 10 | `DeviceMemory` | — | — |
 
 Delegation may narrow a capability but never widen it; delegating at equal
 breadth is allowed, since a set is a subset of itself.
+
+**Device memory.** A device's registers are at addresses the firmware chose,
+in the part of the address space that is not memory: below four gigabytes,
+what the firmware's memory map does not list at all, above the first
+megabyte and with the interrupt controllers' own pages left out. A holder
+of `DeviceMemory` may mint a `PhysRange` over any range that lies wholly
+there (`SYS_CAP_MINT`, as if it held one that covered it), and maps with
+that. It is a capability of its own, and not a `PhysRange` over all of it,
+so that a `PhysRange` stays what it has been: as narrow as what its holder
+maps, a device and never a quarter of the address space. A driver reads
+where its device is out of the device's configuration and mints that. It
+is one authority for every device, as the I/O ports are. The kernel hands
+it to the first task, and only on a machine whose memory map it could keep
+whole.
 
 **Endpoints.** Every task has an endpoint, with a number the kernel never gives
 to anything else, even once the task is gone. An `Endpoint` capability records
@@ -754,7 +770,7 @@ reach zero.
 
 | # | Name | Arguments | Returns | Cap |
 |---|---|---|---|---|
-| 80 | `SYS_CAP_MINT` | arg0 = slot, arg1 = type, arg2 = param0, arg3 = param1 | 0 / `u64::MAX` | must already hold one covering it; for an `Endpoint`, param0 is the destination's TID and the rule is ownership (above) |
+| 80 | `SYS_CAP_MINT` | arg0 = slot, arg1 = type, arg2 = param0, arg3 = param1 | 0 / `u64::MAX` | must already hold one covering it; for an `Endpoint`, param0 is the destination's TID and the rule is ownership (above); for a `PhysRange`, `DeviceMemory` covers what lies in device memory |
 | 81 | `SYS_CAP_GRANT` | arg0 = dest tid, arg1 = src slot, arg2 = dest slot or `u64::MAX - 1` for any | 0, or the slot used when any; `u64::MAX` on failure | `TaskMgmt` over dest, its consent, or dest is a child the caller has not started |
 | 82 | `SYS_CAP_REVOKE` | arg0 = slot | 0 / `u64::MAX` | must be the minter |
 | 83 | `SYS_CAP_INSPECT` | arg0 = slot | packed descriptor | — |
@@ -921,12 +937,13 @@ to hear from.
 
 | # | Name | Arguments | Returns | Cap |
 |---|---|---|---|---|
-| 112 | `SYS_IRQ_REGISTER` | arg0 = irq | 0 / `u64::MAX` | `Irq` for that line |
+| 112 | `SYS_IRQ_REGISTER` | arg0 = irq, one of the sixteen ISA interrupts | 0 / `u64::MAX` | `Irq` for that line |
 | 113 | `SYS_IRQ_ACK` | arg0 = irq | 0 / `u64::MAX` | `Irq` for that line |
 | 114 | `SYS_IOPORT` | arg0 = port, arg1 = op, arg2 = value | read value, or 0 / `u64::MAX` | `IoPort` covering the port |
 | 115 | `SYS_IOPORT_REP` | arg0 = port, arg1 = buf, arg2 = words, arg3 = op | 0 / `u64::MAX` | `IoPort` covering the port |
 | 116 | `SYS_GETRANDOM` | arg0 = buf, arg1 = len, arg2 = flags (none yet) | bytes written, at most 1 MiB / `u64::MAX` | — |
 | 117 | `SYS_CPUS` | — | `(the processor the caller is on << 32) \| how many processors there are` | — |
+| 118 | `SYS_MSI_ALLOC` | — | `(irq << 48) \| (data << 32) \| address` / `u64::MAX` | `Irq` for any line (0xFF) |
 
 `SYS_IOPORT` ops: 0 = read8, 1 = write8, 2 = read16, 3 = write16, 4 = read32,
 5 = write32. `SYS_IOPORT_REP` ops: 0 = `rep insw`, 1 = `rep outsw`.
@@ -934,20 +951,35 @@ to hear from.
 **Interrupts.** A driver is told of its device's interrupt as a message from
 the kernel — sender 0, the tag the interrupt's number — found by its next
 `SYS_RECV` from anybody; eight are kept for a driver that has not looked.
+There are two kinds of number.
 
-The numbers are the sixteen ISA interrupts, 0 to 15: lines of the machine's
-interrupt controller, and a driver asks for one by number
-(`SYS_IRQ_REGISTER`), the number its device's configuration gives. Having
-dealt with the device, the driver says so (`SYS_IRQ_ACK`), and has to: a
-device that holds its line until it is answered is kept from interrupting
-again, in the meantime, by whichever means the controller has, and
-`SYS_IRQ_ACK` is what ends the meantime. On a machine with an I/O APIC that
-means is the line's own mask, and a slow driver holds up nobody else; with
-only 8259s it is the 8259's order of importance, and it holds up every line
-below its own. Either way the rule for a driver is the one rule: quieten
-the device, then acknowledge. A line whose driver has gone is masked until
-another registers for it; the clock and the keyboard, which are the kernel's
-when they are nobody's, are not.
+*The sixteen ISA interrupts*, 0 to 15, are lines of the machine's interrupt
+controller, and a driver asks for one by number (`SYS_IRQ_REGISTER`): the
+number its device's configuration gives. Having dealt with the device, the
+driver says so (`SYS_IRQ_ACK`), and has to: a device that holds its line
+until it is answered is kept from interrupting again, in the meantime, by
+whichever means the controller has, and `SYS_IRQ_ACK` is what ends the
+meantime. On a machine with an I/O APIC that means is the line's own mask,
+and a slow driver holds up nobody else; with only 8259s it is the 8259's
+order of importance, and it holds up every line below its own. Either way
+the rule for a driver is the one rule: quieten the device, then acknowledge.
+A line whose driver has gone is masked until another registers for it; the
+clock and the keyboard, which are the kernel's when they are nobody's, are
+not.
+
+*An interrupt of a device's own*, 16 to 47, is not a line at all but a
+message the device sends to a processor (MSI), and is given out rather than
+asked for: `SYS_MSI_ALLOC` registers the caller for the lowest number nobody
+has and answers with it and with the two words to program into the device's
+MSI capability — the address to send to (the lower 32 bits; the upper are 0)
+and the data to send. It needs the capability for any interrupt, and a
+machine with a local APIC. The number is the caller's until the caller is
+gone. There is nothing to acknowledge — `SYS_IRQ_ACK` succeeds and does
+nothing — and nothing in the kernel to stop a device sending: that is the
+device's own switch. A number given to a second driver after the first has
+gone may still be sent to by the first one's device, so a driver looks at
+its device to see whether it has anything to say, as it would on a shared
+line.
 
 Every interrupt is delivered to the first processor.
 
@@ -1444,6 +1476,38 @@ library needs them: musl finds a static program's thread-local template through
 runtime passes `AT_PHDR` = `0x80_8000_0000 + 3184 + 16`, `AT_PHENT` and
 `AT_PHNUM` from this table. A spawner older than the table leaves the count
 zero; a program older than it never reads that far.
+
+## What the first task is started with
+
+The kernel starts one program, the boot module named `init.elf` (or
+`INIT.ELF`), and everything else is started by it. It is the root of
+authority, and what it is started holding bounds what anything can hold:
+
+- every capability a bit of the old mask stood for — the I/O ports, the
+  interrupt lines, tasks, allocating frames, saying who a task is — in the
+  first slots of its table;
+- a `PhysRange` for the framebuffer and for each boot module, after those;
+- `DeviceMemory`, in the last slot of its table — unless the kernel could
+  not keep the firmware's memory map whole, and so cannot say where there
+  is no memory;
+- the driver band, which is what lets it put a driver there;
+- and no physical memory besides: it could once map the kernel.
+
+What it is told is on one page at `0x80_4000_0000`:
+
+| Offset | Size | Contents |
+|---|---|---|
+| 0 | 8 | how many boot modules there are |
+| 8 | 8 | the framebuffer's physical address, 0 if there is none |
+| 16 | 4, 4, 4 | its pitch in bytes, its width and its height |
+| 28 | 1, 1 | bits to a pixel, and the kind (1 for RGB) |
+| 30 | 1, 1, 1 | where red, green and blue begin in a pixel |
+| 33 | 3 | nothing |
+| 40 | 32 × 64 | the modules: each a physical start and end, and a name of up to 48 bytes, zero-filled |
+
+A field added later is added at the end, and a first task older than it
+does not read that far; a kernel older than it leaves it zero, the page
+having been cleared.
 
 ## Notes for implementers
 

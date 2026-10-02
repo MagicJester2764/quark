@@ -30,6 +30,15 @@
 
 use crate::{ioapic, lapic, pic};
 
+/// An interrupt that is no controller's line: a message a device sends
+/// straight to a local APIC (MSI), numbered from sixteen
+/// (`irq_dispatch::allocate_message`). It is an edge with nothing to mask
+/// here — whether it is sent is the device's own switch — so all there is
+/// to say about one is that it has been taken.
+fn message(irq: u8) -> bool {
+    irq as usize >= crate::irq_dispatch::FIRST_MESSAGE
+}
+
 /// Find the controller and leave every line masked.
 ///
 /// # Safety
@@ -50,6 +59,9 @@ pub unsafe fn init() {
 
 /// Let interrupt `irq` through.
 pub fn enable(irq: u8) {
+    if message(irq) {
+        return;
+    }
     if ioapic::in_use() {
         ioapic::enable(irq);
     } else {
@@ -59,6 +71,9 @@ pub fn enable(irq: u8) {
 
 /// Stop interrupt `irq`: nobody is there to deal with it.
 pub fn disable(irq: u8) {
+    if message(irq) {
+        return;
+    }
     if ioapic::in_use() {
         ioapic::disable(irq);
     } else {
@@ -68,7 +83,7 @@ pub fn disable(irq: u8) {
 
 /// The kernel has dealt with interrupt `irq` itself.
 pub fn done(irq: u8) {
-    if ioapic::in_use() {
+    if message(irq) || ioapic::in_use() {
         lapic::eoi();
     } else {
         unsafe { pic::send_eoi(irq) };
@@ -78,7 +93,9 @@ pub fn done(irq: u8) {
 /// Interrupt `irq` has been handed to a driver, which will say when it has
 /// dealt with the device ([`ack`]).
 pub fn held(irq: u8) {
-    if ioapic::in_use() {
+    if message(irq) {
+        lapic::eoi();
+    } else if ioapic::in_use() {
         ioapic::held(irq);
         lapic::eoi();
     }
@@ -87,7 +104,7 @@ pub fn held(irq: u8) {
 /// Interrupt `irq` was for a driver that has no room to be told of it, and
 /// so will not answer for it.
 pub fn dropped(irq: u8) {
-    if ioapic::in_use() {
+    if message(irq) || ioapic::in_use() {
         held(irq);
     } else {
         unsafe { pic::send_eoi(irq) };
@@ -96,6 +113,9 @@ pub fn dropped(irq: u8) {
 
 /// The driver of `irq` has dealt with its device.
 pub fn ack(irq: u8) {
+    if message(irq) {
+        return;
+    }
     if ioapic::in_use() {
         ioapic::ack(irq);
     } else {

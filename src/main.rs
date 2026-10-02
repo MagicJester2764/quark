@@ -9,6 +9,7 @@ pub mod cap;
 mod console;
 mod cpu;
 mod context;
+mod devmem;
 mod fat32;
 mod fpu;
 mod heap;
@@ -111,6 +112,11 @@ pub extern "C" fn kernel_main(multiboot_info: usize) -> ! {
     // firmware lists one, and the 8259s where it does not.
     unsafe {
         intc::init();
+        // Which local APIC is the first processor's: where every device's
+        // interrupt is sent, a message's included.
+        if lapic::present() {
+            percpu::set_apic_id(lapic::id());
+        }
         pit::init(100); // 100 Hz timer
         intc::enable(0); // timer
         intc::enable(1); // keyboard
@@ -148,6 +154,9 @@ pub extern "C" fn kernel_main(multiboot_info: usize) -> ! {
     // processor is given has been decided on this one, and before there is
     // a task for a tick to switch to.
     unsafe { smp::start(&mmap_regions[..mmap_count], (multiboot_info, mb_info_size)) };
+
+    // Where devices are, for the first task to be given.
+    unsafe { devmem::init(&mmap_regions[..mmap_count]) };
 
     // Initialize scheduler
     scheduler::init();

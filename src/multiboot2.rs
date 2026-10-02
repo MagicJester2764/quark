@@ -33,8 +33,18 @@ pub const RSDP_MAX: usize = 36;
 /// Maximum number of boot modules we track.
 pub const MAX_MODULES: usize = 32;
 
-/// Maximum number of memory regions we track.
+/// Maximum number of memory regions we track, once neighbours of one kind
+/// have been joined.
 pub const MAX_MEMORY_REGIONS: usize = 64;
+
+/// Whether every entry of the firmware's memory map was kept. If not, what
+/// the map does not list is not known to be nothing.
+static MAP_WHOLE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
+
+/// Whether [`parse_memory_map`] kept the whole map.
+pub fn map_is_whole() -> bool {
+    MAP_WHOLE.load(core::sync::atomic::Ordering::Relaxed)
+}
 
 #[allow(dead_code)]
 pub const MMAP_TYPE_AVAILABLE: u32 = 1;
@@ -142,6 +152,13 @@ pub unsafe fn parse_modules(info_addr: usize) -> (usize, [ModuleInfo; MAX_MODULE
 
 /// Parse memory map tags (type 6) from the multiboot2 info structure.
 ///
+/// Entries that touch and are of one kind are joined. A machine started by
+/// UEFI describes its memory in a hundred pieces — every allocation the
+/// firmware made while it ran is an entry of its own — and kept one for
+/// one, the first sixty-four were the map: on a machine with a gigabyte the
+/// last eighteen megabytes were never seen, and on one with more than four
+/// the entry dropped is the one that says so.
+///
 /// # Safety
 /// `info_addr` must point to a valid multiboot2 boot information structure.
 pub unsafe fn parse_memory_map(
@@ -175,20 +192,35 @@ pub unsafe fn parse_memory_map(
             let entries_start = tag_ptr.add(16);
             let entries_end = tag_ptr.add(tag_size);
 
+            // An entry is two addresses and a kind; a size smaller than
+            // that is not a map, and would be walked for ever.
+            if entry_size < 20 {
+                break;
+            }
             let mut entry_ptr = entries_start;
-            while entry_ptr < entries_end && count < MAX_MEMORY_REGIONS {
+            while entry_ptr < entries_end {
                 let base = (entry_ptr as *const u64).read_unaligned();
                 let length = (entry_ptr.add(8) as *const u64).read_unaligned();
                 let region_type = (entry_ptr.add(16) as *const u32).read_unaligned();
+                entry_ptr = entry_ptr.add(entry_size);
 
+                if count > 0 {
+                    let last = &mut regions[count - 1];
+                    if last.region_type == region_type && last.base.checked_add(last.length) == Some(base) {
+                        last.length = last.length.saturating_add(length);
+                        continue;
+                    }
+                }
+                if count == MAX_MEMORY_REGIONS {
+                    MAP_WHOLE.store(false, core::sync::atomic::Ordering::Relaxed);
+                    continue;
+                }
                 regions[count] = MemoryRegion {
                     base,
                     length,
                     region_type,
                 };
                 count += 1;
-
-                entry_ptr = entry_ptr.add(entry_size);
             }
         }
 
