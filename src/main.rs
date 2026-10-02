@@ -4,6 +4,7 @@
 
 extern crate alloc;
 
+mod acpi;
 pub mod cap;
 mod console;
 mod cpu;
@@ -71,6 +72,12 @@ pub extern "C" fn kernel_main(multiboot_info: usize) -> ! {
     console::clear();
     unsafe { heap::init() };
     console::puts(b"Heap initialized.\n");
+    // What the machine is made of, as its firmware tells it: how many
+    // processors, where the interrupt controllers are, how to turn it off.
+    unsafe {
+        let rsdp = multiboot2::rsdp(multiboot_info);
+        acpi::init(rsdp.as_ref().map(|(bytes, len)| &bytes[..*len]));
+    }
     // Before any task exists: the clean state every task is created with is
     // captured here, and the first task is entered without a switch to load it.
     fpu::init();

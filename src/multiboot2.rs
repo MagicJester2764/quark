@@ -1,4 +1,5 @@
-/// Minimal multiboot2 info parser — extracts framebuffer tag (type 8).
+/// Minimal multiboot2 info parser: the modules, the memory map, the
+/// framebuffer, and where the firmware's ACPI tables begin.
 
 #[derive(Debug, Clone, Copy)]
 #[allow(dead_code)]
@@ -23,6 +24,11 @@ const TAG_TYPE_END: u32 = 0;
 const TAG_TYPE_MODULE: u32 = 3;
 const TAG_TYPE_MMAP: u32 = 6;
 const TAG_TYPE_FRAMEBUFFER: u32 = 8;
+const TAG_TYPE_ACPI_OLD: u32 = 14;
+const TAG_TYPE_ACPI_NEW: u32 = 15;
+
+/// The longest ACPI root pointer there is: the second revision's.
+pub const RSDP_MAX: usize = 36;
 
 /// Maximum number of boot modules we track.
 pub const MAX_MODULES: usize = 32;
@@ -277,4 +283,42 @@ pub unsafe fn parse_framebuffer(info_addr: usize) -> Option<FramebufferInfo> { u
 
         offset += tag_size as usize;
     }
+}}
+
+/// The ACPI root pointer the bootloader passed, copied out: its bytes and
+/// how many there are. The second revision's if both were passed.
+///
+/// A bootloader that started from UEFI is the only thing that can say where
+/// the tables are, and says so with a copy of the pointer in a tag (15, or
+/// 14 for the first revision's). The copy is taken because the tag is in
+/// memory that is the bootloader's.
+///
+/// # Safety
+/// `info_addr` must be the multiboot2 information the kernel was started
+/// with.
+pub unsafe fn rsdp(info_addr: usize) -> Option<([u8; RSDP_MAX], usize)> { unsafe {
+    let ptr = info_addr as *const u8;
+    let total_size = (ptr as *const u32).read_unaligned() as usize;
+    let mut offset: usize = 8;
+    let mut found = None;
+
+    while offset + 8 <= total_size {
+        let tag_ptr = ptr.add(offset);
+        let tag_type = (tag_ptr as *const u32).read_unaligned();
+        let tag_size = (tag_ptr.add(4) as *const u32).read_unaligned() as usize;
+        if tag_type == TAG_TYPE_END || tag_size < 8 || offset + tag_size > total_size {
+            break;
+        }
+        if tag_type == TAG_TYPE_ACPI_OLD || tag_type == TAG_TYPE_ACPI_NEW {
+            let len = (tag_size - 8).min(RSDP_MAX);
+            // The newer one wins, whichever order they come in.
+            if tag_type == TAG_TYPE_ACPI_NEW || found.is_none() {
+                let mut bytes = [0u8; RSDP_MAX];
+                core::ptr::copy_nonoverlapping(tag_ptr.add(8), bytes.as_mut_ptr(), len);
+                found = Some((bytes, len));
+            }
+        }
+        offset = (offset + tag_size + 7) & !7;
+    }
+    found
 }}

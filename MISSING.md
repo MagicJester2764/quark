@@ -64,8 +64,11 @@ them struck through as done. What follows is what is true now.
   APIC timer and no use of the TSC.
 - **An interrupt controller newer than the 8259.** Sixteen lines, no APIC, no
   MSI. A driver for a device that only speaks MSI has nothing to be given.
-- **ACPI.** The kernel reads none of it. Powering off is a user program
-  writing to a port QEMU happens to listen on.
+- **ACPI, acted on.** The kernel reads two of its tables at boot
+  (`acpi.rs`) — how many processors there are and where the interrupt
+  controllers are, how the machine is restarted and turned off — says what
+  it found on the serial line, and does nothing with it yet. Powering off is
+  still a user program writing to a port QEMU happens to listen on.
 - **Memory above 4 GiB.** The frame allocator's bitmap covers the first four
   gigabytes and the rest of what the firmware reports is left alone.
 - **Setting the clock.** The date is read once, from the CMOS clock at boot,
