@@ -1,6 +1,6 @@
 # Quark syscall ABI
 
-**Version 3.17.** Query the running kernel with `SYS_ABI_VERSION` (240), which
+**Version 3.18.** Query the running kernel with `SYS_ABI_VERSION` (240), which
 returns `(major << 16) | minor`.
 
 This document is the contract between the Quark kernel and everything above it.
@@ -218,6 +218,7 @@ returning at once turned that loop into a spin.
 | 3.15 | **A clock finer than a tick, and one that can be set.** `SYS_CLOCK` (149) says the time in nanoseconds, since boot or since 1970; `SYS_CLOCK_SET` (150) sets the date, for a holder of the new capability `Clock` (type 11), and writes it to the battery-backed clock. Every span of time a call takes may be given in nanoseconds, by setting its top bit — no number changed and a count of ticks means what it did — and is kept to the nanosecond and seen to when it is due rather than on the next tick, where the machine has a counter to keep time by and a timer to wake by. `SYS_SIG_ALARM` (arg3) and `SYS_TIMER_GET` (arg1) take somewhere to write their answer in nanoseconds; both still answer in ticks, now rounded up. A repeating timer or alarm keeps its beat, and a timer counts every interval that went by. `SYS_TICKS` is the clock's time in ticks rather than a count of interrupts. |
 | 3.16 | **Off, and on again, by the firmware's tables.** `SYS_POWER` (119) turns the machine off or restarts it, for a holder of the new capability `Power` (type 12): by ACPI's control and reset registers, where a program used to write to the three ports QEMU listens on. |
 | 3.17 | **Memory above four gigabytes.** All of a machine's memory is used, up to 511 GiB, where the kernel used the first four gigabytes of it. `SYS_PHYS_ALLOC` takes a flag (arg1 = 1) for frames below four gigabytes, which is what a device that is told an address in thirty-two bits needs; without it a frame is ordinary memory and comes from the top. `SYS_MEM_INFO` takes what to say (arg0): 1 for how much memory the machine has and 2 for where it ends. |
+| 3.18 | **The wide registers.** A program may use AVX, AVX2 and AVX-512 where the processor has them: the kernel turns them on (`OSXSAVE`, XCR0) and saves all of each task's with `XSAVE`. Before, an AVX instruction was a fault. No call changed. |
 
 3.1 was a change of behaviour and no change of number, so a minor: nothing built for
 3.0 calls anything that means something else now. What it could have relied on
@@ -1559,6 +1560,23 @@ library needs them: musl finds a static program's thread-local template through
 runtime passes `AT_PHDR` = `0x80_8000_0000 + 3184 + 16`, `AT_PHENT` and
 `AT_PHNUM` from this table. A spawner older than the table leaves the count
 zero; a program older than it never reads that far.
+
+## What a program may use of the processor
+
+The x87 unit and SSE, on every machine: they are part of what x86-64 is.
+AVX, AVX2 and AVX-512 where the processor has them — which a program finds
+out the way it does anywhere, from CPUID and from what `XGETBV` says the
+operating system saves (`OSXSAVE` is set where it saves more than SSE's
+state, and XCR0 says which). A program that asks only CPUID and uses a
+register the kernel does not save is not one this kernel can run
+correctly, here or anywhere.
+
+Every task has its own of all of them, as it has its own general
+registers: saved when it stops running and loaded when it runs again. A
+new task starts with them empty — the x87 unit reset, MXCSR at its default
+(0x1F80), every vector register nought — whatever the task that made it
+had in them; `SYS_FORK`'s child has its parent's, being its parent at that
+instant; and `SYS_EXEC_SPACE` empties them, for the new program.
 
 ## What the first task is started with
 

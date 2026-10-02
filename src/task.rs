@@ -177,7 +177,7 @@ pub struct Task {
     pub groups: [u32; MAX_GROUPS],
     pub ngroups: u8,
     /// This task's floating-point and SSE registers while it is not running.
-    /// See `fpu.rs` for why this exists and why it is only as wide as FXSAVE.
+    /// See `fpu.rs` for why this exists and what decides how much of it is used.
     pub fpu: crate::fpu::FpuState,
 }
 

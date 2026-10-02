@@ -63,9 +63,10 @@ them struck through as done. What follows is what is true now.
   terminals, timers and counters. A poll set's one waiter is not covered, and
   the lists want to name the task rather than the number: the kernel already
   has a number per task that is never reused, for endpoints.
-- **AVX.** `CR4.OSXSAVE` is clear, so an AVX instruction faults. Turning it on
-  means moving the per-task floating-point state from `FXSAVE` to `XSAVE`
-  first — see [`docs/fpu.md`](docs/fpu.md).
+- **AMX**, and whatever comes after AVX-512. A program may use x87, SSE,
+  AVX and AVX-512, where the processor has them, and each task's registers
+  are its own; the tile registers are not turned on, being eight kilobytes
+  a task for a use nothing here has. See [`docs/fpu.md`](docs/fpu.md).
 - **A clock that is kept right.** The clock is the processor's counter, to
   the nanosecond, at the rate it was measured at when the machine started —
   good to a few parts in ten thousand, and nothing corrects it afterwards.

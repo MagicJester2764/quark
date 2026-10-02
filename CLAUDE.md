@@ -138,7 +138,7 @@ system hung.
 
 There are no tests in this tree, and that is the shape of a microkernel rather
 than an omission: the kernel is tested from outside, through the ABI, by a
-program. `dtest` in `../quarkutils` makes 716 checks — capabilities, IPC,
+program. `dtest` in `../quarkutils` makes 720 checks — capabilities, IPC,
 memory, descriptors, signals, scheduling, users and terminals, `dtest calls`
 with three million calls in three seconds, `dtest smp` for what a second
 processor changes, `dtest clock` for what time it is and whether a wait ends
@@ -235,8 +235,16 @@ may keep — are in `../quarkutils/CLAUDE.md`; these are the kernel's.
   back — which never lets the machine idle — runs out of memory.
 - **Every task has its own floating-point state**, saved and restored on every
   switch (`fpu.rs`). The kernel is soft-float and never touches the registers,
-  so this is the whole of it. FXSAVE is enough only while CR4.OSXSAVE is clear:
-  enabling AVX without moving to XSAVE hands one task another's YMM registers.
+  so this is the whole of it. How much of it there is, is what the kernel
+  has told the processor programs may use (XCR0): x87 and SSE everywhere,
+  AVX and AVX-512 where the processor has them, and all of that is saved,
+  with XSAVE. **What is turned on and what is saved are one decision**
+  (`fpu::enable`): a component turned on and not saved hands one task the
+  upper halves of another's registers, and nothing faults to say so — the
+  checks in `dtest fpu` fail, and that is all. A new component (AMX is
+  eight kilobytes a task) is a bit in XCR0, room in `fpu::AREA_SIZE`, and
+  the same on every processor: XCR0 is each processor's own
+  (`fpu::init_processor`).
 - **Page-table entries that refer to a memory object carry its slot** in bits
   52–62, present or not, and every path that clears or replaces an entry —
   `clear_range`, `unmap_page`, `map_page`, `free_pt_leaves` — hands the
