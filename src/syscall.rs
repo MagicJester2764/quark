@@ -3910,8 +3910,9 @@ extern "C" fn syscall_dispatch(
 // On `syscall` instruction: RCX = user RIP, R11 = user RFLAGS.
 // RSP is unchanged (still user RSP). Interrupts are cleared by SFMASK.
 //
-// We use swapgs to access per-CPU data at %gs:0 (user RSP scratch)
-// and %gs:8 (kernel RSP).
+// `swapgs` finds this processor's own state (`percpu.rs`): %gs:0 is a word
+// to keep the caller's RSP in, and %gs:8 the top of the running task's
+// kernel stack.
 //
 // After saving user context, we shuffle registers to match the C ABI for
 // syscall_dispatch(nr, arg0, arg1, arg2, arg3, arg4), then sysret back.
@@ -3986,35 +3987,6 @@ core::arch::global_asm!(
     "    sysretq",
     options(att_syntax)
 );
-
-/// Per-CPU data for syscall entry (via GS segment).
-#[repr(C, align(16))]
-pub struct PerCpuData {
-    pub user_rsp_scratch: u64,
-    pub kernel_rsp: u64,
-}
-
-static mut PER_CPU: PerCpuData = PerCpuData {
-    user_rsp_scratch: 0,
-    kernel_rsp: 0,
-};
-
-/// Set up GS base for per-CPU syscall data.
-///
-/// # Safety
-/// Must be called after syscall init.
-pub unsafe fn setup_percpu(kernel_stack_top: u64) { unsafe {
-    PER_CPU.kernel_rsp = kernel_stack_top;
-    let addr = &raw const PER_CPU as u64;
-    write_msr(0xC000_0101, addr); // IA32_KERNEL_GS_BASE (for swapgs)
-}}
-
-/// Update the kernel RSP in per-CPU data (used by scheduler on context switch).
-pub fn update_kernel_rsp(rsp: u64) {
-    unsafe {
-        PER_CPU.kernel_rsp = rsp;
-    }
-}
 
 /// Go back to user mode with a whole register frame, as a forked child does.
 ///

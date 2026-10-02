@@ -2,10 +2,15 @@
 ///
 /// Uses a ready queue of task IDs. The PIT timer IRQ calls `schedule()`
 /// to preempt the running task and switch to the next ready one.
+///
+/// Which task is running is each processor's own (`percpu::current`), and
+/// task 0 is what a processor runs when it has nothing to: the idle loop,
+/// one task with a saved context per processor. It is in no ready queue.
+/// It is what is left when the queues are empty.
 
 use crate::context;
 use crate::task::{Task, TaskState, KERNEL_STACK_SIZE, MAX_TASKS};
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, Ordering};
 
 // Task table: fixed-size array of Option<Task>
 static mut TASKS: [Option<Task>; MAX_TASKS] = {
@@ -39,7 +44,6 @@ static mut READY_HEAD: [usize; NUM_PRIORITIES] = [0; NUM_PRIORITIES];
 static mut READY_TAIL: [usize; NUM_PRIORITIES] = [0; NUM_PRIORITIES];
 static mut READY_COUNT: [usize; NUM_PRIORITIES] = [0; NUM_PRIORITIES];
 
-static CURRENT_TID: AtomicUsize = AtomicUsize::new(0);
 static INITIALIZED: AtomicBool = AtomicBool::new(false);
 
 /// Per-task wait state. If true, the task is blocked in sys_wait.
@@ -149,7 +153,6 @@ pub fn init() {
         });
         crate::fdtable::attach_new(0);
     }
-    CURRENT_TID.store(0, Ordering::SeqCst);
     INITIALIZED.store(true, Ordering::SeqCst);
 }
 
@@ -240,7 +243,7 @@ pub fn exit() -> ! {
 /// Mark current task as Dead with an exit status and reschedule. Never returns.
 pub fn exit_with(code: i32) -> ! {
     unsafe {
-        let current = CURRENT_TID.load(Ordering::SeqCst);
+        let current = crate::percpu::current();
         crate::serial::puts(b"[exit tid=");
         crate::serial::put_usize(current);
         crate::serial::puts(b"]\n");
@@ -314,7 +317,7 @@ pub fn timer_tick() {
         return;
     }
     unsafe {
-        let current = CURRENT_TID.load(Ordering::SeqCst);
+        let current = crate::percpu::current();
 
         // A task in a better band is waiting, so the running one has had its
         // turn whether or not its slice is spent. Without this a driver woken
@@ -349,32 +352,26 @@ unsafe fn schedule_inner(from_irq: bool) { unsafe {
     let flags: u64;
     core::arch::asm!("pushfq; pop {}; cli", out(reg) flags, options(nostack));
 
-    let current_tid = CURRENT_TID.load(Ordering::SeqCst);
+    let current_tid = crate::percpu::current();
 
-    // Put current task back in ready queue if it's still runnable
-    if let Some(ref mut task) = TASKS[current_tid] {
-        if task.state == TaskState::Running {
-            task.state = TaskState::Ready;
-            enqueue(current_tid);
+    // Put current task back in ready queue if it's still runnable. Not the
+    // idle loop: that is what runs when the queues are empty, and is in none.
+    if current_tid != 0 {
+        if let Some(ref mut task) = TASKS[current_tid] {
+            if task.state == TaskState::Running {
+                task.state = TaskState::Ready;
+                enqueue(current_tid);
+            }
         }
     }
 
-    // Find next ready task
-    let next_tid = match dequeue_ready() {
-        Some(tid) => tid,
-        None => {
-            // No tasks ready — run idle task (TID 0)
-            if current_tid == 0 {
-                // Already idle, restore flags and return
-                if let Some(ref mut task) = TASKS[0] {
-                    task.state = TaskState::Running;
-                }
-                restore_flags(flags);
-                return;
-            }
-            0
-        }
-    };
+    // Find next ready task, or have nothing to do
+    let next_tid = dequeue_ready().unwrap_or(0);
+    if next_tid == 0 && current_tid == 0 {
+        // Already idle, restore flags and return
+        restore_flags(flags);
+        return;
+    }
 
     // A slice of its own, since this is the scheduler choosing it rather than
     // a task handing over what it had left.
@@ -400,10 +397,12 @@ unsafe fn switch_to(current_tid: usize, next_tid: usize, flags: u64) { unsafe {
     }
 
     // Mark next task as running
-    if let Some(ref mut task) = TASKS[next_tid] {
-        task.state = TaskState::Running;
+    if next_tid != 0 {
+        if let Some(ref mut task) = TASKS[next_tid] {
+            task.state = TaskState::Running;
+        }
     }
-    CURRENT_TID.store(next_tid, Ordering::SeqCst);
+    crate::percpu::set_current(next_tid);
 
     // Switch CR3 if address spaces differ
     let old_cr3 = TASKS[current_tid].as_ref().unwrap().cr3;
@@ -417,8 +416,7 @@ unsafe fn switch_to(current_tid: usize, next_tid: usize, flags: u64) { unsafe {
     if !new_task.kernel_stack_base.is_null() {
         let kernel_stack_top =
             new_task.kernel_stack_base as u64 + new_task.kernel_stack_size as u64;
-        crate::syscall::update_kernel_rsp(kernel_stack_top);
-        crate::idt::update_tss_rsp0(kernel_stack_top);
+        crate::percpu::set_kernel_stack(kernel_stack_top);
     }
 
     // Threads share an address space, so FS is what tells one thread's
@@ -433,12 +431,21 @@ unsafe fn switch_to(current_tid: usize, next_tid: usize, flags: u64) { unsafe {
     // never touches them, so loading early is safe, and it means a task that
     // has never run starts from its own clean state without its entry
     // trampoline having to know anything about this.
-    crate::fpu::save(&raw mut TASKS[current_tid].as_mut().unwrap().fpu);
-    crate::fpu::restore(&raw const TASKS[next_tid].as_ref().unwrap().fpu);
+    //
+    // The idle loop has none to save or load: it is the kernel, which never
+    // touches them. What the last task left stays in the registers while a
+    // processor idles — saved already — and is replaced before anything in
+    // ring 3 runs again.
+    if current_tid != 0 {
+        crate::fpu::save(&raw mut TASKS[current_tid].as_mut().unwrap().fpu);
+    }
+    if next_tid != 0 {
+        crate::fpu::restore(&raw const TASKS[next_tid].as_ref().unwrap().fpu);
+    }
 
-    // Get raw pointers to contexts
-    let old_ctx = &raw mut TASKS[current_tid].as_mut().unwrap().context;
-    let new_ctx = &raw const TASKS[next_tid].as_ref().unwrap().context;
+    // Get raw pointers to contexts. The idle loop's is this processor's.
+    let old_ctx = context_of(current_tid);
+    let new_ctx = context_of(next_tid) as *const context::CpuContext;
 
     // Do NOT restore interrupts here — context_switch restores RFLAGS from
     // the new context, which atomically re-enables interrupts with the switch.
@@ -447,6 +454,19 @@ unsafe fn switch_to(current_tid: usize, next_tid: usize, flags: u64) { unsafe {
 
     // Perform the context switch (restores RFLAGS from new context)
     context::context_switch(old_ctx, new_ctx);
+}}
+
+/// Where a task's registers are kept while it is not running: in the task,
+/// or for the idle loop in the processor whose idle loop it is.
+///
+/// # Safety
+/// Interrupts off, and the task exists.
+unsafe fn context_of(tid: usize) -> *mut context::CpuContext { unsafe {
+    if tid == 0 {
+        crate::percpu::idle_context()
+    } else {
+        &raw mut TASKS[tid].as_mut().unwrap().context
+    }
 }}
 
 /// Move a task into a scheduling band.
@@ -562,7 +582,7 @@ pub fn donate_to(tid: usize, flags: u64) {
             restore_flags(flags);
             return;
         }
-        let current_tid = CURRENT_TID.load(Ordering::SeqCst);
+        let current_tid = crate::percpu::current();
 
         // A task of a stopped program is not handed the processor: it is
         // ready, in no queue, and stays so until the program is continued.
@@ -637,9 +657,9 @@ unsafe fn dequeue_ready() -> Option<usize> { unsafe {
 }}
 
 /// Add a task TID to the back of the ready queue. Not a held one: that is
-/// queued when its program is continued.
+/// queued when its program is continued. And never the idle loop.
 unsafe fn enqueue(tid: usize) { unsafe {
-    if HELD[tid] {
+    if tid == 0 || HELD[tid] {
         return;
     }
     let p = priority_of(tid);
@@ -654,7 +674,7 @@ unsafe fn enqueue(tid: usize) { unsafe {
 
 /// Put a task at the *front* of the ready queue, so it runs next.
 unsafe fn enqueue_front(tid: usize) { unsafe {
-    if HELD[tid] {
+    if tid == 0 || HELD[tid] {
         return;
     }
     let p = priority_of(tid);
@@ -789,7 +809,7 @@ unsafe fn restore_flags(flags: u64) { unsafe {
 
 /// Get the current task's TID.
 pub fn current_tid() -> usize {
-    CURRENT_TID.load(Ordering::SeqCst)
+    crate::percpu::current()
 }
 
 /// Mark a task as blocked. Used by IPC.
@@ -1355,20 +1375,20 @@ pub fn task_info(tid: usize) -> Option<(TaskState, u32, u32, usize)> {
     }
 }
 
-/// The current task's kernel stack, as (base, top). Both zero for the boot
-/// task, which runs on the stack the bootloader left.
+/// The current task's kernel stack, as (base, top). For the idle loop, the
+/// stack its processor started on.
 ///
 /// For working out whether a fault is a stack overflow, which from the rsp
 /// alone is unknowable: the same address is "nearly empty" or "just ran out"
 /// depending on where the allocation starts.
 pub fn current_kernel_stack() -> (usize, usize) {
     unsafe {
-        let tid = CURRENT_TID.load(Ordering::SeqCst);
+        let tid = crate::percpu::current();
         match TASKS[tid] {
             Some(ref t) if !t.kernel_stack_base.is_null() => {
                 (t.kernel_stack_base as usize, t.kernel_stack_base as usize + t.kernel_stack_size)
             }
-            _ => (0, 0),
+            _ => crate::percpu::idle_stack(),
         }
     }
 }
@@ -1922,7 +1942,7 @@ pub fn set_fd(tid: usize, fd: usize, entry: crate::task::FdKind) -> Result<(), (
 pub fn current_alloc_fd(entry: crate::task::FdKind) -> Result<usize, ()> {
     // 0, 1 and 2 are stdio by convention even when unset, and handing one out
     // would silently redirect a program's output.
-    crate::fdtable::install(CURRENT_TID.load(Ordering::SeqCst), entry, 3).ok_or(())
+    crate::fdtable::install(crate::percpu::current(), entry, 3).ok_or(())
 }
 
 /// Set the pager task for a given task.
@@ -2031,7 +2051,7 @@ pub fn current_fd(fd: usize) -> crate::task::FdKind {
     if fd >= crate::task::MAX_FDS {
         return crate::task::FdKind::Empty;
     }
-    crate::fdtable::get(CURRENT_TID.load(Ordering::SeqCst), fd)
+    crate::fdtable::get(crate::percpu::current(), fd)
 }
 
 /// The top of the running task's kernel stack.

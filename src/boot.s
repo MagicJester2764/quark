@@ -65,20 +65,11 @@ pd3:
     .skip 4096
 
 .align 16
-stack_bottom:
-    .skip 65536         // 64 KiB kernel stack
-stack_top:
-
-.align 16
-ist1_stack_bottom:
-    .skip 16384         // 16 KiB double-fault stack
-.global ist1_stack_top
-ist1_stack_top:
-
-.align 16
-.global tss
-tss:
-    .skip 104           // x86-64 TSS, filled by Rust at runtime
+.global boot_stack_bottom
+boot_stack_bottom:
+    .skip 65536         // 64 KiB: the stack the first processor boots and idles on
+.global boot_stack_top
+boot_stack_top:
 
 // ============================================================
 // 32-bit bootstrap (entered by multiboot2 bootloader)
@@ -92,7 +83,7 @@ _start:
     // assumes string instructions run forwards. Every way into the kernel
     // clears the direction flag; this is the first.
     cld
-    mov $stack_top, %esp
+    mov $boot_stack_top, %esp
 
     // Save multiboot2 info pointer (ebx) on the stack
     push %ebx
@@ -190,7 +181,7 @@ _start64:
     mov %rax, %cr4
 
     // Set up 64-bit stack
-    mov $stack_top, %rsp
+    mov $boot_stack_top, %rsp
 
     // edi still holds multiboot2 info pointer (zero-extended to rdi)
     call kernel_main
@@ -202,26 +193,19 @@ _start64:
     jmp 2b
 
 // ============================================================
-// GDT for 64-bit mode (writable for TSS descriptor patching)
+// GDT for the way into 64-bit mode
 // ============================================================
+// Only that. Each processor loads a table of its own once it is in Rust
+// (`percpu.rs`), with a task state segment in it; the selectors there are
+// these, so nothing is reloaded.
 .section .data
 .align 16
-.global gdt64
 gdt64:
     .quad 0x0000000000000000    // [0x00] null
     .quad 0x00AF9A000000FFFF    // [0x08] kernel code64 (DPL=0)
     .quad 0x00CF92000000FFFF    // [0x10] kernel data64 (DPL=0)
-    .quad 0                     // [0x18] TSS low  (Rust fills)
-    .quad 0                     // [0x20] TSS high (Rust fills)
-    .quad 0x00CFF2000000FFFF    // [0x28] user data64 (DPL=3) — must be before code for sysret
-    .quad 0x00AFFA000000FFFF    // [0x30] user code64 (DPL=3)
 gdt64_end:
 
 gdt64_ptr32:                    // 32-bit boot lgdt (6 bytes: 2+4)
     .short gdt64_end - gdt64 - 1
     .long gdt64
-
-.global gdt64_ptr
-gdt64_ptr:                      // 64-bit lgdt from Rust (10 bytes: 2+8)
-    .short gdt64_end - gdt64 - 1
-    .quad gdt64

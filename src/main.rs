@@ -20,6 +20,7 @@ mod lend;
 mod memobj;
 mod modules;
 mod multiboot2;
+mod percpu;
 pub mod paging;
 mod pic;
 mod pit;
@@ -53,6 +54,16 @@ core::arch::global_asm!(include_str!("boot.s"), options(att_syntax));
 
 #[unsafe(no_mangle)]
 pub extern "C" fn kernel_main(multiboot_info: usize) -> ! {
+    // Before anything else: which task is running is asked through GS, and
+    // GS finds this processor's own state only once this has said where it is.
+    unsafe {
+        unsafe extern "C" {
+            static boot_stack_bottom: u8;
+            static boot_stack_top: u8;
+        }
+        percpu::init(0, (&raw const boot_stack_bottom as usize, &raw const boot_stack_top as usize));
+    }
+
     // Initialize serial debug output early
     serial::init();
     serial::puts(b"[serial] Quark booting\n");

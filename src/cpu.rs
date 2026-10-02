@@ -67,6 +67,27 @@ pub fn random_instructions() -> (bool, bool) {
     (cpuid_7_0_ebx() & (1 << 18) != 0, cpuid_1_ecx() & (1 << 30) != 0)
 }
 
+/// Read a model-specific register.
+pub fn rdmsr(msr: u32) -> u64 {
+    let (lo, hi): (u32, u32);
+    unsafe {
+        core::arch::asm!("rdmsr", in("ecx") msr, out("eax") lo, out("edx") hi,
+                         options(nostack, nomem, preserves_flags));
+    }
+    (hi as u64) << 32 | lo as u64
+}
+
+/// Write a model-specific register.
+///
+/// # Safety
+/// Whatever the register means.
+pub unsafe fn wrmsr(msr: u32, value: u64) {
+    unsafe {
+        core::arch::asm!("wrmsr", in("ecx") msr, in("eax") value as u32, in("edx") (value >> 32) as u32,
+                         options(nostack, nomem, preserves_flags));
+    }
+}
+
 fn read_cr4() -> u64 {
     let val: u64;
     unsafe { core::arch::asm!("mov {}, cr4", out(reg) val, options(nomem, nostack)) };

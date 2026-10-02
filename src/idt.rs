@@ -1,7 +1,8 @@
 //! IDT (Interrupt Descriptor Table) and exception handling for x86-64.
 //!
-//! Sets up handlers for all 32 CPU exceptions, a TSS for double-fault
-//! recovery, and the GDT changes to support the TSS.
+//! Sets up handlers for all 32 CPU exceptions and the sixteen interrupt
+//! lines. The stack a double fault is taken on, and the one an interrupt
+//! from ring 3 is, are in each processor's task state segment (`percpu.rs`).
 
 use crate::{console, io, ipc, pic, pit, scheduler};
 
@@ -803,13 +804,6 @@ fn print_dec(val: usize) {
 // ---------------------------------------------------------------------------
 
 unsafe extern "C" {
-    static tss: u8;
-    static ist1_stack_top: u8;
-    static gdt64: u8;
-    static gdt64_ptr: u8;
-}
-
-unsafe extern "C" {
     fn exception_stub_0();
     fn exception_stub_1();
     fn exception_stub_2();
@@ -866,72 +860,12 @@ unsafe extern "C" {
 // ---------------------------------------------------------------------------
 
 pub unsafe fn init() { unsafe {
-    setup_tss();
-    install_tss_in_gdt();
-    reload_gdt();
-    load_tss();
+    // This processor's descriptor table and task state segment, and then
+    // the table of handlers, which is one for the machine.
+    crate::percpu::load_tables();
     setup_idt();
     load_idt();
     console::puts(b"IDT initialized.\n");
-}}
-
-unsafe fn setup_tss() { unsafe {
-    let tss_ptr = &tss as *const u8 as *mut u8;
-    core::ptr::write_bytes(tss_ptr, 0, 104);
-    // IST1 at offset 36 (8 bytes)
-    let ist1_addr = &ist1_stack_top as *const u8 as u64;
-    core::ptr::write_unaligned(tss_ptr.add(36) as *mut u64, ist1_addr);
-    // IOMAP base at offset 102 (2 bytes) — points past TSS end (no IOMAP)
-    core::ptr::write_unaligned(tss_ptr.add(102) as *mut u16, 104u16);
-}}
-
-/// Update TSS RSP0 — the kernel stack used for ring 3→0 transitions on
-/// hardware exceptions and interrupts. Must be called whenever we switch
-/// to a user-mode task so the CPU can find a valid kernel stack.
-///
-/// # Safety
-/// `rsp0` must point to the top of a valid, mapped kernel stack.
-pub unsafe fn update_tss_rsp0(rsp0: u64) { unsafe {
-    let tss_ptr = &tss as *const u8 as *mut u8;
-    // RSP0 is at offset 4 in the x86-64 TSS
-    core::ptr::write_unaligned(tss_ptr.add(4) as *mut u64, rsp0);
-}}
-
-unsafe fn install_tss_in_gdt() { unsafe {
-    let base = &tss as *const u8 as u64;
-    let limit: u64 = 103;
-    let gdt_ptr = &gdt64 as *const u8 as *mut u8;
-    let tss_desc = gdt_ptr.add(0x18);
-
-    // Low 8 bytes of 16-byte TSS descriptor
-    let low: u64 = (limit & 0xFFFF)
-        | ((base & 0xFFFF) << 16)
-        | (((base >> 16) & 0xFF) << 32)
-        | (0x89u64 << 40)
-        | (((base >> 24) & 0xFF) << 56);
-
-    // High 8 bytes: upper 32 bits of base
-    let high: u64 = base >> 32;
-
-    core::ptr::write_unaligned(tss_desc as *mut u64, low);
-    core::ptr::write_unaligned(tss_desc.add(8) as *mut u64, high);
-}}
-
-unsafe fn reload_gdt() { unsafe {
-    let ptr = &gdt64_ptr as *const u8;
-    core::arch::asm!(
-        "lgdt ({0})",
-        in(reg) ptr,
-        options(att_syntax, nostack)
-    );
-}}
-
-unsafe fn load_tss() { unsafe {
-    core::arch::asm!(
-        "ltr %ax",
-        in("ax") 0x18u16,
-        options(att_syntax, nostack, nomem)
-    );
 }}
 
 unsafe fn setup_idt() { unsafe {

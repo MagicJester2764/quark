@@ -282,12 +282,8 @@ fn fork_return_inner(frame: *const crate::task::UserFrame, pml4: u64) -> ! {
     unsafe {
         paging::write_cr3(pml4 as usize);
     }
-    let kernel_rsp = crate::scheduler::current_kernel_stack_top();
-    unsafe {
-        syscall::setup_percpu(kernel_rsp);
-        crate::idt::update_tss_rsp0(kernel_rsp);
-        syscall::enter_usermode_frame(frame)
-    }
+    crate::percpu::set_kernel_stack(crate::scheduler::current_kernel_stack_top());
+    unsafe { syscall::enter_usermode_frame(frame) }
 }
 
 /// Inner function called by the trampoline with proper C ABI args.
@@ -297,8 +293,8 @@ fn enter_user_inner(entry: u64, stack: u64, pml4: u64, arg: u64) {
         paging::write_cr3(pml4 as usize);
     }
 
-    // Set up per-CPU kernel stack for syscall re-entry and TSS RSP0
-    // for hardware exception handling from ring 3.
+    // Where a system call and an interrupt from ring 3 will find this
+    // task's kernel stack.
     //
     // The *top* of the stack rather than the RSP this is running on: nothing
     // below it survives entering user mode, and the scheduler publishes the
@@ -306,11 +302,7 @@ fn enter_user_inner(entry: u64, stack: u64, pml4: u64, arg: u64) {
     // a caller's saved registers from the top less their size, and would find
     // them somewhere else for a task that had not been switched away from
     // since it started.
-    let kernel_rsp = crate::scheduler::current_kernel_stack_top();
-    unsafe {
-        syscall::setup_percpu(kernel_rsp);
-        crate::idt::update_tss_rsp0(kernel_rsp);
-    }
+    crate::percpu::set_kernel_stack(crate::scheduler::current_kernel_stack_top());
 
     // Enter user mode
     unsafe {
