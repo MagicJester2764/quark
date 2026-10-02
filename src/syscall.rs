@@ -711,7 +711,12 @@ extern "C" fn syscall_dispatch(
             scheduler::exit_with((arg0 & 0xFF) as i32)
         }
         SYS_EXIT_PROGRAM => {
-            scheduler::exit_program(arg0 as i32);
+            // The low eight bits, for the reason `SYS_EXIT_CODE` keeps only
+            // them. This took what it was given whole, so a program whose
+            // `main` returned -1 — which is how a C program says it failed —
+            // was reported as ended by signal 1, and one that wanted to be
+            // believed killed had only to say so.
+            scheduler::exit_program((arg0 & 0xFF) as i32);
         }
         SYS_UMASK => {
             // arg0 = the new mask, or u64::MAX to leave it. Returns the old.

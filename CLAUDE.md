@@ -138,7 +138,7 @@ system hung.
 
 There are no tests in this tree, and that is the shape of a microkernel rather
 than an omission: the kernel is tested from outside, through the ABI, by a
-program. `dtest` in `../quarkutils` makes 565 checks — capabilities, IPC,
+program. `dtest` in `../quarkutils` makes 566 checks — capabilities, IPC,
 memory, descriptors, signals, scheduling, `dtest calls` with three million calls in
 three seconds — and `qfuzz` throws random requests at every service.
 
@@ -209,6 +209,14 @@ may keep — are in `../quarkutils/CLAUDE.md`; these are the kernel's.
   privileged `hlt`, so before this, one failed assert stopped everything. The
   program and not the task: a thread that faulted and went alone left the
   rest parked on whatever it held.
+- **A negative exit status is the kernel's to give.** What a program ends
+  itself with is kept as its low eight bits, by every call that ends one;
+  a fault or a kill is the negated signal, and nothing a program passes can
+  look like one. `SYS_EXIT_PROGRAM` took its argument whole for a long time
+  — it is the call a C program's `exit` makes — so `return -1` from `main`
+  was reported as a hangup, and a program that wanted to be believed killed
+  had only to say so. A sweep that runs every program with arguments nobody
+  would give it found it, in a terminal that could not find its display.
 - **Capabilities are the authority.** There is no UID 0 bypass; `uid == 0` no
   longer short-circuits `cap::task_has_*`. A service that cannot do something
   is missing a capability, not a privilege level.
