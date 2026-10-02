@@ -109,6 +109,9 @@ will meet:
 
 - **`exec` in a program with threads is refused.** POSIX has it end every
   other thread, and ending them means unwinding what they hold in a server.
+- **A child is its creator task's to wait for, not its program's.** A thread
+  cannot collect a child another thread of its program forked; POSIX lets
+  any thread. The children of a thread that has ended are nobody's.
 - **A thread starts with a copy of its creator's capabilities**, not a share:
   what either is granted or gives up afterwards the other does not see.
   Descriptors are the program's and are shared.

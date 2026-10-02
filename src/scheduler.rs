@@ -154,9 +154,16 @@ const NO_CPU: u8 = u8::MAX;
 /// child that is still running.
 static mut UNANNOUNCED: [bool; MAX_TASKS] = [false; MAX_TASKS];
 
-/// A dead task could not be taken apart because it was still on a
-/// processor. Whoever next comes into the kernel from ring 3, or has
-/// nothing to do, tries again.
+/// Dead, and nobody is going to wait for it: a thread that is joined
+/// through the word it asked to have cleared ([`joined_by_word`]). Decided
+/// as it dies, when the word is forgotten.
+static mut UNWAITED: [bool; MAX_TASKS] = [false; MAX_TASKS];
+
+/// There is a dead task for the kernel to take apart: one nobody will
+/// collect — a thread joined through its word, a task whose creator has
+/// gone — or one that could not be taken apart when somebody tried, because
+/// it was still on a processor. Whoever next comes into the kernel from
+/// ring 3, or has nothing to do, does it.
 static REAP_WANTED: AtomicBool = AtomicBool::new(false);
 
 /// Initialize the scheduler. Creates the idle task (TID 0) which represents
@@ -324,6 +331,7 @@ pub fn exit_with(code: i32) -> ! {
         // gone, and a parent waiting for it went on waiting. Interrupts stay
         // off until the switch, which is the last thing this task does.
         let _ = irq_save();
+        UNWAITED[current] = joined_by_word(current);
         if let Some(ref mut task) = TASKS[current] {
             task.clear_child_tid = 0;
             task.state = TaskState::Dead;
@@ -832,8 +840,9 @@ unsafe fn runs_elsewhere(tid: usize) -> bool { unsafe {
 /// an interrupt taken in ring 3. With one processor neither can have
 /// happened: a task that is running is the one doing things.
 ///
-/// And if a dead task was left waiting to be taken apart because it was
-/// still running somewhere, this is as good a moment as the idle loop.
+/// And if there is a dead task the kernel is to take apart, this is as
+/// good a moment as the idle loop — and one that comes whether or not the
+/// machine ever has nothing to do.
 pub fn arrived() {
     // Looked at before it is taken: this is on the way into every system
     // call, and taking it is a write every processor would wait its turn at.
@@ -913,6 +922,60 @@ pub fn stop_here() {
     while is_held(current_tid()) {
         yield_now();
     }
+}
+
+/// Whether `tid` is a task nobody waits for: a thread — made by a task of
+/// its own program — with a word to be cleared when it ends
+/// (`SYS_SET_CLEAR_TID`), which its creator gives it before starting it.
+///
+/// That word is how such a thread is joined. A C library registers one for
+/// every thread it makes and waits on the word, never on the task; what it
+/// waits for with a *wait* are its child processes, and a thread among them
+/// is a child it did not make: `waitpid(-1)` answered with a thread that
+/// had ended, and with "none has ended yet" for a program whose only
+/// children were its own threads, where the answer is that it has none.
+/// A thread with no such word is waited for like any child — that is how
+/// this system's own runtime joins one.
+///
+/// # Safety
+/// Interrupts must be off.
+unsafe fn joined_by_word(tid: usize) -> bool { unsafe {
+    if UNWAITED[tid] {
+        return true;
+    }
+    let Some(ref t) = TASKS[tid] else { return false };
+    let parent = t.parent_tid;
+    t.clear_child_tid != 0
+        && t.space != 0
+        && parent != 0
+        && TASKS[parent].as_ref().is_some_and(|p| p.space == t.space)
+}}
+
+/// `tid` has been given a word to clear. If that makes it a thread nobody
+/// waits for, and its creator is waiting — for it, or for any child — the
+/// creator looks again, and may find it has no children at all.
+///
+/// A thread's creator gives the word before the thread is started, and
+/// then there is nobody waiting. But the call can be made by a thread for
+/// itself, later, and a wait that had counted it as a child would go on
+/// waiting for a task no wait is ever given.
+pub fn word_given(tid: usize) {
+    if tid >= MAX_TASKS {
+        return;
+    }
+    let flags = irq_save();
+    unsafe {
+        if joined_by_word(tid) {
+            let parent = TASKS[tid].as_ref().map_or(0, |t| t.parent_tid);
+            if parent != 0 && waits_for(parent, tid) {
+                WAIT_BLOCKED[parent] = false;
+                WAIT_RESULT[parent] = 0;
+                WAIT_AGAIN[parent] = true;
+                unblock_task(parent);
+            }
+        }
+    }
+    irq_restore(flags);
 }
 
 /// Is `parent` blocked in a wait that `child` is one of the children of?
@@ -1161,7 +1224,11 @@ pub fn sys_wait_for(target: u64, how: Wait) -> u64 {
             let wanted = |i: usize| {
                 if group != 0 { crate::job::pgid_of(i) == group } else { target == 0 || target == i }
             };
-            let mine = |i: usize| wanted(i) && TASKS[i].as_ref().is_some_and(|t| t.parent_tid == parent);
+            // Not a thread that is joined through its word: that is no
+            // child of anybody's.
+            let mine = |i: usize| {
+                wanted(i) && TASKS[i].as_ref().is_some_and(|t| t.parent_tid == parent) && !joined_by_word(i)
+            };
             // Check if a child is already dead (zombie) and not yet reaped.
             // Not one that was ended from another processor and is still
             // running there: it is collected when that processor has left
@@ -1397,8 +1464,10 @@ unsafe fn tell_parent(tid: usize) { unsafe {
 /// End a task that is not the one running, with a status.
 fn end_other(tid: usize, code: i32) -> Result<(), ()> {
     unsafe {
+        let unwaited = joined_by_word(tid);
         match TASKS[tid].as_mut() {
             Some(task) if task.state != TaskState::Dead => {
+                UNWAITED[tid] = unwaited;
                 task.state = TaskState::Dead;
                 task.exit_code = code;
                 crate::ipc::clear_signal_deadline(tid);
@@ -1438,8 +1507,28 @@ fn end_other(tid: usize, code: i32) -> Result<(), ()> {
 unsafe fn announce(tid: usize) { unsafe {
     let Some(ref task) = TASKS[tid] else { return };
     let (parent, code) = (task.parent_tid, task.exit_code);
+    if UNWAITED[tid] {
+        // A thread joined through its word, which was cleared as it died:
+        // that was the whole of its being collected, and no wait is woken
+        // for it. Nobody is coming for what is left, so the kernel takes it
+        // apart — the next time anybody is at the door, or has nothing to
+        // do. Left to its creator's wait, it stayed until its program
+        // ended, and a program that made threads one after another used up
+        // the machine's places for tasks.
+        REAPED[tid] = true;
+        REAP_WANTED.store(true, Ordering::Relaxed);
+        return;
+    }
+    if parent == 0 || TASKS[parent].is_none() {
+        // Nobody's either: whoever made it has gone. A thread made by a
+        // thread that has since ended is one of these, so they are not
+        // left for a processor with nothing to do — a busy machine has
+        // none.
+        REAP_WANTED.store(true, Ordering::Relaxed);
+        return;
+    }
     // If parent is blocked in sys_wait, wake it with the dead child's TID
-    if parent != 0 && waits_for(parent, tid) {
+    if waits_for(parent, tid) {
         WAIT_BLOCKED[parent] = false;
         WAIT_RESULT[parent] = tid;
         WAIT_CODE[parent] = code;
@@ -1779,6 +1868,7 @@ unsafe fn reap_one(i: usize) -> u64 { unsafe {
     PROCESS_ID[i] = 0;
     HELD[i] = false;
     UNANNOUNCED[i] = false;
+    UNWAITED[i] = false;
     crate::job::forget(i);
     TASKS[i] = None;
 
@@ -2056,6 +2146,7 @@ pub fn create_empty_task() -> Option<usize> {
         // shell started, and what those started.
         HELD[tid] = false;
         UNANNOUNCED[tid] = false;
+        UNWAITED[tid] = false;
         ON_CPU[tid] = NO_CPU;
         crate::job::born(tid, parent, PROCESS_ID[tid]);
         crate::fdtable::attach_new(tid);

@@ -1,6 +1,6 @@
 # Quark syscall ABI
 
-**Version 3.10.** Query the running kernel with `SYS_ABI_VERSION` (240), which
+**Version 3.11.** Query the running kernel with `SYS_ABI_VERSION` (240), which
 returns `(major << 16) | minor`.
 
 This document is the contract between the Quark kernel and everything above it.
@@ -211,6 +211,7 @@ returning at once turned that loop into a spin.
 | 3.9 | **Who a task is.** A task is in up to sixteen groups besides its own: `SYS_GROUPS` (212) reads them for anybody and sets them for a holder of `SetUid`, they are inherited as the user and group are, and a file server reads them to decide whether a file's group is one of the caller's. `SYS_IDENTIFY` (213) is how a server that holds `SetUid` says who somebody is: the user, the group and the groups of a task that is in a call to it, or of a child that task has created and not started, set in one step and checked by the kernel at that step. `SYS_SET_UID` and `SYS_SET_GID` are unchanged. Also, with no new number: a task waiting on one that ends — sending to it, in a call to it, receiving from it alone — stops waiting when it *ends*, where it used to when the dead task was collected. Its collector may be the one waiting: a parent in a call to a child that exited without answering waited for itself. And: a terminal's slave is for the session that has claimed the terminal — for the user who made the pair, until one has — and no longer for whoever holds a descriptor for it or knows its number. `SYS_PTY_OPEN`, a read or a write of a slave, and `SYS_PTY_CTL` ops 1 and 3 through one are refused to anybody else. A program left running by somebody who then logged out went on holding the console. |
 
 | 3.10 | **More than one processor.** The kernel starts every processor the machine's ACPI tables list and runs tasks on all of them, with itself on one at a time. `SYS_CPUS` (117) says how many there are and which the caller is on. Nothing else has a new number, and what changes is when things happen: tasks run at once; a task ended or stopped from outside while it runs on another processor goes on in ring 3 until that processor is interrupted; `SYS_WAIT_FOR` asked not to wait may answer 0 for a child ended an instant ago; and what a task starts may run before the call that started it returns. See *Processors* under block 0x70. |
+| 3.11 | **A thread joined through a word is not waited for.** A task made by a task of its own program, which has been given a word by `SYS_SET_CLEAR_TID` (106), is collected by the kernel when it ends and is no child to `SYS_WAIT` or `SYS_WAIT_FOR`: not answered with, and not counted among the children a wait could be for. It was both, so a C program's `waitpid(-1)` could answer with one of its own threads, a program with threads and no children was told to go on waiting, and a thread that had ended kept its place among the system's sixty-four tasks until its program did — a program that made threads one after another came to where nothing in the system could make a task. And the call takes a second argument: the task whose word it is, which may be one the caller has made and not started, so that a thread's creator says it before the thread exists to be asked about. A thread with no such word is waited for as before. |
 
 3.1 was a change of behaviour and no change of number, so a minor: nothing built for
 3.0 calls anything that means something else now. What it could have relied on
@@ -787,7 +788,7 @@ cannot resurrect a revoked capability in practice.
 | 101 | `SYS_GET_TUID` | arg0 = tid | `uid << 32 \| gid` of that task / `u64::MAX` | — |
 | 102 | `SYS_SET_FS_BASE` | arg0 = the caller's new FS base, a user address | 0 / `u64::MAX` | — |
 | 104 | `SYS_TASK_WATCH` | arg0 = tid | 0, or `u64::MAX` if that task is already gone | — |
-| 106 | `SYS_SET_CLEAR_TID` | arg0 = address of a `u32`, or 0 | this task's id / `u64::MAX` | — |
+| 106 | `SYS_SET_CLEAR_TID` | arg0 = address of a `u32`, or 0; arg1 = whose: 0 for the caller's, or a task the caller made and has not started | that task's id / `u64::MAX` | — |
 | 107 | `SYS_TASK_SPACE` | arg0 = tid | that task's space id / `u64::MAX` | — |
 | 108 | `SYS_SPACE_WATCH` | arg0 = space id | 0, or `u64::MAX` if no task of it is alive | — |
 | 109 | `SYS_TASK_CREATE_IN` | arg0 = cr3 of an address space the caller created | TID / `u64::MAX` | as `SYS_TASK_CREATE` |
@@ -858,6 +859,23 @@ and starts with a copy of its creator's capabilities, each in a slot the
 creator did not already fill for it, and the creator's band. Capabilities are
 a task's: what either is granted or gives up afterwards, the other does not
 see.
+
+A thread is joined one of two ways, and which is the thread's to say. One
+that gives `SYS_SET_CLEAR_TID` a word is joined *through the word*: when it
+ends the kernel writes 0 there and wakes whoever waits on it with
+`SYS_FUTEX_WAIT`, and that is all — the thread is collected by the kernel,
+and is no child to `SYS_WAIT` or `SYS_WAIT_FOR`, which neither answer with
+it nor count it among the children there are to wait for. This is what a C
+library wants: its threads are not its child processes, and a shell that
+asks whether it has any children left is not asking about threads. One that
+gives no word is a child like any other, kept until its creator waits for
+it, and its status is the answer. (The word only has this meaning for a
+task made by a task of its own program. A program's first task registers
+one too, and is still its parent's to wait for.) A thread's creator gives
+the word for it, before starting it (`SYS_SET_CLEAR_TID` with arg1 the new
+task): a thread left to give its own is, until it has run, a child like any
+other, and a wait that found it so would go on waiting for a task that is
+never handed to a wait.
 
 `SYS_TASK_PRIORITY` puts a task in a scheduling band: 0 drivers, 1 servers,
 2 ordinary programs, 3 the idle task. A task runs only when nothing in a better

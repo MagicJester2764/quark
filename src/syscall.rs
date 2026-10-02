@@ -388,7 +388,7 @@ pub const SYS_ABI_VERSION: u64 = 240;
 /// minor when calls are added. User space can refuse to run against a major it
 /// does not know, which is the point of exposing it at all.
 pub const ABI_VERSION_MAJOR: u64 = 3;
-pub const ABI_VERSION_MINOR: u64 = 10;
+pub const ABI_VERSION_MINOR: u64 = 11;
 
 /// Threads a task may make with no capability at all.
 ///
@@ -983,22 +983,39 @@ fn dispatch(
             }
         }
         SYS_SET_CLEAR_TID => {
-            // Register a word to clear and wake when this task exits, which is
+            // Register a word to clear and wake when a task exits, which is
             // Linux's CLONE_CHILD_CLEARTID and `set_tid_address`. Nothing to
-            // check but the address: a task may only name its own memory, and
-            // clearing it harms nobody else.
+            // check but the address: the word is in the memory of the task
+            // that exits, and clearing it harms nobody else.
+            //
+            // arg1 = whose: the caller's (0), or a task the caller has made
+            // and not started. The second is how a thread's creator says it
+            // before the thread exists to be asked about: a thread that
+            // registered its own word was, until it had run, a child like
+            // any other, and a wait that found it so went on waiting for
+            // something that would be joined and never waited for.
             let addr = arg0;
             if addr != 0 && (addr >= USER_ADDR_LIMIT || addr % 4 != 0) {
                 return u64::MAX;
             }
-            let tid = scheduler::current_tid();
+            let me = scheduler::current_tid();
+            let tid = if arg1 == 0 || arg1 == me as u64 {
+                me
+            } else if arg1 < crate::task::MAX_TASKS as u64 && may_prepare(me, arg1 as usize) {
+                arg1 as usize
+            } else {
+                return u64::MAX;
+            };
             match unsafe { scheduler::get_task_mut(tid) } {
                 Some(t) => {
                     t.clear_child_tid = addr;
-                    tid as u64
                 }
-                None => u64::MAX,
+                None => return u64::MAX,
             }
+            if addr != 0 {
+                scheduler::word_given(tid);
+            }
+            tid as u64
         }
         SYS_SET_FS_BASE => {
             let base = arg0;

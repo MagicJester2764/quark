@@ -138,7 +138,7 @@ system hung.
 
 There are no tests in this tree, and that is the shape of a microkernel rather
 than an omission: the kernel is tested from outside, through the ABI, by a
-program. `dtest` in `../quarkutils` makes 678 checks — capabilities, IPC,
+program. `dtest` in `../quarkutils` makes 684 checks — capabilities, IPC,
 memory, descriptors, signals, scheduling, users and terminals, `dtest calls`
 with three million calls in three seconds, `dtest smp` for what a second
 processor changes — and `qfuzz` throws random requests at every service.
@@ -488,6 +488,20 @@ every Unix program assumes:
   lost it. Reaping does it again for a task that died some other way.
 - **A descriptor sent over a stream outlives the sender's end.** It is in the
   stream rather than in the sender, and the peer can still take it.
+- **A thread joined through a word is nobody's child**
+  (`scheduler::joined_by_word`): a task made by a task of its own program,
+  with a word for the kernel to clear when it ends (`SYS_SET_CLEAR_TID`).
+  That is every thread a C library makes, and the word is how it is joined.
+  No wait answers with it or counts it, nothing is woken for it, and the
+  kernel takes it apart itself (`UNWAITED`) — at the next door
+  (`arrived`), not when a processor next has nothing to do, and the same
+  for a dead task whose creator has gone. Left as its creator's child, an
+  ended thread kept its place among sixty-four until its program ended, a
+  `waitpid(-1)` could be answered with one, and a program whose only
+  "children" were its threads was told to go on waiting. The creator gives
+  the word, before the thread is started: one that gave its own was a
+  child until it first ran. A thread with no word is still waited for,
+  which is how this system's own runtime joins one.
 - **A process is named by a number that is never used twice** (`SYS_PID`). A
   task id is a slot, and the next task made is given the lowest one free —
   usually the one just let go. Every Unix program that remembers a child
@@ -765,6 +779,10 @@ breaking any of them is quiet until it is a machine that stops.
 - A thread starts with a copy of its creator's *capabilities*, not a share of
   them: what either is granted or gives up afterwards, the other does not see.
   (Descriptors are shared: they are the program's.)
+- A child is the *task's* that made it, not the program's: a thread cannot
+  wait for a child another thread of its program forked, which POSIX lets
+  any thread do. And the children of a thread that has ended are nobody's:
+  no wait is given them, and no SIGCHLD is raised for them.
 - A poll set a task is parked on is not held the way a pipe is: a sibling
   closing the set while another thread waits on it leaves that thread to its
   timeout. A one-shot `SYS_POLL` makes a set of its own and is not affected.
