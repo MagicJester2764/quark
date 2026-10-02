@@ -138,12 +138,13 @@ system hung.
 
 There are no tests in this tree, and that is the shape of a microkernel rather
 than an omission: the kernel is tested from outside, through the ABI, by a
-program. `dtest` in `../quarkutils` makes 749 checks — capabilities, IPC,
+program. `dtest` in `../quarkutils` makes 750 checks — capabilities, IPC,
 memory, descriptors, signals, scheduling, users and terminals, `dtest calls`
 with three million calls in three seconds, `dtest smp` for what a second
 processor changes, `dtest clock` for what time it is and whether a wait ends
 when it should, `dtest fork` for what a fork shares and who a write is seen
-by, and seven more (`dtest msi`) on a machine with a device that
+by, twenty-three more (`dtest pressure`) on a machine with somewhere to write
+memory out to, and seven more (`dtest msi`) on a machine with a device that
 interrupts by message and its driver running — and `qfuzz` throws random
 requests at every service.
 
@@ -393,6 +394,49 @@ may keep — are in `../quarkutils/CLAUDE.md`; these are the kernel's.
 - **Validate user pointers with `validate_user_ptr{,_mut}`, not a range check.**
   The kernel runs on the caller's CR3; an in-range but unmapped address faults
   *inside* the kernel, sometimes with a lock held and interrupts off.
+- **What a system call has checked stays in memory until it returns**
+  (`scheduler::pin`, which `validate_user_range` does; `unpin` at the end of
+  `syscall_dispatch`). A call checks a buffer, waits — for a pipe to have
+  something in it — and then copies with a lock held, and a page that had
+  been written out in the meantime (`reclaim.rs`) could not be waited for
+  there: it would be a fault in the kernel with interrupts off, and the
+  machine. So what is taken from a program is never a page a call some task
+  of it is in has checked. Eight ranges a call are remembered, and a call
+  that checks more holds all of its program's memory. A new place the
+  kernel touches a program's memory with interrupts off touches only what
+  the call validated — or pins it itself, as the futex wait does its word.
+  A fault in the kernel where interrupts were *on* may wait like one from
+  ring 3 (`may_wait` in `idt.rs`): it could have been preempted there.
+- **Memory is taken only from what can do without it, and given up only
+  when it is somewhere else.** `reclaim.rs` is the whole of it and says
+  what and why; the rules it leaves:
+  - *Never from a driver or a server* (`scheduler::space_gives_memory`):
+    they are what a page is written out with and read back by, and one
+    waiting for its own page waits for ever. That is also why the pager
+    for memory, the file server it writes through and the disk driver
+    under that are a server, a server and a driver.
+  - *The last frames are theirs* (`reclaim::frame`, `reserve`): what gives
+    a program's page its frame asks there, not `pmm::alloc`, and is
+    refused while the last hundred-and-twenty-eighth of memory is all
+    that is free. `pmm::alloc` itself is for the kernel's own needs.
+  - *A frame of an object's cache is counted once for each entry that maps
+    it* (`pmm::mapped`, in `back_object` and `copy_pt`; `pmm::unmapped`, in
+    `memobj::drop_entry` and where a mapping is taken back): nought is what
+    lets the cache give it up. Map one somewhere new and not count it, and
+    the cache gives the frame away under the mapping.
+  - *A page number of the object memory is written out to is counted once
+    for each reservation that names it* (`memobj::swap_ref`, `swap_unref`):
+    a fork copies a reservation, and each side has its own page when it
+    touches it. Nought is a number that is free, and the lowest free is the
+    one given: a file that backs the object is then as long as the most
+    that was ever out at once.
+  - *Nothing is given up that its pager has not written* — and said it
+    wrote (`CTL_TAKE_OUT`, `CTL_WRITTEN`): a page taken to be written is
+    neither clean nor dirty until then, so a full disk leaves it in memory
+    rather than nowhere.
+  - *A limit is not a shortage* (`Fault::Limit`, `Fault::NoMemory`): a task
+    at its own limit is ended at once, as before, and only one the machine
+    has no frame for waits.
 - **Mapping authority is ownership first, `PhysRange` second.** `sys_map_phys`
   and the deprecated `sys_addrspace_map` accept frames the caller owns
   (`pmm::owns_range`), so a task that allocated a frame may map it holding no
@@ -1017,12 +1061,17 @@ breaking any of them is quiet until it is a machine that stops.
 
 ## Known gaps
 
-- Nothing is ever paged out: anonymous memory is given its frames when first
-  touched (`SYS_MAP_ANON`, which the C library's `mmap` uses) and keeps them.
-  A machine that runs out ends whichever task touched the page it could not
-  give (SIGBUS), not the biggest. Reading an untouched page gives it a frame
-  of its own, where Linux maps one shared page of zeroes. Rust programs' heaps
-  still come from `SYS_MMAP`, backed at once.
+- Memory is written out only where a system starts a pager for it
+  (`swapd` in `../quarkutils`), and only as fast as that pager's disk: it
+  writes through the file server, a page a call. With none, or with it
+  full, a machine that runs out ends whichever task touched the page it
+  could not give (SIGBUS), not the biggest. Memory is looked for when a
+  frame is wanted and there is none, by whoever wanted it; nothing looks
+  ahead of time. A page a fork left in two programs is not taken while it
+  is in both, and a page of a file mapped to be written through is not
+  taken at all. Reading an untouched page gives it a frame of its own,
+  where Linux maps one shared page of zeroes. Rust programs' heaps still
+  come from `SYS_MMAP`, backed at once.
 - A threaded program cannot `exec`: POSIX has it end every other thread, and
   ending them means unwinding what they hold in a server, so it is refused
   rather than half done.
@@ -1052,9 +1101,10 @@ breaking any of them is quiet until it is a machine that stops.
 - A task woken on time runs at once only if it is of a better band than what
   the first processor is running, or a processor is idle: one of the same
   band waits its turn, as any woken task does.
-- The page cache for mapped files holds 8192 pages across 256 objects and
-  nothing evicts them under pressure: a mapped file's pages stay until nothing
-  maps the file any more.
+- The page cache holds 8192 pages across 256 objects, memory on its way
+  out included: that is thirty-two megabytes, and a machine taking pages
+  from programs faster than its pager writes them takes no more until
+  some have been written.
 - A thread starts with a copy of its creator's *capabilities*, not a share of
   them: what either is granted or gives up afterwards, the other does not see.
   (Descriptors are shared: they are the program's.)

@@ -308,11 +308,11 @@ pub fn exit_with(code: i32) -> ! {
         let clear_at = TASKS[current].as_ref().map_or(0, |t| t.clear_child_tid);
         if clear_at != 0 {
             let cr3 = read_cr3_of(current);
-            // On a page shared since a fork it is this program's own word
-            // that is cleared, and a write that would not be allowed until
-            // the page is its own. (The word is four bytes at a multiple
-            // of four: it is in one page.)
-            let _ = crate::paging::own(cr3, clear_at as usize);
+            // The page is given back its memory first, if it has been
+            // written out since the word was named; and on a page shared
+            // since a fork it is this program's own word that is cleared,
+            // a write that would not be allowed until the page is its own.
+            let _ = crate::paging::back_range(cr3, clear_at, 4, true);
             if crate::paging::user_range_accessible(cr3, clear_at, 4, true) {
                 let _ua = crate::cpu::UserAccess::begin();
                 core::ptr::write_volatile(clear_at as *mut u32, 0);
@@ -1621,9 +1621,23 @@ pub fn create_task_in(cr3: usize) -> Option<usize> {
         if let Some(t) = TASKS[tid].as_mut() {
             t.space = space;
         }
+        NPINNED[tid] = 0;
     }
     irq_restore(flags);
     Some(tid)
+}
+
+/// A task of program `space` that has not died, if there is one.
+/// Interrupts must be off.
+pub fn task_of_space(space: u64) -> Option<usize> {
+    if space == 0 {
+        return None;
+    }
+    unsafe {
+        (*core::ptr::addr_of!(TASKS))
+            .iter()
+            .position(|t| matches!(t, Some(t) if t.space == space && t.state != TaskState::Dead))
+    }
 }
 
 /// Whether any task that has not died is running in address space `cr3`.
@@ -2134,6 +2148,7 @@ pub fn create_empty_task() -> Option<usize> {
         }
     };
     unsafe {
+        NPINNED[tid] = 0;
         TASKS[tid] = Some(Task {
             tid,
             state: TaskState::Blocked,
@@ -2361,6 +2376,92 @@ pub fn current_task_pager() -> usize {
             Some(task) => task.pager_tid,
             None => 0,
         }
+    }
+}
+
+/// How many ranges of its program's memory a system call can be remembered
+/// to have checked. More than that and all of the program's memory is held.
+const PINS: usize = 8;
+
+/// What the system call each task is in has checked of its program's
+/// memory, and may touch with interrupts off until it returns: these pages
+/// are not taken away to be written out (`reclaim.rs`). A call checks a
+/// buffer, waits — for a pipe to have something in it — and then copies
+/// with a lock held, where a page that had gone in the meantime could not
+/// be waited for.
+static mut PINNED: [[(u64, u64); PINS]; MAX_TASKS] = [[(0, 0); PINS]; MAX_TASKS];
+static mut NPINNED: [u8; MAX_TASKS] = [0; MAX_TASKS];
+
+/// The current task's system call has checked `len` bytes at `addr`.
+pub fn pin(addr: u64, len: u64) {
+    if len == 0 {
+        return;
+    }
+    let tid = current_tid();
+    let flags = irq_save();
+    unsafe {
+        let n = NPINNED[tid] as usize;
+        if n < PINS {
+            PINNED[tid][n] = (addr & !0xFFF, addr.saturating_add(len - 1) | 0xFFF);
+        }
+        // One past the last there is room for means "everything".
+        NPINNED[tid] = (n + 1).min(PINS + 1) as u8;
+    }
+    irq_restore(flags);
+}
+
+/// The current task's system call is over: what it checked is its
+/// program's to lose again.
+#[inline]
+pub fn unpin() {
+    let tid = current_tid();
+    unsafe { NPINNED[tid] = 0 };
+}
+
+/// Whether a system call some task of program `space` is in has checked
+/// the page at `va`. Interrupts must be off.
+pub fn pinned(space: u64, va: u64) -> bool {
+    unsafe {
+        for tid in 1..MAX_TASKS {
+            let n = NPINNED[tid] as usize;
+            if n == 0 {
+                continue;
+            }
+            if !matches!(TASKS[tid], Some(ref t) if t.space == space && t.state != TaskState::Dead) {
+                continue;
+            }
+            if n > PINS || PINNED[tid][..n].iter().any(|&(from, to)| (from..=to).contains(&va)) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Whether the current task is a driver or a server: what memory is taken
+/// from others for, and not from.
+pub fn current_is_privileged() -> bool {
+    let tid = current_tid();
+    unsafe { matches!(TASKS[tid], Some(ref t) if t.base_priority < PRIO_NORMAL) }
+}
+
+/// Whether memory may be taken from program `space` to be written out:
+/// not from a driver's or a server's, which are what it would be written
+/// out with. Interrupts must be off.
+pub fn space_gives_memory(space: u64) -> bool {
+    unsafe {
+        let mut any = false;
+        for tid in 1..MAX_TASKS {
+            if let Some(ref t) = TASKS[tid] {
+                if t.space == space && t.state != TaskState::Dead {
+                    if t.base_priority < PRIO_NORMAL {
+                        return false;
+                    }
+                    any = true;
+                }
+            }
+        }
+        any
     }
 }
 
@@ -2647,6 +2748,8 @@ pub fn exec_into(cr3: usize, entry: u64, rsp: u64) -> Result<(), ()> {
                 t.mem_pages = 0;
                 t.fpu = crate::fpu::clean();
             }
+            // What this call checked was memory of the program it was.
+            NPINNED[caller] = 0;
             // The program it was has no task now, and that is a program
             // gone: whoever watched it is told, as when a program's last
             // task dies. They were not. What a server kept for the old

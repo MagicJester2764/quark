@@ -650,6 +650,16 @@ fn exception(frame: &InterruptFrame) {
         }
     }
 
+    // Whether this fault may wait: for a pager to fill a page of a file or
+    // to read back one that was written out, or for memory to be found.
+    // One from ring 3 may. One from the kernel may where the kernel had
+    // interrupts on — it could have been preempted there, and waiting is no
+    // more than that — and not where it had them off: it has a lock, or is
+    // half way through something that must not be seen half done. What a
+    // system call touches with interrupts off it has checked, and what it
+    // has checked is kept in memory until it returns (`scheduler::pin`).
+    let may_wait = from_user || frame.rflags & (1 << 9) != 0;
+
     // A fault on a page a mapping reserved is served, not fatal: the page is
     // given its memory and the instruction runs again. The kernel's own copies
     // to and from user memory back what they touch first, but one that did
@@ -659,18 +669,25 @@ fn exception(frame: &InterruptFrame) {
         unsafe { core::arch::asm!("mov {}, cr2", out(reg) cr2, options(nostack, nomem)) };
         let write = frame.error_code & PF_WRITE != 0;
         let cr3 = crate::paging::read_cr3();
-        // A page of a mapped file may have to be asked of its pager, which
-        // blocks; only a fault from user mode may wait for it. The kernel's
-        // own copies page theirs in before they start.
-        match unsafe { crate::paging::back(cr3, cr2 as usize, write, from_user) } {
-            Ok(()) => return,
-            Err(fault @ (crate::paging::Fault::NoMemory | crate::paging::Fault::Bus)) if from_user => {
-                // Promised and not there to give: Linux's overcommit bargain,
-                // and its answer. A page of a file that cannot be had is
-                // SIGBUS too.
-                no_page(cr2, matches!(fault, crate::paging::Fault::NoMemory));
+        loop {
+            match unsafe { crate::paging::back(cr3, cr2 as usize, write, may_wait) } {
+                Ok(()) => return,
+                // No frame to give it with. Memory is looked for, and waited
+                // for while it is being written out; the page is asked for
+                // again if that produced any.
+                Err(crate::paging::Fault::NoMemory) if may_wait && crate::reclaim::wait() => {}
+                Err(
+                    fault @ (crate::paging::Fault::NoMemory
+                    | crate::paging::Fault::Limit
+                    | crate::paging::Fault::Bus),
+                ) if from_user => {
+                    // Promised and not there to give: Linux's overcommit
+                    // bargain, and its answer. A page of a file that cannot
+                    // be had is SIGBUS too.
+                    no_page(cr2, !matches!(fault, crate::paging::Fault::Bus));
+                }
+                Err(_) => break,
             }
-            Err(_) => {}
         }
     }
 
@@ -687,11 +704,15 @@ fn exception(frame: &InterruptFrame) {
         let cr2: u64;
         unsafe { core::arch::asm!("mov {}, cr2", out(reg) cr2, options(nostack, nomem)) };
         let cr3 = crate::paging::read_cr3();
-        match unsafe { crate::paging::own(cr3, cr2 as usize) } {
-            Ok(true) => return,
-            // The same bargain: a fork promised a page it had not got.
-            Err(_) if from_user => no_page(cr2, true),
-            _ => {}
+        loop {
+            match unsafe { crate::paging::own(cr3, cr2 as usize) } {
+                Ok(true) => return,
+                Ok(false) => break,
+                Err(_) if may_wait && crate::reclaim::wait() => {}
+                // The same bargain: a fork promised a page it had not got.
+                Err(_) if from_user => no_page(cr2, true),
+                Err(_) => break,
+            }
         }
     }
 

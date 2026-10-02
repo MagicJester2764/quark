@@ -9,11 +9,25 @@
 //! cache when the pager answers.
 //!
 //! The cache belongs to the object. A cached frame may be mapped in any number
-//! of places, and nothing records where, so none is freed while the object
-//! lives: the object is released only once nothing maps any of its pages, and
-//! its pager has had the chance to write back what it must. The count of
-//! mapped entries is kept by the page tables' own walks, which find an
-//! object's slot in bits 52–62 of every entry that refers to it.
+//! of places, and nothing records where — only how many (`pmm::mapped`, the
+//! count a frame has): a frame nothing maps, holding nothing its pager has
+//! still to write, can be given up when memory is short ([`evict`]) and
+//! asked for again when it is wanted. The object itself is released only
+//! once nothing maps any of its pages, and its pager has had the chance to
+//! write back what it must. The count of mapped entries is kept by the page
+//! tables' own walks, which find an object's slot in bits 52–62 of every
+//! entry that refers to it.
+//!
+//! **One object is where memory that is nobody's file goes** ([`swap_slot`]).
+//! A page of a program's own that has not been used for a while is moved
+//! into that object's cache — the same frame, under a page number the
+//! kernel picks — and the program's entry becomes a reservation for it, as
+//! if it had mapped a file there and not yet touched the page. From then on
+//! it is a dirty page like any other: its pager writes it out when asked,
+//! the frame is given up, and the first touch pages it back in. What is
+//! different is that the page has one owner, or a few after a `fork`, and
+//! is theirs alone again when they touch it: it leaves the cache, and its
+//! number is free (`SWAP_REFS`).
 //!
 //! Everything here runs with interrupts off except the pager call, and nothing
 //! here allocates from the heap, which can turn them back on.
@@ -32,11 +46,21 @@ pub const CTL_READ_PAGE: u64 = 1;
 pub const CTL_WRITE_PAGE: u64 = 2;
 pub const CTL_TAKE_DIRTY: u64 = 3;
 pub const CTL_RELEASE: u64 = 4;
+/// This object is where anonymous memory goes when memory is short.
+pub const CTL_SWAP: u64 = 5;
+/// As `CTL_TAKE_DIRTY`, but the page is neither clean nor dirty until its
+/// pager says how the writing went.
+pub const CTL_TAKE_OUT: u64 = 6;
+/// A page taken with `CTL_TAKE_OUT` has been written (arg 1) or could not
+/// be (0).
+pub const CTL_WRITTEN: u64 = 7;
 /// `CTL_RELEASE`'s answer while a task other than the pager holds a
 /// capability for the object: not now, and nothing will say when.
 pub const RELEASE_LATER: u64 = 1;
 
 const PAGE: usize = 4096;
+/// Where a present entry keeps its frame's address.
+const FRAME_BITS: u64 = 0x000F_FFFF_FFFF_F000;
 /// Page indices fit in the 40 bits a reservation keeps them in.
 pub const MAX_PAGE: u64 = (1 << 40) - 1;
 
@@ -92,10 +116,14 @@ struct Cached {
     key: u64,
     frame: usize,
     dirty: bool,
+    /// Its pager has a copy and is writing it (`CTL_TAKE_OUT`): not to be
+    /// given up until that is known to have worked, and not to be taken
+    /// again meanwhile.
+    writing: bool,
 }
 
 static mut CACHE: [Cached; CACHE_SLOTS] =
-    [Cached { key: EMPTY_KEY, frame: 0, dirty: false }; CACHE_SLOTS];
+    [Cached { key: EMPTY_KEY, frame: 0, dirty: false, writing: false }; CACHE_SLOTS];
 
 #[inline(always)]
 fn irq_save() -> u64 {
@@ -129,32 +157,67 @@ fn home(key: u64) -> usize {
     (key.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 51) as usize % CACHE_SLOTS
 }
 
-/// The cache entry for `key`, if there is one.
-fn find(key: u64) -> Option<&'static mut Cached> {
+/// How many entries of the cache hold a page.
+static mut LIVE: usize = 0;
+
+/// Where in the cache `key`'s entry is, if it has one.
+fn place(key: u64) -> Option<usize> {
     let c = cache();
     let mut i = home(key);
     for _ in 0..CACHE_SLOTS {
         match c[i].key {
             EMPTY_KEY => return None,
-            k if k == key => return Some(&mut c[i]),
+            k if k == key => return Some(i),
             _ => i = (i + 1) % CACHE_SLOTS,
         }
     }
     None
 }
 
-/// Add `key -> frame`. False if the cache is full.
+/// The cache entry for `key`, if there is one.
+fn find(key: u64) -> Option<&'static mut Cached> {
+    place(key).map(|i| &mut cache()[i])
+}
+
+/// Add `key -> frame`. False if the cache is full, which is asked first:
+/// the search for a place in a full table is a walk of the whole of it,
+/// and whoever is looking for memory asks for every page it considers.
 fn insert(key: u64, frame: usize) -> bool {
+    if unsafe { *core::ptr::addr_of!(LIVE) } >= CACHE_SLOTS {
+        return false;
+    }
     let c = cache();
     let mut i = home(key);
     for _ in 0..CACHE_SLOTS {
         if c[i].key == EMPTY_KEY || c[i].key == GONE_KEY {
-            c[i] = Cached { key, frame, dirty: false };
+            c[i] = Cached { key, frame, dirty: false, writing: false };
+            unsafe { *core::ptr::addr_of_mut!(LIVE) += 1 };
             return true;
         }
         i = (i + 1) % CACHE_SLOTS;
     }
     false
+}
+
+/// Take the entry in place `i` out of the cache.
+///
+/// It leaves a gap that a search steps past, because the entry it is
+/// looking for may have been put beyond this one. Where the next place is
+/// empty nothing was, and the gap — with any gaps before it — is empty
+/// too. Pages come and go through here all the time now, and gaps that
+/// were only ever left would in the end be the whole table: every search
+/// for a page that is not there would walk all of it.
+fn forget(i: usize) {
+    let c = cache();
+    c[i] = Cached { key: GONE_KEY, frame: 0, dirty: false, writing: false };
+    unsafe { *core::ptr::addr_of_mut!(LIVE) -= 1 };
+    if c[(i + 1) % CACHE_SLOTS].key == EMPTY_KEY {
+        let mut j = i;
+        while c[j].key == GONE_KEY {
+            c[j].key = EMPTY_KEY;
+            j = (j + CACHE_SLOTS - 1) % CACHE_SLOTS;
+        }
+    }
 }
 
 /// A live object in `slot`, by id if `id` is not 0.
@@ -207,14 +270,19 @@ pub fn create(pager: usize, cookie: u64, bytes: u64) -> Option<(usize, u64)> {
 
 /// Free everything the object in `slot` holds, and the slot.
 fn release(slot: usize) {
-    let c = cache();
-    for e in c.iter_mut() {
+    for i in 0..CACHE_SLOTS {
+        let e = cache()[i];
         if e.key != EMPTY_KEY && e.key != GONE_KEY && (e.key >> 40) as usize == slot {
+            // Nothing maps the object, so nothing maps this: a count that
+            // had stuck at the most it can say is not one to keep the
+            // frame for.
+            pmm::unmapped_everywhere(e.frame);
             pmm::free(pmm::PhysFrame::from_address(e.frame));
-            *e = Cached { key: GONE_KEY, frame: 0, dirty: false };
+            forget(i);
         }
     }
     objects()[slot] = Object::EMPTY;
+    swap_gone(slot);
 }
 
 /// A page-table entry that named an object has been cleared or replaced.
@@ -224,7 +292,16 @@ pub fn drop_entry(raw: u64) {
     if slot == 0 {
         return;
     }
-    let shared_writable = raw & crate::paging::PRESENT != 0
+    let present = raw & crate::paging::PRESENT != 0;
+    if present && raw & crate::paging::OWNED == 0 {
+        // It mapped a frame of the cache, which has one mapping fewer.
+        pmm::unmapped((raw & FRAME_BITS) as usize);
+    }
+    if !present {
+        // A reservation for a page that was written out names its number.
+        swap_unref(slot, (raw >> 12) & MAX_PAGE);
+    }
+    let shared_writable = present
         && raw & crate::paging::WRITABLE != 0
         && raw & crate::paging::OWNED == 0;
     if shared_writable {
@@ -324,7 +401,7 @@ pub fn page_in(slot: usize, page: u64, may_block: bool) -> Result<usize, Fault> 
         return Err(Fault::Invalid);
     }
 
-    let frame = pmm::alloc().ok_or(Fault::NoMemory)?.address();
+    let frame = crate::reclaim::frame().ok_or(Fault::NoMemory)?;
     unsafe { core::ptr::write_bytes(frame as *mut u8, 0, PAGE) };
     let msg = ipc::Message {
         sender: 0,
@@ -342,7 +419,12 @@ pub fn page_in(slot: usize, page: u64, may_block: bool) -> Result<usize, Fault> 
                 pmm::free(pmm::PhysFrame::from_address(frame));
                 Ok(e.frame)
             }
-            None if insert(key(slot, page), frame) => Ok(frame),
+            None if insert(key(slot, page), frame) => {
+                if slot == swap().slot {
+                    swap().back += 1;
+                }
+                Ok(frame)
+            }
             None => {
                 pmm::free(pmm::PhysFrame::from_address(frame));
                 Err(Fault::NoMemory)
@@ -419,6 +501,47 @@ fn ctl_locked(caller: usize, id: u64, op: u64, a: u64, b: u64) -> u64 {
             }
             e.key & MAX_PAGE
         }
+        CTL_TAKE_OUT => {
+            // The dirty page with the lowest number at or after `b` that is
+            // not being written already: copied out, and neither clean nor
+            // to be taken again until its pager says how the writing went.
+            let mut best: Option<usize> = None;
+            for (i, e) in cache().iter().enumerate() {
+                let live = e.key != EMPTY_KEY && e.key != GONE_KEY;
+                if live && e.dirty && !e.writing && (e.key >> 40) as usize == slot && e.key & MAX_PAGE >= b {
+                    let page = e.key & MAX_PAGE;
+                    if best.is_none_or(|j| cache()[j].key & MAX_PAGE > page) {
+                        best = Some(i);
+                    }
+                }
+            }
+            let Some(i) = best else { return u64::MAX };
+            let e = &mut cache()[i];
+            e.writing = true;
+            let _ua = crate::cpu::UserAccess::begin();
+            unsafe {
+                core::ptr::copy_nonoverlapping(e.frame as *const u8, a as *mut u8, PAGE);
+            }
+            e.key & MAX_PAGE
+        }
+        CTL_WRITTEN => {
+            // Page `b` was written (`a` = 1) or could not be (0). A page
+            // that has gone from the cache meanwhile — its owner touched it
+            // again and has it back — is nobody's business any more.
+            let keep = o.writable != 0;
+            if let Some(e) = find(key(slot, b)) {
+                if e.writing {
+                    e.writing = false;
+                    if a == 1 && !keep {
+                        e.dirty = false;
+                    }
+                }
+            }
+            0
+        }
+        CTL_SWAP => {
+            if swap_on(slot) { 0 } else { u64::MAX }
+        }
         CTL_RELEASE => {
             if o.mapped != 0 {
                 return u64::MAX;
@@ -439,4 +562,278 @@ fn ctl_locked(caller: usize, id: u64, op: u64, a: u64, b: u64) -> u64 {
         }
         _ => u64::MAX,
     }
+}
+
+/// The object memory that is nobody's file is written out to, and what the
+/// kernel keeps about its pages: for each page number, how many page-table
+/// entries are reservations for it. None is a number that is free.
+struct Swap {
+    /// The object's slot; 0 while there is none.
+    slot: usize,
+    /// How many page numbers it has.
+    pages: usize,
+    /// The count for each, a byte a page, in frames of its own.
+    refs: *mut u8,
+    /// How many frames that table takes.
+    frames: usize,
+    /// How many numbers are in use.
+    used: usize,
+    /// No number below this one is free: where to begin looking. The
+    /// lowest free number is the one given, always, so that a pager whose
+    /// object is a file has a file as long as the most that was ever out
+    /// at once and no longer — given out in turn, every number is used
+    /// before any is used twice, and a file asked to be thirty-two
+    /// megabytes took all thirty-two from a disk with twenty-four.
+    next: usize,
+    /// Pages written out, and pages read back from the pager, since the
+    /// machine started.
+    out: u64,
+    back: u64,
+}
+
+const NO_SWAP: Swap =
+    Swap { slot: 0, pages: 0, refs: core::ptr::null_mut(), frames: 0, used: 0, next: 0, out: 0, back: 0 };
+static mut SWAP: Swap = NO_SWAP;
+
+fn swap() -> &'static mut Swap {
+    unsafe { &mut *core::ptr::addr_of_mut!(SWAP) }
+}
+
+fn swap_refs() -> &'static mut [u8] {
+    let s = swap();
+    if s.refs.is_null() {
+        return &mut [];
+    }
+    unsafe { core::slice::from_raw_parts_mut(s.refs, s.pages) }
+}
+
+/// The slot of the object memory is written out to, or 0 if there is none.
+/// It is what a reservation for a written-out page names.
+pub fn swap_slot() -> usize {
+    swap().slot
+}
+
+/// How much there is to write memory out to, and how much of it is in use,
+/// in pages.
+pub fn swap_room() -> (usize, usize) {
+    let flags = irq_save();
+    let s = swap();
+    let out = if s.slot == 0 { (0, 0) } else { (s.pages, s.used) };
+    irq_restore(flags);
+    out
+}
+
+/// How many pages have been written out, and how many read back from the
+/// pager, since the machine started.
+pub fn swap_traffic() -> (u64, u64) {
+    let flags = irq_save();
+    let s = swap();
+    let out = (s.out, s.back);
+    irq_restore(flags);
+    out
+}
+
+/// Make the object in `slot` the one memory is written out to. There is one
+/// at a time: a second is refused while the first is there.
+fn swap_on(slot: usize) -> bool {
+    let s = swap();
+    if s.slot != 0 {
+        return false;
+    }
+    let pages = objects()[slot].pages().min(MAX_PAGE) as usize;
+    if pages == 0 {
+        return false;
+    }
+    let frames = pages.div_ceil(PAGE);
+    let Some(table) = pmm::alloc_contiguous(frames, false) else {
+        return false;
+    };
+    unsafe { core::ptr::write_bytes(table.address() as *mut u8, 0, frames * PAGE) };
+    *s = Swap { slot, pages, refs: table.address() as *mut u8, frames, ..NO_SWAP };
+    true
+}
+
+/// The object in `slot` has been released. If it was where memory went,
+/// nothing is any more.
+fn swap_gone(slot: usize) {
+    let s = swap();
+    if s.slot != slot || slot == 0 {
+        return;
+    }
+    for i in 0..s.frames {
+        pmm::free(pmm::PhysFrame::from_address(s.refs as usize + i * PAGE));
+    }
+    *s = NO_SWAP;
+}
+
+/// Whether memory can be written out at all just now: there is somewhere
+/// for it, with a pager to write it and a number to give it.
+pub fn swap_ready() -> bool {
+    let s = swap();
+    s.slot != 0 && s.used < s.pages && object(s.slot, 0).is_some_and(|o| o.pager_alive())
+}
+
+/// Move `frame`, a page of some program's own, into the cache of the object
+/// memory is written out to. Answers with the page number it was given, for
+/// the reservation that replaces the program's entry; `None` if there is no
+/// number to give or no room in the cache, and the page stays where it is.
+///
+/// Interrupts must be off. The caller counts the reservation it writes
+/// ([`map_ref`]); the number is counted here.
+pub fn swap_out(frame: usize) -> Option<u64> {
+    if !swap_ready() {
+        return None;
+    }
+    let s = swap();
+    let refs = swap_refs();
+    let page = (s.next..s.pages).find(|&i| refs[i] == 0)?;
+    if !insert(key(s.slot, page as u64), frame) {
+        return None;
+    }
+    if let Some(e) = find(key(s.slot, page as u64)) {
+        e.dirty = true;
+    }
+    refs[page] = 1;
+    s.used += 1;
+    s.next = page + 1;
+    s.out += 1;
+    Some(page as u64)
+}
+
+/// One more reservation names written-out page `page` of the object in
+/// `slot`: a `fork` copied one.
+pub fn swap_ref(slot: usize, page: u64) {
+    let s = swap();
+    if slot == 0 || slot != s.slot {
+        return;
+    }
+    if let Some(count) = swap_refs().get_mut(page as usize) {
+        *count = count.saturating_add(1);
+    }
+}
+
+/// One fewer does. When none is left the page is nobody's: its number is
+/// free, and what the cache holds of it goes.
+pub fn swap_unref(slot: usize, page: u64) {
+    let flags = irq_save();
+    let s = swap();
+    if slot != 0 && slot == s.slot {
+        if let Some(count) = swap_refs().get_mut(page as usize) {
+            if *count != 0 && *count != u8::MAX {
+                *count -= 1;
+                if *count == 0 {
+                    s.used = s.used.saturating_sub(1);
+                    s.next = s.next.min(page as usize);
+                    if let Some(i) = place(key(slot, page)) {
+                        pmm::free(pmm::PhysFrame::from_address(cache()[i].frame));
+                        forget(i);
+                    }
+                }
+            }
+        }
+    }
+    irq_restore(flags);
+}
+
+/// Take written-out page `page` back out of the cache for the one entry
+/// that names it: the frame is that program's own again, and the number is
+/// free. `None` if more than one entry names the page — after a `fork` —
+/// and each has to be given a copy instead, or if the page is not in the
+/// cache (it is asked for first, [`page_in`]).
+///
+/// Interrupts must be off. The caller gives the reservation's reference
+/// back ([`unmap_ref`]).
+pub fn swap_take(page: u64) -> Option<usize> {
+    let s = swap();
+    let refs = swap_refs();
+    if s.slot == 0 || refs.get(page as usize).copied() != Some(1) {
+        return None;
+    }
+    let i = place(key(s.slot, page))?;
+    let frame = cache()[i].frame;
+    forget(i);
+    refs[page as usize] = 0;
+    s.used = s.used.saturating_sub(1);
+    s.next = s.next.min(page as usize);
+    Some(frame)
+}
+
+/// Where [`evict`] looks next.
+static mut HAND: usize = 0;
+
+/// Give up to `want` frames of the cache back to the allocator: pages that
+/// nothing maps, that hold nothing still to be written, and whose pager is
+/// there to give them again. Answers with how many went.
+pub fn evict(want: usize) -> usize {
+    let flags = irq_save();
+    let c = cache();
+    let mut gone = 0;
+    let start = unsafe { *core::ptr::addr_of!(HAND) };
+    for step in 0..CACHE_SLOTS {
+        if gone >= want {
+            break;
+        }
+        let i = (start + step) % CACHE_SLOTS;
+        let e = c[i];
+        if e.key == EMPTY_KEY || e.key == GONE_KEY || e.dirty || e.writing {
+            continue;
+        }
+        if pmm::shared(e.frame) != 0 {
+            continue;
+        }
+        // A page whose pager has gone cannot be asked for again: what the
+        // cache holds is all there is of it.
+        let slot = (e.key >> 40) as usize;
+        if !object(slot, 0).is_some_and(|o| o.pager_alive()) {
+            continue;
+        }
+        pmm::free(pmm::PhysFrame::from_address(e.frame));
+        forget(i);
+        gone += 1;
+        unsafe { *core::ptr::addr_of_mut!(HAND) = (i + 1) % CACHE_SLOTS };
+    }
+    irq_restore(flags);
+    gone
+}
+
+/// Ask every pager that has pages which could be given up if only they were
+/// written to write them, and say how many such pages there are — being
+/// written already or still to be asked for. Nought is nothing to wait for.
+pub fn ask_to_clean() -> usize {
+    let flags = irq_save();
+    let mut waiting = 0;
+    let mut asked = [0usize; 8];
+    let mut nasked = 0;
+    for e in cache().iter() {
+        if e.key == EMPTY_KEY || e.key == GONE_KEY || !e.dirty {
+            continue;
+        }
+        let slot = (e.key >> 40) as usize;
+        let Some(o) = object(slot, 0) else { continue };
+        // Mapped writable somewhere, it stays dirty whatever is written.
+        if !o.pager_alive() || o.writable != 0 || pmm::shared(e.frame) != 0 {
+            continue;
+        }
+        waiting += 1;
+        if !e.writing && !asked[..nasked].contains(&o.pager) && nasked < asked.len() {
+            asked[nasked] = o.pager;
+            nasked += 1;
+        }
+    }
+    for &pager in &asked[..nasked] {
+        ipc::notify_clean(pager);
+    }
+    irq_restore(flags);
+    waiting
+}
+
+/// The page number and frame of the cache entry holding `frame` for the
+/// object in `slot`: what a mapped page of a file is, said the other way
+/// round. A search of the whole cache, for whoever is taking a mapping
+/// away and needs to leave a reservation that names the page.
+pub fn page_of(slot: usize, frame: usize) -> Option<u64> {
+    cache()
+        .iter()
+        .find(|e| e.key != EMPTY_KEY && e.key != GONE_KEY && e.frame == frame && (e.key >> 40) as usize == slot)
+        .map(|e| e.key & MAX_PAGE)
 }

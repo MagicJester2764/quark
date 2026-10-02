@@ -21,11 +21,14 @@ them struck through as done. What follows is what is true now.
   waking that interrupts the processor running the worst rather than
   waiting for a tick, and an idle processor that takes no ticks. Sixteen
   processors at most.
-- **Paging anything out.** Anonymous memory gets its frames when first touched
-  and keeps them; a machine that runs out ends whichever task touched the page
-  it could not give, not the biggest one. A `fork` promises a copy of every
-  page the same way, and is refused none: the write that needs a frame there
-  is not ends the program that made it. There is no swap.
+- **Choosing who is ended.** A machine that has run out, with nothing left
+  to give up and nothing on its way out, ends whichever task touched the
+  page it could not give — not the biggest one, and not the newest.
+- **Looking for memory ahead of time.** It is looked for when a frame is
+  wanted and there is none, by whoever wanted it, who waits. Nothing keeps
+  a margin free in the background, and nothing notices that a page was
+  written out a moment before it was wanted again and was not worth
+  writing.
 - **Signals that interrupt.** A program is told of a signal it has a handler
   for, and its runtime runs the handler at the next system-call boundary
   (`docs/abi.md`, *Signals*). Nothing stops a program in the middle of
@@ -143,8 +146,15 @@ will meet:
   Descriptors are the program's and are shared.
 - **A pty's window size is stored and nobody is told when it changes.** Linux
   sends `SIGWINCH`.
-- **The page cache never shrinks under pressure.** A mapped file's pages stay
-  until nothing maps the file.
+- **Memory is written out through the file server, a page a call**, to a
+  file, on a disk driven a word at a time. It is correct and it is slow:
+  about a hundred pages a second in a virtual machine. A partition of its
+  own for it, pages written several at a time, and a disk driver that does
+  not copy through a port are each of them faster and none is here.
+- **Not every page can be taken.** A page a fork left in two programs
+  stays while it is in both; a page of a file mapped to be written through
+  stays while it is mapped; the cache that pages pass through on their way
+  out holds thirty-two megabytes.
 - **Five deprecated calls still answer** — the pre-capability grants, 86 to 90
   — and the two debug-console calls (160, 161) are marked for withdrawal once
   early output is handled another way. `docs/abi.md` says which.

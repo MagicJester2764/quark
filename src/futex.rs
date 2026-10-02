@@ -119,6 +119,10 @@ fn wait(addr: u64, expected: u32, timeout_ns: Option<u64>) -> u64 {
     if !usable {
         return u64::MAX;
     }
+    // The word stays in memory for as long as this waits on it: it is read
+    // below with a lock held, and a page written out and brought back is
+    // not the frame it was.
+    scheduler::pin(addr, 4);
     let key = match key_of(cr3, addr) {
         Some(k) => k,
         None => return u64::MAX,

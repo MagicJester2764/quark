@@ -33,7 +33,8 @@ The kernel provides:
   endpoints, task management. There is no UID 0 bypass
 - Address spaces, memory given its frames when first touched, shared memory,
   and memory objects whose pages a user-space pager provides — which is how a
-  file is mapped
+  file is mapped, and how memory that is not being used is written out when
+  there is not enough of it
 - A per-task descriptor table: IPC endpoints, pipes, connected streams that
   can carry descriptors, poll sets, pseudo-terminals, timers and event counters
 - Tasks, threads, a `fork` that shares memory until one side writes it, and
@@ -166,7 +167,7 @@ make run
 ## Testing
 
 The kernel is tested from outside, through the ABI, by a program: `dtest` in
-quarkutils makes 749 checks from user space. A kernel change is verified by
+quarkutils makes 750 checks from user space. A kernel change is verified by
 booting an image and running it — `tools/boot-test.sh` in ExplOSion — on one
 processor and on four.
 

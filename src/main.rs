@@ -30,6 +30,7 @@ mod pic;
 mod pit;
 mod power;
 mod random;
+mod reclaim;
 mod pmm;
 mod rtc;
 pub mod scheduler;

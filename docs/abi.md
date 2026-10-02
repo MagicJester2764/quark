@@ -1,6 +1,6 @@
 # Quark syscall ABI
 
-**Version 3.18.** Query the running kernel with `SYS_ABI_VERSION` (240), which
+**Version 3.19.** Query the running kernel with `SYS_ABI_VERSION` (240), which
 returns `(major << 16) | minor`.
 
 This document is the contract between the Quark kernel and everything above it.
@@ -219,6 +219,7 @@ returning at once turned that loop into a spin.
 | 3.16 | **Off, and on again, by the firmware's tables.** `SYS_POWER` (119) turns the machine off or restarts it, for a holder of the new capability `Power` (type 12): by ACPI's control and reset registers, where a program used to write to the three ports QEMU listens on. |
 | 3.17 | **Memory above four gigabytes.** All of a machine's memory is used, up to 511 GiB, where the kernel used the first four gigabytes of it. `SYS_PHYS_ALLOC` takes a flag (arg1 = 1) for frames below four gigabytes, which is what a device that is told an address in thirty-two bits needs; without it a frame is ordinary memory and comes from the top. `SYS_MEM_INFO` takes what to say (arg0): 1 for how much memory the machine has and 2 for where it ends. |
 | 3.18 | **The wide registers.** A program may use AVX, AVX2 and AVX-512 where the processor has them: the kernel turns them on (`OSXSAVE`, XCR0) and saves all of each task's with `XSAVE`. Before, an AVX instruction was a fault. No call changed. |
+| 3.19 | **Memory is given back.** When no frame is free the kernel gives up pages of files that nothing maps, takes pages programs have not used lately, and makes whoever wanted the frame wait while they are written out, where it used to end it. A page of a program's own goes to the object a pager has said memory may be written out to: `SYS_OBJECT_CTL` op 5, for a holder of the new capability `Swap` (type 13), with ops 6 and 7 to take a page out and say how the writing went. `TAG_OBJECT_CLEAN` (`0xFFFF_000B`) asks a pager to write what it has that is dirty. `SYS_PAGE_OUT` (198) has pages of the caller's own written out at once. `SYS_MEM_INFO` with arg0 = 3 says how much room there is to write memory out to and how much is used, and with 4 how many pages have gone out and come back. |
 
 3.1 was a change of behaviour and no change of number, so a minor: nothing built for
 3.0 calls anything that means something else now. What it could have relied on
@@ -269,6 +270,7 @@ UID 0 bypass in the kernel. Each task has a CSpace of 64 slots holding
 | 10 | `DeviceMemory` | — | — |
 | 11 | `Clock` | — | — |
 | 12 | `Power` | — | — |
+| 13 | `Swap` | — | — |
 
 Delegation may narrow a capability but never widen it; delegating at equal
 breadth is allowed, since a set is a subset of itself.
@@ -296,6 +298,12 @@ first task.
 **Power.** A holder of `Power` may turn the machine off and start it again
 (`SYS_POWER`). It is the machine's, as the clock is, and the kernel hands
 it to the first task.
+
+**Swap.** A holder of `Swap` may make an object of its own the one programs'
+memory is written out to (`SYS_OBJECT_CTL` op 5). Whoever does is handed
+pages of every program's memory and hands them back when asked: it can read
+all of them, and answer with anything. The kernel hands it to the first
+task, which gives it to the one program a system starts for the purpose.
 
 **Endpoints.** Every task has an endpoint, with a number the kernel never gives
 to anything else, even once the task is gone. An `Endpoint` capability records
@@ -1228,11 +1236,12 @@ ordinary programs should use file descriptor 1.
 | # | Name | Arguments | Returns | Cap |
 |---|---|---|---|---|
 | 192 | `SYS_MAP_ANON` | arg0 = address, arg1 = pages (at most 2^27), arg2 = flags (1 = back every page now, 2 = no more pages than the machine has) | 0 / `u64::MAX` | — |
-| 193 | `SYS_MEM_INFO` | arg0 = what: 0, 1 or 2 | 0: `(free frames << 32) \| pages charged to the caller`; 1: how many frames of memory the machine has; 2: the number of the frame after its last / `u64::MAX` | — |
+| 193 | `SYS_MEM_INFO` | arg0 = what: 0 to 4 | 0: `(free frames << 32) \| pages charged to the caller`; 1: how many frames of memory the machine has; 2: the number of the frame after its last; 3: `(pages of room to write memory out to << 32) \| pages of it in use`; 4: `(pages written out << 32) \| pages read back`, since the machine started / `u64::MAX` | — |
 | 194 | `SYS_OBJECT_CREATE` | arg0 = cookie, arg1 = bytes, arg2 = slot | object id / `u64::MAX` | — |
 | 195 | `SYS_OBJECT_MAP` | arg0 = slot, arg1 = address, arg2 = pages, arg3 = first page, arg4 = flags (1 write, 2 shared, 4 exec) | 0 / `u64::MAX` | `MemObject`: read; write too for a shared writable mapping |
 | 196 | `SYS_OBJECT_CTL` | arg0 = object id, arg1 = op, arg2, arg3 | per op / `u64::MAX` | the object's pager |
 | 197 | `SYS_OBJECT_SYNC` | arg0 = address, arg1 = pages | 0 / `u64::MAX` if a pager failed | — |
+| 198 | `SYS_PAGE_OUT` | arg0 = address, arg1 = pages | how many pages were given up / `u64::MAX` for a bad range | — |
 
 `SYS_MAP_ANON` reserves memory without giving it any: each page gets a zeroed
 frame, charged to the task that touches it, the first time it is read or
@@ -1243,10 +1252,12 @@ or more costs a page-directory entry, not a page table, until it is touched.
 `SYS_MUNMAP` removes reservations and mappings alike. `SYS_MMAP` is unchanged:
 it gives its frames at once, for the servers that count on it.
 
-A page promised and not there to give — no free frame, or the task's limit
-(`SYS_SET_MEM_LIMIT`) reached — ends the task that touched it with SIGBUS
-(`-7`), and says `[OOM tid=N]` on the serial line: Linux's overcommit bargain,
-and its answer. With arg2 bit 0 the whole range is backed before the call
+A page promised and not there to give ends the task that touched it with
+SIGBUS (`-7`), and says `[OOM tid=N]` on the serial line: Linux's overcommit
+bargain, and its answer. Not there to give is the task's limit
+(`SYS_SET_MEM_LIMIT`) reached, or no free frame *and none to be had*: before
+a task is ended for want of a frame the kernel looks for memory to give up,
+and the task waits while it is written out (see *Memory given back*). With arg2 bit 0 the whole range is backed before the call
 returns, and the call fails instead. With bit 1 a reservation of more pages
 than the machine has frames is refused outright — Linux's overcommit
 heuristic, which the C library applies to every mapping without
@@ -1293,6 +1304,61 @@ calls each one's pager with `TAG_OBJECT_SYNC` (`0xFFFF_0007`, `sender` marked
 as for a page-in, `data` = `[cookie, object id]`), returning once all have
 answered. A pager writes back what is dirty then, and again when the object
 goes idle, before it releases it.
+
+**Memory given back.** When no frame is free the kernel gives up what it
+can, cheapest first, and whoever wanted the frame waits a few milliseconds
+at a time while it does:
+
+- a page of an object that nothing maps and that holds nothing its pager
+  has still to write. It is asked for again (`TAG_PAGE_IN`) if it is wanted;
+- a page of an object that a program maps to read and has not used since
+  the kernel last looked: its entry goes back to being untouched, and the
+  page is then the first kind;
+- a page of a program's own that it has not used since the kernel last
+  looked, on a machine with somewhere to write memory out to.
+
+That somewhere is an object. A pager holding `Swap` makes one
+(`SYS_OBJECT_CREATE`, as long as it means to keep pages for) and says so
+with op 5; there is one at a time. From then on the kernel moves pages into
+it: a page of a program's becomes a page of the object, under a page number
+the kernel chooses — always the lowest that is free — and the program's
+entry becomes a reservation for it. The pager is told nothing of whose it
+was. It hears `TAG_OBJECT_CLEAN` (`0xFFFF_000B`, sender 0, no data) when
+there is something to write, and for each such page:
+
+| Op | Name | arg2 | arg3 | Returns |
+|---|---|---|---|---|
+| 5 | be where memory is written out to | — | — | 0 / `u64::MAX` without `Swap`, or while another object is |
+| 6 | take a page out | a page to fill | the lowest page to consider | the page's index, `u64::MAX` if none is waiting |
+| 7 | say it was written | 1 if it was, 0 if it could not be | the page | 0 |
+
+A page taken with op 6 is neither clean nor dirty until op 7 says which: one
+that could not be written — a full disk — stays in memory, where the only
+copy of it is. A page the kernel has given up it asks for with `TAG_PAGE_IN`
+like any other, by the number it gave it. `TAG_OBJECT_CLEAN` goes to every
+pager with pages that could be given up if they were written, a file's
+included; a pager that takes dirty pages with op 3 answers it with those.
+
+What is never taken: the memory of a task in the driver or the server band,
+which is what memory is written out *with*; a page the system call some
+task of the program is in has been given a pointer to, until that call
+returns; a page a `fork` left in two programs, while it is in both; a page
+of an object mapped to be written through; and the page a program has named
+to be told of signals through. The last hundred-and-twenty-eighth of memory
+— between 128 frames and 2048 — is not given to a task in the ordinary band
+at all: it is what the kernel, the drivers and the servers do the writing
+out with.
+
+`SYS_PAGE_OUT` is a program doing the same to itself: `pages` pages from
+`address` are taken as above, used lately or not, and the call returns when
+their frames are free. It answers with how many were — none of the caller's
+own on a machine with nowhere to write them. What was there is there when it
+is next touched. `SYS_MEM_INFO` with arg0 = 3 says how many pages of room
+there are to write memory out to and how many are in use.
+
+A page written out is still charged to the task it was charged to, and
+`SYS_FORK` gives the child a reservation for it as it gives it one for any
+page not yet touched: each has its own when it touches it.
 
 A capability a pager has granted keeps the object: op 4 answers 1, and
 releases nothing, while any living task of another program holds one. Granting
@@ -1601,7 +1667,7 @@ authority, and what it is started holding bounds what anything can hold:
 - `DeviceMemory`, in the last slot of its table — unless the kernel could
   not keep the firmware's memory map whole, and so cannot say where there
   is no memory;
-- `Clock` and `Power`, in the last slots that leaves free;
+- `Clock`, `Power` and `Swap`, in the last slots that leaves free;
 - the driver band, which is what lets it put a driver there;
 - and no physical memory besides: it could once map the kernel.
 

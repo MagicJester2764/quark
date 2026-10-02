@@ -34,7 +34,7 @@ pub const USER_ADDR_LIMIT: u64 = paging::USER_ADDR_LIMIT;
 /// runs. A physical address is no name — the frame is reused as soon as the
 /// space is gone — and neither is a TID, which a thread does not share with
 /// its siblings. Servers key what belongs to a program by this.
-const MAX_ADDRESS_SPACES: usize = crate::task::MAX_TASKS * 2;
+pub const MAX_ADDRESS_SPACES: usize = crate::task::MAX_TASKS * 2;
 static mut ADDRESS_SPACES: [(usize, usize, u32, u64); MAX_ADDRESS_SPACES] =
     [(0, 0, 0, 0); MAX_ADDRESS_SPACES];
 
@@ -67,6 +67,16 @@ pub fn unregister_address_space(cr3: usize) {
                 *slot = (0, 0, 0, 0);
             }
         }
+    }
+}
+
+/// The address space in place `index` of the registry, if there is one
+/// there and a task is running in it: where it is and its id. For whoever
+/// goes round all of them (`reclaim.rs`).
+pub fn space_at(index: usize) -> Option<(usize, u64)> {
+    unsafe {
+        let table = &*core::ptr::addr_of!(ADDRESS_SPACES);
+        table.get(index).filter(|s| s.0 != 0 && s.2 != 0).map(|s| (s.0, s.3))
     }
 }
 
@@ -385,6 +395,8 @@ pub fn spawn_init(elf_data: &[u8], fb: Option<crate::multiboot2::FramebufferInfo
         // machine off, for whoever it decides may.
         crate::cap::insert_last(&mut task.cspace, crate::cap::CapType::Clock);
         crate::cap::insert_last(&mut task.cspace, crate::cap::CapType::Power);
+        // And the right to be where memory is written out to.
+        crate::cap::insert_last(&mut task.cspace, crate::cap::CapType::Swap);
         task.context.rip = enter_user_trampoline as *const () as u64;
         task.context.r12 = entry;
         task.context.r13 = stack_top;

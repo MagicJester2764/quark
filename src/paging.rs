@@ -71,6 +71,15 @@ fn is_marker(raw: u64) -> bool {
     raw & PRESENT == 0 && raw & MARKER != 0
 }
 
+/// Whether an entry is a reservation for a page of the program's own that
+/// was written out (`memobj::swap_slot`), rather than for a page of a file.
+fn is_written_out(raw: u64) -> bool {
+    is_marker(raw) && raw & MARKER_OBJECT != 0 && {
+        let slot = ((raw >> OBJECT_SHIFT) & 0x7FF) as usize;
+        slot != 0 && slot == crate::memobj::swap_slot()
+    }
+}
+
 #[inline(always)]
 fn irq_save() -> u64 {
     let flags: u64;
@@ -92,8 +101,13 @@ fn irq_restore(flags: u64) {
 pub enum Fault {
     /// Nothing was promised there, or not that access: the task's fault.
     Invalid,
-    /// It was promised and there is nothing to give it with.
+    /// It was promised and there is nothing to give it with: no frame is
+    /// free. Something may be done about that (`reclaim.rs`), and whoever
+    /// can wait for it does.
     NoMemory,
+    /// It was promised and the task may not have it: it is at the limit it
+    /// was given. Nothing is to be done about that.
+    Limit,
     /// A page of an object that cannot be had: past the end of the file, or
     /// its pager failed or has gone. SIGBUS, as on Linux.
     Bus,
@@ -616,9 +630,9 @@ unsafe fn back_one(pml4_phys: usize, virt: usize, write: bool, may_block: bool) 
         return back_object(pml4_phys, virt, raw, may_block);
     }
     if !crate::scheduler::current_task_check_mem(1) {
-        return Err(Fault::NoMemory);
+        return Err(Fault::Limit);
     }
-    let frame = pmm::alloc().ok_or(Fault::NoMemory)?.address();
+    let frame = crate::reclaim::frame().ok_or(Fault::NoMemory)?;
     core::ptr::write_bytes(frame as *mut u8, 0, PAGE_SIZE);
     crate::scheduler::current_task_charge_mem(1);
     pt.entries[pti].set(frame, PRESENT | USER | OWNED | (raw & (WRITABLE | NO_EXECUTE)));
@@ -643,20 +657,42 @@ unsafe fn back_object(pml4_phys: usize, virt: usize, raw: u64, may_block: bool) 
     }
     let writable = raw & WRITABLE != 0;
     let shared = raw & MARKER_SHARED != 0;
+    if slot == crate::memobj::swap_slot() {
+        // A page of the program's own that was written out: it is the
+        // program's own again, as it was, and no page of any object. The
+        // frame itself if this is the one entry that names the page; a copy
+        // if a fork left several that do. Nothing is charged: it was
+        // counted as this program's all the while.
+        let flags = PRESENT | USER | OWNED | (raw & (WRITABLE | NO_EXECUTE));
+        match crate::memobj::swap_take(page) {
+            Some(own) => pt.entries[pti].set(own, flags),
+            None => {
+                let copy = crate::reclaim::frame().ok_or(Fault::NoMemory)?;
+                core::ptr::copy_nonoverlapping(frame as *const u8, copy as *mut u8, PAGE_SIZE);
+                pt.entries[pti].set(copy, flags);
+                crate::memobj::swap_unref(slot, page);
+            }
+        }
+        crate::memobj::unmap_ref(slot, 1);
+        invlpg(virt & !0xFFF);
+        return Ok(());
+    }
     let keep = (raw & NO_EXECUTE) | ((slot as u64) << OBJECT_SHIFT);
     if shared || !writable {
-        // The object's page itself, which this address space does not own.
+        // The object's page itself, which this address space does not own:
+        // the cache's frame, with one more mapping of it to count.
         if shared && writable {
             // Anything written through it has to go back to the file.
             crate::memobj::mapped_writable(slot, page);
         }
         let w = if shared && writable { WRITABLE } else { 0 };
         pt.entries[pti].set(frame, PRESENT | USER | w | keep);
+        pmm::mapped(frame);
     } else {
         if !crate::scheduler::current_task_check_mem(1) {
-            return Err(Fault::NoMemory);
+            return Err(Fault::Limit);
         }
-        let copy = pmm::alloc().ok_or(Fault::NoMemory)?.address();
+        let copy = crate::reclaim::frame().ok_or(Fault::NoMemory)?;
         core::ptr::copy_nonoverlapping(frame as *const u8, copy as *mut u8, PAGE_SIZE);
         crate::scheduler::current_task_charge_mem(1);
         pt.entries[pti].set(copy, PRESENT | USER | WRITABLE | OWNED | keep);
@@ -698,14 +734,22 @@ pub unsafe fn back_range(pml4_phys: usize, addr: u64, len: u64, write: bool) -> 
     };
     let mut page = addr & !0xFFF;
     while page < end {
-        if marker(pml4_phys, page as usize).is_some() {
-            back(pml4_phys, page as usize, write, true)?;
+        let done = if marker(pml4_phys, page as usize).is_some() {
+            back(pml4_phys, page as usize, write, true)
         } else if write {
             // A page shared since a fork is the writer's own before the
             // kernel writes it, as it would be before the program did.
-            own(pml4_phys, page as usize)?;
+            own(pml4_phys, page as usize).map(|_| ())
+        } else {
+            Ok(())
+        };
+        match done {
+            Ok(()) => page += PAGE_SIZE as u64,
+            // No frame to give it with: wait for one, if waiting can
+            // produce one, and look at the same page again.
+            Err(Fault::NoMemory) if crate::reclaim::wait() => {}
+            Err(fault) => return Err(fault),
         }
-        page += PAGE_SIZE as u64;
     }
     Ok(())
 }}
@@ -755,7 +799,7 @@ unsafe fn own_one(pml4_phys: usize, virt: usize) -> Result<bool, Fault> { unsafe
     if pmm::shared(frame) == 0 {
         pt.entries[pti].set(frame, flags);
     } else {
-        let copy = pmm::alloc().ok_or(Fault::NoMemory)?.address();
+        let copy = crate::reclaim::frame().ok_or(Fault::NoMemory)?;
         core::ptr::copy_nonoverlapping(frame as *const u8, copy as *mut u8, PAGE_SIZE);
         pt.entries[pti].set(copy, flags);
         pmm::free(pmm::PhysFrame::from_address(frame));
@@ -794,7 +838,7 @@ unsafe fn unshare_one(pml4_phys: usize, virt: usize) -> Result<(), Fault> { unsa
         return Ok(());
     }
     // Shared for good, being read-only: a copy is this one's alone.
-    let copy = pmm::alloc().ok_or(Fault::NoMemory)?.address();
+    let copy = crate::reclaim::frame().ok_or(Fault::NoMemory)?;
     core::ptr::copy_nonoverlapping(frame as *const u8, copy as *mut u8, PAGE_SIZE);
     pt.entries[pti].set(copy, raw & !ADDR_MASK);
     pmm::free(pmm::PhysFrame::from_address(frame));
@@ -803,6 +847,177 @@ unsafe fn unshare_one(pml4_phys: usize, virt: usize) -> Result<(), Fault> { unsa
         invlpg(virt & !0xFFF);
     }
     Ok(())
+}}
+
+/// Walk the pages of `pml4_phys` that are there, from `from` up to `to`,
+/// for at most `budget` of them, calling `visit` with each one's address and
+/// entry. Answers with where it stopped, or `None` if it reached the end.
+///
+/// # Safety
+/// `pml4_phys` must point to a valid, identity-mapped user PML4 table;
+/// interrupts off.
+unsafe fn sweep(
+    pml4_phys: usize,
+    from: usize,
+    to: usize,
+    budget: usize,
+    mut visit: impl FnMut(usize, &mut PageTableEntry),
+) -> Option<usize> { unsafe {
+    let mut va = from.max(USER_MIN_ADDR as usize) & !0xFFF;
+    let to = to.min(USER_ADDR_LIMIT as usize);
+    let mut seen = 0;
+    while va < to {
+        let (pml4i, pdpti, pdi, pti) = table_indices(va);
+        let e4 = table_at(pml4_phys).entries[pml4i];
+        if !e4.is_present() {
+            va = next_boundary(va, 1 << 39);
+            continue;
+        }
+        let e3 = table_at(e4.frame_address()).entries[pdpti];
+        if !e3.is_present() || e3.is_huge() {
+            va = next_boundary(va, 1 << 30);
+            continue;
+        }
+        let e2 = table_at(e3.frame_address()).entries[pdi];
+        if !e2.is_present() || e2.is_huge() {
+            va = next_boundary(va, 1 << 21);
+            continue;
+        }
+        let pt = table_at(e2.frame_address());
+        for i in pti..512 {
+            if va >= to {
+                break;
+            }
+            if pt.entries[i].is_present() {
+                if seen == budget {
+                    return Some(va);
+                }
+                seen += 1;
+                visit(va, &mut pt.entries[i]);
+            }
+            va += PAGE_SIZE;
+        }
+    }
+    None
+}}
+
+/// Take the page at `va` of program `space`, whose entry is `e`, if it is
+/// one that may be taken: what [`take_unused`] says of each kind. Whether
+/// it was.
+///
+/// # Safety
+/// As [`sweep`]; `e` is a present entry of that address space.
+unsafe fn take(space: u64, word_page: usize, va: usize, e: &mut PageTableEntry) -> bool {
+    let raw = e.raw();
+    if raw & USER == 0 || va == word_page || crate::scheduler::pinned(space, va as u64) {
+        return false;
+    }
+    let frame = e.frame_address();
+    if raw & OWNED != 0 {
+        if pmm::shared(frame) != 0 {
+            return false;
+        }
+        let Some(page) = crate::memobj::swap_out(frame) else { return false };
+        let slot = crate::memobj::swap_slot();
+        // Shared since a fork and nobody else's any more, it is simply
+        // writable again when it comes back.
+        let write = raw & (WRITABLE | COPY_ON_WRITE) != 0;
+        // A private copy of a file's page named the file; what replaces
+        // it names where it went.
+        crate::memobj::drop_entry(raw);
+        crate::memobj::map_ref(slot, 1);
+        *e = PageTableEntry(object_marker(slot, page, write, false, raw & NO_EXECUTE == 0));
+        true
+    } else {
+        let slot = object_slot(raw);
+        if slot == 0 || raw & WRITABLE != 0 {
+            return false;
+        }
+        let Some(page) = crate::memobj::page_of(slot, frame) else { return false };
+        // It names the same object as before: only the mapping goes.
+        pmm::unmapped(frame);
+        *e = PageTableEntry(object_marker(slot, page, false, false, raw & NO_EXECUTE == 0));
+        true
+    }
+}
+
+/// Take every page from `from` up to `to` that may be taken, used lately
+/// or not — a program giving up its own (`SYS_PAGE_OUT`) — looking at no
+/// more than `budget` pages that are there. Answers with where it stopped,
+/// `None` at the end of the range, and how many were taken.
+///
+/// # Safety
+/// As [`take_unused`].
+pub unsafe fn take_range(
+    pml4_phys: usize,
+    space: u64,
+    word_page: usize,
+    from: usize,
+    to: usize,
+    budget: usize,
+) -> (Option<usize>, usize) { unsafe {
+    let mut taken = 0;
+    let next = sweep(pml4_phys, from, to, budget, |va, e| {
+        taken += take(space, word_page, va, e) as usize;
+    });
+    (next, taken)
+}}
+
+/// Take pages of program `space` that have not been used since this last
+/// looked, to be given up: at most `want` of them, out of at most `budget`
+/// looked at, from `from` upwards. Answers with where to go on from next
+/// time (`None` at the end of the address space) and how many were taken.
+///
+/// "Used" is the processor's own mark on an entry, which is cleared here
+/// as it is seen: a page is taken the second time round, if nothing has
+/// touched it in between.
+///
+/// What a page is decides what taking it means:
+///
+/// - **A page of the program's own**, that no other program shares, is
+///   moved into the cache of the object memory is written out to
+///   (`memobj::swap_out`) and its entry becomes a reservation for it. The
+///   frame is still there, and comes straight back if the page is touched
+///   before its pager has written it and the cache has given it up.
+/// - **A page of a file**, mapped to be read, becomes the reservation it was
+///   before it was first touched. The frame is the cache's, which gives it
+///   up when nothing maps it.
+/// - **Everything else stays**: shared memory, a device, a page of a file
+///   mapped to be written through (it is dirty for as long as it is
+///   mapped), a page a fork left in two programs, a page the system call
+///   some task of the program is in has checked (`scheduler::pinned`), and
+///   the page the program is told of signals through (`word_page`), which
+///   is written by its frame from wherever a signal is raised.
+///
+/// The caller tells the other processors (`tlb::stale`): entries have been
+/// taken away, and marks cleared that a processor only sets again once it
+/// has forgotten the page.
+///
+/// # Safety
+/// As [`sweep`].
+pub unsafe fn take_unused(
+    pml4_phys: usize,
+    space: u64,
+    word_page: usize,
+    from: usize,
+    budget: usize,
+    want: usize,
+) -> (Option<usize>, usize) { unsafe {
+    let mut taken = 0;
+    let next = sweep(pml4_phys, from, USER_ADDR_LIMIT as usize, budget, |va, e| {
+        let raw = e.raw();
+        if raw & USER == 0 {
+            return;
+        }
+        if raw & ACCESSED != 0 {
+            *e = PageTableEntry(raw & !ACCESSED);
+            return;
+        }
+        if taken < want {
+            taken += take(space, word_page, va, e) as usize;
+        }
+    });
+    (next, taken)
 }}
 
 /// The objects mapped shared, and so writable through to their files, in
@@ -940,6 +1155,11 @@ pub unsafe fn clear_range(pml4_phys: usize, virt: usize, pages: usize) -> usize 
                 invlpg(va);
                 crate::tlb::stale(pml4_phys);
             } else if e.raw() != 0 {
+                // A page that was written out is one of its own all the
+                // same, and no longer charged for when it goes.
+                if is_written_out(e.raw()) {
+                    freed += 1;
+                }
                 pt.entries[pti].clear();
             }
             crate::memobj::drop_entry(e.raw());
@@ -1497,6 +1717,15 @@ unsafe fn copy_pt(src_phys: usize, dst_phys: usize) -> Option<usize> { unsafe {
         let slot = object_slot(raw);
         if slot != 0 {
             crate::memobj::map_ref(slot, 1);
+            if raw & PRESENT != 0 {
+                // One more mapping of the cache's frame.
+                pmm::mapped(src.entries[i].frame_address());
+            } else {
+                // One more reservation for a page that was written out, if
+                // that is what this is.
+                crate::memobj::swap_ref(slot, (raw >> 12) & crate::memobj::MAX_PAGE);
+                pages += is_written_out(raw) as usize;
+            }
             if raw & PRESENT != 0 && raw & WRITABLE != 0 && raw & MARKER_SHARED != 0 {
                 // A second shared writable mapping of the same page, which the
                 // object counts so that it knows to write back.

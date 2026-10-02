@@ -114,6 +114,13 @@ const IDLE_QUEUE: usize = 32;
 static mut IDLES: [[(u64, u64); IDLE_QUEUE]; MAX_TASKS] = [[(0, 0); IDLE_QUEUE]; MAX_TASKS];
 static mut IDLES_LEN: [usize; MAX_TASKS] = [0; MAX_TASKS];
 
+/// The kernel to a pager: memory is short, and pages of yours that nothing
+/// maps could be given up if they were written. No object is named: the
+/// pager looks at each it has. A flag and not a queue, so that it cannot be
+/// full; asking twice before the pager has looked is asking once.
+pub const TAG_OBJECT_CLEAN: u64 = 0xFFFF_000B;
+static mut CLEAN_WANTED: [bool; MAX_TASKS] = [false; MAX_TASKS];
+
 /// IPC state and pending message for each task.
 struct TaskIpc {
     state: IpcState,
@@ -467,6 +474,62 @@ pub fn notify_object_idle(pager: usize, cookie: u64, id: u64) {
     }
 }
 
+/// Ask `pager` to write what it has that is dirty (`TAG_OBJECT_CLEAN`).
+///
+/// Interrupts are off.
+pub fn notify_clean(pager: usize) {
+    if pager >= MAX_TASKS {
+        return;
+    }
+    unsafe {
+        CLEAN_WANTED[pager] = true;
+        match TASK_IPC[pager].state {
+            IpcState::RecvBlocked(from) if from == 0 || from == TID_ANY => {
+                TASK_IPC[pager].state = IpcState::None;
+                TASK_TIMEOUT[pager] = 0;
+                scheduler::unblock_task(pager);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Stop the current task for `ns`, for a reason of the kernel's own: it is
+/// waiting for memory. Nothing is received and nothing a signal is owed is
+/// used up; a task in the middle of a call or a receive is not stopped at
+/// all, being in no state to be woken from this.
+pub fn pause(ns: u64) {
+    let me = scheduler::current_tid();
+    if me >= MAX_TASKS {
+        return;
+    }
+    let flags = irq_save();
+    let parked = unsafe {
+        if matches!(TASK_IPC[me].state, IpcState::None) {
+            TASK_TIMEOUT[me] = crate::clock::after(ns);
+            crate::clock::due(TASK_TIMEOUT[me]);
+            TASK_IPC[me].state = IpcState::RecvBlocked(me);
+            scheduler::block_task(me);
+            true
+        } else {
+            false
+        }
+    };
+    irq_restore(flags);
+    if !parked {
+        return;
+    }
+    scheduler::yield_now();
+    let flags = irq_save();
+    unsafe {
+        TASK_TIMEOUT[me] = 0;
+        if matches!(TASK_IPC[me].state, IpcState::RecvBlocked(t) if t == me) {
+            TASK_IPC[me].state = IpcState::None;
+        }
+    }
+    irq_restore(flags);
+}
+
 /// Wake a server that is waiting to receive, because the kernel has a notice
 /// for it. The notice itself is found by its next receive.
 pub fn wake_for_notice(server: usize) {
@@ -513,6 +576,10 @@ unsafe fn take_any_death(receiver: usize) -> Option<Message> {
             }
             IDLES_LEN[receiver] -= 1;
             return Some(Message { sender: 0, tag: TAG_OBJECT_IDLE, data: [cookie, id, 0, 0, 0, 0] });
+        }
+        if CLEAN_WANTED[receiver] {
+            CLEAN_WANTED[receiver] = false;
+            return Some(Message { sender: 0, tag: TAG_OBJECT_CLEAN, data: [0; 6] });
         }
         if SPACE_DEATHS_LEN[receiver] == 0 {
             return None;
@@ -1410,6 +1477,7 @@ pub fn cleanup_task_ipc(dead_tid: usize) {
         DEATHS[dead_tid] = 0;
         SPACE_DEATHS_LEN[dead_tid] = 0;
         IDLES_LEN[dead_tid] = 0;
+        CLEAN_WANTED[dead_tid] = false;
         let bit = !(1u64 << dead_tid);
         for t in 0..MAX_TASKS {
             WATCHERS[t] &= bit;

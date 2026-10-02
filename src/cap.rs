@@ -107,6 +107,14 @@ pub enum CapType {
     /// Permission to turn the machine off and to start it again
     /// (`SYS_POWER`). No parameters.
     Power = 12,
+    /// Permission to be where memory goes when there is not enough of it:
+    /// to make one's object the one programs' unused pages are written out
+    /// to (`SYS_OBJECT_CTL`, op 5). No parameters.
+    ///
+    /// Whoever holds it is handed pages of every program's memory to keep,
+    /// and hands them back: it reads all of them and could answer with
+    /// anything. It is for one program the system starts, and nobody else.
+    Swap = 13,
 }
 
 /// A `MemObject`'s access bits.
@@ -366,6 +374,17 @@ pub fn task_has_clock(tid: usize) -> bool {
     }
 }
 
+/// Check if a task has the Swap capability.
+pub fn task_has_swap(tid: usize) -> bool {
+    if tid >= MAX_TASKS { return false; }
+    unsafe {
+        match task_cspace(tid) {
+            Some(cs) => cs.iter().any(|cap| cap.cap_type as u8 == CapType::Swap as u8 && is_valid(cap)),
+            None => false,
+        }
+    }
+}
+
 /// Check if a task has the Power capability.
 pub fn task_has_power(tid: usize) -> bool {
     if tid >= MAX_TASKS { return false; }
@@ -586,7 +605,8 @@ pub fn insert_kernel_range(cspace: &mut CSpace, base: usize, len: usize) -> bool
 /// Give `cspace` an unrevocable capability of a kind that has no
 /// parameters — the right to map the machine's devices' registers
 /// ([`CapType::DeviceMemory`]), the right to set its clock
-/// ([`CapType::Clock`]), the right to turn it off ([`CapType::Power`]) — in
+/// ([`CapType::Clock`]), the right to turn it off ([`CapType::Power`]), the
+/// right to keep what is written out of memory ([`CapType::Swap`]) — in
 /// its last free slot. The first task names its
 /// low slots itself — where it keeps the nameserver's endpoint, where it
 /// mints what it hands on — and counts on the ones it has not filled being
@@ -668,6 +688,7 @@ pub fn validate_attenuation(source: &CapSlot, new_type: CapType, new_p0: u64, ne
         CapType::DeviceMemory => true,
         CapType::Clock => true,
         CapType::Power => true,
+        CapType::Swap => true,
         // The same object, with no access the source lacks.
         CapType::MemObject => {
             new_p0 == source.param0

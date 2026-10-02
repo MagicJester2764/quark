@@ -162,6 +162,14 @@ pub fn attach_new(tid: usize) -> bool {
 
 /// Which table a task uses, as a number two tasks of one program agree on.
 /// `usize::MAX` for a task with none.
+/// The word program `space` is told of signals through, or 0 if it has
+/// named none. Interrupts must be off.
+pub fn sig_word_of_space(space: u64) -> usize {
+    let Some(tid) = crate::scheduler::task_of_space(space) else { return 0 };
+    let slot = table_of(tid);
+    unsafe { (*core::ptr::addr_of!(TABLES)).get(slot).map_or(0, |t| t.sig_word) }
+}
+
 pub fn table_of(tid: usize) -> usize {
     if tid >= MAX_TASKS {
         return usize::MAX;

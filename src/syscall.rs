@@ -361,6 +361,9 @@ pub const SYS_OBJECT_MAP: u64 = 195;
 pub const SYS_OBJECT_CTL: u64 = 196;
 /// Have what was written through shared mappings in a range reach the files.
 pub const SYS_OBJECT_SYNC: u64 = 197;
+/// Give up pages of one's own: have them written out now and their frames
+/// given back.
+pub const SYS_PAGE_OUT: u64 = 198;
 /// SYS_OBJECT_MAP's flags.
 const OBJECT_MAP_WRITE: u64 = 1;
 const OBJECT_MAP_SHARED: u64 = 2;
@@ -406,7 +409,7 @@ pub const SYS_ABI_VERSION: u64 = 240;
 /// minor when calls are added. User space can refuse to run against a major it
 /// does not know, which is the point of exposing it at all.
 pub const ABI_VERSION_MAJOR: u64 = 3;
-pub const ABI_VERSION_MINOR: u64 = 18;
+pub const ABI_VERSION_MINOR: u64 = 19;
 
 /// Threads a task may make with no capability at all.
 ///
@@ -564,8 +567,18 @@ fn validate_user_range(addr: u64, len: u64, write: bool) -> bool {
         _ => return false,
     }
     let cr3 = paging::read_cr3();
-    // Reserved pages are given their memory before the kernel touches them.
-    unsafe { paging::back_range(cr3, addr, len, write).is_ok() && paging::user_range_accessible(cr3, addr, len, write) }
+    // Reserved pages are given their memory before the kernel touches them,
+    // and pages that were written out are brought back.
+    let ok = unsafe {
+        paging::back_range(cr3, addr, len, write).is_ok() && paging::user_range_accessible(cr3, addr, len, write)
+    };
+    if ok {
+        // And they stay, until this call returns: it may wait, and then
+        // copy with a lock held, where a page that had gone in the
+        // meantime could not be waited for (`reclaim.rs`).
+        scheduler::pin(addr, len);
+    }
+    ok
 }
 
 /// Read-only user buffer check.
@@ -772,6 +785,8 @@ extern "C" fn syscall_dispatch(
     unsafe { core::arch::asm!("sti", options(nostack, nomem)) };
     let answer = dispatch(nr, arg0, arg1, arg2, arg3, arg4);
     unsafe { core::arch::asm!("cli", options(nostack, nomem)) };
+    // What the call checked of its program's memory is its to lose again.
+    scheduler::unpin();
     crate::klock::release();
     answer
 }
@@ -1954,6 +1969,12 @@ fn dispatch(
             if cr3 == own || !crate::userspace::may_use_address_space(caller, cr3) {
                 return u64::MAX;
             }
+            // What was written out since the caller filled it comes back
+            // first, and stays until this is done: it is the page that is
+            // given, not a promise of one.
+            if unsafe { paging::back_range(own, from as u64, (pages * 4096) as u64, false) }.is_ok() {
+                scheduler::pin(from as u64, (pages * 4096) as u64);
+            }
             // All of it is checked before any of it moves. Only memory the
             // caller owns may go — not a device, not shared memory, not a
             // frame somebody lent it — and nothing already mapped at the far
@@ -3081,13 +3102,21 @@ fn dispatch(
                 paging::PRESENT | paging::WRITABLE | paging::USER | paging::OWNED;
             for i in 0..pages {
                 let v = vaddr + i * 4096;
-                let phys = match crate::pmm::alloc() {
-                    Some(frame) => frame.address(),
-                    None => {
-                        unmap_range_owned(cr3, vaddr, i);
-                        scheduler::current_task_uncharge_mem(pages);
-                        return u64::MAX;
+                // A frame, waiting for one if memory is short and waiting
+                // can produce one: this is what starts a program, and a
+                // program that could not be started for want of memory that
+                // was only being written out is one that was ended by it.
+                let phys = loop {
+                    match crate::reclaim::frame() {
+                        Some(frame) => break Some(frame),
+                        None if crate::reclaim::wait() => {}
+                        None => break None,
                     }
+                };
+                let Some(phys) = phys else {
+                    unmap_range_owned(cr3, vaddr, i);
+                    scheduler::current_task_uncharge_mem(pages);
+                    return u64::MAX;
                 };
                 // Zero the frame (identity-mapped)
                 unsafe { core::ptr::write_bytes(phys as *mut u8, 0, 4096) };
@@ -3246,12 +3275,29 @@ fn dispatch(
             let op = arg1;
             if matches!(
                 op,
-                crate::memobj::CTL_READ_PAGE | crate::memobj::CTL_WRITE_PAGE | crate::memobj::CTL_TAKE_DIRTY
+                crate::memobj::CTL_READ_PAGE
+                    | crate::memobj::CTL_WRITE_PAGE
+                    | crate::memobj::CTL_TAKE_DIRTY
+                    | crate::memobj::CTL_TAKE_OUT
             ) && !validate_user_range(arg2, 4096, op != crate::memobj::CTL_WRITE_PAGE)
             {
                 return u64::MAX;
             }
+            // To be where every program's memory is written out to is to
+            // be trusted with all of it.
+            if op == crate::memobj::CTL_SWAP && !crate::cap::task_has_swap(scheduler::current_tid()) {
+                return u64::MAX;
+            }
             crate::memobj::ctl(scheduler::current_tid(), arg0, op, arg2, arg3)
+        }
+        SYS_PAGE_OUT => {
+            // arg0 = address, arg1 = pages. The caller's own memory, which
+            // it may always give up: no capability.
+            let (vaddr, pages) = (arg0 as usize, arg1 as usize);
+            if pages == 0 || pages > MAP_ANON_MAX || !paging::user_range_ok(vaddr, pages) {
+                return u64::MAX;
+            }
+            crate::reclaim::page_out(vaddr, pages)
         }
         SYS_OBJECT_SYNC => {
             // arg0 = start address, arg1 = pages. Each object mapped shared
@@ -3292,6 +3338,19 @@ fn dispatch(
                 }
                 1 => crate::pmm::total_count() as u64,
                 2 => (crate::pmm::top_of_memory() / 4096) as u64,
+                // Where memory is written out to: how many pages of room
+                // there are, and how many are in use. Nought and nought
+                // where there is nowhere.
+                3 => {
+                    let (room, used) = crate::memobj::swap_room();
+                    ((room as u64).min(u32::MAX as u64) << 32) | (used as u64).min(u32::MAX as u64)
+                }
+                // And how busy it has been: pages written out, and pages
+                // read back, since the machine started.
+                4 => {
+                    let (out, back) = crate::memobj::swap_traffic();
+                    (out.min(u32::MAX as u64) << 32) | back.min(u32::MAX as u64)
+                }
                 _ => u64::MAX,
             }
         }
@@ -3876,6 +3935,7 @@ fn dispatch(
                 10 => crate::cap::CapType::DeviceMemory,
                 11 => crate::cap::CapType::Clock,
                 12 => crate::cap::CapType::Power,
+                13 => crate::cap::CapType::Swap,
                 _ => return u64::MAX,
             };
             let tid = scheduler::current_tid();

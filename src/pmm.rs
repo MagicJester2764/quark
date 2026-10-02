@@ -437,6 +437,42 @@ pub fn shared(frame: usize) -> u8 {
     pmm.sharers().get(idx).copied().unwrap_or(0)
 }
 
+/// A frame of an object's cache has been mapped into an address space.
+///
+/// The same count, said of another kind of frame: for a page of a file,
+/// which belongs to its object's cache and to no address space, it is how
+/// many page-table entries map it — nought being what lets the cache give
+/// the frame up (`memobj::evict`). It stops at the most it can say and
+/// stays there: a frame mapped that many times is never thought unmapped.
+pub fn mapped(frame: usize) {
+    let mut pmm = PMM.lock();
+    let idx = PmmInner::frame_index(frame);
+    if let Some(count) = pmm.sharers().get_mut(idx) {
+        *count = count.saturating_add(1);
+    }
+}
+
+/// None of them is left: the object whose cache the frame is in is mapped
+/// nowhere, whatever the count had stuck at.
+pub fn unmapped_everywhere(frame: usize) {
+    let mut pmm = PMM.lock();
+    let idx = PmmInner::frame_index(frame);
+    if let Some(count) = pmm.sharers().get_mut(idx) {
+        *count = 0;
+    }
+}
+
+/// One of them has gone.
+pub fn unmapped(frame: usize) {
+    let mut pmm = PMM.lock();
+    let idx = PmmInner::frame_index(frame);
+    if let Some(count) = pmm.sharers().get_mut(idx) {
+        if *count != 0 && *count != u8::MAX {
+            *count -= 1;
+        }
+    }
+}
+
 /// Give a frame back: whoever had it has it no longer.
 ///
 /// It goes back to the allocator if nobody else has it, and is one fewer's
