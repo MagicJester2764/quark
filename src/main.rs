@@ -28,6 +28,7 @@ mod percpu;
 pub mod paging;
 mod pic;
 mod pit;
+mod power;
 mod random;
 mod pmm;
 mod rtc;

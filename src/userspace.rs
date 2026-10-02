@@ -381,8 +381,10 @@ pub fn spawn_init(elf_data: &[u8], fb: Option<crate::multiboot2::FramebufferInfo
         if !crate::devmem::ranges().is_empty() {
             crate::cap::insert_last(&mut task.cspace, crate::cap::CapType::DeviceMemory);
         }
-        // And the right to say what time it is, for whoever it decides may.
+        // And the right to say what time it is, and the right to turn the
+        // machine off, for whoever it decides may.
         crate::cap::insert_last(&mut task.cspace, crate::cap::CapType::Clock);
+        crate::cap::insert_last(&mut task.cspace, crate::cap::CapType::Power);
         task.context.rip = enter_user_trampoline as *const () as u64;
         task.context.r12 = entry;
         task.context.r13 = stack_top;

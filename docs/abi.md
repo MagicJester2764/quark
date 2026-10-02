@@ -1,6 +1,6 @@
 # Quark syscall ABI
 
-**Version 3.15.** Query the running kernel with `SYS_ABI_VERSION` (240), which
+**Version 3.16.** Query the running kernel with `SYS_ABI_VERSION` (240), which
 returns `(major << 16) | minor`.
 
 This document is the contract between the Quark kernel and everything above it.
@@ -216,6 +216,7 @@ returning at once turned that loop into a spin.
 | 3.13 | **An object is kept for whoever was promised it.** `SYS_OBJECT_CTL` op 4, release, answers 1 and releases nothing while a living task of another program holds a capability for the object. A pager gives a program a capability and the program maps with it — two steps, and the last mapping of the object could go between them, the pager be told it was idle, and release it: the program's `SYS_OBJECT_MAP` then named nothing. Two threads mapping one file did it to each other. A pager written for 3.12 takes 1 for "still mapped" and keeps the object, which is safe; one written for this asks again. |
 | 3.14 | **An interrupt of a device's own.** `SYS_MSI_ALLOC` (118) gives a driver an interrupt number from 16 up and the address and data to program a device's MSI capability with; the device's messages then arrive as that interrupt. `SYS_IRQ_REGISTER` is for the sixteen below. Also, and no new number: devices interrupt through the I/O APIC on a machine that has one, where `SYS_IRQ_ACK` unmasks the line of a device that holds it and one slow driver no longer holds up the lines below its own; and there is a capability for the registers of the machine's devices, `DeviceMemory` (type 10), which the first task is started with: its holder mints a `PhysRange` for what lies in the addresses below four gigabytes that the firmware's memory map does not list, so that a driver can map its device. |
 | 3.15 | **A clock finer than a tick, and one that can be set.** `SYS_CLOCK` (149) says the time in nanoseconds, since boot or since 1970; `SYS_CLOCK_SET` (150) sets the date, for a holder of the new capability `Clock` (type 11), and writes it to the battery-backed clock. Every span of time a call takes may be given in nanoseconds, by setting its top bit — no number changed and a count of ticks means what it did — and is kept to the nanosecond and seen to when it is due rather than on the next tick, where the machine has a counter to keep time by and a timer to wake by. `SYS_SIG_ALARM` (arg3) and `SYS_TIMER_GET` (arg1) take somewhere to write their answer in nanoseconds; both still answer in ticks, now rounded up. A repeating timer or alarm keeps its beat, and a timer counts every interval that went by. `SYS_TICKS` is the clock's time in ticks rather than a count of interrupts. |
+| 3.16 | **Off, and on again, by the firmware's tables.** `SYS_POWER` (119) turns the machine off or restarts it, for a holder of the new capability `Power` (type 12): by ACPI's control and reset registers, where a program used to write to the three ports QEMU listens on. |
 
 3.1 was a change of behaviour and no change of number, so a minor: nothing built for
 3.0 calls anything that means something else now. What it could have relied on
@@ -265,6 +266,7 @@ UID 0 bypass in the kernel. Each task has a CSpace of 64 slots holding
 | 9 | `MemObject` | the object's id | access: 1 read, 2 write |
 | 10 | `DeviceMemory` | — | — |
 | 11 | `Clock` | — | — |
+| 12 | `Power` | — | — |
 
 Delegation may narrow a capability but never widen it; delegating at equal
 breadth is allowed, since a set is a subset of itself.
@@ -288,6 +290,10 @@ every program on it: the date a file is given, what `SYS_CLOCK` answers,
 and what the machine believes when it is next started. A holder of `Clock`
 may set it (`SYS_CLOCK_SET`), and nobody else. The kernel hands it to the
 first task.
+
+**Power.** A holder of `Power` may turn the machine off and start it again
+(`SYS_POWER`). It is the machine's, as the clock is, and the kernel hands
+it to the first task.
 
 **Endpoints.** Every task has an endpoint, with a number the kernel never gives
 to anything else, even once the task is gone. An `Endpoint` capability records
@@ -954,9 +960,27 @@ to hear from.
 | 116 | `SYS_GETRANDOM` | arg0 = buf, arg1 = len, arg2 = flags (none yet) | bytes written, at most 1 MiB / `u64::MAX` | — |
 | 117 | `SYS_CPUS` | — | `(the processor the caller is on << 32) \| how many processors there are` | — |
 | 118 | `SYS_MSI_ALLOC` | — | `(irq << 48) \| (data << 32) \| address` / `u64::MAX` | `Irq` for any line (0xFF) |
+| 119 | `SYS_POWER` | arg0 = 0 to turn the machine off, 1 to start it again | does not return / `u64::MAX` | `Power` |
 
 `SYS_IOPORT` ops: 0 = read8, 1 = write8, 2 = read16, 3 = write16, 4 = read32,
 5 = write32. `SYS_IOPORT_REP` ops: 0 = `rep insw`, 1 = `rep outsw`.
+
+**Power.** `SYS_POWER` turns the machine off, or starts it again, the way
+its firmware says to: off, by the control register the ACPI tables name
+and the value the machine's own table calls `\_S5`; again, by the reset
+register they name, and where there is none — or it does nothing — by the
+keyboard controller's reset line and, failing that, a fault the processor
+cannot deliver. Starting again does not come back. Turning off comes back,
+with a failure, in two cases: the tables do not say how, which is known
+before anything is stopped; or they did and the machine is still here, by
+which time the other processors have been stopped and the caller is what
+is left running — it may know something else to try, as `shutdown` does
+on a machine with no tables.
+
+The kernel stops what it runs and nothing else. What a machine about to go
+off owes its disks is the caller's to see to first: the file servers are
+programs, and a write they have answered is not yet a write they have
+made.
 
 **Interrupts.** A driver is told of its device's interrupt as a message from
 the kernel — sender 0, the tag the interrupt's number — found by its next
@@ -1537,7 +1561,7 @@ authority, and what it is started holding bounds what anything can hold:
 - `DeviceMemory`, in the last slot of its table — unless the kernel could
   not keep the firmware's memory map whole, and so cannot say where there
   is no memory;
-- `Clock`, in the last slot that leaves free;
+- `Clock` and `Power`, in the last slots that leaves free;
 - the driver band, which is what lets it put a driver there;
 - and no physical memory besides: it could once map the kernel.
 

@@ -87,10 +87,13 @@ them struck through as done. What follows is what is true now.
   device. A driver maps its device's registers by the `DeviceMemory`
   capability, which covers what the firmware's map leaves out below four
   gigabytes — all of it: a driver that holds it may map any device's.
-- **ACPI, for power.** The kernel reads two of its tables at boot
-  (`acpi.rs`). What they say about processors it acts on. What they say
-  about restarting the machine and turning it off it does not yet: powering
-  off is still a user program writing to a port QEMU happens to listen on.
+- **The rest of ACPI.** The kernel reads two tables and one object of a
+  third (`acpi.rs`), and acts on all three: the processors, the interrupt
+  controllers, and how to turn the machine off and restart it
+  (`SYS_POWER`). It does not run the firmware's own programs — there is no
+  interpreter for them — so there is no sleeping, no button that asks the
+  machine to turn off, no battery or lid or temperature, and a control
+  register that is memory rather than a port is not written.
 - **Memory above 4 GiB.** The frame allocator's bitmap covers the first four
   gigabytes and the rest of what the firmware reports is left alone.
 - **A time zone.** The date is UTC. `SYS_CLOCK_SET` sets it, for a holder

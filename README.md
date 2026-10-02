@@ -40,6 +40,8 @@ The kernel provides:
 - IRQ delivery to user-space drivers, and page faults forwarded to a pager
 - Random bytes (ChaCha20, seeded from RDSEED or RDRAND and the machine's
   timing), and the date, which a holder of the capability may set
+- Turning the machine off and restarting it, the way its firmware says to,
+  for a holder of the capability to
 
 ## The ABI
 
@@ -96,7 +98,9 @@ src/
   rtc.rs              The date, from the battery-backed clock and back to it
   intc.rs             The interrupt controller devices come in through:
   ioapic.rs  pic.rs     the I/O APIC, or the 8259s
-  acpi.rs             The firmware's tables: processors, interrupt controllers
+  acpi.rs             The firmware's tables: processors, interrupt controllers,
+                      and how to turn the machine off
+  power.rs            Turning it off, and starting it again
   devmem.rs           Device memory: the addresses that are not memory
   percpu.rs           What each processor has of its own
   klock.rs            The kernel lock: one processor in the kernel at a time
@@ -160,7 +164,7 @@ make run
 ## Testing
 
 The kernel is tested from outside, through the ABI, by a program: `dtest` in
-quarkutils makes 708 checks from user space. A kernel change is verified by
+quarkutils makes 710 checks from user space. A kernel change is verified by
 booting an image and running it — `tools/boot-test.sh` in ExplOSion — on one
 processor and on four.
 

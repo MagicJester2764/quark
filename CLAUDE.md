@@ -138,7 +138,7 @@ system hung.
 
 There are no tests in this tree, and that is the shape of a microkernel rather
 than an omission: the kernel is tested from outside, through the ABI, by a
-program. `dtest` in `../quarkutils` makes 708 checks — capabilities, IPC,
+program. `dtest` in `../quarkutils` makes 710 checks — capabilities, IPC,
 memory, descriptors, signals, scheduling, users and terminals, `dtest calls`
 with three million calls in three seconds, `dtest smp` for what a second
 processor changes, `dtest clock` for what time it is and whether a wait ends
@@ -741,6 +741,27 @@ closed:
   the same place, and the one being queued was ready and in no queue.
   `start_task` did that from a system call. Every caller of `unblock_task`
   holds interrupts off, or is an interrupt.
+
+## Power
+
+`power.rs`, and what `acpi.rs` reads for it. Two things that are quiet when
+they are wrong:
+
+- **The value that means "off" is found, not computed.** It is an object
+  named `\_S5` in the machine's table of methods, which is a program, and
+  the kernel has no interpreter: `acpi::s5` looks for the name being given
+  to a package of small numbers, and takes the first two. A table that says
+  it another way — the name built at run time, the numbers computed — is a
+  machine `SYS_POWER` cannot turn off, and it answers so before anything is
+  stopped. `shutdown` then writes the ports it always wrote.
+- **Turning off stops the other processors first, and they stay stopped.**
+  If the machine is still there afterwards the call comes back with a
+  failure, on one processor, to a caller that was ending everything anyway.
+  A new use of `power::off` that expects to carry on afterwards cannot.
+
+Starting again never comes back: where the tables name no reset register —
+OVMF's, for the machine QEMU pretends to be, name none — it is the keyboard
+controller's reset line, and then a fault the processor cannot deliver.
 
 ## Time
 

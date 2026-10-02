@@ -104,6 +104,9 @@ pub enum CapType {
     /// file's, and what the machine believes when it is next started. Who
     /// may set it is nobody by default and whoever is handed this.
     Clock = 11,
+    /// Permission to turn the machine off and to start it again
+    /// (`SYS_POWER`). No parameters.
+    Power = 12,
 }
 
 /// A `MemObject`'s access bits.
@@ -363,6 +366,17 @@ pub fn task_has_clock(tid: usize) -> bool {
     }
 }
 
+/// Check if a task has the Power capability.
+pub fn task_has_power(tid: usize) -> bool {
+    if tid >= MAX_TASKS { return false; }
+    unsafe {
+        match task_cspace(tid) {
+            Some(cs) => cs.iter().any(|cap| cap.cap_type as u8 == CapType::Power as u8 && is_valid(cap)),
+            None => false,
+        }
+    }
+}
+
 /// Public wrapper over the revocation check, for callers outside this module.
 pub fn slot_is_valid(cap: &CapSlot) -> bool {
     is_valid(cap)
@@ -572,7 +586,8 @@ pub fn insert_kernel_range(cspace: &mut CSpace, base: usize, len: usize) -> bool
 /// Give `cspace` an unrevocable capability of a kind that has no
 /// parameters — the right to map the machine's devices' registers
 /// ([`CapType::DeviceMemory`]), the right to set its clock
-/// ([`CapType::Clock`]) — in its last free slot. The first task names its
+/// ([`CapType::Clock`]), the right to turn it off ([`CapType::Power`]) — in
+/// its last free slot. The first task names its
 /// low slots itself — where it keeps the nameserver's endpoint, where it
 /// mints what it hands on — and counts on the ones it has not filled being
 /// empty; what the kernel adds to what it starts with goes where the task
@@ -652,6 +667,7 @@ pub fn validate_attenuation(source: &CapSlot, new_type: CapType, new_p0: u64, ne
         CapType::Endpoint => new_p0 == source.param0,
         CapType::DeviceMemory => true,
         CapType::Clock => true,
+        CapType::Power => true,
         // The same object, with no access the source lacks.
         CapType::MemObject => {
             new_p0 == source.param0

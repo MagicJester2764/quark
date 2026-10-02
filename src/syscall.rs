@@ -286,6 +286,11 @@ pub const SYS_GETRANDOM: u64 = 116;
 /// caller was on when it asked.
 pub const SYS_CPUS: u64 = 117;
 pub const SYS_MSI_ALLOC: u64 = 118;
+/// Turn the machine off, or start it again. For a holder of `Power`.
+pub const SYS_POWER: u64 = 119;
+/// `SYS_POWER`: which.
+const POWER_OFF: u64 = 0;
+const POWER_RESTART: u64 = 1;
 
 // --- 0x80  synchronisation ---
 pub const SYS_FUTEX_WAIT: u64 = 128;
@@ -399,7 +404,7 @@ pub const SYS_ABI_VERSION: u64 = 240;
 /// minor when calls are added. User space can refuse to run against a major it
 /// does not know, which is the point of exposing it at all.
 pub const ABI_VERSION_MAJOR: u64 = 3;
-pub const ABI_VERSION_MINOR: u64 = 15;
+pub const ABI_VERSION_MINOR: u64 = 16;
 
 /// Threads a task may make with no capability at all.
 ///
@@ -3326,6 +3331,27 @@ fn dispatch(
             let data = crate::ioapic::FIRST_VECTOR as u64 + irq as u64;
             ((irq as u64) << 48) | (data << 32) | address
         }
+        SYS_POWER => {
+            // arg0 = 0 to turn the machine off, 1 to start it again. For a
+            // holder of `Power`. Neither comes back when it is done, and
+            // starting again is always done. Turning off answers with a
+            // failure where the firmware's tables do not say how — asked
+            // before anything is stopped — and where they did and the
+            // machine is still here, by which time the other processors
+            // have been stopped: whoever asked is what is left running,
+            // and has whatever else it knows to try.
+            if !crate::cap::task_has_power(scheduler::current_tid()) {
+                return u64::MAX;
+            }
+            match arg0 {
+                POWER_OFF => {
+                    crate::power::off();
+                    u64::MAX
+                }
+                POWER_RESTART => crate::power::restart(),
+                _ => u64::MAX,
+            }
+        }
         SYS_CPUS => {
             // No capability: it is a number every program is entitled to
             // divide its work by. The processor the caller is on is true of
@@ -3807,6 +3833,7 @@ fn dispatch(
                 9 => crate::cap::CapType::MemObject,
                 10 => crate::cap::CapType::DeviceMemory,
                 11 => crate::cap::CapType::Clock,
+                12 => crate::cap::CapType::Power,
                 _ => return u64::MAX,
             };
             let tid = scheduler::current_tid();

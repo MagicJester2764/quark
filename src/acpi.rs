@@ -1,9 +1,12 @@
 //! ACPI: what the firmware says the machine is made of.
 //!
-//! The kernel reads two tables and nothing else. The **MADT** says how many
-//! processors there are and where the interrupt controllers are; the
-//! **FADT** says how to restart the machine and which ports turn it off.
-//! Neither needs the ACPI interpreter: both are plain structures.
+//! The kernel reads two tables, and one object out of a third. The **MADT**
+//! says how many processors there are and where the interrupt controllers
+//! are; the **FADT** says how to restart the machine and which ports turn
+//! it off. Neither needs the ACPI interpreter: both are plain structures.
+//! What to write to those ports to turn it off is in the **DSDT**, which is
+//! not a structure but a program; the one object wanted from it is found by
+//! what it looks like ([`s5`]).
 //!
 //! Where the tables are is the bootloader's to say (`multiboot2::rsdp`),
 //! because on a machine started by UEFI nothing else can; failing that the
@@ -86,6 +89,15 @@ pub struct Info {
     /// Where the table of the machine's own methods is: the value that
     /// means "off" is in there.
     pub dsdt: u64,
+    /// The port and the value that ask the firmware to hand power
+    /// management over, on a machine where it has not: 0 where there is
+    /// nothing to ask.
+    pub smi_cmd: u32,
+    pub acpi_enable: u8,
+    /// What "off" is, for each of the two control ports: the kind of sleep
+    /// the machine's own table calls `\_S5`. `None` if it has none that
+    /// could be read.
+    pub s5: Option<(u8, u8)>,
 }
 
 const NO_CPU: Cpu = Cpu { apic_id: 0 };
@@ -107,6 +119,9 @@ static mut INFO: Info = Info {
     pm1a_cnt: 0,
     pm1b_cnt: 0,
     dsdt: 0,
+    smi_cmd: 0,
+    acpi_enable: 0,
+    s5: None,
 };
 
 /// What the tables said. Unchanged after [`init`].
@@ -247,6 +262,8 @@ fn fadt(t: &[u8], info: &mut Info) {
         return;
     }
     info.dsdt = le32(t, 40) as u64;
+    info.smi_cmd = le32(t, 48);
+    info.acpi_enable = t[52];
     info.pm1a_cnt = le32(t, 64);
     info.pm1b_cnt = le32(t, 68);
     // The reset register is there from the table's second revision, and
@@ -265,6 +282,55 @@ fn fadt(t: &[u8], info: &mut Info) {
             _ => {}
         }
     }
+}
+
+/// What the machine's table of methods says "off" is: the first two values
+/// of the object named `\_S5`, one for each control port.
+///
+/// The table is a program in a language of its own, and this does not run
+/// it. It looks for the one thing wanted by its shape: a name, `_S5_`,
+/// being given — the byte before it says so, with or without the mark that
+/// the name is at the root — to a package, whose first two members are
+/// small numbers. A number in that language is itself when it is 0 or 1 and
+/// has a byte before it saying "a byte follows" otherwise.
+fn s5(dsdt: &[u8]) -> Option<(u8, u8)> {
+    const NAME: u8 = 0x08;
+    const PACKAGE: u8 = 0x12;
+    const BYTE_FOLLOWS: u8 = 0x0A;
+    let body = dsdt.get(SDT_HEADER..)?;
+    let number = |at: &mut usize| -> Option<u8> {
+        let value = match *body.get(*at)? {
+            BYTE_FOLLOWS => {
+                *at += 1;
+                *body.get(*at)?
+            }
+            small @ (0 | 1) => small,
+            _ => return None,
+        };
+        *at += 1;
+        (value <= 7).then_some(value)
+    };
+    (0..body.len().saturating_sub(4)).find_map(|name| {
+        if &body[name..name + 4] != b"_S5_" {
+            return None;
+        }
+        let given = (name >= 1 && body[name - 1] == NAME)
+            || (name >= 2 && body[name - 1] == b'\\' && body[name - 2] == NAME);
+        if !given || *body.get(name + 4)? != PACKAGE {
+            return None;
+        }
+        // The package's length, which says in its top two bits how many
+        // more bytes it is written in; then how many members it has.
+        let mut at = name + 5;
+        at += 1 + (*body.get(at)? >> 6) as usize;
+        if *body.get(at)? < 2 {
+            return None;
+        }
+        at += 1;
+        let a = number(&mut at)?;
+        let b = number(&mut at)?;
+        Some((a, b))
+    })
 }
 
 /// Read the tables, starting from the root pointer the bootloader passed
@@ -294,6 +360,9 @@ pub unsafe fn init(rsdp: Option<&[u8]>) { unsafe {
             b"FACP" => fadt(t, info),
             _ => {}
         }
+    }
+    if let Some(dsdt) = table(info.dsdt) {
+        info.s5 = s5(dsdt);
     }
     // A table of processors with none in it that can be used says nothing.
     if info.ncpus == 0 {
@@ -328,6 +397,15 @@ fn report(info: &Info) {
     if let Some(reset) = info.reset {
         puts(if reset.space == 1 { b", reset by port " } else { b", reset by memory " });
         put_hex(reset.addr);
+    }
+    if let Some((a, b)) = info.s5 {
+        puts(b", off by port ");
+        put_hex(info.pm1a_cnt as u64);
+        puts(b" (");
+        put_dec(a as u64);
+        puts(b", ");
+        put_dec(b as u64);
+        puts(b")");
     }
     puts(b".\n");
 }
