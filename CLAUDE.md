@@ -138,7 +138,7 @@ system hung.
 
 There are no tests in this tree, and that is the shape of a microkernel rather
 than an omission: the kernel is tested from outside, through the ABI, by a
-program. `dtest` in `../quarkutils` makes 747 checks — capabilities, IPC,
+program. `dtest` in `../quarkutils` makes 749 checks — capabilities, IPC,
 memory, descriptors, signals, scheduling, users and terminals, `dtest calls`
 with three million calls in three seconds, `dtest smp` for what a second
 processor changes, `dtest clock` for what time it is and whether a wait ends
@@ -165,7 +165,10 @@ is a real race.
 
 A fault prints to serial: `[UPFAULT ...]` or `[UFAULT ...]` for ring 3, which
 ends the program, and `[KFAULT ...]` for ring 0, which halts the machine. A
-failed check prints to the screen. Look at both.
+failed check prints to the screen. Look at both. `[KSTUCK ...]` is the third
+thing serial can say, and is read as a kernel fault is: one processor has had
+the kernel for half a minute, the rest have been waiting at its door, and
+this is where the one that had it was.
 
 A kernel fault says three things: where (`rip`, `rsp`, the task and its kernel
 stack), the registers, and `calls` — every word on the kernel stack that is an
@@ -495,8 +498,11 @@ byte that begins it and every byte that continues it, and not the last byte
 of one.
 What a program prints waits for room when the terminal is full, all of it: a
 write that came back short, or with nothing, is what a full disk looks like,
-and `cat` said so. What a terminal emulator types does not wait, because its
-echo comes back at it and a wait there is a wait on itself.
+and `cat` said so. The wait is for the room the next byte needs, and a
+newline needs two (`pty::takes`, which the write, the wait and `poll` all
+ask): see *More than one processor* for what it was when the wait asked only
+whether there was any. What a terminal emulator types does not wait, because
+its echo comes back at it and a wait there is a wait on itself.
 Between the master being opened and the slave being opened the master's read
 waits rather than reporting an end of file: the program that will hold the
 slave has not been started yet. Afterwards, the last slave closing *is* the end
@@ -908,6 +914,22 @@ breaking any of them is quiet until it is a machine that stops.
   (`klock::enter`, `leave`) and gives back exactly that. A new way into the
   kernel takes it; a new way out — a new trampoline to ring 3 — gives it
   up. Either mistake panics rather than hangs: the lock knows who has it.
+- **A wait in the kernel parks, or it can end by itself.** A loop that
+  tries, finds it cannot, asks whether to wait, is told there is no need
+  and tries again is waiting for somebody else — and with the kernel one
+  processor's at a time nobody else can come in to do it. On one processor
+  a tick ends such a loop, by running whoever it was waiting for; it costs
+  a tick and looks like nothing. On several that task is at the door, and
+  the machine has every processor busy for good. A terminal's write was
+  one: a newline goes out as two bytes, the write took nothing with one
+  byte of room, and the wait saw room. So *the question a wait asks is the
+  one its retry will be asked* — one function for both (`pty::takes`) —
+  and a new wait that can come back without parking is read for that.
+  It was found by asking the machine's monitor where each processor was,
+  after half an hour of a test saying nothing. The lock says it now: a
+  processor that waits thirty seconds names the one that has the kernel,
+  that one says where it is (`[KSTUCK ...]`, if its interrupts are on),
+  and the machine stops (`klock::waited`).
 - **"Which processor is this" has an answer only with interrupts off.** A
   task in a system call is moved wherever it can be preempted. Nothing reads
   `percpu::index()` and acts on it later. `percpu::current()` is one

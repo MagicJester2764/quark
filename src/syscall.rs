@@ -4454,7 +4454,7 @@ fn pty_write(pty: usize, ptr: *const u8, len: usize) -> u64 {
         let mut sent = 0;
         while sent < chunk {
             sent += crate::pty::write(pty, 1, &buf[sent..chunk]);
-            if sent < chunk && !crate::pty::wait_writable(pty) {
+            if sent < chunk && !crate::pty::wait_writable(pty, buf[sent]) {
                 // Nobody is left to read it. What went, went.
                 let total = done + sent;
                 return if total > 0 { total as u64 } else { u64::MAX };

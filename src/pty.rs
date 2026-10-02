@@ -600,20 +600,29 @@ fn input(p: &mut Pty, bytes: &[u8]) -> usize {
 /// Output, on its way to whatever is drawing the terminal.
 fn output(p: &mut Pty, bytes: &[u8]) -> usize {
     let mut done = 0;
-    let expand = p.termios.c_oflag & OPOST != 0 && p.termios.c_oflag & ONLCR != 0;
     for &b in bytes {
-        if expand && b == b'\n' {
-            if p.to_master.room() < 2 {
-                break;
-            }
-            p.to_master.push(b'\r');
-            p.to_master.push(b'\n');
-        } else if !p.to_master.push(b) {
+        let takes = takes(p, b);
+        if p.to_master.room() < takes {
             break;
         }
+        if takes == 2 {
+            p.to_master.push(b'\r');
+        }
+        p.to_master.push(b);
         done += 1;
     }
     done
+}
+
+/// How much room a byte a program prints takes in what goes to the master:
+/// a newline that goes out as a return and a newline takes two.
+///
+/// One answer, for the write and for the wait for room ([`wait_writable`])
+/// and for whether the end is writable at all: they have to agree about
+/// what is being waited for.
+fn takes(p: &Pty, b: u8) -> usize {
+    let expand = p.termios.c_oflag & OPOST != 0 && p.termios.c_oflag & ONLCR != 0;
+    if expand && b == b'\n' { 2 } else { 1 }
 }
 
 /// What a read from an end would find.
@@ -761,6 +770,16 @@ pub fn wait_readable(pty: usize, end: u8) -> Waited {
 /// again. False when waiting is no use: the master has gone, and nothing will
 /// ever take what is there; or there was nowhere to record the waiter.
 ///
+/// `next` is the byte the write stopped at, and the wait is for room for
+/// *that*. It asked whether there was any room, and a newline wants two
+/// bytes: with one byte left the write took nothing, the wait found room
+/// and did not wait, and the two went round for ever — in the kernel, with
+/// the kernel's lock. On one processor a tick let the terminal's reader in
+/// and it ended. On several the reader was at the kernel's door, waiting
+/// for the lock, and so was everything else: the machine stopped, about
+/// one run of a long test in several, with whatever it was printing cut
+/// off in the middle of a line.
+///
 /// For the slave only. What the master writes is typing, which goes through
 /// the line discipline and can be refused for want of room in *either*
 /// direction — the echo comes back at the writer — so a terminal emulator
@@ -769,7 +788,7 @@ pub fn wait_readable(pty: usize, end: u8) -> Waited {
 /// A write that returned nothing instead of waiting is what this replaced:
 /// `cat` of a file longer than the buffer reported "No space left on device",
 /// because a write of nothing is what a full disk looks like.
-pub fn wait_writable(pty: usize) -> bool {
+pub fn wait_writable(pty: usize, next: u8) -> bool {
     if pty >= MAX_PTYS {
         return false;
     }
@@ -779,7 +798,7 @@ pub fn wait_writable(pty: usize) -> bool {
         let p = &mut ptys()[pty];
         if !p.in_use || peer_gone(p, 1) {
             (false, false)
-        } else if p.to_master.room() > 0 {
+        } else if p.to_master.room() >= takes(p, next) {
             // Somebody read between the write and this: look again.
             (true, false)
         } else if p.to_master.nwriters >= MAX_WAITERS {
@@ -856,7 +875,11 @@ pub fn writable(pty: usize, end: u8) -> bool {
     let flags = irq_save();
     let out = {
         let p = &ptys()[pty];
-        p.in_use && (if end == 0 { p.to_slave.room() } else { p.to_master.room() }) > 0
+        // Room for whatever comes next, which for what a program prints
+        // may be a newline: an end that said it could be written to and
+        // then took nothing is a program that asks again at once, for ever.
+        p.in_use
+            && if end == 0 { p.to_slave.room() > 0 } else { p.to_master.room() >= takes(p, b'\n') }
     };
     irq_restore(flags);
     out

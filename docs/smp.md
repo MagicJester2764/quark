@@ -158,6 +158,19 @@ is run again (`paging::permits`). Before there was a second processor, the
 fault and its handling were one step, and the second thread would have been
 told that nothing was promised at that address.
 
+**Waiting in the kernel for somebody who is outside it.** On one processor
+a loop in the kernel that waits without parking — try, ask whether to wait,
+be told there is no need, try again — ends at the next tick, which runs
+whoever it was waiting for. With the kernel one processor's at a time that
+task is at the door, on another processor, with interrupts off, and the
+tick finds nothing else to run: every processor is busy and the machine
+has stopped. A terminal's write did this with one byte of room and a
+newline, which goes out as two. Nothing can be done about such a loop from
+outside it, so the lock at least says it has happened: a processor that
+has waited half a minute for the kernel names the one that has it, that
+one is stopped and says where it was, and the machine halts with a
+sentence on the serial line rather than without one.
+
 ## Who runs what
 
 The ready queues are the machine's. Each processor takes the best task

@@ -493,6 +493,30 @@ unsafe extern "C" {
     static __text_end: u8;
 }
 
+/// Where this processor was when it was stopped for having had the kernel
+/// too long (`klock.rs`): what a kernel fault says, of a processor that did
+/// not fault.
+fn say_where(frame: &InterruptFrame) {
+    use crate::serial::{put_hex_usize, put_usize, puts};
+    puts(b"[KSTUCK cpu=");
+    put_usize(crate::percpu::index());
+    puts(b" rip=0x");
+    put_hex_usize(frame.rip as usize);
+    puts(b" rsp=0x");
+    put_hex_usize(frame.rsp as usize);
+    puts(b" cs=0x");
+    put_hex_usize(frame.cs as usize);
+    puts(b" tid=");
+    put_usize(crate::scheduler::current_tid());
+    let (kbase, ktop) = crate::scheduler::current_kernel_stack();
+    puts(b" kstack=0x");
+    put_hex_usize(kbase);
+    puts(b"..0x");
+    put_hex_usize(ktop);
+    puts(b"]\n");
+    report_kernel_state(b"[KSTUCK", frame, kbase, ktop);
+}
+
 /// The rest of what a kernel fault says to serial: the registers, and the
 /// words on the kernel stack that are addresses in the kernel's own code.
 ///
@@ -507,7 +531,7 @@ unsafe extern "C" {
 ///
 /// Printed to serial and not the screen, because the screen may be a
 /// compositor's by now and serial is what a test keeps.
-fn report_kernel_state(frame: &InterruptFrame, kbase: usize, ktop: usize) {
+fn report_kernel_state(tag: &[u8], frame: &InterruptFrame, kbase: usize, ktop: usize) {
     use crate::serial::{put_hex_usize, puts};
     let regs: [(&[u8], u64); 16] = [
         (b"rax", frame.rax), (b"rbx", frame.rbx), (b"rcx", frame.rcx), (b"rdx", frame.rdx),
@@ -515,7 +539,8 @@ fn report_kernel_state(frame: &InterruptFrame, kbase: usize, ktop: usize) {
         (b"r9", frame.r9), (b"r10", frame.r10), (b"r11", frame.r11), (b"r12", frame.r12),
         (b"r13", frame.r13), (b"r14", frame.r14), (b"r15", frame.r15), (b"rflags", frame.rflags),
     ];
-    puts(b"[KFAULT regs");
+    puts(tag);
+    puts(b" regs");
     for (name, value) in regs {
         puts(b" ");
         puts(name);
@@ -529,11 +554,13 @@ fn report_kernel_state(frame: &InterruptFrame, kbase: usize, ktop: usize) {
     // would fault again inside the report.
     let rsp = frame.rsp as usize & !7;
     if kbase == 0 || rsp < kbase || rsp >= ktop {
-        puts(b"[KFAULT stack: rsp is not in the task's kernel stack]\n");
+        puts(tag);
+        puts(b" stack: rsp is not in the task's kernel stack]\n");
         return;
     }
     let text = core::ptr::addr_of!(__text_start) as usize..core::ptr::addr_of!(__text_end) as usize;
-    puts(b"[KFAULT stack top:");
+    puts(tag);
+    puts(b" stack top:");
     for i in 0..8 {
         let at = rsp + i * 8;
         if at >= ktop {
@@ -542,7 +569,9 @@ fn report_kernel_state(frame: &InterruptFrame, kbase: usize, ktop: usize) {
         puts(b" 0x");
         put_hex_usize(unsafe { core::ptr::read_volatile(at as *const usize) });
     }
-    puts(b"]\n[KFAULT calls:");
+    puts(b"]\n");
+    puts(tag);
+    puts(b" calls:");
     let mut at = rsp;
     let mut shown = 0;
     while at < ktop && shown < 48 {
@@ -787,7 +816,7 @@ fn exception(frame: &InterruptFrame) {
     crate::serial::puts(b"..0x");
     crate::serial::put_hex_usize(ktop);
     crate::serial::puts(b"]\n");
-    report_kernel_state(frame, kbase, ktop);
+    report_kernel_state(b"[KFAULT", frame, kbase, ktop);
     console::puts(b"\n!!! EXCEPTION: ");
     if vec < 32 {
         console::puts(EXCEPTION_NAMES[vec]);
@@ -869,7 +898,14 @@ extern "C" fn irq_handler(frame: &InterruptFrame) {
             crate::lapic::eoi();
             return;
         }
-        VEC_HALT => crate::smp::halt_here(),
+        VEC_HALT => {
+            // Stopped for having had the kernel too long: where it was is
+            // the whole of what anybody will learn about why.
+            if crate::klock::stuck() {
+                say_where(frame);
+            }
+            crate::smp::halt_here()
+        }
         VEC_SPURIOUS => return,
         _ => {}
     }
