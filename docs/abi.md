@@ -1,6 +1,6 @@
 # Quark syscall ABI
 
-**Version 3.22.** Query the running kernel with `SYS_ABI_VERSION` (240), which
+**Version 3.23.** Query the running kernel with `SYS_ABI_VERSION` (240), which
 returns `(major << 16) | minor`.
 
 This document is the contract between the Quark kernel and everything above it.
@@ -220,6 +220,7 @@ returning at once turned that loop into a spin.
 | 3.16 | **Off, and on again, by the firmware's tables.** `SYS_POWER` (119) turns the machine off or restarts it, for a holder of the new capability `Power` (type 12): by ACPI's control and reset registers, where a program used to write to the three ports QEMU listens on. |
 | 3.17 | **Memory above four gigabytes.** All of a machine's memory is used, up to 511 GiB, where the kernel used the first four gigabytes of it. `SYS_PHYS_ALLOC` takes a flag (arg1 = 1) for frames below four gigabytes, which is what a device that is told an address in thirty-two bits needs; without it a frame is ordinary memory and comes from the top. `SYS_MEM_INFO` takes what to say (arg0): 1 for how much memory the machine has and 2 for where it ends. |
 | 3.18 | **The wide registers.** A program may use AVX, AVX2 and AVX-512 where the processor has them: the kernel turns them on (`OSXSAVE`, XCR0) and saves all of each task's with `XSAVE`. Before, an AVX instruction was a fault. No call changed. |
+| 3.23 | **A device's memory.** `SYS_DEVICE_CLAIM` (127) makes a PCI device the caller's program's; on a machine with an IOMMU it then reaches the memory the program was given for devices and nothing else, and a device nobody has claimed reaches nothing. |
 | 3.22 | **What a program uses.** `SYS_USAGE` (124) says how long a program, the children it collected or a task has run — in the program and in the kernel, to the nanosecond — and how often it gave the processor up or had it taken. `SYS_NICE` (125) sets how nice a program is to the rest of its band, which is its share of it by Linux's weights, on any number of processors. `SYS_CPU_LIMIT` (126) sets how long it may run: SIGXCPU past the soft limit, the end at the hard one. |
 | 3.21 | **Threads share their program's capabilities, and a threaded program can exec.** No new number. A program has one capability space, as it has one descriptor table: a thread uses it, where it started with a copy of its creator's, so what one thread is given the others have. A forked child gets a copy. `SYS_EXEC_SPACE` from a program with more than one task ends the others first, quietly — none is a child to collect or a death to be told of — where it was refused; if one of them was the task the program began as, the caller becomes its parent's child in its place. |
 | 3.20 | **The kernel runs handlers.** `SYS_SIG_ACTION` (11) with 3 has the kernel run a program's handler for a signal: a task that does not hold it back is turned aside on its way out of a call, an interrupt or a fault, and enters the program at the place said with signal 0, with a record of where it was on its stack; `SYS_SIG_RETURN` (121) puts it back. A fault that is a signal goes to the program's handler for it the same way. Each task holds back a set of signals of its own (`SYS_SIG_MASK`, 120): a signal every task holds back waits, whatever it would do; `SYS_SIG_WAIT` (123) takes one without anything being done about it; `SYS_SIG_STACK` (122) names a stack for handlers. `SYS_SIG_RAISE` with arg2 = 4 raises a signal for one task. Every wait a task sits in is ended by a signal it is to run — a pipe's, a stream's, a counter's, a timer's, a futex's, a wait for a child, as well as the ones a signal ended before — and a program that asks is answered `0xFFFF_FFFC` and `0xFFFF_FFFB` as well as `0xFFFF_FFFD`, to say what ran. `SYS_POLL` and `SYS_POLLSET_WAIT` wait under a mask they are given. A terminal raises 28 when its size changes, and stops a job behind that changes its settings or its size, or writes to it where `TOSTOP` says to. |
@@ -1075,6 +1076,7 @@ to hear from.
 | 117 | `SYS_CPUS` | — | `(the processor the caller is on << 32) \| how many processors there are` | — |
 | 118 | `SYS_MSI_ALLOC` | — | `(irq << 48) \| (data << 32) \| address` / `u64::MAX` | `Irq` for any line (0xFF) |
 | 119 | `SYS_POWER` | arg0 = 0 to turn the machine off, 1 to start it again | does not return / `u64::MAX` | `Power` |
+| 127 | `SYS_DEVICE_CLAIM` | arg0 = a PCI device, `bus << 8 \| device << 3 \| function`, on the first segment; arg1 = 1 to ask how many times it reached for what it may not | 1 if it now reaches only the caller's program's memory, 0 if nothing on this machine can make it; with arg1 = 1 the count; `u64::MAX - 1` if it is another program's or the caller may not / `u64::MAX` | `IoPort` covering 0xCF8 and 0xCFC |
 
 `SYS_IOPORT` ops: 0 = read8, 1 = write8, 2 = read16, 3 = write16, 4 = read32,
 5 = write32. `SYS_IOPORT_REP` ops: 0 = `rep insw`, 1 = `rep outsw`.
@@ -1130,6 +1132,24 @@ its device to see whether it has anything to say, as it would on a shared
 line.
 
 Every interrupt is delivered to the first processor.
+
+*A device's memory.* A device that copies to and from memory itself (DMA)
+names it by its physical address, and on a machine without an IOMMU nothing
+checks the address. Where the machine has one (Intel's VT-d, which the
+firmware lists in its `DMAR` table) the kernel turns it on at boot with no
+device able to reach anything, and `SYS_DEVICE_CLAIM` makes a device the
+caller's program's: from then on the device reaches the memory the program
+was given for devices (`SYS_PHYS_ALLOC`), at the addresses `SYS_PHYS_ALLOC`
+answered with, and nothing else — what the program gives back, it can no
+longer reach by the time `SYS_PHYS_FREE` returns. A device is one program's
+until that program ends or `exec`s; its claim is the claim of a driver that
+can configure every device anyway, which is to say a holder of the PCI
+configuration ports. A claim is answered 1 where this is so and 0 where it
+cannot be — no IOMMU, or one that does not take the device, or a firmware
+that reserves memory for some device, which leaves the machine as it was —
+and is a claim either way. Interrupts are not remapped: a device's message
+reaches the processor it names. What a device was stopped from doing is
+counted against it (arg1 = 1) and said on the serial line.
 
 `SYS_GETRANDOM` never blocks and needs nothing. The generator is ChaCha20
 (RFC 8439) with fast key erasure: each call's first block replaces the key

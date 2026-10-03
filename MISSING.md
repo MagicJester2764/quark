@@ -84,7 +84,17 @@ them struck through as done. What follows is what is true now.
 - **A device's registers above four gigabytes**, and an authority for one
   device. A driver maps its device's registers by the `DeviceMemory`
   capability, which covers what the firmware's map leaves out below four
-  gigabytes — all of it: a driver that holds it may map any device's.
+  gigabytes — all of it: a driver that holds it may map any device's. It
+  claims a device for its memory (`SYS_DEVICE_CLAIM`), and the claim does
+  not yet narrow what it may map.
+- **The rest of an IOMMU.** Where Intel's VT-d is, a device's DMA reaches
+  its driver's memory and nothing else; its interrupts are not remapped,
+  so a device can still send any message it likes. A firmware that
+  reserves memory for a device (an RMRR — a USB controller's keyboard, a
+  graphics card's frame) leaves the machine unguarded, as does AMD's
+  IOMMU, which is not driven. And a device is given its driver's memory at
+  the memory's own addresses: a device that addresses less than the
+  machine has needs memory from below what it can reach, as before.
 - **The rest of ACPI.** The kernel reads two tables and one object of a
   third (`acpi.rs`), and acts on all three: the processors, the interrupt
   controllers, and how to turn the machine off and restart it

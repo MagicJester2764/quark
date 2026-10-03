@@ -307,6 +307,8 @@ pub const SYS_USAGE: u64 = 124;
 pub const SYS_NICE: u64 = 125;
 /// How long a program may run.
 pub const SYS_CPU_LIMIT: u64 = 126;
+/// A device is the caller's program's to drive, and reaches its memory only.
+pub const SYS_DEVICE_CLAIM: u64 = 127;
 /// `SYS_POWER`: which.
 const POWER_OFF: u64 = 0;
 const POWER_RESTART: u64 = 1;
@@ -426,7 +428,7 @@ pub const SYS_ABI_VERSION: u64 = 240;
 /// minor when calls are added. User space can refuse to run against a major it
 /// does not know, which is the point of exposing it at all.
 pub const ABI_VERSION_MAJOR: u64 = 3;
-pub const ABI_VERSION_MINOR: u64 = 22;
+pub const ABI_VERSION_MINOR: u64 = 23;
 
 /// Threads a task may make with no capability at all.
 ///
@@ -3624,6 +3626,11 @@ fn dispatch(
             // (u64::MAX none); arg2 = where to write the two it was, or 0;
             // arg3 = 1 to change nothing.
             crate::usage::cpu_limit(scheduler::current_tid(), arg0, arg1, arg2, arg3 == 1)
+        }
+        SYS_DEVICE_CLAIM => {
+            // arg0 = bus << 8 | device << 3 | function; arg1 = 1 to ask how
+            // many times the device reached for what it may not.
+            crate::iommu::claim(scheduler::current_tid(), arg0, arg1 == 1)
         }
         SYS_SIG_WAIT => {
             // arg0 = the signals to take, arg1 = how long to wait for one, a

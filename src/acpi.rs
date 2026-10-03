@@ -1,9 +1,11 @@
 //! ACPI: what the firmware says the machine is made of.
 //!
-//! The kernel reads two tables, and one object out of a third. The **MADT**
-//! says how many processors there are and where the interrupt controllers
-//! are; the **FADT** says how to restart the machine and which ports turn
-//! it off. Neither needs the ACPI interpreter: both are plain structures.
+//! The kernel reads three tables, and one object out of a fourth. The
+//! **MADT** says how many processors there are and where the interrupt
+//! controllers are; the **FADT** says how to restart the machine and which
+//! ports turn it off; the **DMAR**, where there is one, where the machine's
+//! IOMMUs are and which devices are behind each (`iommu.rs`). None needs
+//! the ACPI interpreter: all are plain structures.
 //! What to write to those ports to turn it off is in the **DSDT**, which is
 //! not a structure but a program; the one object wanted from it is found by
 //! what it looks like ([`s5`]).
@@ -24,6 +26,10 @@
 pub const MAX_CPUS: usize = 16;
 pub const MAX_IOAPICS: usize = 4;
 pub const MAX_OVERRIDES: usize = 16;
+pub const MAX_DRHDS: usize = 4;
+/// Devices named one by one under an IOMMU that does not take every device
+/// there is.
+pub const MAX_SCOPES: usize = 8;
 
 /// The kernel's map of memory as the machine starts ends here, and so does
 /// what it can read: the tables are read before the map is made longer, and
@@ -58,6 +64,19 @@ pub struct Override {
     pub irq: u8,
     pub gsi: u32,
     pub flags: u16,
+}
+
+/// An IOMMU (a DMA remapping unit): where its registers are, how many pages
+/// of them, and which devices it takes — every device on its segment that
+/// no other unit names, or the ones named, each a bus and a device and a
+/// function.
+#[derive(Clone, Copy)]
+pub struct Drhd {
+    pub base: u64,
+    pub pages: u32,
+    pub all: bool,
+    pub scopes: [(u8, u8); MAX_SCOPES],
+    pub nscopes: usize,
 }
 
 /// A register named the way ACPI names one: which space, and where.
@@ -100,11 +119,17 @@ pub struct Info {
     /// the machine's own table calls `\_S5`. `None` if it has none that
     /// could be read.
     pub s5: Option<(u8, u8)>,
+    /// The machine's IOMMUs, and how many regions of memory its firmware
+    /// says a device must go on reaching (RMRRs).
+    pub drhds: [Drhd; MAX_DRHDS],
+    pub ndrhds: usize,
+    pub rmrrs: usize,
 }
 
 const NO_CPU: Cpu = Cpu { apic_id: 0 };
 const NO_IOAPIC: IoApic = IoApic { id: 0, addr: 0, gsi_base: 0 };
 const NO_OVERRIDE: Override = Override { irq: 0, gsi: 0, flags: 0 };
+const NO_DRHD: Drhd = Drhd { base: 0, pages: 0, all: false, scopes: [(0, 0); MAX_SCOPES], nscopes: 0 };
 
 static mut INFO: Info = Info {
     found: false,
@@ -124,6 +149,9 @@ static mut INFO: Info = Info {
     smi_cmd: 0,
     acpi_enable: 0,
     s5: None,
+    drhds: [NO_DRHD; MAX_DRHDS],
+    ndrhds: 0,
+    rmrrs: 0,
 };
 
 /// What the tables said. Unchanged after [`init`].
@@ -145,6 +173,54 @@ fn le32(b: &[u8], at: usize) -> u32 {
 
 fn le64(b: &[u8], at: usize) -> u64 {
     le32(b, at) as u64 | (le32(b, at + 4) as u64) << 32
+}
+
+/// The DMAR: each remapping unit (DRHD), with the devices it names where it
+/// does not take them all; and how many reserved regions (RMRR) there are.
+/// A unit on another PCI segment is left out, as everything here is on the
+/// first; and of a device named below a bridge, only the device on the
+/// first bus is kept, as only those are claimed.
+fn dmar(t: &[u8], info: &mut Info) {
+    let mut at = 48;
+    while at + 4 <= t.len() {
+        let (kind, len) = (le16(t, at), le16(t, at + 2) as usize);
+        if len < 4 || at + len > t.len() {
+            break;
+        }
+        let e = &t[at..at + len];
+        match kind {
+            0 if len >= 16 && le16(e, 6) == 0 && info.ndrhds < MAX_DRHDS => {
+                let mut unit = NO_DRHD;
+                unit.all = e[4] & 1 != 0;
+                // The size, in a newer table: two to its power in pages.
+                unit.pages = 1 << (e[5] & 0x0F).min(4);
+                unit.base = le64(e, 8);
+                // The device scopes: a kind, a length, two reserved bytes,
+                // an enumeration id, the bus, and then (device, function)
+                // pairs down through bridges.
+                let mut s = 16;
+                while s + 6 <= len {
+                    let (skind, slen) = (e[s], e[s + 1] as usize);
+                    if slen < 6 || s + slen > len {
+                        break;
+                    }
+                    if skind == 1 && slen == 8 && unit.nscopes < MAX_SCOPES {
+                        let (bus, dev, func) = (e[s + 5], e[s + 6], e[s + 7]);
+                        unit.scopes[unit.nscopes] = (bus, (dev & 0x1F) << 3 | (func & 7));
+                        unit.nscopes += 1;
+                    }
+                    s += slen;
+                }
+                if unit.base != 0 && unit.base < MAP_LIMIT {
+                    info.drhds[info.ndrhds] = unit;
+                    info.ndrhds += 1;
+                }
+            }
+            1 => info.rmrrs += 1,
+            _ => {}
+        }
+        at += len;
+    }
 }
 
 /// The table at `addr`, if there is a whole, sound one there that the
@@ -360,6 +436,7 @@ pub unsafe fn init(rsdp: Option<&[u8]>) { unsafe {
                 madt(t, info);
             }
             b"FACP" => fadt(t, info),
+            b"DMAR" => dmar(t, info),
             _ => {}
         }
     }
@@ -408,6 +485,10 @@ fn report(info: &Info) {
         puts(b", ");
         put_dec(b as u64);
         puts(b")");
+    }
+    for unit in &info.drhds[..info.ndrhds] {
+        puts(b", IOMMU at ");
+        put_hex(unit.base);
     }
     puts(b".\n");
 }

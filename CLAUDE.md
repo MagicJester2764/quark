@@ -146,7 +146,8 @@ when it should, `dtest fork` for what a fork shares and who a write is seen
 by, `dtest handlers` for a handler the kernel runs, `dtest usage` for what
 a program has used and its share of the processor, twenty-three more (`dtest pressure`) on a machine with somewhere to write
 memory out to, and seven more (`dtest msi`) on a machine with a device that
-interrupts by message and its driver running — and `qfuzz` throws random
+interrupts by message and its driver running, and eight (`dtest iommu`)
+where an IOMMU stands between that device and memory — and `qfuzz` throws random
 requests at every service.
 
 So a kernel change is verified by booting an image:
@@ -164,6 +165,12 @@ both: one processor is still a machine people have, and it is the only one
 on which nothing runs at the same time as anything, which hides and shows
 different mistakes. Under KVM the four are four real processors, and a race
 is a real race.
+
+**With an IOMMU and without.** `IOMMU=1` gives the machine Intel's
+(`-device intel-iommu`), which wants QEMU's q35 chipset, where nothing is on
+the old IDE ports: it boots the live ISO (`ISO=explosion.iso`), which runs
+from memory. A change to how memory reaches a device, or to who owns a
+frame, is verified there too.
 
 A fault prints to serial: `[UPFAULT ...]` or `[UFAULT ...]` for ring 3, which
 ends the program, and `[KFAULT ...]` for ring 0, which halts the machine. A
@@ -514,9 +521,9 @@ may keep — are in `../quarkutils/CLAUDE.md`; these are the kernel's.
 - **A `PhysRange` over a device's registers is minted from `DeviceMemory`,
   and only where there is no memory.** *Device memory* (`devmem.rs`) is
   every address below four gigabytes that the firmware's memory map does
-  not list at all, less the first megabyte and the interrupt controllers'
+  not list at all, less the first megabyte, the interrupt controllers'
   own pages — a program that could write to a local APIC could stop the
-  clock. The capability is a kind of its own so that no task holds a
+  clock — and the IOMMUs', which a program could turn off. The capability is a kind of its own so that no task holds a
   `PhysRange` wider than what it maps: a driver reads where its device is
   and mints that (`cap::can_mint`). It is worked out from the *whole* map
   or not at all: a hole in what the kernel kept of the map is not a hole in
@@ -526,6 +533,19 @@ may keep — are in `../quarkutils/CLAUDE.md`; these are the kernel's.
   hundred entries did not fit in sixty-four and the last of its memory was
   never seen. `init`'s capability goes in its *last* free slot: it names
   its low ones itself and counts on the rest of them being empty.
+- **Where there is an IOMMU, a device reaches what its driver was given
+  and nothing else** (`iommu.rs`, Intel's VT-d). It is turned on at boot
+  with nothing reachable; `SYS_DEVICE_CLAIM` makes a device a program's,
+  and from then on it reaches the frames that program asked for for
+  devices (`SYS_PHYS_ALLOC`, the frames with an owner), at their own
+  addresses, so a driver's numbers do not change. Every change of a
+  frame's owner goes through `pmm::set_owner`, `clear_owner` and
+  `release_task_frames`, which tell the IOMMU: a frame leaving its owner
+  is out of every table, the units told and waited for, before it can be
+  anybody else's. A new way to give a program memory for a device, or to
+  take it back, goes through them too. A claim is a driver's — a holder
+  of the PCI configuration ports, who could reprogram any device anyway —
+  and goes when its program does, `exec` included (`program_gone`).
 
 ## Descriptors the kernel owns
 

@@ -1806,6 +1806,8 @@ unsafe fn note_death(tid: usize) { unsafe {
     let space = t.space;
     if space != 0 && !space_has_live_task(space) {
         crate::ipc::notify_space_watchers(space);
+        // Its devices reach nothing any more.
+        crate::iommu::program_gone(space);
         // The process has gone: a session it led, and a job it left
         // stopped with nobody to continue it.
         crate::job::process_ended(tid);
@@ -2566,6 +2568,23 @@ pub fn pinned(space: u64, va: u64) -> bool {
     false
 }
 
+/// A bit for every task of program `space`, living or not yet taken apart:
+/// whose frames are the program's.
+pub fn tasks_of_space_mask(space: u64) -> u64 {
+    const _: () = assert!(MAX_TASKS <= 64, "a bit a task");
+    let mut mask = 0u64;
+    let flags = irq_save();
+    unsafe {
+        for t in 1..MAX_TASKS {
+            if matches!(TASKS[t], Some(ref task) if task.space == space) {
+                mask |= 1 << t;
+            }
+        }
+    }
+    irq_restore(flags);
+    mask
+}
+
 /// Every task of the process `tid` is a task of that has not been taken
 /// apart, into `out`: its threads, dead or alive, and what it began as.
 /// Returns how many.
@@ -2947,6 +2966,7 @@ pub fn exec_into(cr3: usize, entry: u64, rsp: u64) -> Result<(), ()> {
             // then on no server could be told of any program ending.
             if old_space != 0 && !space_has_live_task(old_space) {
                 crate::ipc::notify_space_watchers(old_space);
+                crate::iommu::program_gone(old_space);
             }
         }
         crate::userspace::addrspace_ref(cr3);

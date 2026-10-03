@@ -34,6 +34,8 @@ pub fn tick() {
     crate::random::stir();
     crate::ipc::check_signal_deadlines();
     crate::clock::expire(false);
+    // What the IOMMU stopped a device doing, said.
+    crate::iommu::poll();
     // The groups a death left stopped with nobody to start them.
     crate::job::hang_up();
     crate::scheduler::timer_tick();

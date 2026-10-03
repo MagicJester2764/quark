@@ -17,6 +17,7 @@ mod heap;
 mod idt;
 mod intc;
 mod io;
+mod iommu;
 mod ioapic;
 pub mod ipc;
 pub mod irq_dispatch;
@@ -178,6 +179,8 @@ pub extern "C" fn kernel_main(multiboot_info: usize) -> ! {
 
     // Where devices are, for the first task to be given.
     unsafe { devmem::init(&mmap_regions[..mmap_count]) };
+    // And where they may write: nowhere, until a driver claims one.
+    unsafe { iommu::init() };
 
     // Initialize scheduler
     scheduler::init();

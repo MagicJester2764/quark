@@ -68,7 +68,8 @@ pub unsafe fn init(regions: &[MemoryRegion]) {
     }
     // What is spoken for, below four gigabytes: every entry of the map,
     // whatever it says the memory is for, and the interrupt controllers.
-    const SPANS: usize = crate::multiboot2::MAX_MEMORY_REGIONS + 1 + crate::acpi::MAX_IOAPICS;
+    const SPANS: usize =
+        crate::multiboot2::MAX_MEMORY_REGIONS + 1 + crate::acpi::MAX_IOAPICS + crate::acpi::MAX_DRHDS;
     let mut spans = [(0u64, 0u64); SPANS];
     let mut n = 0;
     let mut take = |base: u64, end: u64| {
@@ -86,6 +87,9 @@ pub unsafe fn init(regions: &[MemoryRegion]) {
         let at = io.addr as u64 & !(PAGE - 1);
         take(at, at + PAGE);
     }
+    // And the IOMMUs': a driver that could write there could let its
+    // device reach anything.
+    crate::iommu::register_pages(&mut take);
     // In order of address. There are a few dozen at most.
     for i in 1..n {
         let mut j = i;

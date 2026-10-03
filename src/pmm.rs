@@ -537,21 +537,30 @@ static FRAME_OWNER: IrqSpinLock<FrameOwners> = IrqSpinLock::new(FrameOwners {
     owned: [0; 256],
 });
 
-/// Record that `owner` holds the `count` frames starting at `base`.
+/// Record that `owner` holds the `count` frames starting at `base`: a
+/// device its program has claimed may reach them now (`iommu::owned`).
 pub fn set_owner(base: usize, count: usize, owner: usize) {
     if owner >= 0xFF {
         return;
     }
-    let mut owners = FRAME_OWNER.lock();
-    for i in 0..count {
-        let idx = PmmInner::frame_index(base + i * PAGE_SIZE);
-        let Some(&was) = owners.bytes().get(idx) else { continue };
-        if was != 0 {
-            owners.owned[was as usize] = owners.owned[was as usize].saturating_sub(1);
+    let mut taken = false;
+    {
+        let mut owners = FRAME_OWNER.lock();
+        for i in 0..count {
+            let idx = PmmInner::frame_index(base + i * PAGE_SIZE);
+            let Some(&was) = owners.bytes().get(idx) else { continue };
+            if was != 0 {
+                owners.owned[was as usize] = owners.owned[was as usize].saturating_sub(1);
+                taken = true;
+            }
+            owners.bytes()[idx] = owner as u8 + 1;
+            owners.owned[owner + 1] += 1;
         }
-        owners.bytes()[idx] = owner as u8 + 1;
-        owners.owned[owner + 1] += 1;
     }
+    if taken {
+        crate::iommu::disowned(base, count);
+    }
+    crate::iommu::owned(base, count, owner);
 }
 
 /// True if every frame in `[base, base + count)` is owned by `owner`.
@@ -567,15 +576,47 @@ pub fn owns_range(base: usize, count: usize, owner: usize) -> bool {
     })
 }
 
-/// Drop the ownership record for `[base, base + count)`.
+/// Drop the ownership record for `[base, base + count)`: no device reaches
+/// the frames by the time this returns (`iommu::disowned`).
 pub fn clear_owner(base: usize, count: usize) {
-    let mut owners = FRAME_OWNER.lock();
-    for i in 0..count {
-        let idx = PmmInner::frame_index(base + i * PAGE_SIZE);
-        let Some(&was) = owners.bytes().get(idx) else { continue };
-        if was != 0 {
-            owners.owned[was as usize] = owners.owned[was as usize].saturating_sub(1);
-            owners.bytes()[idx] = 0;
+    {
+        let mut owners = FRAME_OWNER.lock();
+        for i in 0..count {
+            let idx = PmmInner::frame_index(base + i * PAGE_SIZE);
+            let Some(&was) = owners.bytes().get(idx) else { continue };
+            if was != 0 {
+                owners.owned[was as usize] = owners.owned[was as usize].saturating_sub(1);
+                owners.bytes()[idx] = 0;
+            }
+        }
+    }
+    crate::iommu::disowned(base, count);
+}
+
+/// Every frame owned by a task in `tasks` (a bit for each), to `each`: out
+/// of the ownership lock, a batch at a time, as `release_task_frames` does.
+pub fn each_owned(tasks: u64, mut each: impl FnMut(usize)) {
+    let mut idx = 0;
+    loop {
+        let mut batch = [0usize; 64];
+        let mut n = 0;
+        {
+            let mut owners = FRAME_OWNER.lock();
+            let frames = owners.frames;
+            while idx < frames && n < batch.len() {
+                let b = owners.bytes()[idx];
+                if b != 0 && (b as usize - 1) < 64 && tasks & (1 << (b - 1)) != 0 {
+                    batch[n] = idx * PAGE_SIZE;
+                    n += 1;
+                }
+                idx += 1;
+            }
+        }
+        for &frame in &batch[..n] {
+            each(frame);
+        }
+        if n < batch.len() {
+            break;
         }
     }
 }
@@ -617,7 +658,10 @@ pub fn release_task_frames(owner: usize) -> usize {
                 break;
             }
         }
+        // No device of the owner's reaches them, before anybody else can
+        // have them.
         for &addr in batch.iter().take(n) {
+            crate::iommu::disowned(addr, 1);
             free(PhysFrame::from_address(addr));
         }
         reclaimed += n;
