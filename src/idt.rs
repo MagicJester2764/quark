@@ -988,7 +988,9 @@ fn irq(frame: &InterruptFrame) {
             // tick may switch away, and whatever is switched to must be
             // able to be ticked.
             crate::lapic::eoi();
+            crate::usage::tick(scheduler::current_tid(), frame.cs & 3 != 0);
             scheduler::timer_tick();
+            crate::usage::limits();
             return;
         }
         VEC_RESCHED => {
@@ -1017,7 +1019,11 @@ fn irq(frame: &InterruptFrame) {
             // switch away: told afterwards, a task that then blocked would
             // leave the clock stopped until it ran again.
             crate::intc::done(0);
+            crate::usage::tick(scheduler::current_tid(), frame.cs & 3 != 0);
             pit::tick();
+            // A program past its limit is told, or ended, last: ending it
+            // may not return.
+            crate::usage::limits();
             return;
         }
         // An 8259 with nothing to say.

@@ -93,6 +93,18 @@ struct Table {
     /// to finish in; `fork` does not copy it, since the child set no alarm.
     alarm_at: u64,
     alarm_every: u64,
+    /// What the program's ended tasks used, and the children it collected
+    /// (`usage.rs`).
+    used_gone: crate::usage::Usage,
+    used_children: crate::usage::Usage,
+    /// How nice it is to the rest of its band, -20 to 19.
+    nice: i8,
+    /// How many seconds of processor time it may have: SIGXCPU past the
+    /// first, the end at the second; `u64::MAX` for none. And the second
+    /// it was last sent SIGXCPU for.
+    cpu_soft: u64,
+    cpu_hard: u64,
+    xcpu_sent: u64,
 }
 
 /// What a program that has said nothing leaves off: write for group and other.
@@ -118,6 +130,12 @@ const EMPTY: Table = Table {
     sig_word: 0,
     alarm_at: 0,
     alarm_every: 0,
+    used_gone: crate::usage::Usage::ZERO,
+    used_children: crate::usage::Usage::ZERO,
+    nice: 0,
+    cpu_soft: u64::MAX,
+    cpu_hard: u64::MAX,
+    xcpu_sent: u64::MAX,
 };
 
 /// As many tables as tasks: each task uses exactly one.
@@ -931,6 +949,112 @@ pub fn holders(wanted: impl Fn(&FdKind) -> bool, out: &mut [usize]) -> usize {
     }
     irq_restore(flags);
     n
+}
+
+/// What the ended tasks of `tid`'s program used.
+pub fn usage_gone(tid: usize) -> crate::usage::Usage {
+    let flags = irq_save();
+    let used = unsafe { table_mut(tid).map_or(crate::usage::Usage::ZERO, |t| t.used_gone) };
+    irq_restore(flags);
+    used
+}
+
+/// A task of `tid`'s program has ended, having used `used`.
+pub fn usage_gone_add(tid: usize, used: &crate::usage::Usage) {
+    let flags = irq_save();
+    unsafe {
+        if let Some(t) = table_mut(tid) {
+            t.used_gone.add(used);
+        }
+    }
+    irq_restore(flags);
+}
+
+/// What the children `tid`'s program collected used.
+pub fn usage_children(tid: usize) -> crate::usage::Usage {
+    let flags = irq_save();
+    let used = unsafe { table_mut(tid).map_or(crate::usage::Usage::ZERO, |t| t.used_children) };
+    irq_restore(flags);
+    used
+}
+
+/// `tid`'s program has collected a child that used `used`.
+pub fn usage_children_add(tid: usize, used: &crate::usage::Usage) {
+    let flags = irq_save();
+    unsafe {
+        if let Some(t) = table_mut(tid) {
+            t.used_children.add(used);
+        }
+    }
+    irq_restore(flags);
+}
+
+/// `tid`'s program runs as `from`'s does: as nice, and with the same limit
+/// on how long. Not what it has used, which for a new program is nothing.
+pub fn runs_like(tid: usize, from: usize) {
+    let flags = irq_save();
+    unsafe {
+        if let Some((nice, soft, hard)) = table_mut(from).map(|t| (t.nice, t.cpu_soft, t.cpu_hard)) {
+            if let Some(t) = table_mut(tid) {
+                (t.nice, t.cpu_soft, t.cpu_hard) = (nice, soft, hard);
+            }
+        }
+    }
+    irq_restore(flags);
+}
+
+/// How nice `tid`'s program is.
+pub fn nice_of(tid: usize) -> i8 {
+    let flags = irq_save();
+    let nice = unsafe { table_mut(tid).map_or(0, |t| t.nice) };
+    irq_restore(flags);
+    nice
+}
+
+pub fn set_nice(tid: usize, nice: i8) {
+    let flags = irq_save();
+    unsafe {
+        if let Some(t) = table_mut(tid) {
+            t.nice = nice;
+        }
+    }
+    irq_restore(flags);
+}
+
+/// How many seconds of processor time `tid`'s program may have: SIGXCPU past
+/// the first, the end at the second.
+pub fn cpu_limit_of(tid: usize) -> (u64, u64) {
+    let flags = irq_save();
+    let limit = unsafe { table_mut(tid).map_or((u64::MAX, u64::MAX), |t| (t.cpu_soft, t.cpu_hard)) };
+    irq_restore(flags);
+    limit
+}
+
+pub fn set_cpu_limit(tid: usize, soft: u64, hard: u64) {
+    let flags = irq_save();
+    unsafe {
+        if let Some(t) = table_mut(tid) {
+            (t.cpu_soft, t.cpu_hard) = (soft, hard);
+        }
+    }
+    irq_restore(flags);
+}
+
+/// Whether `tid`'s program, having used `seconds`, is owed a SIGXCPU it has
+/// not been sent: one a second. Taken if it is.
+pub fn xcpu_due(tid: usize, seconds: u64) -> bool {
+    let flags = irq_save();
+    let due = unsafe {
+        table_mut(tid).is_some_and(|t| {
+            let due = t.xcpu_sent == u64::MAX || seconds > t.xcpu_sent;
+            if due {
+                t.xcpu_sent = seconds;
+            }
+            due
+        })
+    };
+    irq_restore(flags);
+    due
 }
 
 /// Set the program's umask and return what it was; `None` only reads it.

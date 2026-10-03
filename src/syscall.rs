@@ -301,6 +301,12 @@ pub const SYS_SIG_RETURN: u64 = 121;
 pub const SYS_SIG_STACK: u64 = 122;
 /// Take a signal that is waiting, or wait for one, without its handler.
 pub const SYS_SIG_WAIT: u64 = 123;
+/// What a program, its children or a task has used of the machine.
+pub const SYS_USAGE: u64 = 124;
+/// How nice a program is to the rest of its band.
+pub const SYS_NICE: u64 = 125;
+/// How long a program may run.
+pub const SYS_CPU_LIMIT: u64 = 126;
 /// `SYS_POWER`: which.
 const POWER_OFF: u64 = 0;
 const POWER_RESTART: u64 = 1;
@@ -420,7 +426,7 @@ pub const SYS_ABI_VERSION: u64 = 240;
 /// minor when calls are added. User space can refuse to run against a major it
 /// does not know, which is the point of exposing it at all.
 pub const ABI_VERSION_MAJOR: u64 = 3;
-pub const ABI_VERSION_MINOR: u64 = 21;
+pub const ABI_VERSION_MINOR: u64 = 22;
 
 /// Threads a task may make with no capability at all.
 ///
@@ -3600,6 +3606,24 @@ fn dispatch(
             // asks. arg1 = the signals, bit n - 1 for signal n. Returns what
             // was held back before.
             crate::signal::mask(scheduler::current_tid(), arg0, arg1)
+        }
+        SYS_USAGE => {
+            // arg0 = 0 the caller's program, 1 the children it collected, 2
+            // the calling task, 3 the program task arg2 is in; arg1 = where
+            // to write four words: ns in the program, ns in the kernel for
+            // it, times it gave the processor up, times it had it taken.
+            crate::usage::usage(scheduler::current_tid(), arg0, arg1, arg2)
+        }
+        SYS_NICE => {
+            // arg0 = a process id, 0 for the caller's; arg1 = how nice to be,
+            // -20 to 19, or u64::MAX to ask. Returns 20 + how nice it was.
+            crate::usage::nice(scheduler::current_tid(), arg0, arg1)
+        }
+        SYS_CPU_LIMIT => {
+            // arg0 = soft, arg1 = hard, in seconds of processor time
+            // (u64::MAX none); arg2 = where to write the two it was, or 0;
+            // arg3 = 1 to change nothing.
+            crate::usage::cpu_limit(scheduler::current_tid(), arg0, arg1, arg2, arg3 == 1)
         }
         SYS_SIG_WAIT => {
             // arg0 = the signals to take, arg1 = how long to wait for one, a

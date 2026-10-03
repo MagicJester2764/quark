@@ -138,12 +138,13 @@ system hung.
 
 There are no tests in this tree, and that is the shape of a microkernel rather
 than an omission: the kernel is tested from outside, through the ABI, by a
-program. `dtest` in `../quarkutils` makes 800 checks — capabilities, IPC,
+program. `dtest` in `../quarkutils` makes 818 checks — capabilities, IPC,
 memory, descriptors, signals, scheduling, users and terminals, `dtest calls`
 with three million calls in three seconds, `dtest smp` for what a second
 processor changes, `dtest clock` for what time it is and whether a wait ends
 when it should, `dtest fork` for what a fork shares and who a write is seen
-by, `dtest handlers` for a handler the kernel runs, twenty-three more (`dtest pressure`) on a machine with somewhere to write
+by, `dtest handlers` for a handler the kernel runs, `dtest usage` for what
+a program has used and its share of the processor, twenty-three more (`dtest pressure`) on a machine with somewhere to write
 memory out to, and seven more (`dtest msi`) on a machine with a device that
 interrupts by message and its driver running — and `qfuzz` throws random
 requests at every service.
@@ -874,12 +875,13 @@ stopped is one the scheduler does not run.
 ## Scheduling
 
 Four bands, best first: drivers, servers, ordinary programs, idle. A task runs
-only when nothing better is waiting and takes turns within its own band. A
-program asks for a band in its `manifest!` block alongside its capabilities,
-and a spawner applies it under the same narrowing rule — it can never grant a
-better band than it is in, so only `init` can put a driver in the driver band.
+only when nothing better is waiting, and within its band the one that has run
+least goes next. A program asks for a band in its `manifest!` block alongside
+its capabilities, and a spawner applies it under the same narrowing rule — it
+can never grant a better band than it is in, so only `init` can put a driver
+in the driver band.
 
-Three things follow from that, and breaking any of them is quiet:
+What follows from that, and breaking any of it is quiet:
 
 - **Waiting means blocking.** A task in a better band that spins on
   `sys_yield` is immediately runnable again, so nothing below it ever runs.
@@ -903,6 +905,20 @@ Three things follow from that, and breaking any of them is quiet:
   anything in between. It is also what lets the direct switch stay safe: the
   callee already carries the caller's band when the scheduler decides whether
   handing straight over would run something ahead of its betters.
+- **Within a band, whoever has run least goes next**, each nanosecond counted
+  for more the nicer its program is (`VRUN`, `usage::weighted` — Linux's
+  weights, so that nice 10 against nought is about one to nine there and
+  here). In the order they were queued, a nicer program's shorter turn came
+  round sooner, and on four processors nice 10 had about half of nice 0's
+  share. A task that was waiting joins a little behind where its band has
+  got to (`FLOOR`), not where it left off: started late or woken after a
+  minute, it is not owed the minute, and with no floor it took a
+  processor until it had caught up. Two things are not by run time: a
+  caller woken by its reply goes first (`unblock_task_next`), and a yield
+  lets everything else ready in the band go first — once (`YIELDED`): sent
+  behind everybody for good, a task that yields while it waits for another
+  can wait for ever, and not passed over at all, it is chosen again at
+  once, having run least.
 
 A system call runs with interrupts on, so anything the scheduler does in more
 than one step is a tick away from being done in half. Three of these were
@@ -930,6 +946,30 @@ closed:
   the same place, and the one being queued was ready and in no queue.
   `start_task` did that from a system call. Every caller of `unblock_task`
   holds interrupts off, or is an interrupt.
+
+## What a program uses
+
+`usage.rs`, and `SYS_USAGE`, `SYS_NICE` and `SYS_CPU_LIMIT` in `docs/abi.md`.
+
+- **Time is counted whenever the scheduler decides anything** (`usage::charge`,
+  from `count_turn`), by the clock: exact, whatever the tick. Which part
+  was the kernel's is sampled — each tick looks at where it found the task
+  — and a task's time is divided in that proportion, each task on its own
+  and never so that either part shrinks (`Raw::split`, Linux's
+  `cputime_adjust`). Divided across a whole program, one child that spent
+  its time in the kernel took user time back from everything its parent
+  had collected, and `time` printed a negative number.
+- **A program's use is its tasks', and outlives them.** An ended task's is
+  folded into its program's record (`task_ended`, from `close_descriptors`).
+  A program that ends leaves its own and what it collected at every task of
+  its process not yet taken apart (`ENDED`): the one its parent collects
+  may not be the last of them to end. Collecting hands it on (`collected`)
+  — only collecting: a child taken apart unwaited-for is nobody's.
+- **How nice a program is and how long it may run are its program's**,
+  beside its descriptors: its threads have them, whatever it starts is
+  given them (`fdtable::runs_like`), `exec` keeps them.
+- **A limit is looked at on the tick, last** (`usage::limits`), as an alarm
+  is: SIGXCPU, or the end of the program, may not return.
 
 ## Power
 

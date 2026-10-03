@@ -1,6 +1,6 @@
 # Quark syscall ABI
 
-**Version 3.21.** Query the running kernel with `SYS_ABI_VERSION` (240), which
+**Version 3.22.** Query the running kernel with `SYS_ABI_VERSION` (240), which
 returns `(major << 16) | minor`.
 
 This document is the contract between the Quark kernel and everything above it.
@@ -220,6 +220,7 @@ returning at once turned that loop into a spin.
 | 3.16 | **Off, and on again, by the firmware's tables.** `SYS_POWER` (119) turns the machine off or restarts it, for a holder of the new capability `Power` (type 12): by ACPI's control and reset registers, where a program used to write to the three ports QEMU listens on. |
 | 3.17 | **Memory above four gigabytes.** All of a machine's memory is used, up to 511 GiB, where the kernel used the first four gigabytes of it. `SYS_PHYS_ALLOC` takes a flag (arg1 = 1) for frames below four gigabytes, which is what a device that is told an address in thirty-two bits needs; without it a frame is ordinary memory and comes from the top. `SYS_MEM_INFO` takes what to say (arg0): 1 for how much memory the machine has and 2 for where it ends. |
 | 3.18 | **The wide registers.** A program may use AVX, AVX2 and AVX-512 where the processor has them: the kernel turns them on (`OSXSAVE`, XCR0) and saves all of each task's with `XSAVE`. Before, an AVX instruction was a fault. No call changed. |
+| 3.22 | **What a program uses.** `SYS_USAGE` (124) says how long a program, the children it collected or a task has run — in the program and in the kernel, to the nanosecond — and how often it gave the processor up or had it taken. `SYS_NICE` (125) sets how nice a program is to the rest of its band, which is its share of it by Linux's weights, on any number of processors. `SYS_CPU_LIMIT` (126) sets how long it may run: SIGXCPU past the soft limit, the end at the hard one. |
 | 3.21 | **Threads share their program's capabilities, and a threaded program can exec.** No new number. A program has one capability space, as it has one descriptor table: a thread uses it, where it started with a copy of its creator's, so what one thread is given the others have. A forked child gets a copy. `SYS_EXEC_SPACE` from a program with more than one task ends the others first, quietly — none is a child to collect or a death to be told of — where it was refused; if one of them was the task the program began as, the caller becomes its parent's child in its place. |
 | 3.20 | **The kernel runs handlers.** `SYS_SIG_ACTION` (11) with 3 has the kernel run a program's handler for a signal: a task that does not hold it back is turned aside on its way out of a call, an interrupt or a fault, and enters the program at the place said with signal 0, with a record of where it was on its stack; `SYS_SIG_RETURN` (121) puts it back. A fault that is a signal goes to the program's handler for it the same way. Each task holds back a set of signals of its own (`SYS_SIG_MASK`, 120): a signal every task holds back waits, whatever it would do; `SYS_SIG_WAIT` (123) takes one without anything being done about it; `SYS_SIG_STACK` (122) names a stack for handlers. `SYS_SIG_RAISE` with arg2 = 4 raises a signal for one task. Every wait a task sits in is ended by a signal it is to run — a pipe's, a stream's, a counter's, a timer's, a futex's, a wait for a child, as well as the ones a signal ended before — and a program that asks is answered `0xFFFF_FFFC` and `0xFFFF_FFFB` as well as `0xFFFF_FFFD`, to say what ran. `SYS_POLL` and `SYS_POLLSET_WAIT` wait under a mask they are given. A terminal raises 28 when its size changes, and stops a job behind that changes its settings or its size, or writes to it where `TOSTOP` says to. |
 | 3.19 | **Memory is given back.** When no frame is free the kernel gives up pages of files that nothing maps, takes pages programs have not used lately, and makes whoever wanted the frame wait while they are written out, where it used to end it. A page of a program's own goes to the object a pager has said memory may be written out to: `SYS_OBJECT_CTL` op 5, for a holder of the new capability `Swap` (type 13), with ops 6 and 7 to take a page out and say how the writing went. `TAG_OBJECT_CLEAN` (`0xFFFF_000B`) asks a pager to write what it has that is dirty. `SYS_PAGE_OUT` (198) has pages of the caller's own written out at once. `SYS_MEM_INFO` with arg0 = 3 says how much room there is to write memory out to and how much is used, and with 4 how many pages have gone out and come back. |
@@ -1035,7 +1036,8 @@ never handed to a wait.
 
 `SYS_TASK_PRIORITY` puts a task in a scheduling band: 0 drivers, 1 servers,
 2 ordinary programs, 3 the idle task. A task runs only when nothing in a better
-band is waiting, and takes turns within its own; a task woken into a better band
+band is waiting, and within its own the one that has run least goes next,
+by how nice its program is (`SYS_NICE`); a task woken into a better band
 than the running one preempts it at the next tick rather than waiting out its
 slice.
 
@@ -1189,6 +1191,37 @@ the rest: what they do is under *Signals*, with the process calls.
 | 121 | `SYS_SIG_RETURN` | arg0 = the record a handler was entered with | does not return: the task goes on from where the record says | — |
 | 122 | `SYS_SIG_STACK` | arg0 = address, or `u64::MAX` to change nothing; arg1 = bytes (0 for none); arg2 = where to write the stack it replaces, address and bytes, or 0 | 0 / `u64::MAX` | — |
 | 123 | `SYS_SIG_WAIT` | arg0 = the signals to take, arg1 = how long to wait for one, a span (0 not at all, `u64::MAX` for ever), arg2 = where to write who raised it, or 0 | the signal; 0 when the time ran out; `0xFFFF_FFFD` when another signal ended the wait with a handler run | — |
+
+### What a program uses (0x7C)
+
+| # | Name | Arguments | Returns | Cap |
+|---|---|---|---|---|
+| 124 | `SYS_USAGE` | arg0 = 0 the caller's program, 1 the children it has collected, 2 the calling task, 3 the program task arg2 is a task of; arg1 = where to write four `u64`: nanoseconds in the program, nanoseconds in the kernel for it, times it gave the processor up, times it had it taken | 0 / `u64::MAX` | — |
+| 125 | `SYS_NICE` | arg0 = a process id, 0 for the caller's; arg1 = how nice to be, -20 to 19 as a signed number, or `u64::MAX` to ask | 20 + how nice it was; `u64::MAX - 1` when it may not / `u64::MAX` | `TaskMgmt` for the program to be less nice |
+| 126 | `SYS_CPU_LIMIT` | arg0 = soft, arg1 = hard: seconds of processor time the caller's program may have, `u64::MAX` for none; arg2 = where to write the two it was, or 0; arg3 = 1 to change nothing | 0; `u64::MAX - 1` when it may not / `u64::MAX` | `TaskMgmt` to raise the hard limit |
+
+Time is counted at every switch, by the clock, and is exact; which part of
+it was the program's and which the kernel's is told by where each tick found
+the task, and its time divided in that proportion — never so that either
+part is less than it was last said to be. A program's use is its tasks',
+those ended included; a program that ends leaves its use, and that of the
+children it collected, to whoever collects it. A forked child has used
+nothing, and `SYS_EXEC_SPACE` keeps what was used. Anybody may ask what any
+program has used, as `ps` does.
+
+How nice a program is decides its share of its band while it and another
+are both computing: each nanosecond a task runs counts for more the nicer
+its program, by Linux's weights, and the task that has run least goes next
+— so a program at 10 has about a ninth of what one at nought has, on one
+processor or many. It sizes its turns as well: three ticks at nought,
+twelve at -15 and below, one at 10 and above. It is the program's: its
+threads have it, a child it forks or spawns has it, and `SYS_EXEC_SPACE`
+keeps it.
+
+A program past its soft limit is sent signal 24 (SIGXCPU) once a second; one
+at its hard limit is ended, as by signal 9. A limit of nought is one of a
+second, as on Linux. A child it forks or spawns has its limits, and
+`SYS_EXEC_SPACE` keeps them.
 
 ### Synchronisation (0x80)
 

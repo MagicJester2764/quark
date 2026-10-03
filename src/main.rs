@@ -52,6 +52,7 @@ pub mod pipe;
 mod pty;
 mod timerfd;
 mod tlb;
+mod usage;
 mod eventfd;
 mod fdtable;
 pub mod serial;

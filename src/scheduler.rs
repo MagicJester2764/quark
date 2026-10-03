@@ -116,7 +116,9 @@ static mut WAIT_CODE: [i32; MAX_TASKS] = [0; MAX_TASKS];
 /// Per-task "reaped" flag. If true, parent has collected the exit via sys_wait (or has no parent).
 static mut REAPED: [bool; MAX_TASKS] = [false; MAX_TASKS];
 
-/// How long a task may run before it is preempted, in PIT ticks.
+/// Ticks left in each task's slice: how long it may run before it is
+/// preempted, which is `usage::slice_for` its program's niceness when the
+/// scheduler chooses it — three ticks for one that has said nothing.
 ///
 /// The scheduler used to reschedule on every timer interrupt, which is a
 /// quantum of one tick and a context switch a hundred times a second whether
@@ -125,11 +127,35 @@ static mut REAPED: [bool; MAX_TASKS] = [false; MAX_TASKS];
 ///
 /// Three ticks is thirty milliseconds. Anything interactive blocks long before
 /// that — a server blocks on its next receive, a client on its next call — so
-/// this only ever bounds work that is genuinely CPU-bound.
-const QUANTUM_TICKS: u32 = 3;
-
-/// Ticks left in each task's slice.
+/// this only ever bounds work that is genuinely CPU-bound; and so does how
+/// nice a program is, which is the share of its band it has when it and
+/// another are both computing.
 static mut SLICE_LEFT: [u32; MAX_TASKS] = [0; MAX_TASKS];
+
+/// How far each task has run, as its band sees it: the nanoseconds it has
+/// had, each counted for more the nicer its program is (`usage::weighted`).
+/// Within a band the task that has run least goes next, so that two
+/// programs computing side by side have the band in proportion to their
+/// weights — on one processor or sixteen. In the order they were queued,
+/// with one queue for every processor, a task with a short turn comes round
+/// sooner, and the share a short turn was to cut evened out: a program at
+/// nice 10 had about half of what one at nought did, on four processors.
+static mut VRUN: [u64; MAX_TASKS] = [0; MAX_TASKS];
+/// The most any task of each band had run, as `VRUN` counts it, when it
+/// was chosen. A task that was not ready joins no further back than a
+/// little behind it ([`SLEEPER_LEAD`]): a program that slept for a minute
+/// is not owed the minute.
+static mut FLOOR: [u64; NUM_PRIORITIES] = [0; NUM_PRIORITIES];
+/// How far behind the floor a task that was waiting may join: one turn of
+/// a program at nought, so that it is chosen next rather than last.
+const SLEEPER_LEAD: u64 = 30_000_000;
+/// Put at the front of its band ([`enqueue_front`]): chosen before anything
+/// else in it, the longest put there first, whatever it has run.
+static mut FRONT: [bool; MAX_TASKS] = [false; MAX_TASKS];
+/// Has just yielded: passed over once if anything else in its band is
+/// ready. Once, and not sent to the back for good, or a task yielding while
+/// it waits for another would wait behind everybody for ever.
+static mut YIELDED: [bool; MAX_TASKS] = [false; MAX_TASKS];
 
 /// The processor each task is running on, or [`NO_CPU`].
 ///
@@ -195,6 +221,7 @@ pub fn init() {
             fpu: crate::fpu::clean(),
         });
         crate::fdtable::attach_new(0);
+        crate::usage::task_made(0);
         // With the UID 0 bypass gone, TID 0's authority has to come from its
         // CSpace like anyone else's: every bit, and the capabilities for them.
         crate::cap::task_made(0);
@@ -248,6 +275,7 @@ pub fn spawn(entry_fn: fn()) -> usize {
             TASKS[tid] = Some(task);
             crate::cap::open_endpoint(tid);
             crate::cap::task_made(tid);
+            crate::usage::task_made(tid);
             PROCESS_ID[tid] = crate::cap::endpoint_of(tid);
             crate::fdtable::attach_new(tid);
             enqueue(tid);
@@ -276,11 +304,21 @@ fn irq_restore(flags: u64) {
     }
 }
 
-/// Voluntary yield — put current task at back of ready queue and reschedule.
+/// Voluntary yield: whatever else in the band is ready goes first, and then
+/// the task competes as before. A task that has blocked and calls this is
+/// not yielding but waiting, and is in no queue.
 pub fn yield_now() {
     if !INITIALIZED.load(Ordering::SeqCst) {
         return;
     }
+    let flags = irq_save();
+    unsafe {
+        let me = crate::percpu::current();
+        if me != 0 && matches!(TASKS[me], Some(ref t) if t.state == TaskState::Running) {
+            YIELDED[me] = true;
+        }
+    }
+    irq_restore(flags);
     unsafe { schedule_inner(false) };
 }
 
@@ -407,6 +445,9 @@ unsafe fn schedule_inner(from_irq: bool) { unsafe {
     core::arch::asm!("pushfq; pop {}; cli", out(reg) flags, options(nostack));
 
     let current_tid = crate::percpu::current();
+    // Its turn so far is counted before anything is chosen, so that what it
+    // has just run counts against it.
+    count_turn(current_tid);
 
     // Put current task back in ready queue if it's still runnable. Not the
     // idle loop: that is what runs when the queues are empty, and is in none.
@@ -441,8 +482,9 @@ unsafe fn schedule_inner(from_irq: bool) { unsafe {
     }
 
     // A slice of its own, since this is the scheduler choosing it rather than
-    // a task handing over what it had left.
-    SLICE_LEFT[next_tid] = QUANTUM_TICKS;
+    // a task handing over what it had left: as long as its program's
+    // niceness says.
+    SLICE_LEFT[next_tid] = crate::usage::slice_for(crate::fdtable::nice_of(next_tid));
     switch_to(current_tid, next_tid, flags);
 }}
 
@@ -462,6 +504,12 @@ unsafe fn switch_to(current_tid: usize, next_tid: usize, flags: u64) { unsafe {
         restore_flags(flags);
         return;
     }
+
+    // Its turn is over: counted, and as given up if it is waiting rather
+    // than being made to make way.
+    let gave_up = !matches!(TASKS[current_tid].as_ref().map(|t| t.state), Some(TaskState::Ready | TaskState::Running));
+    count_turn(current_tid);
+    crate::usage::switched(current_tid, gave_up);
 
     // Mark next task as running, and here; and the one being left as on no
     // processor. The lock is held until the switch is done, so nobody sees
@@ -722,20 +770,77 @@ unsafe fn best_ready_band() -> Option<usize> { unsafe {
 /// Dequeue the next ready task, best band first.
 unsafe fn dequeue_ready() -> Option<usize> { unsafe {
     for p in 0..NUM_PRIORITIES {
-        while READY_COUNT[p] > 0 {
-            let tid = READY_QUEUE[p][READY_HEAD[p]];
-            READY_HEAD[p] = (READY_HEAD[p] + 1) % MAX_TASKS;
-            READY_COUNT[p] -= 1;
-
-            // Skip dead/blocked tasks that may still be in the queue
-            if let Some(ref task) = TASKS[tid] {
-                if task.state == TaskState::Ready {
-                    return Some(tid);
-                }
+        // What in the band is still ready, kept in the order it was queued
+        // — dead and blocked tasks may still be in it — and which of it is
+        // to go: one put at the front, the longest there first; or the one
+        // that has run least, as the band sees it, passing over one that
+        // has just yielded when anything else is ready.
+        let head = READY_HEAD[p];
+        let mut kept = 0;
+        let mut front: Option<usize> = None;
+        let mut least: Option<(usize, u64)> = None;
+        let mut least_yielded: Option<(usize, u64)> = None;
+        for k in 0..READY_COUNT[p] {
+            let tid = READY_QUEUE[p][(head + k) % MAX_TASKS];
+            if !matches!(TASKS[tid], Some(ref t) if t.state == TaskState::Ready) {
+                continue;
             }
+            READY_QUEUE[p][(head + kept) % MAX_TASKS] = tid;
+            let ran = VRUN[tid];
+            if FRONT[tid] {
+                front = front.or(Some(kept));
+            } else if YIELDED[tid] {
+                if least_yielded.is_none_or(|(_, r)| ran < r) {
+                    least_yielded = Some((kept, ran));
+                }
+            } else if least.is_none_or(|(_, r)| ran < r) {
+                least = Some((kept, ran));
+            }
+            kept += 1;
         }
+        let chosen = front.or(least.map(|(i, _)| i)).or(least_yielded.map(|(i, _)| i));
+        let Some(i) = chosen else {
+            READY_COUNT[p] = 0;
+            READY_TAIL[p] = head;
+            continue;
+        };
+        let tid = READY_QUEUE[p][(head + i) % MAX_TASKS];
+        for j in i..kept - 1 {
+            READY_QUEUE[p][(head + j) % MAX_TASKS] = READY_QUEUE[p][(head + j + 1) % MAX_TASKS];
+        }
+        READY_COUNT[p] = kept - 1;
+        READY_TAIL[p] = (head + kept - 1) % MAX_TASKS;
+        // A yield is one turn passed, by whoever is left.
+        for j in 0..kept - 1 {
+            YIELDED[READY_QUEUE[p][(head + j) % MAX_TASKS]] = false;
+        }
+        FRONT[tid] = false;
+        YIELDED[tid] = false;
+        FLOOR[p] = FLOOR[p].max(VRUN[tid]);
+        return Some(tid);
     }
     None
+}}
+
+/// Count the turn `tid` is having on this processor, to now: in what it has
+/// used, and in how far it has run as its band sees it.
+///
+/// # Safety
+/// Interrupts off, and `tid` is what this processor is running.
+unsafe fn count_turn(tid: usize) { unsafe {
+    let ran = crate::usage::charge(tid);
+    if tid != 0 && ran != 0 {
+        VRUN[tid] = VRUN[tid].saturating_add(crate::usage::weighted(ran, crate::fdtable::nice_of(tid)));
+    }
+}}
+
+/// A task joining band `p` that may have been away from it: no further back
+/// than a little behind where the band has got to.
+///
+/// # Safety
+/// Interrupts off.
+unsafe fn join_band(tid: usize, p: usize) { unsafe {
+    VRUN[tid] = VRUN[tid].max(FLOOR[p].saturating_sub(SLEEPER_LEAD));
 }}
 
 /// Add a task TID to the back of the ready queue. Not a held one: that is
@@ -749,6 +854,7 @@ unsafe fn enqueue(tid: usize) { unsafe {
         crate::console::puts(b"scheduler: ready queue full, dropping task\n");
         return;
     }
+    join_band(tid, p);
     READY_QUEUE[p][READY_TAIL[p]] = tid;
     READY_TAIL[p] = (READY_TAIL[p] + 1) % MAX_TASKS;
     READY_COUNT[p] += 1;
@@ -764,6 +870,8 @@ unsafe fn enqueue_front(tid: usize) { unsafe {
         crate::console::puts(b"scheduler: ready queue full, dropping task\n");
         return;
     }
+    join_band(tid, p);
+    FRONT[tid] = true;
     READY_HEAD[p] = (READY_HEAD[p] + MAX_TASKS - 1) % MAX_TASKS;
     READY_QUEUE[p][READY_HEAD[p]] = tid;
     READY_COUNT[p] += 1;
@@ -1292,6 +1400,8 @@ pub fn sys_wait_for(target: u64, how: Wait) -> u64 {
                     REAPED[i] = true;
                     let code = child_exit_code(i);
                     let child = name(i);
+                    // What it used is what its parent's children used.
+                    crate::usage::collected(parent, i);
                     reap(i);
                     irq_restore(flags);
                     return (child & 0x7FFF_FFFF) | ((code as u32 as u64) << 32);
@@ -1359,6 +1469,7 @@ pub fn sys_wait_for(target: u64, how: Wait) -> u64 {
                 // A dead task keeps all its memory until it is reaped, and a
                 // parent running programs one after another never lets the
                 // machine idle: a test suite held every program it had run.
+                crate::usage::collected(parent, child_tid);
                 reap(child_tid);
                 irq_restore(flags);
                 return (child & 0x7FFF_FFFF) | ((code as u32 as u64) << 32);
@@ -1855,6 +1966,8 @@ unsafe fn reap(i: usize) { unsafe {
 /// them — and the descriptors themselves only if it was the last task the
 /// program had. A thread that exits closes nothing.
 pub fn close_descriptors(tid: usize) {
+    // What it used is its program's, before it leaves the program's record.
+    crate::usage::task_ended(tid);
     crate::fdtable::task_gone(tid);
     // And its program's capabilities, which go with the last task to use
     // them: a dead task is the authority for nothing.
@@ -2206,15 +2319,24 @@ pub fn create_empty_task() -> Option<usize> {
         // of its own, empty. A task started as a thread gives them up for its
         // program's; a task started as a program keeps them.
         crate::cap::task_made(tid);
+        crate::usage::task_made(tid);
         PROCESS_ID[tid] = crate::cap::endpoint_of(tid);
         // In its creator's process group and session: a job is whatever a
         // shell started, and what those started.
         HELD[tid] = false;
+        FRONT[tid] = false;
+        YIELDED[tid] = false;
+        // It has run nothing, and joining a band puts it where that band
+        // has got to.
+        VRUN[tid] = 0;
         UNANNOUNCED[tid] = false;
         UNWAITED[tid] = false;
         ON_CPU[tid] = NO_CPU;
         crate::job::born(tid, parent, PROCESS_ID[tid]);
         crate::fdtable::attach_new(tid);
+        // As nice as its creator's program, and limited as it is: a child
+        // forked or spawned runs as its parent was told to.
+        crate::fdtable::runs_like(tid, parent);
     }
     irq_restore(flags);
 
@@ -2442,6 +2564,38 @@ pub fn pinned(space: u64, va: u64) -> bool {
         }
     }
     false
+}
+
+/// Every task of the process `tid` is a task of that has not been taken
+/// apart, into `out`: its threads, dead or alive, and what it began as.
+/// Returns how many.
+pub fn tasks_of_process(tid: usize, out: &mut [usize]) -> usize {
+    if tid >= MAX_TASKS {
+        return 0;
+    }
+    let mut n = 0;
+    let flags = irq_save();
+    unsafe {
+        let pid = PROCESS_ID[tid];
+        for t in 0..MAX_TASKS {
+            if n < out.len() && TASKS[t].is_some() && PROCESS_ID[t] == pid {
+                out[n] = t;
+                n += 1;
+            }
+        }
+    }
+    irq_restore(flags);
+    n
+}
+
+/// The processor task `tid` is running on, if it is running. Interrupts must
+/// be off.
+pub fn running_on(tid: usize) -> Option<usize> {
+    if tid >= MAX_TASKS {
+        return None;
+    }
+    let cpu = unsafe { ON_CPU[tid] };
+    (cpu != NO_CPU).then_some(cpu as usize)
 }
 
 /// The processor task `tid` is running on, if it is running and that is not

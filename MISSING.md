@@ -44,8 +44,10 @@ them struck through as done. What follows is what is true now.
   its readers see the end of the file.
 - **Signals nothing raises.** A pipe with nobody reading it is found out by
   the writer's runtime, which asks what kind of thing the descriptor is.
-  There is one alarm for a program, in real time; nothing measures the time
-  a program spends running, so there is nothing to raise for that.
+  There is one alarm for a program, in real time. The time a program spends
+  running is measured (`SYS_USAGE`) and limited (`SYS_CPU_LIMIT`, SIGXCPU),
+  but no timer counts it down: `ITIMER_VIRTUAL` and `ITIMER_PROF`, and
+  SIGVTALRM and SIGPROF with them, are not there.
 - **Process ids that come round.** A process id is an endpoint number, and
   those only go up. A C `pid_t` holds two thousand million of them; Linux
   wraps and reuses, and here the task after that many has an id a C program
