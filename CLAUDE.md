@@ -169,10 +169,10 @@ different mistakes. Under KVM the four are four real processors, and a race
 is a real race.
 
 **With an IOMMU and without.** `IOMMU=1` gives the machine Intel's
-(`-device intel-iommu`), which wants QEMU's q35 chipset, where nothing is on
-the old IDE ports: it boots the live ISO (`ISO=explosion.iso`), which runs
-from memory. A change to how memory reaches a device, or to who owns a
-frame, is verified there too.
+(`-device intel-iommu`), which wants QEMU's q35 chipset, whose disks are on
+AHCI: it boots a disk image there as anywhere, or the live ISO
+(`ISO=explosion.iso`), which runs from memory. A change to how memory
+reaches a device, or to who owns a frame, is verified there too.
 
 A fault prints to serial: `[UPFAULT ...]` or `[UFAULT ...]` for ring 3, which
 ends the program, and `[KFAULT ...]` for ring 0, which halts the machine. A
