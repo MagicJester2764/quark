@@ -138,7 +138,7 @@ system hung.
 
 There are no tests in this tree, and that is the shape of a microkernel rather
 than an omission: the kernel is tested from outside, through the ABI, by a
-program. `dtest` in `../quarkutils` makes 818 checks — capabilities, IPC,
+program. `dtest` in `../quarkutils` makes 821 checks — capabilities, IPC,
 memory, descriptors, signals, scheduling, users and terminals, `dtest calls`
 with three million calls in three seconds, `dtest smp` for what a second
 processor changes, `dtest clock` for what time it is and whether a wait ends
@@ -194,6 +194,15 @@ These were established deliberately. Breaking one silently re-opens a hole.
 The ones that are rules for *programs* — what a spawner must do, what a server
 may keep — are in `../quarkutils/CLAUDE.md`; these are the kernel's.
 
+- **Where a program's things go is chosen at random, by whoever chooses.**
+  A program names every address it maps, so the choosing is in user space
+  — `quark_rt::layout` and the C layer in `../quarkutils`, from
+  `SYS_GETRANDOM`: a stack, a heap, threads' stacks, an `mmap` arena, each
+  a random number of pages into a window of its own. The kernel chooses
+  one address, the first program's stack (`setup_user_stack`), and chooses
+  it the same way. A new place the kernel chooses is chosen so too; what
+  does not move is a program's code, linked where it runs, and the page its
+  arguments are on.
 - **User mappings live at or above `paging::USER_MIN_ADDR` (PML4[1]).**
   `create_address_space` deep-copies only PML4[0]'s PDPT and *shares* the page
   directories beneath it, so a mapping below that writes into tables every

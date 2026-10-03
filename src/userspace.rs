@@ -9,7 +9,14 @@ const PAGE_SIZE: usize = 4096;
 
 /// User-space address constants.
 /// User code/data lives in the lower half (below 0x0000_8000_0000_0000).
+///
+/// The highest a stack the kernel makes may reach. Where in the two
+/// gigabytes below it the first program's stack ends is chosen at random
+/// ([`STACK_WINDOW_PAGES`]): an address learned from one start of the
+/// machine is no use in the next. Every other place in a program is its
+/// runtime's to choose, and it chooses at random too.
 pub const USER_STACK_TOP: u64 = 0x0000_7FFF_FFFF_F000;
+const STACK_WINDOW_PAGES: u64 = 1 << 19;
 /// 1 MiB. Sixteen kilobytes was enough for the programs in this tree and
 /// nothing else: GNU `wc` puts a quarter of a megabyte on its stack in one
 /// frame and faulted on the first write to it. There is no demand paging, so
@@ -235,9 +242,14 @@ pub fn map_user_page(
     unsafe { paging::map_page(pml4_phys, virt, phys, flags) }
 }
 
-/// Allocate and map a user stack. Returns the top of the stack (for RSP).
+/// Allocate and map a user stack, ending somewhere at random in the two
+/// gigabytes below [`USER_STACK_TOP`]. Returns the top of the stack (for
+/// RSP).
 pub fn setup_user_stack(pml4_phys: usize) -> Option<u64> {
-    let stack_bottom = USER_STACK_TOP as usize - (USER_STACK_PAGES * PAGE_SIZE);
+    let mut chance = [0u8; 8];
+    crate::random::fill(&mut chance);
+    let top = USER_STACK_TOP - (u64::from_le_bytes(chance) % STACK_WINDOW_PAGES) * PAGE_SIZE as u64;
+    let stack_bottom = top as usize - (USER_STACK_PAGES * PAGE_SIZE);
     for i in 0..USER_STACK_PAGES {
         let frame = pmm::alloc()?;
         let virt = stack_bottom + i * PAGE_SIZE;
@@ -254,7 +266,7 @@ pub fn setup_user_stack(pml4_phys: usize) -> Option<u64> {
     // The x86_64 ABI requires RSP+8 be 16-byte aligned at function entry
     // (as if a `call` had just pushed a return address). Since iretq sets
     // RSP directly (no push), we pre-bias it here.
-    Some(USER_STACK_TOP - 8)
+    Some(top - 8)
 }
 
 /// Naked trampoline stub: moves r12/r13/r14 into argument registers

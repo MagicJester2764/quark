@@ -10,6 +10,13 @@ them struck through as done. What follows is what is true now.
 
 ## Not there
 
+- **A program somewhere else each time.** Where a program's stack, heap,
+  threads and anonymous memory are is chosen at random each time it runs;
+  where its code and data are is where it was linked, because nothing here
+  is built to be loaded anywhere (PIE) — and the page its arguments are
+  on is where every program looks for it. The kernel is where it was
+  linked, too.
+
 - **A second processor in the kernel.** Programs run on every processor
   the machine has; the kernel runs on one at a time
   ([`docs/smp.md`](docs/smp.md)). A system call, a fault or an interrupt on
