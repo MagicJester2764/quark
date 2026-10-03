@@ -367,6 +367,8 @@ pub const SYS_PCI_DEVICE: u64 = 168;
 pub const SYS_PCI_READ: u64 = 169;
 /// Write it, less what the kernel keeps.
 pub const SYS_PCI_WRITE: u64 = 170;
+/// Memory for a display device's screen, nobody's, as a `PhysRange`.
+pub const SYS_DISPLAY_MEMORY: u64 = 171;
 
 // --- 0xC0  memory, continued: reservations and memory objects ---
 /// Reserve anonymous memory, backed when first touched.
@@ -436,7 +438,7 @@ pub const SYS_ABI_VERSION: u64 = 240;
 /// minor when calls are added. User space can refuse to run against a major it
 /// does not know, which is the point of exposing it at all.
 pub const ABI_VERSION_MAJOR: u64 = 3;
-pub const ABI_VERSION_MINOR: u64 = 24;
+pub const ABI_VERSION_MINOR: u64 = 25;
 
 /// Threads a task may make with no capability at all.
 ///
@@ -3584,6 +3586,43 @@ fn dispatch(
                 return NOT_ALLOWED;
             }
             if crate::pci::write(d.bdf, offset, width, value) { 0 } else { u64::MAX }
+        }
+        SYS_DISPLAY_MEMORY => {
+            // arg0 = a display device (class 0x03) the caller holds and its
+            // program has claimed, arg1 = pages, arg2 = an empty slot of the
+            // caller's. The screen's memory (`display.rs`), as a `PhysRange`
+            // in that slot, which the device reaches from now on: where it
+            // begins, or u64::MAX.
+            let tid = scheduler::current_tid();
+            let space = scheduler::space_of_task(tid);
+            let (pages, slot) = (arg1 as usize, arg2 as usize);
+            let Some(d) = crate::pci::find(arg0).filter(|_| crate::cap::task_has_pci_device(tid, arg0)) else {
+                return u64::MAX;
+            };
+            if d.class >> 16 != 0x03 || !crate::iommu::claimed_by(space, d.bdf) || slot >= crate::cap::MAX_CAPS {
+                return u64::MAX;
+            }
+            let empty = crate::cap::with_cspace(tid, |cs| cs[slot].cap_type as u8 == crate::cap::CapType::Empty as u8);
+            if empty != Some(true) {
+                return u64::MAX;
+            }
+            let Some(base) = crate::display::memory(d.bdf, pages) else {
+                return u64::MAX;
+            };
+            let generation = crate::cap::current_generation(tid, slot);
+            let (start, end) = (base as u64, (base + pages * 4096) as u64);
+            let _ = crate::cap::with_cspace(tid, |cs| {
+                cs[slot] = crate::cap::CapSlot {
+                    cap_type: crate::cap::CapType::PhysRange,
+                    generation,
+                    root_slot: slot as u8,
+                    root: crate::cap::KERNEL_ROOT,
+                    param0: start,
+                    param1: end,
+                };
+            });
+            crate::iommu::reach(space, base, pages);
+            start
         }
         SYS_POWER => {
             // arg0 = 0 to turn the machine off, 1 to start it again. For a

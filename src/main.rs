@@ -11,6 +11,7 @@ mod console;
 mod cpu;
 mod context;
 mod devmem;
+mod display;
 mod fat32;
 mod fpu;
 mod heap;
@@ -89,9 +90,12 @@ pub extern "C" fn kernel_main(multiboot_info: usize) -> ! {
     let fb = unsafe { multiboot2::parse_framebuffer(multiboot_info) };
     let (mmap_count, mmap_regions) = unsafe { multiboot2::parse_memory_map(multiboot_info) };
 
-    // Initialize PMM before drivers so they can allocate pages
+    // Initialize PMM before drivers so they can allocate pages. The
+    // framebuffer is kept back from it: where the firmware's display draws
+    // from memory, it is memory the map calls free.
     let mb_info_size = unsafe { *(multiboot_info as *const u32) } as usize;
-    unsafe { pmm::init(&mmap_regions, mmap_count, multiboot_info, mb_info_size) };
+    let screen = fb.map(|f| (f.addr as usize, f.pitch as usize * f.height as usize));
+    unsafe { pmm::init(&mmap_regions, mmap_count, multiboot_info, mb_info_size, screen) };
 
     // The kernel's own map, over all the memory there is: before the heap,
     // which is above it, and before anything is given a frame it could not

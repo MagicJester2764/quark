@@ -528,10 +528,17 @@ pub fn program_gone(space: u64) {
 /// Frames `[base, base + count pages)` have been given to task `owner`: if
 /// its program has a domain, its devices may reach them now.
 pub fn owned(base: usize, count: usize, owner: usize) {
-    if !on() {
+    reach(crate::scheduler::space_of_task(owner), base, count);
+}
+
+/// Program `space`'s devices may reach `[base, base + count pages)` from now
+/// on, if it has claimed any: its own frames as they come, and its display
+/// device's screen, which is nobody's (`display.rs`). Until the program goes,
+/// and its domain with it.
+pub fn reach(space: u64, base: usize, count: usize) {
+    if !on() || space == 0 {
         return;
     }
-    let space = crate::scheduler::space_of_task(owner);
     let flags = irq_save();
     unsafe {
         let domains = &*core::ptr::addr_of!(DOMAINS);

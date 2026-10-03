@@ -529,6 +529,15 @@ may keep — are in `../quarkutils/CLAUDE.md`; these are the kernel's.
 - **`init` is started with the framebuffer and its boot modules, and nothing
   wider.** Every other `PhysRange` over memory is derived from those, so
   what the kernel hands the first task bounds what any task can map.
+- **A screen in memory is nobody's** (`display.rs`). The bootloader's
+  framebuffer, where it is RAM, is kept from the allocator at boot
+  (`pmm::init`); and a display driver's screen (`SYS_DISPLAY_MEMORY`) is one
+  run of frames no task owns and nothing frees — its device's for as long as
+  the machine is up, the same run given to a driver started for it again,
+  handed out as a `PhysRange` the way the boot framebuffer is, and reached
+  by the device of whichever program has claimed it (`iommu::reach`). Owned
+  by the driver, its death would hand the frames to the allocator while the
+  console was still drawing into them.
 - **A `PhysRange` over a device's registers is minted from the device.**
   A PCI device's driver holds that device (see the next rule) and mints
   inside its BARs, as the kernel sized them at boot. `DeviceMemory` is the

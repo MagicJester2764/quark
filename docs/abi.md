@@ -1,6 +1,6 @@
 # Quark syscall ABI
 
-**Version 3.24.** Query the running kernel with `SYS_ABI_VERSION` (240), which
+**Version 3.25.** Query the running kernel with `SYS_ABI_VERSION` (240), which
 returns `(major << 16) | minor`.
 
 This document is the contract between the Quark kernel and everything above it.
@@ -222,6 +222,7 @@ returning at once turned that loop into a spin.
 | 3.16 | **Off, and on again, by the firmware's tables.** `SYS_POWER` (119) turns the machine off or restarts it, for a holder of the new capability `Power` (type 12): by ACPI's control and reset registers, where a program used to write to the three ports QEMU listens on. |
 | 3.17 | **Memory above four gigabytes.** All of a machine's memory is used, up to 511 GiB, where the kernel used the first four gigabytes of it. `SYS_PHYS_ALLOC` takes a flag (arg1 = 1) for frames below four gigabytes, which is what a device that is told an address in thirty-two bits needs; without it a frame is ordinary memory and comes from the top. `SYS_MEM_INFO` takes what to say (arg0): 1 for how much memory the machine has and 2 for where it ends. |
 | 3.18 | **The wide registers.** A program may use AVX, AVX2 and AVX-512 where the processor has them: the kernel turns them on (`OSXSAVE`, XCR0) and saves all of each task's with `XSAVE`. Before, an AVX instruction was a fault. No call changed. |
+| 3.25 | **A screen in memory.** `SYS_DISPLAY_MEMORY` (171) gives the driver of a display device that draws its picture from memory — a virtio GPU — the screen it draws from: one run of memory for the device, no task's and never freed, as a `PhysRange` the device reaches. And the bootloader's framebuffer is kept from the frame allocator where it is memory, as it was not. |
 | 3.24 | **A device is its capability.** The kernel finds every PCI device at boot and sizes its BARs, and a new capability, `PciDevice` (type 14), is one device or every device: the first task is started with every device. Its holder is told what was found (`SYS_PCI_DEVICE`, 168), reads and writes the device's configuration (`SYS_PCI_READ`, 169; `SYS_PCI_WRITE`, 170), mints a `PhysRange` or an `IoPort` inside one of the device's BARs, claims it (`SYS_DEVICE_CLAIM`, which no longer asks for the configuration ports) and has an interrupt for it by message (`SYS_MSI_ALLOC` with arg1 = 1), which the kernel aims the device at itself. The ports devices were configured through, 0xCF8 and 0xCFC to 0xCFF, are refused to every program, and a write to a BAR, to the MSI capability, or that turns bus mastering on before the device is claimed, is refused; every device but a bridge starts with bus mastering off, and has it turned off when the program that claimed it goes. A capability type above 255 is refused by `SYS_CAP_MINT`, where it was read as its low byte. |
 | 3.23 | **A device's memory.** `SYS_DEVICE_CLAIM` (127) makes a PCI device the caller's program's; on a machine with an IOMMU it then reaches the memory the program was given for devices and nothing else, and a device nobody has claimed reaches nothing. |
 | 3.22 | **What a program uses.** `SYS_USAGE` (124) says how long a program, the children it collected or a task has run — in the program and in the kernel, to the nanosecond — and how often it gave the processor up or had it taken. `SYS_NICE` (125) sets how nice a program is to the rest of its band, which is its share of it by Linux's weights, on any number of processors. `SYS_CPU_LIMIT` (126) sets how long it may run: SIGXCPU past the soft limit, the end at the hard one. |
@@ -1409,6 +1410,7 @@ for the top half of its own: the calls about a PCI device are here.
 | 168 | `SYS_PCI_DEVICE` | arg0 = a device to start from, `bus << 8 \| device << 3 \| function`; arg1 = where to write 21 words | the first device at or after arg0 that the caller holds, which it describes / `u64::MAX` when there is none | `PciDevice` |
 | 169 | `SYS_PCI_READ` | arg0 = a device; arg1 = an offset in its configuration; arg2 = how many bytes, 1, 2 or 4, at an offset that is a multiple of it | the value / `u64::MAX` | `PciDevice` for the device |
 | 170 | `SYS_PCI_WRITE` | arg0 = a device; arg1 = an offset; arg2 = 1, 2 or 4 bytes; arg3 = the value | 0; `u64::MAX - 1` for what the kernel keeps / `u64::MAX` | `PciDevice` for the device |
+| 171 | `SYS_DISPLAY_MEMORY` | arg0 = a display device (class 0x03); arg1 = pages, 1 to 16384; arg2 = an empty slot of the caller's | where the device's screen begins, a `PhysRange` over it now in that slot / `u64::MAX` | `PciDevice` for the device, which the caller's program has claimed |
 
 **A device is its capability.** Every PCI function is found once, at boot,
 by the kernel, which sizes its BARs then and keeps what it found. A holder
@@ -1444,6 +1446,19 @@ the message is asked for; and turning bus mastering on for a device the
 caller's program has not claimed. Every function that is not a bridge is
 started with bus mastering off, and has it turned off again when the
 program that claimed it goes.
+
+**A screen in memory** (`SYS_DISPLAY_MEMORY`). A display device that reads
+its picture out of memory, as a virtio GPU does, has no framebuffer of its
+own to hand out: its driver is given one here, one contiguous run of
+memory for each device, at least as long as was asked for the first time
+and the same run every time after — a driver started again for the device
+is given the screen back. It is a `PhysRange`, which the driver hands to
+whatever lends the display out, as the bootloader's framebuffer is; and the
+device reaches it, behind an IOMMU, for as long as the program that claimed
+the device is there. The frames are no task's: they are never freed, and
+never anybody else's, so a program still drawing into them when the driver
+has gone draws into nothing that matters. And the bootloader's framebuffer,
+where it is memory, is kept from the allocator in the same way.
 
 ### Memory, continued (0xC0)
 

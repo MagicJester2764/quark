@@ -247,7 +247,13 @@ pub unsafe fn init(
     count: usize,
     mb_info_addr: usize,
     mb_info_size: usize,
+    screen: Option<(usize, usize)>,
 ) { unsafe {
+    // The framebuffer the bootloader was given, where it is memory: a
+    // virtio GPU's, which the firmware drew from RAM, is in a part of the
+    // map that is free once boot services have gone. Its frames are
+    // nobody's, and the console and whoever has the display draw into them.
+    let (screen_start, screen_end) = screen.map_or((0, 0), |(at, len)| (at & !(PAGE_SIZE - 1), at + len));
     let regions = &regions[..count];
     let kernel_end = &__bss_end as *const u8 as usize;
     let usable = |r: &&MemoryRegion| r.region_type == MMAP_TYPE_AVAILABLE && !scrap(regions, r);
@@ -272,7 +278,8 @@ pub unsafe fn init(
         let hits = |a: usize, b: usize| (start < b && a < end).then_some(b);
         let mut past = hits(0, 0x100000)
             .or(hits(0x100000, kernel_end))
-            .or(hits(mb_info_addr, mb_info_addr + mb_info_size));
+            .or(hits(mb_info_addr, mb_info_addr + mb_info_size))
+            .or(hits(screen_start, screen_end));
         for i in 0..crate::modules::count() {
             if let Some(m) = crate::modules::get(i) {
                 past = past.or(hits(m.start, m.end));
@@ -367,6 +374,10 @@ pub unsafe fn init(
         if let Some(m) = crate::modules::get(i) {
             pmm.mark_range_used(m.start, m.end);
         }
+    }
+    // The framebuffer, where it is memory.
+    if screen_end > screen_start {
+        pmm.mark_range_used(screen_start, screen_end);
     }
     // And the tables themselves.
     pmm.mark_range_used(place, place + room);
