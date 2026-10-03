@@ -138,15 +138,17 @@ system hung.
 
 There are no tests in this tree, and that is the shape of a microkernel rather
 than an omission: the kernel is tested from outside, through the ABI, by a
-program. `dtest` in `../quarkutils` makes 821 checks — capabilities, IPC,
+program. `dtest` in `../quarkutils` makes 828 checks — capabilities, IPC,
 memory, descriptors, signals, scheduling, users and terminals, `dtest calls`
 with three million calls in three seconds, `dtest smp` for what a second
 processor changes, `dtest clock` for what time it is and whether a wait ends
 when it should, `dtest fork` for what a fork shares and who a write is seen
 by, `dtest handlers` for a handler the kernel runs, `dtest usage` for what
-a program has used and its share of the processor, twenty-three more (`dtest pressure`) on a machine with somewhere to write
-memory out to, and seven more (`dtest msi`) on a machine with a device that
-interrupts by message and its driver running, and eight (`dtest iommu`)
+a program has used and its share of the processor, `dtest devices` for who
+holds which device, twenty-three more (`dtest pressure`) on a machine with
+somewhere to write memory out to, and twelve more (`dtest msi`, `dtest
+devices`) on a machine with a device that interrupts by message and its
+driver running, and eight (`dtest iommu`)
 where an IOMMU stands between that device and memory — and `qfuzz` throws random
 requests at every service.
 
@@ -527,21 +529,59 @@ may keep — are in `../quarkutils/CLAUDE.md`; these are the kernel's.
 - **`init` is started with the framebuffer and its boot modules, and nothing
   wider.** Every other `PhysRange` over memory is derived from those, so
   what the kernel hands the first task bounds what any task can map.
-- **A `PhysRange` over a device's registers is minted from `DeviceMemory`,
-  and only where there is no memory.** *Device memory* (`devmem.rs`) is
-  every address below four gigabytes that the firmware's memory map does
-  not list at all, less the first megabyte, the interrupt controllers'
-  own pages — a program that could write to a local APIC could stop the
-  clock — and the IOMMUs', which a program could turn off. The capability is a kind of its own so that no task holds a
-  `PhysRange` wider than what it maps: a driver reads where its device is
-  and mints that (`cap::can_mint`). It is worked out from the *whole* map
-  or not at all: a hole in what the kernel kept of the map is not a hole in
-  the map, and RAM handed out as device memory is the kernel handed out.
-  The map is kept whole by joining neighbours of one kind as it is read
-  (`multiboot2::parse_memory_map`); kept one for one, a UEFI machine's
-  hundred entries did not fit in sixty-four and the last of its memory was
-  never seen. `init`'s capability goes in its *last* free slot: it names
-  its low ones itself and counts on the rest of them being empty.
+- **A `PhysRange` over a device's registers is minted from the device.**
+  A PCI device's driver holds that device (see the next rule) and mints
+  inside its BARs, as the kernel sized them at boot. `DeviceMemory` is the
+  older and wider way, still handed to `init` and asked for by nothing:
+  *device memory* (`devmem.rs`) is every address below four gigabytes that
+  the firmware's memory map does not list at all, less the first megabyte,
+  the interrupt controllers' own pages — a program that could write to a
+  local APIC could stop the clock — the IOMMUs', which a program could turn
+  off, and the MCFG's window, which is every device's configuration. Either
+  way the capability is minted narrow so that no task holds a `PhysRange`
+  wider than what it maps (`cap::can_mint`). Device memory is worked out
+  from the *whole* map or not at all: a hole in what the kernel kept of the
+  map is not a hole in the map, and RAM handed out as device memory is the
+  kernel handed out. The map is kept whole by joining neighbours of one
+  kind as it is read (`multiboot2::parse_memory_map`); kept one for one, a
+  UEFI machine's hundred entries did not fit in sixty-four and the last of
+  its memory was never seen. `init`'s capabilities of these kinds go in its
+  *last* free slots: it names its low ones itself and counts on the rest of
+  them being empty.
+- **A device is its capability, and its configuration is the kernel's.**
+  Every PCI function is found once, at boot, before the other processors
+  start and before there is a task (`pci::init`): its ids, its class, its
+  capabilities and its BARs, sized then, while nothing can be using them.
+  Configuration space is reached through the kernel and nothing else — the
+  window every device shares, ports 0xCF8 and 0xCFC to 0xCFF, is refused to
+  every program whoever holds the ports (`pci::config_port`; a byte at
+  0xCF9 is the chipset's reset register and is not the window), and the
+  MCFG's window is left out of device memory. A program reaches a device
+  with `PciDevice` for it (type 14): `init` holds every device, the device
+  manager in `../quarkutils` is handed that and hands each driver its own.
+  Everything about a device goes with that one capability: its
+  configuration (`SYS_PCI_READ`, `SYS_PCI_WRITE`), what the kernel found
+  (`SYS_PCI_DEVICE`), a `PhysRange` or `IoPort` minted inside one of its
+  BARs (`pci::memory_covers`, `ports_cover`), its claim and its interrupt by
+  message. Three things follow, each kept by a refusal in `pci::kept` or
+  beside it:
+  - *A device stays where the firmware put it.* No program writes a BAR, a
+    ROM base or a bridge's windows: a BAR moved is a capability that lets
+    its holder map whatever is now at the old address. A `PhysRange` from a
+    device is its BAR's pages, and only where no other device's BAR shares
+    them.
+  - *Where a message goes is the kernel's to say.* The MSI capability is
+    not written by a program; `SYS_MSI_ALLOC` for a device aims it
+    (`pci::aim`). MSI-X's table is in the device's own registers and is its
+    driver's to write — a gap, below.
+  - *Nothing masters the bus that its program has not claimed.* Every
+    function but a bridge has bus mastering turned off at boot; turning it
+    on is refused until the caller's program has claimed the device; and it
+    is turned off again when that program goes (`iommu::program_gone` calls
+    `pci::stop`), before the program's frames are anybody else's — on a
+    machine with no IOMMU that is all that stops a device writing to them.
+  A new way to reach a device's configuration goes through `pci::read` and
+  `write`, and asks `kept`.
 - **Where there is an IOMMU, a device reaches what its driver was given
   and nothing else** (`iommu.rs`, Intel's VT-d). It is turned on at boot
   with nothing reachable; `SYS_DEVICE_CLAIM` makes a device a program's,
@@ -553,8 +593,8 @@ may keep — are in `../quarkutils/CLAUDE.md`; these are the kernel's.
   is out of every table, the units told and waited for, before it can be
   anybody else's. A new way to give a program memory for a device, or to
   take it back, goes through them too. A claim is a driver's — a holder
-  of the PCI configuration ports, who could reprogram any device anyway —
-  and goes when its program does, `exec` included (`program_gone`).
+  of the device — and goes when its program does, `exec` included
+  (`program_gone`).
 
 ## Descriptors the kernel owns
 
@@ -1243,9 +1283,14 @@ breaking any of them is quiet until it is a machine that stops.
   device that wants an interrupt of its own sends a message. One message
   each: nothing gives a device several (MSI-X, or MSI's multiple
   messages).
-- `DeviceMemory` is one authority for all devices, as the I/O ports are: a
-  driver that holds it may map any device's registers. Above four
-  gigabytes there is none, so a device the firmware put there cannot be
-  driven.
+- PCI is the first segment's, found once at boot: no hot-plug, and a
+  machine with more than one segment has the rest left out. A BAR the
+  firmware did not place stays unplaced, and a small BAR that shares a
+  page with another device's cannot be mapped at all. MSI-X's table is in
+  the device's registers, so a driver aims its device's messages there as
+  it likes: nothing remaps interrupts. `DeviceMemory` is still one
+  authority for every device's registers, and is still handed to `init`,
+  though nothing asks for it now; a device that is not a PCI function has
+  only that, and above four gigabytes there is none.
 - Sixteen processors at most, and local APIC ids below 256 unless the
   firmware left the APICs in x2APIC mode.

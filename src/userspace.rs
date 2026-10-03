@@ -401,14 +401,16 @@ pub fn spawn_init(elf_data: &[u8], fb: Option<crate::multiboot2::FramebufferInfo
             // And the right to map a device's registers, to hand to drivers:
             // if the machine has anywhere that is known to be only devices.
             if !crate::devmem::ranges().is_empty() {
-                crate::cap::insert_last(cs, crate::cap::CapType::DeviceMemory);
+                crate::cap::insert_last(cs, crate::cap::CapType::DeviceMemory, 0);
             }
             // And the right to say what time it is, and the right to turn the
             // machine off, for whoever it decides may.
-            crate::cap::insert_last(cs, crate::cap::CapType::Clock);
-            crate::cap::insert_last(cs, crate::cap::CapType::Power);
+            crate::cap::insert_last(cs, crate::cap::CapType::Clock, 0);
+            crate::cap::insert_last(cs, crate::cap::CapType::Power, 0);
             // And the right to be where memory is written out to.
-            crate::cap::insert_last(cs, crate::cap::CapType::Swap);
+            crate::cap::insert_last(cs, crate::cap::CapType::Swap, 0);
+            // And every PCI device, to hand each driver its own.
+            crate::cap::insert_last(cs, crate::cap::CapType::PciDevice, crate::pci::ANY);
         });
         task.context.rip = enter_user_trampoline as *const () as u64;
         task.context.r12 = entry;

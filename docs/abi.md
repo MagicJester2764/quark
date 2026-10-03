@@ -1,6 +1,6 @@
 # Quark syscall ABI
 
-**Version 3.23.** Query the running kernel with `SYS_ABI_VERSION` (240), which
+**Version 3.24.** Query the running kernel with `SYS_ABI_VERSION` (240), which
 returns `(major << 16) | minor`.
 
 This document is the contract between the Quark kernel and everything above it.
@@ -99,7 +99,9 @@ unused slots in a block are reserved for that subsystem.
 
 Every block is assigned. Threads never needed one: a thread is a task started
 with its creator's address space, so it is built from calls that already
-existed.
+existed. Two blocks filled up and carry on in the top half of another, where
+it says so in its heading: hardware's calls about a PCI device are in 0xA8
+(168–175), the half of the debug console's block it had no use for.
 
 ## Stability and deprecation
 
@@ -220,6 +222,7 @@ returning at once turned that loop into a spin.
 | 3.16 | **Off, and on again, by the firmware's tables.** `SYS_POWER` (119) turns the machine off or restarts it, for a holder of the new capability `Power` (type 12): by ACPI's control and reset registers, where a program used to write to the three ports QEMU listens on. |
 | 3.17 | **Memory above four gigabytes.** All of a machine's memory is used, up to 511 GiB, where the kernel used the first four gigabytes of it. `SYS_PHYS_ALLOC` takes a flag (arg1 = 1) for frames below four gigabytes, which is what a device that is told an address in thirty-two bits needs; without it a frame is ordinary memory and comes from the top. `SYS_MEM_INFO` takes what to say (arg0): 1 for how much memory the machine has and 2 for where it ends. |
 | 3.18 | **The wide registers.** A program may use AVX, AVX2 and AVX-512 where the processor has them: the kernel turns them on (`OSXSAVE`, XCR0) and saves all of each task's with `XSAVE`. Before, an AVX instruction was a fault. No call changed. |
+| 3.24 | **A device is its capability.** The kernel finds every PCI device at boot and sizes its BARs, and a new capability, `PciDevice` (type 14), is one device or every device: the first task is started with every device. Its holder is told what was found (`SYS_PCI_DEVICE`, 168), reads and writes the device's configuration (`SYS_PCI_READ`, 169; `SYS_PCI_WRITE`, 170), mints a `PhysRange` or an `IoPort` inside one of the device's BARs, claims it (`SYS_DEVICE_CLAIM`, which no longer asks for the configuration ports) and has an interrupt for it by message (`SYS_MSI_ALLOC` with arg1 = 1), which the kernel aims the device at itself. The ports devices were configured through, 0xCF8 and 0xCFC to 0xCFF, are refused to every program, and a write to a BAR, to the MSI capability, or that turns bus mastering on before the device is claimed, is refused; every device but a bridge starts with bus mastering off, and has it turned off when the program that claimed it goes. A capability type above 255 is refused by `SYS_CAP_MINT`, where it was read as its low byte. |
 | 3.23 | **A device's memory.** `SYS_DEVICE_CLAIM` (127) makes a PCI device the caller's program's; on a machine with an IOMMU it then reaches the memory the program was given for devices and nothing else, and a device nobody has claimed reaches nothing. |
 | 3.22 | **What a program uses.** `SYS_USAGE` (124) says how long a program, the children it collected or a task has run — in the program and in the kernel, to the nanosecond — and how often it gave the processor up or had it taken. `SYS_NICE` (125) sets how nice a program is to the rest of its band, which is its share of it by Linux's weights, on any number of processors. `SYS_CPU_LIMIT` (126) sets how long it may run: SIGXCPU past the soft limit, the end at the hard one. |
 | 3.21 | **Threads share their program's capabilities, and a threaded program can exec.** No new number. A program has one capability space, as it has one descriptor table: a thread uses it, where it started with a copy of its creator's, so what one thread is given the others have. A forked child gets a copy. `SYS_EXEC_SPACE` from a program with more than one task ends the others first, quietly — none is a child to collect or a death to be told of — where it was refused; if one of them was the task the program began as, the caller becomes its parent's child in its place. |
@@ -276,23 +279,33 @@ UID 0 bypass in the kernel. Each task has a CSpace of 64 slots holding
 | 11 | `Clock` | — | — |
 | 12 | `Power` | — | — |
 | 13 | `Swap` | — | — |
+| 14 | `PciDevice` | a PCI device, `bus << 8 \| device << 3 \| function` (`0xFFFF_FFFF` = every one) | — |
 
 Delegation may narrow a capability but never widen it; delegating at equal
 breadth is allowed, since a set is a subset of itself.
 
+**A device.** A holder of `PciDevice` for a PCI device — or for every
+device — may mint a `PhysRange` over the pages of one of the device's memory
+BARs, where no other device's BAR is in those pages, and an `IoPort` over
+one of its I/O BARs (`SYS_CAP_MINT`, as if it held one that covered it); and
+reads and writes the device's configuration, claims it and has an interrupt
+for it, under *Devices (0xA8)*. That is how a driver maps its device: it is
+handed the capability for that device by whoever starts it, and the kernel
+says where its BARs are. A BAR above four gigabytes is a BAR like any other.
+
 **Device memory.** A device's registers are at addresses the firmware chose,
 in the part of the address space that is not memory: below four gigabytes,
 what the firmware's memory map does not list at all, above the first
-megabyte and with the interrupt controllers' own pages left out. A holder
-of `DeviceMemory` may mint a `PhysRange` over any range that lies wholly
-there (`SYS_CAP_MINT`, as if it held one that covered it), and maps with
-that. It is a capability of its own, and not a `PhysRange` over all of it,
-so that a `PhysRange` stays what it has been: as narrow as what its holder
-maps, a device and never a quarter of the address space. A driver reads
-where its device is out of the device's configuration and mints that. It
-is one authority for every device, as the I/O ports are. The kernel hands
-it to the first task, and only on a machine whose memory map it could keep
-whole.
+megabyte and with the interrupt controllers', the IOMMUs' and the PCI
+configuration window's pages left out. A holder of `DeviceMemory` may mint a
+`PhysRange` over any range that lies wholly there (`SYS_CAP_MINT`, as if it
+held one that covered it), and maps with that. It is a capability of its
+own, and not a `PhysRange` over all of it, so that a `PhysRange` stays what
+it has been: as narrow as what its holder maps, a device and never a
+quarter of the address space. It is one authority for every device, and a
+PCI device's driver needs it no longer: the device is a capability of its
+own. The kernel hands it to the first task, and only on a machine whose
+memory map it could keep whole.
 
 **The clock.** What time it is, is the machine's to say and one thing for
 every program on it: the date a file is given, what `SYS_CLOCK` answers,
@@ -1070,13 +1083,13 @@ to hear from.
 |---|---|---|---|---|
 | 112 | `SYS_IRQ_REGISTER` | arg0 = irq, one of the sixteen ISA interrupts | 0 / `u64::MAX` | `Irq` for that line |
 | 113 | `SYS_IRQ_ACK` | arg0 = irq | 0 / `u64::MAX` | `Irq` for that line |
-| 114 | `SYS_IOPORT` | arg0 = port, arg1 = op, arg2 = value | read value, or 0 / `u64::MAX` | `IoPort` covering the port |
-| 115 | `SYS_IOPORT_REP` | arg0 = port, arg1 = buf, arg2 = words, arg3 = op | 0 / `u64::MAX` | `IoPort` covering the port |
+| 114 | `SYS_IOPORT` | arg0 = port, arg1 = op, arg2 = value | read value, or 0 / `u64::MAX`; the PCI configuration ports, 0xCF8 and 0xCFC to 0xCFF, are refused | `IoPort` covering the port |
+| 115 | `SYS_IOPORT_REP` | arg0 = port, arg1 = buf, arg2 = words, arg3 = op | 0 / `u64::MAX`; the same ports refused | `IoPort` covering the port |
 | 116 | `SYS_GETRANDOM` | arg0 = buf, arg1 = len, arg2 = flags (none yet) | bytes written, at most 1 MiB / `u64::MAX` | — |
 | 117 | `SYS_CPUS` | — | `(the processor the caller is on << 32) \| how many processors there are` | — |
-| 118 | `SYS_MSI_ALLOC` | — | `(irq << 48) \| (data << 32) \| address` / `u64::MAX` | `Irq` for any line (0xFF) |
+| 118 | `SYS_MSI_ALLOC` | arg1 = 0; or arg1 = 1 and arg0 = a PCI device, whose MSI capability the kernel then programs | `(irq << 48) \| (data << 32) \| address` / `u64::MAX` | `Irq` for any line (0xFF); with a device, `PciDevice` for it |
 | 119 | `SYS_POWER` | arg0 = 0 to turn the machine off, 1 to start it again | does not return / `u64::MAX` | `Power` |
-| 127 | `SYS_DEVICE_CLAIM` | arg0 = a PCI device, `bus << 8 \| device << 3 \| function`, on the first segment; arg1 = 1 to ask how many times it reached for what it may not | 1 if it now reaches only the caller's program's memory, 0 if nothing on this machine can make it; with arg1 = 1 the count; `u64::MAX - 1` if it is another program's or the caller may not / `u64::MAX` | `IoPort` covering 0xCF8 and 0xCFC |
+| 127 | `SYS_DEVICE_CLAIM` | arg0 = a PCI device, `bus << 8 \| device << 3 \| function`, on the first segment; arg1 = 1 to ask how many times it reached for what it may not | 1 if it now reaches only the caller's program's memory, 0 if nothing on this machine can make it; with arg1 = 1 the count; `u64::MAX - 1` if it is another program's or the caller may not / `u64::MAX` | `PciDevice` for the device |
 
 `SYS_IOPORT` ops: 0 = read8, 1 = write8, 2 = read16, 3 = write16, 4 = read32,
 5 = write32. `SYS_IOPORT_REP` ops: 0 = `rep insw`, 1 = `rep outsw`.
@@ -1120,10 +1133,14 @@ not.
 *An interrupt of a device's own*, 16 to 47, is not a line at all but a
 message the device sends to a processor (MSI), and is given out rather than
 asked for: `SYS_MSI_ALLOC` registers the caller for the lowest number nobody
-has and answers with it and with the two words to program into the device's
-MSI capability — the address to send to (the lower 32 bits; the upper are 0)
-and the data to send. It needs the capability for any interrupt, and a
-machine with a local APIC. The number is the caller's until the caller is
+has and answers with it and with the two words a device sends it with — the
+address to send to (the lower 32 bits; the upper are 0) and the data to
+send. Asked for a PCI device the caller holds (arg1 = 1), the kernel writes
+them into the device's MSI capability itself — one message, enabled, its
+line turned off — where the device has one; a device with MSI-X alone keeps
+its messages in a table in its own registers, which its driver writes with
+the two words. Asked for no device, it needs the capability for any
+interrupt. Either way it needs a machine with a local APIC. The number is the caller's until the caller is
 gone. There is nothing to acknowledge — `SYS_IRQ_ACK` succeeds and does
 nothing — and nothing in the kernel to stop a device sending: that is the
 device's own switch. A number given to a second driver after the first has
@@ -1142,9 +1159,9 @@ caller's program's: from then on the device reaches the memory the program
 was given for devices (`SYS_PHYS_ALLOC`), at the addresses `SYS_PHYS_ALLOC`
 answered with, and nothing else — what the program gives back, it can no
 longer reach by the time `SYS_PHYS_FREE` returns. A device is one program's
-until that program ends or `exec`s; its claim is the claim of a driver that
-can configure every device anyway, which is to say a holder of the PCI
-configuration ports. A claim is answered 1 where this is so and 0 where it
+until that program ends or `exec`s, and is claimed by a holder of it
+(`PciDevice`). It masters the bus only once it is claimed — the kernel
+refuses to turn that on before — and stops when its program goes. A claim is answered 1 where this is so and 0 where it
 cannot be — no IOMMU, or one that does not take the device, or a firmware
 that reserves memory for some device, which leaves the machine as it was —
 and is a claim either way. Interrupts are not remapped: a device's message
@@ -1381,6 +1398,52 @@ These write to the kernel's own console, bypassing the user-space console
 server. They exist for bring-up and for output before a console exists.
 **Expect them to be withdrawn** once early output is handled another way;
 ordinary programs should use file descriptor 1.
+
+### Devices (0xA8)
+
+The hardware block (0x70) has no room left, and the debug console has no use
+for the top half of its own: the calls about a PCI device are here.
+
+| # | Name | Arguments | Returns | Cap |
+|---|---|---|---|---|
+| 168 | `SYS_PCI_DEVICE` | arg0 = a device to start from, `bus << 8 \| device << 3 \| function`; arg1 = where to write 21 words | the first device at or after arg0 that the caller holds, which it describes / `u64::MAX` when there is none | `PciDevice` |
+| 169 | `SYS_PCI_READ` | arg0 = a device; arg1 = an offset in its configuration; arg2 = how many bytes, 1, 2 or 4, at an offset that is a multiple of it | the value / `u64::MAX` | `PciDevice` for the device |
+| 170 | `SYS_PCI_WRITE` | arg0 = a device; arg1 = an offset; arg2 = 1, 2 or 4 bytes; arg3 = the value | 0; `u64::MAX - 1` for what the kernel keeps / `u64::MAX` | `PciDevice` for the device |
+
+**A device is its capability.** Every PCI function is found once, at boot,
+by the kernel, which sizes its BARs then and keeps what it found. A holder
+of `PciDevice` (type 14) for a device — or for every device — is told what
+that was (`SYS_PCI_DEVICE`), reads and writes the device's configuration,
+claims it (`SYS_DEVICE_CLAIM`), has an interrupt for it by message
+(`SYS_MSI_ALLOC` with arg1 = 1), and mints a `PhysRange` over a memory BAR
+of it or an `IoPort` over an I/O BAR (`SYS_CAP_MINT`, as if it held one
+that covered it). Nothing else reaches a device's configuration: the ports
+it was reached through, 0xCF8 and 0xCFC to 0xCFF, are refused to every
+program (`SYS_IOPORT`, `SYS_IOPORT_REP`; a byte at 0xCF9, which is how a
+PC is reset, is not one of them).
+
+**What is described** (`SYS_PCI_DEVICE`), in 21 `u64`s:
+
+| Word | What |
+|---|---|
+| 0 | the device's address, \| header type `<< 16` \| interrupt pin `<< 24` (1 is A, 0 none) \| interrupt line `<< 32` \| where its MSI capability is `<< 40` \| where its MSI-X capability is `<< 48` (0 for none) |
+| 1 | vendor \| device `<< 16` \| subsystem vendor `<< 32` \| subsystem `<< 48` |
+| 2 | class `<< 16` \| subclass `<< 8` \| programming interface, \| revision `<< 24` |
+| 3 + 3n, 4 + 3n, 5 + 3n | BAR *n* (0 to 5): where it is, how long, and 1 if it is ports, 2 if it is 64 bits wide, 4 if prefetchable. A length of 0 is no BAR; the second half of a 64-bit one is none. A BAR the firmware left at 0 is said to be there, and cannot be mapped. |
+
+An IDE controller in compatibility mode is described with the ports it
+answers at as its BARs — 0x1F0 and 0x3F6 for the first channel, 0x170 and
+0x376 for the second — and the interrupt it uses is 14 or 15.
+
+**What the kernel keeps** (`SYS_PCI_WRITE` answers `u64::MAX - 1` and writes
+nothing): the BARs, the expansion ROM's base, and a bridge's bus numbers and
+windows — a device stays where the firmware put it, so that what a
+capability lets its holder map is still the device; the MSI capability —
+where a device's message goes is the kernel's to say, and it says it when
+the message is asked for; and turning bus mastering on for a device the
+caller's program has not claimed. Every function that is not a bridge is
+started with bus mastering off, and has it turned off again when the
+program that claimed it goes.
 
 ### Memory, continued (0xC0)
 
@@ -1818,7 +1881,8 @@ authority, and what it is started holding bounds what anything can hold:
 - `DeviceMemory`, in the last slot of its table — unless the kernel could
   not keep the firmware's memory map whole, and so cannot say where there
   is no memory;
-- `Clock`, `Power` and `Swap`, in the last slots that leaves free;
+- `Clock`, `Power`, `Swap` and `PciDevice` for every device, in the last
+  slots that leaves free;
 - the driver band, which is what lets it put a driver there;
 - and no physical memory besides: it could once map the kernel.
 

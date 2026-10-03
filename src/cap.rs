@@ -117,6 +117,19 @@ pub enum CapType {
     /// and hands them back: it reads all of them and could answer with
     /// anything. It is for one program the system starts, and nobody else.
     Swap = 13,
+    /// One PCI device: param0 is its address, `bus << 8 | device << 3 |
+    /// function`, or `pci::ANY` for every device.
+    ///
+    /// Everything about a device goes with it: its configuration, read and
+    /// written through the kernel (`SYS_PCI_READ`, `SYS_PCI_WRITE`), what
+    /// the kernel found of it (`SYS_PCI_DEVICE`), a `PhysRange` or an
+    /// `IoPort` minted inside one of its BARs (`can_mint`), its claim
+    /// (`SYS_DEVICE_CLAIM`) and an interrupt for it by message
+    /// (`SYS_MSI_ALLOC`). Configuration space used to be reached through
+    /// two ports, and whoever held them held every device; the kernel keeps
+    /// those ports now (`pci::config_port`). The first task holds every
+    /// device and hands each driver its own.
+    PciDevice = 14,
 }
 
 /// A `MemObject`'s access bits.
@@ -839,17 +852,18 @@ pub fn insert_kernel_range(cspace: &mut CSpace, base: usize, len: usize) -> bool
     }
 }
 
-/// Give `cspace` an unrevocable capability of a kind that has no
-/// parameters — the right to map the machine's devices' registers
+/// Give `cspace` an unrevocable capability of a kind that takes one
+/// parameter or none — the right to map the machine's devices' registers
 /// ([`CapType::DeviceMemory`]), the right to set its clock
 /// ([`CapType::Clock`]), the right to turn it off ([`CapType::Power`]), the
-/// right to keep what is written out of memory ([`CapType::Swap`]) — in
-/// its last free slot. The first task names its
+/// right to keep what is written out of memory ([`CapType::Swap`]), every
+/// PCI device ([`CapType::PciDevice`], `pci::ANY`) — in its last free
+/// slot. The first task names its
 /// low slots itself — where it keeps the nameserver's endpoint, where it
 /// mints what it hands on — and counts on the ones it has not filled being
 /// empty; what the kernel adds to what it starts with goes where the task
 /// will not look for room.
-pub fn insert_last(cspace: &mut CSpace, cap_type: CapType) -> bool {
+pub fn insert_last(cspace: &mut CSpace, cap_type: CapType, param0: u64) -> bool {
     match cspace.iter().rposition(|cap| cap.cap_type as u8 == CapType::Empty as u8) {
         Some(slot) => {
             cspace[slot] = CapSlot {
@@ -857,7 +871,7 @@ pub fn insert_last(cspace: &mut CSpace, cap_type: CapType) -> bool {
                 generation: 0,
                 root_slot: 0,
                 root: KERNEL_ROOT,
-                param0: 0,
+                param0,
                 param1: 0,
             };
             true
@@ -926,6 +940,11 @@ pub fn validate_attenuation(source: &CapSlot, new_type: CapType, new_p0: u64, ne
         CapType::Clock => true,
         CapType::Power => true,
         CapType::Swap => true,
+        // Every device covers each one; one covers itself.
+        CapType::PciDevice => {
+            (new_p0 <= 0xFFFF || new_p0 == crate::pci::ANY)
+                && (source.param0 == crate::pci::ANY || new_p0 == source.param0)
+        }
         // The same object, with no access the source lacks.
         CapType::MemObject => {
             new_p0 == source.param0
@@ -957,6 +976,29 @@ pub fn can_mint(cspace: &CSpace, cap_type: CapType, param0: u64, param1: u64) ->
         || (cap_type as u8 == CapType::PhysRange as u8
             && cspace.iter().any(|cap| cap.cap_type as u8 == CapType::DeviceMemory as u8 && is_valid(cap))
             && crate::devmem::covers(param0, param1))
+        // Or from a device: a range inside one of its BARs, of memory or of
+        // ports.
+        || (cap_type as u8 == CapType::PhysRange as u8
+            && crate::pci::memory_covers(param0, param1, |bdf| holds_device(cspace, bdf as u64)))
+        || (cap_type as u8 == CapType::IoPort as u8
+            && crate::pci::ports_cover(param0, param1, |bdf| holds_device(cspace, bdf as u64)))
+}
+
+/// Whether `cspace` holds PCI device `bdf`, or every device.
+fn holds_device(cspace: &CSpace, bdf: u64) -> bool {
+    cspace.iter().any(|cap| {
+        cap.cap_type as u8 == CapType::PciDevice as u8
+            && is_valid(cap)
+            && (cap.param0 == crate::pci::ANY || cap.param0 == bdf)
+    })
+}
+
+/// Whether task `tid`'s program holds PCI device `bdf`, or every device.
+pub fn task_has_pci_device(tid: usize, bdf: u64) -> bool {
+    if tid >= MAX_TASKS || bdf > 0xFFFF {
+        return false;
+    }
+    unsafe { task_cspace(tid).is_some_and(|cs| holds_device(cs, bdf)) }
 }
 
 /// The current generation of a slot of `tid`'s program (for creating

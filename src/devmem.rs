@@ -16,6 +16,9 @@
 //! - **The interrupt controllers' own registers** — the local APIC's page
 //!   and each I/O APIC's. They are in the same stretch of addresses as any
 //!   device, and a program that could write to them could stop the clock.
+//!   The IOMMUs', which a program could turn off. And where PCI devices'
+//!   configuration is (the MCFG's window), which is every device's and the
+//!   kernel's (`pci.rs`).
 //! - **Everything, if the map was not kept whole.** A hole in what the
 //!   kernel remembers of the map is not a hole in the map.
 //!
@@ -69,7 +72,7 @@ pub unsafe fn init(regions: &[MemoryRegion]) {
     // What is spoken for, below four gigabytes: every entry of the map,
     // whatever it says the memory is for, and the interrupt controllers.
     const SPANS: usize =
-        crate::multiboot2::MAX_MEMORY_REGIONS + 1 + crate::acpi::MAX_IOAPICS + crate::acpi::MAX_DRHDS;
+        crate::multiboot2::MAX_MEMORY_REGIONS + 1 + crate::acpi::MAX_IOAPICS + crate::acpi::MAX_DRHDS + 1;
     let mut spans = [(0u64, 0u64); SPANS];
     let mut n = 0;
     let mut take = |base: u64, end: u64| {
@@ -90,6 +93,12 @@ pub unsafe fn init(regions: &[MemoryRegion]) {
     // And the IOMMUs': a driver that could write there could let its
     // device reach anything.
     crate::iommu::register_pages(&mut take);
+    // And every device's configuration: whoever could write there could
+    // move any device, and have it copy anywhere.
+    if info.ecam_base != 0 {
+        let buses = (info.ecam_last as u64).saturating_sub(info.ecam_first as u64) + 1;
+        take(info.ecam_base, info.ecam_base + (buses << 20));
+    }
     // In order of address. There are a few dozen at most.
     for i in 1..n {
         let mut j = i;

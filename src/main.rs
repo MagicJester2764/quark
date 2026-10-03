@@ -27,6 +27,7 @@ mod modules;
 mod multiboot2;
 mod percpu;
 pub mod paging;
+mod pci;
 mod pic;
 mod pit;
 mod power;
@@ -171,6 +172,10 @@ pub extern "C" fn kernel_main(multiboot_info: usize) -> ! {
 
     // Initialize syscall/sysret mechanism
     unsafe { syscall::init() };
+
+    // Every PCI device, found and sized while nothing else can be touching
+    // one: before the other processors and before there is a task.
+    unsafe { pci::init() };
 
     // The other processors, if the machine has any. Here: after everything a
     // processor is given has been decided on this one, and before there is

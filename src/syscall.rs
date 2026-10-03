@@ -360,6 +360,14 @@ const fn sock_tag(op: u64, handle: usize) -> u64 {
 pub const SYS_WRITE: u64 = 160;
 pub const SYS_CONSOLE_POS: u64 = 161;
 
+// --- 0xA8  devices: the block 0x70 had no room left for ---
+/// What the kernel found of a PCI device the caller holds.
+pub const SYS_PCI_DEVICE: u64 = 168;
+/// Read a PCI device's configuration.
+pub const SYS_PCI_READ: u64 = 169;
+/// Write it, less what the kernel keeps.
+pub const SYS_PCI_WRITE: u64 = 170;
+
 // --- 0xC0  memory, continued: reservations and memory objects ---
 /// Reserve anonymous memory, backed when first touched.
 pub const SYS_MAP_ANON: u64 = 192;
@@ -428,7 +436,7 @@ pub const SYS_ABI_VERSION: u64 = 240;
 /// minor when calls are added. User space can refuse to run against a major it
 /// does not know, which is the point of exposing it at all.
 pub const ABI_VERSION_MAJOR: u64 = 3;
-pub const ABI_VERSION_MINOR: u64 = 23;
+pub const ABI_VERSION_MINOR: u64 = 24;
 
 /// Threads a task may make with no capability at all.
 ///
@@ -1493,7 +1501,16 @@ fn dispatch(
         SYS_IOPORT => {
             // arg0=port, arg1=op (0=read8,1=write8,2=read16,3=write16,4=read32,5=write32), arg2=value (for writes)
             let port = arg0 as u16;
-            if !crate::cap::task_has_ioport(scheduler::current_tid(), port) {
+            // The window every PCI device is configured through is the
+            // kernel's, whoever holds the port (`pci::config_port`).
+            let width = match arg1 {
+                0 | 1 => 1,
+                2 | 3 => 2,
+                _ => 4,
+            };
+            if crate::pci::config_port(port, width)
+                || !crate::cap::task_has_ioport(scheduler::current_tid(), port)
+            {
                 return u64::MAX;
             }
             match arg1 {
@@ -1509,7 +1526,7 @@ fn dispatch(
         SYS_IOPORT_REP => {
             // arg0=port, arg1=user_buf_ptr, arg2=count (words), arg3=op (0=insw, 1=outsw)
             let port = arg0 as u16;
-            if !crate::cap::task_has_ioport(scheduler::current_tid(), port) {
+            if crate::pci::config_port(port, 2) || !crate::cap::task_has_ioport(scheduler::current_tid(), port) {
                 return u64::MAX;
             }
             let buf = arg1;
@@ -3480,17 +3497,28 @@ fn dispatch(
             0
         }
         SYS_MSI_ALLOC => {
-            // No arguments. An interrupt of the caller's own, for a device
-            // that sends its interrupts as messages: a number from 16 up,
-            // which the caller is registered for as `SYS_IRQ_REGISTER`
-            // would have registered it, and the two words to program the
-            // device with — where to send, and what.
+            // An interrupt of the caller's own, for a device that sends its
+            // interrupts as messages: a number from 16 up, which the caller
+            // is registered for as `SYS_IRQ_REGISTER` would have registered
+            // it, and the two words to program the device with — where to
+            // send, and what.
             //
-            // It takes the capability for any interrupt (0xFF): one for a
-            // particular line is for that line. And a local APIC, which is
-            // what such a message is sent to.
+            // With arg1 = 1, for the PCI device arg0, which the caller
+            // holds: and the kernel programs it, where the device has an
+            // MSI capability — where its message goes is not the driver's
+            // to say. With none — MSI-X alone — the driver writes the two
+            // words into the device's table itself.
+            //
+            // Without a device it takes the capability for any interrupt
+            // (0xFF): one for a particular line is for that line. Either way
+            // a local APIC, which is what such a message is sent to.
             let tid = scheduler::current_tid();
-            if !crate::cap::task_has_irq(tid, 0xFF) || !crate::lapic::present() {
+            let device = (arg1 == 1).then_some(arg0);
+            let allowed = match device {
+                Some(bdf) => crate::cap::task_has_pci_device(tid, bdf) && crate::pci::find(bdf).is_some(),
+                None => crate::cap::task_has_irq(tid, 0xFF),
+            };
+            if !allowed || !crate::lapic::present() {
                 return u64::MAX;
             }
             let to = crate::percpu::apic_id(0) as u64;
@@ -3503,7 +3531,59 @@ fn dispatch(
             };
             let address = 0xFEE0_0000u64 | (to << 12);
             let data = crate::ioapic::FIRST_VECTOR as u64 + irq as u64;
+            if let Some(d) = device.and_then(crate::pci::find) {
+                crate::pci::aim(d, address as u32, data as u16);
+            }
             ((irq as u64) << 48) | (data << 32) | address
+        }
+        SYS_PCI_DEVICE => {
+            // arg0 = a device to start from, arg1 = where to write the 21
+            // words that describe it. The first device at or after arg0
+            // that the caller holds.
+            let tid = scheduler::current_tid();
+            if !validate_user_ptr_mut(arg1, (crate::pci::RECORD * 8) as u64) {
+                return u64::MAX;
+            }
+            let Some(d) = crate::pci::next(arg0, |bdf| crate::cap::task_has_pci_device(tid, bdf as u64)) else {
+                return u64::MAX;
+            };
+            let record = crate::pci::record(d);
+            let _ua = crate::cpu::UserAccess::begin();
+            unsafe { core::ptr::copy_nonoverlapping(record.as_ptr(), arg1 as *mut u64, crate::pci::RECORD) };
+            d.bdf as u64
+        }
+        SYS_PCI_READ => {
+            // arg0 = a device the caller holds, arg1 = offset, arg2 = 1, 2
+            // or 4 bytes.
+            let tid = scheduler::current_tid();
+            if !crate::cap::task_has_pci_device(tid, arg0) || crate::pci::find(arg0).is_none() || arg1 > 0xFFFF {
+                return u64::MAX;
+            }
+            crate::pci::read(arg0 as u16, arg1 as u16, arg2.min(8) as u8).map_or(u64::MAX, |v| v as u64)
+        }
+        SYS_PCI_WRITE => {
+            // arg0 = a device the caller holds, arg1 = offset, arg2 = 1, 2
+            // or 4 bytes, arg3 = the value. What the kernel keeps is
+            // refused: where the device is, where its message goes, and
+            // turning its bus mastering on before its program has claimed
+            // it.
+            let tid = scheduler::current_tid();
+            let Some(d) = crate::pci::find(arg0).filter(|_| crate::cap::task_has_pci_device(tid, arg0)) else {
+                return u64::MAX;
+            };
+            if arg1 > 0xFFFF || !matches!(arg2, 1 | 2 | 4) {
+                return u64::MAX;
+            }
+            let (offset, width, value) = (arg1 as u16, arg2 as u8, arg3 as u32);
+            if crate::pci::kept(d, offset, width) {
+                return NOT_ALLOWED;
+            }
+            if crate::pci::turns_master_on(d.bdf, offset, value)
+                && !crate::iommu::claimed_by(scheduler::space_of_task(tid), d.bdf)
+            {
+                return NOT_ALLOWED;
+            }
+            if crate::pci::write(d.bdf, offset, width, value) { 0 } else { u64::MAX }
         }
         SYS_POWER => {
             // arg0 = 0 to turn the machine off, 1 to start it again. For a
@@ -3630,8 +3710,9 @@ fn dispatch(
             crate::usage::cpu_limit(scheduler::current_tid(), arg0, arg1, arg2, arg3 == 1)
         }
         SYS_DEVICE_CLAIM => {
-            // arg0 = bus << 8 | device << 3 | function; arg1 = 1 to ask how
-            // many times the device reached for what it may not.
+            // arg0 = bus << 8 | device << 3 | function, a device the caller
+            // holds; arg1 = 1 to ask how many times the device reached for
+            // what it may not.
             crate::iommu::claim(scheduler::current_tid(), arg0, arg1 == 1)
         }
         SYS_SIG_WAIT => {
@@ -4051,6 +4132,10 @@ fn dispatch(
             // arg0 = slot, arg1 = type, arg2 = param0, arg3 = param1
             // Create a root cap in caller's slot (requires existing authority)
             let slot = arg0 as usize;
+            // A type is a byte: 0x101 is not 1.
+            if arg1 > 0xFF {
+                return u64::MAX;
+            }
             let cap_type_raw = arg1 as u8;
             let param0 = arg2;
             let param1 = arg3;
@@ -4071,6 +4156,7 @@ fn dispatch(
                 11 => crate::cap::CapType::Clock,
                 12 => crate::cap::CapType::Power,
                 13 => crate::cap::CapType::Swap,
+                14 => crate::cap::CapType::PciDevice,
                 _ => return u64::MAX,
             };
             let tid = scheduler::current_tid();

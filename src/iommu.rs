@@ -17,7 +17,8 @@
 //! when the program does (`program_gone`).
 //!
 //! What it does not do: interrupts are not remapped, so a device can still
-//! send whatever message it likes to a processor (MSI); only memory is
+//! send whatever message it is set to send (MSI-X's table is in the
+//! device's own registers, and its driver writes it); only memory is
 //! guarded. And a machine whose firmware says some memory must stay
 //! reachable by some device (an RMRR — a USB controller's keyboard for the
 //! firmware's own use, a graphics card's) is left unguarded: honouring that
@@ -414,20 +415,20 @@ fn context_entry(u: &Unit, bdf: u16) -> Option<u64> {
 
 /// `SYS_DEVICE_CLAIM`: device `bdf` (bus << 8 | device << 3 | function, on
 /// the first PCI segment) is the program of task `tid`'s, to be driven by
-/// it alone. Asked by a program that may configure devices — that holds the
-/// PCI configuration ports, as every driver of a PCI device does. Answers 1
-/// if the device can reach only the program's memory from now on, 0 if
-/// nothing on this machine can make it, and `NOT_ALLOWED` if it is another
-/// program's or the caller may not. With `ask`, how many times the device
-/// reached for something it may not, instead.
+/// it alone. Asked by a program that holds the device (`PciDevice`), as its
+/// driver does. Answers 1 if the device can reach only the program's memory
+/// from now on, 0 if nothing on this machine can make it, and
+/// `NOT_ALLOWED` if it is another program's or the caller may not. With
+/// `ask`, how many times the device reached for something it may not,
+/// instead.
 pub fn claim(tid: usize, bdf: u64, ask: bool) -> u64 {
     if bdf > 0xFFFF {
         return u64::MAX;
     }
-    let bdf = bdf as u16;
-    if !crate::cap::task_has_ioport(tid, 0xCF8) || !crate::cap::task_has_ioport(tid, 0xCFC) {
+    if !crate::cap::task_has_pci_device(tid, bdf) {
         return NOT_ALLOWED;
     }
+    let bdf = bdf as u16;
     let space = crate::scheduler::space_of_task(tid);
     if space == 0 {
         return u64::MAX;
@@ -482,8 +483,16 @@ unsafe fn claim_locked(space: u64, bdf: u16, ask: bool) -> u64 {
     1
 }
 
-/// Program `space` has gone: its devices reach nothing again, and its
-/// table is given back.
+/// Whether program `space` has claimed device `bdf`.
+pub fn claimed_by(space: u64, bdf: u16) -> bool {
+    let flags = irq_save();
+    let claimed = unsafe { (*core::ptr::addr_of!(CLAIMS)).iter().any(|c| c.space != 0 && c.space == space && c.bdf == bdf) };
+    irq_restore(flags);
+    claimed
+}
+
+/// Program `space` has gone: its devices master the bus no more and reach
+/// nothing again, and its table is given back.
 pub fn program_gone(space: u64) {
     if space == 0 {
         return;
@@ -493,6 +502,9 @@ pub fn program_gone(space: u64) {
         let claims = &mut *core::ptr::addr_of_mut!(CLAIMS);
         let units = &(&*core::ptr::addr_of!(UNITS))[..NUNITS];
         for c in claims.iter_mut().filter(|c| c.space == space) {
+            // Before its frames can be anybody's: on a machine with no
+            // IOMMU, this is all that stops it writing to them.
+            crate::pci::stop(c.bdf);
             if let Some(u) = c.unit {
                 let unit = &units[u as usize];
                 if let Some(entry) = context_entry(unit, c.bdf) {

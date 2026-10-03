@@ -4,8 +4,10 @@
 //! **MADT** says how many processors there are and where the interrupt
 //! controllers are; the **FADT** says how to restart the machine and which
 //! ports turn it off; the **DMAR**, where there is one, where the machine's
-//! IOMMUs are and which devices are behind each (`iommu.rs`). None needs
-//! the ACPI interpreter: all are plain structures.
+//! IOMMUs are and which devices are behind each (`iommu.rs`); and the
+//! **MCFG**, where there is one, where PCI devices' configuration is in
+//! memory (`pci.rs`). None needs the ACPI interpreter: all are plain
+//! structures.
 //! What to write to those ports to turn it off is in the **DSDT**, which is
 //! not a structure but a program; the one object wanted from it is found by
 //! what it looks like ([`s5`]).
@@ -124,6 +126,11 @@ pub struct Info {
     pub drhds: [Drhd; MAX_DRHDS],
     pub ndrhds: usize,
     pub rmrrs: usize,
+    /// Where the first PCI segment's configuration is in memory, and the
+    /// buses it covers: 0 where the firmware does not say.
+    pub ecam_base: u64,
+    pub ecam_first: u8,
+    pub ecam_last: u8,
 }
 
 const NO_CPU: Cpu = Cpu { apic_id: 0 };
@@ -152,6 +159,9 @@ static mut INFO: Info = Info {
     drhds: [NO_DRHD; MAX_DRHDS],
     ndrhds: 0,
     rmrrs: 0,
+    ecam_base: 0,
+    ecam_first: 0,
+    ecam_last: 0,
 };
 
 /// What the tables said. Unchanged after [`init`].
@@ -220,6 +230,22 @@ fn dmar(t: &[u8], info: &mut Info) {
             _ => {}
         }
         at += len;
+    }
+}
+
+/// The MCFG: where each PCI segment's configuration is in memory, a page
+/// for each function of each device of each bus from the first to the last.
+/// Only the first segment's is kept, as everything here is on the first.
+fn mcfg(t: &[u8], info: &mut Info) {
+    let mut at = SDT_HEADER + 8;
+    while at + 16 <= t.len() {
+        let (base, segment, first, last) = (le64(t, at), le16(t, at + 8), t[at + 10], t[at + 11]);
+        if segment == 0 && base != 0 && last >= first && info.ecam_base == 0 {
+            info.ecam_base = base;
+            info.ecam_first = first;
+            info.ecam_last = last;
+        }
+        at += 16;
     }
 }
 
@@ -437,6 +463,7 @@ pub unsafe fn init(rsdp: Option<&[u8]>) { unsafe {
             }
             b"FACP" => fadt(t, info),
             b"DMAR" => dmar(t, info),
+            b"MCFG" => mcfg(t, info),
             _ => {}
         }
     }
@@ -489,6 +516,10 @@ fn report(info: &Info) {
     for unit in &info.drhds[..info.ndrhds] {
         puts(b", IOMMU at ");
         put_hex(unit.base);
+    }
+    if info.ecam_base != 0 {
+        puts(b", PCI configuration at ");
+        put_hex(info.ecam_base);
     }
     puts(b".\n");
 }

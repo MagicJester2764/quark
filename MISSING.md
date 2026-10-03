@@ -27,12 +27,11 @@ for.
 - **Signals queued**, as the C library will want for its real-time ones:
   one raised twice before it is run is run once, and a handler is told who
   raised it by process id and nothing more.
-- **A device's own authority, and its registers wherever they are.** A
-  driver that holds `DeviceMemory` may map any device's registers below
-  four gigabytes, and none above; a claim (`SYS_DEVICE_CLAIM`) narrows
-  what its device may reach, not what it may map. And a device is given
-  one message (MSI), not several (MSI-X), as the drivers for faster
-  devices will want.
+- **Several messages for a device.** A device is its own capability now
+  (`PciDevice`), with its registers wherever the firmware put them; what
+  is left is MSI-X, which the drivers for faster devices will want: a
+  driver asks for one message at a time, and a device's MSI-X table is in
+  its own registers, where its driver aims it as it likes.
 
 ## Not asked for
 

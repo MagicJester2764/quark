@@ -33,8 +33,11 @@ The kernel provides:
   plus notifications, deadlines, and buffers lent with a call so that no server
   has to map a client's memory
 - Object capabilities as the only authority: I/O ports, IRQs, physical ranges,
-  endpoints, task management — held by a program, so that its threads hold
-  them too. There is no UID 0 bypass
+  endpoints, task management, a PCI device — held by a program, so that its
+  threads hold them too. There is no UID 0 bypass
+- Every PCI device found and sized at boot, and its configuration the
+  kernel's: a driver holds its own device and reaches nothing else — its
+  registers, its interrupt, whether it may copy memory
 - Where the machine has an IOMMU, a device that copies memory reaches what
   its driver was given and nothing else
 - Address spaces, memory given its frames when first touched, shared memory,
@@ -122,8 +125,10 @@ src/
   intc.rs             The interrupt controller devices come in through:
   ioapic.rs  pic.rs     the I/O APIC, or the 8259s
   acpi.rs             The firmware's tables: processors, interrupt controllers,
-                      how to turn the machine off, and where its IOMMUs are
+                      how to turn the machine off, where its IOMMUs are, and
+                      where PCI configuration is
   power.rs            Turning it off, and starting it again
+  pci.rs              Every PCI device, found once; its configuration
   devmem.rs           Device memory: the addresses that are not memory
   iommu.rs            Where a device may copy memory: Intel's VT-d
   percpu.rs           What each processor has of its own
