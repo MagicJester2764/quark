@@ -138,7 +138,7 @@ system hung.
 
 There are no tests in this tree, and that is the shape of a microkernel rather
 than an omission: the kernel is tested from outside, through the ABI, by a
-program. `dtest` in `../quarkutils` makes 796 checks — capabilities, IPC,
+program. `dtest` in `../quarkutils` makes 800 checks — capabilities, IPC,
 memory, descriptors, signals, scheduling, users and terminals, `dtest calls`
 with three million calls in three seconds, `dtest smp` for what a second
 processor changes, `dtest clock` for what time it is and whether a wait ends
@@ -646,11 +646,20 @@ every Unix program assumes:
   task into it: same id, same descriptors, same capabilities, same parent, new
   address space — and therefore a new program as far as every server is
   concerned. The thread pointer is cleared with it, or the new program's first
-  thread-local reads through an address the old one had.
-- **`fork` copies the descriptor table; `exec` keeps it.** The child gets a
-  second descriptor for everything the parent has open, the working directory
-  included; `exec` closes what was marked for it (`SYS_FD_FLAGS`) and nothing
-  else. A thread does neither: it uses its program's table.
+  thread-local reads through an address the old one had. A program with other
+  tasks has them ended first, as POSIX has it (`end_siblings`), and quietly:
+  none is a child anybody collects or a death anybody is told of, since the
+  program goes on. If one of them was the task the program began as, the
+  caller takes its place as its parent's child, and a parent already waiting
+  looks again.
+- **`fork` copies the descriptor table and the capabilities; `exec` keeps
+  them.** The child gets a second descriptor for everything the parent has
+  open, the working directory included, and a copy of the capability space;
+  `exec` closes what was marked for it (`SYS_FD_FLAGS`) and nothing else. A
+  thread does neither: it uses its program's table and its program's space
+  (`cap::share`), so what one thread is given the others have. A thread used
+  to start with a copy of its creator's capabilities, as they stood: a C
+  library that looked a service up in one thread was refused it in another.
 - **A program ends as a whole** (`SYS_EXIT_PROGRAM`). `SYS_EXIT_CODE` ends one
   task, which is what a thread wants and never what `exit` means: the other
   threads stayed parked on locks nobody would release, holding the program's
@@ -1116,9 +1125,6 @@ breaking any of them is quiet until it is a machine that stops.
   taken at all. Reading an untouched page gives it a frame of its own,
   where Linux maps one shared page of zeroes. Rust programs' heaps still
   come from `SYS_MMAP`, backed at once.
-- A threaded program cannot `exec`: POSIX has it end every other thread, and
-  ending them means unwinding what they hold in a server, so it is refused
-  rather than half done.
 - **A call to a server is not cut short by a signal** (see *Signals*): a
   file's read or write, a socket's, a lock's wait. The handler runs when the
   server answers. A signal of the same number raised twice before it is run
@@ -1144,9 +1150,6 @@ breaking any of them is quiet until it is a machine that stops.
   out included: that is thirty-two megabytes, and a machine taking pages
   from programs faster than its pager writes them takes no more until
   some have been written.
-- A thread starts with a copy of its creator's *capabilities*, not a share of
-  them: what either is granted or gives up afterwards, the other does not see.
-  (Descriptors are shared: they are the program's.)
 - A child is the *task's* that made it, not the program's: a thread cannot
   wait for a child another thread of its program forked, which POSIX lets
   any thread do. And the children of a thread that has ended are nobody's:

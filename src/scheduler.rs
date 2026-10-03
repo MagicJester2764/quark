@@ -181,15 +181,6 @@ pub fn init() {
             base_priority: PRIO_IDLE,
             cr3: crate::paging::read_cr3(),
             space: 0,
-            caps: crate::task::CAP_ALL,
-            // Mirror the bitmask into real capabilities: with the UID 0 bypass
-            // gone, TID 0's authority has to come from its CSpace like anyone
-            // else's.
-            cspace: {
-                let mut cs = crate::cap::empty_cspace();
-                crate::cap::populate_from_bitmask(&mut cs, crate::task::CAP_ALL);
-                cs
-            },
             pager_tid: 0,
             parent_tid: 0,
             mem_pages: 0,
@@ -204,6 +195,10 @@ pub fn init() {
             fpu: crate::fpu::clean(),
         });
         crate::fdtable::attach_new(0);
+        // With the UID 0 bypass gone, TID 0's authority has to come from its
+        // CSpace like anyone else's: every bit, and the capabilities for them.
+        crate::cap::task_made(0);
+        crate::cap::add_bits(0, crate::task::CAP_ALL);
     }
     INITIALIZED.store(true, Ordering::SeqCst);
 }
@@ -252,6 +247,7 @@ pub fn spawn(entry_fn: fn()) -> usize {
             }
             TASKS[tid] = Some(task);
             crate::cap::open_endpoint(tid);
+            crate::cap::task_made(tid);
             PROCESS_ID[tid] = crate::cap::endpoint_of(tid);
             crate::fdtable::attach_new(tid);
             enqueue(tid);
@@ -1250,8 +1246,14 @@ pub fn sys_wait_for(target: u64, how: Wait) -> u64 {
             } else if target == 0 {
                 (0, 0)
             } else if how.by_pid {
+                // Not a task nobody waits for: a program's first task, ended
+                // by an exec from another thread, still has the program's id
+                // until it is taken apart, and the task that took its place
+                // is the one to wait for.
                 let child = (1..MAX_TASKS).find(|&i| {
-                    PROCESS_ID[i] == target && TASKS[i].as_ref().is_some_and(|t| t.parent_tid == parent)
+                    PROCESS_ID[i] == target
+                        && TASKS[i].as_ref().is_some_and(|t| t.parent_tid == parent)
+                        && !joined_by_word(i)
                 });
                 match child {
                     Some(i) => (i, 0),
@@ -1854,6 +1856,9 @@ unsafe fn reap(i: usize) { unsafe {
 /// program had. A thread that exits closes nothing.
 pub fn close_descriptors(tid: usize) {
     crate::fdtable::task_gone(tid);
+    // And its program's capabilities, which go with the last task to use
+    // them: a dead task is the authority for nothing.
+    crate::cap::task_gone(tid);
 }
 
 unsafe fn reap_one(i: usize) -> u64 { unsafe {
@@ -1888,6 +1893,7 @@ unsafe fn reap_one(i: usize) -> u64 { unsafe {
     // For a task that died some way other than `exit_with` or `kill_task` —
     // a kernel task, say. Ordinarily it left its table when it died.
     crate::fdtable::task_gone(i);
+    crate::cap::task_gone(i);
     // Reclaim pipes it created but never attached to an fd
     crate::pipe::cleanup_orphans(i);
     // Clean up IPC state and unblock tasks waiting on this one
@@ -1973,24 +1979,12 @@ pub fn current_task_cr3() -> usize {
 
 /// Get the current task's capability bits.
 pub fn current_task_caps() -> u32 {
-    let tid = current_tid();
-    unsafe {
-        match TASKS[tid].as_ref() {
-            Some(task) => task.caps,
-            None => 0,
-        }
-    }
+    crate::cap::bits_of(current_tid())
 }
 
 /// Check if the current task has a given capability.
 pub fn current_task_has_cap(cap: u32) -> bool {
-    let tid = current_tid();
-    unsafe {
-        match TASKS[tid].as_ref() {
-            Some(task) => task.caps & cap != 0,
-            None => false,
-        }
-    }
+    crate::cap::bits_of(current_tid()) & cap != 0
 }
 
 /// Get the current task's UID.
@@ -2190,8 +2184,6 @@ pub fn create_empty_task() -> Option<usize> {
             base_priority: crate::scheduler::PRIO_NORMAL,
             cr3: 0,
             space: 0,
-            caps: 0,
-            cspace: crate::cap::empty_cspace(),
             pager_tid: 0,
             parent_tid: parent,
             mem_pages: 0,
@@ -2210,9 +2202,10 @@ pub fn create_empty_task() -> Option<usize> {
             fpu: crate::fpu::clean(),
         });
         crate::cap::open_endpoint(tid);
-        // A process id of its own, and a table of its own, empty. A task
-        // started as a thread gives both up for its program's; a task
-        // started as a program keeps them.
+        // A process id of its own, a table of its own and a capability space
+        // of its own, empty. A task started as a thread gives them up for its
+        // program's; a task started as a program keeps them.
+        crate::cap::task_made(tid);
         PROCESS_ID[tid] = crate::cap::endpoint_of(tid);
         // In its creator's process group and session: a job is whatever a
         // shell started, and what those started.
@@ -2228,40 +2221,31 @@ pub fn create_empty_task() -> Option<usize> {
     Some(tid)
 }
 
-/// Give a new task of a program what its creator holds as a *task*: its
-/// capabilities and its band.
+/// Give a new task what its creator holds: its capabilities and its band.
 ///
 /// A thread is not a new principal: it runs in its creator's address space and
 /// can already do anything its creator can. It used to start with nothing — no
 /// capability, so it could call no server, not even the VFS about a file its
-/// program had opened — and the ordinary band whatever its program's. So it
-/// starts with a copy of each: the capabilities as they are (a revoked
-/// original takes the copy with it, since both name the same root), and the
-/// band. A slot the creator filled before starting it keeps what it was given.
-///
-/// A copy, because a CSpace is a task's. Descriptors are not here: those are
-/// the program's, and a thread shares them (`fdtable::share`) where a forked
-/// child gets copies (`fdtable::copy_into`).
-pub fn inherit_from_creator(tid: usize, creator: usize) {
+/// program had opened — and the ordinary band whatever its program's. Then
+/// with a copy of each, which was the creator's as it stood: what either was
+/// given afterwards the other did not have. Now a `thread` uses its
+/// program's capabilities (`cap::share`), as it uses its program's
+/// descriptors, and anything it was given before it started becomes the
+/// program's. A forked child gets a copy, as it gets copies of the
+/// descriptors (`fdtable::copy_into`). Either way the band is the creator's.
+pub fn inherit_from_creator(tid: usize, creator: usize, thread: bool) {
     if tid >= MAX_TASKS || creator >= MAX_TASKS || tid == creator {
         return;
     }
+    if thread {
+        crate::cap::share(tid, creator);
+    } else {
+        crate::cap::copy_into(tid, creator);
+    }
     let flags = irq_save();
     unsafe {
-        let Some(src) = TASKS[creator].as_ref() else {
-            irq_restore(flags);
-            return;
-        };
-        let cspace = src.cspace;
-        let caps = src.caps;
-        let band = src.base_priority;
-        if let Some(dst) = TASKS[tid].as_mut() {
-            for (slot, cap) in cspace.iter().enumerate() {
-                if dst.cspace[slot].cap_type == crate::cap::CapType::Empty {
-                    dst.cspace[slot] = *cap;
-                }
-            }
-            dst.caps = caps;
+        let band = TASKS[creator].as_ref().map(|t| t.base_priority);
+        if let (Some(band), Some(dst)) = (band, TASKS[tid].as_mut()) {
             dst.base_priority = band;
             dst.priority = band;
         }
@@ -2341,20 +2325,11 @@ unsafe fn start_task_locked(tid: usize, rip: u64, rsp: u64, cr3: usize, arg: u64
 
 /// Grant a capability to a task.
 pub fn grant_cap(tid: usize, cap: u32) -> Result<(), ()> {
-    if tid >= MAX_TASKS {
+    if tid >= MAX_TASKS || unsafe { TASKS[tid].is_none() } {
         return Err(());
     }
-    unsafe {
-        match TASKS[tid].as_mut() {
-            Some(task) => {
-                task.caps |= cap;
-                // Also populate CSpace with wildcard/full-range caps
-                crate::cap::populate_from_bitmask(&mut task.cspace, cap);
-                Ok(())
-            }
-            None => Err(()),
-        }
-    }
+    // The bits, and wildcard/full-range caps for them in the CSpace.
+    if crate::cap::add_bits(tid, cap) { Ok(()) } else { Err(()) }
 }
 
 /// Set a file descriptor entry on a task.
@@ -2686,7 +2661,7 @@ pub fn fork_current() -> Option<usize> {
             return None;
         }
     };
-    inherit_from_creator(tid, parent);
+    inherit_from_creator(tid, parent, false);
     // A second descriptor for everything the parent has open, the working
     // directory included: the child's own, to close without the parent
     // noticing.
@@ -2761,9 +2736,10 @@ pub fn space_task_count(space: u64) -> usize {
 /// program's identity: a new address space is a new program, so servers see
 /// the caller become something else rather than carry on.
 ///
-/// Refused for a program with more than one task. POSIX has `exec` end every
-/// other thread, and ending them means unwinding whatever they hold in a
-/// server; refusing is the honest version of not having done that yet.
+/// A program with more than one task has the others ended first, as POSIX
+/// says (`end_siblings`). What they held in a server is the old program's,
+/// and the old program is gone the moment the caller leaves it: whoever
+/// watched it is told, and lets go of it, as when a program ends.
 ///
 /// Does not return on success.
 pub fn exec_into(cr3: usize, entry: u64, rsp: u64) -> Result<(), ()> {
@@ -2786,7 +2762,9 @@ pub fn exec_into(cr3: usize, entry: u64, rsp: u64) -> Result<(), ()> {
         s.unwrap_or(0)
     };
     if space_task_count(old_space) > 1 {
-        return Err(());
+        let flags = irq_save();
+        unsafe { end_siblings(caller, old_space) };
+        irq_restore(flags);
     }
 
     {
@@ -2844,6 +2822,39 @@ pub fn exec_into(cr3: usize, entry: u64, rsp: u64) -> Result<(), ()> {
         crate::syscall::enter_usermode(entry, rsp, 0);
     }
 }
+
+/// End every task of program `space` but `caller`: it is about to become
+/// another program, and they were threads of this one.
+///
+/// Quietly. None of them is a child anybody collects — the kernel takes
+/// each apart (`UNWAITED`) — and none is a death anybody is told of: the
+/// program goes on, as what `caller` is about to be. If one of them is the
+/// task the program began as, `caller` takes its place as the child of
+/// whoever started the program, and a parent already waiting for it looks
+/// again — a wait by process id finds `caller`, which has that id.
+///
+/// # Safety
+/// Interrupts off.
+unsafe fn end_siblings(caller: usize, space: u64) { unsafe {
+    let live = |t: usize| matches!(TASKS[t], Some(ref x) if x.space == space && x.state != TaskState::Dead);
+    let began = (1..MAX_TASKS).find(|&t| t != caller && live(t) && PROCESS_ID[t] == crate::cap::endpoint_of(t));
+    if let Some(first) = began {
+        let parent = TASKS[first].as_ref().map_or(0, |t| t.parent_tid);
+        if let Some(me) = TASKS[caller].as_mut() {
+            me.parent_tid = parent;
+        }
+        if parent != 0 && WAIT_BLOCKED[parent] && WAIT_RESULT[parent] == 0 {
+            WAIT_AGAIN[parent] = true;
+            unblock_task(parent);
+        }
+    }
+    for t in 1..MAX_TASKS {
+        if t != caller && live(t) {
+            UNWAITED[t] = true;
+            let _ = end_other(t, -9);
+        }
+    }
+}}
 
 /// Throw away an address space no task ever ran in.
 ///

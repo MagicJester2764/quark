@@ -2,7 +2,7 @@
 ///
 /// Each task has a unique TID, its own kernel stack, and saved CPU context.
 
-use crate::cap::{self, CSpace};
+
 use crate::context::CpuContext;
 use alloc::alloc::{alloc, dealloc, Layout};
 
@@ -139,9 +139,6 @@ pub struct Task {
     /// task is made to run there (or made for it), and never changed. 0 for a
     /// kernel task and for one not yet given an address space.
     pub space: u64,
-    pub caps: u32,
-    /// Object capability space (16 slots).
-    pub cspace: CSpace,
     /// Pager task TID for exception forwarding. 0 = no pager (kill on fault).
     pub pager_tid: usize,
     /// Parent task TID. 0 = no parent (init/kernel tasks).
@@ -233,8 +230,6 @@ impl Task {
             base_priority: crate::scheduler::PRIO_NORMAL,
             cr3: crate::paging::read_cr3(),
             space: 0,
-            caps: 0,
-            cspace: cap::empty_cspace(),
             pager_tid: 0,
             parent_tid: 0,
             mem_pages: 0,

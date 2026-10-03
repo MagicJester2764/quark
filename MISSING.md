@@ -109,7 +109,7 @@ will meet:
 | Interrupts of a device's own (MSI) | 32 |
 | Entries of the firmware's memory map | 64, once neighbours are joined |
 | Descriptors per program | 64, and one more for its working directory |
-| Capability slots per task | 64 |
+| Capability slots per program | 64 |
 | Pipes | 96 in the machine, 8 made by any one program |
 | Connected streams | 32 |
 | Poll sets | 64, each watching 32 descriptors |
@@ -134,9 +134,6 @@ will meet:
   mapped file of several programs ended together — and the rest are not
   told of: they stay until the pager lets them go some other way. Deaths of
   tasks and of programs are not lost; this still can be.
-- **A thread starts with a copy of its creator's capabilities**, not a share:
-  what either is granted or gives up afterwards the other does not see.
-  Descriptors are the program's and are shared.
 - **Memory is written out through the file server, a page a call**, to a
   file, on a disk driven a word at a time. It is correct and it is slow:
   about a hundred pages a second in a virtual machine. A partition of its

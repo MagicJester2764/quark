@@ -1,6 +1,6 @@
 # Quark syscall ABI
 
-**Version 3.20.** Query the running kernel with `SYS_ABI_VERSION` (240), which
+**Version 3.21.** Query the running kernel with `SYS_ABI_VERSION` (240), which
 returns `(major << 16) | minor`.
 
 This document is the contract between the Quark kernel and everything above it.
@@ -220,6 +220,7 @@ returning at once turned that loop into a spin.
 | 3.16 | **Off, and on again, by the firmware's tables.** `SYS_POWER` (119) turns the machine off or restarts it, for a holder of the new capability `Power` (type 12): by ACPI's control and reset registers, where a program used to write to the three ports QEMU listens on. |
 | 3.17 | **Memory above four gigabytes.** All of a machine's memory is used, up to 511 GiB, where the kernel used the first four gigabytes of it. `SYS_PHYS_ALLOC` takes a flag (arg1 = 1) for frames below four gigabytes, which is what a device that is told an address in thirty-two bits needs; without it a frame is ordinary memory and comes from the top. `SYS_MEM_INFO` takes what to say (arg0): 1 for how much memory the machine has and 2 for where it ends. |
 | 3.18 | **The wide registers.** A program may use AVX, AVX2 and AVX-512 where the processor has them: the kernel turns them on (`OSXSAVE`, XCR0) and saves all of each task's with `XSAVE`. Before, an AVX instruction was a fault. No call changed. |
+| 3.21 | **Threads share their program's capabilities, and a threaded program can exec.** No new number. A program has one capability space, as it has one descriptor table: a thread uses it, where it started with a copy of its creator's, so what one thread is given the others have. A forked child gets a copy. `SYS_EXEC_SPACE` from a program with more than one task ends the others first, quietly — none is a child to collect or a death to be told of — where it was refused; if one of them was the task the program began as, the caller becomes its parent's child in its place. |
 | 3.20 | **The kernel runs handlers.** `SYS_SIG_ACTION` (11) with 3 has the kernel run a program's handler for a signal: a task that does not hold it back is turned aside on its way out of a call, an interrupt or a fault, and enters the program at the place said with signal 0, with a record of where it was on its stack; `SYS_SIG_RETURN` (121) puts it back. A fault that is a signal goes to the program's handler for it the same way. Each task holds back a set of signals of its own (`SYS_SIG_MASK`, 120): a signal every task holds back waits, whatever it would do; `SYS_SIG_WAIT` (123) takes one without anything being done about it; `SYS_SIG_STACK` (122) names a stack for handlers. `SYS_SIG_RAISE` with arg2 = 4 raises a signal for one task. Every wait a task sits in is ended by a signal it is to run — a pipe's, a stream's, a counter's, a timer's, a futex's, a wait for a child, as well as the ones a signal ended before — and a program that asks is answered `0xFFFF_FFFC` and `0xFFFF_FFFB` as well as `0xFFFF_FFFD`, to say what ran. `SYS_POLL` and `SYS_POLLSET_WAIT` wait under a mask they are given. A terminal raises 28 when its size changes, and stops a job behind that changes its settings or its size, or writes to it where `TOSTOP` says to. |
 | 3.19 | **Memory is given back.** When no frame is free the kernel gives up pages of files that nothing maps, takes pages programs have not used lately, and makes whoever wanted the frame wait while they are written out, where it used to end it. A page of a program's own goes to the object a pager has said memory may be written out to: `SYS_OBJECT_CTL` op 5, for a holder of the new capability `Swap` (type 13), with ops 6 and 7 to take a page out and say how the writing went. `TAG_OBJECT_CLEAN` (`0xFFFF_000B`) asks a pager to write what it has that is dirty. `SYS_PAGE_OUT` (198) has pages of the caller's own written out at once. `SYS_MEM_INFO` with arg0 = 3 says how much room there is to write memory out to and how much is used, and with 4 how many pages have gone out and come back. |
 
@@ -1006,11 +1007,14 @@ from the moment it exists: `SYS_TASK_SPACE` names it, a watch on the program
 counts it, and `SYS_TASK_START` refuses to start it anywhere else.
 
 A task started with `SYS_TASK_START` in its creator's own address space is a
-thread of it. It uses the program's descriptors — the same table, not a copy —
-and starts with a copy of its creator's capabilities, each in a slot the
-creator did not already fill for it, and the creator's band. Capabilities are
-a task's: what either is granted or gives up afterwards, the other does not
-see.
+thread of it. It uses the program's descriptors and the program's
+capabilities — the same table and the same space, not copies — and the
+creator's band. What one thread is granted, mints, takes or deletes, every
+thread of the program has or has not; what the creator put in the task's
+slots before starting it becomes the program's, in a slot free there. A
+forked child starts with a copy of each (`SYS_FORK`), and `SYS_EXEC_SPACE`
+keeps them. A capability's revocation is counted by the slot of the
+program's space it was minted from, whichever thread revokes it.
 
 A thread is joined one of two ways, and which is the thread's to say. One
 that gives `SYS_SET_CLEAR_TID` a word is joined *through the word*: when it

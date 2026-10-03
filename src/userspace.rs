@@ -375,28 +375,29 @@ pub fn spawn_init(elf_data: &[u8], fb: Option<crate::multiboot2::FramebufferInfo
         task.cr3 = pml4;
         task.space = space_of(pml4);
         let caps = crate::task::CAP_ALL & !crate::task::CAP_MAP_PHYS;
-        task.caps = caps;
-        crate::cap::populate_from_bitmask(&mut task.cspace, caps);
-        if let Some(ref fbi) = fb {
-            let len = fbi.pitch as usize * fbi.height as usize;
-            crate::cap::insert_kernel_range(&mut task.cspace, fbi.addr as usize, len);
-        }
-        for i in 0..crate::modules::count() {
-            if let Some(m) = crate::modules::get(i) {
-                crate::cap::insert_kernel_range(&mut task.cspace, m.start, m.end - m.start);
+        crate::cap::add_bits(tid, caps);
+        crate::cap::with_cspace(tid, |cs| {
+            if let Some(ref fbi) = fb {
+                let len = fbi.pitch as usize * fbi.height as usize;
+                crate::cap::insert_kernel_range(cs, fbi.addr as usize, len);
             }
-        }
-        // And the right to map a device's registers, to hand to drivers:
-        // if the machine has anywhere that is known to be only devices.
-        if !crate::devmem::ranges().is_empty() {
-            crate::cap::insert_last(&mut task.cspace, crate::cap::CapType::DeviceMemory);
-        }
-        // And the right to say what time it is, and the right to turn the
-        // machine off, for whoever it decides may.
-        crate::cap::insert_last(&mut task.cspace, crate::cap::CapType::Clock);
-        crate::cap::insert_last(&mut task.cspace, crate::cap::CapType::Power);
-        // And the right to be where memory is written out to.
-        crate::cap::insert_last(&mut task.cspace, crate::cap::CapType::Swap);
+            for i in 0..crate::modules::count() {
+                if let Some(m) = crate::modules::get(i) {
+                    crate::cap::insert_kernel_range(cs, m.start, m.end - m.start);
+                }
+            }
+            // And the right to map a device's registers, to hand to drivers:
+            // if the machine has anywhere that is known to be only devices.
+            if !crate::devmem::ranges().is_empty() {
+                crate::cap::insert_last(cs, crate::cap::CapType::DeviceMemory);
+            }
+            // And the right to say what time it is, and the right to turn the
+            // machine off, for whoever it decides may.
+            crate::cap::insert_last(cs, crate::cap::CapType::Clock);
+            crate::cap::insert_last(cs, crate::cap::CapType::Power);
+            // And the right to be where memory is written out to.
+            crate::cap::insert_last(cs, crate::cap::CapType::Swap);
+        });
         task.context.rip = enter_user_trampoline as *const () as u64;
         task.context.r12 = entry;
         task.context.r13 = stack_top;

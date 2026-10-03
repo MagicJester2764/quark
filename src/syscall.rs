@@ -420,7 +420,7 @@ pub const SYS_ABI_VERSION: u64 = 240;
 /// minor when calls are added. User space can refuse to run against a major it
 /// does not know, which is the point of exposing it at all.
 pub const ABI_VERSION_MAJOR: u64 = 3;
-pub const ABI_VERSION_MINOR: u64 = 20;
+pub const ABI_VERSION_MINOR: u64 = 21;
 
 /// Threads a task may make with no capability at all.
 ///
@@ -1305,9 +1305,7 @@ fn dispatch(
             // never reaches the server. The take checks again: the capability
             // can be revoked while the call waits.
             let slot = arg3 as usize;
-            let offered = slot < crate::cap::MAX_CAPS
-                && unsafe { scheduler::get_task_mut(caller) }
-                    .is_some_and(|t| crate::cap::slot_is_valid(&t.cspace[slot]));
+            let offered = crate::cap::slot(caller, slot).is_some_and(|c| crate::cap::slot_is_valid(&c));
             if !offered {
                 return u64::MAX;
             }
@@ -1368,9 +1366,7 @@ fn dispatch(
                 None
             } else {
                 let slot = with.offer as usize;
-                let valid = slot < crate::cap::MAX_CAPS
-                    && unsafe { scheduler::get_task_mut(caller) }
-                        .is_some_and(|t| crate::cap::slot_is_valid(&t.cspace[slot]));
+                let valid = crate::cap::slot(caller, slot).is_some_and(|c| crate::cap::slot_is_valid(&c));
                 if !valid {
                     return u64::MAX;
                 }
@@ -2103,7 +2099,7 @@ fn dispatch(
             // it, and holds what the caller holds.
             let own_cr3 = unsafe { scheduler::get_task_mut(caller).map(|t| t.cr3) };
             if own_cr3 == Some(cr3) {
-                scheduler::inherit_from_creator(tid, caller);
+                scheduler::inherit_from_creator(tid, caller, true);
                 // And uses what the program has open, rather than a copy of
                 // it: a descriptor is the program's. So is its process id.
                 crate::fdtable::share(tid, caller);
@@ -3270,28 +3266,22 @@ fn dispatch(
             if slot >= crate::cap::MAX_CAPS {
                 return u64::MAX;
             }
-            let free = unsafe {
-                scheduler::get_task_mut(caller)
-                    .is_some_and(|t| t.cspace[slot].cap_type == crate::cap::CapType::Empty)
-            };
+            let free = crate::cap::slot(caller, slot).is_some_and(|c| c.cap_type == crate::cap::CapType::Empty);
             if !free || crate::memobj::objects_of(caller) >= OBJECTS_PER_PAGER {
                 return u64::MAX;
             }
             let Some((_, id)) = crate::memobj::create(caller, arg0, arg1) else {
                 return u64::MAX;
             };
-            unsafe {
-                if let Some(task) = scheduler::get_task_mut(caller) {
-                    task.cspace[slot] = crate::cap::CapSlot {
-                        cap_type: crate::cap::CapType::MemObject,
-                        generation: crate::cap::current_generation(caller, slot),
-                        root_slot: slot as u8,
-                        root_tid: caller as u8,
-                        param0: id,
-                        param1: crate::cap::OBJECT_READ | crate::cap::OBJECT_WRITE,
-                    };
-                }
-            }
+            let made = crate::cap::CapSlot {
+                cap_type: crate::cap::CapType::MemObject,
+                generation: crate::cap::current_generation(caller, slot),
+                root_slot: slot as u8,
+                root: crate::cap::root_of(caller),
+                param0: id,
+                param1: crate::cap::OBJECT_READ | crate::cap::OBJECT_WRITE,
+            };
+            crate::cap::with_cspace(caller, |cs| cs[slot] = made);
             id
         }
         SYS_OBJECT_MAP => {
@@ -3309,11 +3299,8 @@ fn dispatch(
             {
                 return u64::MAX;
             }
-            let cap = unsafe {
-                match scheduler::get_task_mut(caller) {
-                    Some(t) => t.cspace[slot],
-                    None => return u64::MAX,
-                }
+            let Some(cap) = crate::cap::slot(caller, slot) else {
+                return u64::MAX;
             };
             if cap.cap_type != crate::cap::CapType::MemObject || !crate::cap::slot_is_valid(&cap) {
                 return u64::MAX;
@@ -4054,40 +4041,32 @@ fn dispatch(
                 _ => return u64::MAX,
             };
             let tid = scheduler::current_tid();
-            unsafe {
-                let task = match scheduler::get_task_mut(tid) {
-                    Some(t) => t,
-                    None => return u64::MAX,
-                };
+            let root = crate::cap::root_of(tid);
+            let generation = crate::cap::current_generation(tid, slot);
+            let minted = crate::cap::with_cspace(tid, |cs| {
                 let (param0, param1) = if cap_type == crate::cap::CapType::Endpoint {
                     // Asked for by TID, recorded by the endpoint's number, and
                     // minted on ownership rather than from a capability held.
-                    match crate::cap::endpoint_to_mint(&task.cspace, tid, param0 as usize) {
-                        Some(number) => (number, 0),
-                        None => return u64::MAX,
-                    }
-                } else if crate::cap::can_mint(&task.cspace, cap_type, param0, param1) {
+                    crate::cap::endpoint_to_mint(cs, tid, param0 as usize).map(|number| (number, 0))?
+                } else if crate::cap::can_mint(cs, cap_type, param0, param1) {
                     // The caller already holds a capability that covers what
                     // it is minting. This used to be skipped for UID 0.
                     (param0, param1)
                 } else {
-                    return u64::MAX;
+                    return None;
                 };
                 // Target slot must be empty
-                if task.cspace[slot].cap_type as u8 != crate::cap::CapType::Empty as u8 {
-                    return u64::MAX;
+                if cs[slot].cap_type as u8 != crate::cap::CapType::Empty as u8 {
+                    return None;
                 }
                 // Must adopt the slot's *current* generation. Hardcoding 0
                 // meant that after a single sys_cap_revoke on this slot every
                 // subsequently minted cap was born already-invalid.
-                task.cspace[slot] = crate::cap::CapSlot {
-                    cap_type,
-                    generation: crate::cap::current_generation(tid, slot),
-                    root_slot: slot as u8,
-                    root_tid: tid as u8,
-                    param0,
-                    param1,
-                };
+                cs[slot] = crate::cap::CapSlot { cap_type, generation, root_slot: slot as u8, root, param0, param1 };
+                Some(())
+            });
+            if minted.flatten().is_none() {
+                return u64::MAX;
             }
             0
         }
@@ -4149,39 +4128,37 @@ fn dispatch(
             {
                 return u64::MAX;
             }
-            unsafe {
-                let src_cap = match scheduler::get_task_mut(caller_tid) {
-                    Some(t) => t.cspace[src_slot],
-                    None => return u64::MAX,
-                };
-                if src_cap.cap_type as u8 == crate::cap::CapType::Empty as u8 {
-                    return u64::MAX;
-                }
-                // A revoked cap must not be re-delegatable.
-                if !crate::cap::slot_is_valid(&src_cap) {
-                    return u64::MAX;
-                }
-                let dest_task = match scheduler::get_task_mut(dest_tid) {
-                    Some(t) => t,
-                    None => return u64::MAX,
-                };
-                if any_slot {
-                    let Some(slot) = crate::cap::receive_slot(&dest_task.cspace, &src_cap) else {
-                        return u64::MAX;
-                    };
-                    // An endpoint the destination already holds is not copied
-                    // again; the slot it is in is the answer.
-                    if dest_task.cspace[slot].cap_type == crate::cap::CapType::Empty {
-                        dest_task.cspace[slot] = crate::cap::derive(caller_tid, src_slot, &src_cap);
-                    }
-                    return slot as u64;
-                }
-                if dest_task.cspace[dest_slot].cap_type as u8 != crate::cap::CapType::Empty as u8 {
-                    return u64::MAX;
-                }
-                dest_task.cspace[dest_slot] = crate::cap::derive(caller_tid, src_slot, &src_cap);
+            let Some(src_cap) = crate::cap::slot(caller_tid, src_slot) else {
+                return u64::MAX;
+            };
+            if src_cap.cap_type as u8 == crate::cap::CapType::Empty as u8 {
+                return u64::MAX;
             }
-            0
+            // A revoked cap must not be re-delegatable.
+            if !crate::cap::slot_is_valid(&src_cap) {
+                return u64::MAX;
+            }
+            let derived = crate::cap::derive(caller_tid, src_slot, &src_cap);
+            let landed = crate::cap::with_cspace(dest_tid, |cs| {
+                let slot = if any_slot {
+                    crate::cap::receive_slot(cs, &src_cap)?
+                } else if cs[dest_slot].cap_type as u8 == crate::cap::CapType::Empty as u8 {
+                    dest_slot
+                } else {
+                    return None;
+                };
+                // An endpoint the destination already holds is not copied
+                // again; the slot it is in is the answer.
+                if cs[slot].cap_type == crate::cap::CapType::Empty {
+                    cs[slot] = derived;
+                }
+                Some(slot)
+            });
+            match landed.flatten() {
+                Some(slot) if any_slot => slot as u64,
+                Some(_) => 0,
+                None => u64::MAX,
+            }
         }
         SYS_CAP_TAKE => {
             // arg0 = the caller whose offer to take, arg1 = slot or ANY_SLOT.
@@ -4200,34 +4177,31 @@ fn dispatch(
             let Some(from) = crate::ipc::offered_to(client, taker) else {
                 return u64::MAX;
             };
-            unsafe {
-                let offered = match scheduler::get_task_mut(client) {
-                    Some(t) => t.cspace[from],
-                    None => return u64::MAX,
-                };
-                if !crate::cap::slot_is_valid(&offered) {
-                    return u64::MAX;
-                }
-                let task = match scheduler::get_task_mut(taker) {
-                    Some(t) => t,
-                    None => return u64::MAX,
-                };
+            let Some(offered) = crate::cap::slot(client, from) else {
+                return u64::MAX;
+            };
+            if !crate::cap::slot_is_valid(&offered) {
+                return u64::MAX;
+            }
+            let derived = crate::cap::derive(client, from, &offered);
+            let landed = crate::cap::with_cspace(taker, |cs| {
                 let slot = if any_slot {
-                    match crate::cap::receive_slot(&task.cspace, &offered) {
-                        Some(s) => s,
-                        None => return u64::MAX,
-                    }
-                } else if task.cspace[want].cap_type == crate::cap::CapType::Empty {
+                    crate::cap::receive_slot(cs, &offered)?
+                } else if cs[want].cap_type == crate::cap::CapType::Empty {
                     want
                 } else {
-                    return u64::MAX;
+                    return None;
                 };
-                if task.cspace[slot].cap_type == crate::cap::CapType::Empty {
-                    task.cspace[slot] = crate::cap::derive(client, from, &offered);
+                if cs[slot].cap_type == crate::cap::CapType::Empty {
+                    cs[slot] = derived;
                 }
-                crate::ipc::withdraw_offer(client);
-                slot as u64
-            }
+                Some(slot)
+            });
+            let Some(slot) = landed.flatten() else {
+                return u64::MAX;
+            };
+            crate::ipc::withdraw_offer(client);
+            slot as u64
         }
         SYS_CAP_REVOKE => {
             // arg0 = slot
@@ -4249,17 +4223,11 @@ fn dispatch(
             if slot >= crate::cap::MAX_CAPS {
                 return u64::MAX;
             }
-            let tid = scheduler::current_tid();
-            unsafe {
-                let task = match scheduler::get_task_mut(tid) {
-                    Some(t) => t,
-                    None => return u64::MAX,
-                };
-                let cap = &task.cspace[slot];
-                let cap_type = cap.cap_type as u64;
-                // Pack: [7:0]=type, [23:8]=param0 low 16, [39:24]=param1 low 16
-                cap_type | ((cap.param0 & 0xFFFF) << 8) | ((cap.param1 & 0xFFFF) << 24)
-            }
+            let Some(cap) = crate::cap::slot(scheduler::current_tid(), slot) else {
+                return u64::MAX;
+            };
+            // Pack: [7:0]=type, [23:8]=param0 low 16, [39:24]=param1 low 16
+            cap.cap_type as u64 | ((cap.param0 & 0xFFFF) << 8) | ((cap.param1 & 0xFFFF) << 24)
         }
         SYS_CAP_READ => {
             // arg0 = tid, arg1 = slot, arg2 = out: type, param0, param1, valid
@@ -4276,9 +4244,8 @@ fn dispatch(
             if tid != caller && !crate::cap::task_has_task_mgmt(caller, tid) {
                 return u64::MAX;
             }
-            let cap = match unsafe { scheduler::get_task_mut(tid) } {
-                Some(t) => t.cspace[slot],
-                None => return u64::MAX,
+            let Some(cap) = crate::cap::slot(tid, slot) else {
+                return u64::MAX;
             };
             let out = [
                 cap.cap_type as u64,
@@ -4297,13 +4264,8 @@ fn dispatch(
             if slot >= crate::cap::MAX_CAPS {
                 return u64::MAX;
             }
-            let tid = scheduler::current_tid();
-            unsafe {
-                let task = match scheduler::get_task_mut(tid) {
-                    Some(t) => t,
-                    None => return u64::MAX,
-                };
-                task.cspace[slot] = crate::cap::CapSlot::empty();
+            if crate::cap::with_cspace(scheduler::current_tid(), |cs| cs[slot] = crate::cap::CapSlot::empty()).is_none() {
+                return u64::MAX;
             }
             0
         }
