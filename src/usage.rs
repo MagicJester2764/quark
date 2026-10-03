@@ -6,13 +6,16 @@
 //! (`SYS_CPU_LIMIT`).
 //!
 //! Time is counted whenever the scheduler decides anything, by the clock
-//! (`charge`): exactly, whatever the tick. Which part of it was the program's and which the
-//! kernel's is not counted there — every door would have to, and be slower
-//! for it — so each tick looks at where it found the task (`tick`), and a
-//! task's time is divided in that proportion, which is Linux's way when it
-//! is not told more. Each task's on its own, and never so that either part
-//! is less than it was last said to be (`Raw::split`): a count that went
-//! backwards is a negative time to whoever subtracts.
+//! (`charge`): exactly, whatever the tick. So is the part of it spent in the
+//! kernel: each door from ring 3 says when a task came in (`entered`) and
+//! each way back when it left (`leaving`), and a switch counts what a task
+//! in the kernel had of it so far. The program's part is the rest. It was
+//! sampled once — each tick looking at where it found the task, as Linux
+//! does when it is not told more — and a call spends most of its time with
+//! interrupts off, so a tick that fell in it was taken after `sysretq`, in
+//! the program: a loop of calls was said to be four-fifths the program's on
+//! one processor model and a seventh on another. Counted, neither part can
+//! go back.
 //!
 //! A program's use is its tasks': what those that have ended used, kept with
 //! the program (`fdtable`), and what those still here have. A program that
@@ -60,62 +63,25 @@ impl Usage {
     }
 }
 
-/// What one task has used, as counted: before it is divided.
+/// What one task has used, as counted.
 #[derive(Clone, Copy)]
 struct Raw {
-    /// Nanoseconds run, to its last switch.
+    /// Nanoseconds run, to its last switch, and of them, in the kernel.
     run_ns: u64,
-    /// Ticks that found it in the program, and in the kernel.
-    user_ticks: u64,
-    sys_ticks: u64,
+    sys_ns: u64,
     voluntary: u64,
     involuntary: u64,
-    /// The two parts as last said, which neither goes below.
-    said_user: u64,
-    said_sys: u64,
 }
 
 impl Raw {
-    const ZERO: Raw = Raw {
-        run_ns: 0,
-        user_ticks: 0,
-        sys_ticks: 0,
-        voluntary: 0,
-        involuntary: 0,
-        said_user: 0,
-        said_sys: 0,
-    };
-
-    /// `run` nanoseconds divided as the ticks found the task — all the
-    /// program's when no tick did — and then so that neither part is less
-    /// than it was last said to be. Linux's `cputime_adjust`.
-    fn split(&mut self, run: u64) -> Usage {
-        let (said_user, said_sys) = (self.said_user, self.said_sys);
-        if run > said_user + said_sys {
-            let ticks = self.user_ticks + self.sys_ticks;
-            let mut sys = if ticks == 0 {
-                0
-            } else {
-                (run as u128 * self.sys_ticks as u128 / ticks as u128) as u64
-            };
-            sys = sys.max(said_sys);
-            let mut user = run - sys;
-            if user < said_user {
-                user = said_user;
-                sys = run - user;
-            }
-            (self.said_user, self.said_sys) = (user, sys);
-        }
-        Usage {
-            user_ns: self.said_user,
-            sys_ns: self.said_sys,
-            voluntary: self.voluntary,
-            involuntary: self.involuntary,
-        }
-    }
+    const ZERO: Raw = Raw { run_ns: 0, sys_ns: 0, voluntary: 0, involuntary: 0 };
 }
 
 static mut TASK: [Raw; MAX_TASKS] = [Raw::ZERO; MAX_TASKS];
+/// Whether each task is in the kernel, and since when on this turn. A task
+/// is made in the kernel, and first leaves for its program.
+static mut IN_KERNEL: [bool; MAX_TASKS] = [true; MAX_TASKS];
+static mut KERNEL_SINCE: [u64; MAX_TASKS] = [0; MAX_TASKS];
 /// What a program's last task leaves for whoever collects it: what the
 /// program used, and what the children it collected did.
 static mut ENDED: [Usage; MAX_TASKS] = [Usage::ZERO; MAX_TASKS];
@@ -129,6 +95,7 @@ pub fn task_made(tid: usize) {
         unsafe {
             TASK[tid] = Raw::ZERO;
             ENDED[tid] = Usage::ZERO;
+            IN_KERNEL[tid] = true;
         }
         irq_restore(flags);
     }
@@ -150,7 +117,59 @@ pub unsafe fn charge(tid: usize) -> u64 {
             return 0;
         }
         TASK[tid].run_ns += ran;
+        if IN_KERNEL[tid] {
+            TASK[tid].sys_ns += now.saturating_sub(KERNEL_SINCE[tid]);
+            KERNEL_SINCE[tid] = now;
+        }
         ran
+    }
+}
+
+/// `tid` is about to run on this processor, its last turn counted: if it
+/// is in the kernel, its time there goes on from now.
+///
+/// # Safety
+/// Interrupts off, after [`charge`] for whatever this processor ran.
+pub unsafe fn resumed(tid: usize) {
+    unsafe {
+        if tid != 0 && tid < MAX_TASKS && IN_KERNEL[tid] {
+            KERNEL_SINCE[tid] = SINCE[crate::percpu::index()];
+        }
+    }
+}
+
+/// Task `tid`, running here, has come into the kernel from its program:
+/// at a system call, an interrupt or a fault taken in ring 3. Every system
+/// call pays for this and [`leaving`], so neither saves the flags nor keeps
+/// the clock from going back between processors: both are called at the
+/// doors, where interrupts are off already.
+///
+/// # Safety
+/// Interrupts off.
+pub unsafe fn entered(tid: usize) {
+    if tid == 0 || tid >= MAX_TASKS {
+        return;
+    }
+    unsafe {
+        IN_KERNEL[tid] = true;
+        KERNEL_SINCE[tid] = crate::clock::now_here();
+    }
+}
+
+/// Task `tid`, running here, is going back to its program: what it has had
+/// in the kernel since it came in is counted.
+///
+/// # Safety
+/// Interrupts off.
+pub unsafe fn leaving(tid: usize) {
+    if tid == 0 || tid >= MAX_TASKS {
+        return;
+    }
+    unsafe {
+        if IN_KERNEL[tid] {
+            TASK[tid].sys_ns += crate::clock::now_here().saturating_sub(KERNEL_SINCE[tid]);
+            IN_KERNEL[tid] = false;
+        }
     }
 }
 
@@ -171,23 +190,6 @@ pub unsafe fn switched(from: usize, gave_up: bool) {
     }
 }
 
-/// A tick has found `tid` running: in the program if `user`, in the kernel
-/// if not.
-pub fn tick(tid: usize, user: bool) {
-    if tid == 0 || tid >= MAX_TASKS {
-        return;
-    }
-    let flags = irq_save();
-    unsafe {
-        if user {
-            TASK[tid].user_ticks += 1;
-        } else {
-            TASK[tid].sys_ticks += 1;
-        }
-    }
-    irq_restore(flags);
-}
-
 /// What task `tid` has used, up to now: the turn it is having included.
 pub fn of_task(tid: usize) -> Usage {
     if tid >= MAX_TASKS {
@@ -195,12 +197,19 @@ pub fn of_task(tid: usize) -> Usage {
     }
     let flags = irq_save();
     let used = unsafe {
-        let raw = &mut *core::ptr::addr_of_mut!(TASK[tid]);
-        let mut run = raw.run_ns;
+        let raw = TASK[tid];
+        let (mut run, mut sys) = (raw.run_ns, raw.sys_ns);
         if let Some(cpu) = crate::scheduler::running_on(tid) {
-            run += crate::clock::now().saturating_sub(SINCE[cpu]);
+            let now = crate::clock::now();
+            run += now.saturating_sub(SINCE[cpu]);
+            if IN_KERNEL[tid] {
+                sys += now.saturating_sub(KERNEL_SINCE[tid]);
+            }
         }
-        raw.split(run)
+        // The kernel's part is part of what it ran, counted from the same
+        // moments; the program's is the rest.
+        let sys = sys.min(run);
+        Usage { user_ns: run - sys, sys_ns: sys, voluntary: raw.voluntary, involuntary: raw.involuntary }
     };
     irq_restore(flags);
     used

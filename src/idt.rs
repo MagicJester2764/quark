@@ -601,12 +601,14 @@ fn report_kernel_state(tag: &[u8], frame: &InterruptFrame, kbase: usize, ktop: u
 extern "C" fn exception_handler(frame: &mut InterruptFrame) {
     let took = crate::klock::enter();
     if frame.cs & 3 != 0 {
+        unsafe { crate::usage::entered(scheduler::current_tid()) };
         scheduler::arrived();
     }
     exception(frame);
     // Back to ring 3, by way of a handler if there is one to run.
     if frame.cs & 3 != 0 {
         crate::signal::leaving_interrupt(frame);
+        unsafe { crate::usage::leaving(scheduler::current_tid()) };
     }
     crate::klock::leave(took);
 }
@@ -969,12 +971,16 @@ extern "C" fn irq_handler(frame: &mut InterruptFrame) {
         _ => {}
     }
     let took = crate::klock::enter();
+    if frame.cs & 3 != 0 {
+        unsafe { crate::usage::entered(scheduler::current_tid()) };
+    }
     irq(frame);
     if frame.cs & 3 != 0 {
         scheduler::arrived();
         // A handler the kernel runs is run on the way back: this is what
         // interrupts a program that is computing and makes no call.
         crate::signal::leaving_interrupt(frame);
+        unsafe { crate::usage::leaving(scheduler::current_tid()) };
     }
     crate::klock::leave(took);
 }
@@ -988,7 +994,6 @@ fn irq(frame: &InterruptFrame) {
             // tick may switch away, and whatever is switched to must be
             // able to be ticked.
             crate::lapic::eoi();
-            crate::usage::tick(scheduler::current_tid(), frame.cs & 3 != 0);
             scheduler::timer_tick();
             crate::usage::limits();
             return;
@@ -1019,7 +1024,6 @@ fn irq(frame: &InterruptFrame) {
             // switch away: told afterwards, a task that then blocked would
             // leave the clock stopped until it ran again.
             crate::intc::done(0);
-            crate::usage::tick(scheduler::current_tid(), frame.cs & 3 != 0);
             pit::tick();
             // A program past its limit is told, or ended, last: ending it
             // may not return.

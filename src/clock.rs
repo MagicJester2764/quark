@@ -103,6 +103,20 @@ pub fn now() -> u64 {
     LAST.fetch_max(ns, Ordering::Relaxed).max(ns)
 }
 
+/// [`now`], without the step that keeps it from going back between two
+/// processors' readings: for a span measured where both ends are this
+/// processor's, or near enough that a nanosecond's disagreement is a
+/// `saturating_sub` — the time a task spends in the kernel, read at every
+/// system call.
+#[inline]
+pub fn now_here() -> u64 {
+    if !FINE.load(Ordering::Relaxed) {
+        return crate::pit::ticks() * TICK_NS;
+    }
+    let counted = counter().wrapping_sub(BASE.load(Ordering::Relaxed));
+    ((counted as u128 * MUL.load(Ordering::Relaxed) as u128) >> 32) as u64
+}
+
 /// Whether the clock is finer than a tick.
 pub fn fine() -> bool {
     FINE.load(Ordering::Relaxed)

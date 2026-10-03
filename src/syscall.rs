@@ -798,6 +798,7 @@ extern "C" fn syscall_dispatch(
     arg4: u64,
 ) -> u64 {
     crate::klock::acquire();
+    unsafe { crate::usage::entered(scheduler::current_tid()) };
     // It may have waited at the door for that, and whoever had the lock may
     // have ended this task or stopped it. One that was ended makes no call.
     scheduler::arrived();
@@ -810,6 +811,7 @@ extern "C" fn syscall_dispatch(
     // to the handler, with where it was going on its stack.
     let answer = crate::signal::leaving_call(answer);
     unsafe { core::arch::asm!("cli", options(nostack, nomem)) };
+    unsafe { crate::usage::leaving(scheduler::current_tid()) };
     crate::klock::release();
     answer
 }
@@ -4417,6 +4419,7 @@ core::arch::global_asm!(
 pub unsafe fn enter_usermode_frame(frame: *const crate::task::UserFrame) -> ! { unsafe {
     // Out of the kernel, as in `enter_usermode`.
     core::arch::asm!("cli", options(nostack, nomem));
+    crate::usage::leaving(scheduler::current_tid());
     crate::klock::release();
     core::arch::asm!(
         // The iretq frame, built from the saved one.
@@ -4457,6 +4460,7 @@ pub fn enter_usermode_regs(regs: &crate::signal::Regs) -> ! {
     unsafe {
         // Out of the kernel, as in `enter_usermode`.
         core::arch::asm!("cli", options(nostack, nomem));
+        crate::usage::leaving(scheduler::current_tid());
         crate::klock::release();
         core::arch::asm!(
             "pushq $0x2B",                 // SS
@@ -4747,6 +4751,7 @@ pub unsafe fn enter_usermode(rip: u64, rsp: u64, arg: u64) -> ! { unsafe {
     // until the `iretq` — between the two this processor is in the kernel
     // without the lock, and after the `swapgs` without its own GS.
     core::arch::asm!("cli", options(nostack, nomem));
+    crate::usage::leaving(scheduler::current_tid());
     crate::klock::release();
     core::arch::asm!(
         "pushq {user_ss}",             // SS

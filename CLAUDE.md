@@ -981,13 +981,15 @@ closed:
 `usage.rs`, and `SYS_USAGE`, `SYS_NICE` and `SYS_CPU_LIMIT` in `docs/abi.md`.
 
 - **Time is counted whenever the scheduler decides anything** (`usage::charge`,
-  from `count_turn`), by the clock: exact, whatever the tick. Which part
-  was the kernel's is sampled — each tick looks at where it found the task
-  — and a task's time is divided in that proportion, each task on its own
-  and never so that either part shrinks (`Raw::split`, Linux's
-  `cputime_adjust`). Divided across a whole program, one child that spent
-  its time in the kernel took user time back from everything its parent
-  had collected, and `time` printed a negative number.
+  from `count_turn`), by the clock: exact, whatever the tick. **And the
+  kernel's part at the doors**: `usage::entered` where a task comes in from
+  ring 3 — `syscall_dispatch`, the interrupt and exception handlers — and
+  `usage::leaving` on every way back, the three `enter_usermode`s included.
+  A new way out to ring 3 says so, or the time a program then runs is
+  counted as the kernel's. Sampled at the tick, as it first was, the part
+  was wrong: a call runs mostly with interrupts off, a tick in it is taken
+  after `sysretq`, and a loop of calls was the program's four-fifths of the
+  time on one processor model and a seventh on another.
 - **A program's use is its tasks', and outlives them.** An ended task's is
   folded into its program's record (`task_ended`, from `close_descriptors`).
   A program that ends leaves its own and what it collected at every task of

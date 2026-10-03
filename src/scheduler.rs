@@ -510,6 +510,7 @@ unsafe fn switch_to(current_tid: usize, next_tid: usize, flags: u64) { unsafe {
     let gave_up = !matches!(TASKS[current_tid].as_ref().map(|t| t.state), Some(TaskState::Ready | TaskState::Running));
     count_turn(current_tid);
     crate::usage::switched(current_tid, gave_up);
+    crate::usage::resumed(next_tid);
 
     // Mark next task as running, and here; and the one being left as on no
     // processor. The lock is held until the switch is done, so nobody sees

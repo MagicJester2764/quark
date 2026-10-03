@@ -1220,10 +1220,10 @@ the rest: what they do is under *Signals*, with the process calls.
 | 125 | `SYS_NICE` | arg0 = a process id, 0 for the caller's; arg1 = how nice to be, -20 to 19 as a signed number, or `u64::MAX` to ask | 20 + how nice it was; `u64::MAX - 1` when it may not / `u64::MAX` | `TaskMgmt` for the program to be less nice |
 | 126 | `SYS_CPU_LIMIT` | arg0 = soft, arg1 = hard: seconds of processor time the caller's program may have, `u64::MAX` for none; arg2 = where to write the two it was, or 0; arg3 = 1 to change nothing | 0; `u64::MAX - 1` when it may not / `u64::MAX` | `TaskMgmt` to raise the hard limit |
 
-Time is counted at every switch, by the clock, and is exact; which part of
-it was the program's and which the kernel's is told by where each tick found
-the task, and its time divided in that proportion — never so that either
-part is less than it was last said to be. A program's use is its tasks',
+Time is counted by the clock, exactly: at every switch, and where a task
+comes into the kernel from its program and goes back, so that what it had
+in the kernel is counted as well as what it ran — and neither part is ever
+less than it was. A program's use is its tasks',
 those ended included; a program that ends leaves its use, and that of the
 children it collected, to whoever collects it. A forked child has used
 nothing, and `SYS_EXEC_SPACE` keeps what was used. Anybody may ask what any
