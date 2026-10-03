@@ -6,115 +6,75 @@ that cannot shorten a file, a compositor with no drag and drop — is under
 `CLAUDE.md`.
 
 This file was once a list of twenty-three things Quark needed, twenty-one of
-them struck through as done. What follows is what is true now.
+them struck through as done. What follows is what is true now: what has been
+asked for and is planned, and then the short list of what nobody has asked
+for.
 
-## Not there
+## Asked for, and planned
 
-- **A program somewhere else each time.** Where a program's stack, heap,
-  threads and anonymous memory are is chosen at random each time it runs;
-  where its code and data are is where it was linked, because nothing here
-  is built to be loaded anywhere (PIE) — and the page its arguments are
-  on is where every program looks for it. The kernel is where it was
-  linked, too.
+- **The kernel on every processor at once.** Programs run on every
+  processor; the kernel runs on one at a time
+  ([`docs/smp.md`](docs/smp.md)), so four programs making calls make no
+  more calls than one. Taking the lock apart is the next kernel work, and
+  with it a ready queue for each processor, a task kept where its cache is
+  and one that can say where it runs, a task woken that runs at once on
+  whichever processor runs the worst instead of at its band's next turn,
+  and an idle processor that takes no ticks. Sixteen processors at most.
+- **Threads in full.** More than sixty-four tasks; a child that is its
+  program's, so that any thread may collect it, where it is the task's
+  that made it; and the rest of the futex — requeue, priority inheritance,
+  robust lists.
+- **Signals queued**, as the C library will want for its real-time ones:
+  one raised twice before it is run is run once, and a handler is told who
+  raised it by process id and nothing more.
+- **A device's own authority, and its registers wherever they are.** A
+  driver that holds `DeviceMemory` may map any device's registers below
+  four gigabytes, and none above; a claim (`SYS_DEVICE_CLAIM`) narrows
+  what its device may reach, not what it may map. And a device is given
+  one message (MSI), not several (MSI-X), as the drivers for faster
+  devices will want.
 
-- **A second processor in the kernel.** Programs run on every processor
-  the machine has; the kernel runs on one at a time
-  ([`docs/smp.md`](docs/smp.md)). A system call, a fault or an interrupt on
-  a second processor waits for the first to leave, so four programs making
-  calls make no more calls than one. Taking that lock apart is its own
-  project, and with it go the rest of what using several processors well
-  means: a ready queue for each rather than one for the machine, a task kept
-  where its cache is, a task that can say where it runs, a better task
-  waking that interrupts the processor running the worst rather than
-  waiting for a tick, and an idle processor that takes no ticks. Sixteen
-  processors at most.
-- **Choosing who is ended.** A machine that has run out, with nothing left
-  to give up and nothing on its way out, ends whichever task touched the
-  page it could not give — not the biggest one, and not the newest.
+## Not asked for
+
+- **A program's code somewhere else each time.** Its stack, heap, threads
+  and anonymous memory move each run; its code is where it was linked, as
+  nothing is built to load anywhere (PIE), and so is the page its
+  arguments are on. The kernel is where it was linked.
+- **Choosing who is ended.** A machine with nothing left to give up ends
+  whichever task touched the page it could not give, not the biggest.
 - **Looking for memory ahead of time.** It is looked for when a frame is
-  wanted and there is none, by whoever wanted it, who waits. Nothing keeps
-  a margin free in the background, and nothing notices that a page was
-  written out a moment before it was wanted again and was not worth
-  writing.
-- **A call to a server that a signal cuts short.** The kernel runs a
-  handler wherever it finds a program (`docs/abi.md`, *Signals*), and every
-  wait the kernel keeps is ended by one. A call to a server is not: woken
-  with no reply it would fail, so the handler runs when the server answers
-  — a read of a file, a wait for a lock. Ending one would be a word to the
-  server that its caller has gone away, and an answer that says so.
-- **Signals queued.** One raised twice before it is run is run once — the
-  real-time signals too, which Linux queues with a value each. A handler is
-  told who raised a signal by process id; not by user, and for SIGCHLD not
-  with the child's status.
+  wanted and there is none, by whoever wanted it; nothing keeps a margin
+  free in the background.
+- **A call to a server that a signal cuts short.** A handler runs when the
+  server answers: ending the call would be a word to the server that its
+  caller has gone, and an answer that says so.
 - **The rest of job control.** A session's terminal is given up only by its
-  leader ending. And nothing is hung up on when a terminal's master goes:
-  its readers see the end of the file.
-- **Signals nothing raises.** A pipe with nobody reading it is found out by
-  the writer's runtime, which asks what kind of thing the descriptor is.
-  There is one alarm for a program, in real time. The time a program spends
-  running is measured (`SYS_USAGE`) and limited (`SYS_CPU_LIMIT`, SIGXCPU),
-  but no timer counts it down: `ITIMER_VIRTUAL` and `ITIMER_PROF`, and
-  SIGVTALRM and SIGPROF with them, are not there.
-- **Process ids that come round.** A process id is an endpoint number, and
-  those only go up. A C `pid_t` holds two thousand million of them; Linux
-  wraps and reuses, and here the task after that many has an id a C program
-  cannot hold.
-- **A wait list names a task by its id, and ids are reused.** A task killed
-  while it is parked in a read or a write is taken off the list it was on
-  (`pipe::forget_waiter`, reached through what it held), because a wake meant
-  for it would otherwise reach whatever has its number next — and a call to a
-  server that is woken with no reply fails. That covers pipes, streams,
-  terminals, timers and counters. A poll set's one waiter is not covered, and
-  the lists want to name the task rather than the number: the kernel already
-  has a number per task that is never reused, for endpoints.
-- **AMX**, and whatever comes after AVX-512. A program may use x87, SSE,
-  AVX and AVX-512, where the processor has them, and each task's registers
-  are its own; the tile registers are not turned on, being eight kilobytes
-  a task for a use nothing here has. See [`docs/fpu.md`](docs/fpu.md).
-- **A clock that is kept right.** The clock is the processor's counter, to
-  the nanosecond, at the rate it was measured at when the machine started —
-  good to a few parts in ten thousand, and nothing corrects it afterwards.
-  A machine whose counter cannot be trusted keeps time by the tick. There is
-  no HPET, and the local APIC's timer is not used in the mode that takes a
-  time on the counter itself.
-- **A waking that preempts.** A task whose wait ends on time runs at once
-  if it is of a better band than what is running where the clock is, or if
-  a processor is idle; one of the same band waits its turn.
-- **An interrupt for every device, wherever it is.** Devices interrupt
-  through the I/O APIC where there is one, on the sixteen ISA interrupts,
-  wherever the firmware says each comes in; and a device that can send its
-  interrupt as a message (MSI) is given a number of its own. What is not
-  there: the I/O APIC's lines above the sixteen — where a PCI device that
-  cannot send messages is wired on a newer machine, which the firmware's
-  bytecode says and its tables do not; more than one message for a device
-  (MSI-X); and anywhere to deliver one but the first processor.
-- **A device's registers above four gigabytes**, and an authority for one
-  device. A driver maps its device's registers by the `DeviceMemory`
-  capability, which covers what the firmware's map leaves out below four
-  gigabytes — all of it: a driver that holds it may map any device's. It
-  claims a device for its memory (`SYS_DEVICE_CLAIM`), and the claim does
-  not yet narrow what it may map.
-- **The rest of an IOMMU.** Where Intel's VT-d is, a device's DMA reaches
-  its driver's memory and nothing else; its interrupts are not remapped,
-  so a device can still send any message it likes. A firmware that
-  reserves memory for a device (an RMRR — a USB controller's keyboard, a
-  graphics card's frame) leaves the machine unguarded, as does AMD's
-  IOMMU, which is not driven. And a device is given its driver's memory at
-  the memory's own addresses: a device that addresses less than the
-  machine has needs memory from below what it can reach, as before.
-- **The rest of ACPI.** The kernel reads two tables and one object of a
-  third (`acpi.rs`), and acts on all three: the processors, the interrupt
-  controllers, and how to turn the machine off and restart it
-  (`SYS_POWER`). It does not run the firmware's own programs — there is no
-  interpreter for them — so there is no sleeping, no button that asks the
-  machine to turn off, no battery or lid or temperature, and a control
-  register that is memory rather than a port is not written.
-- **Memory above 511 GiB**, which is as far as the kernel's own map of
-  memory goes: the first entry of the top-level page table, less a gigabyte
-  for the heap. And the table of frames — a bit and a byte for each — has
-  to fit below four gigabytes, which it does for any machine that small.
-- **A time zone.** The date is UTC. `SYS_CLOCK_SET` sets it, for a holder
-  of `Clock`, and writes it to the CMOS clock.
+  leader ending, and a terminal's master going hangs up on nobody.
+- **Signals nothing raises.** No timer counts a program's own time down
+  (`ITIMER_VIRTUAL`, `ITIMER_PROF`); a pipe with nobody reading it is found
+  out by the writer's runtime, not raised.
+- **Process ids that come round.** They only go up, and after two thousand
+  million a C `pid_t` cannot hold one.
+- **A wait list that names a task.** The lists name a task's id, which is
+  reused, and a killed task is taken off them through what it held; a poll
+  set's one waiter is not.
+- **AMX**, and whatever comes after AVX-512 ([`docs/fpu.md`](docs/fpu.md)).
+- **A clock that is kept right.** It runs at the rate it was measured at
+  when the machine started, good to a few parts in ten thousand; there is
+  no HPET, and a machine whose counter cannot be trusted keeps time by the
+  tick.
+- **The I/O APIC above the sixteen ISA interrupts**, where a newer
+  machine wires a PCI device that cannot send messages: which line is in
+  the firmware's bytecode, not its tables.
+- **The rest of an IOMMU.** Interrupts are not remapped; a firmware that
+  reserves memory for a device (an RMRR) leaves the machine unguarded; AMD's
+  is not driven; and a device that addresses less than the machine has
+  still needs memory from below what it can reach.
+- **The rest of ACPI.** Three tables and one object of a fourth are read
+  (`acpi.rs`); the firmware's own programs are not run, so there is no
+  sleeping, no power button, no battery, lid or temperature.
+- **Memory above 511 GiB**, as far as the kernel's own map goes.
+- **A time zone.** The date is UTC; a C library keeps the zone.
 
 ## Fixed tables
 
@@ -143,11 +103,6 @@ will meet:
 
 ## Half done
 
-- **`exec` in a program with threads is refused.** POSIX has it end every
-  other thread, and ending them means unwinding what they hold in a server.
-- **A child is its creator task's to wait for, not its program's.** A thread
-  cannot collect a child another thread of its program forked; POSIX lets
-  any thread. The children of a thread that has ended are nobody's.
 - **A pager's idle objects are told to it in a list thirty-two long.** More
   of a pager's objects than that going idle before it has looked — every
   mapped file of several programs ended together — and the rest are not

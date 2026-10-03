@@ -19,8 +19,11 @@ the display, the shell.
 The kernel provides:
 
 - Preemptive scheduling in four bands, where a synchronous call hands the CPU
-  straight to its callee and a task runs at the band of whoever is waiting on
-  it
+  straight to its callee, a task runs at the band of whoever is waiting on
+  it, and within a band a program has the share its niceness gives it, by
+  Linux's weights
+- What each program has used, to the nanosecond, in it and in the kernel for
+  it — and a limit on how long it may run
 - A clock in nanoseconds — the processor's counter, where it can be trusted —
   and waits, timers and alarms that end when they are due rather than on the
   next of a hundred ticks a second
@@ -30,16 +33,22 @@ The kernel provides:
   plus notifications, deadlines, and buffers lent with a call so that no server
   has to map a client's memory
 - Object capabilities as the only authority: I/O ports, IRQs, physical ranges,
-  endpoints, task management. There is no UID 0 bypass
+  endpoints, task management — held by a program, so that its threads hold
+  them too. There is no UID 0 bypass
+- Where the machine has an IOMMU, a device that copies memory reaches what
+  its driver was given and nothing else
 - Address spaces, memory given its frames when first touched, shared memory,
   and memory objects whose pages a user-space pager provides — which is how a
   file is mapped, and how memory that is not being used is written out when
   there is not enough of it
-- A per-task descriptor table: IPC endpoints, pipes, connected streams that
-  can carry descriptors, poll sets, pseudo-terminals, timers and event counters
+- A descriptor table for each program: IPC endpoints, pipes, connected streams
+  that can carry descriptors, poll sets, pseudo-terminals, timers and event
+  counters
 - Tasks, threads, a `fork` that shares memory until one side writes it, and
-  `exec`; futexes with deadlines; every task's own floating-point and vector
-  registers, as wide as the processor has
+  `exec` — of a program with threads too; futexes with deadlines; every task's
+  own floating-point and vector registers, as wide as the processor has; and
+  a first program whose stack is somewhere else each time, as the userland
+  puts everything of every program
 - Unix's signals: handlers the kernel runs wherever it finds a program, a
   mask for each thread, a signal for one thread, faults handed to a
   program's handler, waits a signal ends saying whether to make the call
@@ -78,8 +87,14 @@ src/
   main.rs             Kernel entry, boot flow
   boot.s              32-to-64-bit bootstrap assembly
   syscall.rs          System call numbers and dispatch (syscall/sysret)
-  scheduler.rs        Preemptive scheduler: four bands, round-robin within one
-  task.rs             Task struct, descriptor table, capability space
+  scheduler.rs        Preemptive scheduler: four bands, and within one whoever
+                      has run least by its weight
+  usage.rs            What a program has used, how nice it is, how long it may run
+  task.rs             Task struct
+  fdtable.rs          A program's descriptors, and what it has said about signals
+  served.rs           Descriptors a server serves: a file is one
+  signal.rs           Signals: raised, held back, and handlers the kernel runs
+  job.rs              Process groups, sessions, stopping and continuing
   context.rs          Task context switching
   fpu.rs              Floating-point and SSE state, one copy per task
   ipc.rs              Synchronous IPC and notifications
@@ -89,6 +104,7 @@ src/
   pmm.rs              Physical memory: a bitmap, given out from both ends
   heap.rs             Kernel heap
   memobj.rs           Memory objects: pages a pager provides
+  reclaim.rs          Giving memory back when there is none to give
   shmem.rs            Shared memory regions
   futex.rs            Futex wait and wake
   pipe.rs             Pipes
@@ -106,9 +122,10 @@ src/
   intc.rs             The interrupt controller devices come in through:
   ioapic.rs  pic.rs     the I/O APIC, or the 8259s
   acpi.rs             The firmware's tables: processors, interrupt controllers,
-                      and how to turn the machine off
+                      how to turn the machine off, and where its IOMMUs are
   power.rs            Turning it off, and starting it again
   devmem.rs           Device memory: the addresses that are not memory
+  iommu.rs            Where a device may copy memory: Intel's VT-d
   percpu.rs           What each processor has of its own
   klock.rs            The kernel lock: one processor in the kernel at a time
   lapic.rs            The local APIC: a tick, a timer, a word to another processor
@@ -116,6 +133,7 @@ src/
   tlb.rs              A mapping taken away, on every processor
   irq_dispatch.rs     IRQ delivery to user-space tasks
   cpu.rs              SMEP, SMAP and the FS base
+  io.rs               Port I/O
   random.rs           Random bytes
   serial.rs           COM1 debug output
   sync.rs             IrqSpinLock<T>
