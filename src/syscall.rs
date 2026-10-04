@@ -252,6 +252,11 @@ const GROUPS_SET: u64 = 1;
 /// groups it is in, in one step — where that task is in a call to the
 /// holder, or is a child such a task is still preparing.
 pub const SYS_IDENTIFY: u64 = 213;
+/// What a program was started as: its command line, set and read.
+pub const SYS_PROGRAM_NAME: u64 = 214;
+/// `SYS_PROGRAM_NAME` operations.
+const NAME_SET: u64 = 0;
+const NAME_GET: u64 = 1;
 /// Timers, in the time block.
 pub const SYS_TIMER_CREATE: u64 = 146;
 pub const SYS_TIMER_SET: u64 = 147;
@@ -438,7 +443,7 @@ pub const SYS_ABI_VERSION: u64 = 240;
 /// minor when calls are added. User space can refuse to run against a major it
 /// does not know, which is the point of exposing it at all.
 pub const ABI_VERSION_MAJOR: u64 = 3;
-pub const ABI_VERSION_MINOR: u64 = 26;
+pub const ABI_VERSION_MINOR: u64 = 27;
 
 /// Threads a task may make with no capability at all.
 ///
@@ -1132,6 +1137,51 @@ fn dispatch(
             match crate::ipc::sys_task_watch(scheduler::current_tid(), arg0 as usize) {
                 Ok(()) => 0,
                 Err(_) => u64::MAX,
+            }
+        }
+        SYS_PROGRAM_NAME => {
+            // arg0 = a task, arg1 = NAME_SET or NAME_GET, arg2 = a buffer,
+            // arg3 = its length. What its program was started as: the
+            // arguments, each ended by a nought. Set by the program itself,
+            // or for a child its caller made and has not started — the
+            // spawner, which knows what it started — or by a holder of
+            // `TaskMgmt`; read by anybody, as `ps` reads it.
+            let caller = scheduler::current_tid();
+            let tid = arg0 as usize;
+            let len = (arg3 as usize).min(crate::fdtable::CMDLINE);
+            match arg1 {
+                NAME_SET => {
+                    let own = tid == caller
+                        || (scheduler::space_of_task(tid) == scheduler::space_of_task(caller) && tid != 0);
+                    if !own && !may_prepare(caller, tid) && !crate::cap::task_has_task_mgmt(caller, tid) {
+                        return u64::MAX;
+                    }
+                    let mut name = [0u8; crate::fdtable::CMDLINE];
+                    if len > 0 {
+                        if !validate_user_ptr(arg2, len as u64) {
+                            return u64::MAX;
+                        }
+                        let _ua = crate::cpu::UserAccess::begin();
+                        unsafe { core::ptr::copy_nonoverlapping(arg2 as *const u8, name.as_mut_ptr(), len) };
+                    }
+                    if crate::fdtable::set_cmdline(tid, &name[..len]) { 0 } else { u64::MAX }
+                }
+                NAME_GET => {
+                    let mut name = [0u8; crate::fdtable::CMDLINE];
+                    let Some(n) = crate::fdtable::cmdline_of(tid, &mut name) else {
+                        return u64::MAX;
+                    };
+                    let n = n.min(len);
+                    if n > 0 {
+                        if !validate_user_ptr_mut(arg2, n as u64) {
+                            return u64::MAX;
+                        }
+                        let _ua = crate::cpu::UserAccess::begin();
+                        unsafe { core::ptr::copy_nonoverlapping(name.as_ptr(), arg2 as *mut u8, n) };
+                    }
+                    n as u64
+                }
+                _ => u64::MAX,
             }
         }
         SYS_TASK_SPACE => {

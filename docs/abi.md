@@ -1,6 +1,6 @@
 # Quark syscall ABI
 
-**Version 3.26.** Query the running kernel with `SYS_ABI_VERSION` (240), which
+**Version 3.27.** Query the running kernel with `SYS_ABI_VERSION` (240), which
 returns `(major << 16) | minor`.
 
 This document is the contract between the Quark kernel and everything above it.
@@ -222,6 +222,7 @@ returning at once turned that loop into a spin.
 | 3.16 | **Off, and on again, by the firmware's tables.** `SYS_POWER` (119) turns the machine off or restarts it, for a holder of the new capability `Power` (type 12): by ACPI's control and reset registers, where a program used to write to the three ports QEMU listens on. |
 | 3.17 | **Memory above four gigabytes.** All of a machine's memory is used, up to 511 GiB, where the kernel used the first four gigabytes of it. `SYS_PHYS_ALLOC` takes a flag (arg1 = 1) for frames below four gigabytes, which is what a device that is told an address in thirty-two bits needs; without it a frame is ordinary memory and comes from the top. `SYS_MEM_INFO` takes what to say (arg0): 1 for how much memory the machine has and 2 for where it ends. |
 | 3.18 | **The wide registers.** A program may use AVX, AVX2 and AVX-512 where the processor has them: the kernel turns them on (`OSXSAVE`, XCR0) and saves all of each task's with `XSAVE`. Before, an AVX instruction was a fault. No call changed. |
+| 3.27 | **What a program was started as.** `SYS_PROGRAM_NAME` (214) keeps a program's command line — its arguments, each ended by a nought, the first 128 bytes of them — set by the program itself or for a child its caller has made and not started, and read by anybody: what `ps` shows, and what `/proc` says a process is called. `SYS_FORK` copies it; a program that becomes another with `SYS_EXEC_SPACE` says what it has become. |
 | 3.26 | **A child is put in its band by whoever made it.** `SYS_TASK_PRIORITY` (105) sets the band of a task its caller made and has not started, as `SYS_TASK_CREATE_IN` and the rest let it be filled, with no `TaskMgmt`; and with arg1 = `u64::MAX` it says which band a task is in, to anybody. A spawner with no authority over anybody — the device manager — could not give a driver the drivers' band its manifest asks for, so every driver it started ran as an ordinary program: preempted by anything, and its memory taken when memory was short — a disk's driver written out to the disk it drives. |
 | 3.25 | **A screen in memory.** `SYS_DISPLAY_MEMORY` (171) gives the driver of a display device that draws its picture from memory — a virtio GPU — the screen it draws from: one run of memory for the device, no task's and never freed, as a `PhysRange` the device reaches. And the bootloader's framebuffer is kept from the frame allocator where it is memory, as it was not. |
 | 3.24 | **A device is its capability.** The kernel finds every PCI device at boot and sizes its BARs, and a new capability, `PciDevice` (type 14), is one device or every device: the first task is started with every device. Its holder is told what was found (`SYS_PCI_DEVICE`, 168), reads and writes the device's configuration (`SYS_PCI_READ`, 169; `SYS_PCI_WRITE`, 170), mints a `PhysRange` or an `IoPort` inside one of the device's BARs, claims it (`SYS_DEVICE_CLAIM`, which no longer asks for the configuration ports) and has an interrupt for it by message (`SYS_MSI_ALLOC` with arg1 = 1), which the kernel aims the device at itself. The ports devices were configured through, 0xCF8 and 0xCFC to 0xCFF, are refused to every program, and a write to a BAR, to the MSI capability, or that turns bus mastering on before the device is claimed, is refused; every device but a bridge starts with bus mastering off, and has it turned off when the program that claimed it goes. A capability type above 255 is refused by `SYS_CAP_MINT`, where it was read as its low byte. |
@@ -1686,12 +1687,13 @@ which may be less, or nothing.
 
 ### Identity, continued (0xD0)
 
-Block 0x60 is full; these two are its overflow.
+Block 0x60 is full; these are its overflow.
 
 | # | Name | Arguments | Returns | Cap |
 |---|---|---|---|---|
 | 212 | `SYS_GROUPS` | arg0 = op: 0 read, 1 set; arg1 = a task, 0 for the caller; arg2 = where the group ids are, or go: `u32`s; arg3 = how many (sixteen at most) | reading, how many groups the task is in — as many as there was room for are written; setting, 0 / `u64::MAX` | — to read; `SetUid` to set, and the task is the caller or a child it has created and not started |
 | 213 | `SYS_IDENTIFY` | arg0 = a task that is in a call to the caller; arg1 = that task, or a child it has created and not started; arg2 = `uid << 32 \| gid`; arg3 = the groups it is in besides, `u32`s; arg4 = how many (sixteen at most) | 0 / `u64::MAX` | `SetUid` |
+| 214 | `SYS_PROGRAM_NAME` | arg0 = a task; arg1 = op: 0 set, 1 read; arg2 = the command line, or where it goes: arguments each ended by a nought; arg3 = its length, or the room (128 bytes are kept) | setting, 0 / `u64::MAX`; reading, how many bytes were written | — to read; to set, the task is of the caller's own program, or a child it has made and not started, or `TaskMgmt` for it |
 
 A task has a user, a group, and the groups it is in besides: sixteen at
 most. All three are inherited by a task from its creator, copied by

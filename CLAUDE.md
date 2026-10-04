@@ -744,6 +744,14 @@ every Unix program assumes:
   (`cap::share`), so what one thread is given the others have. A thread used
   to start with a copy of its creator's capabilities, as they stood: a C
   library that looked a service up in one thread was refused it in another.
+- **What a program was started as is its program's** (`SYS_PROGRAM_NAME`):
+  a hundred and twenty-eight bytes of its arguments, kept in its descriptor
+  table's record beside its signals, so its threads have it, `fork` copies
+  it and `exec` keeps it — until the program that execs says what it is
+  becoming, which the C layer's `execve` does. It is said by the program,
+  by a spawner of the child it has made and not started (`may_prepare`), or
+  by a holder of `TaskMgmt`, and read by anybody: it is what `ps` shows and
+  what `/proc` calls a process. Nothing in the kernel acts on it.
 - **A program ends as a whole** (`SYS_EXIT_PROGRAM`). `SYS_EXIT_CODE` ends one
   task, which is what a thread wants and never what `exit` means: the other
   threads stayed parked on locks nobody would release, holding the program's

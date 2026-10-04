@@ -105,7 +105,16 @@ struct Table {
     cpu_soft: u64,
     cpu_hard: u64,
     xcpu_sent: u64,
+    /// What the program was started as: its arguments, each ended by a
+    /// nought, as much as fits — said by whoever started it, or by itself
+    /// (`SYS_PROGRAM_NAME`). `fork` copies it; an `exec` is a new program,
+    /// and the one exec'ing says what.
+    cmdline: [u8; CMDLINE],
+    cmdline_len: u8,
 }
+
+/// How much of a program's command line is kept.
+pub const CMDLINE: usize = 128;
 
 /// What a program that has said nothing leaves off: write for group and other.
 const DEFAULT_UMASK: u16 = 0o022;
@@ -136,6 +145,8 @@ const EMPTY: Table = Table {
     cpu_soft: u64::MAX,
     cpu_hard: u64::MAX,
     xcpu_sent: u64::MAX,
+    cmdline: [0; CMDLINE],
+    cmdline_len: 0,
 };
 
 /// As many tables as tasks: each task uses exactly one.
@@ -325,13 +336,14 @@ pub fn copy_into(child: usize, parent: usize) {
     // read and its being retained would have this retain something freed.
     let flags = irq_save();
     unsafe {
-        let (src_fds, src_cloexec, src_umask, src_signals, src_run) = match table_mut(parent) {
+        let (src_fds, src_cloexec, src_umask, src_signals, src_run, src_name) = match table_mut(parent) {
             Some(t) => (
                 t.fds,
                 t.cloexec,
                 t.umask,
                 (t.sig_ignore, t.sig_catch, t.sig_word),
                 (t.sig_run, t.sig_masks, t.sig_flags, t.sig_cookies, t.sig_entry, t.sig_unix),
+                (t.cmdline, t.cmdline_len),
             ),
             None => {
                 irq_restore(flags);
@@ -340,6 +352,7 @@ pub fn copy_into(child: usize, parent: usize) {
         };
         if let Some(dst) = table_mut(child) {
             dst.umask = src_umask;
+            (dst.cmdline, dst.cmdline_len) = src_name;
             // The child is a copy of the program, handlers and the word they
             // are told through included. What was raised for the parent and
             // not yet taken is the parent's.
@@ -1001,6 +1014,38 @@ pub fn runs_like(tid: usize, from: usize) {
         }
     }
     irq_restore(flags);
+}
+
+/// Say what `tid`'s program was started as: `cmdline`, as much as fits.
+pub fn set_cmdline(tid: usize, cmdline: &[u8]) -> bool {
+    let flags = irq_save();
+    let done = unsafe {
+        match table_mut(tid) {
+            Some(t) => {
+                let n = cmdline.len().min(CMDLINE);
+                t.cmdline[..n].copy_from_slice(&cmdline[..n]);
+                t.cmdline[n..].fill(0);
+                t.cmdline_len = n as u8;
+                true
+            }
+            None => false,
+        }
+    };
+    irq_restore(flags);
+    done
+}
+
+/// What `tid`'s program was started as, into `out`: how long it is.
+pub fn cmdline_of(tid: usize, out: &mut [u8; CMDLINE]) -> Option<usize> {
+    let flags = irq_save();
+    let len = unsafe {
+        table_mut(tid).map(|t| {
+            *out = t.cmdline;
+            t.cmdline_len as usize
+        })
+    };
+    irq_restore(flags);
+    len
 }
 
 /// How nice `tid`'s program is.
