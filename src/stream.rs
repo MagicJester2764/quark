@@ -131,12 +131,14 @@ pub fn pipes_for(stream: usize, end: u8) -> Option<(usize, usize)> {
     out
 }
 
-/// Make a connected pair. Returns the stream index, or `None`.
-pub fn create(tid: usize) -> Option<usize> {
+/// Make a connected pair — of byte streams, or with `packets`, of streams
+/// of messages each kept whole (`SOCK_SEQPACKET`). Returns the stream index,
+/// or `None`.
+pub fn create(tid: usize, packets: bool) -> Option<usize> {
     // The two pipes first: if either is refused there is nothing to unwind but
     // the other, and no stream slot has been claimed.
-    let a = pipe::create_for_stream()?;
-    let b = match pipe::create_for_stream() {
+    let a = pipe::create_for_stream(packets)?;
+    let b = match pipe::create_for_stream(packets) {
         Some(b) => b,
         None => {
             pipe::drop_unreferenced(a);

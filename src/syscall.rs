@@ -471,6 +471,9 @@ pub const SYS_FD_SERVE_PIPE: u64 = 231;
 pub const SYS_PIPE_PEER: u64 = 232;
 /// A server says what an object of its own is ready for, to a poll.
 pub const SYS_FD_READY: u64 = 233;
+/// A connected pair whose writes are messages, each read whole:
+/// `socketpair` of `SOCK_SEQPACKET`.
+pub const SYS_PACKET_PAIR: u64 = 234;
 /// `SYS_FD_SERVE`'s flag: the server will say when the object is ready.
 const SERVE_SAYS_READY: u64 = 1;
 /// SYS_FD_SERVE_PIPE: the writing end, and only if the other end is held.
@@ -3055,12 +3058,14 @@ fn dispatch(
                 }
             }
         }
-        SYS_SOCKETPAIR => {
+        SYS_SOCKETPAIR | SYS_PACKET_PAIR => {
             // Both ends land in the caller's own table, the way socketpair(2)
             // works. Moving one into a child is sys_fd_dup followed by closing
-            // our copy, which is why an end is reference counted.
+            // our copy, which is why an end is reference counted. A pair made
+            // by SYS_PACKET_PAIR keeps each write whole, for a read to take
+            // whole: a socketpair of SOCK_SEQPACKET.
             let tid = scheduler::current_tid();
-            let s = match crate::stream::create(tid) {
+            let s = match crate::stream::create(tid, nr == SYS_PACKET_PAIR) {
                 Some(s) => s,
                 None => return u64::MAX,
             };

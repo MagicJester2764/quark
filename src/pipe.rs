@@ -57,6 +57,12 @@ struct Pipe {
     /// Tasks waiting for the other end to be opened by somebody.
     peer_waiters: [usize; MAX_WAITERS],
     peer_waiter_count: usize,
+    /// Each write is a record kept whole — two bytes of length and its
+    /// bytes — and each read takes one record, what does not fit the reader
+    /// dropped: a stream made to keep messages whole (`SOCK_SEQPACKET`).
+    /// What is in the buffer is always whole records, so what it holds and
+    /// whether it is empty mean what they mean for bytes.
+    packets: bool,
 }
 
 impl Pipe {
@@ -79,7 +85,70 @@ impl Pipe {
             opens: [0; 2],
             peer_waiters: [0; MAX_WAITERS],
             peer_waiter_count: 0,
+            packets: false,
         }
+    }
+
+    /// Take what is next for a reader with room for `max_len`: bytes up to
+    /// that, or one record, of which what does not fit is dropped. How much
+    /// the reader was given.
+    ///
+    /// # Safety
+    /// Interrupts off, something to take, and `buf` a user range the call
+    /// has checked.
+    unsafe fn take(&mut self, buf: *mut u8, max_len: usize) -> usize {
+        let (from, n, used) = if self.packets {
+            let n = self.buf[self.read_pos] as usize | (self.buf[(self.read_pos + 1) % PIPE_BUF_SIZE] as usize) << 8;
+            ((self.read_pos + 2) % PIPE_BUF_SIZE, n.min(max_len), 2 + n)
+        } else {
+            let n = self.len.min(max_len);
+            (self.read_pos, n, n)
+        };
+        {
+            let _ua = crate::cpu::UserAccess::begin();
+            for i in 0..n {
+                unsafe { buf.add(i).write(self.buf[(from + i) % PIPE_BUF_SIZE]) };
+            }
+        }
+        self.read_pos = (self.read_pos + used) % PIPE_BUF_SIZE;
+        self.len -= used;
+        n
+    }
+
+    /// Room for a write of `len`: any for bytes, and for a record the whole
+    /// of it with its length.
+    fn room_for(&self, len: usize) -> usize {
+        let space = PIPE_BUF_SIZE - self.len;
+        if !self.packets {
+            space
+        } else if space >= len + 2 {
+            len
+        } else {
+            0
+        }
+    }
+
+    /// Put `n` bytes of `buf` in — as one record, with its length, for a
+    /// stream of records.
+    ///
+    /// # Safety
+    /// Interrupts off, room for them ([`Pipe::room_for`]), and `buf` a user
+    /// range the call has checked.
+    unsafe fn put(&mut self, buf: *const u8, n: usize) {
+        if self.packets {
+            self.buf[self.write_pos] = n as u8;
+            self.buf[(self.write_pos + 1) % PIPE_BUF_SIZE] = (n >> 8) as u8;
+            self.write_pos = (self.write_pos + 2) % PIPE_BUF_SIZE;
+            self.len += 2;
+        }
+        {
+            let _ua = crate::cpu::UserAccess::begin();
+            for i in 0..n {
+                self.buf[(self.write_pos + i) % PIPE_BUF_SIZE] = unsafe { buf.add(i).read() };
+            }
+        }
+        self.write_pos = (self.write_pos + n) % PIPE_BUF_SIZE;
+        self.len += n;
     }
 }
 
@@ -320,7 +389,7 @@ const MAX_PIPES_PER_TASK: usize = 8;
 /// could otherwise drain the table. A stream is bounded by its own table
 /// instead, and charging its two pipes against a task's eight would have meant
 /// four connections per program.
-pub fn create_for_stream() -> Option<usize> {
+pub fn create_for_stream(packets: bool) -> Option<usize> {
     let creator = scheduler::current_tid();
     let space = scheduler::space_of_task(creator);
     let flags = irq_save();
@@ -332,6 +401,7 @@ pub fn create_for_stream() -> Option<usize> {
                 PIPES[i].in_use = true;
                 PIPES[i].creator = creator;
                 PIPES[i].owner_space = space;
+                PIPES[i].packets = packets;
                 found = Some(i);
                 break;
             }
@@ -388,7 +458,7 @@ pub fn readable(handle: usize) -> bool {
 pub fn writable(handle: usize) -> bool {
     let flags = irq_save();
     let out = unsafe {
-        handle < MAX_PIPES && PIPES[handle].in_use && PIPES[handle].len < PIPE_BUF_SIZE
+        handle < MAX_PIPES && PIPES[handle].in_use && PIPES[handle].room_for(1) > 0
     };
     irq_restore(flags);
     out
@@ -509,16 +579,7 @@ fn read_inner(handle: usize, buf: *mut u8, max_len: usize) -> u64 {
 
             if pipe.len > 0 {
                 // Copy data out of ring buffer
-                let to_copy = pipe.len.min(max_len);
-                {
-                    let _ua = crate::cpu::UserAccess::begin();
-                    for i in 0..to_copy {
-                        let pos = (pipe.read_pos + i) % PIPE_BUF_SIZE;
-                        buf.add(i).write(pipe.buf[pos]);
-                    }
-                }
-                pipe.read_pos = (pipe.read_pos + to_copy) % PIPE_BUF_SIZE;
-                pipe.len -= to_copy;
+                let to_copy = pipe.take(buf, max_len);
 
                 // Wake one blocked writer if any
                 if pipe.write_waiter_count > 0 {
@@ -594,16 +655,7 @@ fn read_nonblock_inner(handle: usize, buf: *mut u8, max_len: usize) -> u64 {
             let pipe = &mut PIPES[handle];
 
             if pipe.len > 0 {
-                let to_copy = pipe.len.min(max_len);
-                {
-                    let _ua = crate::cpu::UserAccess::begin();
-                    for i in 0..to_copy {
-                        let pos = (pipe.read_pos + i) % PIPE_BUF_SIZE;
-                        buf.add(i).write(pipe.buf[pos]);
-                    }
-                }
-                pipe.read_pos = (pipe.read_pos + to_copy) % PIPE_BUF_SIZE;
-                pipe.len -= to_copy;
+                let to_copy = pipe.take(buf, max_len);
 
                 if pipe.write_waiter_count > 0 {
                     let tid = pipe.write_waiters[0];
@@ -641,21 +693,15 @@ pub fn write_nonblock(handle: usize, buf: *const u8, len: usize) -> u64 {
             let pipe = &mut PIPES[handle];
             if pipe.readers == 0 {
                 u64::MAX
+            } else if pipe.packets && len + 2 > PIPE_BUF_SIZE {
+                // A record bigger than the buffer never fits.
+                u64::MAX
             } else {
-                let space = PIPE_BUF_SIZE - pipe.len;
-                let to_copy = space.min(len);
+                let to_copy = pipe.room_for(len).min(len);
                 if to_copy == 0 {
                     WOULD_BLOCK
                 } else {
-                    {
-                        let _ua = crate::cpu::UserAccess::begin();
-                        for i in 0..to_copy {
-                            let pos = (pipe.write_pos + i) % PIPE_BUF_SIZE;
-                            pipe.buf[pos] = buf.add(i).read();
-                        }
-                    }
-                    pipe.write_pos = (pipe.write_pos + to_copy) % PIPE_BUF_SIZE;
-                    pipe.len += to_copy;
+                    pipe.put(buf, to_copy);
 
                     if pipe.read_waiter_count > 0 {
                         let tid = pipe.read_waiters[0];
@@ -707,19 +753,18 @@ fn write_inner(handle: usize, buf: *const u8, len: usize) -> u64 {
                 irq_restore(flags);
                 return if offset > 0 { offset as u64 } else { u64::MAX };
             }
+            // A record bigger than the buffer never fits.
+            if pipe.packets && len + 2 > PIPE_BUF_SIZE {
+                irq_restore(flags);
+                return u64::MAX;
+            }
 
-            let space = PIPE_BUF_SIZE - pipe.len;
+            // Bytes as there is room; a record when there is room for all of
+            // it, and then all of it at once.
+            let space = pipe.room_for(len - offset);
             if space > 0 {
                 let to_copy = space.min(len - offset);
-                {
-                    let _ua = crate::cpu::UserAccess::begin();
-                    for i in 0..to_copy {
-                        let pos = (pipe.write_pos + i) % PIPE_BUF_SIZE;
-                        pipe.buf[pos] = buf.add(offset + i).read();
-                    }
-                }
-                pipe.write_pos = (pipe.write_pos + to_copy) % PIPE_BUF_SIZE;
-                pipe.len += to_copy;
+                pipe.put(buf.add(offset), to_copy);
                 offset += to_copy;
 
                 // Wake one blocked reader if any

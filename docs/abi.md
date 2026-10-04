@@ -225,7 +225,7 @@ returning at once turned that loop into a spin.
 | 3.16 | **Off, and on again, by the firmware's tables.** `SYS_POWER` (119) turns the machine off or restarts it, for a holder of the new capability `Power` (type 12): by ACPI's control and reset registers, where a program used to write to the three ports QEMU listens on. |
 | 3.17 | **Memory above four gigabytes.** All of a machine's memory is used, up to 511 GiB, where the kernel used the first four gigabytes of it. `SYS_PHYS_ALLOC` takes a flag (arg1 = 1) for frames below four gigabytes, which is what a device that is told an address in thirty-two bits needs; without it a frame is ordinary memory and comes from the top. `SYS_MEM_INFO` takes what to say (arg0): 1 for how much memory the machine has and 2 for where it ends. |
 | 3.18 | **The wide registers.** A program may use AVX, AVX2 and AVX-512 where the processor has them: the kernel turns them on (`OSXSAVE`, XCR0) and saves all of each task's with `XSAVE`. Before, an AVX instruction was a fault. No call changed. |
-| 3.37 | **A program's calls, answered by its C library.** `SYS_SYSCALL_TRAP` (138): a program names where it makes its system calls from, and a `syscall` instruction anywhere else raises signal 31 with every register in the handler's record — Linux's syscall user dispatch, for a program built for Linux's musl whose own code makes calls Quark's C library would have answered. The system call stub keeps the caller's R9 for it. Nothing else changes. |
+| 3.37 | **A program's calls, answered by its C library.** `SYS_SYSCALL_TRAP` (138): a program names where it makes its system calls from, and a `syscall` instruction anywhere else raises signal 31 with every register in the handler's record — Linux's syscall user dispatch, for a program built for Linux's musl whose own code makes calls Quark's C library would have answered. The system call stub keeps the caller's R9 for it. And `SYS_PACKET_PAIR` (234): `SYS_SOCKETPAIR`'s pair, each write a message read whole and what does not fit a read dropped — `SOCK_SEQPACKET`, which Rust's standard library makes a pair of whenever it forks to start a program. Nothing else changes. |
 | 3.36 | **An IPC descriptor names a task, not a number.** `SYS_FD_SET` (67) records the task arg2 names as it is then — by its endpoint number, as an `Endpoint` capability does — and refuses a task that is not there. Once that task is gone a read or a write through the descriptor fails, and `SYS_FD_KIND` (230) answers 1 with its bit for an end that has gone; before, the descriptor named the TID, and wrote to whatever task was given that number next. A socket of the old kind (`SYS_SOCK_FD`, 11 to `SYS_FD_KIND`) names its server the same way. Nothing else changes. |
 | 3.35 | **The right to run the network.** Capability type 15, `NetAdmin`: no parameters, minted and handed on as `Clock` is, and the first task is started with it. The kernel acts on it nowhere: the network stack is offered one with a call (`SYS_CALL_OFFER`) and changes its filter only for a caller that could. |
 | 3.34 | **What a thread library keeps with the kernel.** `SYS_TASK_NAME` (215) says and reads what a task is called — Linux's `comm`, fifteen bytes, none being its program's name — set for a task of the caller's own program, or by a server for one of the program of a client that is calling it; a task is called what its maker was, and `exec` forgets it. `SYS_ROBUST_LIST` (132) says where the caller's robust list is (`set_robust_list`): when a task dies, or becomes another program, the kernel walks it in its memory and marks each mutex it still holds as one whose owner died, waking a waiter. `SYS_USAGE` with 4 says what one task has used, another thread's processor clock, and `SYS_PID` with arg1 = 1 a task's own number, which is how the task a program began as is told from its others. |
@@ -1913,6 +1913,7 @@ set together or not at all.
 | 231 | `SYS_FD_SERVE_PIPE` | arg0 = client tid, arg1 = a key of the caller's choosing, arg2 = bit 0 for the writing end rather than the reading, bit 1 to give it only if the other end is held | the descriptor, the lowest free from 3 in the client, with what to wait for above it: `fd \| wait << 32`, where `wait` is 0 if the other end is held; `0xFFFF_FFFE` if bit 1 was set and it is not / `u64::MAX` | the client is in a call to the caller |
 | 232 | `SYS_PIPE_PEER` | arg0 = a descriptor for one end of a named pipe, arg1 = the `wait` that came with it | 0 when the other end has been opened; `0xFFFF_FFFD` if a signal the program handles came first / `u64::MAX`. **Blocks.** | — |
 | 233 | `SYS_FD_READY` | arg0 = a cookie of the caller's, made with flag 1; arg1 = what it is ready for: 1 readable, 2 writable, 4 hung up | 0 / `u64::MAX` | — |
+| 234 | `SYS_PACKET_PAIR` | — | `(fd0 << 32) \| fd1`, both in the caller's table / `u64::MAX` | — |
 
 `SYS_FD_KIND` answers 1 for an IPC endpoint, 2 and 3 for the reading and
 writing ends of a pipe, 4 for a stream, 5 and 6 for a terminal's master and
@@ -1924,6 +1925,15 @@ endpoint or an old socket whose server has gone. A failed
 write says only that it failed, and this is how its caller tells a pipe
 nobody is reading — which a C library must answer with `EPIPE` — from a
 number that names nothing.
+
+**A packet pair** (`SYS_PACKET_PAIR`) is a stream whose writes are messages:
+each write is kept whole, waits for room for all of it rather than going in
+by parts, and is refused if it is bigger than the stream's 4094 bytes can
+ever hold; each read takes one message, and what does not fit the reader's
+buffer is dropped. Otherwise it is `SYS_SOCKETPAIR`'s — the same kind (4),
+the same descriptors carried, the same end of file. It is `SOCK_SEQPACKET`
+as `socketpair` makes it, which Rust's standard library makes whenever it
+forks to start a program, to hear how the `exec` went.
 
 **A served descriptor names an object in a server**: a file, most often. The
 object is the server's, known to it by a number of its own choosing — the

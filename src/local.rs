@@ -224,7 +224,7 @@ pub fn connect(server: u64, key: u64, creds: Creds, tid: usize) -> Result<usize,
         Some((_, true)) => return Err(Refused::Full),
         Some((l, false)) => l,
     };
-    let stream = crate::stream::create(tid).ok_or(Refused::Full)?;
+    let stream = crate::stream::create(tid, false).ok_or(Refused::Full)?;
     let flags = irq_save();
     let queued = unsafe {
         let it = &mut locals()[l];
