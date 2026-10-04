@@ -748,6 +748,14 @@ pub fn donate_to(tid: usize, flags: u64) {
 }
 
 /// Which band a task is in. Anything out of range is treated as ordinary.
+/// The band `tid` was put in, whatever it is running in for now.
+pub fn base_priority_of(tid: usize) -> Option<u8> {
+    if tid >= MAX_TASKS {
+        return None;
+    }
+    unsafe { TASKS[tid].as_ref().filter(|t| t.state != TaskState::Dead).map(|t| t.base_priority) }
+}
+
 pub fn priority_of(tid: usize) -> usize {
     if tid >= MAX_TASKS {
         return PRIO_NORMAL as usize;

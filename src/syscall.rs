@@ -438,7 +438,7 @@ pub const SYS_ABI_VERSION: u64 = 240;
 /// minor when calls are added. User space can refuse to run against a major it
 /// does not know, which is the point of exposing it at all.
 pub const ABI_VERSION_MAJOR: u64 = 3;
-pub const ABI_VERSION_MINOR: u64 = 25;
+pub const ABI_VERSION_MINOR: u64 = 26;
 
 /// Threads a task may make with no capability at all.
 ///
@@ -1154,7 +1154,19 @@ fn dispatch(
             let tid = arg0 as usize;
             let band = arg1;
             let caller = scheduler::current_tid();
-            if !crate::cap::task_has_task_mgmt(caller, tid) {
+            // Asked rather than told: which band the task was put in.
+            // Anybody may ask, as anybody may ask what state a task is in.
+            if band == u64::MAX {
+                return scheduler::base_priority_of(tid).map_or(u64::MAX, |b| b as u64);
+            }
+            // A child the caller has made and not started is its own to put
+            // in a band, as it is its own to fill (`may_prepare`): a spawner
+            // with no authority over anybody — the device manager — gives
+            // what it starts the band its manifest asks for. Without it, every
+            // driver the device manager started ran as an ordinary program,
+            // whose memory is taken when memory is short: a disk's driver
+            // written out to the disk it drives.
+            if !crate::cap::task_has_task_mgmt(caller, tid) && !may_prepare(caller, tid) {
                 return u64::MAX;
             }
             // The same rule capabilities follow: a spawner may narrow what it
