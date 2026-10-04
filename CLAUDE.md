@@ -640,6 +640,14 @@ another waits until it is not zero and takes what is there. It is what glib,
 libwayland and GTK reach for first to wake a sleeping loop; a pipe is only ever
 their fallback.
 
+And **signals are one** (`SYS_SIGNAL_FD`, `signalfd`): a descriptor read
+for a set of signals, whose reads take what is waiting for the *reader* —
+its own task's, then its program's — so a forked child reads its own. It is
+readable while one of its set is waiting, and a signal that comes to wait
+where one could read it wakes a set watching one (`pollset::note_signals`).
+What a read gives is Linux's `signalfd_siginfo`, laid out by the kernel: a
+C library cannot tell this read from any other.
+
 And **a file is one**, though the file is not the kernel's. A *served
 descriptor* (`served.rs`) names an object in a server by a number the server
 chose; the kernel counts who holds it and nothing more. That is what makes a

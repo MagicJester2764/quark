@@ -333,6 +333,8 @@ pub const SYS_EVENT_CREATE: u64 = 131;
 // The top half of synchronisation's block: the signals' own two are full.
 /// Raise a signal that carries a value — a real-time one queues.
 pub const SYS_SIG_QUEUE: u64 = 136;
+/// A descriptor read for signals: `signalfd`.
+pub const SYS_SIGNAL_FD: u64 = 137;
 
 // --- 0x90  time ---
 //
@@ -456,7 +458,7 @@ pub const SYS_ABI_VERSION: u64 = 240;
 /// minor when calls are added. User space can refuse to run against a major it
 /// does not know, which is the point of exposing it at all.
 pub const ABI_VERSION_MAJOR: u64 = 3;
-pub const ABI_VERSION_MINOR: u64 = 29;
+pub const ABI_VERSION_MINOR: u64 = 30;
 
 /// Threads a task may make with no capability at all.
 ///
@@ -1058,6 +1060,7 @@ fn dispatch(
                 FdKind::MemFd { .. } => (10, false),
                 FdKind::Socket { .. } => (11, false),
                 FdKind::Served { obj } => (12, crate::served::of(obj).is_none()),
+                FdKind::Signals { .. } => (13, false),
             };
             kind | if gone { FD_KIND_GONE } else { 0 }
         }
@@ -1758,6 +1761,30 @@ fn dispatch(
                 }
             }
         }
+        SYS_SIGNAL_FD => {
+            // arg0 = a signal descriptor of the caller's to change, or
+            // u64::MAX for a new one; arg1 = the signals it is read for,
+            // less 9 and 19, which are nobody's to read.
+            let me = scheduler::current_tid();
+            let mask = arg1 & !((1 << 8) | (1 << 18));
+            if arg0 != u64::MAX {
+                return match crate::fdtable::get(me, arg0 as usize) {
+                    crate::task::FdKind::Signals { sfd } => {
+                        crate::sigfd::set_mask(sfd, mask);
+                        arg0
+                    }
+                    _ => u64::MAX,
+                };
+            }
+            let Some(sfd) = crate::sigfd::create(mask) else { return u64::MAX };
+            match scheduler::current_alloc_fd(crate::task::FdKind::Signals { sfd }) {
+                Ok(fd) => fd as u64,
+                Err(()) => {
+                    crate::sigfd::release(sfd);
+                    u64::MAX
+                }
+            }
+        }
         SYS_EVENT_CREATE => {
             // arg0 = the count it starts at, arg1 = flags (1 = semaphore).
             //
@@ -2378,8 +2405,9 @@ fn dispatch(
                         None => u64::MAX,
                     }
                 }
-                // A set is waited on, not written to.
-                crate::task::FdKind::PollSet { .. } => u64::MAX,
+                // A set is waited on, and signals are read: neither is
+                // written to.
+                crate::task::FdKind::PollSet { .. } | crate::task::FdKind::Signals { .. } => u64::MAX,
                 // Memory is mapped, not written through. A stream of bytes is
                 // the wrong shape for it, and answering as if it were would
                 // put the caller's data somewhere it will never look.
@@ -2428,6 +2456,9 @@ fn dispatch(
                 crate::task::FdKind::PtyEnd { pty, end } => pty_read(pty, end, ptr, max_len),
                 crate::task::FdKind::Timer { timer } => timer_read(timer, ptr, max_len),
                 crate::task::FdKind::Event { ev } => event_read(ev, ptr, max_len),
+                crate::task::FdKind::Signals { sfd } => {
+                    crate::signal::read_for(me, crate::sigfd::mask(sfd), ptr, max_len, true)
+                }
                 crate::task::FdKind::StreamEnd { stream, end } => {
                     match crate::stream::pipes_for(stream, end) {
                         Some((rd, _)) => crate::pipe::read(rd, ptr, max_len),
@@ -2516,6 +2547,9 @@ fn dispatch(
                             None => crate::pipe::WOULD_BLOCK,
                         }
                     }
+                }
+                crate::task::FdKind::Signals { sfd } => {
+                    crate::signal::read_for(me, crate::sigfd::mask(sfd), ptr, max_len, false)
                 }
                 // A file answers at once whichever way it is asked.
                 crate::task::FdKind::Served { obj } => {

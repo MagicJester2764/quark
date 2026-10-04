@@ -1320,6 +1320,7 @@ pub fn hold(tid: usize, fd: usize) -> FdKind {
             | FdKind::Timer { .. }
             | FdKind::Event { .. }
             | FdKind::Served { .. }
+            | FdKind::Signals { .. }
     );
     if waits && crate::pipe::retain_fd(&kind).is_ok() {
         unsafe { (*core::ptr::addr_of_mut!(HELD))[tid] = kind };

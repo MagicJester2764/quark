@@ -1,6 +1,6 @@
 # Quark syscall ABI
 
-**Version 3.29.** Query the running kernel with `SYS_ABI_VERSION` (240), which
+**Version 3.30.** Query the running kernel with `SYS_ABI_VERSION` (240), which
 returns `(major << 16) | minor`.
 
 This document is the contract between the Quark kernel and everything above it.
@@ -225,6 +225,7 @@ returning at once turned that loop into a spin.
 | 3.16 | **Off, and on again, by the firmware's tables.** `SYS_POWER` (119) turns the machine off or restarts it, for a holder of the new capability `Power` (type 12): by ACPI's control and reset registers, where a program used to write to the three ports QEMU listens on. |
 | 3.17 | **Memory above four gigabytes.** All of a machine's memory is used, up to 511 GiB, where the kernel used the first four gigabytes of it. `SYS_PHYS_ALLOC` takes a flag (arg1 = 1) for frames below four gigabytes, which is what a device that is told an address in thirty-two bits needs; without it a frame is ordinary memory and comes from the top. `SYS_MEM_INFO` takes what to say (arg0): 1 for how much memory the machine has and 2 for where it ends. |
 | 3.18 | **The wide registers.** A program may use AVX, AVX2 and AVX-512 where the processor has them: the kernel turns them on (`OSXSAVE`, XCR0) and saves all of each task's with `XSAVE`. Before, an AVX instruction was a fault. No call changed. |
+| 3.30 | **A descriptor read for signals.** `SYS_SIGNAL_FD` (137) makes one, read for a set of signals, or changes the set of one: a read takes those of the set waiting for the reader — its own task's first, then its program's — as 128-byte records laid out as Linux's `signalfd_siginfo`, waiting for the first unless asked not to; a set reports it readable while one is waiting. `SYS_FD_KIND` answers 13 for it. |
 | 3.29 | **A program's timers.** `SYS_PTIMER` (151) gives a program up to 32 timers, each on the date's clock or the time since boot, that raise a signal — for the program, or for one task of it — carrying a value, or nothing: POSIX's `timer_create`, `timer_settime`, `timer_gettime` and `timer_delete`. What comes with a timer's signal says so (`si_code` -2) and carries its number and its overruns: a timer that fires while its last signal is still waiting raises no other, and that one counts it. A forked child has none; `SYS_EXEC_SPACE` ends them. |
 | 3.28 | **Signals that queue, and say who.** A real-time signal (32 to 64) raised while one of its number is waiting waits behind it, with what it carried — 64 for a program and 16 for a task beyond the first of each number — where it used to be the same one again; a signal below 32 keeps what came with the raise that made it wait. `SYS_SIG_QUEUE` (136) raises one carrying a value. What came with a signal is three words — Linux's `si_code`, who raised it (a process id and a user; a child's for 17), and a value (the one it was queued with, a child's status, a fault's address) — at the end of a handler's record, and written by `SYS_SIG_WAIT` with arg3 = 1. `SYS_SIG_RAISE` answers `0xFFFF_FFFE` for a real-time signal that cannot wait. |
 | 3.27 | **What a program was started as.** `SYS_PROGRAM_NAME` (214) keeps a program's command line — its arguments, each ended by a nought, the first 128 bytes of them — set by the program itself or for a child its caller has made and not started, and read by anybody: what `ps` shows, and what `/proc` says a process is called. `SYS_FORK` copies it; a program that becomes another with `SYS_EXEC_SPACE` says what it has become. |
@@ -1338,11 +1339,34 @@ it as a resource limit rather than as a bad argument.
 | # | Name | Arguments | Returns | Cap |
 |---|---|---|---|---|
 | 136 | `SYS_SIG_QUEUE` | arg0 = a task of the program to signal, or with arg3 = 1 its process id, or with arg3 = 4 the task alone; arg1 = the signal, or 0 to ask whether one could be raised; arg2 = the value it carries | 0; `0xFFFF_FFFE` for a real-time signal that cannot wait / `u64::MAX` | `TaskMgmt` for target, or same UID |
+| 137 | `SYS_SIGNAL_FD` | arg0 = a signal descriptor of the caller's to change, or `u64::MAX` for a new one; arg1 = the signals it is read for, bit `n - 1` for signal `n` | the descriptor / `u64::MAX` | — |
 
 `SYS_SIG_RAISE` with a value: what comes with the signal says it was queued
 (`si_code` -1), by whom, and carries arg2 (see *What comes with a signal* under
 *Signals*) — Linux's `sigqueue`, and with arg3 = 4 its `pthread_sigqueue`. Not
 for a process group.
+
+**A signal descriptor** (`SYS_SIGNAL_FD`) is read for signals: Linux's
+`signalfd`. What it names is a set — 9 and 19 are left out of it, being
+nobody's to read — and whose signals a read takes is the reader's: those of
+the set waiting for the task reading, then for its program, each taken as
+`SYS_SIG_WAIT` takes one. A read is of whole records, as many as fit, and
+refused if not one does; it waits for the first, where `SYS_FD_READ_NB`
+answers "would block" instead, and a signal with a handler to run ends the
+wait (`0xFFFF_FFFD`). A set (`SYS_POLL`, `SYS_POLLSET_WAIT`) reports it
+readable while one of its signals is waiting for whoever asks, and wakes a
+task waiting on it when one comes to wait. A signal that is not held back is
+run or does what it does, and is never there to read: a program holds back
+what it reads for. The set is the descriptor's object's, so a change made
+through one descriptor for it is a change for every other. It is written to
+by nothing; `SYS_FD_KIND` answers 13.
+
+A record is 128 bytes, laid out as Linux's `struct signalfd_siginfo`: the
+signal (a `u32` at 0), `si_code` (an `i32` at 8), the process id and user
+that raised it (`u32`s at 12 and 16) — or, for a timer's, its number at 24
+and its overruns at 32 — and what it carried: for 17 the child's status (an
+`i32` at 40), and for anything else the value, its low 32 bits at 44 and the
+whole of it at 48. The rest is nought.
 
 ### Time (0x90)
 
@@ -1799,7 +1823,7 @@ set together or not at all.
 `SYS_FD_KIND` answers 1 for an IPC endpoint, 2 and 3 for the reading and
 writing ends of a pipe, 4 for a stream, 5 and 6 for a terminal's master and
 slave, 7 for a timer, 8 for a counter, 9 for a poll set, 10 for memory, 11 for
-a socket and 12 for a served descriptor. The bit above says nothing is left at
+a socket, 12 for a served descriptor and 13 for a signal descriptor. The bit above says nothing is left at
 the other end: a pipe with no writers, or no readers; a stream or a terminal
 whose peer has closed; a served descriptor whose server has gone. A failed
 write says only that it failed, and this is how its caller tells a pipe

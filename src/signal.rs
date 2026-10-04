@@ -482,9 +482,10 @@ pub fn raise_with(tid: usize, signo: u8, info: Info) -> Result<(), NotRaised> {
             Some(Ok((Disposition::Run, _))) => {
                 // It waits for a task that does not hold it back, and one
                 // that can be is made to look — or for one waiting to take
-                // it, which is woken.
+                // it, which is woken, or a reader of a signal descriptor.
                 prod(tid, signo);
                 waiters(tid, signo);
+                crate::pollset::note_signals();
                 return Ok(());
             }
             Some(Ok((said, _))) => said,
@@ -504,6 +505,7 @@ pub fn raise_with(tid: usize, signo: u8, info: Info) -> Result<(), NotRaised> {
             return Err(NotRaised::Full);
         }
         waiters(tid, signo);
+        crate::pollset::note_signals();
         return Ok(());
     }
     act(tid, signo).map_err(|()| NotRaised::Nobody)
@@ -544,6 +546,7 @@ pub fn raise_task(t: usize, signo: u8, info: Info) -> Result<(), NotRaised> {
             if !put {
                 return Err(NotRaised::Full);
             }
+            crate::pollset::note_signals();
             if waiting {
                 crate::ipc::wake_sleeper(t);
             } else if !held {
@@ -818,6 +821,90 @@ pub fn ends_wait(tid: usize) -> bool {
         return false;
     }
     ready(tid) || unsafe { WAITSET[tid] } & pending_for(tid) != 0
+}
+
+/// Every signal waiting for task `tid`: its own, and its program's — what a
+/// signal descriptor it reads would give it.
+pub fn waiting_for(tid: usize) -> u64 {
+    if tid >= MAX_TASKS {
+        return 0;
+    }
+    let flags = irq_save();
+    let set = pending_for(tid);
+    irq_restore(flags);
+    set
+}
+
+/// A read of a signal descriptor read for `set` (`sigfd.rs`): as many of
+/// `set` waiting for task `tid` — its own first, then its program's — as
+/// whole records fit in `max_len` bytes at `ptr`, each taken, as Linux's
+/// `signalfd_siginfo`. With `block` the first is waited for, as
+/// `SYS_SIG_WAIT` waits; without, none waiting is would-block. Too little
+/// room for one is refused.
+pub fn read_for(tid: usize, set: u64, ptr: *mut u8, max_len: usize, block: bool) -> u64 {
+    const RECORD: usize = 128;
+    if tid >= MAX_TASKS || max_len < RECORD {
+        return u64::MAX;
+    }
+    let set = set & !UNBLOCKABLE;
+    let mut n = 0;
+    while n + RECORD <= max_len {
+        let Some((signo, info)) = take_one(tid, set) else {
+            if n > 0 {
+                break;
+            }
+            if !block {
+                return crate::pipe::WOULD_BLOCK;
+            }
+            // Woken by one of `set` arriving, or ended by another signal
+            // with a handler to run.
+            let flags = irq_save();
+            unsafe { WAITSET[tid] = set };
+            irq_restore(flags);
+            let slept = crate::ipc::sys_recv_timeout(tid, u64::MAX);
+            let flags = irq_save();
+            unsafe { WAITSET[tid] = 0 };
+            let mine = pending_for(tid) & set != 0;
+            irq_restore(flags);
+            if matches!(slept, Err(crate::ipc::IpcError::Interrupted)) && !mine && ready(tid) {
+                return INTERRUPTED;
+            }
+            continue;
+        };
+        let record = linux_record(signo, &info);
+        {
+            let _ua = crate::cpu::UserAccess::begin();
+            unsafe { core::ptr::copy_nonoverlapping(record.as_ptr(), ptr.add(n), RECORD) };
+        }
+        n += RECORD;
+    }
+    n as u64
+}
+
+/// What a signal descriptor's reader is given for a signal: Linux's
+/// `signalfd_siginfo`, 128 bytes — the signal, `si_code`, who raised it (a
+/// timer's number and overruns, for a timer's), and what it carried, as
+/// `ssi_int` and `ssi_ptr`, or for SIGCHLD as `ssi_status`.
+fn linux_record(signo: u8, info: &Info) -> [u8; 128] {
+    let mut r = [0u8; 128];
+    let mut put = |at: usize, bytes: &[u8]| r[at..at + bytes.len()].copy_from_slice(bytes);
+    put(0, &(signo as u32).to_le_bytes());
+    put(8, &(info.code as i32).to_le_bytes());
+    let (low, high) = (info.who as u32, (info.who >> 32) as u32);
+    if info.code == SI_TIMER {
+        put(24, &low.to_le_bytes());
+        put(32, &high.to_le_bytes());
+    } else {
+        put(12, &low.to_le_bytes());
+        put(16, &high.to_le_bytes());
+    }
+    if signo == SIGCHLD {
+        put(40, &(info.value as u32).to_le_bytes());
+    } else {
+        put(44, &(info.value as u32).to_le_bytes());
+        put(48, &info.value.to_le_bytes());
+    }
+    r
 }
 
 /// Whether task `tid` has something to do on its way out of the kernel: a

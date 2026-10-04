@@ -78,6 +78,8 @@ pub enum FdKind {
     /// An object in a server — a file, most often — named by a number the
     /// server chose. See `served.rs`.
     Served { obj: usize },
+    /// Signals to be read, by whoever reads: `signalfd`. See `sigfd.rs`.
+    Signals { sfd: usize },
     /// A network connection, held by the net server as `handle`.
     ///
     /// Unlike `Ipc`, which is one-directional and carries a fixed tag, a

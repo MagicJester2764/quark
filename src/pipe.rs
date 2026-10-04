@@ -777,6 +777,7 @@ pub fn release_fd(kind: &FdKind) {
         FdKind::StreamEnd { stream, end } => crate::stream::close_end(*stream, *end),
         FdKind::PollSet { set } => crate::pollset::destroy(*set),
         FdKind::Served { obj } => crate::served::release(*obj),
+        FdKind::Signals { sfd } => crate::sigfd::release(*sfd),
         _ => {}
     }
 }
@@ -867,6 +868,10 @@ pub fn retain_fd(kind: &FdKind) -> Result<(), ()> {
         }
         FdKind::Served { obj } => {
             if crate::served::retain(*obj) { Ok(()) } else { Err(()) }
+        }
+        FdKind::Signals { sfd } => {
+            crate::sigfd::retain(*sfd);
+            Ok(())
         }
         // A set counts no holders, and closing any copy destroys it, so it
         // has exactly one.

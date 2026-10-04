@@ -54,6 +54,7 @@ mod stream;
 pub mod pipe;
 mod pty;
 mod ptimer;
+mod sigfd;
 mod timerfd;
 mod tlb;
 mod usage;
