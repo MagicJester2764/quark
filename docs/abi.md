@@ -1,6 +1,6 @@
 # Quark syscall ABI
 
-**Version 3.31.** Query the running kernel with `SYS_ABI_VERSION` (240), which
+**Version 3.32.** Query the running kernel with `SYS_ABI_VERSION` (240), which
 returns `(major << 16) | minor`.
 
 This document is the contract between the Quark kernel and everything above it.
@@ -225,6 +225,7 @@ returning at once turned that loop into a spin.
 | 3.16 | **Off, and on again, by the firmware's tables.** `SYS_POWER` (119) turns the machine off or restarts it, for a holder of the new capability `Power` (type 12): by ACPI's control and reset registers, where a program used to write to the three ports QEMU listens on. |
 | 3.17 | **Memory above four gigabytes.** All of a machine's memory is used, up to 511 GiB, where the kernel used the first four gigabytes of it. `SYS_PHYS_ALLOC` takes a flag (arg1 = 1) for frames below four gigabytes, which is what a device that is told an address in thirty-two bits needs; without it a frame is ordinary memory and comes from the top. `SYS_MEM_INFO` takes what to say (arg0): 1 for how much memory the machine has and 2 for where it ends. |
 | 3.18 | **The wide registers.** A program may use AVX, AVX2 and AVX-512 where the processor has them: the kernel turns them on (`OSXSAVE`, XCR0) and saves all of each task's with `XSAVE`. Before, an AVX instruction was a fault. No call changed. |
+| 3.32 | **What a server says is ready.** `SYS_FD_SERVE` takes a flag (arg3 = 1) for an object that is not a file — what is read from it comes when it comes — whose server says what it is ready for, with `SYS_FD_READY` (233): a poll answers what was said last, and is woken when it changes. A read or a write that may not wait says so to the server (`data[2]` = 1), whose answer of `0xFFFF_FFFE` for a count is "would block". A file is as it was: always ready, and asked the same way whether or not the caller would wait. |
 | 3.31 | **Local sockets by a name, who is at the other end, and several descriptors at once.** `SYS_SOCKET` (178) makes a local socket that is nothing yet; a file server names one a task calling it holds (`SYS_SOCKET_BIND`, 179) and connects one to whatever listens at a name (`SYS_SOCKET_CONNECT`, 181), each by a key of its own, as it keys a named pipe; `SYS_SOCKET_LISTEN` (180) and `SYS_SOCKET_ACCEPT` (182) listen and take a connection, which is a stream like a pair's. `SYS_SOCKET_PEER` (183) says who is at the other end of a stream — a pair's maker, the listener as it listened, the connector as it connected — and `SYS_SOCKET_OPTION` (184) whether an end asks to be told who sent what it receives. `SYS_FD_SEND` and `SYS_FD_RECV` with flag 2 carry several descriptors, as many as 32, and a stream holds 32 in flight each way where it held 8. `SYS_FD_KIND` answers 14 for a local socket not yet connected. |
 | 3.30 | **A descriptor read for signals.** `SYS_SIGNAL_FD` (137) makes one, read for a set of signals, or changes the set of one: a read takes those of the set waiting for the reader — its own task's first, then its program's — as 128-byte records laid out as Linux's `signalfd_siginfo`, waiting for the first unless asked not to; a set reports it readable while one is waiting. `SYS_FD_KIND` answers 13 for it. |
 | 3.29 | **A program's timers.** `SYS_PTIMER` (151) gives a program up to 32 timers, each on the date's clock or the time since boot, that raise a signal — for the program, or for one task of it — carrying a value, or nothing: POSIX's `timer_create`, `timer_settime`, `timer_gettime` and `timer_delete`. What comes with a timer's signal says so (`si_code` -2) and carries its number and its overruns: a timer that fires while its last signal is still waiting raises no other, and that one counts it. A forked child has none; `SYS_EXEC_SPACE` ends them. |
@@ -1859,7 +1860,7 @@ set together or not at all.
 
 | # | Name | Arguments | Returns | Cap |
 |---|---|---|---|---|
-| 224 | `SYS_FD_SERVE` | arg0 = client tid, arg1 = cookie, arg2 = where: a free descriptor number, `u64::MAX - 1` for the lowest free from 3, or 64 for the working directory | the descriptor / `u64::MAX` | the client is in a call to the caller |
+| 224 | `SYS_FD_SERVE` | arg0 = client tid, arg1 = cookie, arg2 = where: a free descriptor number, `u64::MAX - 1` for the lowest free from 3, or 64 for the working directory; arg3 = flags: 1, the caller will say when the object is ready (`SYS_FD_READY`) | the descriptor / `u64::MAX` | the client is in a call to the caller |
 | 225 | `SYS_FD_SERVED` | arg0 = one of the caller's descriptors (64 allowed), arg1 = two words to fill | 0, and `[server tid, cookie]` / `u64::MAX` if it is not a served descriptor or its server has gone | — |
 | 226 | `SYS_FD_HOLDS` | arg0 = tid, arg1 = cookie | 1 if that task's program holds a descriptor for the caller's object `cookie`, else 0 | — |
 | 227 | `SYS_FD_COOKIE` | arg0 = tid, arg1 = one of its descriptors (64 allowed) | the caller's cookie there / `u64::MAX` if what is there is not the caller's | — |
@@ -1868,6 +1869,7 @@ set together or not at all.
 | 230 | `SYS_FD_KIND` | arg0 = one of the caller's descriptors (64 allowed) | what it names, `\| 0x100` if its other end has gone / `u64::MAX` if it names nothing | — |
 | 231 | `SYS_FD_SERVE_PIPE` | arg0 = client tid, arg1 = a key of the caller's choosing, arg2 = bit 0 for the writing end rather than the reading, bit 1 to give it only if the other end is held | the descriptor, the lowest free from 3 in the client, with what to wait for above it: `fd \| wait << 32`, where `wait` is 0 if the other end is held; `0xFFFF_FFFE` if bit 1 was set and it is not / `u64::MAX` | the client is in a call to the caller |
 | 232 | `SYS_PIPE_PEER` | arg0 = a descriptor for one end of a named pipe, arg1 = the `wait` that came with it | 0 when the other end has been opened; `0xFFFF_FFFD` if a signal the program handles came first / `u64::MAX`. **Blocks.** | — |
+| 233 | `SYS_FD_READY` | arg0 = a cookie of the caller's, made with flag 1; arg1 = what it is ready for: 1 readable, 2 writable, 4 hung up | 0 / `u64::MAX` | — |
 
 `SYS_FD_KIND` answers 1 for an IPC endpoint, 2 and 3 for the reading and
 writing ends of a pipe, 4 for a stream, 5 and 6 for a terminal's master and
@@ -1884,22 +1886,32 @@ object is the server's, known to it by a number of its own choosing — the
 *cookie* — and the kernel's part is to count who holds a descriptor for it.
 That is what makes a file an ordinary descriptor: `SYS_FD_DUP` copies it,
 `SYS_FORK` gives the child one, `SYS_EXEC_SPACE` keeps it, `SYS_FD_SEND`
-passes it, `SYS_FD_CLOSE` drops it, and `SYS_POLL` reports it readable and
-writable, always. None of those is a message to the server.
+passes it, `SYS_FD_CLOSE` drops it, and `SYS_POLL` reports a file readable
+and writable, always. None of those is a message to the server.
 
 - **Making one.** `SYS_FD_SERVE` puts a descriptor for `cookie` in the table
   of a task that is in a call to the server. The call is the consent, as it is
   for `SYS_CAP_GRANT`: nobody is handed a descriptor unasked. The server says
   where — a number that must be free, the lowest free from 3, or the working
   directory, which it replaces — and tells the client in its reply.
-- **Using one.** `SYS_FD_READ` and `SYS_FD_WRITE` (and their non-blocking
-  forms, which are the same here) are a call the kernel makes to the server on
-  the task's behalf: tag `0xFFFF_0009` to read or `0xFFFF_000A` to write,
-  `data` = `[cookie, length]`, with the task's buffer lent for the server to
-  fill or to read, at most a mebibyte at a time. The server answers tag 0 with
-  the count in `data[0]`, and anything else is `u64::MAX` to the task. The
-  task needs no `Endpoint` for the server: the descriptor is the permission.
-  So anything that can write to descriptor 1 can write to a file put there.
+- **Using one.** `SYS_FD_READ` and `SYS_FD_WRITE`, and their non-blocking
+  forms, are a call the kernel makes to the server on the task's behalf: tag
+  `0xFFFF_0009` to read or `0xFFFF_000A` to write, `data` = `[cookie, length,
+  do not wait]`, with the task's buffer lent for the server to fill or to
+  read, at most a mebibyte at a time. `data[2]` is 1 from the non-blocking
+  forms and 0 from the others. The server answers tag 0 with the count in
+  `data[0]` — or, to one that may not wait, `0xFFFF_FFFE` for nothing yet,
+  which the task is answered as "would block" — and anything else is
+  `u64::MAX` to the task. A server may hold its answer to one that may wait
+  until it has something, as a lock's is held. The task needs no `Endpoint`
+  for the server: the descriptor is the permission. So anything that can
+  write to descriptor 1 can write to a file put there.
+- **Saying it is ready.** An object made with flag 1 is not a file: what is
+  read from it comes when it comes. Its server says what it is ready for —
+  readable, writable, hung up, a poll's bits — with `SYS_FD_READY`, and a
+  poll (`SYS_POLL`, `SYS_POLLSET_WAIT`) answers what it said last, and is
+  woken when that changes. Until it first says, it is ready for nothing. One
+  whose server has gone is readable and hung up, and a read of it fails.
 - **Asking about one.** For anything else a client wants of the object, it
   finds out which server and which cookie (`SYS_FD_SERVED`) and asks the
   server in the server's own protocol, naming the cookie.

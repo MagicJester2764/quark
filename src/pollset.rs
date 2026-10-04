@@ -250,8 +250,9 @@ fn readiness(tid: usize, fd: usize) -> u32 {
             }
         }
         // A file never keeps anybody waiting: a read answers with what is
-        // there, the end included, and a write is taken.
-        FdKind::Served { .. } => out |= READABLE | WRITABLE,
+        // there, the end included, and a write is taken. What is not a file
+        // is what its server last said.
+        FdKind::Served { obj } => out |= crate::served::readiness(obj).unwrap_or(READABLE | WRITABLE),
         // A listener with a connection waiting to be accepted.
         FdKind::Local { l } => {
             if crate::local::readable(l) {
@@ -409,6 +410,12 @@ pub fn note_timer() {
 /// and let the scan say whose it was.
 pub fn note_signals() {
     note(|tid, fd| fd < crate::task::MAX_FDS && matches!(crate::fdtable::get(tid, fd), FdKind::Signals { .. }));
+}
+
+/// What served object `obj` is ready for has changed, as its server said:
+/// wake whoever is waiting on a set that watches it.
+pub fn note_served(obj: usize) {
+    note(|tid, fd| fd < crate::task::MAX_FDS && crate::fdtable::get(tid, fd) == FdKind::Served { obj });
 }
 
 /// A connection has come to wait on listener `l`: wake whoever is waiting on

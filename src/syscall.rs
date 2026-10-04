@@ -457,6 +457,10 @@ pub const SYS_FD_KIND: u64 = 230;
 pub const SYS_FD_SERVE_PIPE: u64 = 231;
 /// Wait for somebody to hold the other end of a pipe.
 pub const SYS_PIPE_PEER: u64 = 232;
+/// A server says what an object of its own is ready for, to a poll.
+pub const SYS_FD_READY: u64 = 233;
+/// `SYS_FD_SERVE`'s flag: the server will say when the object is ready.
+const SERVE_SAYS_READY: u64 = 1;
 /// SYS_FD_SERVE_PIPE: the writing end, and only if the other end is held.
 const SERVE_PIPE_WRITE: u64 = 1;
 const SERVE_PIPE_PEER: u64 = 2;
@@ -474,7 +478,7 @@ pub const SYS_ABI_VERSION: u64 = 240;
 /// minor when calls are added. User space can refuse to run against a major it
 /// does not know, which is the point of exposing it at all.
 pub const ABI_VERSION_MAJOR: u64 = 3;
-pub const ABI_VERSION_MINOR: u64 = 31;
+pub const ABI_VERSION_MINOR: u64 = 32;
 
 /// Threads a task may make with no capability at all.
 ///
@@ -902,9 +906,17 @@ fn dispatch(
             let new = if arg0 == u64::MAX { None } else { Some(arg0 as u16) };
             crate::fdtable::umask(scheduler::current_tid(), new) as u64
         }
+        SYS_FD_READY => {
+            // arg0 = a cookie of the caller's, an object it made saying it
+            // would say when it is ready; arg1 = what it is ready for, a
+            // poll's bits.
+            if crate::served::set_ready(scheduler::current_tid(), arg0, arg1 as u32 & 0x7) { 0 } else { u64::MAX }
+        }
         SYS_FD_SERVE => {
             // arg0 = the client, arg1 = cookie, arg2 = where: a number,
-            // ANY_FD for the lowest free from 3, or the working directory's.
+            // ANY_FD for the lowest free from 3, or the working directory's;
+            // arg3 = flags: SERVE_SAYS_READY, that the caller will say when
+            // the object is ready rather than its always being, as a file is.
             //
             // Putting a descriptor into a task is handing it something, and
             // the rule is the one a capability grant has: the task consents by
@@ -914,7 +926,7 @@ fn dispatch(
             if client == me || !crate::ipc::is_calling(client, me) {
                 return u64::MAX;
             }
-            let obj = match crate::served::create(me, arg1) {
+            let obj = match crate::served::create(me, arg1, arg3 & SERVE_SAYS_READY != 0) {
                 Some(o) => o,
                 None => return u64::MAX,
             };
@@ -2580,7 +2592,7 @@ fn dispatch(
                     fd_write_ipc(net_tid, sock_tag(TAG_SOCK_WRITE, handle), ptr, len)
                 }
                 crate::task::FdKind::Served { obj } => {
-                    crate::served::io(obj, true, ptr as usize, len)
+                    crate::served::io(obj, true, ptr as usize, len, true)
                 }
                 crate::task::FdKind::Empty => {
                     // fd not connected — fall back to kernel console for fd 1/2
@@ -2638,7 +2650,7 @@ fn dispatch(
                     fd_read_ipc(net_tid, sock_tag(TAG_SOCK_READ, handle), ptr, max_len)
                 }
                 crate::task::FdKind::Served { obj } => {
-                    crate::served::io(obj, false, ptr as usize, max_len)
+                    crate::served::io(obj, false, ptr as usize, max_len, true)
                 }
                 crate::task::FdKind::Empty => u64::MAX,
             };
@@ -2717,9 +2729,10 @@ fn dispatch(
                 crate::task::FdKind::Signals { sfd } => {
                     crate::signal::read_for(me, crate::sigfd::mask(sfd), ptr, max_len, false)
                 }
-                // A file answers at once whichever way it is asked.
+                // A file answers at once whichever way it is asked; what is
+                // not a file is told the caller will not wait.
                 crate::task::FdKind::Served { obj } => {
-                    crate::served::io(obj, false, ptr as usize, max_len)
+                    crate::served::io(obj, false, ptr as usize, max_len, false)
                 }
                 _ => u64::MAX,
             };
@@ -2770,7 +2783,7 @@ fn dispatch(
                 }
                 crate::task::FdKind::Event { ev } => event_write(ev, ptr, len, false),
                 crate::task::FdKind::Served { obj } => {
-                    crate::served::io(obj, true, ptr as usize, len)
+                    crate::served::io(obj, true, ptr as usize, len, false)
                 }
                 _ => u64::MAX,
             };

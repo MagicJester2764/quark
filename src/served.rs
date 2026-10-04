@@ -28,6 +28,12 @@
 //!   call the kernel makes to the server on the task's behalf, lending the
 //!   task's buffer. So anything that can write to descriptor 1 can write to a
 //!   file put there, whatever it was written in.
+//! - A file is always ready, to a poll. An object that is not a file — what
+//!   is read from it comes when it comes — can have its server say when it
+//!   is ready instead (`SYS_FD_READY`): a poll answers what was said last,
+//!   and is woken when it changes. A read that may not wait says so to the
+//!   server, whose "nothing yet" is the would-block every other descriptor
+//!   answers; one that may, the server answers when it has something.
 //!
 //! A server is known by its endpoint, which is never given to another task, so
 //! a cookie outlives its server as nothing: every operation on it fails, and
@@ -53,6 +59,12 @@ pub const TAG_FD_READ: u64 = 0xFFFF_0009;
 /// The kernel writes for a task: `data` = `[cookie, length]`, a buffer lent
 /// for reading. Reply tag 0 with the count in `data[0]`.
 pub const TAG_FD_WRITE: u64 = 0xFFFF_000A;
+/// In `data[2]` of either: the task may not wait. A server with nothing yet
+/// answers [`NOTHING_YET`] for a count.
+const DO_NOT_WAIT: u64 = 1;
+/// A server's answer to a read or a write that may not wait, for which it
+/// has nothing yet: the would-block of every other descriptor.
+const NOTHING_YET: u64 = 0xFFFF_FFFE;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum State {
@@ -72,9 +84,12 @@ struct Object {
     endpoint: u64,
     cookie: u64,
     refs: u32,
+    /// What its server last said it is ready for (`SYS_FD_READY`), in a
+    /// poll's bits; `None` for one that is always ready, as a file is.
+    ready: Option<u32>,
 }
 
-const NONE: Object = Object { state: State::Free, server: 0, endpoint: 0, cookie: 0, refs: 0 };
+const NONE: Object = Object { state: State::Free, server: 0, endpoint: 0, cookie: 0, refs: 0, ready: None };
 
 static mut OBJECTS: [Object; MAX_SERVED] = [NONE; MAX_SERVED];
 /// Per server: something is waiting to be collected, and it has not been told.
@@ -107,8 +122,9 @@ fn server_alive(o: &Object) -> bool {
 }
 
 /// Make an object for `server`'s `cookie`, with one reference: the descriptor
-/// the caller is about to install.
-pub fn create(server: usize, cookie: u64) -> Option<usize> {
+/// the caller is about to install. With `says_ready`, the server says when it
+/// is ready, and until it does it is ready for nothing.
+pub fn create(server: usize, cookie: u64, says_ready: bool) -> Option<usize> {
     let endpoint = crate::cap::endpoint_of(server);
     if endpoint == 0 {
         return None;
@@ -117,7 +133,14 @@ pub fn create(server: usize, cookie: u64) -> Option<usize> {
     let out = unsafe {
         match objects().iter().position(|o| o.state == State::Free) {
             Some(i) => {
-                objects()[i] = Object { state: State::Live, server, endpoint, cookie, refs: 1 };
+                objects()[i] = Object {
+                    state: State::Live,
+                    server,
+                    endpoint,
+                    cookie,
+                    refs: 1,
+                    ready: says_ready.then_some(0),
+                };
                 Some(i)
             }
             None => None,
@@ -241,6 +264,43 @@ pub fn of(obj: usize) -> Option<(usize, u64)> {
     out
 }
 
+/// What a poll says of an object: what its server said last, or for one whose
+/// server says nothing, ready whichever way it is asked. One whose server has
+/// gone is ended, which a read finds out at once.
+pub fn readiness(obj: usize) -> Option<u32> {
+    if obj >= MAX_SERVED {
+        return None;
+    }
+    let flags = irq_save();
+    let out = unsafe {
+        let o = &objects()[obj];
+        if o.state != State::Live || !server_alive(o) { Some(crate::pollset::READABLE | crate::pollset::HANGUP) } else { o.ready }
+    };
+    irq_restore(flags);
+    out
+}
+
+/// `server`'s object `cookie` is ready for `bits` (a poll's: readable,
+/// writable, hung up), as it says. False for an object it did not make so.
+/// Whoever waits on a set watching it looks again.
+pub fn set_ready(server: usize, cookie: u64, bits: u32) -> bool {
+    let endpoint = crate::cap::endpoint_of(server);
+    if endpoint == 0 {
+        return false;
+    }
+    let flags = irq_save();
+    let found = unsafe {
+        objects().iter_mut().position(|o| o.state == State::Live && o.endpoint == endpoint && o.cookie == cookie)
+            .filter(|&i| objects()[i].ready.is_some())
+            .inspect(|&i| objects()[i].ready = Some(bits))
+    };
+    irq_restore(flags);
+    if let Some(obj) = found {
+        crate::pollset::note_served(obj);
+    }
+    found.is_some()
+}
+
 /// The cookie an object names, if it is one of `server`'s.
 pub fn cookie_for(obj: usize, server: usize) -> Option<u64> {
     let endpoint = crate::cap::endpoint_of(server);
@@ -277,11 +337,13 @@ pub fn server_gone(server: usize) {
 }
 
 /// Read or write through a served descriptor: a call to its server on the
-/// running task's behalf, lending it `len` bytes at `ptr`.
+/// running task's behalf, lending it `len` bytes at `ptr` — saying, unless
+/// it may `wait`, that it may not; and a server's "nothing yet" is then
+/// would-block.
 ///
 /// The task's own capabilities have nothing to do with it. Holding the
 /// descriptor is the permission, as it is for a pipe.
-pub fn io(obj: usize, write: bool, ptr: usize, len: usize) -> u64 {
+pub fn io(obj: usize, write: bool, ptr: usize, len: usize, wait: bool) -> u64 {
     let Some((server, cookie)) = of(obj) else {
         return u64::MAX;
     };
@@ -292,7 +354,7 @@ pub fn io(obj: usize, write: bool, ptr: usize, len: usize) -> u64 {
     let msg = crate::ipc::Message {
         sender: 0,
         tag: if write { TAG_FD_WRITE } else { TAG_FD_READ },
-        data: [cookie, len as u64, 0, 0, 0, 0],
+        data: [cookie, len as u64, if wait { 0 } else { DO_NOT_WAIT }, 0, 0, 0],
     };
     let lent = crate::ipc::Lent {
         addr: ptr,
@@ -302,6 +364,11 @@ pub fn io(obj: usize, write: bool, ptr: usize, len: usize) -> u64 {
         frame: false,
     };
     match crate::ipc::served_call(server, &msg, lent) {
+        // Nothing yet is an answer only to a caller that would not wait: to
+        // one that would, the server has failed it.
+        Ok(reply) if reply.tag == 0 && reply.data[0] == NOTHING_YET => {
+            if wait { u64::MAX } else { crate::pipe::WOULD_BLOCK }
+        }
         Ok(reply) if reply.tag == 0 => reply.data[0].min(len as u64),
         _ => u64::MAX,
     }

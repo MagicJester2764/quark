@@ -676,6 +676,13 @@ and kept in memory that `exec` throws away. Three things hold it together:
   (`ipc::served_call`), with the task's buffer lent. The task needs no
   capability for the server: the descriptor is the permission, as it is for a
   pipe.
+- A file is always ready. What is not a file — an inotify instance, whose
+  events come when they come — is made with a flag that says its server
+  will say when it is (`SYS_FD_READY`), and a poll answers that. Its
+  server is told whether a read may wait, and answers one that may not
+  with "nothing yet" rather than holding it: a descriptor marked
+  non-blocking that was held would be a program stopped, not one told to
+  try again.
 
 A **named pipe** is the other thing a file server hands out, and it is not
 a served descriptor: it is a pipe. The name, its owner and its mode are the
