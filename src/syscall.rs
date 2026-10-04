@@ -349,6 +349,13 @@ pub const SYS_CLOCK: u64 = 149;
 const CLOCK_WALL: u64 = 1;
 /// Say what time it is. For a holder of `Clock`.
 pub const SYS_CLOCK_SET: u64 = 150;
+/// A program's timer that raises a signal: POSIX's `timer_create` and the
+/// rest, by what arg0 says.
+pub const SYS_PTIMER: u64 = 151;
+const PTIMER_CREATE: u64 = 0;
+const PTIMER_SET: u64 = 1;
+const PTIMER_GET: u64 = 2;
+const PTIMER_DELETE: u64 = 3;
 
 // --- 0xB0  sockets ---
 /// Bind a net-server connection handle to a file descriptor.
@@ -449,7 +456,7 @@ pub const SYS_ABI_VERSION: u64 = 240;
 /// minor when calls are added. User space can refuse to run against a major it
 /// does not know, which is the point of exposing it at all.
 pub const ABI_VERSION_MAJOR: u64 = 3;
-pub const ABI_VERSION_MINOR: u64 = 28;
+pub const ABI_VERSION_MINOR: u64 = 29;
 
 /// Threads a task may make with no capability at all.
 ///
@@ -3565,6 +3572,71 @@ fn dispatch(
             crate::clock::set_wall(arg0);
             crate::rtc::write(arg0 / 1_000_000_000);
             0
+        }
+        SYS_PTIMER => {
+            let tid = scheduler::current_tid();
+            let now = crate::clock::now();
+            // Where to write how a timer stands, two words of nanoseconds:
+            // left, and between firings.
+            let write = |at: u64, (left, every): (u64, u64)| {
+                let _ua = crate::cpu::UserAccess::begin();
+                unsafe { core::ptr::write_unaligned(at as *mut [u64; 2], [left, every]) };
+            };
+            match arg0 {
+                // arg1 = the clock (0 the date, 1 or 7 the time since boot);
+                // arg2 = the signal, 0 for none, with bit 8 to carry the
+                // timer's own number rather than arg3; arg3 = what it
+                // carries; arg4 = the task of the caller's program to raise
+                // it for alone, 0 for the program.
+                PTIMER_CREATE => crate::ptimer::create(tid, arg1, arg2 & 0xFF, arg2 & 0x100 != 0, arg3, arg4 as usize)
+                    .map_or(u64::MAX, |id| id as u64),
+                // arg1 = the timer, with bit 32 for an absolute time; arg2 =
+                // when it first fires, a span from now — or with bit 32 of
+                // arg1 a time on its clock, in nanoseconds — 0 to disarm it;
+                // arg3 = a span between firings, 0 for once; arg4 = where to
+                // write how it stood before, or 0.
+                PTIMER_SET => {
+                    if arg4 != 0 && !validate_user_ptr_mut(arg4, 16) {
+                        return u64::MAX;
+                    }
+                    let absolute = arg1 >> 32 & 1 != 0;
+                    let first = if absolute { arg2 } else { crate::clock::span(arg2) };
+                    let every = crate::clock::span(arg3);
+                    match crate::ptimer::set(tid, (arg1 & 0xFFFF_FFFF) as usize, absolute, first, every, now) {
+                        Some((was, at)) => {
+                            if arg4 != 0 {
+                                write(arg4, was);
+                            }
+                            if at != 0 {
+                                crate::clock::due(at);
+                            }
+                            0
+                        }
+                        None => u64::MAX,
+                    }
+                }
+                // arg1 = the timer, arg2 = where to write how it stands, or
+                // 0 to ask only whether it is one.
+                PTIMER_GET => {
+                    if arg2 != 0 && !validate_user_ptr_mut(arg2, 16) {
+                        return u64::MAX;
+                    }
+                    match crate::ptimer::get(tid, arg1 as usize, now) {
+                        Some(stands) => {
+                            if arg2 != 0 {
+                                write(arg2, stands);
+                            }
+                            0
+                        }
+                        None => u64::MAX,
+                    }
+                }
+                // arg1 = the timer.
+                PTIMER_DELETE => {
+                    if crate::ptimer::delete(tid, arg1 as usize) { 0 } else { u64::MAX }
+                }
+                _ => u64::MAX,
+            }
         }
         SYS_MSI_ALLOC => {
             // An interrupt of the caller's own, for a device that sends its

@@ -1116,7 +1116,9 @@ The rules it leaves behind:
   time once in a while, by where in the tick it began.
 - **Everything about time passing is `clock::expire`.** A new kind of
   deadline is looked at there and answers with its earliest still to come,
-  so that the timer is set for it. Alarms last: raising one may not return.
+  so that the timer is set for it. Alarms and a program's timers
+  (`ptimer.rs`) last, each re-armed before its signal is raised: raising
+  one may not return.
 - **A wait never ends early.** The timer is set a thousandth late on
   purpose (`lapic::one_shot`): an interrupt before the time finds nothing
   due and has to be taken again.

@@ -1,6 +1,6 @@
 # Quark syscall ABI
 
-**Version 3.28.** Query the running kernel with `SYS_ABI_VERSION` (240), which
+**Version 3.29.** Query the running kernel with `SYS_ABI_VERSION` (240), which
 returns `(major << 16) | minor`.
 
 This document is the contract between the Quark kernel and everything above it.
@@ -225,6 +225,7 @@ returning at once turned that loop into a spin.
 | 3.16 | **Off, and on again, by the firmware's tables.** `SYS_POWER` (119) turns the machine off or restarts it, for a holder of the new capability `Power` (type 12): by ACPI's control and reset registers, where a program used to write to the three ports QEMU listens on. |
 | 3.17 | **Memory above four gigabytes.** All of a machine's memory is used, up to 511 GiB, where the kernel used the first four gigabytes of it. `SYS_PHYS_ALLOC` takes a flag (arg1 = 1) for frames below four gigabytes, which is what a device that is told an address in thirty-two bits needs; without it a frame is ordinary memory and comes from the top. `SYS_MEM_INFO` takes what to say (arg0): 1 for how much memory the machine has and 2 for where it ends. |
 | 3.18 | **The wide registers.** A program may use AVX, AVX2 and AVX-512 where the processor has them: the kernel turns them on (`OSXSAVE`, XCR0) and saves all of each task's with `XSAVE`. Before, an AVX instruction was a fault. No call changed. |
+| 3.29 | **A program's timers.** `SYS_PTIMER` (151) gives a program up to 32 timers, each on the date's clock or the time since boot, that raise a signal — for the program, or for one task of it — carrying a value, or nothing: POSIX's `timer_create`, `timer_settime`, `timer_gettime` and `timer_delete`. What comes with a timer's signal says so (`si_code` -2) and carries its number and its overruns: a timer that fires while its last signal is still waiting raises no other, and that one counts it. A forked child has none; `SYS_EXEC_SPACE` ends them. |
 | 3.28 | **Signals that queue, and say who.** A real-time signal (32 to 64) raised while one of its number is waiting waits behind it, with what it carried — 64 for a program and 16 for a task beyond the first of each number — where it used to be the same one again; a signal below 32 keeps what came with the raise that made it wait. `SYS_SIG_QUEUE` (136) raises one carrying a value. What came with a signal is three words — Linux's `si_code`, who raised it (a process id and a user; a child's for 17), and a value (the one it was queued with, a child's status, a fault's address) — at the end of a handler's record, and written by `SYS_SIG_WAIT` with arg3 = 1. `SYS_SIG_RAISE` answers `0xFFFF_FFFE` for a real-time signal that cannot wait. |
 | 3.27 | **What a program was started as.** `SYS_PROGRAM_NAME` (214) keeps a program's command line — its arguments, each ended by a nought, the first 128 bytes of them — set by the program itself or for a child its caller has made and not started, and read by anybody: what `ps` shows, and what `/proc` says a process is called. `SYS_FORK` copies it; a program that becomes another with `SYS_EXEC_SPACE` says what it has become. |
 | 3.26 | **A child is put in its band by whoever made it.** `SYS_TASK_PRIORITY` (105) sets the band of a task its caller made and has not started, as `SYS_TASK_CREATE_IN` and the rest let it be filled, with no `TaskMgmt`; and with arg1 = `u64::MAX` it says which band a task is in, to anybody. A spawner with no authority over anybody — the device manager — could not give a driver the drivers' band its manifest asks for, so every driver it started ran as an ordinary program: preempted by anything, and its memory taken when memory was short — a disk's driver written out to the disk it drives. |
@@ -520,9 +521,9 @@ laid out as Linux's `siginfo_t` has them after its first two ints:
 
 | word | what |
 |---|---|
-| 0 | `si_code`, sign-extended: 0 raised with `SYS_SIG_RAISE` (`SI_USER`), -6 the same for one task (`SI_TKILL`), -1 with `SYS_SIG_QUEUE` (`SI_QUEUE`), 0x80 the kernel's own (`SI_KERNEL`); for 17, 1 the child exited, 2 a signal ended it, 5 it stopped, 6 it was continued; for a fault, Linux's word for how — 1 or 2 for 11 (nothing there, or something that may not be touched so), 1 or 2 for 7 (an address off its boundary, or one that could not be had), 1 for 8 (a division by nought), 2 for 4 (not an instruction) |
-| 1 | who raised it: the process id in the low 32 bits and its user in the high; for 17, the child's; 0 for the kernel and a fault |
-| 2 | what it carried: the value it was queued with; for 17, what the child exited with, or the signal that ended, stopped or continued it; for a fault, the address |
+| 0 | `si_code`, sign-extended: 0 raised with `SYS_SIG_RAISE` (`SI_USER`), -6 the same for one task (`SI_TKILL`), -1 with `SYS_SIG_QUEUE` (`SI_QUEUE`), -2 by a program's timer (`SI_TIMER`, see *Time*), 0x80 the kernel's own (`SI_KERNEL`); for 17, 1 the child exited, 2 a signal ended it, 5 it stopped, 6 it was continued; for a fault, Linux's word for how — 1 or 2 for 11 (nothing there, or something that may not be touched so), 1 or 2 for 7 (an address off its boundary, or one that could not be had), 1 for 8 (a division by nought), 2 for 4 (not an instruction) |
+| 1 | who raised it: the process id in the low 32 bits and its user in the high; for 17, the child's; for a timer, its number and its overruns; 0 for the kernel and a fault |
+| 2 | what it carried: the value it was queued with, or a timer's; for 17, what the child exited with, or the signal that ended, stopped or continued it; for a fault, the address |
 
 From 32 up a signal is *real-time*, and one raised while one of its number
 is waiting waits behind it, with its own three words, rather than being the
@@ -1354,6 +1355,7 @@ for a process group.
 | 148 | `SYS_TIMER_GET` | arg0 = fd, arg1 = where to write two `u64` of nanoseconds, what is left and the interval, or 0 | in ticks, `(interval << 32) \| ticks left` / `u64::MAX` | — |
 | 149 | `SYS_CLOCK` | arg0 = which: 0 since boot, 1 since 1970 | nanoseconds; 0 since 1970 if the machine has no clock / `u64::MAX` for a clock there is not | — |
 | 150 | `SYS_CLOCK_SET` | arg0 = nanoseconds since 1970, now | 0 / `u64::MAX` | `Clock` |
+| 151 | `SYS_PTIMER` | arg0 = what: 0 make one — arg1 = its clock (0 the date, 1 or 7 the time since boot), arg2 = the signal it raises (0 for none) with bit 8 to carry its own number rather than arg3, arg3 = what it carries, arg4 = a task of the caller's program to raise it for alone (0 for the program); 1 set it — arg1 = the timer, with bit 32 for a time rather than a span, arg2 = when it first fires, a span from now or a time on its clock in nanoseconds (0 disarms it), arg3 = a span between firings (0 for once), arg4 = where to write how it stood, or 0; 2 say how it stands — arg1 = the timer, arg2 = where to write it, or 0; 3 end it — arg1 = the timer | 0: the timer's number; else 0 / `u64::MAX` | — |
 
 **A span of time is a count of ticks, or — with its top bit set — of
 nanoseconds.** A tick is a hundredth of a second, and for a long time it was
@@ -1400,6 +1402,34 @@ its own beat — every interval after the first firing, however late any one
 of them was seen to — and one that fell behind its reader does not fire in
 a burst to catch up: the intervals that went by are counted, and the next
 deadline is the first one still to come. There are sixteen in the machine.
+
+**A program's timers** (`SYS_PTIMER`) raise a signal rather than wake a
+reader: POSIX's `timer_create` and the rest. A program has up to 32, each on
+a clock — the date (0) or the time since boot (1, and 7, which here is the
+same) — with what it raises: a signal for the program, or for one task of it
+alone (Linux's `SIGEV_THREAD_ID`, which musl's `SIGEV_THREAD` is built on),
+carrying a value; or nothing, for a timer that is only asked how it stands.
+The number a timer is made with is what every other op names it by; it is
+the program's, from 0 up, and is given out again once the timer is ended.
+
+A timer is made disarmed. Setting it says when it first fires — a span from
+now, or with bit 32 of arg1 a time on its clock, which for the date is a
+date and a time already gone fires at once — and how often after that; a
+first firing of 0 disarms it. It fires on its own beat, as a timer
+descriptor does. How it stands is two words of nanoseconds: what is left
+until it next fires, which is 0 only for a timer that is disarmed, and what
+it repeats at. Setting it writes how it stood before where arg4 says.
+
+What comes with a timer's signal (see *Signals*) says a timer raised it
+(`si_code` -2), has the timer's number where a process id would be and its
+overruns where a user would be, and carries the timer's value. A timer
+whose last signal is still waiting when it fires again raises no other: the
+one waiting counts one more overrun, and so does every firing the clock was
+too late to see to. The timers are the program's: a forked child has none,
+`SYS_EXEC_SPACE` ends them, and a timer for a task that has ended raises
+nothing. Setting the date moves none of them, a timer set for a date
+included: it fires when the time since boot reaches what that date was when
+it was set.
 
 ### Sockets (0xB0)
 

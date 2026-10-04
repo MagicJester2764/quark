@@ -53,6 +53,7 @@ mod lapic;
 mod stream;
 pub mod pipe;
 mod pty;
+mod ptimer;
 mod timerfd;
 mod tlb;
 mod usage;

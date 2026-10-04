@@ -409,10 +409,10 @@ fn set(at: u64, now: u64) {
 /// processor, interrupts off, the kernel lock held.
 ///
 /// It may not return. The last thing it does is raise the alarms that are
-/// due, and for a program that has said nothing about that signal an alarm
-/// is the end — if that is the program this interrupted, there is nothing
-/// to come back to. So the timer is set before, for what will be due once
-/// those alarms have been seen to.
+/// due, and the signals of programs' timers, and for a program that has
+/// said nothing about that signal one is the end — if that is the program
+/// this interrupted, there is nothing to come back to. So the timer is set
+/// before, for what will be due once those have been seen to.
 pub fn expire(shot: bool) {
     let now = now();
     if shot {
@@ -421,7 +421,8 @@ pub fn expire(shot: bool) {
     let next = crate::timerfd::expire(now)
         .min(crate::ipc::check_timeouts(now))
         .min(crate::futex::check_timeouts(now))
-        .min(crate::fdtable::alarm_after(now));
+        .min(crate::fdtable::alarm_after(now))
+        .min(crate::ptimer::after(now));
     if TIMER.load(Ordering::Relaxed) {
         if next < now.saturating_add(TICK_NS) {
             set(next, now);
@@ -432,4 +433,5 @@ pub fn expire(shot: bool) {
         }
     }
     crate::signal::alarms(now);
+    crate::signal::timers(now);
 }

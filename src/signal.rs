@@ -172,10 +172,11 @@ impl Info {
 }
 
 /// Linux's `si_code`s: raised by a program with `kill`, by the kernel, by a
-/// program with a value, by a program for one task.
+/// program with a value, by a timer, by a program for one task.
 pub const SI_USER: i64 = 0;
 pub const SI_KERNEL: i64 = 0x80;
 pub const SI_QUEUE: i64 = -1;
+pub const SI_TIMER: i64 = -2;
 pub const SI_TKILL: i64 = -6;
 /// SIGCHLD's: the child exited, was ended by a signal, stopped, or was
 /// continued — and the status is what it exited with or the signal.
@@ -266,6 +267,26 @@ impl<const N: usize> Waiting<N> {
     /// Nothing is waiting.
     pub fn clear(&mut self) {
         self.queued = 0;
+    }
+
+    /// Timer `id`'s `signo` is waiting — the one waiting first if `first`
+    /// says one is, or behind it — and its overruns are counted up by `by`.
+    /// False if it is not waiting.
+    pub fn bump_timer(&mut self, signo: u8, id: u64, first: bool, by: u64) -> bool {
+        let mine = |info: &Info| info.code == SI_TIMER && info.who & 0xFFFF_FFFF == id;
+        let at = if first && mine(&self.info[signo as usize - 1]) {
+            Some(&mut self.info[signo as usize - 1])
+        } else {
+            self.behind[..self.queued].iter_mut().find(|b| b.0 == signo && mine(&b.1)).map(|b| &mut b.1)
+        };
+        match at {
+            Some(info) => {
+                let overruns = (info.who >> 32).saturating_add(by).min(i32::MAX as u64);
+                info.who = id | overruns << 32;
+                true
+            }
+            None => false,
+        }
     }
 
     /// Nothing is waiting behind but signals in `set`.
@@ -723,6 +744,44 @@ pub fn alarms(now: u64) {
     while let Some(tid) = fdtable::alarm_due(now) {
         let _ = raise(tid, SIGALRM);
     }
+}
+
+/// The clock's part for timers (`ptimer.rs`): the signal of each timer of
+/// each program due at `now`, one at a time, each re-armed before its
+/// signal is raised, as an alarm's is — raising it may not return. A timer
+/// whose last signal is still waiting raises no other: what is waiting
+/// counts this firing, and those the clock did not look in time for, as
+/// overruns.
+pub fn timers(now: u64) {
+    while let Some(due) = crate::ptimer::due(now) {
+        let id = due.id as u64;
+        let waiting = if due.task != 0 {
+            task_timer_bump(due.task, due.signo, id, due.missed + 1)
+        } else {
+            fdtable::sig_timer_bump(due.tid, due.signo, id, due.missed + 1)
+        };
+        if waiting {
+            continue;
+        }
+        let info = Info { code: SI_TIMER, who: id | due.missed.min(i32::MAX as u64) << 32, value: due.value };
+        let _ = if due.task != 0 {
+            raise_task(due.task, due.signo, info)
+        } else {
+            raise_with(due.tid, due.signo, info)
+        };
+    }
+}
+
+/// Timer `id`'s `signo`, raised for task `t` alone, is still waiting there:
+/// it counts `by` more overruns. False if it is not.
+fn task_timer_bump(t: usize, signo: u8, id: u64, by: u64) -> bool {
+    if t >= MAX_TASKS {
+        return false;
+    }
+    let flags = irq_save();
+    let bumped = unsafe { TWAITING[t].bump_timer(signo, id, TPENDING[t] & 1 << (signo - 1) != 0, by) };
+    irq_restore(flags);
+    bumped
 }
 
 /// A child of `parent` has ended, stopped or been continued, as `info`

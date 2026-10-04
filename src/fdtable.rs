@@ -227,6 +227,7 @@ pub fn attach_new(tid: usize) -> bool {
                     tables()[i] = EMPTY;
                     tables()[i].tasks = 1;
                     (*core::ptr::addr_of_mut!(WAITING))[i].clear();
+                    crate::ptimer::clear(i);
                     of[tid] = i as u16;
                     true
                 }
@@ -258,6 +259,28 @@ pub fn table_of(tid: usize) -> usize {
     if i == NONE { usize::MAX } else { i as usize }
 }
 
+/// A task using table `table`, if any does.
+pub fn a_task_of(table: usize) -> Option<usize> {
+    let flags = irq_save();
+    let found = unsafe {
+        (*core::ptr::addr_of!(OF_TASK)).iter().position(|&t| t != NONE && t as usize == table)
+    };
+    irq_restore(flags);
+    found
+}
+
+/// Timer `id`'s `signo` is still waiting for `tid`'s program: it counts
+/// `by` more overruns. False if it is not.
+pub fn sig_timer_bump(tid: usize, signo: u8, id: u64, by: u64) -> bool {
+    let bit = sig_bit(signo);
+    let flags = irq_save();
+    let bumped = unsafe {
+        signals_mut(tid).is_some_and(|(t, w)| w.bump_timer(signo, id, (t.sig_pending | t.sig_held) & bit != 0, by))
+    };
+    irq_restore(flags);
+    bumped
+}
+
 /// Leave the table `tid` uses. If no task uses it any more, what it held is
 /// returned for the caller to release — outside the lock, since releasing a
 /// pipe end wakes whoever was waiting on it.
@@ -278,6 +301,7 @@ fn leave(tid: usize) -> Option<[FdKind; SLOTS]> {
             if t.tasks == 0 {
                 let fds = t.fds;
                 *t = EMPTY;
+                crate::ptimer::clear(i as usize);
                 Some(fds)
             } else {
                 None
@@ -1246,6 +1270,8 @@ pub fn close_on_exec(tid: usize) {
         }
     }
     irq_restore(flags);
+    // And its timers, which were set for the program that has gone.
+    crate::ptimer::clear(table_of(tid));
     release_all(&gone);
 }
 
