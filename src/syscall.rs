@@ -487,7 +487,7 @@ pub const SYS_ABI_VERSION: u64 = 240;
 /// minor when calls are added. User space can refuse to run against a major it
 /// does not know, which is the point of exposing it at all.
 pub const ABI_VERSION_MAJOR: u64 = 3;
-pub const ABI_VERSION_MINOR: u64 = 34;
+pub const ABI_VERSION_MINOR: u64 = 35;
 
 /// Threads a task may make with no capability at all.
 ///
@@ -4697,6 +4697,7 @@ fn dispatch(
                 12 => crate::cap::CapType::Power,
                 13 => crate::cap::CapType::Swap,
                 14 => crate::cap::CapType::PciDevice,
+                15 => crate::cap::CapType::NetAdmin,
                 _ => return u64::MAX,
             };
             let tid = scheduler::current_tid();

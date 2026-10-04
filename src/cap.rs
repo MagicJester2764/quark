@@ -130,6 +130,16 @@ pub enum CapType {
     /// those ports now (`pci::config_port`). The first task holds every
     /// device and hands each driver its own.
     PciDevice = 14,
+    /// Permission to say how the network stack treats what comes in: its
+    /// filter, and what else its server keeps for whoever runs the network.
+    /// No parameters.
+    ///
+    /// The kernel acts on it nowhere. A server is offered one with a call
+    /// (`SYS_CALL_OFFER`) and believes the call of a program that could:
+    /// a right that is the stack's to honour, minted and handed on as the
+    /// clock's is, so that who may is said where everything else a session
+    /// may do is said.
+    NetAdmin = 15,
 }
 
 /// A `MemObject`'s access bits.
@@ -856,7 +866,8 @@ pub fn insert_kernel_range(cspace: &mut CSpace, base: usize, len: usize) -> bool
 /// parameter or none — the right to map the machine's devices' registers
 /// ([`CapType::DeviceMemory`]), the right to set its clock
 /// ([`CapType::Clock`]), the right to turn it off ([`CapType::Power`]), the
-/// right to keep what is written out of memory ([`CapType::Swap`]), every
+/// right to keep what is written out of memory ([`CapType::Swap`]), the
+/// right to run its network ([`CapType::NetAdmin`]), every
 /// PCI device ([`CapType::PciDevice`], `pci::ANY`) — in its last free
 /// slot. The first task names its
 /// low slots itself — where it keeps the nameserver's endpoint, where it
@@ -940,6 +951,7 @@ pub fn validate_attenuation(source: &CapSlot, new_type: CapType, new_p0: u64, ne
         CapType::Clock => true,
         CapType::Power => true,
         CapType::Swap => true,
+        CapType::NetAdmin => true,
         // Every device covers each one; one covers itself.
         CapType::PciDevice => {
             (new_p0 <= 0xFFFF || new_p0 == crate::pci::ANY)

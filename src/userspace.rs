@@ -409,6 +409,9 @@ pub fn spawn_init(elf_data: &[u8], fb: Option<crate::multiboot2::FramebufferInfo
             crate::cap::insert_last(cs, crate::cap::CapType::Power, 0);
             // And the right to be where memory is written out to.
             crate::cap::insert_last(cs, crate::cap::CapType::Swap, 0);
+            // And the right to say how the network treats what comes in,
+            // which its server is offered and the kernel never asks for.
+            crate::cap::insert_last(cs, crate::cap::CapType::NetAdmin, 0);
             // And every PCI device, to hand each driver its own.
             crate::cap::insert_last(cs, crate::cap::CapType::PciDevice, crate::pci::ANY);
         });

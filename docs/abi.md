@@ -1,6 +1,6 @@
 # Quark syscall ABI
 
-**Version 3.34.** Query the running kernel with `SYS_ABI_VERSION` (240), which
+**Version 3.35.** Query the running kernel with `SYS_ABI_VERSION` (240), which
 returns `(major << 16) | minor`.
 
 This document is the contract between the Quark kernel and everything above it.
@@ -225,6 +225,7 @@ returning at once turned that loop into a spin.
 | 3.16 | **Off, and on again, by the firmware's tables.** `SYS_POWER` (119) turns the machine off or restarts it, for a holder of the new capability `Power` (type 12): by ACPI's control and reset registers, where a program used to write to the three ports QEMU listens on. |
 | 3.17 | **Memory above four gigabytes.** All of a machine's memory is used, up to 511 GiB, where the kernel used the first four gigabytes of it. `SYS_PHYS_ALLOC` takes a flag (arg1 = 1) for frames below four gigabytes, which is what a device that is told an address in thirty-two bits needs; without it a frame is ordinary memory and comes from the top. `SYS_MEM_INFO` takes what to say (arg0): 1 for how much memory the machine has and 2 for where it ends. |
 | 3.18 | **The wide registers.** A program may use AVX, AVX2 and AVX-512 where the processor has them: the kernel turns them on (`OSXSAVE`, XCR0) and saves all of each task's with `XSAVE`. Before, an AVX instruction was a fault. No call changed. |
+| 3.35 | **The right to run the network.** Capability type 15, `NetAdmin`: no parameters, minted and handed on as `Clock` is, and the first task is started with it. The kernel acts on it nowhere: the network stack is offered one with a call (`SYS_CALL_OFFER`) and changes its filter only for a caller that could. |
 | 3.34 | **What a thread library keeps with the kernel.** `SYS_TASK_NAME` (215) says and reads what a task is called — Linux's `comm`, fifteen bytes, none being its program's name — set for a task of the caller's own program, or by a server for one of the program of a client that is calling it; a task is called what its maker was, and `exec` forgets it. `SYS_ROBUST_LIST` (132) says where the caller's robust list is (`set_robust_list`): when a task dies, or becomes another program, the kernel walks it in its memory and marks each mutex it still holds as one whose owner died, waking a waiter. `SYS_USAGE` with 4 says what one task has used, another thread's processor clock, and `SYS_PID` with arg1 = 1 a task's own number, which is how the task a program began as is told from its others. |
 | 3.33 | **A set watches everything, as epoll does.** A watch of `SYS_POLLSET_CTL` can be an edge (events bit 16, epoll's `EPOLLET`): reported when what it watches has been noted since it was last looked at, and is ready then — and once when it is added or modified, if it is ready. Or a one-shot (bit 17, `EPOLLONESHOT`): reported once, and then not until it is modified. `0x10` asked for beside readable is said beside a hangup (`EPOLLRDHUP`). A set can watch a set, which is readable while a wait on it would report something — a chain no deeper than four below the one waited on, and no set watching itself through others. And `SYS_POLLSET_CTL` with op bit 8 says why it refused, with a small number, where it answered all ones. |
 | 3.32 | **What a server says is ready.** `SYS_FD_SERVE` takes a flag (arg3 = 1) for an object that is not a file — what is read from it comes when it comes — whose server says what it is ready for, with `SYS_FD_READY` (233): a poll answers what was said last, and is woken when it changes. A read or a write that may not wait says so to the server (`data[2]` = 1), whose answer of `0xFFFF_FFFE` for a count is "would block". A file is as it was: always ready, and asked the same way whether or not the caller would wait. |
@@ -293,6 +294,7 @@ UID 0 bypass in the kernel. Each task has a CSpace of 64 slots holding
 | 12 | `Power` | — | — |
 | 13 | `Swap` | — | — |
 | 14 | `PciDevice` | a PCI device, `bus << 8 \| device << 3 \| function` (`0xFFFF_FFFF` = every one) | — |
+| 15 | `NetAdmin` | — | — |
 
 Delegation may narrow a capability but never widen it; delegating at equal
 breadth is allowed, since a set is a subset of itself.
