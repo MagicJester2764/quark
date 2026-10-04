@@ -6,10 +6,20 @@
 //!
 //! The bytes are two pipes rather than a new buffer, because a pipe is already
 //! a ring with readers, writers and tasks blocked on both. What a stream adds
-//! is the pairing, and a queue of descriptors in flight: a message can carry a
-//! handle to an object, which is what `SCM_RIGHTS` does on Unix and the reason
-//! `wl_shm` works at all. The queue is filled in the commit that adds passing;
-//! here it exists and stays empty.
+//! is the pairing, and a queue of descriptors in flight: a message can carry
+//! handles to objects, which is what `SCM_RIGHTS` does on Unix and the reason
+//! `wl_shm` works at all.
+//!
+//! The queue is not tied to the bytes. A send queues its descriptors before
+//! its bytes, so a receive that reads a message's first byte can take them,
+//! and a receive takes what is queued, in order, as many as it has room for
+//! — perhaps a later message's too. That is all that what passes descriptors
+//! asks: libwayland, libdbus and xcb each gather what arrives into a queue of
+//! their own and give each message its share in order.
+//!
+//! And each end knows who is at the other (`SO_PEERCRED`): for a pair, the
+//! program that made it; for a connection made by a name (`local.rs`), the
+//! listener as it listened and the connector as it connected.
 
 use crate::pipe;
 use crate::task::FdKind;
@@ -18,11 +28,26 @@ use crate::task::FdKind;
 /// for.
 const MAX_STREAMS: usize = 32;
 
-/// Descriptors in flight in one direction.
-///
-/// A protocol attaches at most one descriptor to a message and the peer reads
-/// messages in order, so this only has to absorb a burst.
-const FD_QUEUE: usize = 8;
+/// Descriptors in flight in one direction: a burst of messages, each with a
+/// few. A send that would overfill it is refused whole.
+const FD_QUEUE: usize = 32;
+
+/// Who a program is, as one end of a stream is told of the other: a process
+/// id, a user and a group.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub struct Creds {
+    pub pid: u32,
+    pub uid: u32,
+    pub gid: u32,
+}
+
+impl Creds {
+    /// Task `tid`'s program, as it is now.
+    pub fn of(tid: usize) -> Creds {
+        let (uid, gid) = crate::scheduler::task_uid_gid(tid).unwrap_or((0, 0));
+        Creds { pid: crate::scheduler::pid_of(tid) as u32, uid, gid }
+    }
+}
 
 struct Stream {
     in_use: bool,
@@ -41,6 +66,11 @@ struct Stream {
     /// connection. With a flag, the parent closing its copy would tell the peer
     /// the end had gone while the child was still holding it.
     refs: [usize; 2],
+    /// Who is at the other end of each end.
+    peer: [Creds; 2],
+    /// Each end has asked to be told who sent what it receives
+    /// (`SO_PASSCRED`).
+    passcred: [bool; 2],
 }
 
 impl Stream {
@@ -53,6 +83,8 @@ impl Stream {
             q: [[FdKind::Empty; FD_QUEUE]; 2],
             q_len: [0; 2],
             refs: [0; 2],
+            peer: [Creds { pid: 0, uid: 0, gid: 0 }; 2],
+            passcred: [false; 2],
         }
     }
 }
@@ -130,6 +162,7 @@ pub fn create(tid: usize) -> Option<usize> {
                 s.zero_to_one = a;
                 s.one_to_zero = b;
                 s.refs = [1, 1];
+                s.peer = [Creds::of(tid); 2];
             }
             irq_restore(flags);
             Some(i)
@@ -228,12 +261,12 @@ pub fn close_end(stream: usize, end: u8) {
     pipe::drop_ref(wr, true);
 }
 
-/// Queue a descriptor for the peer of `end`. False if the queue is full or
-/// the peer has gone.
+/// Queue descriptors for the peer of `end`, all of them or none. False if
+/// there is not room for them all, or the peer has gone.
 ///
-/// The caller has already taken an in-flight reference; on refusal it is the
-/// caller's to give back.
-pub fn push_fd(stream: usize, end: u8, kind: FdKind) -> bool {
+/// The caller has already taken an in-flight reference on each; on refusal
+/// they are the caller's to give back.
+pub fn push_fds(stream: usize, end: u8, kinds: &[FdKind]) -> bool {
     if stream >= MAX_STREAMS || end > 1 {
         return false;
     }
@@ -241,11 +274,13 @@ pub fn push_fd(stream: usize, end: u8, kind: FdKind) -> bool {
     let flags = irq_save();
     let ok = unsafe {
         let s = &mut streams()[stream];
-        if !s.in_use || s.refs[to] == 0 || s.q_len[to] == FD_QUEUE {
+        if !s.in_use || s.refs[to] == 0 || s.q_len[to] + kinds.len() > FD_QUEUE {
             false
         } else {
-            s.q[to][s.q_len[to]] = kind;
-            s.q_len[to] += 1;
+            for &kind in kinds {
+                s.q[to][s.q_len[to]] = kind;
+                s.q_len[to] += 1;
+            }
             true
         }
     };
@@ -253,10 +288,11 @@ pub fn push_fd(stream: usize, end: u8, kind: FdKind) -> bool {
     ok
 }
 
-/// Take back the descriptor this end last put on its peer's queue, if it is
-/// still there and is `kind`: a send that sent nothing sends no descriptor
-/// either. Its in-flight reference is the caller's to release.
-pub fn take_back_fd(stream: usize, end: u8, kind: FdKind) -> bool {
+/// Take back the descriptors this end last put on its peer's queue, if they
+/// are still there and are `kinds`: a send that sent nothing sends no
+/// descriptor either. Their in-flight references are the caller's to
+/// release.
+pub fn take_back_fds(stream: usize, end: u8, kinds: &[FdKind]) -> bool {
     if stream >= MAX_STREAMS || end > 1 {
         return false;
     }
@@ -265,8 +301,8 @@ pub fn take_back_fd(stream: usize, end: u8, kind: FdKind) -> bool {
     let taken = unsafe {
         let s = &mut streams()[stream];
         let n = s.q_len[to];
-        if s.in_use && n > 0 && s.q[to][n - 1] == kind {
-            s.q_len[to] -= 1;
+        if s.in_use && n >= kinds.len() && s.q[to][n - kinds.len()..n] == *kinds {
+            s.q_len[to] -= kinds.len();
             true
         } else {
             false
@@ -274,6 +310,55 @@ pub fn take_back_fd(stream: usize, end: u8, kind: FdKind) -> bool {
     };
     irq_restore(flags);
     taken
+}
+
+/// Who is at the other end of `end`.
+pub fn peer_of(stream: usize, end: u8) -> Option<Creds> {
+    if stream >= MAX_STREAMS || end > 1 {
+        return None;
+    }
+    let flags = irq_save();
+    let out = unsafe {
+        let s = &streams()[stream];
+        s.in_use.then_some(s.peer[end as usize])
+    };
+    irq_restore(flags);
+    out
+}
+
+/// A connection made by a name: end 0's peer is `of_zero`'s and end 1's is
+/// `of_one`'s; and end 1 has asked to be told who sent what, if `passcred`.
+pub fn connected(stream: usize, of_zero: Creds, of_one: Creds, passcred: bool) {
+    if stream < MAX_STREAMS {
+        let flags = irq_save();
+        unsafe {
+            let s = &mut streams()[stream];
+            s.peer = [of_zero, of_one];
+            s.passcred[1] = passcred;
+        }
+        irq_restore(flags);
+    }
+}
+
+/// Whether `end` has asked to be told who sent what it receives; and, with
+/// `set`, that it has or has not.
+pub fn passcred(stream: usize, end: u8, set: Option<bool>) -> Option<bool> {
+    if stream >= MAX_STREAMS || end > 1 {
+        return None;
+    }
+    let flags = irq_save();
+    let out = unsafe {
+        let s = &mut streams()[stream];
+        s.in_use.then(|| {
+            let was = s.passcred[end as usize];
+            if let Some(on) = set {
+                s.passcred[end as usize] = on;
+            }
+            was
+        })
+    };
+    irq_restore(flags);
+    out
 }
 
 /// Take the descriptor at the head of this end's queue, if any.

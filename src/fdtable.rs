@@ -481,6 +481,28 @@ pub fn replace(tid: usize, fd: usize, kind: FdKind) -> Result<FdKind, ()> {
     out
 }
 
+/// Put `new` at `fd` if `expected` is what is there, keeping the slot's
+/// close-on-exec mark: the same descriptor, become what its object became.
+/// What was there is the caller's to release. False, and nothing changed,
+/// if the slot holds something else.
+pub fn swap_if(tid: usize, fd: usize, expected: FdKind, new: FdKind) -> bool {
+    if fd >= SLOTS {
+        return false;
+    }
+    let flags = irq_save();
+    let swapped = unsafe {
+        table_mut(tid).is_some_and(|t| {
+            let same = t.fds[fd] == expected;
+            if same {
+                t.fds[fd] = new;
+            }
+            same
+        })
+    };
+    irq_restore(flags);
+    swapped
+}
+
 /// Empty `fd` and return what it named, for the caller to release.
 pub fn take(tid: usize, fd: usize) -> FdKind {
     replace(tid, fd, FdKind::Empty).unwrap_or(FdKind::Empty)
@@ -1321,6 +1343,7 @@ pub fn hold(tid: usize, fd: usize) -> FdKind {
             | FdKind::Event { .. }
             | FdKind::Served { .. }
             | FdKind::Signals { .. }
+            | FdKind::Local { .. }
     );
     if waits && crate::pipe::retain_fd(&kind).is_ok() {
         unsafe { (*core::ptr::addr_of_mut!(HELD))[tid] = kind };

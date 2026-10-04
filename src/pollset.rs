@@ -128,6 +128,7 @@ pub fn watchable(tid: usize, fd: usize) -> bool {
             | FdKind::Event { .. }
             | FdKind::Served { .. }
             | FdKind::Signals { .. }
+            | FdKind::Local { .. }
     )
 }
 
@@ -251,6 +252,12 @@ fn readiness(tid: usize, fd: usize) -> u32 {
         // A file never keeps anybody waiting: a read answers with what is
         // there, the end included, and a write is taken.
         FdKind::Served { .. } => out |= READABLE | WRITABLE,
+        // A listener with a connection waiting to be accepted.
+        FdKind::Local { l } => {
+            if crate::local::readable(l) {
+                out |= READABLE;
+            }
+        }
         // Whose signals are the reader's: here the one asking.
         FdKind::Signals { sfd } => {
             if crate::signal::waiting_for(tid) & crate::sigfd::mask(sfd) != 0 {
@@ -402,6 +409,12 @@ pub fn note_timer() {
 /// and let the scan say whose it was.
 pub fn note_signals() {
     note(|tid, fd| fd < crate::task::MAX_FDS && matches!(crate::fdtable::get(tid, fd), FdKind::Signals { .. }));
+}
+
+/// A connection has come to wait on listener `l`: wake whoever is waiting on
+/// a set that watches it.
+pub fn note_local(l: usize) {
+    note(|tid, fd| fd < crate::task::MAX_FDS && crate::fdtable::get(tid, fd) == FdKind::Local { l });
 }
 
 /// A counter was added to or taken from: same reasoning as `note_timer`, and

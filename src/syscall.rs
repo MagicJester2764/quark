@@ -364,6 +364,22 @@ const PTIMER_DELETE: u64 = 3;
 pub const SYS_SOCK_FD: u64 = 176;
 /// Recover the (net_tid, handle) behind a socket fd.
 pub const SYS_SOCK_INFO: u64 = 177;
+/// A local socket that is nothing yet: to be named and listened on, or
+/// connected by a name (`local.rs`).
+pub const SYS_SOCKET: u64 = 178;
+/// A server names a local socket a task calling it holds.
+pub const SYS_SOCKET_BIND: u64 = 179;
+/// A named local socket listens.
+pub const SYS_SOCKET_LISTEN: u64 = 180;
+/// A server connects a local socket a task calling it holds to whatever
+/// listens at a name of its own.
+pub const SYS_SOCKET_CONNECT: u64 = 181;
+/// Take a connection that waits on a listener.
+pub const SYS_SOCKET_ACCEPT: u64 = 182;
+/// Who is at the other end of a stream.
+pub const SYS_SOCKET_PEER: u64 = 183;
+/// A socket's option: whether it is told who sent what it receives.
+pub const SYS_SOCKET_OPTION: u64 = 184;
 
 /// Operation tags a socket fd sends to the net server. The connection handle
 /// rides in the tag's upper 32 bits, because the payload fills every data word
@@ -458,7 +474,7 @@ pub const SYS_ABI_VERSION: u64 = 240;
 /// minor when calls are added. User space can refuse to run against a major it
 /// does not know, which is the point of exposing it at all.
 pub const ABI_VERSION_MAJOR: u64 = 3;
-pub const ABI_VERSION_MINOR: u64 = 30;
+pub const ABI_VERSION_MINOR: u64 = 31;
 
 /// Threads a task may make with no capability at all.
 ///
@@ -642,6 +658,12 @@ pub const ANY_FD: u64 = u64::MAX - 1;
 /// an empty stream never returns and the client hangs holding data it has
 /// already been given.
 pub const FD_DONTWAIT: u64 = 1;
+/// `SYS_FD_SEND` and `SYS_FD_RECV`: arg3 is where an array of descriptors
+/// is, `u32`s, as many as bits 8 to 15 of the flags say — to send, or room
+/// to write those received.
+pub const FD_MANY: u64 = 2;
+/// The most one send carries, and one receive takes.
+const FD_MANY_MOST: usize = 32;
 
 /// The set a descriptor names, or `None` if it names something else.
 fn pollset_of(tid: usize, fd: usize) -> Option<usize> {
@@ -1061,6 +1083,7 @@ fn dispatch(
                 FdKind::Socket { .. } => (11, false),
                 FdKind::Served { obj } => (12, crate::served::of(obj).is_none()),
                 FdKind::Signals { .. } => (13, false),
+                FdKind::Local { .. } => (14, false),
             };
             kind | if gone { FD_KIND_GONE } else { 0 }
         }
@@ -1761,6 +1784,145 @@ fn dispatch(
                 }
             }
         }
+        SYS_SOCKET => {
+            // arg0 = what kind: 0, a local stream. One that is nothing yet.
+            if arg0 != 0 {
+                return u64::MAX;
+            }
+            let Some(l) = crate::local::create() else { return u64::MAX };
+            match scheduler::current_alloc_fd(crate::task::FdKind::Local { l }) {
+                Ok(fd) => fd as u64,
+                Err(()) => {
+                    crate::local::release(l);
+                    u64::MAX
+                }
+            }
+        }
+        SYS_SOCKET_BIND | SYS_SOCKET_CONNECT => {
+            // arg0 = a task that is calling the caller; arg1 = its
+            // descriptor, a local socket that is nothing yet; arg2 = a key
+            // of the caller's choosing — the name, as the caller knows it.
+            // The rule is SYS_FD_SERVE's: what a server does to a task's
+            // table, it does while the task is in a call to it.
+            let me = scheduler::current_tid();
+            let client = arg0 as usize;
+            let fd = arg1 as usize;
+            if client == me || !crate::ipc::is_calling(client, me) {
+                return u64::MAX;
+            }
+            let crate::task::FdKind::Local { l } = crate::fdtable::get(client, fd) else { return u64::MAX };
+            let server = crate::cap::endpoint_of(me);
+            if nr == SYS_SOCKET_BIND {
+                return match crate::local::bind(l, server, arg2) {
+                    Ok(()) => 0,
+                    Err(crate::local::Refused::Taken) => 1,
+                    Err(_) => u64::MAX,
+                };
+            }
+            if !crate::local::unbound(l) {
+                return u64::MAX;
+            }
+            match crate::local::connect(server, arg2, crate::stream::Creds::of(client), client) {
+                Ok(stream) => {
+                    // The connector's socket is end 0 of the stream now, in the
+                    // same slot, close-on-exec mark and all.
+                    let end = crate::task::FdKind::StreamEnd { stream, end: 0 };
+                    if crate::fdtable::swap_if(client, fd, crate::task::FdKind::Local { l }, end) {
+                        crate::local::release(l);
+                        0
+                    } else {
+                        // A sibling closed it in between: whoever accepts
+                        // finds nobody at the other end.
+                        crate::stream::close_end(stream, 0);
+                        u64::MAX
+                    }
+                }
+                Err(crate::local::Refused::Nobody) => 1,
+                Err(crate::local::Refused::Full) => crate::pipe::WOULD_BLOCK,
+                Err(_) => u64::MAX,
+            }
+        }
+        SYS_SOCKET_LISTEN => {
+            // arg0 = a named local socket of the caller's; arg1 = how many
+            // connections may wait to be accepted.
+            let me = scheduler::current_tid();
+            let crate::task::FdKind::Local { l } = crate::fdtable::get(me, arg0 as usize) else { return u64::MAX };
+            if crate::local::listen(l, arg1 as usize, crate::stream::Creds::of(me)) { 0 } else { u64::MAX }
+        }
+        SYS_SOCKET_ACCEPT => {
+            // arg0 = a listening socket of the caller's; arg1 = flags (1 =
+            // do not wait). A descriptor for the connection, the lowest free
+            // from 3. Held while it waits, as a read holds what it reads.
+            let me = scheduler::current_tid();
+            let crate::task::FdKind::Local { l } = crate::fdtable::hold(me, arg0 as usize) else {
+                crate::fdtable::unhold(me);
+                return u64::MAX;
+            };
+            let answer = loop {
+                // Somewhere to put it before it is taken: a connection is not
+                // thrown away because the table is full.
+                if crate::local::readable(l) && scheduler::lowest_free_fd(me).is_none() {
+                    break u64::MAX;
+                }
+                if let Some(stream) = crate::local::take(l) {
+                    match crate::fdtable::install(me, crate::task::FdKind::StreamEnd { stream, end: 1 }, 3) {
+                        Some(fd) => break fd as u64,
+                        None => {
+                            crate::stream::close_end(stream, 1);
+                            break u64::MAX;
+                        }
+                    }
+                }
+                if arg1 & 1 != 0 {
+                    break crate::pipe::WOULD_BLOCK;
+                }
+                if crate::signal::ends_wait(me) {
+                    break crate::signal::INTERRUPTED;
+                }
+                if !crate::local::wait(l) && !crate::local::readable(l) && !crate::signal::ends_wait(me) {
+                    // It does not listen, or there is no room to wait.
+                    break u64::MAX;
+                }
+            };
+            crate::fdtable::unhold(me);
+            answer
+        }
+        SYS_SOCKET_PEER => {
+            // arg0 = a stream of the caller's; arg1 = where to write who is
+            // at the other end: three u32s, process id, user, group.
+            if !validate_user_ptr_mut(arg1, 12) {
+                return u64::MAX;
+            }
+            let crate::task::FdKind::StreamEnd { stream, end } = crate::fdtable::get(scheduler::current_tid(), arg0 as usize)
+            else {
+                return u64::MAX;
+            };
+            let Some(peer) = crate::stream::peer_of(stream, end) else { return u64::MAX };
+            let _ua = crate::cpu::UserAccess::begin();
+            unsafe { core::ptr::write_unaligned(arg1 as *mut [u32; 3], [peer.pid, peer.uid, peer.gid]) };
+            0
+        }
+        SYS_SOCKET_OPTION => {
+            // arg0 = a socket of the caller's, a stream or a local socket not
+            // yet connected; arg1 = which: 0, to be told who sent what it
+            // receives; arg2 = 0 off, 1 on, u64::MAX to ask. Answers what it
+            // was.
+            let set = match arg2 {
+                0 => Some(false),
+                1 => Some(true),
+                u64::MAX => None,
+                _ => return u64::MAX,
+            };
+            if arg1 != 0 {
+                return u64::MAX;
+            }
+            let was = match crate::fdtable::get(scheduler::current_tid(), arg0 as usize) {
+                crate::task::FdKind::StreamEnd { stream, end } => crate::stream::passcred(stream, end, set),
+                crate::task::FdKind::Local { l } => crate::local::passcred(l, set),
+                _ => None,
+            };
+            was.map_or(u64::MAX, |on| on as u64)
+        }
         SYS_SIGNAL_FD => {
             // arg0 = a signal descriptor of the caller's to change, or
             // u64::MAX for a new one; arg1 = the signals it is read for,
@@ -2407,7 +2569,9 @@ fn dispatch(
                 }
                 // A set is waited on, and signals are read: neither is
                 // written to.
-                crate::task::FdKind::PollSet { .. } | crate::task::FdKind::Signals { .. } => u64::MAX,
+                crate::task::FdKind::PollSet { .. }
+                | crate::task::FdKind::Signals { .. }
+                | crate::task::FdKind::Local { .. } => u64::MAX,
                 // Memory is mapped, not written through. A stream of bytes is
                 // the wrong shape for it, and answering as if it were would
                 // put the caller's data somewhere it will never look.
@@ -2459,6 +2623,8 @@ fn dispatch(
                 crate::task::FdKind::Signals { sfd } => {
                     crate::signal::read_for(me, crate::sigfd::mask(sfd), ptr, max_len, true)
                 }
+                // Not connected: nothing to read from.
+                crate::task::FdKind::Local { .. } => u64::MAX,
                 crate::task::FdKind::StreamEnd { stream, end } => {
                     match crate::stream::pipes_for(stream, end) {
                         Some((rd, _)) => crate::pipe::read(rd, ptr, max_len),
@@ -3048,27 +3214,48 @@ fn dispatch(
                 None => return u64::MAX,
             };
 
-            // The descriptor goes on the queue before the bytes, so a peer
-            // that reads the bytes never has to wonder whether the handle is
+            // What to pass: one descriptor, or with FD_MANY an array of
+            // them.
+            let mut fds = [0u32; FD_MANY_MOST];
+            let count = if arg4 & FD_MANY != 0 {
+                let count = ((arg4 >> 8) & 0xFF) as usize;
+                if count > FD_MANY_MOST || (count > 0 && !validate_user_ptr(pass, count as u64 * 4)) {
+                    return u64::MAX;
+                }
+                let _ua = crate::cpu::UserAccess::begin();
+                for (i, fd) in fds[..count].iter_mut().enumerate() {
+                    *fd = unsafe { core::ptr::read_unaligned((pass as *const u32).add(i)) };
+                }
+                count
+            } else if pass != u64::MAX {
+                fds[0] = pass.min(u32::MAX as u64) as u32;
+                1
+            } else {
+                0
+            };
+            // Held on the queue's behalf, each of them. Without this the
+            // sender closing its own copy frees the object underneath a
+            // descriptor still travelling.
+            let mut passed = [crate::task::FdKind::Empty; FD_MANY_MOST];
+            for i in 0..count {
+                match crate::fdtable::get_retained(tid, fds[i] as usize) {
+                    Some(kind) => passed[i] = kind,
+                    None => {
+                        for kind in &passed[..i] {
+                            crate::pipe::release_fd(kind);
+                        }
+                        return u64::MAX;
+                    }
+                }
+            }
+            // The descriptors go on the queue before the bytes, so a peer
+            // that reads the bytes never has to wonder whether they are
             // still coming.
-            let mut passed = None;
-            if pass != u64::MAX {
-                let pfd = pass as usize;
-                if pfd >= crate::task::MAX_FDS {
-                    return u64::MAX;
+            if count > 0 && !crate::stream::push_fds(stream, end, &passed[..count]) {
+                for kind in &passed[..count] {
+                    crate::pipe::release_fd(kind);
                 }
-                // Held on the queue's behalf. Without this the sender
-                // closing its own copy frees the object underneath a
-                // descriptor still travelling.
-                let kind = match crate::fdtable::get_retained(tid, pfd) {
-                    Some(k) => k,
-                    None => return u64::MAX,
-                };
-                if !crate::stream::push_fd(stream, end, kind) {
-                    crate::pipe::release_fd(&kind);
-                    return u64::MAX;
-                }
-                passed = Some(kind);
+                return u64::MAX;
             }
 
             let (_, wr) = match crate::stream::pipes_for(stream, end) {
@@ -3080,13 +3267,14 @@ fn dispatch(
             } else {
                 crate::pipe::write(wr, arg1 as *const u8, len)
             };
-            // A signal ended the wait with nothing sent: nor is the
-            // descriptor, which the call made again would send a second time.
-            if sent == crate::signal::INTERRUPTED {
-                if let Some(kind) = passed {
-                    if crate::stream::take_back_fd(stream, end, kind) {
-                        crate::pipe::release_fd(&kind);
-                    }
+            // A signal ended the wait with nothing sent: nor are the
+            // descriptors, which the call made again would send a second time.
+            if sent == crate::signal::INTERRUPTED
+                && count > 0
+                && crate::stream::take_back_fds(stream, end, &passed[..count])
+            {
+                for kind in &passed[..count] {
+                    crate::pipe::release_fd(kind);
                 }
             }
             sent
@@ -3103,6 +3291,11 @@ fn dispatch(
                 return u64::MAX;
             }
             if len > 0 && !validate_user_ptr_mut(arg1, arg2) {
+                return u64::MAX;
+            }
+            let many = arg4 & FD_MANY != 0;
+            let room = if many { (((arg4 >> 8) & 0xFF) as usize).min(FD_MANY_MOST) } else { 0 };
+            if room > 0 && !validate_user_ptr_mut(at, room as u64 * 4) {
                 return u64::MAX;
             }
             let (stream, end) = match stream_end_of(tid, fd) {
@@ -3146,6 +3339,33 @@ fn dispatch(
             // number and reports it, and a caller that had to guess would have
             // to probe — which cannot be done without reading, and reading is
             // the thing it is trying to do exactly once.
+            // With FD_MANY: as many as there are and room for, each where the
+            // table has a slot, in the order they were sent. Whether there is
+            // a slot is asked before each is taken, as below.
+            if many {
+                let mut landed = [0u32; FD_MANY_MOST];
+                let mut k = 0;
+                while k < room && scheduler::lowest_free_fd(tid).is_some() {
+                    let Some(kind) = crate::stream::pop_fd(stream, end) else { break };
+                    match crate::fdtable::install(tid, kind, 3) {
+                        Some(fd) => {
+                            landed[k] = fd as u32;
+                            k += 1;
+                        }
+                        None => {
+                            crate::pipe::release_fd(&kind);
+                            break;
+                        }
+                    }
+                }
+                if k > 0 {
+                    let _ua = crate::cpu::UserAccess::begin();
+                    for (i, &fd) in landed[..k].iter().enumerate() {
+                        unsafe { core::ptr::write_unaligned((at as *mut u32).add(i), fd) };
+                    }
+                }
+                return (k as u64) << 32 | n;
+            }
             let mut got = 0u64;
             if at != u64::MAX {
                 // Check there is somewhere to put it *before* taking the

@@ -648,6 +648,17 @@ where one could read it wakes a set watching one (`pollset::note_signals`).
 What a read gives is Linux's `signalfd_siginfo`, laid out by the kernel: a
 C library cannot tell this read from any other.
 
+And **a local socket is one** before it is connected (`local.rs`): nothing
+yet, named, listening. Its name is a file server's, as a named pipe's is —
+the server names a socket a task calling it holds, and connects one to
+what listens at a name, each by a key of its own (`SYS_SOCKET_BIND`,
+`SYS_SOCKET_CONNECT`) — and the kernel knows a listener by the server's
+endpoint and the key. Connected, it is a stream, made at once whether
+anybody is accepting or not: the connector's descriptor becomes end 0 in
+the same slot (`fdtable::swap_if`, close-on-exec mark and all), and end 1
+waits in the listener's queue for `accept`. Each end of a stream knows who
+is at the other (`stream::Creds`).
+
 And **a file is one**, though the file is not the kernel's. A *served
 descriptor* (`served.rs`) names an object in a server by a number the server
 chose; the kernel counts who holds it and nothing more. That is what makes a

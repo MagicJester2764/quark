@@ -80,6 +80,9 @@ pub enum FdKind {
     Served { obj: usize },
     /// Signals to be read, by whoever reads: `signalfd`. See `sigfd.rs`.
     Signals { sfd: usize },
+    /// A local socket before it is connected: nothing yet, named, or
+    /// listening. See `local.rs`; connected, it is a `StreamEnd`.
+    Local { l: usize },
     /// A network connection, held by the net server as `handle`.
     ///
     /// Unlike `Ipc`, which is one-directional and carries a fixed tag, a

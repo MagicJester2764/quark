@@ -1,6 +1,6 @@
 # Quark syscall ABI
 
-**Version 3.30.** Query the running kernel with `SYS_ABI_VERSION` (240), which
+**Version 3.31.** Query the running kernel with `SYS_ABI_VERSION` (240), which
 returns `(major << 16) | minor`.
 
 This document is the contract between the Quark kernel and everything above it.
@@ -225,6 +225,7 @@ returning at once turned that loop into a spin.
 | 3.16 | **Off, and on again, by the firmware's tables.** `SYS_POWER` (119) turns the machine off or restarts it, for a holder of the new capability `Power` (type 12): by ACPI's control and reset registers, where a program used to write to the three ports QEMU listens on. |
 | 3.17 | **Memory above four gigabytes.** All of a machine's memory is used, up to 511 GiB, where the kernel used the first four gigabytes of it. `SYS_PHYS_ALLOC` takes a flag (arg1 = 1) for frames below four gigabytes, which is what a device that is told an address in thirty-two bits needs; without it a frame is ordinary memory and comes from the top. `SYS_MEM_INFO` takes what to say (arg0): 1 for how much memory the machine has and 2 for where it ends. |
 | 3.18 | **The wide registers.** A program may use AVX, AVX2 and AVX-512 where the processor has them: the kernel turns them on (`OSXSAVE`, XCR0) and saves all of each task's with `XSAVE`. Before, an AVX instruction was a fault. No call changed. |
+| 3.31 | **Local sockets by a name, who is at the other end, and several descriptors at once.** `SYS_SOCKET` (178) makes a local socket that is nothing yet; a file server names one a task calling it holds (`SYS_SOCKET_BIND`, 179) and connects one to whatever listens at a name (`SYS_SOCKET_CONNECT`, 181), each by a key of its own, as it keys a named pipe; `SYS_SOCKET_LISTEN` (180) and `SYS_SOCKET_ACCEPT` (182) listen and take a connection, which is a stream like a pair's. `SYS_SOCKET_PEER` (183) says who is at the other end of a stream — a pair's maker, the listener as it listened, the connector as it connected — and `SYS_SOCKET_OPTION` (184) whether an end asks to be told who sent what it receives. `SYS_FD_SEND` and `SYS_FD_RECV` with flag 2 carry several descriptors, as many as 32, and a stream holds 32 in flight each way where it held 8. `SYS_FD_KIND` answers 14 for a local socket not yet connected. |
 | 3.30 | **A descriptor read for signals.** `SYS_SIGNAL_FD` (137) makes one, read for a set of signals, or changes the set of one: a read takes those of the set waiting for the reader — its own task's first, then its program's — as 128-byte records laid out as Linux's `signalfd_siginfo`, waiting for the first unless asked not to; a set reports it readable while one is waiting. `SYS_FD_KIND` answers 13 for it. |
 | 3.29 | **A program's timers.** `SYS_PTIMER` (151) gives a program up to 32 timers, each on the date's clock or the time since boot, that raise a signal — for the program, or for one task of it — carrying a value, or nothing: POSIX's `timer_create`, `timer_settime`, `timer_gettime` and `timer_delete`. What comes with a timer's signal says so (`si_code` -2) and carries its number and its overruns: a timer that fires while its last signal is still waiting raises no other, and that one counts it. A forked child has none; `SYS_EXEC_SPACE` ends them. |
 | 3.28 | **Signals that queue, and say who.** A real-time signal (32 to 64) raised while one of its number is waiting waits behind it, with what it carried — 64 for a program and 16 for a task beyond the first of each number — where it used to be the same one again; a signal below 32 keeps what came with the raise that made it wait. `SYS_SIG_QUEUE` (136) raises one carrying a value. What came with a signal is three words — Linux's `si_code`, who raised it (a process id and a user; a child's for 17), and a value (the one it was queued with, a child's status, a fault's address) — at the end of a handler's record, and written by `SYS_SIG_WAIT` with arg3 = 1. `SYS_SIG_RAISE` answers `0xFFFF_FFFE` for a real-time signal that cannot wait. |
@@ -897,8 +898,8 @@ would on Linux, and the pipe is freed when the read returns.
 | 70 | `SYS_PIPE_FD_SET` | arg0 = target tid, arg1 = fd or `u64::MAX - 1` for any free one, arg2 = pipe handle, arg3 = 1 for write end | the fd it took / `u64::MAX` | `TaskMgmt` over the target, unless the target is the caller or a child it has not started |
 | 71 | `SYS_FD_CLOSE` | arg0 = fd | 0 / `u64::MAX` | — |
 | 72 | `SYS_SOCKETPAIR` | — | `(fd0 << 32) \| fd1`, both in the caller's table / `u64::MAX` | — |
-| 73 | `SYS_FD_SEND` | arg0 = stream fd, arg1 = buf, arg2 = len, arg3 = fd to pass or `u64::MAX`, arg4 = flags (1 = do not wait) | bytes written, `0xFFFF_FFFE` if it would have blocked, `0xFFFF_FFFD` if a signal ended the wait — nothing sent, the descriptor included / `u64::MAX` | — |
-| 74 | `SYS_FD_RECV` | arg0 = stream fd, arg1 = buf, arg2 = len, arg3 = fd to install a passed descriptor at, `u64::MAX - 1` for any free one, or `u64::MAX` to leave it queued, arg4 = flags (1 = do not wait) | `((fd + 1) << 32) \| bytes`, high half 0 if none arrived, `0xFFFF_FFFE` if it would have blocked, `0xFFFF_FFFD` if a signal ended the wait — nothing taken / `u64::MAX` | — |
+| 73 | `SYS_FD_SEND` | arg0 = stream fd, arg1 = buf, arg2 = len, arg3 = fd to pass or `u64::MAX` — or, with flag 2, where an array of descriptors to pass is, `u32`s, as many as bits 8 to 15 of arg4 say (at most 32); arg4 = flags (1 = do not wait, 2 = several) | bytes written, `0xFFFF_FFFE` if it would have blocked, `0xFFFF_FFFD` if a signal ended the wait — nothing sent, the descriptors included / `u64::MAX` | — |
+| 74 | `SYS_FD_RECV` | arg0 = stream fd, arg1 = buf, arg2 = len, arg3 = fd to install a passed descriptor at, `u64::MAX - 1` for any free one, or `u64::MAX` to leave it queued — or, with flag 2, where to write the descriptors installed, `u32`s, room for as many as bits 8 to 15 of arg4 say; arg4 = flags (1 = do not wait, 2 = several) | `((fd + 1) << 32) \| bytes` — with flag 2, `(how many << 32) \| bytes` — high half 0 if none arrived, `0xFFFF_FFFE` if it would have blocked, `0xFFFF_FFFD` if a signal ended the wait — nothing taken / `u64::MAX` | — |
 | 75 | `SYS_POLLSET_CREATE` | — | fd naming the set / `u64::MAX` | — |
 | 76 | `SYS_POLLSET_CTL` | arg0 = set fd, arg1 = op (0 add, 1 modify, 2 remove), arg2 = fd, arg3 = events, arg4 = token | 0 / `u64::MAX` | — |
 | 77 | `SYS_POLLSET_WAIT` | arg0 = set fd, arg1 = array of `(u64 token, u32 events, u32 pad)`, arg2 = capacity, arg3 = how long to wait, a span, arg4 = the signals to hold back while it waits, with bit 8 set to say there are some | entries filled, 0 = timed out, `0xFFFF_FFFD` = a signal ended the wait / `u64::MAX` | — |
@@ -914,6 +915,16 @@ the peer the connection has gone.
 `SYS_FD_SET` and `SYS_PIPE_FD_SET` release whatever the target slot named, and
 copying a descriptor onto itself changes nothing. A poll set cannot be copied or
 sent at all: it counts no holders, so it has exactly one.
+
+**Several at once.** With flag 2 a send carries up to 32 descriptors, all or
+none, and a receive takes as many as are queued and it has room for, each in
+the lowest free slot from 3, in the order they were sent. A stream holds 32
+in flight each way, and a send that would overfill it is refused. What is
+queued is not tied to the bytes: a send queues its descriptors before its
+bytes, so the receive that reads a message's first byte can take them, and
+may take a later message's as well — which is what every program that
+passes descriptors (libwayland, libdbus, xcb) expects, each gathering them
+in order and giving each message its share.
 
 **Passing a descriptor needs no authority over the peer.** `SYS_FD_DUP` puts one
 into a task that never asked, so it requires `TaskMgmt` over that task — unless
@@ -1461,6 +1472,13 @@ it was set.
 |---|---|---|---|---|
 | 176 | `SYS_SOCK_FD` | arg0 = net server tid, arg1 = connection handle | the new fd / `u64::MAX` | Endpoint to the net server |
 | 177 | `SYS_SOCK_INFO` | arg0 = fd | `(net_tid << 32) \| handle` / `u64::MAX` | — |
+| 178 | `SYS_SOCKET` | arg0 = what: 0, a local stream | a descriptor for a local socket that is nothing yet / `u64::MAX` | — |
+| 179 | `SYS_SOCKET_BIND` | arg0 = a task that is calling the caller, arg1 = its descriptor (a local socket that is nothing yet), arg2 = a key of the caller's | 0; 1 if another socket has that name / `u64::MAX` | — |
+| 180 | `SYS_SOCKET_LISTEN` | arg0 = a named local socket of the caller's, arg1 = how many connections may wait (at most 16) | 0 / `u64::MAX` | — |
+| 181 | `SYS_SOCKET_CONNECT` | arg0 = a task that is calling the caller, arg1 = its descriptor (a local socket that is nothing yet), arg2 = a key of the caller's | 0; 1 if nothing listens there; `0xFFFF_FFFE` if what does has as many waiting as it has room for / `u64::MAX` | — |
+| 182 | `SYS_SOCKET_ACCEPT` | arg0 = a listening socket of the caller's, arg1 = flags (1 = do not wait) | a descriptor for the connection; `0xFFFF_FFFE` if it would have waited; `0xFFFF_FFFD` if a signal ended the wait / `u64::MAX` | — |
+| 183 | `SYS_SOCKET_PEER` | arg0 = a stream of the caller's, arg1 = where to write who is at the other end: three `u32`s, process id, user, group | 0 / `u64::MAX` | — |
+| 184 | `SYS_SOCKET_OPTION` | arg0 = a stream or a local socket of the caller's, arg1 = which: 0, to be told who sent what it receives; arg2 = 0 off, 1 on, `u64::MAX` to ask | what it was / `u64::MAX` | — |
 
 A socket is a connection the net server already holds, bound to a descriptor in
 the calling task's fd table. `SYS_FD_READ` and `SYS_FD_WRITE` on that descriptor
@@ -1481,6 +1499,37 @@ Closing is not a kernel operation: the connection is the net server's, and
 `quark_rt::socket` closes it through `TAG_TCP_CLOSE` when the stream is
 dropped. `SYS_SOCK_INFO` exists so a program holding only a descriptor can
 recover what to close.
+
+**A local socket by a name** (178 to 184) is what Unix's `bind`, `listen`,
+`accept` and `connect` make of a socket of the local family. Connected, it
+is a stream, the same object `SYS_SOCKETPAIR` makes; before that it is a
+socket that is nothing yet, then one with a name, then one that listens. The
+name is a file server's — an inode whose mode says it is a socket, made the
+way a named pipe's is — and the server joins the two, as it joins a named
+pipe's name to its pipe: it names a socket that a task calling it holds,
+by a key of its own (`SYS_SOCKET_BIND`), and connects one to whatever
+listens at a key (`SYS_SOCKET_CONNECT`), having decided by the inode's
+owner and mode whether that task may. The kernel knows a listener by the
+server's endpoint, which is never given out again, and the key; a name two
+sockets would share is refused the second.
+
+A connection is made at once, whether anybody is accepting or not: a stream,
+one end of which becomes the connector's socket in the same slot of its
+table, and the other of which waits in the listener's queue — as many as it
+said, and never more than 16 — until `SYS_SOCKET_ACCEPT` puts it in the
+lowest free slot from 3, waiting for one to come unless asked not to. A
+listener that is closed takes its queue with it, and a connector finds the
+other end gone. A set reports a listener readable while a connection waits.
+Reading or writing a socket that is not connected is refused, and
+`SYS_FD_KIND` answers 14 for one.
+
+**Who is at the other end.** Each end of a stream knows who is at the other
+(`SYS_SOCKET_PEER`): for a pair, the program that made it; for a connection,
+the listener as it was when it began to listen and the connector as it was
+when it connected — Unix's `SO_PEERCRED`. An end can ask to be told who
+sent what it receives (`SYS_SOCKET_OPTION` 0, Unix's `SO_PASSCRED`), which is
+what a C library asks before it says so with a message; what a listener has
+asked, what it accepts has asked too.
 
 **Throughput.** The fd path carries 40 bytes per message, so a socket does a
 round trip per 40 bytes rather than per page. That is the cost of going through
@@ -1823,7 +1872,7 @@ set together or not at all.
 `SYS_FD_KIND` answers 1 for an IPC endpoint, 2 and 3 for the reading and
 writing ends of a pipe, 4 for a stream, 5 and 6 for a terminal's master and
 slave, 7 for a timer, 8 for a counter, 9 for a poll set, 10 for memory, 11 for
-a socket, 12 for a served descriptor and 13 for a signal descriptor. The bit above says nothing is left at
+a socket, 12 for a served descriptor, 13 for a signal descriptor and 14 for a local socket not yet connected. The bit above says nothing is left at
 the other end: a pipe with no writers, or no readers; a stream or a terminal
 whose peer has closed; a served descriptor whose server has gone. A failed
 write says only that it failed, and this is how its caller tells a pipe

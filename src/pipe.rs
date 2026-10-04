@@ -778,6 +778,7 @@ pub fn release_fd(kind: &FdKind) {
         FdKind::PollSet { set } => crate::pollset::destroy(*set),
         FdKind::Served { obj } => crate::served::release(*obj),
         FdKind::Signals { sfd } => crate::sigfd::release(*sfd),
+        FdKind::Local { l } => crate::local::release(*l),
         _ => {}
     }
 }
@@ -799,6 +800,7 @@ pub fn forget_waiter(kind: &FdKind, tid: usize) -> bool {
         FdKind::PtyEnd { pty, .. } => crate::pty::forget_waiter(*pty, tid),
         FdKind::Timer { timer } => crate::timerfd::forget_waiter(*timer, tid),
         FdKind::Event { ev } => crate::eventfd::forget_waiter(*ev, tid),
+        FdKind::Local { l } => crate::local::forget_waiter(*l, tid),
         _ => false,
     }
 }
@@ -871,6 +873,10 @@ pub fn retain_fd(kind: &FdKind) -> Result<(), ()> {
         }
         FdKind::Signals { sfd } => {
             crate::sigfd::retain(*sfd);
+            Ok(())
+        }
+        FdKind::Local { l } => {
+            crate::local::retain(*l);
             Ok(())
         }
         // A set counts no holders, and closing any copy destroys it, so it
