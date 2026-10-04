@@ -106,6 +106,7 @@ pub const SIGTTOU: u8 = 22;
 const SIGURG: u8 = 23;
 pub const SIGWINCH: u8 = 28;
 const SIGSEGV: u8 = 11;
+pub const SIGSYS: u8 = 31;
 /// The highest signal there is.
 pub const NSIG: u8 = 64;
 
@@ -193,6 +194,11 @@ pub const BUS_ADRALN: i64 = 1;
 pub const BUS_ADRERR: i64 = 2;
 pub const FPE_INTDIV: i64 = 1;
 pub const ILL_ILLOPN: i64 = 2;
+/// For 31: a system call a program's trap turned aside (Linux's
+/// `SYS_USER_DISPATCH`), and the architecture its record says it was made
+/// on (`AUDIT_ARCH_X86_64`).
+pub const SYS_USER_DISPATCH: i64 = 2;
+const AUDIT_ARCH_X86_64: u64 = 0xC000_003E;
 
 /// The first real-time signal. From here up, one raised while one of its
 /// number is waiting waits behind it, with what it carried, rather than
@@ -313,9 +319,13 @@ pub type Regs = [u64; 18];
 pub const RAX: usize = 0;
 pub const RBX: usize = 1;
 pub const RCX: usize = 2;
+pub const RDX: usize = 3;
 pub const RSI: usize = 4;
 pub const RDI: usize = 5;
 pub const RBP: usize = 6;
+pub const R8: usize = 7;
+pub const R9: usize = 8;
+pub const R10: usize = 9;
 pub const R11: usize = 10;
 pub const R12: usize = 11;
 pub const RIP: usize = 15;
@@ -1308,6 +1318,83 @@ pub fn fault(regs: &mut Regs, signo: u8, code: i64, addr: u64) -> bool {
     let Some(how) = fdtable::sig_run_begin(tid, signo) else { return false };
     let info = Info { code, who: 0, value: addr };
     push(tid, regs, signo, BY_FAULT, addr, mask_of(tid), how, info)
+}
+
+/// A system call made from where the caller's program has said none is
+/// (`SYS_SYSCALL_TRAP`; Linux's syscall user dispatch): it is not made.
+/// SIGSYS is raised for the task instead, the way a fault raises its
+/// signal — the handler entered at once, ahead of anything else waiting —
+/// with every register in the record as it was at the call, the call's
+/// number in RAX as Linux's record has it, and what came with it saying
+/// where the call was made (the address of the `syscall`, in the word for
+/// who) and which it was (its number in the low half of the value, the
+/// architecture in the high, as `si_syscall` and `si_arch` lie). The
+/// handler answers by writing RAX in the record, and `SYS_SIG_RETURN` puts
+/// the task back after the call with that and the rest as they were — RDX
+/// and R8 to R10 included, which a call of this kernel's leaves as nought
+/// and one of Linux's leaves alone. A program with no handler the kernel
+/// runs for it, or a task holding it back, is ended by it.
+///
+/// It is how a program built for Linux's musl, run on Quark's C library,
+/// is answered when its own code makes a call rather than asking the C
+/// library to: the library traps every call not made from its own code
+/// and answers it as it answers its own.
+///
+/// `args` is what the call was given, RDI to R9 as Linux passes them.
+/// Returns what the task leaves the call with on its way to the handler,
+/// or None for a call that is to be made.
+pub fn trap_call(nr: u64, args: [u64; 6]) -> Option<u64> {
+    let tid = scheduler::current_tid();
+    if tid == 0 || tid >= MAX_TASKS {
+        return None;
+    }
+    let (from, to) = fdtable::trap_of(tid)?;
+    let frame = scheduler::current_user_frame_mut()?;
+    let at = frame.rip as usize;
+    if at >= from && at < to {
+        return None;
+    }
+    let mut regs: Regs = [0; 18];
+    regs[RAX] = nr;
+    regs[RBX] = frame.rbx;
+    regs[RCX] = frame.rip;
+    regs[RDX] = args[2];
+    regs[RSI] = args[1];
+    regs[RDI] = args[0];
+    regs[RBP] = frame.rbp;
+    regs[R8] = args[4];
+    regs[R9] = args[5];
+    regs[R10] = args[3];
+    regs[R11] = frame.rflags;
+    regs[R12] = frame.r12;
+    regs[R12 + 1] = frame.r13;
+    regs[R12 + 2] = frame.r14;
+    regs[R12 + 3] = frame.r15;
+    regs[RIP] = frame.rip;
+    regs[RFLAGS] = frame.rflags;
+    regs[RSP] = frame.rsp;
+    let info = Info {
+        code: SYS_USER_DISPATCH,
+        who: frame.rip.wrapping_sub(2),
+        value: (nr & 0xFFFF_FFFF) | AUDIT_ARCH_X86_64 << 32,
+    };
+    let mask = mask_of(tid);
+    let pushed = mask & (1 << (SIGSYS - 1)) == 0
+        && fdtable::sig_run_begin(tid, SIGSYS)
+            .is_some_and(|how| push(tid, &mut regs, SIGSYS, BY_KERNEL, 0, mask, how, info));
+    if !pushed {
+        // The end of the program, and no return from that — but for the
+        // first task, which nothing ends, and which is answered as a call
+        // that failed.
+        let _ = scheduler::end_program(tid, -(SIGSYS as i32));
+        return Some(u64::MAX);
+    }
+    // Out to the handler, with its record, as `leaving_call` sends a task.
+    frame.rip = regs[RIP];
+    frame.rsp = regs[RSP];
+    frame.rdi = regs[RDI];
+    frame.rflags = regs[RFLAGS];
+    Some(regs[RAX])
 }
 
 /// `SYS_SIG_RETURN`: the handler has run, and the task is to be where its

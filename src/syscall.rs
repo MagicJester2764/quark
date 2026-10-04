@@ -344,6 +344,9 @@ pub const SYS_ROBUST_LIST: u64 = 132;
 pub const SYS_SIG_QUEUE: u64 = 136;
 /// A descriptor read for signals: `signalfd`.
 pub const SYS_SIGNAL_FD: u64 = 137;
+/// Where the caller's program makes its system calls from: one made
+/// anywhere else raises SIGSYS. Linux's syscall user dispatch.
+pub const SYS_SYSCALL_TRAP: u64 = 138;
 
 // --- 0x90  time ---
 //
@@ -487,7 +490,7 @@ pub const SYS_ABI_VERSION: u64 = 240;
 /// minor when calls are added. User space can refuse to run against a major it
 /// does not know, which is the point of exposing it at all.
 pub const ABI_VERSION_MAJOR: u64 = 3;
-pub const ABI_VERSION_MINOR: u64 = 36;
+pub const ABI_VERSION_MINOR: u64 = 37;
 
 /// Threads a task may make with no capability at all.
 ///
@@ -875,13 +878,21 @@ extern "C" fn syscall_dispatch(
     arg3: u64,
     arg4: u64,
 ) -> u64 {
+    // What the caller had in R9, which the stub kept: interrupts have been
+    // off since, so it is this call's.
+    let r9 = crate::percpu::syscall_r9();
     crate::klock::acquire();
     unsafe { crate::usage::entered(scheduler::current_tid()) };
     // It may have waited at the door for that, and whoever had the lock may
     // have ended this task or stopped it. One that was ended makes no call.
     scheduler::arrived();
     unsafe { core::arch::asm!("sti", options(nostack, nomem)) };
-    let answer = dispatch(nr, arg0, arg1, arg2, arg3, arg4);
+    // A call made from where its program has said none is made is not made:
+    // the task goes to its handler for SIGSYS instead (`SYS_SYSCALL_TRAP`).
+    let answer = match crate::signal::trap_call(nr, [arg0, arg1, arg2, arg3, arg4, r9]) {
+        Some(answer) => answer,
+        None => dispatch(nr, arg0, arg1, arg2, arg3, arg4),
+    };
     unsafe { core::arch::asm!("cli", options(nostack, nomem)) };
     // What the call checked of its program's memory is its to lose again.
     scheduler::unpin();
@@ -4271,6 +4282,24 @@ fn dispatch(
             // where and how long, or 0.
             crate::signal::stack(scheduler::current_tid(), arg0, arg1, arg2)
         }
+        SYS_SYSCALL_TRAP => {
+            // arg0 = where the caller's program makes its system calls from,
+            // arg1 = how many bytes: a call made from anywhere else raises
+            // SIGSYS rather than being made. arg1 = 0 for calls from anywhere,
+            // as every program begins. The caller's own program only, and
+            // the user half only: it is a way for a program to answer its
+            // own calls, and changes nothing anybody else can see.
+            let (from, len) = (arg0 as usize, arg1 as usize);
+            let Some(to) = from.checked_add(len) else { return u64::MAX };
+            if len != 0
+                && (from < crate::paging::USER_MIN_ADDR as usize
+                    || to > crate::paging::USER_ADDR_LIMIT as usize)
+            {
+                return u64::MAX;
+            }
+            let (from, to) = if len == 0 { (0, 0) } else { (from, to) };
+            if crate::fdtable::set_trap(scheduler::current_tid(), from, to) { 0 } else { u64::MAX }
+        }
         SYS_SIG_RETURN => {
             // arg0 = the record a handler was entered with. Does not come
             // back here: the task goes on from where the record says.
@@ -4976,8 +5005,10 @@ fn dispatch(
 // RSP is unchanged (still user RSP). Interrupts are cleared by SFMASK.
 //
 // `swapgs` finds this processor's own state (`percpu.rs`): %gs:0 is a word
-// to keep the caller's RSP in, and %gs:8 the top of the running task's
-// kernel stack.
+// to keep the caller's RSP in, %gs:8 the top of the running task's kernel
+// stack, and %gs:16 a word for the caller's R9 — a sixth argument no call
+// of this kernel's takes, which the shuffle below writes over, and which a
+// call a program's trap turns into a signal has to give back.
 //
 // After saving user context, we shuffle registers to match the C ABI for
 // syscall_dispatch(nr, arg0, arg1, arg2, arg3, arg4), then sysret back.
@@ -4988,6 +5019,7 @@ core::arch::global_asm!(
     ".global syscall_entry",
     "syscall_entry:",
     "    swapgs",
+    "    movq %r9, %gs:16",            // keep user R9
     "    movq %rsp, %gs:0",            // save user RSP
     "    movq %gs:8, %rsp",            // load kernel RSP
 

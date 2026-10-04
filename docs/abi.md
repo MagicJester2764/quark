@@ -1,6 +1,6 @@
 # Quark syscall ABI
 
-**Version 3.36.** Query the running kernel with `SYS_ABI_VERSION` (240), which
+**Version 3.37.** Query the running kernel with `SYS_ABI_VERSION` (240), which
 returns `(major << 16) | minor`.
 
 This document is the contract between the Quark kernel and everything above it.
@@ -225,6 +225,7 @@ returning at once turned that loop into a spin.
 | 3.16 | **Off, and on again, by the firmware's tables.** `SYS_POWER` (119) turns the machine off or restarts it, for a holder of the new capability `Power` (type 12): by ACPI's control and reset registers, where a program used to write to the three ports QEMU listens on. |
 | 3.17 | **Memory above four gigabytes.** All of a machine's memory is used, up to 511 GiB, where the kernel used the first four gigabytes of it. `SYS_PHYS_ALLOC` takes a flag (arg1 = 1) for frames below four gigabytes, which is what a device that is told an address in thirty-two bits needs; without it a frame is ordinary memory and comes from the top. `SYS_MEM_INFO` takes what to say (arg0): 1 for how much memory the machine has and 2 for where it ends. |
 | 3.18 | **The wide registers.** A program may use AVX, AVX2 and AVX-512 where the processor has them: the kernel turns them on (`OSXSAVE`, XCR0) and saves all of each task's with `XSAVE`. Before, an AVX instruction was a fault. No call changed. |
+| 3.37 | **A program's calls, answered by its C library.** `SYS_SYSCALL_TRAP` (138): a program names where it makes its system calls from, and a `syscall` instruction anywhere else raises signal 31 with every register in the handler's record — Linux's syscall user dispatch, for a program built for Linux's musl whose own code makes calls Quark's C library would have answered. The system call stub keeps the caller's R9 for it. Nothing else changes. |
 | 3.36 | **An IPC descriptor names a task, not a number.** `SYS_FD_SET` (67) records the task arg2 names as it is then — by its endpoint number, as an `Endpoint` capability does — and refuses a task that is not there. Once that task is gone a read or a write through the descriptor fails, and `SYS_FD_KIND` (230) answers 1 with its bit for an end that has gone; before, the descriptor named the TID, and wrote to whatever task was given that number next. A socket of the old kind (`SYS_SOCK_FD`, 11 to `SYS_FD_KIND`) names its server the same way. Nothing else changes. |
 | 3.35 | **The right to run the network.** Capability type 15, `NetAdmin`: no parameters, minted and handed on as `Clock` is, and the first task is started with it. The kernel acts on it nowhere: the network stack is offered one with a call (`SYS_CALL_OFFER`) and changes its filter only for a caller that could. |
 | 3.34 | **What a thread library keeps with the kernel.** `SYS_TASK_NAME` (215) says and reads what a task is called — Linux's `comm`, fifteen bytes, none being its program's name — set for a task of the caller's own program, or by a server for one of the program of a client that is calling it; a task is called what its maker was, and `exec` forgets it. `SYS_ROBUST_LIST` (132) says where the caller's robust list is (`set_robust_list`): when a task dies, or becomes another program, the kernel walks it in its memory and marks each mutex it still holds as one whose owner died, waking a waiter. `SYS_USAGE` with 4 says what one task has used, another thread's processor clock, and `SYS_PID` with arg1 = 1 a task's own number, which is how the task a program began as is told from its others. |
@@ -1373,6 +1374,7 @@ it as a resource limit rather than as a bad argument.
 |---|---|---|---|---|
 | 136 | `SYS_SIG_QUEUE` | arg0 = a task of the program to signal, or with arg3 = 1 its process id, or with arg3 = 4 the task alone; arg1 = the signal, or 0 to ask whether one could be raised; arg2 = the value it carries | 0; `0xFFFF_FFFE` for a real-time signal that cannot wait / `u64::MAX` | `TaskMgmt` for target, or same UID |
 | 137 | `SYS_SIGNAL_FD` | arg0 = a signal descriptor of the caller's to change, or `u64::MAX` for a new one; arg1 = the signals it is read for, bit `n - 1` for signal `n` | the descriptor / `u64::MAX` | — |
+| 138 | `SYS_SYSCALL_TRAP` | arg0 = where the caller's program makes its system calls from, arg1 = how many bytes; arg1 = 0 for anywhere, as a program begins | 0 / `u64::MAX` for a range not in the user half | — |
 
 `SYS_SIG_RAISE` with a value: what comes with the signal says it was queued
 (`si_code` -1), by whom, and carries arg2 (see *What comes with a signal* under
@@ -1400,6 +1402,25 @@ that raised it (`u32`s at 12 and 16) — or, for a timer's, its number at 24
 and its overruns at 32 — and what it carried: for 17 the child's status (an
 `i32` at 40), and for anything else the value, its low 32 bits at 44 and the
 whole of it at 48. The rest is nought.
+
+**A call made from elsewhere** (`SYS_SYSCALL_TRAP`) is Linux's syscall user
+dispatch. Once a program has said where its calls are made from — its C
+library's code — a `syscall` instruction anywhere else is not a call: the
+task is sent signal 31 at once, ahead of anything else waiting, as a fault
+sends its signal, and its handler's record holds every register as it was at
+the instruction, with the call's number in RAX — RDX and R8 to R10 too,
+which a call of this kernel's leaves as nought, and R9, which none of its
+calls takes. What comes with it says `si_code` 2 (`SYS_USER_DISPATCH`), the
+address of the `syscall` instruction in the word for who raised it, and the
+call's number and the architecture (`0xC000003E`) in the low and high halves
+of the value: Linux's `si_call_addr`, `si_syscall` and `si_arch`. The handler
+answers by writing RAX in the record, and `SYS_SIG_RETURN` puts the task back
+after the instruction with that and every other register as it was. With no
+handler the kernel runs for 31, or with the task holding it back, the program
+ends by signal 31. `SYS_FORK` copies where the calls are made from;
+`SYS_EXEC_SPACE` forgets it. It is how a program built for Linux's musl is
+answered on Quark's: the C library traps every call not made from its own
+code, and answers it as it answers its own.
 
 ### Time (0x90)
 

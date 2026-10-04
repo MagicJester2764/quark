@@ -83,6 +83,14 @@ pub struct PerCpu {
     user_rsp: u64,
     /// The top of the running task's kernel stack. `%gs:8`, likewise.
     kernel_rsp: u64,
+    /// The caller's R9, which the stub puts here before it uses the register
+    /// for something else: `%gs:16`. No call of this kernel's takes a sixth
+    /// argument, and Linux's do — a call a program's trap turns into a
+    /// signal (`signal::trap_call`) is one of Linux's, and gives every
+    /// register back as it was. Read before anything can enter the kernel
+    /// on this processor again: interrupts are off from the stub until the
+    /// dispatcher has it.
+    syscall_r9: u64,
     /// Which processor this is: its place in the table.
     index: u64,
     /// The task it is running. 0 while it has nothing to run: every
@@ -114,16 +122,18 @@ pub struct PerCpu {
 
 const USER_RSP: usize = offset_of!(PerCpu, user_rsp);
 const KERNEL_RSP: usize = offset_of!(PerCpu, kernel_rsp);
+const SYSCALL_R9: usize = offset_of!(PerCpu, syscall_r9);
 const INDEX: usize = offset_of!(PerCpu, index);
 const CURRENT: usize = offset_of!(PerCpu, current);
 const TSS_RSP0: usize = offset_of!(PerCpu, tss) + offset_of!(Tss, rsp0);
 const CR3: usize = offset_of!(PerCpu, cr3);
-// The stub in `syscall.rs` says `%gs:0` and `%gs:8`.
-const _: () = assert!(USER_RSP == 0 && KERNEL_RSP == 8);
+// The stub in `syscall.rs` says `%gs:0`, `%gs:8` and `%gs:16`.
+const _: () = assert!(USER_RSP == 0 && KERNEL_RSP == 8 && SYSCALL_R9 == 16);
 
 const EMPTY: PerCpu = PerCpu {
     user_rsp: 0,
     kernel_rsp: 0,
+    syscall_r9: 0,
     index: 0,
     current: 0,
     tss: Tss {
@@ -182,6 +192,18 @@ pub unsafe fn set_current(tid: usize) {
         asm!("mov gs:[{at}], {}", in(reg) tid, at = const CURRENT,
              options(nostack, preserves_flags));
     }
+}
+
+/// What the caller of the system call this processor is in had in R9.
+/// Right until interrupts are next turned on.
+#[inline(always)]
+pub fn syscall_r9() -> u64 {
+    let r9: u64;
+    unsafe {
+        asm!("mov {}, gs:[{at}]", out(reg) r9, at = const SYSCALL_R9,
+             options(nostack, readonly, preserves_flags));
+    }
+    r9
 }
 
 /// Which processor this is. True for as long as interrupts stay off.

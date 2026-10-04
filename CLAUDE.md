@@ -203,7 +203,9 @@ may keep — are in `../quarkutils/CLAUDE.md`; these are the kernel's.
   a random number of pages into a window of its own. The kernel chooses
   one address, the first program's stack (`setup_user_stack`), and chooses
   it the same way. A new place the kernel chooses is chosen so too; what
-  does not move is a program's code, linked where it runs, and the page its
+  does not move is a program's code, linked where it runs — but a program
+  linked to be put anywhere (a PIE, as Linux's are), which its loader puts
+  a random number of pages into a window of its own — and the page its
   arguments are on.
 - **User mappings live at or above `paging::USER_MIN_ADDR` (PML4[1]).**
   `create_address_space` deep-copies only PML4[0]'s PDPT and *shares* the page
@@ -889,6 +891,18 @@ background job that ignores what its terminal raises.
   program is entered saves and restores it, in ring 3, where a state that
   is not one is the program's fault and not the kernel's: an `XRSTOR` in
   ring 0 that faults halts the machine.
+- **A call made from where its program said none is made is not made**
+  (`signal::trap_call`, `SYS_SYSCALL_TRAP`; Linux's syscall user dispatch).
+  It is SIGSYS at once, as a fault is, ahead of anything else waiting, with
+  every register the call had in the handler's record: a call of this
+  kernel's leaves RDX and R8 to R10 as nought and takes no sixth argument,
+  and one of Linux's leaves them alone and takes R9 — so the stub keeps R9
+  at `%gs:16` before it uses the register, and the record is built from the
+  user frame and the arguments rather than by `leaving_call`. No handler,
+  or one held back, is the end of the program. It is how a program built
+  for Linux runs on Quark's C library: the library traps every call not
+  made from its own code, and answers it as its own. A new way in by
+  `syscall` asks it too.
 - **A mask is a task's, and a signal waits for a task that lets it
   through.** `signal::MASK`. A signal every task of the program holds back
   waits whatever it would do (`fdtable::sig_hold`), and does it when one

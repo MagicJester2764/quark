@@ -85,6 +85,13 @@ struct Table {
     /// a word its runtime looks at on its way out of every system call. 0
     /// until it has said where.
     sig_word: usize,
+    /// Where the program's own system calls are made from, when it has
+    /// said (`SYS_SYSCALL_TRAP`): one made from anywhere else is not made,
+    /// and raises SIGSYS (`signal::trap_call`). Equal for none. `fork`
+    /// copies it, the child's code being where the parent's was; an `exec`
+    /// is another program, and has none.
+    trap_from: usize,
+    trap_to: usize,
     /// When SIGALRM is next raised for the program, in the clock's
     /// nanoseconds, 0 for never; and how long after that to raise it again,
     /// 0 for not at all. One for the program, so one for all its threads.
@@ -135,6 +142,8 @@ const EMPTY: Table = Table {
     sig_held: 0,
     sig_interrupt: false,
     sig_word: 0,
+    trap_from: 0,
+    trap_to: 0,
     alarm_at: 0,
     alarm_every: 0,
     used_gone: crate::usage::Usage::ZERO,
@@ -382,7 +391,7 @@ pub fn copy_into(child: usize, parent: usize) {
     // read and its being retained would have this retain something freed.
     let flags = irq_save();
     unsafe {
-        let (src_fds, src_cloexec, src_umask, src_signals, src_run, src_name) = match table_mut(parent) {
+        let (src_fds, src_cloexec, src_umask, src_signals, src_run, src_name, src_trap) = match table_mut(parent) {
             Some(t) => (
                 t.fds,
                 t.cloexec,
@@ -390,6 +399,7 @@ pub fn copy_into(child: usize, parent: usize) {
                 (t.sig_ignore, t.sig_catch, t.sig_word),
                 (t.sig_run, t.sig_masks, t.sig_flags, t.sig_cookies, t.sig_entry, t.sig_unix),
                 (t.cmdline, t.cmdline_len),
+                (t.trap_from, t.trap_to),
             ),
             None => {
                 irq_restore(flags);
@@ -404,6 +414,7 @@ pub fn copy_into(child: usize, parent: usize) {
             // not yet taken is the parent's.
             (dst.sig_ignore, dst.sig_catch, dst.sig_word) = src_signals;
             (dst.sig_run, dst.sig_masks, dst.sig_flags, dst.sig_cookies, dst.sig_entry, dst.sig_unix) = src_run;
+            (dst.trap_from, dst.trap_to) = src_trap;
             dst.sig_pending = 0;
             dst.sig_held = 0;
             dst_waiting.clear();
@@ -1229,6 +1240,30 @@ pub fn umask(tid: usize, new: Option<u16>) -> u16 {
     old
 }
 
+/// Calls made by `tid`'s program from outside `from..to` raise SIGSYS
+/// rather than being made; `from == to` for none (`signal::trap_call`).
+pub fn set_trap(tid: usize, from: usize, to: usize) -> bool {
+    let flags = irq_save();
+    let set = unsafe {
+        table_mut(tid).map(|t| {
+            t.trap_from = from;
+            t.trap_to = to;
+        })
+    };
+    irq_restore(flags);
+    set.is_some()
+}
+
+/// Where `tid`'s program has said its calls are made from, if it has.
+pub fn trap_of(tid: usize) -> Option<(usize, usize)> {
+    let flags = irq_save();
+    let range = unsafe {
+        table_mut(tid).and_then(|t| (t.trap_from != t.trap_to).then_some((t.trap_from, t.trap_to)))
+    };
+    irq_restore(flags);
+    range
+}
+
 /// Whether `fd` is closed when the program becomes another.
 pub fn cloexec(tid: usize, fd: usize) -> Option<bool> {
     if fd >= SLOTS {
@@ -1289,6 +1324,9 @@ pub fn close_on_exec(tid: usize) {
             w.keep(t.sig_held);
             t.sig_interrupt = false;
             t.sig_word = 0;
+            // And where its calls were made from.
+            t.trap_from = 0;
+            t.trap_to = 0;
         }
     }
     irq_restore(flags);
