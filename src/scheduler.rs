@@ -1153,7 +1153,12 @@ pub fn child_changed(child: usize, kind: u8) {
                 WAIT_AGAIN[parent] = true;
                 unblock_task(parent);
             }
-            crate::signal::child_ended(parent);
+            let info = if kind == crate::job::HAS_STOPPED {
+                crate::signal::child_info(child, crate::signal::CLD_STOPPED, crate::job::stopped_by(child) as u64)
+            } else {
+                crate::signal::child_info(child, crate::signal::CLD_CONTINUED, crate::signal::SIGCONT as u64)
+            };
+            crate::signal::child_ended(parent, info);
         }
     }
     irq_restore(flags);
@@ -1636,7 +1641,13 @@ unsafe fn tell_parent(tid: usize) { unsafe {
     if theirs != 0 && theirs == task.space {
         return;
     }
-    crate::signal::child_ended(parent);
+    // What it exited with, or the signal that ended it.
+    let info = if task.exit_code < 0 {
+        crate::signal::child_info(tid, crate::signal::CLD_KILLED, -(task.exit_code as i64) as u64)
+    } else {
+        crate::signal::child_info(tid, crate::signal::CLD_EXITED, (task.exit_code & 0xFF) as u64)
+    };
+    crate::signal::child_ended(parent, info);
 }}
 
 /// End a task that is not the one running, with a status.

@@ -124,10 +124,167 @@ const UNBLOCKABLE: u64 = (1 << (SIGKILL - 1)) | (1 << (SIGSTOP - 1));
 
 /// What `Frame::code` says of why: a program raised it (`value` is who),
 /// the kernel did, or it is something the task itself did (`value` is the
-/// address it faulted at).
+/// address it faulted at). [`Info`] says more, and these are what a program
+/// written before it was there reads.
 const BY_PROGRAM: u64 = 0;
 const BY_KERNEL: u64 = 1;
 const BY_FAULT: u64 = 2;
+
+/// What came with a signal: what a program is told of it in `siginfo_t` —
+/// Linux's `si_code`, and the two words after it, as Linux lays them out.
+/// It is the end of a handler's [`Frame`], and what `SYS_SIG_WAIT` writes
+/// when it is asked for it.
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Info {
+    /// Linux's `si_code`, sign-extended: [`SI_USER`] and the rest.
+    pub code: i64,
+    /// The process id that raised it in the low half and its user in the
+    /// high: for SIGCHLD the child's; for a timer, its id and how many more
+    /// times it fired while its signal was waiting.
+    pub who: u64,
+    /// What it carried: the value it was queued with, a timer's, a child's
+    /// status, or the address a fault was at.
+    pub value: u64,
+}
+
+impl Info {
+    /// The kernel raised it, of its own accord.
+    pub const KERNEL: Info = Info { code: SI_KERNEL, who: 0, value: 0 };
+
+    /// Raised by task `tid`'s program, as `code` says, carrying `value`.
+    pub fn from_task(tid: usize, code: i64, value: u64) -> Info {
+        let pid = scheduler::pid_of(tid) & 0xFFFF_FFFF;
+        let uid = scheduler::task_uid_gid(tid).map_or(0, |(uid, _)| uid) as u64;
+        Info { code, who: pid | uid << 32, value }
+    }
+
+    /// What a frame said before there was this, and what `SYS_SIG_WAIT`
+    /// says when not asked for more: who, with the top bit set, for a signal
+    /// a program raised, and nothing for the kernel's.
+    fn old_value(&self) -> u64 {
+        if matches!(self.code, SI_USER | SI_QUEUE | SI_TKILL) {
+            (self.who & 0xFFFF_FFFF) | 1 << 63
+        } else {
+            0
+        }
+    }
+}
+
+/// Linux's `si_code`s: raised by a program with `kill`, by the kernel, by a
+/// program with a value, by a program for one task.
+pub const SI_USER: i64 = 0;
+pub const SI_KERNEL: i64 = 0x80;
+pub const SI_QUEUE: i64 = -1;
+pub const SI_TKILL: i64 = -6;
+/// SIGCHLD's: the child exited, was ended by a signal, stopped, or was
+/// continued — and the status is what it exited with or the signal.
+pub const CLD_EXITED: i64 = 1;
+pub const CLD_KILLED: i64 = 2;
+pub const CLD_STOPPED: i64 = 5;
+pub const CLD_CONTINUED: i64 = 6;
+/// A fault's: nothing at the address, or something that may not be touched
+/// so; an address not on its boundary, or one that could not be had; a
+/// division by nought; an instruction that is not one.
+pub const SEGV_MAPERR: i64 = 1;
+pub const SEGV_ACCERR: i64 = 2;
+pub const BUS_ADRALN: i64 = 1;
+pub const BUS_ADRERR: i64 = 2;
+pub const FPE_INTDIV: i64 = 1;
+pub const ILL_ILLOPN: i64 = 2;
+
+/// The first real-time signal. From here up, one raised while one of its
+/// number is waiting waits behind it, with what it carried, rather than
+/// being the same one again — as many as [`QUEUE`] a program and
+/// [`TQUEUE`] a task, beyond the first of each number. Below it a signal
+/// waiting keeps what came with the raise that made it wait.
+pub const SIGRTMIN: u8 = 32;
+pub const QUEUE: usize = 64;
+const TQUEUE: usize = 16;
+
+/// Why a signal was not raised.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum NotRaised {
+    /// No such program, or no such signal.
+    Nobody,
+    /// A real-time signal with as many of it waiting as can.
+    Full,
+}
+
+/// What came with each signal waiting, and the real-time signals waiting
+/// behind one of their number, in the order they were raised: a program's
+/// (`fdtable`) and each task's. Which signals are waiting is said by bits
+/// kept beside this; this is only what each carries.
+#[derive(Clone, Copy)]
+pub struct Waiting<const N: usize> {
+    info: [Info; 64],
+    behind: [(u8, Info); N],
+    queued: usize,
+}
+
+impl<const N: usize> Waiting<N> {
+    /// All noughts, which nothing reads before it is written: so that the
+    /// tables of these are the kernel's zeroed memory, and not its image.
+    const NOTHING: Info = Info { code: 0, who: 0, value: 0 };
+    pub const EMPTY: Self = Waiting { info: [Self::NOTHING; 64], behind: [(0, Self::NOTHING); N], queued: 0 };
+
+    /// `signo` has been raised with `info`, and `already` one of its number
+    /// was waiting. False if this one cannot wait: a real-time signal with
+    /// as many behind as there is room for.
+    pub fn put(&mut self, signo: u8, info: Info, already: bool) -> bool {
+        if !already {
+            self.info[signo as usize - 1] = info;
+            return true;
+        }
+        if signo < SIGRTMIN {
+            return true;
+        }
+        if self.queued == N {
+            return false;
+        }
+        self.behind[self.queued] = (signo, info);
+        self.queued += 1;
+        true
+    }
+
+    /// The `signo` waiting is taken: what came with it, and whether another
+    /// of its number has taken its place.
+    pub fn take(&mut self, signo: u8) -> (Info, bool) {
+        let i = signo as usize - 1;
+        let info = self.info[i];
+        match self.behind[..self.queued].iter().position(|b| b.0 == signo) {
+            Some(at) => {
+                self.info[i] = self.behind[at].1;
+                self.behind.copy_within(at + 1..self.queued, at);
+                self.queued -= 1;
+                (info, true)
+            }
+            None => (info, false),
+        }
+    }
+
+    /// Nothing is waiting.
+    pub fn clear(&mut self) {
+        self.queued = 0;
+    }
+
+    /// Nothing is waiting behind but signals in `set`.
+    pub fn keep(&mut self, set: u64) {
+        let mut kept = 0;
+        for i in 0..self.queued {
+            if set & 1 << (self.behind[i].0 - 1) != 0 {
+                self.behind[kept] = self.behind[i];
+                kept += 1;
+            }
+        }
+        self.queued = kept;
+    }
+
+    /// No `signo` is waiting any more.
+    pub fn forget(&mut self, signo: u8) {
+        self.keep(!(1 << (signo - 1)));
+    }
+}
 
 /// The registers of a task in ring 3, as a handler's record keeps them and
 /// `SYS_SIG_RETURN` puts them back: this order is the ABI.
@@ -162,6 +319,9 @@ pub struct Frame {
     /// The program's word for the handler, as it gave it.
     pub cookie: u64,
     pub regs: Regs,
+    /// What came with it, of which `code` and `value` above say part: what
+    /// a program written before this was here reads.
+    pub info: Info,
 }
 
 /// Each task's mask: the signals it holds back.
@@ -171,10 +331,10 @@ static mut MASK: [u64; MAX_TASKS] = [0; MAX_TASKS];
 static mut RESTORE: [Option<u64>; MAX_TASKS] = [None; MAX_TASKS];
 /// The stack each task has named for handlers: where it is and how long.
 static mut STACK: [(usize, usize); MAX_TASKS] = [(0, 0); MAX_TASKS];
-/// Signals raised for one task and no other ([`raise_task`]), and who
-/// raised each.
+/// Signals raised for one task and no other ([`raise_task`]), and what
+/// came with each.
 static mut TPENDING: [u64; MAX_TASKS] = [0; MAX_TASKS];
-static mut TVALUE: [[u64; 64]; MAX_TASKS] = [[0; 64]; MAX_TASKS];
+static mut TWAITING: [Waiting<TQUEUE>; MAX_TASKS] = [Waiting::EMPTY; MAX_TASKS];
 /// The signals each task is waiting to take rather than have run
 /// (`SYS_SIG_WAIT`).
 static mut WAITSET: [u64; MAX_TASKS] = [0; MAX_TASKS];
@@ -225,7 +385,10 @@ fn forget(tid: usize, signo: u8) {
     let n = fdtable::tasks_of(tid, &mut tasks);
     let flags = irq_save();
     for &t in &tasks[..n] {
-        unsafe { TPENDING[t] &= !bit };
+        unsafe {
+            TPENDING[t] &= !bit;
+            TWAITING[t].forget(signo);
+        }
     }
     irq_restore(flags);
 }
@@ -268,20 +431,16 @@ pub fn handle(tid: usize, signo: u64, mask: u64, flags: u64, cookie: u64) -> u64
     old
 }
 
-/// Raise `signo` for the program `tid` is a task of.
-pub fn raise(tid: usize, signo: u8) -> Result<(), ()> {
-    raise_from(tid, signo, BY_KERNEL, 0)
+/// Raise `signo` for the program `tid` is a task of, as the kernel.
+pub fn raise(tid: usize, signo: u8) -> Result<(), NotRaised> {
+    raise_with(tid, signo, Info::KERNEL)
 }
 
-/// Raise `signo` for the program `tid` is a task of, as a program does:
-/// `from` is the process id of whoever it was.
-pub fn raise_by(tid: usize, signo: u8, from: u64) -> Result<(), ()> {
-    raise_from(tid, signo, BY_PROGRAM, from)
-}
-
-fn raise_from(tid: usize, signo: u8, code: u64, from: u64) -> Result<(), ()> {
+/// Raise `signo` for the program `tid` is a task of, with `info`: who
+/// raised it, and what it carries.
+pub fn raise_with(tid: usize, signo: u8, info: Info) -> Result<(), NotRaised> {
     if signo == 0 || signo > NSIG || tid <= 1 || tid >= MAX_TASKS {
-        return Err(());
+        return Err(NotRaised::Nobody);
     }
     // A stopped program is started by SIGCONT whatever it has said about
     // the signal: ignoring it does not keep a program stopped, and a handler
@@ -289,19 +448,17 @@ fn raise_from(tid: usize, signo: u8, code: u64, from: u64) -> Result<(), ()> {
     if signo == SIGCONT {
         crate::job::resume(tid);
     }
-    // Who raised it, with the top bit saying it was a program.
-    let value = if code == BY_PROGRAM { from | (1 << 63) } else { 0 };
     let said = if signo == SIGKILL {
         Disposition::Default
     } else {
-        match fdtable::sig_post(tid, signo, value) {
-            Some((Disposition::Catch, word)) => {
+        match fdtable::sig_post(tid, signo, info) {
+            Some(Ok((Disposition::Catch, word))) => {
                 tell(tid, word);
                 wake(tid);
                 waiters(tid, signo);
                 return Ok(());
             }
-            Some((Disposition::Run, _)) => {
+            Some(Ok((Disposition::Run, _))) => {
                 // It waits for a task that does not hold it back, and one
                 // that can be is made to look — or for one waiting to take
                 // it, which is woken.
@@ -309,9 +466,10 @@ fn raise_from(tid: usize, signo: u8, code: u64, from: u64) -> Result<(), ()> {
                 waiters(tid, signo);
                 return Ok(());
             }
-            Some((said, _)) => said,
+            Some(Ok((said, _))) => said,
+            Some(Err(())) => return Err(NotRaised::Full),
             // In no program: not started yet, or gone.
-            None => return Err(()),
+            None => return Err(NotRaised::Nobody),
         }
     };
     if said == Disposition::Ignore {
@@ -321,42 +479,50 @@ fn raise_from(tid: usize, signo: u8, code: u64, from: u64) -> Result<(), ()> {
     // does, it does when one of them lets it through — or it is taken.
     // Two cannot be held back.
     if signo != SIGKILL && signo != SIGSTOP && (held_by_all(tid, signo) || waited_for(tid, signo)) {
-        fdtable::sig_hold(tid, signo, value);
+        if !fdtable::sig_hold(tid, signo, info) {
+            return Err(NotRaised::Full);
+        }
         waiters(tid, signo);
         return Ok(());
     }
-    act(tid, signo)
+    act(tid, signo).map_err(|()| NotRaised::Nobody)
 }
 
-/// Raise `signo` for task `t` and no other, as a program does: `from` is
-/// its process id. A handler for it is run in that task; held back there,
-/// it waits there, whatever it would do. What it does to a program that has
-/// said nothing, it does to the whole of the program, as on Unix.
-pub fn raise_task(t: usize, signo: u8, from: u64) -> Result<(), ()> {
+/// Raise `signo` for task `t` and no other, with `info`. A handler for it
+/// is run in that task; held back there, it waits there, whatever it would
+/// do. What it does to a program that has said nothing, it does to the
+/// whole of the program, as on Unix.
+pub fn raise_task(t: usize, signo: u8, info: Info) -> Result<(), NotRaised> {
     if signo == 0 || signo > NSIG || t <= 1 || t >= MAX_TASKS {
-        return Err(());
+        return Err(NotRaised::Nobody);
     }
     // Three are the program's whichever task they name.
     if signo == SIGKILL || signo == SIGSTOP || signo == SIGCONT {
-        return raise_from(t, signo, BY_PROGRAM, from);
+        return raise_with(t, signo, info);
     }
     let bit = 1u64 << (signo - 1);
-    let said = fdtable::sig_action(t, signo, None).ok_or(())?;
+    let said = fdtable::sig_action(t, signo, None).ok_or(NotRaised::Nobody)?;
     let flags = irq_save();
     let (held, waiting) = unsafe { (MASK[t] & bit != 0, WAITSET[t] & bit != 0) };
     irq_restore(flags);
     match said {
         // Told: the program runs it, from whichever task looks.
-        Disposition::Catch => raise_from(t, signo, BY_PROGRAM, from),
+        Disposition::Catch => raise_with(t, signo, info),
         Disposition::Ignore => Ok(()),
-        Disposition::Default if !held && !waiting => act(t, signo),
+        Disposition::Default if !held && !waiting => act(t, signo).map_err(|()| NotRaised::Nobody),
         _ => {
             let flags = irq_save();
-            unsafe {
-                TPENDING[t] |= bit;
-                TVALUE[t][signo as usize - 1] = from | (1 << 63);
-            }
+            let put = unsafe {
+                let ok = TWAITING[t].put(signo, info, TPENDING[t] & bit != 0);
+                if ok {
+                    TPENDING[t] |= bit;
+                }
+                ok
+            };
             irq_restore(flags);
+            if !put {
+                return Err(NotRaised::Full);
+            }
             if waiting {
                 crate::ipc::wake_sleeper(t);
             } else if !held {
@@ -559,10 +725,18 @@ pub fn alarms(now: u64) {
     }
 }
 
-/// A child of `parent` has ended: SIGCHLD for the parent's program, which
-/// does nothing to one that has not asked to hear of it.
-pub fn child_ended(parent: usize) {
-    let _ = raise(parent, SIGCHLD);
+/// A child of `parent` has ended, stopped or been continued, as `info`
+/// says: SIGCHLD for the parent's program, which does nothing to one that
+/// has not asked to hear of it.
+pub fn child_ended(parent: usize, info: Info) {
+    let _ = raise_with(parent, SIGCHLD, info);
+}
+
+/// What SIGCHLD carries for task `child`, of which `code` says what
+/// happened: its process id and user, and its status — what it exited
+/// with, or the signal that ended, stopped or continued it.
+pub fn child_info(child: usize, code: i64, status: u64) -> Info {
+    Info::from_task(child, code, status)
 }
 
 /// Should the running task not wait, because a signal has arrived for a
@@ -620,6 +794,7 @@ pub fn task_made(tid: usize) {
             RESTORE[tid] = None;
             STACK[tid] = (0, 0);
             TPENDING[tid] = 0;
+            TWAITING[tid].clear();
             WAITSET[tid] = 0;
         }
     }
@@ -692,19 +867,27 @@ pub fn mask(tid: usize, how: u64, set: u64) -> u64 {
 /// ever), without running its handler — a program that waits for signals
 /// this way holds them back. Answers with the signal, having written who
 /// raised it to `at` if that is not nought (a process id, with the top bit
-/// set for a program), or 0 if the time ran out, or [`INTERRUPTED`] when
-/// another signal ended the wait with a handler run.
-pub fn wait_for(tid: usize, set: u64, span: u64, at: u64) -> u64 {
-    if tid >= MAX_TASKS || (at != 0 && !crate::syscall::validate_user_ptr_mut(at, 8)) {
+/// set for a program) — or, with `whole`, everything that came with it, an
+/// [`Info`] — or 0 if the time ran out, or [`INTERRUPTED`] when another
+/// signal ended the wait with a handler run.
+pub fn wait_for(tid: usize, set: u64, span: u64, at: u64, whole: bool) -> u64 {
+    let size = if whole { core::mem::size_of::<Info>() as u64 } else { 8 };
+    if tid >= MAX_TASKS || (at != 0 && !crate::syscall::validate_user_ptr_mut(at, size)) {
         return u64::MAX;
     }
     let set = set & !UNBLOCKABLE;
     let deadline = if span == u64::MAX { u64::MAX } else { crate::clock::after(crate::clock::span(span)) };
     loop {
-        if let Some((signo, value)) = take_one(tid, set) {
+        if let Some((signo, info)) = take_one(tid, set) {
             if at != 0 {
                 let _ua = crate::cpu::UserAccess::begin();
-                unsafe { core::ptr::write_unaligned(at as *mut u64, value) };
+                unsafe {
+                    if whole {
+                        core::ptr::write_unaligned(at as *mut Info, info);
+                    } else {
+                        core::ptr::write_unaligned(at as *mut u64, info.old_value());
+                    }
+                }
             }
             return signo as u64;
         }
@@ -729,21 +912,30 @@ pub fn wait_for(tid: usize, set: u64, span: u64, at: u64) -> u64 {
 }
 
 /// Take the lowest of `set` waiting for task `tid`, its own first: the
-/// signal and who raised it.
-fn take_one(tid: usize, set: u64) -> Option<(u8, u64)> {
+/// signal and what came with it.
+fn take_one(tid: usize, set: u64) -> Option<(u8, Info)> {
     let flags = irq_save();
     let own = unsafe { TPENDING[tid] } & set;
     let out = if own != 0 {
         let signo = own.trailing_zeros() as u8 + 1;
-        unsafe {
-            TPENDING[tid] &= !(1 << (signo - 1));
-            Some((signo, TVALUE[tid][signo as usize - 1]))
-        }
+        Some((signo, unsafe { take_own(tid, signo) }))
     } else {
         fdtable::sig_take_one(tid, set)
     };
     irq_restore(flags);
     out
+}
+
+/// Take the `signo` raised for task `tid` alone: what came with it. Another
+/// of its number behind it is waiting now in its place. Interrupts are off.
+unsafe fn take_own(tid: usize, signo: u8) -> Info {
+    unsafe {
+        let (info, more) = TWAITING[tid].take(signo);
+        if !more {
+            TPENDING[tid] &= !(1 << (signo - 1));
+        }
+        info
+    }
 }
 
 /// `SYS_SIG_STACK`: the stack the caller wants handlers that ask for one
@@ -805,33 +997,30 @@ fn sti() {
 }
 
 /// The next handler to run for task `tid` on its way out, taken: the
-/// signal, how to run its handler, and who raised it. The task's own
+/// signal, how to run its handler, and what came with it. The task's own
 /// signals first, then its program's. What is let through and has no
 /// handler to run does what it does on the way — which may be the end of
 /// the program, so that this does not return, or stop it here until it is
 /// continued.
-fn take_next(tid: usize) -> Option<(u8, Handler, u64)> {
+fn take_next(tid: usize) -> Option<(u8, Handler, Info)> {
     loop {
         let flags = irq_save();
         let mask = unsafe { MASK[tid] };
         let own = unsafe { TPENDING[tid] } & !mask;
         let mine = (own != 0).then(|| {
             let signo = own.trailing_zeros() as u8 + 1;
-            unsafe {
-                TPENDING[tid] &= !(1 << (signo - 1));
-                (signo, TVALUE[tid][signo as usize - 1])
-            }
+            (signo, unsafe { take_own(tid, signo) })
         });
         irq_restore(flags);
-        if let Some((signo, value)) = mine {
+        if let Some((signo, info)) = mine {
             match fdtable::sig_action(tid, signo, None) {
                 Some(Disposition::Run) => {
                     if let Some(how) = fdtable::sig_run_begin(tid, signo) {
-                        return Some((signo, how, value));
+                        return Some((signo, how, info));
                     }
                 }
                 Some(Disposition::Catch) => {
-                    let _ = raise_from(tid, signo, BY_PROGRAM, value & !(1 << 63));
+                    let _ = raise_with(tid, signo, info);
                 }
                 Some(Disposition::Default) => {
                     let _ = act(tid, signo);
@@ -866,21 +1055,23 @@ fn settle(tid: usize) {
 /// stack is.
 ///
 /// It may wait: the stack's page may have to be read back in.
-fn run(tid: usize, regs: &mut Regs, signo: u8, how: Handler, value: u64) {
+fn run(tid: usize, regs: &mut Regs, signo: u8, how: Handler, info: Info) {
     // The mask to go back to afterwards: the one a wait replaced, if this
     // ends that wait, and otherwise the one it has.
     let flags = irq_save();
     let before = unsafe { RESTORE[tid].take().unwrap_or(MASK[tid]) };
     irq_restore(flags);
-    let (code, value) = if value >> 63 != 0 { (BY_PROGRAM, value & !(1 << 63)) } else { (BY_KERNEL, value) };
-    if !push(tid, regs, signo, code, value, before, how) {
+    let old = info.old_value();
+    let (code, value) = if old >> 63 != 0 { (BY_PROGRAM, old & !(1 << 63)) } else { (BY_KERNEL, old) };
+    if !push(tid, regs, signo, code, value, before, how, info) {
         let _ = scheduler::end_program(tid, -(SIGSEGV as i32));
     }
 }
 
 /// Write the record for `signo` on task `tid`'s stack and point `regs` at
 /// the program's handler. False if the stack cannot be written.
-fn push(tid: usize, regs: &mut Regs, signo: u8, code: u64, value: u64, before: u64, how: Handler) -> bool {
+#[allow(clippy::too_many_arguments)]
+fn push(tid: usize, regs: &mut Regs, signo: u8, code: u64, value: u64, before: u64, how: Handler, info: Info) -> bool {
     let size = core::mem::size_of::<Frame>();
     let sp = regs[RSP] as usize;
     let (base, len) = unsafe { STACK[tid] };
@@ -909,6 +1100,7 @@ fn push(tid: usize, regs: &mut Regs, signo: u8, code: u64, value: u64, before: u
         flags: on_stack as u64 | (how.flags & !0xFF) as u64,
         cookie: how.cookie,
         regs: *regs,
+        info,
     };
     // Brought in, and then looked at and written in one step: between the
     // two, with interrupts on, the page could be taken again by a program
@@ -957,17 +1149,19 @@ fn clean_flags(rflags: u64) -> u64 {
 }
 
 /// The current task has faulted in ring 3 in a way that is signal `signo`
-/// to a program on Unix. If its program has a handler the kernel runs for
-/// that and the task is not holding it back, `regs` is changed to run it
-/// and this is true. If not the fault is the end of the program, as it
-/// always was: a fault that is held back would only happen again.
-pub fn fault(regs: &mut Regs, signo: u8, addr: u64) -> bool {
+/// to a program on Unix — `code` is Linux's word for how, `addr` where. If
+/// its program has a handler the kernel runs for that and the task is not
+/// holding it back, `regs` is changed to run it and this is true. If not the
+/// fault is the end of the program, as it always was: a fault that is held
+/// back would only happen again.
+pub fn fault(regs: &mut Regs, signo: u8, code: i64, addr: u64) -> bool {
     let tid = scheduler::current_tid();
     if tid == 0 || tid >= MAX_TASKS || mask_of(tid) & (1 << (signo - 1)) != 0 {
         return false;
     }
     let Some(how) = fdtable::sig_run_begin(tid, signo) else { return false };
-    push(tid, regs, signo, BY_FAULT, addr, mask_of(tid), how)
+    let info = Info { code, who: 0, value: addr };
+    push(tid, regs, signo, BY_FAULT, addr, mask_of(tid), how, info)
 }
 
 /// `SYS_SIG_RETURN`: the handler has run, and the task is to be where its
@@ -1018,7 +1212,7 @@ pub fn ret(at: u64) -> ! {
         }
         sti();
         match take_next(tid) {
-            Some((signo, how, value)) => run(tid, &mut regs, signo, how, value),
+            Some((signo, how, info)) => run(tid, &mut regs, signo, how, info),
             None => settle(tid),
         }
     }
@@ -1062,7 +1256,7 @@ pub fn leaving_call(answer: u64) -> u64 {
             cli();
             return answer;
         };
-        let Some((signo, how, value)) = take_next(tid) else {
+        let Some((signo, how, info)) = take_next(tid) else {
             settle(tid);
             continue;
         };
@@ -1085,7 +1279,7 @@ pub fn leaving_call(answer: u64) -> u64 {
         regs[RIP] = frame.rip;
         regs[RFLAGS] = frame.rflags;
         regs[RSP] = frame.rsp;
-        run(tid, &mut regs, signo, how, value);
+        run(tid, &mut regs, signo, how, info);
         frame.rip = regs[RIP];
         frame.rsp = regs[RSP];
         frame.rdi = regs[RDI];
@@ -1107,9 +1301,9 @@ pub fn leaving_interrupt(frame: &mut crate::idt::InterruptFrame) {
         }
         sti();
         match take_next(tid) {
-            Some((signo, how, value)) => {
+            Some((signo, how, info)) => {
                 let mut regs = regs_of(frame);
-                run(tid, &mut regs, signo, how, value);
+                run(tid, &mut regs, signo, how, info);
                 enter(frame, &regs);
             }
             None => settle(tid),
@@ -1134,9 +1328,14 @@ pub fn enter(frame: &mut crate::idt::InterruptFrame, regs: &Regs) {
     frame.rflags = regs[RFLAGS];
 }
 
-/// `SYS_SIG_TAKE`.
+/// `SYS_SIG_TAKE`. A real-time signal with another of its number behind
+/// it is taken once and is still waiting, and the program is told so again.
 pub fn take(tid: usize, word: usize) -> u64 {
-    fdtable::sig_take(tid, word)
+    let (taken, again) = fdtable::sig_take(tid, word);
+    if let Some(word) = again {
+        tell(tid, word);
+    }
+    taken
 }
 
 /// A character typed at a terminal raised a signal: it is for the group in

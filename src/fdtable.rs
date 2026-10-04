@@ -26,6 +26,7 @@
 //! descriptor would free the object under it, and the next thing to take the
 //! slot would be read by a task that never held it.
 
+use crate::signal::{Info, Waiting};
 use crate::task::{FdKind, MAX_FDS, MAX_TASKS};
 
 /// The working directory's slot: a descriptor number one past the last
@@ -69,8 +70,6 @@ struct Table {
     /// It has said that a call a signal cuts short is to answer as Unix
     /// would have it (`signal::handle` for signal 0).
     sig_unix: bool,
-    /// What came with each signal when it was last raised: who raised it.
-    sig_values: [u64; 64],
     /// Signals with a handler that have been raised and not yet taken, or
     /// not yet run.
     sig_pending: u64,
@@ -132,7 +131,6 @@ const EMPTY: Table = Table {
     sig_cookies: [0; 64],
     sig_entry: 0,
     sig_unix: false,
-    sig_values: [0; 64],
     sig_pending: 0,
     sig_held: 0,
     sig_interrupt: false,
@@ -153,6 +151,11 @@ const EMPTY: Table = Table {
 static mut TABLES: [Table; MAX_TASKS] = [EMPTY; MAX_TASKS];
 /// Which table each task uses.
 static mut OF_TASK: [u16; MAX_TASKS] = [NONE; MAX_TASKS];
+/// What came with each signal waiting for the program a table is, and the
+/// real-time signals waiting behind one of their number: beside the tables
+/// rather than in them, so that it is zeroed memory and not the kernel's
+/// image.
+static mut WAITING: [Waiting<{ crate::signal::QUEUE }>; MAX_TASKS] = [Waiting::EMPTY; MAX_TASKS];
 /// What each task is in the middle of using, held so that it cannot go away.
 static mut HELD: [FdKind; MAX_TASKS] = [FdKind::Empty; MAX_TASKS];
 
@@ -189,6 +192,24 @@ unsafe fn table_mut(tid: usize) -> Option<&'static mut Table> {
     }
 }
 
+/// The table `tid` uses, and what came with the signals waiting for it.
+///
+/// # Safety
+/// Interrupts are off.
+unsafe fn signals_mut(tid: usize) -> Option<(&'static mut Table, &'static mut Waiting<{ crate::signal::QUEUE }>)> {
+    unsafe {
+        if tid >= MAX_TASKS {
+            return None;
+        }
+        let i = (*core::ptr::addr_of!(OF_TASK))[tid];
+        if i == NONE {
+            None
+        } else {
+            Some((&mut tables()[i as usize], &mut (*core::ptr::addr_of_mut!(WAITING))[i as usize]))
+        }
+    }
+}
+
 /// Give a new task an empty table of its own. False if it already has one.
 pub fn attach_new(tid: usize) -> bool {
     if tid >= MAX_TASKS {
@@ -205,6 +226,7 @@ pub fn attach_new(tid: usize) -> bool {
                 Some(i) => {
                     tables()[i] = EMPTY;
                     tables()[i].tasks = 1;
+                    (*core::ptr::addr_of_mut!(WAITING))[i].clear();
                     of[tid] = i as u16;
                     true
                 }
@@ -350,7 +372,7 @@ pub fn copy_into(child: usize, parent: usize) {
                 return;
             }
         };
-        if let Some(dst) = table_mut(child) {
+        if let Some((dst, dst_waiting)) = signals_mut(child) {
             dst.umask = src_umask;
             (dst.cmdline, dst.cmdline_len) = src_name;
             // The child is a copy of the program, handlers and the word they
@@ -360,6 +382,7 @@ pub fn copy_into(child: usize, parent: usize) {
             (dst.sig_run, dst.sig_masks, dst.sig_flags, dst.sig_cookies, dst.sig_entry, dst.sig_unix) = src_run;
             dst.sig_pending = 0;
             dst.sig_held = 0;
+            dst_waiting.clear();
             dst.sig_interrupt = false;
             for (i, kind) in src_fds.iter().enumerate() {
                 if kind.is_empty() || !dst.fds[i].is_empty() {
@@ -528,7 +551,7 @@ pub fn sig_action(tid: usize, signo: u8, new: Option<Disposition>) -> Option<Dis
     let bit = sig_bit(signo);
     let flags = irq_save();
     let old = unsafe {
-        table_mut(tid).map(|t| {
+        signals_mut(tid).map(|(t, w)| {
             let old = said(t, bit);
             if let Some(new) = new {
                 // A signal waiting for a handler the kernel was to run, and
@@ -555,6 +578,9 @@ pub fn sig_action(tid: usize, signo: u8, new: Option<Disposition>) -> Option<Dis
                 // not waiting for anything.
                 if new != Disposition::Catch {
                     t.sig_pending &= !bit;
+                }
+                if (t.sig_pending | t.sig_held) & bit == 0 {
+                    w.forget(signo);
                 }
             }
             old
@@ -651,18 +677,22 @@ pub fn sig_ready(tid: usize, mask: u64) -> bool {
 
 /// Take the lowest signal waiting for a handler the kernel runs that `mask`
 /// does not hold back: the signal, how to run its handler, and what came
-/// with it. It is no longer waiting.
-pub fn sig_run_take(tid: usize, mask: u64) -> Option<(u8, Handler, u64)> {
+/// with it. It is no longer waiting, unless another of its number was
+/// behind it.
+pub fn sig_run_take(tid: usize, mask: u64) -> Option<(u8, Handler, Info)> {
     let flags = irq_save();
     let out = unsafe {
-        table_mut(tid).and_then(|t| {
+        signals_mut(tid).and_then(|(t, w)| {
             let ready = t.sig_pending & t.sig_run & !mask;
             if ready == 0 || t.sig_entry == 0 {
                 return None;
             }
             let signo = ready.trailing_zeros() as u8 + 1;
-            t.sig_pending &= !sig_bit(signo);
-            Some((signo, begin(t, signo), t.sig_values[signo as usize - 1]))
+            let (info, more) = w.take(signo);
+            if !more {
+                t.sig_pending &= !sig_bit(signo);
+            }
+            Some((signo, begin(t, signo), info))
         })
     };
     irq_restore(flags);
@@ -701,13 +731,15 @@ pub fn sig_run_begin(tid: usize, signo: u8) -> Option<Handler> {
 pub fn sig_held_take(tid: usize, mask: u64) -> Option<u8> {
     let flags = irq_save();
     let out = unsafe {
-        table_mut(tid).and_then(|t| {
+        signals_mut(tid).and_then(|(t, w)| {
             let ready = t.sig_held & !mask;
             if ready == 0 {
                 return None;
             }
             let signo = ready.trailing_zeros() as u8 + 1;
-            t.sig_held &= !sig_bit(signo);
+            if !w.take(signo).1 {
+                t.sig_held &= !sig_bit(signo);
+            }
             Some(signo)
         })
     };
@@ -715,26 +747,35 @@ pub fn sig_held_take(tid: usize, mask: u64) -> Option<u8> {
     out
 }
 
-/// `signo` was raised for `tid`'s program, by `value`, which has said
+/// `signo` was raised for `tid`'s program, with `info`, which has said
 /// nothing about it, while every task of it held it back or one waited to
-/// take it.
-pub fn sig_hold(tid: usize, signo: u8, value: u64) {
+/// take it. False if it cannot wait: a real-time signal with as many of it
+/// waiting as can.
+pub fn sig_hold(tid: usize, signo: u8, info: Info) -> bool {
+    let bit = sig_bit(signo);
     let flags = irq_save();
-    unsafe {
-        if let Some(t) = table_mut(tid) {
-            t.sig_held |= sig_bit(signo);
-            t.sig_values[signo as usize - 1] = value;
-        }
-    }
+    let held = unsafe {
+        signals_mut(tid).is_none_or(|(t, w)| {
+            let ok = w.put(signo, info, (t.sig_held | t.sig_pending) & bit != 0);
+            if ok {
+                t.sig_held |= bit;
+            }
+            ok
+        })
+    };
     irq_restore(flags);
+    held
 }
 
 /// `signo` is no longer held for `tid`'s program.
 pub fn sig_unhold(tid: usize, signo: u8) {
     let flags = irq_save();
     unsafe {
-        if let Some(t) = table_mut(tid) {
+        if let Some((t, w)) = signals_mut(tid) {
             t.sig_held &= !sig_bit(signo);
+            if t.sig_pending & sig_bit(signo) == 0 {
+                w.forget(signo);
+            }
         }
     }
     irq_restore(flags);
@@ -750,64 +791,73 @@ pub fn sig_pending_set(tid: usize) -> u64 {
 }
 
 /// Take the lowest of `set` waiting for `tid`'s program, whatever was said
-/// about it, without anything being done about it: the signal and who
-/// raised it.
-pub fn sig_take_one(tid: usize, set: u64) -> Option<(u8, u64)> {
+/// about it, without anything being done about it: the signal and what came
+/// with it.
+pub fn sig_take_one(tid: usize, set: u64) -> Option<(u8, Info)> {
     let flags = irq_save();
     let out = unsafe {
-        table_mut(tid).and_then(|t| {
+        signals_mut(tid).and_then(|(t, w)| {
             let waiting = ((t.sig_pending & (t.sig_run | t.sig_catch)) | t.sig_held) & set;
             if waiting == 0 {
                 return None;
             }
             let signo = waiting.trailing_zeros() as u8 + 1;
-            t.sig_pending &= !sig_bit(signo);
-            t.sig_held &= !sig_bit(signo);
-            Some((signo, t.sig_values[signo as usize - 1]))
+            let (info, more) = w.take(signo);
+            if !more {
+                t.sig_pending &= !sig_bit(signo);
+                t.sig_held &= !sig_bit(signo);
+            }
+            Some((signo, info))
         })
     };
     irq_restore(flags);
     out
 }
 
-/// Signal `signo` has been raised for `tid`'s program, by `value`. Returns
-/// what the program said to do about it and, when that is to tell it, where
-/// — with the signal now waiting to be taken, or to be run.
-pub fn sig_post(tid: usize, signo: u8, value: u64) -> Option<(Disposition, usize)> {
+/// Signal `signo` has been raised for `tid`'s program, with `info`.
+/// Returns what the program said to do about it and, when that is to tell
+/// it, where — with the signal now waiting to be taken, or to be run; or
+/// `Err` for a real-time signal with as many of it waiting as can.
+pub fn sig_post(tid: usize, signo: u8, info: Info) -> Option<Result<(Disposition, usize), ()>> {
     if signo == 0 || signo > 64 {
         return None;
     }
     let bit = sig_bit(signo);
     let flags = irq_save();
     let out = unsafe {
-        table_mut(tid).map(|t| {
-            if t.sig_run & bit != 0 {
+        signals_mut(tid).map(|(t, w)| {
+            if t.sig_run & bit != 0 || t.sig_catch & bit != 0 {
+                if !w.put(signo, info, (t.sig_pending | t.sig_held) & bit != 0) {
+                    return Err(());
+                }
                 t.sig_pending |= bit;
-                t.sig_values[signo as usize - 1] = value;
+            }
+            Ok(if t.sig_run & bit != 0 {
                 (Disposition::Run, 0)
             } else if t.sig_catch & bit != 0 {
-                t.sig_pending |= bit;
                 t.sig_interrupt = true;
                 (Disposition::Catch, t.sig_word)
             } else if t.sig_ignore & bit != 0 {
                 (Disposition::Ignore, 0)
             } else {
                 (Disposition::Default, 0)
-            }
+            })
         })
     };
     irq_restore(flags);
     out
 }
 
-/// The signals raised for `tid`'s program that it has a handler for, which
-/// are no longer waiting once this returns. `word`, if not 0, is where it
-/// wants to be told of the next.
-pub fn sig_take(tid: usize, word: usize) -> u64 {
+/// The signals raised for `tid`'s program that it has a handler for, each
+/// of which is no longer waiting once this returns — unless another of its
+/// number was behind it, and then the program is to be told again, through
+/// the word this answers with. `word`, if not 0, is where it wants to be
+/// told of the next.
+pub fn sig_take(tid: usize, word: usize) -> (u64, Option<usize>) {
     let flags = irq_save();
     let taken = unsafe {
-        match table_mut(tid) {
-            Some(t) => {
+        match signals_mut(tid) {
+            Some((t, w)) => {
                 if word != 0 {
                     t.sig_word = word;
                 }
@@ -815,10 +865,22 @@ pub fn sig_take(tid: usize, word: usize) -> u64 {
                 // Those the program is told of. One the kernel runs a
                 // handler for is taken by running it.
                 let taken = t.sig_pending & t.sig_catch;
-                t.sig_pending &= !taken;
-                taken
+                let mut again = false;
+                for signo in 1..=64u8 {
+                    if taken & sig_bit(signo) != 0 {
+                        if w.take(signo).1 {
+                            again = true;
+                        } else {
+                            t.sig_pending &= !sig_bit(signo);
+                        }
+                    }
+                }
+                if again {
+                    t.sig_interrupt = true;
+                }
+                (taken, again.then_some(t.sig_word))
             }
-            None => 0,
+            None => (0, None),
         }
     };
     irq_restore(flags);
@@ -1164,7 +1226,7 @@ pub fn close_on_exec(tid: usize) {
     let mut gone = [FdKind::Empty; SLOTS];
     let flags = irq_save();
     unsafe {
-        if let Some(t) = table_mut(tid) {
+        if let Some((t, w)) = signals_mut(tid) {
             for fd in 0..SLOTS {
                 if t.cloexec & (1u128 << fd) != 0 {
                     gone[fd] = core::mem::replace(&mut t.fds[fd], FdKind::Empty);
@@ -1178,6 +1240,7 @@ pub fn close_on_exec(tid: usize) {
             t.sig_entry = 0;
             t.sig_unix = false;
             t.sig_pending = 0;
+            w.keep(t.sig_held);
             t.sig_interrupt = false;
             t.sig_word = 0;
         }

@@ -1,6 +1,6 @@
 # Quark syscall ABI
 
-**Version 3.27.** Query the running kernel with `SYS_ABI_VERSION` (240), which
+**Version 3.28.** Query the running kernel with `SYS_ABI_VERSION` (240), which
 returns `(major << 16) | minor`.
 
 This document is the contract between the Quark kernel and everything above it.
@@ -63,7 +63,8 @@ ask; the futex waits return `1` when the word had already changed and `2` when
 the time ran out; and the calls that answer instead of waiting —
 `SYS_FD_READ_NB`, `SYS_FD_WRITE_NB`, and `SYS_FD_SEND` and `SYS_FD_RECV` when
 asked not to wait — return `0xFFFF_FFFE` for "would block", distinct from `0`,
-which is end of file. And a wait that a signal ended says so, where its count
+which is end of file; and `SYS_SIG_RAISE` and `SYS_SIG_QUEUE` return it for a
+real-time signal that cannot wait, as many of its kind waiting as can. And a wait that a signal ended says so, where its count
 would be: `0xFFFF_FFFD` — and, to a program that has asked for Unix's answers,
 `0xFFFF_FFFC` or `0xFFFF_FFFB` to say what was run (see *Signals*) — except a
 sleep on `SYS_RECV_TIMEOUT`, which answers `2`.
@@ -101,7 +102,9 @@ Every block is assigned. Threads never needed one: a thread is a task started
 with its creator's address space, so it is built from calls that already
 existed. Two blocks filled up and carry on in the top half of another, where
 it says so in its heading: hardware's calls about a PCI device are in 0xA8
-(168–175), the half of the debug console's block it had no use for.
+(168–175), the half of the debug console's block it had no use for. The
+signals did too, twice: they go on in 0x78 (120–123), in hardware's block,
+and then in 0x88 (136–143), the half of synchronisation's.
 
 ## Stability and deprecation
 
@@ -222,6 +225,7 @@ returning at once turned that loop into a spin.
 | 3.16 | **Off, and on again, by the firmware's tables.** `SYS_POWER` (119) turns the machine off or restarts it, for a holder of the new capability `Power` (type 12): by ACPI's control and reset registers, where a program used to write to the three ports QEMU listens on. |
 | 3.17 | **Memory above four gigabytes.** All of a machine's memory is used, up to 511 GiB, where the kernel used the first four gigabytes of it. `SYS_PHYS_ALLOC` takes a flag (arg1 = 1) for frames below four gigabytes, which is what a device that is told an address in thirty-two bits needs; without it a frame is ordinary memory and comes from the top. `SYS_MEM_INFO` takes what to say (arg0): 1 for how much memory the machine has and 2 for where it ends. |
 | 3.18 | **The wide registers.** A program may use AVX, AVX2 and AVX-512 where the processor has them: the kernel turns them on (`OSXSAVE`, XCR0) and saves all of each task's with `XSAVE`. Before, an AVX instruction was a fault. No call changed. |
+| 3.28 | **Signals that queue, and say who.** A real-time signal (32 to 64) raised while one of its number is waiting waits behind it, with what it carried — 64 for a program and 16 for a task beyond the first of each number — where it used to be the same one again; a signal below 32 keeps what came with the raise that made it wait. `SYS_SIG_QUEUE` (136) raises one carrying a value. What came with a signal is three words — Linux's `si_code`, who raised it (a process id and a user; a child's for 17), and a value (the one it was queued with, a child's status, a fault's address) — at the end of a handler's record, and written by `SYS_SIG_WAIT` with arg3 = 1. `SYS_SIG_RAISE` answers `0xFFFF_FFFE` for a real-time signal that cannot wait. |
 | 3.27 | **What a program was started as.** `SYS_PROGRAM_NAME` (214) keeps a program's command line — its arguments, each ended by a nought, the first 128 bytes of them — set by the program itself or for a child its caller has made and not started, and read by anybody: what `ps` shows, and what `/proc` says a process is called. `SYS_FORK` copies it; a program that becomes another with `SYS_EXEC_SPACE` says what it has become. |
 | 3.26 | **A child is put in its band by whoever made it.** `SYS_TASK_PRIORITY` (105) sets the band of a task its caller made and has not started, as `SYS_TASK_CREATE_IN` and the rest let it be filled, with no `TaskMgmt`; and with arg1 = `u64::MAX` it says which band a task is in, to anybody. A spawner with no authority over anybody — the device manager — could not give a driver the drivers' band its manifest asks for, so every driver it started ran as an ordinary program: preempted by anything, and its memory taken when memory was short — a disk's driver written out to the disk it drives. |
 | 3.25 | **A screen in memory.** `SYS_DISPLAY_MEMORY` (171) gives the driver of a display device that draws its picture from memory — a virtio GPU — the screen it draws from: one run of memory for the device, no task's and never freed, as a `PhysRange` the device reaches. And the bootloader's framebuffer is kept from the frame allocator where it is memory, as it was not. |
@@ -362,7 +366,7 @@ everything else returns promptly.
 | 9 | `SYS_UMASK` | arg0 = the new mask (nine bits), or `u64::MAX` to leave it | the mask as it was | — |
 | 10 | `SYS_WAIT_FOR` | arg0 = a child, or 0 for any; arg1 = flags: 1 = do not wait, 2 = the child is named by its process id, here and in the answer, rather than by its tid, 4 = answer for a child that has stopped too, 8 = and for one that has been continued, 16 = arg0 is a process group of children, 0 for the caller's own | `child \| (exit_code << 32)`; for a stop or a continue, `child \| (1 << 31) \| (signal << 32)`, the signal 0 for a continue; 0 if asked not to wait and there is nothing to say; `u64::MAX` if there is no such child. **Blocks** unless asked not to. | — |
 | 11 | `SYS_SIG_ACTION` | arg0 = signal (1 to 64), arg1 = 0 nothing said, 1 ignore, 2 told, 3 run by the kernel — with arg2 what to hold back besides while it runs, arg3 how (1, 2, 4, 8, and the program's own bits 8–31), arg4 the program's word for the handler; anything else only asks. With signal 0 and 3: arg4 is where handlers are entered, and bit 0 of arg3 asks for Unix's answers | what it was: 0 to 3 / `u64::MAX`; for signal 0, 0 | — |
-| 12 | `SYS_SIG_RAISE` | arg0 = a task of the program to signal, or with arg2 = 1 its process id, or with arg2 = 2 a process group (0 for the caller's own), or with arg2 = 4 the task alone; arg1 = signal, or 0 to ask whether one could be raised | 0 / `u64::MAX`; for a group, `u64::MAX - 1` if it has members and none the caller may signal | `TaskMgmt` for target, or same UID |
+| 12 | `SYS_SIG_RAISE` | arg0 = a task of the program to signal, or with arg2 = 1 its process id, or with arg2 = 2 a process group (0 for the caller's own), or with arg2 = 4 the task alone; arg1 = signal, or 0 to ask whether one could be raised | 0; `0xFFFF_FFFE` for a real-time signal that cannot wait / `u64::MAX`; for a group, `u64::MAX - 1` if it has members and none the caller may signal | `TaskMgmt` for target, or same UID |
 | 13 | `SYS_SIG_TAKE` | arg0 = where to be told of the next (a `u32` in the caller's memory), or 0 to leave that as it is | the signals waiting for a handler, bit `n - 1` for signal `n`; none is waiting afterwards | — |
 | 14 | `SYS_PID` | arg0 = a task, or 0 for the caller | the process id of the program it belongs to / `u64::MAX` | — |
 | 15 | `SYS_SIG_ALARM` | arg0 = how long until signal 14 is raised for the caller's program, a span, 0 for no alarm; arg1 = how long between repeats after that, a span, 0 for none; arg2 = 1 to ask and change nothing; arg3 = where to write how the alarm stood as two `u64` of nanoseconds, what was left and the repeat, or 0 | how the alarm stood, in ticks: `ticks left \| (repeat << 32)`, 0 if there was none / `u64::MAX` | — |
@@ -474,6 +478,10 @@ at the record and the stack as a function finds it:
 | 32 | bit 0: the record is on the stack named for handlers; bits 8–31 as the handler was said with |
 | 40 | the program's word for the handler |
 | 48 | eighteen words: RAX RBX RCX RDX RSI RDI RBP R8–R15 RIP RFLAGS RSP — where the task was |
+| 192 | three words: what came with it, as Linux's `siginfo_t` has it after `si_signo` and `si_errno` — `si_code`, sign-extended; who raised it, a process id in the low half and its user in the high; and what it carried (see *What comes with a signal*) |
+
+Offsets 8 and 16 say less than 192 and are what a program written before 3.28
+reads; they mean what they meant.
 
 The handler runs holding back its own signal unless it asked otherwise, and
 what it asked to besides. When it has done, the program gives the record back
@@ -503,7 +511,29 @@ lets it through — and one raised for a task alone waits while that task
 holds it back. `SYS_SIG_WAIT` (123) takes one of a set that is waiting, or
 waits for one to arrive, without anything being done about it: it answers
 with the signal, or 0 if the time ran out, and writes who raised it where
-arg2 says; a program that waits so holds the signals back.
+arg2 says — the process id with bit 63 set for a program, 0 for the kernel —
+or, with arg3 = 1, the three words of what came with it, as a handler's
+record ends; a program that waits so holds the signals back.
+
+*What comes with a signal, and what queues.* A signal carries three words,
+laid out as Linux's `siginfo_t` has them after its first two ints:
+
+| word | what |
+|---|---|
+| 0 | `si_code`, sign-extended: 0 raised with `SYS_SIG_RAISE` (`SI_USER`), -6 the same for one task (`SI_TKILL`), -1 with `SYS_SIG_QUEUE` (`SI_QUEUE`), 0x80 the kernel's own (`SI_KERNEL`); for 17, 1 the child exited, 2 a signal ended it, 5 it stopped, 6 it was continued; for a fault, Linux's word for how — 1 or 2 for 11 (nothing there, or something that may not be touched so), 1 or 2 for 7 (an address off its boundary, or one that could not be had), 1 for 8 (a division by nought), 2 for 4 (not an instruction) |
+| 1 | who raised it: the process id in the low 32 bits and its user in the high; for 17, the child's; 0 for the kernel and a fault |
+| 2 | what it carried: the value it was queued with; for 17, what the child exited with, or the signal that ended, stopped or continued it; for a fault, the address |
+
+From 32 up a signal is *real-time*, and one raised while one of its number
+is waiting waits behind it, with its own three words, rather than being the
+same one again: each is run, or taken, in the order they were raised, the
+lowest number first. A program has room for 64 of them behind the first of
+each number, and a task for 16 more of its own (`SYS_SIG_RAISE` with arg2 =
+4, `SYS_SIG_QUEUE` with arg3 = 4); one that cannot wait is not raised, and
+the call answers `0xFFFF_FFFE`. Below 32 a signal raised while one of its
+number waits is the same one, which keeps the three words it was raised
+with first. What waits for a handler that goes, or for a signal that is
+then ignored, goes with it, and a forked child has nothing waiting.
 
 *Waits.* A signal the kernel is to run ends any wait the task that will run
 it is in: a sleep, a poll, a read or a write of a terminal, a pipe or a
@@ -554,7 +584,8 @@ has said nothing about signal 14 is ended by it, like any other.
 
 *A child ending.* When a task whose parent is in another program dies —
 or its program is stopped, or continued — signal 17 is raised for the
-parent's program, after the parent has been
+parent's program, carrying the child's process id and user and what became
+of it, after the parent has been
 woken from `SYS_WAIT` if it was in one — so the child is there to collect
 when anything hears of it. A thread ending is not a child ending: its parent
 is the task that made it, in the program they share. Signal 17 does nothing
@@ -1232,7 +1263,7 @@ the rest: what they do is under *Signals*, with the process calls.
 | 120 | `SYS_SIG_MASK` | arg0 = how: 0 hold these back too, 1 let these through, 2 hold back exactly these, 3 the same and wait, 4 say what is waiting that is held back; anything else asks. arg1 = the signals, bit `n - 1` for signal `n` | what the calling task held back before; with 3, `0xFFFF_FFFD` when a signal ended the wait; with 4, what is waiting | — |
 | 121 | `SYS_SIG_RETURN` | arg0 = the record a handler was entered with | does not return: the task goes on from where the record says | — |
 | 122 | `SYS_SIG_STACK` | arg0 = address, or `u64::MAX` to change nothing; arg1 = bytes (0 for none); arg2 = where to write the stack it replaces, address and bytes, or 0 | 0 / `u64::MAX` | — |
-| 123 | `SYS_SIG_WAIT` | arg0 = the signals to take, arg1 = how long to wait for one, a span (0 not at all, `u64::MAX` for ever), arg2 = where to write who raised it, or 0 | the signal; 0 when the time ran out; `0xFFFF_FFFD` when another signal ended the wait with a handler run | — |
+| 123 | `SYS_SIG_WAIT` | arg0 = the signals to take, arg1 = how long to wait for one, a span (0 not at all, `u64::MAX` for ever), arg2 = where to write who raised it, or 0; arg3 = 1 to write there instead the three words of what came with it | the signal; 0 when the time ran out; `0xFFFF_FFFD` when another signal ended the wait with a handler run | — |
 
 ### What a program uses (0x7C)
 
@@ -1300,6 +1331,17 @@ returns through the kernel and reads why it woke, so a task blocked on a futex
 holds its slot from the moment it waits to the moment it runs again. With
 `MAX_FUTEX_WAITERS` slots in total, a caller that gets `u64::MAX` should treat
 it as a resource limit rather than as a bad argument.
+
+### Signals, continued again (0x88)
+
+| # | Name | Arguments | Returns | Cap |
+|---|---|---|---|---|
+| 136 | `SYS_SIG_QUEUE` | arg0 = a task of the program to signal, or with arg3 = 1 its process id, or with arg3 = 4 the task alone; arg1 = the signal, or 0 to ask whether one could be raised; arg2 = the value it carries | 0; `0xFFFF_FFFE` for a real-time signal that cannot wait / `u64::MAX` | `TaskMgmt` for target, or same UID |
+
+`SYS_SIG_RAISE` with a value: what comes with the signal says it was queued
+(`si_code` -1), by whom, and carries arg2 (see *What comes with a signal* under
+*Signals*) — Linux's `sigqueue`, and with arg3 = 4 its `pthread_sigqueue`. Not
+for a process group.
 
 ### Time (0x90)
 

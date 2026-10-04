@@ -618,9 +618,9 @@ extern "C" fn exception_handler(frame: &mut InterruptFrame) {
 /// back, the task goes back to that handler and not to the instruction
 /// that faulted. True if it does. If not, the fault is the end of the
 /// program, as it always was.
-fn handed_to_program(frame: &mut InterruptFrame, signo: i32, addr: u64) -> bool {
+fn handed_to_program(frame: &mut InterruptFrame, signo: i32, code: i64, addr: u64) -> bool {
     let mut regs = crate::signal::regs_of(frame);
-    if crate::signal::fault(&mut regs, signo as u8, addr) {
+    if crate::signal::fault(&mut regs, signo as u8, code, addr) {
         crate::signal::enter(frame, &regs);
         true
     } else {
@@ -706,7 +706,7 @@ fn exception(frame: &mut InterruptFrame) {
                     // bargain, and its answer. A page of a file that cannot
                     // be had is SIGBUS too — to the program's handler, if it
                     // has one.
-                    if handed_to_program(frame, SIGBUS, cr2) {
+                    if handed_to_program(frame, SIGBUS, crate::signal::BUS_ADRERR, cr2) {
                         return;
                     }
                     no_page(cr2, !matches!(fault, crate::paging::Fault::Bus));
@@ -736,7 +736,7 @@ fn exception(frame: &mut InterruptFrame) {
                 Err(_) if may_wait && crate::reclaim::wait() => {}
                 // The same bargain: a fork promised a page it had not got.
                 Err(_) if from_user => {
-                    if handed_to_program(frame, SIGBUS, cr2) {
+                    if handed_to_program(frame, SIGBUS, crate::signal::BUS_ADRERR, cr2) {
                         return;
                     }
                     no_page(cr2, true)
@@ -779,8 +779,16 @@ fn exception(frame: &mut InterruptFrame) {
         }
 
         // A program that has said what to do about touching what is not
-        // there does that.
-        if handed_to_program(frame, SIGSEGV, cr2) {
+        // there does that — told whether there was nothing there, or a page
+        // of its own it may not touch so. Below where programs live the
+        // processor finds the kernel's pages, which are nothing to the
+        // program.
+        let code = if frame.error_code & PF_PRESENT != 0 && crate::paging::user_range_ok(cr2 as usize & !0xFFF, 1) {
+            crate::signal::SEGV_ACCERR
+        } else {
+            crate::signal::SEGV_MAPERR
+        };
+        if handed_to_program(frame, SIGSEGV, code, cr2) {
             return;
         }
 
@@ -817,8 +825,17 @@ fn exception(frame: &mut InterruptFrame) {
     if from_user {
         let tid = scheduler::current_tid();
         let sig = signal_for(vec);
-        // The program's own handler for it, if it has one.
-        if handed_to_program(frame, sig, frame.rip) {
+        // The program's own handler for it, if it has one, told as Linux
+        // tells it: a division by nought, an instruction that is not one,
+        // an address off its boundary, and the kernel's own word for the
+        // rest.
+        let code = match vec {
+            0 => crate::signal::FPE_INTDIV,
+            6 => crate::signal::ILL_ILLOPN,
+            17 => crate::signal::BUS_ADRALN,
+            _ => crate::signal::SI_KERNEL,
+        };
+        if handed_to_program(frame, sig, code, frame.rip) {
             return;
         }
         crate::serial::puts(b"[UFAULT vec=");

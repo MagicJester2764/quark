@@ -144,6 +144,11 @@ pub fn is_stopped(tid: usize) -> bool {
     tid < MAX_TASKS && unsafe { STOPPED[tid] != 0 }
 }
 
+/// The signal that stopped the program `tid` is a task of; 0 if it runs.
+pub fn stopped_by(tid: usize) -> u8 {
+    if tid < MAX_TASKS { unsafe { STOPPED[tid] } } else { 0 }
+}
+
 /// Every live task of process `pid`, to `each`.
 ///
 /// Interrupts are off.

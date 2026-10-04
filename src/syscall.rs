@@ -328,6 +328,12 @@ pub const SYS_FUTEX_WAIT_TIMEOUT: u64 = 130;
 /// program passes to the Linux call are the argument here.
 pub const SYS_EVENT_CREATE: u64 = 131;
 
+// --- 0x88  signals, continued again ---
+//
+// The top half of synchronisation's block: the signals' own two are full.
+/// Raise a signal that carries a value — a real-time one queues.
+pub const SYS_SIG_QUEUE: u64 = 136;
+
 // --- 0x90  time ---
 //
 // A span of time handed to any call is a count of ticks, hundredths of a
@@ -443,7 +449,7 @@ pub const SYS_ABI_VERSION: u64 = 240;
 /// minor when calls are added. User space can refuse to run against a major it
 /// does not know, which is the point of exposing it at all.
 pub const ABI_VERSION_MAJOR: u64 = 3;
-pub const ABI_VERSION_MINOR: u64 = 27;
+pub const ABI_VERSION_MINOR: u64 = 28;
 
 /// Threads a task may make with no capability at all.
 ///
@@ -3819,8 +3825,9 @@ fn dispatch(
         SYS_SIG_WAIT => {
             // arg0 = the signals to take, arg1 = how long to wait for one, a
             // span (0 not at all, u64::MAX for ever), arg2 = where to say
-            // who raised it, or 0. Returns the signal, or 0 if none came.
-            crate::signal::wait_for(scheduler::current_tid(), arg0, arg1, arg2)
+            // who raised it, or 0 — with arg3 = 1, everything that came with
+            // it. Returns the signal, or 0 if none came.
+            crate::signal::wait_for(scheduler::current_tid(), arg0, arg1, arg2, arg3 == 1)
         }
         SYS_SIG_STACK => {
             // arg0 = where, arg1 = how long: the stack for handlers that
@@ -3834,12 +3841,21 @@ fn dispatch(
             // back here: the task goes on from where the record says.
             crate::signal::ret(arg0)
         }
-        SYS_SIG_RAISE => {
+        SYS_SIG_RAISE | SYS_SIG_QUEUE => {
             // arg0 = a task of the program to signal — or, with arg2 = 1, the
             // program's process id — and arg1 = the signal, or 0 to ask only
             // whether it could be. Whoever may kill a task may signal it:
             // TaskMgmt for the target, or the same user.
+            //
+            // SYS_SIG_QUEUE is the same with a value in arg2, and so what
+            // arg2 says in arg3: what came with it says it was queued, and
+            // a real-time signal waits behind one of its number already
+            // waiting. Either answers 0xFFFF_FFFE when one cannot.
             let caller = scheduler::current_tid();
+            let (arg2, value) = if nr == SYS_SIG_QUEUE { (arg3, arg2) } else { (arg2, 0) };
+            if nr == SYS_SIG_QUEUE && arg2 & RAISE_GROUP != 0 {
+                return u64::MAX;
+            }
             let caller_uid = scheduler::current_task_uid();
             let may = |tid: usize| {
                 crate::cap::task_has_task_mgmt(caller, tid)
@@ -3862,6 +3878,7 @@ fn dispatch(
                 let mine = scheduler::pid_of(caller);
                 let mut own = None;
                 let mut any = false;
+                let info = crate::signal::Info::from_task(caller, crate::signal::SI_USER, 0);
                 for &tid in tasks[..n].iter().filter(|&&tid| may(tid)) {
                     any = true;
                     if arg1 == 0 {
@@ -3870,14 +3887,14 @@ fn dispatch(
                     if scheduler::pid_of(tid) == mine {
                         own = Some(tid);
                     } else {
-                        let _ = crate::signal::raise_by(tid, arg1 as u8, mine);
+                        let _ = crate::signal::raise_with(tid, arg1 as u8, info);
                     }
                 }
                 if !any {
                     return NOT_ALLOWED;
                 }
                 if let Some(tid) = own {
-                    let _ = crate::signal::raise_by(tid, arg1 as u8, mine);
+                    let _ = crate::signal::raise_with(tid, arg1 as u8, info);
                 }
                 return 0;
             }
@@ -3906,14 +3923,22 @@ fn dispatch(
             if arg1 > crate::signal::NSIG as u64 {
                 return u64::MAX;
             }
-            let raised = if arg2 & RAISE_THREAD != 0 && !by_pid {
-                crate::signal::raise_task(tid, arg1 as u8, scheduler::pid_of(caller))
+            let thread = arg2 & RAISE_THREAD != 0 && !by_pid;
+            let code = match (nr == SYS_SIG_QUEUE, thread) {
+                (true, _) => crate::signal::SI_QUEUE,
+                (false, true) => crate::signal::SI_TKILL,
+                (false, false) => crate::signal::SI_USER,
+            };
+            let info = crate::signal::Info::from_task(caller, code, value);
+            let raised = if thread {
+                crate::signal::raise_task(tid, arg1 as u8, info)
             } else {
-                crate::signal::raise_by(tid, arg1 as u8, scheduler::pid_of(caller))
+                crate::signal::raise_with(tid, arg1 as u8, info)
             };
             match raised {
                 Ok(()) => 0,
-                Err(()) => u64::MAX,
+                Err(crate::signal::NotRaised::Full) => crate::pipe::WOULD_BLOCK,
+                Err(crate::signal::NotRaised::Nobody) => u64::MAX,
             }
         }
         SYS_PGROUP => {

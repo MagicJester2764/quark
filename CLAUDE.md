@@ -873,6 +873,16 @@ background job that ignores what its terminal raises.
   server is not one — woken with no reply, it fails — so a task is reached
   by what it is waiting on, never by its state. A new kind of wait is a new
   line in `end_wait` and a new `ends_wait` before it parks.
+- **What came with a signal goes with it** (`signal::Info`): Linux's
+  `si_code`, who raised it, and what it carried, at the end of a handler's
+  record and wherever it is taken. A new place that raises a signal says
+  who and as what (`raise_with`, `Info::from_task`; `raise` is the
+  kernel's own), and a real-time one can be refused — as many of its
+  number waiting as there is room for (`NotRaised::Full`) — which a call
+  that raised it on a program's behalf answers (`0xFFFF_FFFE`). What waits
+  is kept beside the descriptor tables (`fdtable::WAITING`) and not in
+  them: in them it was two hundred kilobytes of noughts in the kernel's
+  image.
 - **A call a signal cut short says what came of it, to a program that asked**
   (`fdtable::sig_unix`): `INTERRUPTED` for a handler that did not ask for
   SA_RESTART, `RESTART` for one that did, `AGAIN` when nothing ran here.
@@ -1260,12 +1270,12 @@ breaking any of them is quiet until it is a machine that stops.
   come from `SYS_MMAP`, backed at once.
 - **A call to a server is not cut short by a signal** (see *Signals*): a
   file's read or write, a socket's, a lock's wait. The handler runs when the
-  server answers. A signal of the same number raised twice before it is run
-  is run once: nothing is queued, real-time signals included. What a
-  handler is told of who raised a signal is a process id; there is no user,
-  and for SIGCHLD no status. A handler a program is told of — the way of a
+  server answers. Only the real-time signals queue, 64 a program and 16 a
+  task behind the first of each number; one past that is not raised, and
+  its raiser is told. A handler a program is told of — the way of a
   program written for this system — runs at a system-call boundary and
-  nowhere else. And the three *task* signals of `SYS_SIGNAL` — bits in one
+  nowhere else, and is told of a real-time signal waiting behind another
+  only by being told again. And the three *task* signals of `SYS_SIGNAL` — bits in one
   task's notification word, with a deadline — are still what a program
   written for this system is asked to stop with.
 - The date is UTC, and there is no time zone: what keeps one is a C library.
