@@ -241,11 +241,16 @@ pub const TIMED_OUT: u64 = 2;
 /// Wake up to `max_wake` tasks waiting on the futex at `addr`.
 /// Returns the number of tasks woken.
 pub fn futex_wake(addr: u64, max_wake: u64) -> u64 {
+    wake_in(scheduler::current_task_cr3(), addr, max_wake)
+}
+
+/// [`futex_wake`] of the word at `addr` in address space `cr3`, which need
+/// not be the caller's: a dying task's robust mutexes are woken in its own.
+pub fn wake_in(cr3: usize, addr: u64, max_wake: u64) -> u64 {
     if addr == 0 {
         return 0;
     }
 
-    let cr3 = scheduler::current_task_cr3();
     // No page there is no waiter there: a wait gives the page its memory
     // before it waits.
     let key = match key_of(cr3, addr) {

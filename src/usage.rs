@@ -275,7 +275,7 @@ pub fn collected(parent: usize, child: usize) {
 
 /// `SYS_USAGE`: what was used — 0 by the caller's program, 1 by the children
 /// it has collected, 2 by the calling task, 3 by the program task `of` is a
-/// task of — written to `out` as four words: nanoseconds in the program,
+/// task of, 4 by task `of` itself — written to `out` as four words: nanoseconds in the program,
 /// nanoseconds in the kernel for it, and how many times it gave the
 /// processor up and had it taken. Anybody may ask about any program, as
 /// `ps` does.
@@ -290,6 +290,8 @@ pub fn usage(tid: usize, whose: u64, out: u64, of: u64) -> u64 {
         3 if (of as usize) < MAX_TASKS && crate::scheduler::task_is_live(of as usize) => {
             of_program(of as usize)
         }
+        // A thread's own clock, another thread's of the program asks.
+        4 if (of as usize) < MAX_TASKS && crate::scheduler::task_is_live(of as usize) => of_task(of as usize),
         _ => return u64::MAX,
     };
     let words = [used.user_ns, used.sys_ns, used.voluntary, used.involuntary];

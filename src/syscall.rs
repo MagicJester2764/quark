@@ -260,6 +260,9 @@ pub const SYS_PROGRAM_NAME: u64 = 214;
 /// `SYS_PROGRAM_NAME` operations.
 const NAME_SET: u64 = 0;
 const NAME_GET: u64 = 1;
+/// What a task is called — a thread's name, Linux's `comm` — set and read,
+/// with `SYS_PROGRAM_NAME`'s operations.
+pub const SYS_TASK_NAME: u64 = 215;
 /// Timers, in the time block.
 pub const SYS_TIMER_CREATE: u64 = 146;
 pub const SYS_TIMER_SET: u64 = 147;
@@ -330,6 +333,9 @@ pub const SYS_FUTEX_WAIT_TIMEOUT: u64 = 130;
 /// for: one task adds, another waits. `eventfd`, in one call — the flags a
 /// program passes to the Linux call are the argument here.
 pub const SYS_EVENT_CREATE: u64 = 131;
+/// Where the caller's robust list is: the mutexes it holds that must not
+/// stay held if it dies. Linux's `set_robust_list`.
+pub const SYS_ROBUST_LIST: u64 = 132;
 
 // --- 0x88  signals, continued again ---
 //
@@ -481,7 +487,7 @@ pub const SYS_ABI_VERSION: u64 = 240;
 /// minor when calls are added. User space can refuse to run against a major it
 /// does not know, which is the point of exposing it at all.
 pub const ABI_VERSION_MAJOR: u64 = 3;
-pub const ABI_VERSION_MINOR: u64 = 33;
+pub const ABI_VERSION_MINOR: u64 = 34;
 
 /// Threads a task may make with no capability at all.
 ///
@@ -1191,6 +1197,58 @@ fn dispatch(
             match crate::ipc::sys_task_watch(scheduler::current_tid(), arg0 as usize) {
                 Ok(()) => 0,
                 Err(_) => u64::MAX,
+            }
+        }
+        SYS_ROBUST_LIST => {
+            // arg0 = where the caller's robust list's head is in its memory,
+            // 0 for none, u64::MAX to ask. Returns where it was.
+            crate::threads::robust_list(scheduler::current_tid(), arg0)
+        }
+        SYS_TASK_NAME => {
+            // arg0 = a task, arg1 = NAME_SET or NAME_GET, arg2 = the name or
+            // where it goes, arg3 = its length or the room, arg4 = for a
+            // server, a client in a call to it, whose program's task this
+            // is to be — 0 for the caller's own. Read by anybody, as `ps`
+            // reads it; none is its program's name.
+            let caller = scheduler::current_tid();
+            let tid = arg0 as usize;
+            if tid >= crate::task::MAX_TASKS || tid == 0 || !scheduler::task_is_live(tid) {
+                return u64::MAX;
+            }
+            match arg1 {
+                NAME_SET => {
+                    let asker = if arg4 == 0 { caller } else { arg4 as usize };
+                    if asker != caller && (asker >= crate::task::MAX_TASKS || !crate::ipc::is_calling(asker, caller)) {
+                        return u64::MAX;
+                    }
+                    if scheduler::space_of_task(tid) != scheduler::space_of_task(asker) {
+                        return u64::MAX;
+                    }
+                    let len = (arg3 as usize).min(crate::threads::NAME_MAX);
+                    let mut name = [0u8; crate::threads::NAME_MAX];
+                    if len > 0 {
+                        if !validate_user_ptr(arg2, len as u64) {
+                            return u64::MAX;
+                        }
+                        let _ua = crate::cpu::UserAccess::begin();
+                        unsafe { core::ptr::copy_nonoverlapping(arg2 as *const u8, name.as_mut_ptr(), len) };
+                    }
+                    crate::threads::set_name(tid, &name[..len]);
+                    0
+                }
+                NAME_GET => {
+                    let (name, len) = crate::threads::name_of(tid);
+                    let n = len.min(arg3 as usize);
+                    if n > 0 {
+                        if !validate_user_ptr_mut(arg2, n as u64) {
+                            return u64::MAX;
+                        }
+                        let _ua = crate::cpu::UserAccess::begin();
+                        unsafe { core::ptr::copy_nonoverlapping(name.as_ptr(), arg2 as *mut u8, n) };
+                    }
+                    len as u64
+                }
+                _ => u64::MAX,
             }
         }
         SYS_PROGRAM_NAME => {
@@ -4119,11 +4177,18 @@ fn dispatch(
             )
         }
         SYS_PID => {
-            // arg0 = a task, or 0 for the caller.
+            // arg0 = a task, or 0 for the caller; arg1 = 1 for the task's
+            // own number, which is its program's process id when it is the
+            // task the program began as.
             let tid = if arg0 == 0 { scheduler::current_tid() } else { arg0 as usize };
-            match scheduler::pid_of(tid) {
+            let number = if arg1 == 1 && scheduler::task_is_live(tid) {
+                crate::cap::endpoint_of(tid)
+            } else {
+                scheduler::pid_of(tid)
+            };
+            match number {
                 0 => u64::MAX,
-                pid => pid,
+                n => n,
             }
         }
         SYS_SIG_ACTION => {

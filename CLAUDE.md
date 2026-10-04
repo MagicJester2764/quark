@@ -829,6 +829,17 @@ every Unix program assumes:
   the word, before the thread is started: one that gave its own was a
   child until it first ran. A thread with no word is still waited for,
   which is how this system's own runtime joins one.
+- **A task that dies holding a robust mutex lets it go** (`threads.rs`). A C
+  library says where its list of them is (`SYS_ROBUST_LIST`, Linux's
+  `set_robust_list`); where a task dies (`close_descriptors`) and where it
+  becomes another program (`exec_into`) the kernel walks the list in the
+  task's own memory, marks each mutex still marked with its id as one whose
+  owner died, and wakes a waiter in that space (`futex::wake_in`) — a page
+  shared since a fork made the dying task's own first, as anything the
+  kernel writes through a frame is. musl walks the list itself when a
+  thread ends the ordinary way; this is for a program that ends without
+  doing so, holding a mutex another program waits on. A new way for a task
+  to end, or to stop being its program, calls `let_go`.
 - **A process is named by a number that is never used twice** (`SYS_PID`). A
   task id is a slot, and the next task made is given the lowest one free —
   usually the one just let go. Every Unix program that remembers a child

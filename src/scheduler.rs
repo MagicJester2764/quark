@@ -1988,6 +1988,8 @@ unsafe fn reap(i: usize) { unsafe {
 /// them — and the descriptors themselves only if it was the last task the
 /// program had. A thread that exits closes nothing.
 pub fn close_descriptors(tid: usize) {
+    // The robust mutexes it held, while its memory is still where it was.
+    crate::threads::let_go(tid);
     // What it used is its program's, before it leaves the program's record.
     crate::usage::task_ended(tid);
     crate::fdtable::task_gone(tid);
@@ -2342,6 +2344,7 @@ pub fn create_empty_task() -> Option<usize> {
         // program's; a task started as a program keeps them.
         crate::cap::task_made(tid);
         crate::usage::task_made(tid);
+        crate::threads::task_made(tid, parent);
         PROCESS_ID[tid] = crate::cap::endpoint_of(tid);
         // In its creator's process group and session: a job is whatever a
         // shell started, and what those started.
@@ -2948,6 +2951,9 @@ pub fn exec_into(cr3: usize, entry: u64, rsp: u64) -> Result<(), ()> {
     if space == 0 || space_in_use(space) {
         return Err(());
     }
+    // What it held as the program it was, it holds no longer; and it is
+    // called by the new one's name.
+    crate::threads::exec(caller);
     let old_space = {
         let flags = irq_save();
         let s = unsafe { TASKS[caller].as_ref().map(|t| t.space) };

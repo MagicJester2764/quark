@@ -57,6 +57,7 @@ mod ptimer;
 mod sigfd;
 mod local;
 mod timerfd;
+mod threads;
 mod tlb;
 mod usage;
 mod eventfd;
