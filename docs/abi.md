@@ -1,6 +1,6 @@
 # Quark syscall ABI
 
-**Version 3.35.** Query the running kernel with `SYS_ABI_VERSION` (240), which
+**Version 3.36.** Query the running kernel with `SYS_ABI_VERSION` (240), which
 returns `(major << 16) | minor`.
 
 This document is the contract between the Quark kernel and everything above it.
@@ -225,6 +225,7 @@ returning at once turned that loop into a spin.
 | 3.16 | **Off, and on again, by the firmware's tables.** `SYS_POWER` (119) turns the machine off or restarts it, for a holder of the new capability `Power` (type 12): by ACPI's control and reset registers, where a program used to write to the three ports QEMU listens on. |
 | 3.17 | **Memory above four gigabytes.** All of a machine's memory is used, up to 511 GiB, where the kernel used the first four gigabytes of it. `SYS_PHYS_ALLOC` takes a flag (arg1 = 1) for frames below four gigabytes, which is what a device that is told an address in thirty-two bits needs; without it a frame is ordinary memory and comes from the top. `SYS_MEM_INFO` takes what to say (arg0): 1 for how much memory the machine has and 2 for where it ends. |
 | 3.18 | **The wide registers.** A program may use AVX, AVX2 and AVX-512 where the processor has them: the kernel turns them on (`OSXSAVE`, XCR0) and saves all of each task's with `XSAVE`. Before, an AVX instruction was a fault. No call changed. |
+| 3.36 | **An IPC descriptor names a task, not a number.** `SYS_FD_SET` (67) records the task arg2 names as it is then — by its endpoint number, as an `Endpoint` capability does — and refuses a task that is not there. Once that task is gone a read or a write through the descriptor fails, and `SYS_FD_KIND` (230) answers 1 with its bit for an end that has gone; before, the descriptor named the TID, and wrote to whatever task was given that number next. A socket of the old kind (`SYS_SOCK_FD`, 11 to `SYS_FD_KIND`) names its server the same way. Nothing else changes. |
 | 3.35 | **The right to run the network.** Capability type 15, `NetAdmin`: no parameters, minted and handed on as `Clock` is, and the first task is started with it. The kernel acts on it nowhere: the network stack is offered one with a call (`SYS_CALL_OFFER`) and changes its filter only for a caller that could. |
 | 3.34 | **What a thread library keeps with the kernel.** `SYS_TASK_NAME` (215) says and reads what a task is called — Linux's `comm`, fifteen bytes, none being its program's name — set for a task of the caller's own program, or by a server for one of the program of a client that is calling it; a task is called what its maker was, and `exec` forgets it. `SYS_ROBUST_LIST` (132) says where the caller's robust list is (`set_robust_list`): when a task dies, or becomes another program, the kernel walks it in its memory and marks each mutex it still holds as one whose owner died, waking a waiter. `SYS_USAGE` with 4 says what one task has used, another thread's processor clock, and `SYS_PID` with arg1 = 1 a task's own number, which is how the task a program began as is told from its others. |
 | 3.33 | **A set watches everything, as epoll does.** A watch of `SYS_POLLSET_CTL` can be an edge (events bit 16, epoll's `EPOLLET`): reported when what it watches has been noted since it was last looked at, and is ready then — and once when it is added or modified, if it is ready. Or a one-shot (bit 17, `EPOLLONESHOT`): reported once, and then not until it is modified. `0x10` asked for beside readable is said beside a hangup (`EPOLLRDHUP`). A set can watch a set, which is readable while a wait on it would report something — a chain no deeper than four below the one waited on, and no set watching itself through others. And `SYS_POLLSET_CTL` with op bit 8 says why it refused, with a small number, where it answered all ones. |
@@ -897,7 +898,7 @@ would on Linux, and the pipe is freed when the read returns.
 | 64 | `SYS_FD_READ` | arg0 = fd, arg1 = buf, arg2 = max len | bytes read, `0` = EOF, `0xFFFF_FFFD` = a read that a signal ended (see *Signals*), `u64::MAX` = error. **Blocks.** | — |
 | 65 | `SYS_FD_WRITE` | arg0 = fd, arg1 = buf, arg2 = len | bytes written, `0xFFFF_FFFD` = a write a signal ended with nothing written / `u64::MAX` | — |
 | 66 | `SYS_FD_READ_NB` | arg0 = fd, arg1 = buf, arg2 = max len | bytes, `0` = EOF, **`0xFFFF_FFFE` = would block**, `u64::MAX` = error | — |
-| 67 | `SYS_FD_SET` | arg0 = target tid, arg1 = fd, arg2 = service tid, arg3 = tag | 0 / `u64::MAX` | `TaskMgmt` |
+| 67 | `SYS_FD_SET` | arg0 = target tid, arg1 = fd, arg2 = service tid, arg3 = tag. A read or a write through the descriptor is a call to the service with that tag; the service is the task arg2 names now, and once it is gone the descriptor names nothing, whoever has its number | 0 / `u64::MAX`, also if arg2 names no task | `TaskMgmt` |
 | 68 | `SYS_FD_DUP` | arg0 = target tid, arg1 = target fd or `u64::MAX - 1` for any free one, arg2 = source fd, arg3 = lowest acceptable fd when arg1 asks for any | the fd it took / `u64::MAX` | `TaskMgmt` over the target, unless the target is the caller or a child it has not started |
 | 69 | `SYS_PIPE_CREATE` | — | handle / `u64::MAX` | — (bounded per task) |
 | 70 | `SYS_PIPE_FD_SET` | arg0 = target tid, arg1 = fd or `u64::MAX - 1` for any free one, arg2 = pipe handle, arg3 = 1 for write end | the fd it took / `u64::MAX` | `TaskMgmt` over the target, unless the target is the caller or a child it has not started |
@@ -1897,7 +1898,8 @@ writing ends of a pipe, 4 for a stream, 5 and 6 for a terminal's master and
 slave, 7 for a timer, 8 for a counter, 9 for a poll set, 10 for memory, 11 for
 a socket, 12 for a served descriptor, 13 for a signal descriptor and 14 for a local socket not yet connected. The bit above says nothing is left at
 the other end: a pipe with no writers, or no readers; a stream or a terminal
-whose peer has closed; a served descriptor whose server has gone. A failed
+whose peer has closed; a served descriptor whose server has gone; an IPC
+endpoint or an old socket whose server has gone. A failed
 write says only that it failed, and this is how its caller tells a pipe
 nobody is reading — which a C library must answer with `EPIPE` — from a
 number that names nothing.

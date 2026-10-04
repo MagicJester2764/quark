@@ -473,7 +473,10 @@ may keep — are in `../quarkutils/CLAUDE.md`; these are the kernel's.
   else is handed one: every program gets the nameserver's from its spawner, and
   a lookup grants the one for the name. IPC the kernel performs through an
   installed fd bypasses this on purpose: the fd is the authorisation, and only
-  a CAP_TASK_MGMT holder can install one.
+  a CAP_TASK_MGMT holder can install one. It names its task the same way
+  (`FdKind::Ipc`'s `endpoint`, and the old socket's): it held the TID once,
+  and a descriptor to a server that had died wrote to whatever task was made
+  next — every service's output, once the services had a log.
 - **A server calls a client back only with a capability the client offered.**
   `sys_call_offer` puts one on a call and `sys_cap_take` accepts it; nothing
   else can fill a server's CSpace, and a claim or registration made without

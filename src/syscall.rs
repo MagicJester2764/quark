@@ -487,7 +487,7 @@ pub const SYS_ABI_VERSION: u64 = 240;
 /// minor when calls are added. User space can refuse to run against a major it
 /// does not know, which is the point of exposing it at all.
 pub const ABI_VERSION_MAJOR: u64 = 3;
-pub const ABI_VERSION_MINOR: u64 = 35;
+pub const ABI_VERSION_MINOR: u64 = 36;
 
 /// Threads a task may make with no capability at all.
 ///
@@ -759,14 +759,24 @@ fn unmap_range_owned(cr3: usize, vaddr: usize, pages: usize) {
 /// Maximum bytes per IPC write message (5 data words × 8 bytes).
 const FD_WRITE_MAX_CHUNK: usize = 40;
 
+/// Whether the task an IPC descriptor was set to is still the one with
+/// `target_tid`. Asked before every call: the target can die while a write
+/// waits for an answer, and its number be given to the next task made.
+fn ipc_target_is(target_tid: usize, endpoint: u64) -> bool {
+    endpoint != 0 && crate::cap::endpoint_of(target_tid) == endpoint
+}
+
 /// Send a write via IPC to a service, chunking data into 40-byte messages.
 /// Returns bytes written.
-fn fd_write_ipc(target_tid: usize, tag: u64, ptr: *const u8, len: usize) -> u64 {
+fn fd_write_ipc(target_tid: usize, endpoint: u64, tag: u64, ptr: *const u8, len: usize) -> u64 {
     if len == 0 {
         return 0;
     }
     let mut offset = 0usize;
     while offset < len {
+        if !ipc_target_is(target_tid, endpoint) {
+            return offset as u64;
+        }
         let chunk = (len - offset).min(FD_WRITE_MAX_CHUNK);
 
         // Snapshot this chunk while the SMAP window is open, then close it
@@ -808,7 +818,10 @@ fn fd_write_ipc(target_tid: usize, tag: u64, ptr: *const u8, len: usize) -> u64 
 
 /// Send a read request via IPC to a service, copy response into user buffer.
 /// Returns bytes read, or u64::MAX on error.
-fn fd_read_ipc(target_tid: usize, tag: u64, ptr: *mut u8, max_len: usize) -> u64 {
+fn fd_read_ipc(target_tid: usize, endpoint: u64, tag: u64, ptr: *mut u8, max_len: usize) -> u64 {
+    if !ipc_target_is(target_tid, endpoint) {
+        return u64::MAX;
+    }
     let request_len = max_len.min(FD_WRITE_MAX_CHUNK);
     let msg = crate::ipc::Message {
         sender: 0,
@@ -1091,7 +1104,7 @@ fn dispatch(
             use crate::task::FdKind;
             let (kind, gone) = match crate::fdtable::get(scheduler::current_tid(), arg0 as usize) {
                 FdKind::Empty => return u64::MAX,
-                FdKind::Ipc { .. } => (1, false),
+                FdKind::Ipc { target_tid, endpoint, .. } => (1, !ipc_target_is(target_tid, endpoint)),
                 FdKind::PipeRead(handle) => (2, crate::pipe::no_writers(handle)),
                 FdKind::PipeWrite(handle) => (3, crate::pipe::no_readers(handle)),
                 FdKind::StreamEnd { stream, end } => (4, crate::stream::peer_gone(stream, end)),
@@ -1101,7 +1114,7 @@ fn dispatch(
                 FdKind::Event { .. } => (8, false),
                 FdKind::PollSet { .. } => (9, false),
                 FdKind::MemFd { .. } => (10, false),
-                FdKind::Socket { .. } => (11, false),
+                FdKind::Socket { net_tid, endpoint, .. } => (11, !ipc_target_is(net_tid, endpoint)),
                 FdKind::Served { obj } => (12, crate::served::of(obj).is_none()),
                 FdKind::Signals { .. } => (13, false),
                 FdKind::Local { .. } => (14, false),
@@ -2616,8 +2629,8 @@ fn dispatch(
             // parked on what it names.
             let me = scheduler::current_tid();
             let done = match crate::fdtable::hold(me, fd) {
-                crate::task::FdKind::Ipc { target_tid, tag } => {
-                    fd_write_ipc(target_tid, tag, ptr, len)
+                crate::task::FdKind::Ipc { target_tid, endpoint, tag } => {
+                    fd_write_ipc(target_tid, endpoint, tag, ptr, len)
                 }
                 crate::task::FdKind::PipeWrite(handle) => {
                     crate::pipe::write(handle, ptr, len)
@@ -2649,8 +2662,8 @@ fn dispatch(
                 // the wrong shape for it, and answering as if it were would
                 // put the caller's data somewhere it will never look.
                 crate::task::FdKind::MemFd { .. } => u64::MAX,
-                crate::task::FdKind::Socket { net_tid, handle } => {
-                    fd_write_ipc(net_tid, sock_tag(TAG_SOCK_WRITE, handle), ptr, len)
+                crate::task::FdKind::Socket { net_tid, endpoint, handle } => {
+                    fd_write_ipc(net_tid, endpoint, sock_tag(TAG_SOCK_WRITE, handle), ptr, len)
                 }
                 crate::task::FdKind::Served { obj } => {
                     crate::served::io(obj, true, ptr as usize, len, true)
@@ -2683,8 +2696,8 @@ fn dispatch(
             // parked on what it names.
             let me = scheduler::current_tid();
             let done = match crate::fdtable::hold(me, fd) {
-                crate::task::FdKind::Ipc { target_tid, tag } => {
-                    fd_read_ipc(target_tid, tag, ptr, max_len)
+                crate::task::FdKind::Ipc { target_tid, endpoint, tag } => {
+                    fd_read_ipc(target_tid, endpoint, tag, ptr, max_len)
                 }
                 crate::task::FdKind::PipeRead(handle) => {
                     crate::pipe::read(handle, ptr, max_len)
@@ -2707,8 +2720,8 @@ fn dispatch(
                 crate::task::FdKind::PollSet { .. } => u64::MAX,
                 // As with write: it is mapped, not read.
                 crate::task::FdKind::MemFd { .. } => u64::MAX,
-                crate::task::FdKind::Socket { net_tid, handle } => {
-                    fd_read_ipc(net_tid, sock_tag(TAG_SOCK_READ, handle), ptr, max_len)
+                crate::task::FdKind::Socket { net_tid, endpoint, handle } => {
+                    fd_read_ipc(net_tid, endpoint, sock_tag(TAG_SOCK_READ, handle), ptr, max_len)
                 }
                 crate::task::FdKind::Served { obj } => {
                     crate::served::io(obj, false, ptr as usize, max_len, true)
@@ -2861,8 +2874,15 @@ fn dispatch(
             let fd = arg1 as usize;
             let service_tid = arg2 as usize;
             let tag = arg3;
+            // The task as it is now: once it is gone the descriptor names
+            // nothing, whoever is given its number.
+            let endpoint = crate::cap::endpoint_of(service_tid);
+            if endpoint == 0 {
+                return u64::MAX;
+            }
             let entry = crate::task::FdKind::Ipc {
                 target_tid: service_tid,
+                endpoint,
                 tag,
             };
             match scheduler::set_fd(tid, fd, entry) {
@@ -2933,7 +2953,8 @@ fn dispatch(
             if !crate::cap::task_has_endpoint(scheduler::current_tid(), net_tid) {
                 return u64::MAX;
             }
-            match scheduler::current_alloc_fd(crate::task::FdKind::Socket { net_tid, handle }) {
+            let endpoint = crate::cap::endpoint_of(net_tid);
+            match scheduler::current_alloc_fd(crate::task::FdKind::Socket { net_tid, endpoint, handle }) {
                 Ok(fd) => fd as u64,
                 Err(()) => u64::MAX,
             }
@@ -2942,7 +2963,7 @@ fn dispatch(
             // arg0 = fd. Returns (net_tid << 32) | handle, so a program can
             // close the connection it is about to drop the descriptor for.
             match scheduler::current_fd(arg0 as usize) {
-                crate::task::FdKind::Socket { net_tid, handle } => {
+                crate::task::FdKind::Socket { net_tid, handle, .. } => {
                     ((net_tid as u64) << 32) | (handle as u64)
                 }
                 _ => u64::MAX,

@@ -52,7 +52,12 @@ const _: () = assert!(core::mem::size_of::<UserFrame>() == 88);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FdKind {
     Empty,
-    Ipc { target_tid: usize, tag: u64 },
+    /// A server's: a read or a write is a call to it with `tag`. The task is
+    /// named by its endpoint number as well as its TID, as an `Endpoint`
+    /// capability names it: a TID is the next task's once this one is
+    /// reaped, and a descriptor to a server that had died wrote to whatever
+    /// was started next.
+    Ipc { target_tid: usize, endpoint: u64, tag: u64 },
     PipeRead(usize),   // pipe handle index
     PipeWrite(usize),  // pipe handle index
     /// Shared memory, named by a descriptor so that it can be passed across a
@@ -87,8 +92,9 @@ pub enum FdKind {
     ///
     /// Unlike `Ipc`, which is one-directional and carries a fixed tag, a
     /// socket is read and written through the same descriptor, so the tag is
-    /// chosen per direction and the handle travels in its upper bits.
-    Socket { net_tid: usize, handle: usize },
+    /// chosen per direction and the handle travels in its upper bits. The
+    /// server is named by its endpoint number too, as `Ipc`'s is.
+    Socket { net_tid: usize, endpoint: u64, handle: usize },
 }
 
 impl FdKind {
