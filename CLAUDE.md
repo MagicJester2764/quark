@@ -712,8 +712,11 @@ is quiet: `FdKind` in `task.rs`, read and write in both their blocking and
 non-blocking forms in `syscall.rs`, `pipe::release_fd` and `pipe::retain_fd`
 (a kind in one and not the other leaks or double-frees), `fdtable::hold`'s
 list of what a task can be parked on, and `pollset::watchable` and
-`readiness` — `poll` answered `POLLNVAL` for a terminal until the last of
-those knew about it.
+`readiness_at` — `poll` answered `POLLNVAL` for a terminal until the last of
+those knew about it. And whatever changes what one is ready for says so with
+a `pollset::note_*`: a set somebody is parked on can be woken by anything,
+but an edge-triggered watch (epoll's `EPOLLET`) is stirred by a note and by
+nothing else, so a kind that changes quietly is one an edge never reports.
 
 ## What a process is
 

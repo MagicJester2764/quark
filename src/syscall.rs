@@ -170,6 +170,9 @@ pub const SYS_POLLSET_CREATE: u64 = 75;
 pub const SYS_POLLSET_CTL: u64 = 76;
 pub const SYS_POLLSET_WAIT: u64 = 77;
 pub const SYS_POLL: u64 = 78;
+/// SYS_POLLSET_CTL's op: say why it was refused, with a small number
+/// (`pollset::Refused`), rather than all ones.
+const POLLSET_WHY: u64 = 1 << 8;
 pub const SYS_FD_WRITE_NB: u64 = 79;
 
 // --- 0x50  capabilities ---
@@ -478,7 +481,7 @@ pub const SYS_ABI_VERSION: u64 = 240;
 /// minor when calls are added. User space can refuse to run against a major it
 /// does not know, which is the point of exposing it at all.
 pub const ABI_VERSION_MAJOR: u64 = 3;
-pub const ABI_VERSION_MINOR: u64 = 32;
+pub const ABI_VERSION_MINOR: u64 = 33;
 
 /// Threads a task may make with no capability at all.
 ///
@@ -3049,7 +3052,8 @@ fn dispatch(
             for i in 0..n {
                 if crate::pollset::watchable(tid, want[i].0) {
                     // The index is the token, so a hit names its own entry.
-                    crate::pollset::ctl(set, tid, 0, want[i].0, want[i].1, i as u64);
+                    let events = want[i].1 & (crate::pollset::READABLE | crate::pollset::WRITABLE);
+                    let _ = crate::pollset::ctl(set, tid, 0, want[i].0, events, i as u64);
                 } else {
                     rev[i] = crate::pollset::INVALID;
                     invalid += 1;
@@ -3061,7 +3065,17 @@ fn dispatch(
             let mut hits = 0usize;
             let mut interrupted = false;
             loop {
-                let got = crate::pollset::scan(set, tid, &mut found[..n]);
+                let mut got = crate::pollset::scan(set, tid, &mut found[..n]);
+                // An invalid entry is an answer, so do not sleep on top of it.
+                let now = crate::clock::now();
+                if got == 0 && invalid == 0 && now < deadline {
+                    // The last look, parked: what it finds is the answer.
+                    crate::pollset::park(set, tid);
+                    got = crate::pollset::scan(set, tid, &mut found[..n]);
+                    if got > 0 {
+                        crate::pollset::unpark(set);
+                    }
+                }
                 if got > 0 {
                     for i in 0..got {
                         let idx = found[i].0 as usize;
@@ -3072,18 +3086,8 @@ fn dispatch(
                     hits = got;
                     break;
                 }
-                // An invalid entry is an answer, so do not sleep on top of it.
-                if invalid > 0 {
+                if invalid > 0 || now >= deadline {
                     break;
-                }
-                let now = crate::clock::now();
-                if now >= deadline {
-                    break;
-                }
-                crate::pollset::park(set, tid);
-                if crate::pollset::scan(set, tid, &mut found[..n]) > 0 {
-                    crate::pollset::unpark(set);
-                    continue;
                 }
                 let slept = crate::ipc::sys_recv_timeout(tid, deadline - now);
                 crate::pollset::unpark(set);
@@ -3120,22 +3124,26 @@ fn dispatch(
             }
         }
         SYS_POLLSET_CTL => {
-            // arg0 = set fd, arg1 = op, arg2 = fd, arg3 = events, arg4 = token
+            // arg0 = set fd, arg1 = op (0 add, 1 modify, 2 remove), with
+            // POLLSET_WHY to be told why not; arg2 = fd, arg3 = events, arg4
+            // = token.
             let tid = scheduler::current_tid();
+            let why = arg1 & POLLSET_WHY != 0;
+            let refused = |r: crate::pollset::Refused| if why { r as u64 } else { u64::MAX };
             let set = match pollset_of(tid, arg0 as usize) {
                 Some(s) => s,
-                None => return u64::MAX,
+                None => return refused(crate::pollset::Refused::NotOne),
             };
+            let op = arg1 & !POLLSET_WHY;
             let target = arg2 as usize;
             // Refuse what can never become ready rather than accept it and go
             // quiet.
-            if arg1 != 2 && !crate::pollset::watchable(tid, target) {
-                return u64::MAX;
+            if op != 2 && !crate::pollset::watchable(tid, target) {
+                return refused(crate::pollset::Refused::Cannot);
             }
-            if crate::pollset::ctl(set, tid, arg1, target, arg3 as u32, arg4) {
-                0
-            } else {
-                u64::MAX
+            match crate::pollset::ctl(set, tid, op, target, arg3 as u32, arg4) {
+                Ok(()) => 0,
+                Err(r) => refused(r),
             }
         }
         SYS_POLLSET_WAIT => {
@@ -3173,11 +3181,13 @@ fn dispatch(
                 // becomes ready after this either happened before that scan,
                 // so the scan sees it and we never block, or after it — and
                 // then `note_pipe` finds us parked and wakes us. There is no
-                // window between looking and sleeping.
+                // window between looking and sleeping. What the last look
+                // finds is the answer: a scan takes the edges it reports.
                 crate::pollset::park(set, tid);
-                if crate::pollset::scan(set, tid, &mut found[..cap]) > 0 {
+                let n = crate::pollset::scan(set, tid, &mut found[..cap]);
+                if n > 0 {
                     crate::pollset::unpark(set);
-                    continue;
+                    break n as u64;
                 }
 
                 // There is no `sleep` in this kernel. A task sleeps by

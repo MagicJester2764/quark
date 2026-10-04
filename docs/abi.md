@@ -1,6 +1,6 @@
 # Quark syscall ABI
 
-**Version 3.32.** Query the running kernel with `SYS_ABI_VERSION` (240), which
+**Version 3.33.** Query the running kernel with `SYS_ABI_VERSION` (240), which
 returns `(major << 16) | minor`.
 
 This document is the contract between the Quark kernel and everything above it.
@@ -225,6 +225,7 @@ returning at once turned that loop into a spin.
 | 3.16 | **Off, and on again, by the firmware's tables.** `SYS_POWER` (119) turns the machine off or restarts it, for a holder of the new capability `Power` (type 12): by ACPI's control and reset registers, where a program used to write to the three ports QEMU listens on. |
 | 3.17 | **Memory above four gigabytes.** All of a machine's memory is used, up to 511 GiB, where the kernel used the first four gigabytes of it. `SYS_PHYS_ALLOC` takes a flag (arg1 = 1) for frames below four gigabytes, which is what a device that is told an address in thirty-two bits needs; without it a frame is ordinary memory and comes from the top. `SYS_MEM_INFO` takes what to say (arg0): 1 for how much memory the machine has and 2 for where it ends. |
 | 3.18 | **The wide registers.** A program may use AVX, AVX2 and AVX-512 where the processor has them: the kernel turns them on (`OSXSAVE`, XCR0) and saves all of each task's with `XSAVE`. Before, an AVX instruction was a fault. No call changed. |
+| 3.33 | **A set watches everything, as epoll does.** A watch of `SYS_POLLSET_CTL` can be an edge (events bit 16, epoll's `EPOLLET`): reported when what it watches has been noted since it was last looked at, and is ready then — and once when it is added or modified, if it is ready. Or a one-shot (bit 17, `EPOLLONESHOT`): reported once, and then not until it is modified. `0x10` asked for beside readable is said beside a hangup (`EPOLLRDHUP`). A set can watch a set, which is readable while a wait on it would report something — a chain no deeper than four below the one waited on, and no set watching itself through others. And `SYS_POLLSET_CTL` with op bit 8 says why it refused, with a small number, where it answered all ones. |
 | 3.32 | **What a server says is ready.** `SYS_FD_SERVE` takes a flag (arg3 = 1) for an object that is not a file — what is read from it comes when it comes — whose server says what it is ready for, with `SYS_FD_READY` (233): a poll answers what was said last, and is woken when it changes. A read or a write that may not wait says so to the server (`data[2]` = 1), whose answer of `0xFFFF_FFFE` for a count is "would block". A file is as it was: always ready, and asked the same way whether or not the caller would wait. |
 | 3.31 | **Local sockets by a name, who is at the other end, and several descriptors at once.** `SYS_SOCKET` (178) makes a local socket that is nothing yet; a file server names one a task calling it holds (`SYS_SOCKET_BIND`, 179) and connects one to whatever listens at a name (`SYS_SOCKET_CONNECT`, 181), each by a key of its own, as it keys a named pipe; `SYS_SOCKET_LISTEN` (180) and `SYS_SOCKET_ACCEPT` (182) listen and take a connection, which is a stream like a pair's. `SYS_SOCKET_PEER` (183) says who is at the other end of a stream — a pair's maker, the listener as it listened, the connector as it connected — and `SYS_SOCKET_OPTION` (184) whether an end asks to be told who sent what it receives. `SYS_FD_SEND` and `SYS_FD_RECV` with flag 2 carry several descriptors, as many as 32, and a stream holds 32 in flight each way where it held 8. `SYS_FD_KIND` answers 14 for a local socket not yet connected. |
 | 3.30 | **A descriptor read for signals.** `SYS_SIGNAL_FD` (137) makes one, read for a set of signals, or changes the set of one: a read takes those of the set waiting for the reader — its own task's first, then its program's — as 128-byte records laid out as Linux's `signalfd_siginfo`, waiting for the first unless asked not to; a set reports it readable while one is waiting. `SYS_FD_KIND` answers 13 for it. |
@@ -902,7 +903,7 @@ would on Linux, and the pipe is freed when the read returns.
 | 73 | `SYS_FD_SEND` | arg0 = stream fd, arg1 = buf, arg2 = len, arg3 = fd to pass or `u64::MAX` — or, with flag 2, where an array of descriptors to pass is, `u32`s, as many as bits 8 to 15 of arg4 say (at most 32); arg4 = flags (1 = do not wait, 2 = several) | bytes written, `0xFFFF_FFFE` if it would have blocked, `0xFFFF_FFFD` if a signal ended the wait — nothing sent, the descriptors included / `u64::MAX` | — |
 | 74 | `SYS_FD_RECV` | arg0 = stream fd, arg1 = buf, arg2 = len, arg3 = fd to install a passed descriptor at, `u64::MAX - 1` for any free one, or `u64::MAX` to leave it queued — or, with flag 2, where to write the descriptors installed, `u32`s, room for as many as bits 8 to 15 of arg4 say; arg4 = flags (1 = do not wait, 2 = several) | `((fd + 1) << 32) \| bytes` — with flag 2, `(how many << 32) \| bytes` — high half 0 if none arrived, `0xFFFF_FFFE` if it would have blocked, `0xFFFF_FFFD` if a signal ended the wait — nothing taken / `u64::MAX` | — |
 | 75 | `SYS_POLLSET_CREATE` | — | fd naming the set / `u64::MAX` | — |
-| 76 | `SYS_POLLSET_CTL` | arg0 = set fd, arg1 = op (0 add, 1 modify, 2 remove), arg2 = fd, arg3 = events, arg4 = token | 0 / `u64::MAX` | — |
+| 76 | `SYS_POLLSET_CTL` | arg0 = set fd, arg1 = op (0 add, 1 modify, 2 remove), with bit 8 to be told why not; arg2 = fd, arg3 = events: 1 readable, 2 writable, `0x10` the other end gone, with bit 16 for an edge and bit 17 for a one-shot; arg4 = token | 0 / `u64::MAX`, or with bit 8: 1 not a set of the caller's or the set itself, 2 watched already, 3 not watched, 4 can never be ready, 5 a set that leads back or too deep, 6 full | — |
 | 77 | `SYS_POLLSET_WAIT` | arg0 = set fd, arg1 = array of `(u64 token, u32 events, u32 pad)`, arg2 = capacity, arg3 = how long to wait, a span, arg4 = the signals to hold back while it waits, with bit 8 set to say there are some | entries filled, 0 = timed out, `0xFFFF_FFFD` = a signal ended the wait / `u64::MAX` | — |
 | 78 | `SYS_POLL` | arg0 = array of `(u32 fd, u32 events, u32 revents, u32 pad)`, arg1 = count, arg2 = how long to wait, a span; arg3 = the signals to hold back while it waits, if arg4 = 1 | entries with non-zero `revents`, `0xFFFF_FFFD` = a signal ended the wait / `u64::MAX` | — |
 | 79 | `SYS_FD_WRITE_NB` | arg0 = fd, arg1 = buf, arg2 = len | bytes written, **`0xFFFF_FFFE` = would block**, `u64::MAX` = error | — |
@@ -938,11 +939,26 @@ descriptor is the permission.
 
 **Waiting.** Events are `1` readable, `2` writable, `4` hangup, `8` invalid.
 Hangup is reported whether or not it was asked for, because waiting for readable
-on a stream whose peer has gone is waiting for something that cannot arrive.
+on a stream whose peer has gone is waiting for something that cannot arrive;
+`0x10`, asked for, is said with it, which is epoll's `EPOLLRDHUP`.
 `SYS_POLLSET_CTL` refuses a descriptor that can never become ready — an IPC
-endpoint has no buffer — while `SYS_POLL` reports `8` in that entry's `revents`
-instead, because one bad entry should not deny the caller the answer about the
-others.
+endpoint has no buffer, a file answers at once, memory is mapped — while
+`SYS_POLL` reports `8` in that entry's `revents` instead, because one bad entry
+should not deny the caller the answer about the others.
+
+**Edges, one-shots and sets in sets.** A watch is reported at every wait while
+what it watches is ready, unless its events say otherwise. With bit 16 it is an
+edge: reported when what it watches has been noted since the watch was last
+looked at — written to, read from, said to be ready by its server, fired — and
+is ready then, and once when it is added or modified if it is ready, as on
+Linux; a wait that looks at it and finds it not ready leaves it for the next
+noting. With bit 17 it is reported once and then not until `SYS_POLLSET_CTL`
+modifies it. A set is something a set can watch, and a poll: readable while a
+wait on it would report something, which takes nothing from it. A chain of
+sets goes no deeper than four below the one waited on, and a set that would
+come back to the one watching it is refused (`5`), as the set itself is (`1`).
+A wait reports what it has room for, the earliest watches first; an edge or a
+one-shot there was no room for is reported by the next.
 
 `SYS_PIPE_CREATE` needs no capability because a shell needs it for pipelines.
 Pipes are reference counted through the descriptors that hold them; a read
