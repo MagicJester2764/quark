@@ -180,7 +180,11 @@ program's page fault says where it was (`rip`, `rsp`), what the processor
 said of the access (`err`) and what the page's entries hold (`pde`, `pte`;
 a reservation is a non-present entry with bit 10, `MARKER`, and bit 11 too
 where it names an object's page): a stack run past its end, a reservation
-lost, or a pointer to nothing. A
+lost, or a pointer to nothing. Either kind ends with two words of the code
+at `rip`, twelve from the top of the stack and what the program was started
+as (`code=`, `stack=`, `name=`): the code's bytes, looked for in the
+libraries the program has, say which and where (musl's `a_crash` is a `hlt`,
+so a failed assert in its malloc is a `[UFAULT vec=13 ...]`). A
 failed check prints to the screen. Look at both. `[KSTUCK ...]` is the third
 thing serial can say, and is read as a kernel fault is: one processor has had
 the kernel for half a minute, the rest have been waiting at its door, and

@@ -628,6 +628,44 @@ fn handed_to_program(frame: &mut InterruptFrame, signo: i32, code: i64, addr: u6
     }
 }
 
+/// The rest of a report of a program ended for a fault, and its end: two
+/// words of the code it was running and twelve from the top of its stack,
+/// as far as their pages are there, and what it was started as. A
+/// library's bytes at `rip` say which library and where in it, the return
+/// addresses where it had been called from, and the name which program —
+/// a task's number says nothing once it has been given to somebody else.
+fn report_program(frame: &InterruptFrame, tid: usize) {
+    let cr3 = crate::paging::read_cr3();
+    let words = |label: &[u8], at: usize, n: usize| {
+        crate::serial::puts(label);
+        for i in 0..n {
+            match unsafe { crate::paging::peek_user(cr3, (at & !7) + i * 8) } {
+                Some(w) => {
+                    crate::serial::puts(b"0x");
+                    crate::serial::put_hex_usize(w as usize);
+                    crate::serial::puts(b",");
+                }
+                None => break,
+            }
+        }
+    };
+    words(b" code=", frame.rip as usize, 2);
+    words(b" stack=", frame.rsp as usize, 12);
+    let mut name = [0u8; crate::fdtable::CMDLINE];
+    if let Some(len) = crate::fdtable::cmdline_of(tid, &mut name) {
+        crate::serial::puts(b" name=");
+        let len = name[..len].iter().rposition(|&b| b != 0).map_or(0, |i| i + 1);
+        for &b in &name[..len] {
+            crate::serial::putb(match b {
+                0 => b' ',
+                0x20..0x7f => b,
+                _ => b'?',
+            });
+        }
+    }
+    crate::serial::puts(b"]\n");
+}
+
 /// End the program that touched a page it was promised and cannot be given:
 /// there is no memory for it, or it is a page of a file that cannot be had.
 fn no_page(cr2: u64, oom: bool) -> ! {
@@ -815,34 +853,7 @@ fn exception(frame: &mut InterruptFrame) {
         crate::serial::put_hex_usize(pde as usize);
         crate::serial::puts(b" pte=0x");
         crate::serial::put_hex_usize(pte as usize);
-        // The code it was running and the words on top of its stack, as far
-        // as their pages are there: a library's bytes at `rip` say which
-        // library and where in it, and the return addresses where it had
-        // been called from.
-        let cr3 = crate::paging::read_cr3();
-        crate::serial::puts(b" code=");
-        for i in 0..2 {
-            match unsafe { crate::paging::peek_user(cr3, (frame.rip as usize & !7) + i * 8) } {
-                Some(w) => {
-                    crate::serial::puts(b"0x");
-                    crate::serial::put_hex_usize(w as usize);
-                    crate::serial::puts(b",");
-                }
-                None => break,
-            }
-        }
-        crate::serial::puts(b" stack=");
-        for i in 0..12 {
-            match unsafe { crate::paging::peek_user(cr3, (frame.rsp as usize & !7) + i * 8) } {
-                Some(w) => {
-                    crate::serial::puts(b"0x");
-                    crate::serial::put_hex_usize(w as usize);
-                    crate::serial::puts(b",");
-                }
-                None => break,
-            }
-        }
-        crate::serial::puts(b"]\n");
+        report_program(frame, tid);
         console::puts(b"\n[kernel] Page fault in task ");
         print_dec(tid);
         console::puts(b" at ");
@@ -889,7 +900,9 @@ fn exception(frame: &mut InterruptFrame) {
         crate::serial::put_hex_usize(frame.rip as usize);
         crate::serial::puts(b" sig=");
         crate::serial::put_usize(sig as usize);
-        crate::serial::puts(b"]\n");
+        crate::serial::puts(b" rsp=0x");
+        crate::serial::put_hex_usize(frame.rsp as usize);
+        report_program(frame, tid);
         console::puts(b"\n[kernel] ");
         if vec < 32 {
             console::puts(EXCEPTION_NAMES[vec]);
