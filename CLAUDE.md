@@ -732,6 +732,11 @@ those knew about it. And whatever changes what one is ready for says so with
 a `pollset::note_*`: a set somebody is parked on can be woken by anything,
 but an edge-triggered watch (epoll's `EPOLLET`) is stirred by a note and by
 nothing else, so a kind that changes quietly is one an edge never reports.
+It says so before it waits, too: a write that fills a pipe and waits for
+room has made it readable already, and the reader that would make the room
+may be waiting in a poll. Told only once the write was over, cargo — which
+polls for what rustc prints — and rustc, printing more than a pipe's 4 KiB,
+waited for each other for good.
 
 ## What a process is
 

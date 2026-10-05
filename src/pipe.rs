@@ -791,6 +791,16 @@ fn write_inner(handle: usize, buf: *const u8, len: usize) -> u64 {
                 }
 
                 irq_restore(flags);
+                // And whoever is polling for it, now, if there is more to
+                // write: what is left may wait for room, and room comes only
+                // from a reader who knows there is something to read. Told
+                // once the whole write was over, a reader that polls — cargo,
+                // for what rustc prints — was told nothing while a write of
+                // more than the buffer waited for it, and the two waited for
+                // each other for good.
+                if offset < len {
+                    crate::pollset::note_pipe(handle);
+                }
             } else {
                 // Buffer full — block until space available. Same rule as the
                 // read path: no waiter slot means no wakeup, so fail instead.
