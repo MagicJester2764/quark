@@ -11,10 +11,13 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::task::MAX_TASKS;
 
-/// Slots in a CSpace. A task holds one `Endpoint` for each task it calls, so
-/// this is sized for a program that talks to a few dozen services, not for the
-/// handful of fixed slots manifests and spawners fill.
-pub const MAX_CAPS: usize = 64;
+/// Slots in a CSpace. A task holds one `Endpoint` for each task it calls, and
+/// a pager one `MemObject` for each object it pages — a file server, one for
+/// every file that is mapped. Sixty-four held a few dozen services' and
+/// thirty files', and rustc maps more than thirty files at once to build an
+/// archive: building the standard library on Quark, the file server could
+/// map no more.
+pub const MAX_CAPS: usize = 256;
 /// Where a capability lands when it is given without naming a slot: clear of
 /// the fixed slots manifests and spawners use, which are all below 16.
 pub const RECEIVED: core::ops::Range<usize> = 16..MAX_CAPS;
