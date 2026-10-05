@@ -79,6 +79,9 @@ struct Object {
     /// Of those, the ones mapping a cached frame writable. While any does, a
     /// dirty page stays dirty after it is taken: it can change again unseen.
     writable: u64,
+    /// One past the highest page of it that has been in the cache: how far
+    /// a walk of its pages has to go to have seen every one that is there.
+    end: u64,
 }
 
 impl Object {
@@ -91,6 +94,7 @@ impl Object {
         bytes: 0,
         mapped: 0,
         writable: 0,
+        end: 0,
     };
 
     fn pages(&self) -> u64 {
@@ -105,8 +109,23 @@ impl Object {
 static mut OBJECTS: [Object; MAX_OBJECTS] = [Object::EMPTY; MAX_OBJECTS];
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
-/// The page cache: open addressing on `(slot, page)`.
-const CACHE_SLOTS: usize = 8192;
+/// The page cache: open addressing on `(slot, page)`, in a table made at
+/// boot as big as the machine is (`init`). It was 8192 pages whatever the
+/// machine, and a program that mapped more than that of files — rustc maps
+/// its own code, two hundred megabytes of it — had each page it touched
+/// past them take back one it was using: building the kernel on Quark read
+/// six gigabytes from the disk in twenty minutes and did not finish.
+static mut CACHE: *mut Cached = core::ptr::NonNull::dangling().as_ptr();
+/// How many places the table has, a power of two; and how many of them may
+/// hold a page at once, three quarters at most, so that a search for a page
+/// that is not there ends soon.
+static mut SLOTS: usize = 0;
+static mut ROOM: usize = 0;
+/// Where in the table each frame's entry is, a word for every frame of the
+/// machine: what a mapped page of a file is found by when the mapping is
+/// taken away (`page_of`), where it used to be a search of the whole table.
+static mut PLACES: *mut u32 = core::ptr::NonNull::dangling().as_ptr();
+static mut FRAMES: usize = 0;
 /// A free entry, and one whose page has gone (which a search steps past).
 const EMPTY_KEY: u64 = 0;
 const GONE_KEY: u64 = u64::MAX;
@@ -122,8 +141,31 @@ struct Cached {
     writing: bool,
 }
 
-static mut CACHE: [Cached; CACHE_SLOTS] =
-    [Cached { key: EMPTY_KEY, frame: 0, dirty: false, writing: false }; CACHE_SLOTS];
+/// Make the cache as big as the machine: room for a quarter of its memory,
+/// at least the 8192 pages it had before and at most a million, in a table
+/// no more than three quarters full, and the word for each frame saying
+/// where in it the frame is. Both are taken from the allocator, before
+/// there is an object, and are the kernel's for good; an empty entry and a
+/// table of places are both noughts.
+pub fn init() {
+    let room = (pmm::total_count() / 4).clamp(8192, 1 << 20);
+    let slots = (room * 4 / 3 + 1).next_power_of_two();
+    let frames = pmm::top_of_memory() / PAGE;
+    let table = slots * core::mem::size_of::<Cached>();
+    let pages = (table + frames * core::mem::size_of::<u32>()).div_ceil(PAGE);
+    let Some(run) = pmm::alloc_contiguous(pages, false) else {
+        panic!("no room for the page cache: {} pages", pages);
+    };
+    let at = run.address();
+    unsafe {
+        core::ptr::write_bytes(at as *mut u8, 0, pages * PAGE);
+        CACHE = at as *mut Cached;
+        PLACES = (at + table) as *mut u32;
+        SLOTS = slots;
+        ROOM = room;
+        FRAMES = frames;
+    }
+}
 
 #[inline(always)]
 fn irq_save() -> u64 {
@@ -145,16 +187,27 @@ fn objects() -> &'static mut [Object; MAX_OBJECTS] {
     unsafe { &mut *core::ptr::addr_of_mut!(OBJECTS) }
 }
 
-fn cache() -> &'static mut [Cached; CACHE_SLOTS] {
-    unsafe { &mut *core::ptr::addr_of_mut!(CACHE) }
+fn cache() -> &'static mut [Cached] {
+    unsafe { core::slice::from_raw_parts_mut(CACHE, SLOTS) }
+}
+
+fn slots() -> usize {
+    unsafe { SLOTS }
+}
+
+/// How many pages the cache may hold at once.
+pub fn room() -> usize {
+    unsafe { ROOM }
 }
 
 fn key(slot: usize, page: u64) -> u64 {
     ((slot as u64) << 40) | page
 }
 
+/// The top bits of the key's product with the golden ratio, as many as
+/// number the table's places.
 fn home(key: u64) -> usize {
-    (key.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 51) as usize % CACHE_SLOTS
+    (key.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (64 - slots().trailing_zeros())) as usize
 }
 
 /// How many entries of the cache hold a page.
@@ -163,12 +216,13 @@ static mut LIVE: usize = 0;
 /// Where in the cache `key`'s entry is, if it has one.
 fn place(key: u64) -> Option<usize> {
     let c = cache();
+    let n = c.len();
     let mut i = home(key);
-    for _ in 0..CACHE_SLOTS {
+    for _ in 0..n {
         match c[i].key {
             EMPTY_KEY => return None,
             k if k == key => return Some(i),
-            _ => i = (i + 1) % CACHE_SLOTS,
+            _ => i = (i + 1) % n,
         }
     }
     None
@@ -180,21 +234,27 @@ fn find(key: u64) -> Option<&'static mut Cached> {
 }
 
 /// Add `key -> frame`. False if the cache is full, which is asked first:
-/// the search for a place in a full table is a walk of the whole of it,
-/// and whoever is looking for memory asks for every page it considers.
+/// the table is never more than three quarters full, so that a search for
+/// a place, or for a page that is not there, ends soon.
 fn insert(key: u64, frame: usize) -> bool {
-    if unsafe { *core::ptr::addr_of!(LIVE) } >= CACHE_SLOTS {
+    if unsafe { *core::ptr::addr_of!(LIVE) } >= unsafe { ROOM } {
         return false;
     }
     let c = cache();
+    let n = c.len();
     let mut i = home(key);
-    for _ in 0..CACHE_SLOTS {
+    for _ in 0..n {
         if c[i].key == EMPTY_KEY || c[i].key == GONE_KEY {
             c[i] = Cached { key, frame, dirty: false, writing: false };
             unsafe { *core::ptr::addr_of_mut!(LIVE) += 1 };
+            if let Some(at) = (frame / PAGE < unsafe { FRAMES }).then(|| unsafe { PLACES.add(frame / PAGE) }) {
+                unsafe { *at = i as u32 };
+            }
+            let o = &mut objects()[(key >> 40) as usize];
+            o.end = o.end.max((key & MAX_PAGE) + 1);
             return true;
         }
-        i = (i + 1) % CACHE_SLOTS;
+        i = (i + 1) % n;
     }
     false
 }
@@ -209,15 +269,48 @@ fn insert(key: u64, frame: usize) -> bool {
 /// for a page that is not there would walk all of it.
 fn forget(i: usize) {
     let c = cache();
+    let n = c.len();
     c[i] = Cached { key: GONE_KEY, frame: 0, dirty: false, writing: false };
     unsafe { *core::ptr::addr_of_mut!(LIVE) -= 1 };
-    if c[(i + 1) % CACHE_SLOTS].key == EMPTY_KEY {
+    if c[(i + 1) % n].key == EMPTY_KEY {
         let mut j = i;
         while c[j].key == GONE_KEY {
             c[j].key = EMPTY_KEY;
-            j = (j + CACHE_SLOTS - 1) % CACHE_SLOTS;
+            j = (j + n - 1) % n;
         }
     }
+}
+
+/// The place of the cached page of the object in `slot` with the lowest
+/// number at or after `from` that `wanted` says yes to.
+///
+/// Its pages are looked up one by one from `from`, for as many as an
+/// eighth of the table's places: a pager walking an object's dirty pages
+/// asks for the next each time, and finds it soon. Past that the whole
+/// table is looked through for the rest, which with a table as big as a
+/// quarter of memory is to be done once in a while and not once a page.
+fn lowest(slot: usize, from: u64, wanted: impl Fn(&Cached) -> bool) -> Option<usize> {
+    let end = objects()[slot].end;
+    let walked = end.min(from.saturating_add((slots() / 8) as u64));
+    for page in from..walked {
+        if let Some(i) = place(key(slot, page)).filter(|&i| wanted(&cache()[i])) {
+            return Some(i);
+        }
+    }
+    if walked >= end {
+        return None;
+    }
+    let mut best: Option<usize> = None;
+    for (i, e) in cache().iter().enumerate() {
+        let live = e.key != EMPTY_KEY && e.key != GONE_KEY;
+        if live && (e.key >> 40) as usize == slot && e.key & MAX_PAGE >= walked && wanted(e) {
+            let page = e.key & MAX_PAGE;
+            if best.is_none_or(|j| cache()[j].key & MAX_PAGE > page) {
+                best = Some(i);
+            }
+        }
+    }
+    best
 }
 
 /// A live object in `slot`, by id if `id` is not 0.
@@ -261,6 +354,7 @@ pub fn create(pager: usize, cookie: u64, bytes: u64) -> Option<(usize, u64)> {
             bytes,
             mapped: 0,
             writable: 0,
+            end: 0,
         };
         (slot, id)
     });
@@ -270,15 +364,29 @@ pub fn create(pager: usize, cookie: u64, bytes: u64) -> Option<(usize, u64)> {
 
 /// Free everything the object in `slot` holds, and the slot.
 fn release(slot: usize) {
-    for i in 0..CACHE_SLOTS {
-        let e = cache()[i];
-        if e.key != EMPTY_KEY && e.key != GONE_KEY && (e.key >> 40) as usize == slot {
-            // Nothing maps the object, so nothing maps this: a count that
-            // had stuck at the most it can say is not one to keep the
-            // frame for.
-            pmm::unmapped_everywhere(e.frame);
-            pmm::free(pmm::PhysFrame::from_address(e.frame));
-            forget(i);
+    // Nothing maps the object, so nothing maps what it has cached: a count
+    // that had stuck at the most it can say is not one to keep a frame for.
+    let free = |i: usize| {
+        let frame = cache()[i].frame;
+        pmm::unmapped_everywhere(frame);
+        pmm::free(pmm::PhysFrame::from_address(frame));
+        forget(i);
+    };
+    // By its pages, where it has had fewer than an eighth of the table's
+    // places: it nearly always has.
+    let end = objects()[slot].end;
+    if end <= (slots() / 8) as u64 {
+        for page in 0..end {
+            if let Some(i) = place(key(slot, page)) {
+                free(i);
+            }
+        }
+    } else {
+        for i in 0..slots() {
+            let e = cache()[i];
+            if e.key != EMPTY_KEY && e.key != GONE_KEY && (e.key >> 40) as usize == slot {
+                free(i);
+            }
         }
     }
     objects()[slot] = Object::EMPTY;
@@ -480,17 +588,7 @@ fn ctl_locked(caller: usize, id: u64, op: u64, a: u64, b: u64) -> u64 {
             // still mapped writable somewhere stays dirty, so a pager walks
             // on from the page it was given rather than asking again.
             let keep = o.writable != 0;
-            let mut best: Option<usize> = None;
-            for (i, e) in cache().iter().enumerate() {
-                let live = e.key != EMPTY_KEY && e.key != GONE_KEY;
-                if live && e.dirty && (e.key >> 40) as usize == slot && e.key & MAX_PAGE >= b {
-                    let page = e.key & MAX_PAGE;
-                    if best.is_none_or(|j| cache()[j].key & MAX_PAGE > page) {
-                        best = Some(i);
-                    }
-                }
-            }
-            let Some(i) = best else { return u64::MAX };
+            let Some(i) = lowest(slot, b, |e| e.dirty) else { return u64::MAX };
             let e = &mut cache()[i];
             if !keep {
                 e.dirty = false;
@@ -505,17 +603,7 @@ fn ctl_locked(caller: usize, id: u64, op: u64, a: u64, b: u64) -> u64 {
             // The dirty page with the lowest number at or after `b` that is
             // not being written already: copied out, and neither clean nor
             // to be taken again until its pager says how the writing went.
-            let mut best: Option<usize> = None;
-            for (i, e) in cache().iter().enumerate() {
-                let live = e.key != EMPTY_KEY && e.key != GONE_KEY;
-                if live && e.dirty && !e.writing && (e.key >> 40) as usize == slot && e.key & MAX_PAGE >= b {
-                    let page = e.key & MAX_PAGE;
-                    if best.is_none_or(|j| cache()[j].key & MAX_PAGE > page) {
-                        best = Some(i);
-                    }
-                }
-            }
-            let Some(i) = best else { return u64::MAX };
+            let Some(i) = lowest(slot, b, |e| e.dirty && !e.writing) else { return u64::MAX };
             let e = &mut cache()[i];
             e.writing = true;
             let _ua = crate::cpu::UserAccess::begin();
@@ -768,12 +856,13 @@ pub fn evict(want: usize) -> usize {
     let flags = irq_save();
     let c = cache();
     let mut gone = 0;
+    let n = c.len();
     let start = unsafe { *core::ptr::addr_of!(HAND) };
-    for step in 0..CACHE_SLOTS {
+    for step in 0..n {
         if gone >= want {
             break;
         }
-        let i = (start + step) % CACHE_SLOTS;
+        let i = (start + step) % n;
         let e = c[i];
         if e.key == EMPTY_KEY || e.key == GONE_KEY || e.dirty || e.writing {
             continue;
@@ -790,7 +879,7 @@ pub fn evict(want: usize) -> usize {
         pmm::free(pmm::PhysFrame::from_address(e.frame));
         forget(i);
         gone += 1;
-        unsafe { *core::ptr::addr_of_mut!(HAND) = (i + 1) % CACHE_SLOTS };
+        unsafe { *core::ptr::addr_of_mut!(HAND) = (i + 1) % n };
     }
     irq_restore(flags);
     gone
@@ -827,13 +916,17 @@ pub fn ask_to_clean() -> usize {
     waiting
 }
 
-/// The page number and frame of the cache entry holding `frame` for the
-/// object in `slot`: what a mapped page of a file is, said the other way
-/// round. A search of the whole cache, for whoever is taking a mapping
-/// away and needs to leave a reservation that names the page.
+/// The page number of the cache entry holding `frame` for the object in
+/// `slot`: what a mapped page of a file is, said the other way round, for
+/// whoever is taking a mapping away and needs to leave a reservation that
+/// names the page. The frame's place says where to look, and the entry
+/// there says whether it is still the frame's.
 pub fn page_of(slot: usize, frame: usize) -> Option<u64> {
-    cache()
-        .iter()
-        .find(|e| e.key != EMPTY_KEY && e.key != GONE_KEY && e.frame == frame && (e.key >> 40) as usize == slot)
-        .map(|e| e.key & MAX_PAGE)
+    let index = frame / PAGE;
+    if index >= unsafe { FRAMES } {
+        return None;
+    }
+    let e = cache().get(unsafe { *PLACES.add(index) } as usize)?;
+    (e.key != EMPTY_KEY && e.key != GONE_KEY && e.frame == frame && (e.key >> 40) as usize == slot)
+        .then_some(e.key & MAX_PAGE)
 }

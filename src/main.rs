@@ -112,6 +112,8 @@ pub extern "C" fn kernel_main(multiboot_info: usize) -> ! {
     console::clear();
     unsafe { heap::init() };
     console::puts(b"Heap initialized.\n");
+    // The cache of files' pages, as big as the machine.
+    memobj::init();
     // What the machine is made of, as its firmware tells it: how many
     // processors, where the interrupt controllers are, how to turn it off.
     unsafe {
@@ -168,6 +170,9 @@ pub extern "C" fn kernel_main(multiboot_info: usize) -> ! {
     serial::puts(b"; the kernel's map reaches ");
     serial::put_hex_usize(paging::identity_end());
     serial::puts(b".\n");
+    serial::puts(b"Files' pages: room for ");
+    serial::put_usize(memobj::room() / 256);
+    serial::puts(b" MiB of them.\n");
 
     // Print PMM stats
     console::puts(b"PMM initialized: ");

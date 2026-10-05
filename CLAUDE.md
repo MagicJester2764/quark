@@ -445,6 +445,16 @@ may keep — are in `../quarkutils/CLAUDE.md`; these are the kernel's.
     `memobj::drop_entry` and where a mapping is taken back): nought is what
     lets the cache give it up. Map one somewhere new and not count it, and
     the cache gives the frame away under the mapping.
+  - *The cache is as big as the machine, and an entry is found by what
+    names it* (`memobj::init`): room for a quarter of memory's pages, in a
+    table made at boot. It was 8192 pages whatever the machine, and rustc —
+    which maps its own code, two hundred megabytes of it — took back a page
+    it was using for every page it touched past them: building the kernel
+    on Quark read six gigabytes from the disk in twenty minutes and did not
+    finish. An entry is found by its key, by its frame's place (`page_of`)
+    or by its object's pages (`lowest`, `release`); a walk of the whole
+    table grows with the machine, and is for once a pass, never once a
+    page.
   - *A page number of the object memory is written out to is counted once
     for each reservation that names it* (`memobj::swap_ref`, `swap_unref`):
     a fork copies a reservation, and each side has its own page when it
@@ -1348,10 +1358,11 @@ breaking any of them is quiet until it is a machine that stops.
 - A task woken on time runs at once only if it is of a better band than what
   the first processor is running, or a processor is idle: one of the same
   band waits its turn, as any woken task does.
-- The page cache holds 8192 pages across 256 objects, memory on its way
-  out included: that is thirty-two megabytes, and a machine taking pages
-  from programs faster than its pager writes them takes no more until
-  some have been written.
+- The page cache holds a quarter of memory's pages — at least 8192, at
+  most a million — across 256 objects, memory on its way out included, and
+  a machine taking pages from programs faster than its pager writes them
+  takes no more until some have been written. Its table is made at boot
+  and does not grow.
 - A child is the *task's* that made it, not the program's: a thread cannot
   wait for a child another thread of its program forked, which POSIX lets
   any thread do. And the children of a thread that has ended are nobody's:
