@@ -145,7 +145,7 @@ processor changes, `dtest clock` for what time it is and whether a wait ends
 when it should, `dtest fork` for what a fork shares and who a write is seen
 by, `dtest handlers` for a handler the kernel runs, `dtest usage` for what
 a program has used and its share of the processor, `dtest devices` for who
-holds which device, twenty-three more (`dtest pressure`) on a machine with
+holds which device, twenty-five more (`dtest pressure`) on a machine with
 somewhere to write memory out to, and twelve more (`dtest msi`, `dtest
 devices`) on a machine with a device that interrupts by message and its
 driver running, and eight (`dtest iommu`)
@@ -473,6 +473,14 @@ may keep — are in `../quarkutils/CLAUDE.md`; these are the kernel's.
   - *A limit is not a shortage* (`Fault::Limit`, `Fault::NoMemory`): a task
     at its own limit is ended at once, as before, and only one the machine
     has no frame for waits.
+  - *A fault that has waited is taken again, not served again* (`idt.rs`):
+    once memory has been found the instruction runs again and faults again
+    if it has to. While it waited another thread may have been given the
+    page, which `back` calls nothing promised — of four threads that
+    touched the same new pages as memory ran out, three were ended so — or
+    the page may have gone. And where the fault was is read once, at the
+    door: CR2 is the processor's, and the faults of whatever ran while
+    this one waited write it.
 - **Mapping authority is ownership first, `PhysRange` second.** `sys_map_phys`
   and the deprecated `sys_addrspace_map` accept frames the caller owns
   (`pmm::owns_range`), so a task that allocated a frame may map it holding no

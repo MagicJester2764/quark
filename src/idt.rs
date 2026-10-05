@@ -651,6 +651,18 @@ fn no_page(cr2: u64, oom: bool) -> ! {
 fn exception(frame: &mut InterruptFrame) {
     let vec = frame.vector as usize;
     let from_user = frame.cs & 3 != 0;
+    // Where a page fault was, read once. CR2 is the processor's, and a fault
+    // that waits — for memory, for a pager — lets other tasks run on it,
+    // whose faults write it: read again afterwards, it named another
+    // program's page, and that is what a program ended for the fault was
+    // told it had touched.
+    let cr2: u64 = if vec == 14 {
+        let at: u64;
+        unsafe { core::arch::asm!("mov {}, cr2", out(reg) at, options(nostack, nomem)) };
+        at
+    } else {
+        0
+    };
 
     // A page fault that the page tables no longer agree with. The fault was
     // taken in ring 3 and then waited for the kernel; meanwhile another
@@ -662,8 +674,6 @@ fn exception(frame: &mut InterruptFrame) {
     // and the next thing below would call this page's reservation gone and
     // end the program.
     if vec == 14 && from_user && frame.error_code & PF_RESERVED == 0 {
-        let cr2: u64;
-        unsafe { core::arch::asm!("mov {}, cr2", out(reg) cr2, options(nostack, nomem)) };
         let write = frame.error_code & PF_WRITE != 0;
         let exec = frame.error_code & PF_INSN_FETCH != 0;
         if unsafe { crate::paging::permits(crate::paging::read_cr3(), cr2 as usize, write, exec) } {
@@ -686,33 +696,33 @@ fn exception(frame: &mut InterruptFrame) {
     // to and from user memory back what they touch first, but one that did
     // not is served the same way rather than halting the machine.
     if vec == 14 && frame.error_code & PF_PRESENT == 0 {
-        let cr2: u64;
-        unsafe { core::arch::asm!("mov {}, cr2", out(reg) cr2, options(nostack, nomem)) };
         let write = frame.error_code & PF_WRITE != 0;
         let cr3 = crate::paging::read_cr3();
-        loop {
-            match unsafe { crate::paging::back(cr3, cr2 as usize, write, may_wait) } {
-                Ok(()) => return,
-                // No frame to give it with. Memory is looked for, and waited
-                // for while it is being written out; the page is asked for
-                // again if that produced any.
-                Err(crate::paging::Fault::NoMemory) if may_wait && crate::reclaim::wait() => {}
-                Err(
-                    fault @ (crate::paging::Fault::NoMemory
-                    | crate::paging::Fault::Limit
-                    | crate::paging::Fault::Bus),
-                ) if from_user => {
-                    // Promised and not there to give: Linux's overcommit
-                    // bargain, and its answer. A page of a file that cannot
-                    // be had is SIGBUS too — to the program's handler, if it
-                    // has one.
-                    if handed_to_program(frame, SIGBUS, crate::signal::BUS_ADRERR, cr2) {
-                        return;
-                    }
-                    no_page(cr2, !matches!(fault, crate::paging::Fault::Bus));
+        match unsafe { crate::paging::back(cr3, cr2 as usize, write, may_wait) } {
+            Ok(()) => return,
+            // No frame to give it with. Memory is looked for, and waited for
+            // while it is being written out; if that produced any, the
+            // instruction runs again and meets the page as it is now — not
+            // `back` again from here. While this waited, another thread may
+            // have been given the page, or it may have gone: of four threads
+            // that touched the same new pages as memory ran out, three were
+            // told nothing was promised there, and their program ended.
+            Err(crate::paging::Fault::NoMemory) if may_wait && crate::reclaim::wait() => return,
+            Err(
+                fault @ (crate::paging::Fault::NoMemory
+                | crate::paging::Fault::Limit
+                | crate::paging::Fault::Bus),
+            ) if from_user => {
+                // Promised and not there to give: Linux's overcommit
+                // bargain, and its answer. A page of a file that cannot
+                // be had is SIGBUS too — to the program's handler, if it
+                // has one.
+                if handed_to_program(frame, SIGBUS, crate::signal::BUS_ADRERR, cr2) {
+                    return;
                 }
-                Err(_) => break,
+                no_page(cr2, !matches!(fault, crate::paging::Fault::Bus));
             }
+            Err(_) => {}
         }
     }
 
@@ -726,31 +736,25 @@ fn exception(frame: &mut InterruptFrame) {
     if vec == 14
         && frame.error_code & (PF_PRESENT | PF_WRITE | PF_RESERVED) == PF_PRESENT | PF_WRITE
     {
-        let cr2: u64;
-        unsafe { core::arch::asm!("mov {}, cr2", out(reg) cr2, options(nostack, nomem)) };
         let cr3 = crate::paging::read_cr3();
-        loop {
-            match unsafe { crate::paging::own(cr3, cr2 as usize) } {
-                Ok(true) => return,
-                Ok(false) => break,
-                Err(_) if may_wait && crate::reclaim::wait() => {}
-                // The same bargain: a fork promised a page it had not got.
-                Err(_) if from_user => {
-                    if handed_to_program(frame, SIGBUS, crate::signal::BUS_ADRERR, cr2) {
-                        return;
-                    }
-                    no_page(cr2, true)
+        match unsafe { crate::paging::own(cr3, cr2 as usize) } {
+            Ok(true) => return,
+            Ok(false) => {}
+            // As above: once memory has been found, the instruction again.
+            Err(_) if may_wait && crate::reclaim::wait() => return,
+            // The same bargain: a fork promised a page it had not got.
+            Err(_) if from_user => {
+                if handed_to_program(frame, SIGBUS, crate::signal::BUS_ADRERR, cr2) {
+                    return;
                 }
-                Err(_) => break,
+                no_page(cr2, true)
             }
+            Err(_) => {}
         }
     }
 
     // Handle user-mode page faults: forward to pager or kill task
     if vec == 14 && from_user {
-        let cr2: u64;
-        unsafe { core::arch::asm!("mov {}, cr2", out(reg) cr2, options(nostack, nomem)) };
-
         let tid = scheduler::current_tid();
         let pager = scheduler::current_task_pager();
 
@@ -918,10 +922,8 @@ fn exception(frame: &mut InterruptFrame) {
     crate::serial::puts(b" err=0x");
     crate::serial::put_hex_usize(frame.error_code as usize);
     if vec == 14 {
-        let cr2_k: u64;
-        unsafe { core::arch::asm!("mov {}, cr2", out(reg) cr2_k, options(nostack, nomem)) };
         crate::serial::puts(b" cr2=0x");
-        crate::serial::put_hex_usize(cr2_k as usize);
+        crate::serial::put_hex_usize(cr2 as usize);
     }
     crate::serial::puts(b" tid=");
     crate::serial::put_usize(crate::scheduler::current_tid());
@@ -977,8 +979,6 @@ fn exception(frame: &mut InterruptFrame) {
     console::puts(b"\n");
 
     if vec == 14 {
-        let cr2: u64;
-        unsafe { core::arch::asm!("mov {}, cr2", out(reg) cr2, options(nostack, nomem)) };
         console::puts(b"CR2: ");
         print_hex(cr2);
         console::puts(b"\n");
