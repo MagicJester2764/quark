@@ -803,8 +803,9 @@ pub unsafe fn back_range(pml4_phys: usize, addr: u64, len: u64, write: bool) -> 
 /// It is called for a write that faulted, from ring 3 or from the kernel;
 /// before the kernel writes a program's memory where it can say so first
 /// ([`back_range`]); and for another address space's page, where the kernel
-/// is about to write it through its frame. Wherever the frame changes,
-/// every processor with the address space loaded is told (`tlb::stale`).
+/// is about to write it through its frame. Where the frame changes, the
+/// entry is taken away and every processor with the address space loaded
+/// has forgotten it before the copy is put in: break before make.
 ///
 /// Looking at the entry, copying the page and changing the entry are one
 /// step, with interrupts off. In two, another thread of the program run in
@@ -837,12 +838,25 @@ unsafe fn own_one(pml4_phys: usize, virt: usize) -> Result<bool, Fault> { unsafe
         pt.entries[pti].set(frame, flags);
     } else {
         let copy = crate::reclaim::frame().ok_or(Fault::NoMemory)?;
+        // The entry goes, and every processor with this address space loaded
+        // forgets it, before the copy takes its place. Put straight in, the
+        // copy and the frame it was made from were both in use at once: a
+        // processor goes on using a translation it remembers until it is
+        // told to forget it, whatever the table says by then, so another
+        // thread's processor that remembered the old, read-only one found
+        // the new one for a store and answered its next load from the old —
+        // and the thread read back, from the frame its program no longer
+        // had, an older value than it had just written. A missing entry is
+        // a fault instead, and the fault waits for this to be done.
+        pt.entries[pti] = PageTableEntry(0);
+        crate::tlb::stale(pml4_phys);
+        crate::tlb::sync();
+        if pml4_phys == read_cr3() {
+            invlpg(virt & !0xFFF);
+        }
         core::ptr::copy_nonoverlapping(frame as *const u8, copy as *mut u8, PAGE_SIZE);
         pt.entries[pti].set(copy, flags);
         pmm::free(pmm::PhysFrame::from_address(frame));
-        // Another thread of the program, on another processor, may still be
-        // reading the page it was.
-        crate::tlb::stale(pml4_phys);
     }
     if pml4_phys == read_cr3() {
         invlpg(virt & !0xFFF);

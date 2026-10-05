@@ -771,9 +771,14 @@ fn exception(frame: &mut InterruptFrame) {
     // (`paging::back_range`), and CR0.WP is what brings the writes that
     // could not here, rather than letting them through to a frame that is
     // somebody else's as well.
-    if vec == 14
-        && frame.error_code & (PF_PRESENT | PF_WRITE | PF_RESERVED) == PF_PRESENT | PF_WRITE
-    {
+    //
+    // Whatever the fault said about the page being there: `own` looks at the
+    // entry as it is now. A write that found no entry — taken while another
+    // thread's copy was being made, when there is none — and waited at the
+    // door while a fork shared the page again, is a write to a page shared
+    // since a fork. Judged by the fault, it went to `back`, which has nothing
+    // to give a page that is there, and its program was ended.
+    if vec == 14 && frame.error_code & (PF_WRITE | PF_RESERVED) == PF_WRITE {
         let cr3 = crate::paging::read_cr3();
         match unsafe { crate::paging::own(cr3, cr2 as usize) } {
             Ok(true) => return,

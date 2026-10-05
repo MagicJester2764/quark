@@ -291,6 +291,24 @@ may keep — are in `../quarkutils/CLAUDE.md`; these are the kernel's.
     otherwise go on writing, through what it remembered, pages the child
     now has too. `dtest fork` has a check for each of these, and each was
     seen to fail with its line taken out.
+  - *Break before make.* A copy is put in where the old frame was only once
+    the entry has gone and every processor with the address space loaded
+    has forgotten it (`own`: cleared, `tlb::sync`, then the copy). A
+    processor goes on using a translation it remembers until it is told to
+    forget it, whatever the table says by then; with the copy put straight
+    in, another thread's processor that remembered the old, read-only
+    translation found the new one for a store and answered its next load
+    from the old frame — the child's — and the thread read back an older
+    value than it had just written. Flushing sooner does not close that,
+    only a missing entry does. cargo's malloc met it every few builds on
+    four processors; `cowstress` in `../quarkutils` — threads storing to
+    the same pages and reading straight back while one of them forks —
+    meets it in seconds. And a fault is served by what the entry is when it
+    is served, not by what the processor said when it was taken: a write
+    that found no entry in that window, and waited at the door while a fork
+    shared the page again, is a write to a page shared since a fork (`own`
+    takes every write fault). Sent by the fault's word to `back`, which has
+    nothing to give a page that is there, it ended its program.
 - **A scrap of memory between the firmware's own is not used**
   (`pmm::scrap`). A restart does not clear memory, and a firmware that
   reads a page it did not keep for itself finds what the last system left:
