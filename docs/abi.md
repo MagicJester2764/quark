@@ -901,7 +901,7 @@ would on Linux, and the pipe is freed when the read returns.
 | 66 | `SYS_FD_READ_NB` | arg0 = fd, arg1 = buf, arg2 = max len | bytes, `0` = EOF, **`0xFFFF_FFFE` = would block**, `u64::MAX` = error | — |
 | 67 | `SYS_FD_SET` | arg0 = target tid, arg1 = fd, arg2 = service tid, arg3 = tag. A read or a write through the descriptor is a call to the service with that tag; the service is the task arg2 names now, and once it is gone the descriptor names nothing, whoever has its number | 0 / `u64::MAX`, also if arg2 names no task | `TaskMgmt` |
 | 68 | `SYS_FD_DUP` | arg0 = target tid, arg1 = target fd or `u64::MAX - 1` for any free one, arg2 = source fd, arg3 = lowest acceptable fd when arg1 asks for any | the fd it took / `u64::MAX` | `TaskMgmt` over the target, unless the target is the caller or a child it has not started |
-| 69 | `SYS_PIPE_CREATE` | — | handle / `u64::MAX` | — (bounded per task) |
+| 69 | `SYS_PIPE_CREATE` | — | handle / `u64::MAX` | — (bounded per program: 64 not yet closed, a stream's not counted) |
 | 70 | `SYS_PIPE_FD_SET` | arg0 = target tid, arg1 = fd or `u64::MAX - 1` for any free one, arg2 = pipe handle, arg3 = 1 for write end | the fd it took / `u64::MAX` | `TaskMgmt` over the target, unless the target is the caller or a child it has not started |
 | 71 | `SYS_FD_CLOSE` | arg0 = fd | 0 / `u64::MAX` | — |
 | 72 | `SYS_SOCKETPAIR` | — | `(fd0 << 32) \| fd1`, both in the caller's table / `u64::MAX` | — |

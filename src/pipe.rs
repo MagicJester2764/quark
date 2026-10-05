@@ -13,10 +13,13 @@ use crate::task::FdKind;
 /// Pipes in the system.
 ///
 /// Every stream is two of these, so a compositor holding a connection per
-/// client spends them quickly: ninety-six is thirty-two ordinary pipes plus
-/// two apiece for the thirty-two streams. Each carries a 4 KiB buffer inline,
-/// so the number is 384 KiB of kernel memory and is spent up front.
-const MAX_PIPES: usize = 96;
+/// client spends them quickly: two hundred and fifty-six is a hundred and
+/// twenty-eight ordinary pipes plus two apiece for the sixty-four streams.
+/// Each carries a 4 KiB buffer inline, so the number is a megabyte of
+/// kernel memory and is spent up front. It was ninety-six, and a build
+/// running four jobs at once — a pipe or two for each job's output, a pair
+/// to hear how each start went — is a good many of them.
+const MAX_PIPES: usize = 256;
 const PIPE_BUF_SIZE: usize = 4096;
 const MAX_WAITERS: usize = 8;
 
@@ -63,6 +66,9 @@ struct Pipe {
     /// What is in the buffer is always whole records, so what it holds and
     /// whether it is empty mean what they mean for bytes.
     packets: bool,
+    /// One of a stream's two, which the stream's own table bounds: not
+    /// counted against its program's pipes.
+    for_stream: bool,
 }
 
 impl Pipe {
@@ -86,6 +92,7 @@ impl Pipe {
             peer_waiters: [0; MAX_WAITERS],
             peer_waiter_count: 0,
             packets: false,
+            for_stream: false,
         }
     }
 
@@ -378,8 +385,13 @@ fn irq_restore(flags: u64) {
     }
 }
 
-/// Maximum pipes a single task may hold open at once.
-const MAX_PIPES_PER_TASK: usize = 8;
+/// The most ordinary pipes one program may have made and not yet seen
+/// closed: a quarter of the table, so that one program cannot take the
+/// rest's. It was eight, and a pipe a program made for a child's output is
+/// still its own while the child writes to it: cargo, running four jobs,
+/// has two for each job and one for its jobserver, and could not start its
+/// fourth rustc — which it reported as being out of descriptors.
+const MAX_PIPES_PER_PROGRAM: usize = MAX_PIPES / 4;
 
 /// Create a new pipe. Returns the pipe handle index.
 /// Handles start at 1 (slot 0 is reserved so that 0 can mean "no pipe").
@@ -402,6 +414,7 @@ pub fn create_for_stream(packets: bool) -> Option<usize> {
                 PIPES[i].creator = creator;
                 PIPES[i].owner_space = space;
                 PIPES[i].packets = packets;
+                PIPES[i].for_stream = true;
                 found = Some(i);
                 break;
             }
@@ -490,9 +503,9 @@ pub fn create() -> Option<usize> {
         // the global table. By program rather than by task, because a space id
         // is never reused and a TID is: see `owner_space`.
         let held = (1..MAX_PIPES)
-            .filter(|&i| PIPES[i].in_use && PIPES[i].owner_space == space)
+            .filter(|&i| PIPES[i].in_use && PIPES[i].owner_space == space && !PIPES[i].for_stream)
             .count();
-        if held >= MAX_PIPES_PER_TASK {
+        if held >= MAX_PIPES_PER_PROGRAM {
             None
         } else {
             let mut found = None;
