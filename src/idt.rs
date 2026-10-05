@@ -811,6 +811,33 @@ fn exception(frame: &mut InterruptFrame) {
         crate::serial::put_hex_usize(pde as usize);
         crate::serial::puts(b" pte=0x");
         crate::serial::put_hex_usize(pte as usize);
+        // The code it was running and the words on top of its stack, as far
+        // as their pages are there: a library's bytes at `rip` say which
+        // library and where in it, and the return addresses where it had
+        // been called from.
+        let cr3 = crate::paging::read_cr3();
+        crate::serial::puts(b" code=");
+        for i in 0..2 {
+            match unsafe { crate::paging::peek_user(cr3, (frame.rip as usize & !7) + i * 8) } {
+                Some(w) => {
+                    crate::serial::puts(b"0x");
+                    crate::serial::put_hex_usize(w as usize);
+                    crate::serial::puts(b",");
+                }
+                None => break,
+            }
+        }
+        crate::serial::puts(b" stack=");
+        for i in 0..12 {
+            match unsafe { crate::paging::peek_user(cr3, (frame.rsp as usize & !7) + i * 8) } {
+                Some(w) => {
+                    crate::serial::puts(b"0x");
+                    crate::serial::put_hex_usize(w as usize);
+                    crate::serial::puts(b",");
+                }
+                None => break,
+            }
+        }
         crate::serial::puts(b"]\n");
         console::puts(b"\n[kernel] Page fault in task ");
         print_dec(tid);

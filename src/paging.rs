@@ -722,6 +722,22 @@ pub unsafe fn entries_of(pml4_phys: usize, virt: usize) -> (u64, u64) { unsafe {
     (pde.raw(), table_at(pde.frame_address()).entries[pti].raw())
 }}
 
+/// The word of a program's memory at `virt`, where its page is there for
+/// it to read — for saying what a program that faulted was running and where
+/// it had been called from; nothing is backed or waited for to read it.
+pub unsafe fn peek_user(pml4_phys: usize, virt: usize) -> Option<u64> { unsafe {
+    let end = virt.checked_add(7)?;
+    if virt & 7 != 0 || !user_range_ok(virt & !0xFFF, 1) || !user_range_ok(end & !0xFFF, 1) {
+        return None;
+    }
+    let (_, pte) = entries_of(pml4_phys, virt);
+    if pte & (PRESENT | USER) != PRESENT | USER {
+        return None;
+    }
+    let _ua = crate::cpu::UserAccess::begin();
+    Some(core::ptr::read_volatile(virt as *const u64))
+}}
+
 /// The page table holding `virt`'s entry, if there is one.
 unsafe fn leaf_table(pml4_phys: usize, virt: usize) -> Option<&'static mut PageTable> { unsafe {
     let (pml4i, pdpti, pdi, _) = table_indices(virt);
