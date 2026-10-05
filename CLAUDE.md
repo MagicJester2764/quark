@@ -176,6 +176,10 @@ reaches a device, or to who owns a frame, is verified there too.
 
 A fault prints to serial: `[UPFAULT ...]` or `[UFAULT ...]` for ring 3, which
 ends the program, and `[KFAULT ...]` for ring 0, which halts the machine. A
+program's page fault says where it was (`rip`, `rsp`), what the processor
+said of the access (`err`) and what the page's entries hold (`pde`, `pte`;
+a reservation is a non-present entry with bit 11): a stack run past its
+end, a reservation lost, or a pointer to nothing. A
 failed check prints to the screen. Look at both. `[KSTUCK ...]` is the third
 thing serial can say, and is read as a kernel fault is: one processor has had
 the kernel for half a minute, the rest have been waiting at its door, and

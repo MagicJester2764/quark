@@ -701,6 +701,27 @@ unsafe fn back_object(pml4_phys: usize, virt: usize, raw: u64, may_block: bool) 
     Ok(())
 }}
 
+/// What `virt` is in `pml4_phys`, for saying so when a program faults there:
+/// the page directory's entry, and the page table's if the directory names
+/// a table — a reservation is a non-present entry with `MARKER` at either.
+/// Noughts where there is nothing.
+pub unsafe fn entries_of(pml4_phys: usize, virt: usize) -> (u64, u64) { unsafe {
+    let (pml4i, pdpti, pdi, pti) = table_indices(virt);
+    let e = table_at(pml4_phys).entries[pml4i];
+    if !e.is_present() {
+        return (0, 0);
+    }
+    let e = table_at(e.frame_address()).entries[pdpti];
+    if !e.is_present() || e.is_huge() {
+        return (0, 0);
+    }
+    let pde = table_at(e.frame_address()).entries[pdi];
+    if !pde.is_present() || pde.is_huge() {
+        return (pde.raw(), 0);
+    }
+    (pde.raw(), table_at(pde.frame_address()).entries[pti].raw())
+}}
+
 /// The page table holding `virt`'s entry, if there is one.
 unsafe fn leaf_table(pml4_phys: usize, virt: usize) -> Option<&'static mut PageTable> { unsafe {
     let (pml4i, pdpti, pdi, _) = table_indices(virt);

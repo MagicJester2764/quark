@@ -793,12 +793,24 @@ fn exception(frame: &mut InterruptFrame) {
         }
 
         // No pager — kill the faulting task
+        // And what was there: the stack pointer, what the processor said
+        // of the access, and the page's entries — enough to tell a stack
+        // run past its end from a reservation lost or a wild pointer.
+        let (pde, pte) = unsafe { crate::paging::entries_of(crate::paging::read_cr3(), cr2 as usize) };
         crate::serial::puts(b"[UPFAULT tid=");
         crate::serial::put_usize(tid);
         crate::serial::puts(b" cr2=0x");
         crate::serial::put_hex_usize(cr2 as usize);
         crate::serial::puts(b" rip=0x");
         crate::serial::put_hex_usize(frame.rip as usize);
+        crate::serial::puts(b" rsp=0x");
+        crate::serial::put_hex_usize(frame.rsp as usize);
+        crate::serial::puts(b" err=0x");
+        crate::serial::put_hex_usize(frame.error_code as usize);
+        crate::serial::puts(b" pde=0x");
+        crate::serial::put_hex_usize(pde as usize);
+        crate::serial::puts(b" pte=0x");
+        crate::serial::put_hex_usize(pte as usize);
         crate::serial::puts(b"]\n");
         console::puts(b"\n[kernel] Page fault in task ");
         print_dec(tid);
