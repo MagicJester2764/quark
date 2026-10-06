@@ -138,19 +138,21 @@ system hung.
 
 There are no tests in this tree, and that is the shape of a microkernel rather
 than an omission: the kernel is tested from outside, through the ABI, by a
-program. `dtest` in `../quarkutils` makes 828 checks — capabilities, IPC,
+program. `dtest` in `../quarkutils` makes 1024 checks — capabilities, IPC,
 memory, descriptors, signals, scheduling, users and terminals, `dtest calls`
 with three million calls in three seconds, `dtest smp` for what a second
 processor changes, `dtest clock` for what time it is and whether a wait ends
 when it should, `dtest fork` for what a fork shares and who a write is seen
 by, `dtest handlers` for a handler the kernel runs, `dtest usage` for what
 a program has used and its share of the processor, `dtest devices` for who
-holds which device, twenty-five more (`dtest pressure`) on a machine with
-somewhere to write memory out to, and twelve more (`dtest msi`, `dtest
-devices`) on a machine with a device that interrupts by message and its
-driver running, and eight (`dtest iommu`)
-where an IOMMU stands between that device and memory — and `qfuzz` throws random
-requests at every service.
+holds which device; twenty-five more (`dtest pressure`) on a machine with
+somewhere to write memory out to, twelve (`dtest msi`, `dtest devices`)
+with a device that interrupts by message and its driver running, eight
+(`dtest iommu`) where an IOMMU stands between that device and memory,
+eleven (`dtest usb`) with a keyboard, a mouse and a disk on USB, three
+(`dtest display`) where the display can be had another size, and seventeen
+(`dtest sound`) with a sound card: 1061 on the machine ExplOSion tests on —
+and `qfuzz` throws random requests at every service.
 
 So a kernel change is verified by booting an image:
 

@@ -22,23 +22,26 @@ for.
   and an idle processor that takes no ticks. Sixteen processors at most.
 - **Threads in full.** More than sixty-four tasks; a child that is its
   program's, so that any thread may collect it, where it is the task's
-  that made it; and the rest of the futex — requeue, priority inheritance,
-  robust lists.
-- **Signals queued**, as the C library will want for its real-time ones:
-  one raised twice before it is run is run once, and a handler is told who
-  raised it by process id and nothing more.
-- **Several messages for a device.** A device is its own capability now
-  (`PciDevice`), with its registers wherever the firmware put them; what
-  is left is MSI-X, which the drivers for faster devices will want: a
-  driver asks for one message at a time, and a device's MSI-X table is in
-  its own registers, where its driver aims it as it likes.
+  that made it; and the rest of the futex — requeue, which the C library
+  answers by waking every waiter it would have moved, and priority
+  inheritance.
+- **Several messages for a device.** A device is its own capability
+  (`PciDevice`), with its registers wherever the firmware put them, and its
+  driver has one message: the kernel aims it where the device has MSI, and
+  the driver writes it into the first entry of its MSI-X table where it
+  has only that. What is left is several — each of an NVMe disk's queues
+  with its own, on a processor of its own — and a table only the kernel
+  writes: a device's MSI-X table is in its own registers, where its driver
+  aims it as it likes.
 
 ## Not asked for
 
-- **A program's code somewhere else each time.** Its stack, heap, threads
-  and anonymous memory move each run; its code is where it was linked, as
-  nothing is built to load anywhere (PIE), and so is the page its
-  arguments are on. The kernel is where it was linked.
+- **The system's own programs somewhere else each time.** A program's
+  stack, heap, threads and anonymous memory move each run, and so does a
+  program linked to be put anywhere — a PIE, as a program built for Linux
+  usually is. The system's own programs are not linked so: their code is
+  where it was linked, and so is the page a program's arguments are on.
+  The kernel is where it was linked.
 - **Choosing who is ended.** A machine with nothing left to give up ends
   whichever task touched the page it could not give, not the biggest.
 - **Looking for memory ahead of time.** It is looked for when a frame is
@@ -87,35 +90,40 @@ will meet:
 | Interrupts of a device's own (MSI) | 32 |
 | Entries of the firmware's memory map | 64, once neighbours are joined |
 | Descriptors per program | 64, and one more for its working directory |
-| Capability slots per program | 64 |
-| Pipes | 96 in the machine, 8 made by any one program |
-| Connected streams | 32 |
+| Capability slots per program | 256 |
+| Pipes | 256 in the machine, 64 made by any one program |
+| Named pipes | 32 with somebody holding an end |
+| Connected streams | 64 |
+| Local sockets | 32 not yet connected, each with 16 waiting to be accepted |
 | Poll sets | 64, each watching 32 descriptors |
 | Pseudo-terminals | 8 |
 | Objects servers serve (open files) | 1024 |
-| Timers, event counters | 16 of each |
+| Timers, event counters, descriptors read for signals | 16, 16 and 32 |
+| A program's own timers | 32 |
+| Real-time signals waiting | 64 a program and 16 a task, behind the first of each number |
+| Groups a task is in besides its own | 16 |
 | Shared memory regions | 256, of at most 4096 pages |
-| Memory objects | 256, with 8192 cached pages between them |
+| Memory objects | 256, and a cache of their pages a quarter of memory — at least 8192 pages, at most a million |
+| PCI functions | 128, of the first segment |
+| Programs whose devices an IOMMU guards | 8, with 32 devices between them |
 | Futex waiters | 64 at once |
 | Kernel heap | 1 GiB of address space |
 | Memory | 511 GiB |
 
 ## Half done
 
-- **A pager's idle objects are told to it in a list thirty-two long.** More
-  of a pager's objects than that going idle before it has looked — every
-  mapped file of several programs ended together — and the rest are not
-  told of: they stay until the pager lets them go some other way. Deaths of
-  tasks and of programs are not lost; this still can be.
 - **Memory is written out through the file server, a page a call**, to a
-  file, on a disk driven a word at a time. It is correct and it is slow:
-  about a hundred pages a second in a virtual machine. A partition of its
-  own for it, pages written several at a time, and a disk driver that does
-  not copy through a port are each of them faster and none is here.
+  file. It is correct and it is slow: `dtest pressure` — a program that
+  wants more memory than the machine has, and then four threads of one —
+  takes half a minute where the disk is IDE's, driven a word at a time,
+  and six to twelve seconds where the device copies for itself (NVMe,
+  AHCI, virtio), in a virtual machine. A partition of its own for it and
+  pages written several at a time are each faster, and neither is here.
 - **Not every page can be taken.** A page a fork left in two programs
   stays while it is in both; a page of a file mapped to be written through
-  stays while it is mapped; the cache that pages pass through on their way
-  out holds thirty-two megabytes.
+  stays while it is mapped; and what is on its way out waits in the cache
+  of objects' pages, which a machine taking pages faster than its pager
+  writes them fills.
 - **Five deprecated calls still answer** — the pre-capability grants, 86 to 90
   — and the two debug-console calls (160, 161) are marked for withdrawal once
   early output is handled another way. `docs/abi.md` says which.

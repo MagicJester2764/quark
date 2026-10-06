@@ -37,25 +37,34 @@ The kernel provides:
   threads hold them too. There is no UID 0 bypass
 - Every PCI device found and sized at boot, and its configuration the
   kernel's: a driver holds its own device and reaches nothing else — its
-  registers, its interrupt, whether it may copy memory
+  registers, its interrupt, whether it may copy memory — and a display
+  device that draws from memory is given a screen that outlives its driver
 - Where the machine has an IOMMU, a device that copies memory reaches what
   its driver was given and nothing else
 - Address spaces, memory given its frames when first touched, shared memory,
   and memory objects whose pages a user-space pager provides — which is how a
   file is mapped, and how memory that is not being used is written out when
   there is not enough of it
-- A descriptor table for each program: IPC endpoints, pipes, connected streams
-  that can carry descriptors, poll sets, pseudo-terminals, timers and event
-  counters
+- A descriptor table for each program: IPC endpoints, pipes and named pipes,
+  connected streams that can carry descriptors and say who is at the other
+  end, local sockets found by a name, poll sets that watch as epoll does,
+  pseudo-terminals, timers, event counters, signals read as records, and
+  a server's files, which the kernel counts and their server serves
 - Tasks, threads, a `fork` that shares memory until one side writes it, and
-  `exec` — of a program with threads too; futexes with deadlines; every task's
-  own floating-point and vector registers, as wide as the processor has; and
-  a first program whose stack is somewhere else each time, as the userland
+  `exec` — of a program with threads too; futexes with deadlines, and a
+  robust mutex let go when the task that held it dies; every task's own
+  floating-point and vector registers, as wide as the processor has; and a
+  first program whose stack is somewhere else each time, as the userland
   puts everything of every program
 - Unix's signals: handlers the kernel runs wherever it finds a program, a
   mask for each thread, a signal for one thread, faults handed to a
   program's handler, waits a signal ends saying whether to make the call
-  again, and process groups, sessions and a terminal's job control
+  again, real-time signals that queue with what they carry, a program's
+  own timers that raise them, and process groups, sessions and a
+  terminal's job control
+- A program's own `syscall` instructions, where it asks, raised as a
+  signal for its C library to answer: how a program built for Linux's
+  musl, linked to its shared C library, runs here unchanged
 - IRQ delivery to user-space drivers, and page faults forwarded to a pager
 - Random bytes (ChaCha20, seeded from RDSEED or RDRAND and the machine's
   timing), and the date, which a holder of the capability may set
@@ -114,8 +123,12 @@ src/
   stream.rs           Connected pairs of byte streams
   pollset.rs          Waiting on more than one descriptor
   pty.rs              Pseudo-terminals and their line discipline
+  local.rs            Local sockets: found by a name, and who is at the other end
   timerfd.rs          Timers as descriptors
+  ptimer.rs           A program's own timers, which raise signals
   eventfd.rs          Counters as descriptors
+  sigfd.rs            Signals read from a descriptor
+  threads.rs          What a thread library keeps with the kernel: robust lists
   userspace.rs        Starting init, address space helpers
   elf.rs              ELF64 loader, for init
   idt.rs              Interrupt descriptor table and exceptions
@@ -130,6 +143,7 @@ src/
   power.rs            Turning it off, and starting it again
   pci.rs              Every PCI device, found once; its configuration
   devmem.rs           Device memory: the addresses that are not memory
+  display.rs          A display device's screen: memory nobody owns
   iommu.rs            Where a device may copy memory: Intel's VT-d
   percpu.rs           What each processor has of its own
   klock.rs            The kernel lock: one processor in the kernel at a time
@@ -194,7 +208,8 @@ make run
 ## Testing
 
 The kernel is tested from outside, through the ABI, by a program: `dtest` in
-quarkutils makes 821 checks from user space. A kernel change is verified by
+quarkutils makes 1024 checks from user space, and more where the machine has
+more to ask about: 1061 on the machine ExplOSion tests on. A kernel change is verified by
 booting an image and running it — `tools/boot-test.sh` in ExplOSion — on one
 processor and on four.
 
