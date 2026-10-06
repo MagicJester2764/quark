@@ -791,7 +791,10 @@ descriptors, hands over the capabilities and starts a task there. The kernel's
 rule is `may_prepare` — a task the caller created and has not started is its
 own to fill, because nothing else can name it, it holds nothing and it cannot
 run — so none of that needs authority over anybody. That includes its band
-(`SYS_TASK_PRIORITY`, no better than the caller's own): the device manager
+(`SYS_TASK_PRIORITY`, no better than the caller's own — the band it is in,
+not the one it runs at: a program the framebuffer device is calling back is
+lent the servers' band while the device waits, and a child put in it then
+kept it): the device manager
 holds no `TaskMgmt`, and when this rule left the band out every driver it
 started ran as an ordinary program, whose memory is taken when memory is
 short — a disk's driver written out to the disk it drives, and the machine

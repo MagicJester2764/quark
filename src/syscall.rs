@@ -1362,9 +1362,13 @@ fn dispatch(
             // holds and never widen it. A shell running as an ordinary program
             // cannot promote what it starts into a driver band, so a program
             // asking for one gets it only from a spawner that is already there.
-            if band as usize >= scheduler::NUM_PRIORITIES
-                || (band as usize) < scheduler::priority_of(caller)
-            {
+            //
+            // The band it is in, not the one it runs at: while a better task
+            // waits on it — the framebuffer device saying the display has gone
+            // — it is lent that one, and a child put in it then kept it for
+            // good, in front of every ordinary program and never written out.
+            let own = scheduler::base_priority_of(caller).map_or(scheduler::NUM_PRIORITIES, |b| b as usize);
+            if band as usize >= scheduler::NUM_PRIORITIES || (band as usize) < own {
                 return u64::MAX;
             }
             match scheduler::set_priority(tid, band as u8) {

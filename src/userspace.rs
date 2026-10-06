@@ -376,13 +376,17 @@ pub fn spawn_init(elf_data: &[u8], fb: Option<crate::multiboot2::FramebufferInfo
         let task = scheduler::get_task_mut(tid)?;
         // init is the root of authority: it holds every capability, and it is
         // the only spawner that can put a driver in the driver band, since a
-        // spawner may never grant a better band than it is in. It steps down
-        // to an ordinary one once it has finished starting things.
+        // spawner may never grant a better band than the one it is in. That
+        // is its own band and not only the one it runs at: it was the second
+        // alone, and it fell back to an ordinary one the first time anything
+        // called it — and started what it started again, a server among them,
+        // as an ordinary program.
         //
         // Every capability but one kind: physical memory, of which it holds
         // exactly what it maps — the framebuffer, to lend to `fb`, and its
         // boot modules, to read them. It used to hold all four gigabytes, and
         // so could map the kernel.
+        task.base_priority = scheduler::PRIO_DRIVER;
         task.priority = scheduler::PRIO_DRIVER;
         task.cr3 = pml4;
         task.space = space_of(pml4);

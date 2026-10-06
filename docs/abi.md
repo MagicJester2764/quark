@@ -1016,7 +1016,7 @@ cannot resurrect a revoked capability in practice.
 | 109 | `SYS_TASK_CREATE_IN` | arg0 = cr3 of an address space the caller created | TID / `u64::MAX` | as `SYS_TASK_CREATE` |
 | 110 | `SYS_FORK` | — | the child's TID, `0` in the child / `u64::MAX` | — |
 | 111 | `SYS_EXEC_SPACE` | arg0 = cr3 the caller made, arg1 = entry, arg2 = rsp | does not return / `u64::MAX` | — |
-| 105 | `SYS_TASK_PRIORITY` | arg0 = tid, arg1 = band, or `u64::MAX` to ask | 0, or the band asked about / `u64::MAX` | to set: `TaskMgmt` for the target, or the target a child the caller made and has not started; and the caller's own band or worse. To ask: none |
+| 105 | `SYS_TASK_PRIORITY` | arg0 = tid, arg1 = band, or `u64::MAX` to ask | 0, or the band asked about / `u64::MAX` | to set: `TaskMgmt` for the target, or the target a child the caller made and has not started; and the caller's own band or worse — the band it is in, not one lent it while a better task waits on it. To ask: none |
 
 A program starts one of two ways. A parent may *build* one: it creates a task,
 makes its address space, loads its image, sets its arguments, descriptors and
@@ -1134,8 +1134,10 @@ returned when the caller stops waiting, whether that is a reply, a timeout, or
 the caller dying.
 
 It follows the same narrowing rule as capabilities — a caller cannot grant a
-better band than it is in itself — so a shell running as an ordinary program
-cannot promote what it starts. A child the caller made and has not started
+better band than it is in itself: its own band, not one it is lent while
+something better waits on it — so a shell running as an ordinary program
+cannot promote what it starts, and nor can a program that a server is calling
+back. A child the caller made and has not started
 is its to put in a band, as it is its to fill; any other task is a holder of
 `TaskMgmt`'s. Programs ask for a band in their manifest, and
 only a spawner already in that band can satisfy the request. `init` starts in
