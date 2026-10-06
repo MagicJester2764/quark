@@ -107,13 +107,6 @@ pub const TAG_OBJECT_IDLE: u64 = 0xFFFF_0006;
 /// its file: `data` = `[cookie, object id]`, sender marked as for a page-in.
 pub const TAG_OBJECT_SYNC: u64 = 0xFFFF_0007;
 
-/// Idle objects a pager has been told about and has not collected. Deeper
-/// than the death queues: a pager with many files mapped may see many go at
-/// once, and one it misses stays until it releases it some other way.
-const IDLE_QUEUE: usize = 32;
-static mut IDLES: [[(u64, u64); IDLE_QUEUE]; MAX_TASKS] = [[(0, 0); IDLE_QUEUE]; MAX_TASKS];
-static mut IDLES_LEN: [usize; MAX_TASKS] = [0; MAX_TASKS];
-
 /// The kernel to a pager: memory is short, and pages of yours that nothing
 /// maps could be given up if they were written. No object is named: the
 /// pager looks at each it has. A flag and not a queue, so that it cannot be
@@ -452,18 +445,15 @@ unsafe fn take_death(receiver: usize) -> Option<Message> {
     }
 }
 
-/// Tell `pager` that nothing maps its object `id` (its `cookie`) any more.
+/// Wake `pager`: an object of its has nothing mapping it any more, which
+/// the object says (`memobj::take_idle`) until the pager has collected it.
 ///
 /// Interrupts are off: this is called as page tables are cleared.
-pub fn notify_object_idle(pager: usize, cookie: u64, id: u64) {
+pub fn notify_object_idle(pager: usize) {
     if pager >= MAX_TASKS {
         return;
     }
     unsafe {
-        if IDLES_LEN[pager] < IDLE_QUEUE {
-            IDLES[pager][IDLES_LEN[pager]] = (cookie, id);
-            IDLES_LEN[pager] += 1;
-        }
         match TASK_IPC[pager].state {
             IpcState::RecvBlocked(from) if from == 0 || from == TID_ANY => {
                 TASK_IPC[pager].state = IpcState::None;
@@ -569,12 +559,7 @@ unsafe fn take_any_death(receiver: usize) -> Option<Message> {
                 data: [0; 6],
             });
         }
-        if IDLES_LEN[receiver] > 0 {
-            let (cookie, id) = IDLES[receiver][0];
-            for i in 1..IDLES_LEN[receiver] {
-                IDLES[receiver][i - 1] = IDLES[receiver][i];
-            }
-            IDLES_LEN[receiver] -= 1;
+        if let Some((cookie, id)) = crate::memobj::take_idle(receiver) {
             return Some(Message { sender: 0, tag: TAG_OBJECT_IDLE, data: [cookie, id, 0, 0, 0, 0] });
         }
         if CLEAN_WANTED[receiver] {
@@ -1480,7 +1465,6 @@ pub fn cleanup_task_ipc(dead_tid: usize) {
         WATCHERS[dead_tid] = 0;
         DEATHS[dead_tid] = 0;
         SPACE_DEATHS_LEN[dead_tid] = 0;
-        IDLES_LEN[dead_tid] = 0;
         CLEAN_WANTED[dead_tid] = false;
         let bit = !(1u64 << dead_tid);
         for t in 0..MAX_TASKS {

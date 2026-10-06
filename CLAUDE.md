@@ -569,7 +569,13 @@ may keep — are in `../quarkutils/CLAUDE.md`; these are the kernel's.
   every member of a pipeline. The ninth was not told of. A notice the
   kernel owes somebody needs somewhere to wait that cannot be full, as a
   served descriptor's last close has (`served.rs`: a flag, and a call that
-  collects); a pager's idle objects are still a list, thirty-two long.
+  collects), and as an object nothing maps has (`memobj::take_idle`: a
+  flag on the object, which its pager's next receive collects). That was a
+  list thirty-two long too: a program that gave up forty mapped files at
+  once left eight untold, and their file server kept them, removed and
+  open, until the machine went off — eight files on the orphan list of
+  every disk the C suite had run on (`manymaps` in `../quarkutils` counts
+  its files back now).
 - **A call from the kernel to a pager carries `PAGER_BIT` in its sender**, and
   nothing else can: the bit is set by `call_as` and by no syscall. The reply
   strips the bit and reaches the faulting task.

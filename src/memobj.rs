@@ -82,6 +82,12 @@ struct Object {
     /// One past the highest page of it that has been in the cache: how far
     /// a walk of its pages has to go to have seen every one that is there.
     end: u64,
+    /// Nothing maps it, and its pager has not yet been told so
+    /// (`TAG_OBJECT_IDLE`). A flag on the object, collected by the pager, and
+    /// not a list of the pager's: a list was thirty-two long, a program that
+    /// gave up forty files at once left eight untold, and their server kept
+    /// them — removed and open — until the machine went off.
+    idle: bool,
 }
 
 impl Object {
@@ -95,6 +101,7 @@ impl Object {
         mapped: 0,
         writable: 0,
         end: 0,
+        idle: false,
     };
 
     fn pages(&self) -> u64 {
@@ -319,6 +326,17 @@ fn object(slot: usize, id: u64) -> Option<&'static mut Object> {
     (slot != 0 && o.in_use && (id == 0 || o.id == id)).then_some(o)
 }
 
+/// One object `pager` pages for that nothing maps and that it has not been
+/// told of: its cookie and id, and it is told of now.
+///
+/// # Safety
+/// Interrupts off.
+pub unsafe fn take_idle(pager: usize) -> Option<(u64, u64)> {
+    let o = objects().iter_mut().find(|o| o.in_use && o.idle && o.pager == pager && o.pager_alive())?;
+    o.idle = false;
+    Some((o.cookie, o.id))
+}
+
 /// How many objects `pager` pages for.
 pub fn objects_of(pager: usize) -> usize {
     let flags = irq_save();
@@ -355,6 +373,7 @@ pub fn create(pager: usize, cookie: u64, bytes: u64) -> Option<(usize, u64)> {
             mapped: 0,
             writable: 0,
             end: 0,
+            idle: false,
         };
         (slot, id)
     });
@@ -448,6 +467,10 @@ pub fn map_ref(slot: usize, n: u64) {
     let flags = irq_save();
     if let Some(o) = object(slot, 0) {
         o.mapped += n;
+        // Mapped again before its pager heard it was not: nothing to hear.
+        if n > 0 {
+            o.idle = false;
+        }
     }
     irq_restore(flags);
 }
@@ -461,7 +484,8 @@ pub fn unmap_ref(slot: usize, n: u64) {
         o.mapped = o.mapped.saturating_sub(n);
         if o.mapped == 0 {
             if o.pager_alive() {
-                ipc::notify_object_idle(o.pager, o.cookie, o.id);
+                o.idle = true;
+                ipc::notify_object_idle(o.pager);
             } else {
                 release(slot);
             }

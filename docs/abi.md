@@ -1704,7 +1704,9 @@ error to make the fault SIGBUS). The page joins the object's cache. A shared
 mapping, and a read-only one, maps the cached frame itself; a private writable
 one gets a copy of its own, charged to it. A page past the object's end is
 SIGBUS, as on Linux. When the last page of an object is unmapped, its pager
-hears `TAG_OBJECT_IDLE` (`0xFFFF_0006`, sender 0, `data` = `[cookie, id]`).
+hears `TAG_OBJECT_IDLE` (`0xFFFF_0006`, sender 0, `data` = `[cookie, id]`):
+once for each object, however many go at once, and not for one mapped again
+before the pager has received it.
 
 `SYS_OBJECT_CTL` is the pager's, on its own object:
 
