@@ -484,6 +484,9 @@ pub const SYS_TASK_NEXT: u64 = 236;
 /// Wake some of a futex word's waiters and move the rest to wait on another:
 /// Linux's `FUTEX_REQUEUE`, and with a value to compare, `FUTEX_CMP_REQUEUE`.
 pub const SYS_FUTEX_REQUEUE: u64 = 237;
+/// How one task is scheduled: its niceness, and its class — ordinary, or
+/// real-time FIFO or round-robin, at a priority.
+pub const SYS_SCHED: u64 = 238;
 /// `SYS_FD_SERVE`'s flag: the server will say when the object is ready.
 const SERVE_SAYS_READY: u64 = 1;
 /// SYS_FD_SERVE_PIPE: the writing end, and only if the other end is held.
@@ -503,7 +506,7 @@ pub const SYS_ABI_VERSION: u64 = 240;
 /// minor when calls are added. User space can refuse to run against a major it
 /// does not know, which is the point of exposing it at all.
 pub const ABI_VERSION_MAJOR: u64 = 4;
-pub const ABI_VERSION_MINOR: u64 = 2;
+pub const ABI_VERSION_MINOR: u64 = 3;
 
 /// How many tasks a program may have with no capability at all: its own, and
 /// the children it has made and not collected, by `SYS_TASK_CREATE`,
@@ -927,6 +930,9 @@ extern "C" fn syscall_dispatch(
     unsafe { core::arch::asm!("cli", options(nostack, nomem)) };
     // What the call checked of its program's memory is its to lose again.
     scheduler::unpin();
+    // A real-time task it made ready, better placed than itself: it runs
+    // now, not at the next tick.
+    scheduler::preempt_if_asked();
     // A handler the kernel runs is run on the way out: the task goes back
     // to the handler, with where it was going on its stack.
     let answer = crate::signal::leaving_call(answer);
@@ -3663,6 +3669,11 @@ fn dispatch(
             // arg0 = addr, arg1 = max_wake
             crate::futex::futex_wake(arg0, arg1)
         }
+        SYS_SCHED => {
+            // arg0 = op (0 nice, 1 set nice, 2 set class, 3 class), arg1 =
+            // the task (0 for the caller), arg2 and arg3 what the op takes.
+            crate::usage::sched(scheduler::current_tid(), arg0, arg1, arg2, arg3)
+        }
         SYS_FUTEX_REQUEUE => {
             // arg0 = the first word, arg1 = the second, arg2 = (how many to
             // wake << 32) | how many to move, arg3 = what the first must
@@ -4847,6 +4858,7 @@ fn dispatch(
                 13 => crate::cap::CapType::Swap,
                 14 => crate::cap::CapType::PciDevice,
                 15 => crate::cap::CapType::NetAdmin,
+                16 => crate::cap::CapType::RealTime,
                 _ => return u64::MAX,
             };
             let tid = scheduler::current_tid();

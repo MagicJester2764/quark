@@ -149,6 +149,11 @@ pub enum CapType {
     /// clock's is, so that who may is said where everything else a session
     /// may do is said.
     NetAdmin = 15,
+    /// Permission to put a task in a real-time class, `SCHED_FIFO` or
+    /// `SCHED_RR` (`SYS_SCHED`), where it runs before every ordinary task of
+    /// its band. No parameters. Leaving one takes nothing. The first task
+    /// holds it, and a session whose account has the right.
+    RealTime = 16,
 }
 
 /// A `MemObject`'s access bits.
@@ -777,6 +782,17 @@ pub fn task_has_swap(tid: usize) -> bool {
     }
 }
 
+/// Check if a task has the RealTime capability.
+pub fn task_has_realtime(tid: usize) -> bool {
+    if tid >= MAX_TASKS { return false; }
+    unsafe {
+        match task_cspace(tid) {
+            Some(cs) => cs.iter().any(|cap| cap.cap_type as u8 == CapType::RealTime as u8 && is_valid(cap)),
+            None => false,
+        }
+    }
+}
+
 /// Check if a task has the Power capability.
 pub fn task_has_power(tid: usize) -> bool {
     if tid >= MAX_TASKS { return false; }
@@ -1022,7 +1038,8 @@ pub fn insert_kernel_range(cspace: &mut CSpace, base: usize, len: usize) -> bool
 /// ([`CapType::Clock`]), the right to turn it off ([`CapType::Power`]), the
 /// right to keep what is written out of memory ([`CapType::Swap`]), the
 /// right to run its network ([`CapType::NetAdmin`]), every
-/// PCI device ([`CapType::PciDevice`], `pci::ANY`) — in its last free
+/// PCI device ([`CapType::PciDevice`], `pci::ANY`), the right to run a task
+/// in a real-time class ([`CapType::RealTime`]) — in its last free
 /// slot of the first [`FIRST_CAPS`]. The first task names its
 /// low slots itself — where it keeps the nameserver's endpoint, where it
 /// mints what it hands on — and counts on the ones it has not filled being
@@ -1108,6 +1125,7 @@ pub fn validate_attenuation(source: &CapSlot, new_type: CapType, new_p0: u64, ne
         CapType::Power => true,
         CapType::Swap => true,
         CapType::NetAdmin => true,
+        CapType::RealTime => true,
         // Every device covers each one; one covers itself.
         CapType::PciDevice => {
             (new_p0 <= 0xFFFF || new_p0 == crate::pci::ANY)

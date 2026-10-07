@@ -129,6 +129,18 @@ pub struct PerTask {
     /// sooner, and the share a short turn was to cut evened out: a program at
     /// nice 10 had about half of what one at nought did, on four processors.
     vrun: u64,
+    /// How nice it is, -20 to 19: the task's own, given it by whoever made
+    /// it (`SYS_SCHED`; `SYS_NICE` says it of every task of a program). It
+    /// was the program's, and no thread could be nicer than its siblings.
+    nice: i8,
+    /// Its class — [`SCHED_OTHER`], [`SCHED_FIFO`] or [`SCHED_RR`], Linux's
+    /// numbers — and in a real-time one its own priority, 1 to 99; 0 in
+    /// none. Its threads and children are given both.
+    policy: u8,
+    rt_base: u8,
+    /// The real-time priority it runs at: its own, or the better one of a
+    /// task waiting on it, as `priority` is its band (`refresh_priority`).
+    rt: u8,
     /// Put at the front of its band ([`enqueue_front`]): chosen before anything
     /// else in it, the longest put there first, whatever it has run.
     front: bool,
@@ -190,6 +202,10 @@ impl PerTask {
             reaped: false,
             slice_left: 0,
             vrun: 0,
+            nice: 0,
+            policy: SCHED_OTHER,
+            rt_base: 0,
+            rt: 0,
             front: false,
             yielded: false,
             on_cpu: NO_CPU,
@@ -276,6 +292,184 @@ pub const PRIO_SERVER: u8 = 1;
 pub const PRIO_NORMAL: u8 = 2;
 /// The idle task, and nothing else.
 pub const PRIO_IDLE: u8 = 3;
+
+/// The classes a task can be in, by Linux's numbers: ordinary, and the two
+/// real-time ones. Within a band a real-time task runs before every other,
+/// the best priority first: one in FIFO until it blocks, yields or something
+/// better is ready; one in RR for a turn of [`RR_TICKS`] among its equals.
+pub const SCHED_OTHER: u8 = 0;
+pub const SCHED_FIFO: u8 = 1;
+pub const SCHED_RR: u8 = 2;
+
+/// A round-robin task's turn among those of its priority: a hundred
+/// milliseconds, as Linux's.
+const RR_TICKS: u32 = 10;
+
+/// What a processor's real-time tasks may have of each window of time, so
+/// that one that never stops leaves the rest a twentieth: Linux's
+/// `sched_rt_runtime_us` and `sched_rt_period_us`.
+const RT_WINDOW_NS: u64 = 1_000_000_000;
+const RT_RUNTIME_NS: u64 = 950_000_000;
+
+/// Per processor: when its window began, how much of it its real-time tasks
+/// have had, and when one of them last stopped running. Counted as a turn is
+/// counted (`count_turn`).
+static mut RT_USE: [(u64, u64, u64); crate::percpu::MAX_CPUS] = [(0, 0, 0); crate::percpu::MAX_CPUS];
+
+/// Per processor: a real-time task better placed than the one it is running
+/// has been made ready on it, and the call it is in is to give way before it
+/// returns (`preempt_if_asked`). A task woken in an ordinary band still
+/// waits for the tick, which is a known gap; a real-time one is woken to run.
+static RESCHED: [AtomicBool; crate::percpu::MAX_CPUS] = [const { AtomicBool::new(false) }; crate::percpu::MAX_CPUS];
+
+/// Where `tid` stands to be chosen: the band it runs in and its real-time
+/// priority there, 0 for none. The lower band is better, and in one band the
+/// higher priority.
+pub fn place_of(tid: usize) -> (u8, u8) {
+    unsafe { ((*slot(tid)).as_ref().map_or(PRIO_NORMAL, |t| t.priority), st(tid).rt) }
+}
+
+/// Whether place `a` is better than place `b`.
+fn better(a: (u8, u8), b: (u8, u8)) -> bool {
+    a.0 < b.0 || (a.0 == b.0 && a.1 > b.1)
+}
+
+/// Whether this processor's real-time tasks have had their share of the
+/// window: past it, anything else in their band goes first.
+///
+/// # Safety
+/// Interrupts off.
+unsafe fn throttled() -> bool { unsafe {
+    let (start, used, _) = (*core::ptr::addr_of!(RT_USE))[crate::percpu::index()];
+    used >= RT_RUNTIME_NS && crate::clock::now().saturating_sub(start) < RT_WINDOW_NS
+}}
+
+/// `ran` nanoseconds of a real-time task's, to now, against this processor's
+/// window.
+///
+/// A window begins when the last has run its length, and when the real-time
+/// tasks come back after being away for as long as the rest are owed of one:
+/// those have had their share of the window, and what comes next has a whole
+/// window to itself. Begun only by time, a window was wherever earlier
+/// real-time work had left it, and three seconds of FIFO met two throttles
+/// or three by where that was — 3.4% for the rest in one run, 5.3% in another.
+///
+/// # Safety
+/// Interrupts off.
+unsafe fn charge_rt(ran: u64) { unsafe {
+    let now = crate::clock::now();
+    let began = now.saturating_sub(ran);
+    let u = &mut (*core::ptr::addr_of_mut!(RT_USE))[crate::percpu::index()];
+    if now.saturating_sub(u.0) >= RT_WINDOW_NS || began.saturating_sub(u.2) >= RT_WINDOW_NS - RT_RUNTIME_NS {
+        (u.0, u.1) = (began, 0);
+    }
+    u.1 = u.1.saturating_add(ran);
+    u.2 = now;
+}}
+
+/// Whether a task ready in band `p` is one `which` says of.
+///
+/// # Safety
+/// Interrupts off.
+unsafe fn ready_in(p: usize, which: impl Fn(usize) -> bool) -> bool { unsafe {
+    let mut t = READY[p].0;
+    while t != END {
+        let tid = t as usize;
+        if matches!(*slot(tid), Some(ref task) if task.state == TaskState::Ready) && which(tid) {
+            return true;
+        }
+        t = st(tid).run_next;
+    }
+    false
+}}
+
+/// Whether something ready should run before `tid` does: a task in a better
+/// band, or in its own a real-time one of a higher priority while this
+/// processor's real-time tasks have time left. What a reschedule now would
+/// choose over it, and so what a hand-over to it must not skip.
+///
+/// # Safety
+/// Interrupts off.
+unsafe fn outranked(tid: usize) -> bool { unsafe {
+    let band = priority_of(tid);
+    if best_ready_band().is_some_and(|b| b < band) {
+        return true;
+    }
+    let rt = st(tid).rt;
+    !throttled() && ready_in(band, |t| st(t).rt > rt)
+}}
+
+/// A real-time task made ready on this processor that is better placed than
+/// what it is running: the call in progress gives way to it before it
+/// returns.
+///
+/// # Safety
+/// Interrupts off.
+unsafe fn note_ready(tid: usize) { unsafe {
+    let me = crate::percpu::current();
+    if me != 0 && st(tid).rt > 0 && better(place_of(tid), place_of(me)) {
+        RESCHED[crate::percpu::index()].store(true, Ordering::Relaxed);
+    }
+}}
+
+/// At the end of a system call: if a real-time task better placed than the
+/// caller was made ready during it, the caller gives way now — the woken
+/// task runs within the call's return, not at the next tick.
+///
+/// The flag only says to look: it may be stale, set by an interrupt while
+/// the task was in ring 3, or the task woken may have run elsewhere since.
+pub fn preempt_if_asked() {
+    let flags = irq_save();
+    let asked = RESCHED[crate::percpu::index()].swap(false, Ordering::Relaxed);
+    let me = crate::percpu::current();
+    let give_way = asked && me != 0 && unsafe { outranked(me) };
+    irq_restore(flags);
+    if give_way {
+        unsafe { schedule_inner(true) };
+    }
+}
+
+/// How nice task `tid` is.
+pub fn nice_of(tid: usize) -> i8 {
+    let flags = irq_save();
+    let n = unsafe { st(tid).nice };
+    irq_restore(flags);
+    n
+}
+
+/// Make task `tid` as nice as `nice`.
+pub fn set_nice(tid: usize, nice: i8) {
+    let flags = irq_save();
+    unsafe {
+        if (*slot(tid)).is_some() {
+            st(tid).nice = nice.clamp(-20, 19);
+        }
+    }
+    irq_restore(flags);
+}
+
+/// Task `tid`'s class and its real-time priority.
+pub fn sched_of(tid: usize) -> (u8, u8) {
+    let flags = irq_save();
+    let out = unsafe { (st(tid).policy, st(tid).rt_base) };
+    irq_restore(flags);
+    out
+}
+
+/// Put task `tid` in class `policy`, at real-time priority `priority` (0 for
+/// an ordinary one). The caller has said whether it may.
+pub fn set_sched(tid: usize, policy: u8, priority: u8) {
+    let flags = irq_save();
+    unsafe {
+        if (*slot(tid)).is_some() {
+            st(tid).policy = policy;
+            st(tid).rt_base = if policy == SCHED_OTHER { 0 } else { priority };
+            // The priority it runs at: its own now, or a waiter's better one.
+            refresh_priority(tid);
+        }
+    }
+    irq_restore(flags);
+}
 
 /// Each band's ready queue: its first task and its last, the rest linked
 /// through their records (`PerTask::run_next`). In the order they were
@@ -544,12 +738,53 @@ pub fn timer_tick() {
         // turn whether or not its slice is spent. Without this a driver woken
         // by its device waits out whatever was running, and the slice that
         // makes CPU-bound work cheaper would make interrupt-driven work worse.
+        let band = priority_of(current);
         if let Some(best) = best_ready_band() {
-            if best < priority_of(current) {
+            if best < band {
                 st(current).slice_left = 0;
                 schedule_inner(true);
                 return;
             }
+        }
+
+        // And within its band: a real-time task runs before every other, the
+        // best priority first — a FIFO one until it blocks, yields or
+        // something better comes, a round-robin one for its turn among its
+        // equals — and one that has had its share of the window waits for
+        // whatever ordinary task is ready.
+        let rt = st(current).rt;
+        if rt > 0 {
+            // What it has run so far counts against this processor's window
+            // now, and not only when it next gives the processor up: a FIFO
+            // task that never does would never be counted.
+            count_turn(current);
+        }
+        let throttled = throttled();
+        if rt > 0 && !throttled {
+            if ready_in(band, |t| st(t).rt > rt) {
+                st(current).slice_left = 0;
+                schedule_inner(true);
+                return;
+            }
+            if st(current).policy == SCHED_RR {
+                if st(current).slice_left > 1 {
+                    st(current).slice_left -= 1;
+                    return;
+                }
+                if ready_in(band, |t| st(t).rt >= rt) {
+                    st(current).slice_left = 0;
+                    schedule_inner(true);
+                    return;
+                }
+                st(current).slice_left = RR_TICKS;
+            }
+            return;
+        }
+        let first = if rt > 0 { ready_in(band, |t| st(t).rt == 0) } else { !throttled && ready_in(band, |t| st(t).rt > 0) };
+        if first {
+            st(current).slice_left = 0;
+            schedule_inner(true);
+            return;
         }
 
         if st(current).slice_left > 1 {
@@ -611,9 +846,13 @@ unsafe fn schedule_inner(from_irq: bool) { unsafe {
     }
 
     // A slice of its own, since this is the scheduler choosing it rather than
-    // a task handing over what it had left: as long as its program's
-    // niceness says.
-    st(next_tid).slice_left = crate::usage::slice_for(crate::fdtable::nice_of(next_tid));
+    // a task handing over what it had left: as long as its niceness says,
+    // or a round-robin task's turn. A FIFO task's is not counted down.
+    st(next_tid).slice_left = if st(next_tid).policy == SCHED_RR && st(next_tid).rt > 0 {
+        RR_TICKS
+    } else {
+        crate::usage::slice_for(st(next_tid).nice)
+    };
     switch_to(current_tid, next_tid, flags);
 }}
 
@@ -771,24 +1010,28 @@ pub fn refresh_priority(tid: usize) {
             return;
         }
         unsafe {
+            // Its own place, or the better of a waiter's: the band, and the
+            // real-time priority in it.
             let base = match *slot(cur) {
-                Some(ref t) => t.base_priority,
+                Some(ref t) => (t.base_priority, st(cur).rt_base),
                 None => return,
             };
             let mut best = base;
             for t in tids() {
-                if crate::ipc::blocked_on(t) == Some(cur) {
-                    if let Some(ref waiter) = *slot(t) {
-                        if waiter.priority < best {
-                            best = waiter.priority;
-                        }
+                if crate::ipc::blocked_on(t) == Some(cur) && (*slot(t)).is_some() {
+                    let waiter = place_of(t);
+                    if better(waiter, best) {
+                        best = waiter;
                     }
                 }
             }
-            match *slot(cur) {
-                Some(ref mut t) if t.priority != best => t.priority = best,
-                _ => return, // unchanged, so nothing downstream changes either
+            if place_of(cur) == best {
+                return; // unchanged, so nothing downstream changes either
             }
+            if let Some(ref mut t) = *slot(cur) {
+                t.priority = best.0;
+            }
+            st(cur).rt = best.1;
         }
         // Whatever `cur` is itself waiting on inherits this too.
         match crate::ipc::blocked_on(cur) {
@@ -851,16 +1094,13 @@ pub fn donate_to(tid: usize, flags: u64) {
             && !st(tid).held
             && (*slot(tid)).as_ref().map(|t| t.state == TaskState::Ready).unwrap_or(false);
         // Handing the CPU straight to the callee skips the scheduler, so it
-        // must not be used to run a worse band ahead of a better one. When
-        // something better is waiting, go through the queue instead — the
-        // callee is ready and will be picked in its turn.
-        if takeable {
-            if let Some(best) = best_ready_band() {
-                if best < priority_of(tid) {
-                    enqueue(tid);
-                    takeable = false;
-                }
-            }
+        // must not be used to run a worse band ahead of a better one, or an
+        // ordinary task ahead of a real-time one. When something better is
+        // waiting, go through the queue instead — the callee is ready and
+        // will be picked in its turn.
+        if takeable && outranked(tid) {
+            enqueue(tid);
+            takeable = false;
         }
         if !takeable {
             restore_flags(flags);
@@ -954,12 +1194,16 @@ unsafe fn unlink_ready(tid: usize) { unsafe {
 
 /// Dequeue the next ready task, best band first.
 unsafe fn dequeue_ready() -> Option<usize> { unsafe {
+    let throttled = throttled();
     for p in 0..NUM_PRIORITIES {
         // What in the band is still ready — dead and blocked tasks may still
-        // be in it, and are taken out — and which of it is to go: one put at
-        // the front, the first of them; or the one that has run least, as the
-        // band sees it, passing over one that has just yielded when anything
-        // else is ready.
+        // be in it, and are taken out — and which of it is to go: a
+        // real-time one, the best priority and of those the first queued;
+        // then one put at the front, the first of them; or the one that has
+        // run least, as the band sees it, passing over one that has just
+        // yielded when anything else is ready. Real-time tasks that have had
+        // their share of this processor's window go last.
+        let mut realtime: Option<(usize, u8)> = None;
         let mut front: Option<usize> = None;
         let mut least: Option<(usize, u64)> = None;
         let mut least_yielded: Option<(usize, u64)> = None;
@@ -969,6 +1213,13 @@ unsafe fn dequeue_ready() -> Option<usize> { unsafe {
             t = st(tid).run_next;
             if !matches!(*slot(tid), Some(ref task) if task.state == TaskState::Ready) {
                 unlink_ready(tid);
+                continue;
+            }
+            let rt = st(tid).rt;
+            if rt > 0 {
+                if realtime.is_none_or(|(_, r)| rt > r) {
+                    realtime = Some((tid, rt));
+                }
                 continue;
             }
             let ran = st(tid).vrun;
@@ -982,7 +1233,10 @@ unsafe fn dequeue_ready() -> Option<usize> { unsafe {
                 least = Some((tid, ran));
             }
         }
-        let Some(tid) = front.or(least.map(|(i, _)| i)).or(least_yielded.map(|(i, _)| i)) else {
+        let ordinary = front.or(least.map(|(i, _)| i)).or(least_yielded.map(|(i, _)| i));
+        let realtime = realtime.map(|(i, _)| i);
+        let chosen = if throttled { ordinary.or(realtime) } else { realtime.or(ordinary) };
+        let Some(tid) = chosen else {
             continue;
         };
         unlink_ready(tid);
@@ -994,7 +1248,12 @@ unsafe fn dequeue_ready() -> Option<usize> { unsafe {
         }
         st(tid).front = false;
         st(tid).yielded = false;
-        FLOOR[p] = FLOOR[p].max(st(tid).vrun);
+        // Where the band has got to is its ordinary tasks' measure: a
+        // real-time one is chosen by priority, and what it has run is not
+        // counted in it.
+        if st(tid).rt == 0 {
+            FLOOR[p] = FLOOR[p].max(st(tid).vrun);
+        }
         return Some(tid);
     }
     None
@@ -1008,7 +1267,17 @@ unsafe fn dequeue_ready() -> Option<usize> { unsafe {
 unsafe fn count_turn(tid: usize) { unsafe {
     let ran = crate::usage::charge(tid);
     if tid != 0 && ran != 0 {
-        st(tid).vrun = st(tid).vrun.saturating_add(crate::usage::weighted(ran, crate::fdtable::nice_of(tid)));
+        // A real-time turn is counted against this processor's window, and
+        // not in how far the task has run as its band sees it: counted
+        // there, three seconds of FIFO put the band's floor three seconds
+        // ahead, and every ordinary task that woke joined that far behind
+        // those that had not slept. Leaving the class, it joins where the
+        // band has got to, as any task that has been away does.
+        if st(tid).rt > 0 {
+            charge_rt(ran);
+        } else {
+            st(tid).vrun = st(tid).vrun.saturating_add(crate::usage::weighted(ran, st(tid).nice));
+        }
     }
 }}
 
@@ -1037,6 +1306,7 @@ unsafe fn enqueue(tid: usize) { unsafe {
     unlink_ready(tid);
     join_band(tid, p);
     link_ready(tid, p, false);
+    note_ready(tid);
 }}
 
 /// Put a task at the *front* of the ready queue, so it runs next.
@@ -1049,6 +1319,7 @@ unsafe fn enqueue_front(tid: usize) { unsafe {
     join_band(tid, p);
     st(tid).front = true;
     link_ready(tid, p, true);
+    note_ready(tid);
 }}
 
 /// Take a task out of every ready queue it is in.
@@ -1160,18 +1431,21 @@ pub fn kicked() {
 /// The clock has woken what was due, on this processor and between two
 /// ticks: if what is now ready is better than what is running, it runs now,
 /// as it would have at the next tick — which is the wait it was woken on
-/// time to be spared. What is of the running task's own band waits for the
-/// turn to end, as it does at a tick.
+/// time to be spared. Better is a better band, or in the same band a
+/// real-time task of a higher priority ([`outranked`]); an ordinary task of
+/// the running task's own band waits for the turn to end, as at a tick.
 pub fn woken() {
     if !INITIALIZED.load(Ordering::SeqCst) {
         return;
     }
     unsafe {
         let current = crate::percpu::current();
-        let Some(best) = best_ready_band() else { return };
+        if best_ready_band().is_none() {
+            return;
+        }
         if current == 0 {
             schedule_inner(true);
-        } else if best < priority_of(current) {
+        } else if outranked(current) {
             st(current).slice_left = 0;
             schedule_inner(true);
         }
@@ -2515,6 +2789,12 @@ pub fn create_empty_task() -> Option<usize> {
         st(tid).held = false;
         st(tid).front = false;
         st(tid).yielded = false;
+        // As nice as its creator, and in its class: a thread or a child runs
+        // as the task that made it was told to, as on Linux.
+        st(tid).nice = st(parent).nice;
+        st(tid).policy = st(parent).policy;
+        st(tid).rt_base = st(parent).rt_base;
+        st(tid).rt = st(parent).rt_base;
         // It has run nothing, and joining a band puts it where that band
         // has got to.
         st(tid).vrun = 0;
@@ -2523,8 +2803,8 @@ pub fn create_empty_task() -> Option<usize> {
         st(tid).on_cpu = NO_CPU;
         crate::job::born(tid, parent, st(tid).process_id);
         crate::fdtable::attach_new(tid);
-        // As nice as its creator's program, and limited as it is: a child
-        // forked or spawned runs as its parent was told to.
+        // Limited as its creator's program is: a child forked or spawned
+        // runs as its parent was told to.
         crate::fdtable::runs_like(tid, parent);
     }
     irq_restore(flags);

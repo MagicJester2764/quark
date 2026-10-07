@@ -1181,8 +1181,9 @@ stopped is one the scheduler does not run.
 ## Scheduling
 
 Four bands, best first: drivers, servers, ordinary programs, idle. A task runs
-only when nothing better is waiting, and within its band the one that has run
-least goes next. A program asks for a band in its `manifest!` block alongside
+only when nothing better is waiting, and within its band a task in a
+real-time class goes first, by its priority, and then the one that has run
+least. A program asks for a band in its `manifest!` block alongside
 its capabilities, and a spawner applies it under the same narrowing rule — it
 can never grant a better band than it is in, so only `init` can put a driver
 in the driver band.
@@ -1206,13 +1207,14 @@ What follows from that, and breaking any of it is quiet:
   already blocked, and nothing ever ran either task again: fontconfig hung
   about once a minute scanning fonts. `dtest calls` makes three million calls
   in three seconds and caught it on its first run.
-- **A task runs at the band of whoever is waiting on it**, for as long as that
-  is true. Without it a server called by something urgent is preempted by
-  anything in between. It is also what lets the direct switch stay safe: the
-  callee already carries the caller's band when the scheduler decides whether
+- **A task runs at the place of whoever is waiting on it** — the band, and
+  the real-time priority in it (`place_of`) — for as long as that is true.
+  Without it a server called by something urgent is preempted by anything in
+  between. It is also what lets the direct switch stay safe: the callee
+  already carries the caller's place when the scheduler decides whether
   handing straight over would run something ahead of its betters.
 - **Within a band, whoever has run least goes next**, each nanosecond counted
-  for more the nicer its program is (`VRUN`, `usage::weighted` — Linux's
+  for more the nicer it is (`VRUN`, `usage::weighted` — Linux's
   weights, so that nice 10 against nought is about one to nine there and
   here). In the order they were queued, a nicer program's shorter turn came
   round sooner, and on four processors nice 10 had about half of nice 0's
@@ -1225,6 +1227,39 @@ What follows from that, and breaking any of it is quiet:
   behind everybody for good, a task that yields while it waits for another
   can wait for ever, and not passed over at all, it is chosen again at
   once, having run least.
+- **A real-time task goes before every ordinary one of its band**
+  (`SYS_SCHED`; Linux's `SCHED_FIFO` and `SCHED_RR`, priorities 1 to 99):
+  the best priority first, a FIFO one until it blocks, yields or a better one
+  is ready, a round-robin one for ten ticks among its equals. Entering a
+  class takes `RealTime`; a task's class is given to what it makes. Its run
+  time is not counted where its band's ordinary tasks' is (`count_turn`, and
+  `FLOOR` moves only for an ordinary task): counted there, three seconds of
+  FIFO would put the floor three seconds on, and every ordinary task that
+  woke would join that far behind those that had not slept.
+- **A processor's real-time tasks have 950 ms of each second**, and past
+  that its ordinary tasks of their band go first (`RT_USE`, `throttled`) —
+  or, with none ready, the real-time one runs on. The time is counted at
+  every switch *and on the tick*: a FIFO task that computes switches only
+  when something of a better band preempts it, which a busy machine's
+  servers do often enough to count it by and a quiet machine's need never
+  do. (`rtsched` cannot tell: taken out, the tick's count still left the
+  ordinary thread 4.5% on an ExplOSion machine.) A second begins when the
+  last has run out, or when the real-time
+  tasks come back after fifty milliseconds away (`charge_rt`): begun only by
+  time, it was wherever earlier real-time work had left it, and three
+  seconds of FIFO met two throttles or three by where that was. This is
+  what leaves a machine whose real-time thread has gone into a loop a
+  twentieth of a second in each to stop it with.
+- **What outranks the running task runs when it is made ready, where the
+  kernel can say so**: at the end of the system call that made it ready
+  (`note_ready`, `preempt_if_asked` in `syscall_dispatch`), and when the
+  clock wakes it between ticks (`woken`). Outranking is one question
+  (`outranked`: a better band, or a higher real-time priority in the same
+  one while the processor's share lasts), and a hand-over asks it too: a
+  direct switch to an ordinary callee must not skip a real-time task any
+  more than a worse band may skip a better. Anywhere else a wake waits for
+  the tick: a FIFO thread woken through a futex by one that goes on
+  computing would wait out the rest of that one's turn.
 
 A system call runs with interrupts on, so anything the scheduler does in more
 than one step is a tick away from being done in half. Three of these were
@@ -1273,9 +1308,14 @@ closed:
   its process not yet taken apart (`ENDED`): the one its parent collects
   may not be the last of them to end. Collecting hands it on (`collected`)
   — only collecting: a child taken apart unwaited-for is nobody's.
-- **How nice a program is and how long it may run are its program's**,
-  beside its descriptors: its threads have them, whatever it starts is
-  given them (`fdtable::runs_like`), `exec` keeps them.
+- **How long a program may run is its program's**, beside its
+  descriptors: its threads have it, whatever it starts is given it
+  (`fdtable::runs_like`), `exec` keeps it.
+- **How nice a task is, is the task's**, with its class: given by the task
+  that makes a thread or a child to it (`create_empty_task`), and kept by
+  `exec`. `SYS_NICE` says it of every task of a program, `SYS_SCHED` of one,
+  as Linux's `setpriority` does of a thread. It was the program's, and no
+  thread could be nicer than its siblings.
 - **A limit is looked at on the tick, last** (`usage::limits`), as an alarm
   is: SIGXCPU, or the end of the program, may not return.
 
@@ -1496,8 +1536,14 @@ breaking any of them is quiet until it is a machine that stops.
   tick, ten milliseconds wide, as every machine did. One with no local APIC
   has the fine clock and wakes on ticks.
 - A task woken on time runs at once only if it is of a better band than what
-  the first processor is running, or a processor is idle: one of the same
-  band waits its turn, as any woken task does.
+  the first processor is running, or of a higher real-time priority in the
+  same band, or a processor is idle: one of the same band waits its turn, as
+  any woken task does. On several processors a real-time task made ready
+  runs at once only on the processor that made it ready, or one that is
+  idle; elsewhere it waits for a tick. A FIFO task that is preempted goes
+  behind its equals rather than ahead of them, as POSIX would have it, and
+  `SCHED_BATCH`, `SCHED_IDLE`, `SCHED_DEADLINE` and `SCHED_RESET_ON_FORK`
+  are refused.
 - The page cache holds a quarter of memory's pages — at least 8192, at
   most a million — across 2,047 objects, memory on its way out included, and
   a machine taking pages from programs faster than its pager writes them

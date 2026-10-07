@@ -374,11 +374,12 @@ fn may(caller: usize, target: usize) -> bool {
         })
 }
 
-/// `SYS_NICE`: how nice the program of process `pid` (0 for the caller's)
-/// is, as 0 to 39 for -20 to 19, set to `new` (a signed number, -20 to 19)
-/// unless that is `u64::MAX`. Anybody may ask. A program may make itself, or
-/// another of its user's, nicer; to be less nice takes `TaskMgmt` for the
-/// program, which is what root's power to was.
+/// `SYS_NICE`: how nice process `pid` (0 for the caller's) is — its first
+/// task, as 0 to 39 for -20 to 19 — and with `new` (a signed number, -20 to
+/// 19) unless that is `u64::MAX`, every task of its program made that nice.
+/// Anybody may ask. A program may make itself, or another of its user's,
+/// nicer; to be less nice takes `TaskMgmt` for the program, which is what
+/// root's power to was. How nice one task is is `SYS_SCHED`'s ([`sched`]).
 pub fn nice(caller: usize, pid: u64, new: u64) -> u64 {
     let target = if pid == 0 {
         caller
@@ -388,18 +389,82 @@ pub fn nice(caller: usize, pid: u64, new: u64) -> u64 {
             _ => return u64::MAX,
         }
     };
-    let old = crate::fdtable::nice_of(target);
+    let old = crate::scheduler::nice_of(target);
     if new != u64::MAX {
         if target != caller && !may(caller, target) {
             return NOT_ALLOWED;
         }
         let wanted = (new as i64).clamp(-20, 19) as i8;
-        if wanted < old && !crate::cap::task_has_task_mgmt(caller, target) {
+        // Less nice is asked of every task it changes: a thread the program
+        // made nicer than its first is made less nice by being set to the
+        // first's.
+        let space = crate::scheduler::space_of_task(target);
+        let mut nicest = old;
+        crate::scheduler::each_task_of(space, |t| nicest = nicest.max(crate::scheduler::nice_of(t)));
+        if wanted < nicest && !crate::cap::task_has_task_mgmt(caller, target) {
             return NOT_ALLOWED;
         }
-        crate::fdtable::set_nice(target, wanted);
+        crate::scheduler::each_task_of(space, |t| crate::scheduler::set_nice(t, wanted));
+        // A task with no program yet is one task.
+        crate::scheduler::set_nice(target, wanted);
     }
     (old as i64 + 20) as u64
+}
+
+/// `SYS_SCHED`'s operations.
+const SCHED_NICE: u64 = 0;
+const SCHED_SET_NICE: u64 = 1;
+const SCHED_SET_CLASS: u64 = 2;
+const SCHED_CLASS: u64 = 3;
+
+/// `SYS_SCHED`: how task `tid` (0 for the caller) is scheduled, one task at a
+/// time — Linux's `setpriority` on a thread, and its `sched_setscheduler`.
+/// Operation 0 answers how nice it is, 0 to 39 for -20 to 19; 1 makes it as
+/// nice as `a` (a signed number), the rules of `SYS_NICE`; 2 puts it in
+/// class `a` — 0 ordinary, 1 FIFO, 2 round-robin — at real-time priority `b`,
+/// 1 to 99 for a real-time class and 0 for the ordinary one; 3 answers
+/// `(class << 8) | priority`. A task of the caller's own program, or one it
+/// may say this of as `SYS_NICE` decides; and entering a real-time class
+/// takes the right to, `RealTime`, which leaving it does not.
+pub fn sched(caller: usize, op: u64, tid: u64, a: u64, b: u64) -> u64 {
+    let target = if tid == 0 { caller } else { tid as usize };
+    if !crate::scheduler::task_is_live(target) {
+        return u64::MAX;
+    }
+    let ours = crate::scheduler::space_of_task(target) == crate::scheduler::space_of_task(caller);
+    let allowed = ours || may(caller, target);
+    match op {
+        SCHED_NICE => (crate::scheduler::nice_of(target) as i64 + 20) as u64,
+        SCHED_SET_NICE => {
+            let wanted = (a as i64).clamp(-20, 19) as i8;
+            if !allowed || (wanted < crate::scheduler::nice_of(target) && !crate::cap::task_has_task_mgmt(caller, target)) {
+                return NOT_ALLOWED;
+            }
+            crate::scheduler::set_nice(target, wanted);
+            0
+        }
+        SCHED_SET_CLASS => {
+            let (policy, priority) = (a, b);
+            let fits = match policy as u8 {
+                crate::scheduler::SCHED_OTHER => priority == 0,
+                crate::scheduler::SCHED_FIFO | crate::scheduler::SCHED_RR => (1..=99).contains(&priority),
+                _ => false,
+            };
+            if policy > 2 || !fits {
+                return u64::MAX;
+            }
+            if !allowed || (policy != 0 && !crate::cap::task_has_realtime(caller)) {
+                return NOT_ALLOWED;
+            }
+            crate::scheduler::set_sched(target, policy as u8, priority as u8);
+            0
+        }
+        SCHED_CLASS => {
+            let (policy, priority) = crate::scheduler::sched_of(target);
+            (policy as u64) << 8 | priority as u64
+        }
+        _ => u64::MAX,
+    }
 }
 
 /// `SYS_CPU_LIMIT`: how long the caller's program may run, in seconds of

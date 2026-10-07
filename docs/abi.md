@@ -1,6 +1,6 @@
 # Quark syscall ABI
 
-**Version 4.2.** Query the running kernel with `SYS_ABI_VERSION` (240), which
+**Version 4.3.** Query the running kernel with `SYS_ABI_VERSION` (240), which
 returns `(major << 16) | minor`.
 
 This document is the contract between the Quark kernel and everything above it.
@@ -277,6 +277,7 @@ numbers, and only 64 could name it before, through a range check.
 |---|---|
 | 4.1 | **As many tasks as a desktop runs.** The kernel has up to 32,768 tasks, where it had sixty-four, so a program can no longer find every task by asking about each number below 64: `SYS_TASK_NEXT` (236) answers the first task at or past a number, and a walk of every task is one call a task. A program has 4,096 tasks without `TaskMgmt` — its own that have not died, and the children it has made in other programs and not collected — where a task could have sixteen children and a fork was not counted at all; `SYS_TASK_CREATE`, `SYS_TASK_CREATE_IN` and `SYS_FORK` answer `u64::MAX` past it. **And what a program makes is made when it makes it**, as many as its descriptors and the machine's memory allow: counters, timers, signal descriptors, pipes and shared regions, where there were 16, 16, 32, 256 — 64 a program — and 256 for the machine. `SYS_PIPE_CREATE` counts no budget of the program's; nor does anything else that was made with one. So are terminals, local sockets, streams, poll sets and served descriptors, where there were 8, 32, 64, 64 and 1,024; and what is in them grows: a set watches as many descriptors as a program may have (it watched 32), `SYS_POLL` takes as many entries and refuses more (it took 32 and ignored the rest), a listener's backlog goes to 4,096 (16), a stream holds in flight as many descriptors as its sender may have (32), and a send or receive of several carries 255 (32). Memory objects are 2,047, the most a page-table entry can name (256), and 1,024 a pager (128). And a program's capability space grows: 256 slots when the first is written, doubled as more are wanted, up to 65,536 (it was 256, all of them inline in every program's), a slot's number never moving; `SYS_CAP_READ` answers how many slots a space has room for, where it answered 0. |
 | 4.2 | **A futex keeps every waiter, and moves them.** A futex wait is never refused for room: there were sixty-four waiters for the machine, and the sixty-fifth was answered `u64::MAX` at once. `SYS_FUTEX_REQUEUE` (237) wakes some of a word's waiters and moves the rest to wait on another word — Linux's `FUTEX_REQUEUE`, and with a value to compare, `FUTEX_CMP_REQUEUE`, which answers `0xFFFF_FFFE` when the word has changed. |
+| 4.3 | **How one task is scheduled.** Nice is a task's, given to the threads and children it makes, where it was a program's: `SYS_NICE` says it of every task of a program, and `SYS_SCHED` (238) of one — and puts a task in a real-time class, Linux's `SCHED_FIFO` or `SCHED_RR` at a priority from 1 to 99, which takes the new right `RealTime` (capability 16) to enter. Within its band a real-time task runs before every ordinary one, the best priority first: FIFO until it blocks, yields or something better is ready, round-robin for a turn of 100 ms among its equals; one woken by a call runs as the call returns. A processor's real-time tasks have at most 950 ms of each second, and past that wait for whatever ordinary task is ready. A task waited on runs at the place — band, then real-time priority — of the best of its waiters. |
 
 ### Deprecated
 
@@ -330,6 +331,7 @@ slot's number never moves, and a slot past the room a space has is empty:
 | 13 | `Swap` | — | — |
 | 14 | `PciDevice` | a PCI device, `bus << 8 \| device << 3 \| function` (`0xFFFF_FFFF` = every one) | — |
 | 15 | `NetAdmin` | — | — |
+| 16 | `RealTime` | — | — |
 
 Delegation may narrow a capability but never widen it; delegating at equal
 breadth is allowed, since a set is a subset of itself.
@@ -1158,12 +1160,29 @@ never handed to a wait.
 `SYS_TASK_PRIORITY` puts a task in a scheduling band: 0 drivers, 1 servers,
 2 ordinary programs, 3 the idle task. A task runs only when nothing in a better
 band is waiting, and within its own the one that has run least goes next,
-by how nice its program is (`SYS_NICE`); a task woken into a better band
+by how nice it is (`SYS_NICE`, `SYS_SCHED`); a task woken into a better band
 than the running one preempts it at the next tick rather than waiting out its
 slice.
 
+Within a band, a task in a real-time class (`SYS_SCHED`, op 2: Linux's
+`SCHED_FIFO` and `SCHED_RR`, at a priority from 1 to 99) runs before every
+ordinary one, the highest priority first. A FIFO task runs until it blocks,
+yields, or a better one is ready; a round-robin one has turns of 100 ms among
+those of its priority. One made ready by a system call — a futex woken, a
+message sent — that is better placed than the caller runs as the call
+returns, not at the next tick. What a processor's real-time tasks may have
+is 950 ms of each second — a second that begins when they do, after fifty
+milliseconds or more without them — and past that they wait for whatever
+ordinary task of their band is ready, so that one that never stops cannot
+keep the machine.
+Entering a real-time class takes `RealTime` (capability 16); leaving one, or
+choosing a priority within one, takes what any change to a task takes. A
+task's class and priority, and how nice it is, are given to the threads and
+children it makes, and kept by `SYS_EXEC_SPACE`.
+
 A task also runs in the better of its own band and the band of anything blocked
-waiting on it, for as long as that is true. Bands otherwise introduce the
+waiting on it, for as long as that is true — and, in that band, at the
+better of its own real-time priority and its waiter's. Bands otherwise introduce the
 problem they are famous for: a server in an ordinary band, called by something
 in a better one, is preempted by any middling task that comes along, and the
 caller — which outranks that task — waits behind it. The work is being done on
@@ -1345,7 +1364,7 @@ the rest: what they do is under *Signals*, with the process calls.
 | # | Name | Arguments | Returns | Cap |
 |---|---|---|---|---|
 | 124 | `SYS_USAGE` | arg0 = 0 the caller's program, 1 the children it has collected, 2 the calling task, 3 the program task arg2 is a task of, 4 task arg2 itself; arg1 = where to write four `u64`: nanoseconds in the program, nanoseconds in the kernel for it, times it gave the processor up, times it had it taken | 0 / `u64::MAX` | — |
-| 125 | `SYS_NICE` | arg0 = a process id, 0 for the caller's; arg1 = how nice to be, -20 to 19 as a signed number, or `u64::MAX` to ask | 20 + how nice it was; `u64::MAX - 1` when it may not / `u64::MAX` | `TaskMgmt` for the program to be less nice |
+| 125 | `SYS_NICE` | arg0 = a process id, 0 for the caller's; arg1 = how nice to be, -20 to 19 as a signed number, or `u64::MAX` to ask — said of every task of the program | 20 + how nice its first task was; `u64::MAX - 1` when it may not / `u64::MAX` | `TaskMgmt` for the program to be less nice |
 | 126 | `SYS_CPU_LIMIT` | arg0 = soft, arg1 = hard: seconds of processor time the caller's program may have, `u64::MAX` for none; arg2 = where to write the two it was, or 0; arg3 = 1 to change nothing | 0; `u64::MAX - 1` when it may not / `u64::MAX` | `TaskMgmt` to raise the hard limit |
 
 Time is counted by the clock, exactly: at every switch, and where a task
@@ -1357,14 +1376,16 @@ children it collected, to whoever collects it. A forked child has used
 nothing, and `SYS_EXEC_SPACE` keeps what was used. Anybody may ask what any
 program has used, as `ps` does.
 
-How nice a program is decides its share of its band while it and another
-are both computing: each nanosecond a task runs counts for more the nicer
-its program, by Linux's weights, and the task that has run least goes next
-— so a program at 10 has about a ninth of what one at nought has, on one
-processor or many. It sizes its turns as well: three ticks at nought,
-twelve at -15 and below, one at 10 and above. It is the program's: its
-threads have it, a child it forks or spawns has it, and `SYS_EXEC_SPACE`
-keeps it.
+How nice a task is decides its share of its band while it and another
+are both computing: each nanosecond it runs counts for more the nicer it
+is, by Linux's weights, and the task that has run least goes next — so a
+task at 10 has about a ninth of what one at nought has, on one processor or
+many. It sizes its turns as well: three ticks at nought, twelve at -15 and
+below, one at 10 and above. It is the task's: `SYS_NICE` says it of every
+task of a program, and `SYS_SCHED` of one, as Linux's `setpriority` does of
+a thread; the threads and children a task makes are given it, and
+`SYS_EXEC_SPACE` keeps it. (Until 4.3 it was the program's, and no thread
+could be nicer than its siblings.)
 
 A program past its soft limit is sent signal 24 (SIGXCPU) once a second; one
 at its hard limit is ended, as by signal 9. A limit of nought is one of a
@@ -1965,6 +1986,7 @@ set together or not at all.
 | 235 | `SYS_FD_LIMIT` | arg0 = 0 to read, 1 to set what the program may have to arg1, 2 to lower how far it may raise that to arg1 | read: `(how far << 32) \| what it may have`; set: 0 / `u64::MAX` | — (the caller's own program) |
 | 236 | `SYS_TASK_NEXT` | arg0 = a task id | the first task at or past it that has not been taken apart, living or dead / `u64::MAX` if there is none | — |
 | 237 | `SYS_FUTEX_REQUEUE` | arg0 = the first word, arg1 = the second (each 4-byte aligned), arg2 = `(how many to wake << 32) \| how many to move`, arg3 = what the first word must hold, arg4 = flags: bit 0, compare it | how many were woken and moved: up to the first number of the first word's waiters woken, up to the second of the rest moved to wait on the second word, as if they had waited there / `0xFFFF_FFFE` if bit 0 was given and the first word does not hold arg3 — nothing is done — / `u64::MAX` = bad address | — |
+| 238 | `SYS_SCHED` | arg0 = op: 0 how nice, 1 make as nice as arg2 (-20 to 19, signed), 2 put in class arg2 — 0 ordinary, 1 `SCHED_FIFO`, 2 `SCHED_RR` — at real-time priority arg3 (1 to 99, or 0 for ordinary), 3 the class; arg1 = a task id, 0 for the caller | op 0: 20 + how nice; op 3: `(class << 8) \| priority`; ops 1 and 2: 0; `u64::MAX - 1` when it may not / `u64::MAX` | a task of the caller's program, or one `SYS_NICE` would let it say this of; `TaskMgmt` for it to be less nice; `RealTime` to enter a real-time class |
 
 `SYS_FD_KIND` answers 1 for an IPC endpoint, 2 and 3 for the reading and
 writing ends of a pipe, 4 for a stream, 5 and 6 for a terminal's master and

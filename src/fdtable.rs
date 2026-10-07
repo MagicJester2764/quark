@@ -129,8 +129,6 @@ struct Table {
     /// (`usage.rs`).
     used_gone: crate::usage::Usage,
     used_children: crate::usage::Usage,
-    /// How nice it is to the rest of its band, -20 to 19.
-    nice: i8,
     /// How many seconds of processor time it may have: SIGXCPU past the
     /// first, the end at the second; `u64::MAX` for none. And the second
     /// it was last sent SIGXCPU for.
@@ -176,7 +174,6 @@ const EMPTY: Table = Table {
     alarm_every: 0,
     used_gone: crate::usage::Usage::ZERO,
     used_children: crate::usage::Usage::ZERO,
-    nice: 0,
     cpu_soft: u64::MAX,
     cpu_hard: u64::MAX,
     xcpu_sent: u64::MAX,
@@ -1330,14 +1327,15 @@ pub fn usage_children_add(tid: usize, used: &crate::usage::Usage) {
     irq_restore(flags);
 }
 
-/// `tid`'s program runs as `from`'s does: as nice, and with the same limit
-/// on how long. Not what it has used, which for a new program is nothing.
+/// `tid`'s program runs as `from`'s does: with the same limit on how long.
+/// Not what it has used, which for a new program is nothing. How nice it is
+/// is its task's, and a task made is given its maker's (`scheduler`).
 pub fn runs_like(tid: usize, from: usize) {
     let flags = irq_save();
     unsafe {
-        if let Some((nice, soft, hard)) = table_mut(from).map(|t| (t.nice, t.cpu_soft, t.cpu_hard)) {
+        if let Some((soft, hard)) = table_mut(from).map(|t| (t.cpu_soft, t.cpu_hard)) {
             if let Some(t) = table_mut(tid) {
-                (t.nice, t.cpu_soft, t.cpu_hard) = (nice, soft, hard);
+                (t.cpu_soft, t.cpu_hard) = (soft, hard);
             }
         }
     }
@@ -1374,24 +1372,6 @@ pub fn cmdline_of(tid: usize, out: &mut [u8; CMDLINE]) -> Option<usize> {
     };
     irq_restore(flags);
     len
-}
-
-/// How nice `tid`'s program is.
-pub fn nice_of(tid: usize) -> i8 {
-    let flags = irq_save();
-    let nice = unsafe { table_mut(tid).map_or(0, |t| t.nice) };
-    irq_restore(flags);
-    nice
-}
-
-pub fn set_nice(tid: usize, nice: i8) {
-    let flags = irq_save();
-    unsafe {
-        if let Some(t) = table_mut(tid) {
-            t.nice = nice;
-        }
-    }
-    irq_restore(flags);
 }
 
 /// How many seconds of processor time `tid`'s program may have: SIGXCPU past
