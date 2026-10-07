@@ -315,6 +315,8 @@ pub struct TaskRec {
     pub pmm: crate::pmm::PerTask,
     /// What it waits on, and the tasks either side of it there.
     pub wait: crate::waitlist::WaitLink,
+    /// The futex word it waits on, if one, and its place on that word's list.
+    pub futex: crate::futex::PerTask,
 }
 
 impl TaskRec {
@@ -334,6 +336,7 @@ impl TaskRec {
             cap: crate::cap::PerTask::new(),
             pmm: crate::pmm::PerTask::new(),
             wait: crate::waitlist::WaitLink::NONE,
+            futex: crate::futex::PerTask::new(),
         }
     }
 
@@ -351,6 +354,7 @@ impl TaskRec {
             cap: crate::cap::PerTask::new(),
             pmm: crate::pmm::PerTask::new(),
             wait: crate::waitlist::WaitLink::NONE,
+            futex: crate::futex::PerTask::new(),
         }
     }
 }

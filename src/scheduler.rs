@@ -2153,6 +2153,9 @@ pub fn close_descriptors(tid: usize) {
     // What it used is its program's, before it leaves the program's record.
     crate::usage::task_ended(tid);
     crate::fdtable::task_gone(tid);
+    // The futex word it waited on, if it died waiting: a wake counted for it
+    // would be one a waiter that will run again was not given.
+    crate::futex::cleanup_task(tid);
     // And its program's capabilities, which go with the last task to use
     // them: a dead task is the authority for nothing.
     crate::cap::task_gone(tid);

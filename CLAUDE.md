@@ -583,6 +583,16 @@ may keep — are in `../quarkutils/CLAUDE.md`; these are the kernel's.
   with its number would be handed their links. A new kind's waiters go the
   same way: an `On`, its lists' ends in the object, and a `waiters()` that
   `waitlist::forget` finds them by.
+- **A futex waiter is its task's record too** (`futex.rs`): the word's key,
+  its deadline, why it woke, and a link into one of 256 lists by the key's
+  hash — so no wait is refused for room (there were sixty-four, and the
+  sixty-fifth was answered at once, which a lock's user takes for a wake and
+  spins on), and a waiter can be moved to another word's list
+  (`SYS_FUTEX_REQUEUE`, keyed as a wait on that word would be). A wake, a
+  deadline and a signal each take the waiter off its list and say why in
+  its record, for it to read when it runs; and a task that dies waiting is
+  taken off where it dies (`close_descriptors`), not at its reap — a wake
+  counted for it would be one a waiter that runs again was not given.
 - **A task about to wait on what a descriptor names holds it** (`fdtable::hold`,
   given back by `unhold`, or by `task_gone` for a task killed where it
   waited). Without it a sibling's `close` frees the pipe under a parked read,

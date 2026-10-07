@@ -1,6 +1,6 @@
 # Quark syscall ABI
 
-**Version 4.1.** Query the running kernel with `SYS_ABI_VERSION` (240), which
+**Version 4.2.** Query the running kernel with `SYS_ABI_VERSION` (240), which
 returns `(major << 16) | minor`.
 
 This document is the contract between the Quark kernel and everything above it.
@@ -276,6 +276,7 @@ numbers, and only 64 could name it before, through a range check.
 | Minor | What |
 |---|---|
 | 4.1 | **As many tasks as a desktop runs.** The kernel has up to 32,768 tasks, where it had sixty-four, so a program can no longer find every task by asking about each number below 64: `SYS_TASK_NEXT` (236) answers the first task at or past a number, and a walk of every task is one call a task. A program has 4,096 tasks without `TaskMgmt` — its own that have not died, and the children it has made in other programs and not collected — where a task could have sixteen children and a fork was not counted at all; `SYS_TASK_CREATE`, `SYS_TASK_CREATE_IN` and `SYS_FORK` answer `u64::MAX` past it. **And what a program makes is made when it makes it**, as many as its descriptors and the machine's memory allow: counters, timers, signal descriptors, pipes and shared regions, where there were 16, 16, 32, 256 — 64 a program — and 256 for the machine. `SYS_PIPE_CREATE` counts no budget of the program's; nor does anything else that was made with one. So are terminals, local sockets, streams, poll sets and served descriptors, where there were 8, 32, 64, 64 and 1,024; and what is in them grows: a set watches as many descriptors as a program may have (it watched 32), `SYS_POLL` takes as many entries and refuses more (it took 32 and ignored the rest), a listener's backlog goes to 4,096 (16), a stream holds in flight as many descriptors as its sender may have (32), and a send or receive of several carries 255 (32). Memory objects are 2,047, the most a page-table entry can name (256), and 1,024 a pager (128). And a program's capability space grows: 256 slots when the first is written, doubled as more are wanted, up to 65,536 (it was 256, all of them inline in every program's), a slot's number never moving; `SYS_CAP_READ` answers how many slots a space has room for, where it answered 0. |
+| 4.2 | **A futex keeps every waiter, and moves them.** A futex wait is never refused for room: there were sixty-four waiters for the machine, and the sixty-fifth was answered `u64::MAX` at once. `SYS_FUTEX_REQUEUE` (237) wakes some of a word's waiters and moves the rest to wait on another word — Linux's `FUTEX_REQUEUE`, and with a value to compare, `FUTEX_CMP_REQUEUE`, which answers `0xFFFF_FFFE` when the word has changed. |
 
 ### Deprecated
 
@@ -1374,7 +1375,7 @@ second, as on Linux. A child it forks or spawns has its limits, and
 
 | # | Name | Arguments | Returns | Cap |
 |---|---|---|---|---|
-| 128 | `SYS_FUTEX_WAIT` | arg0 = addr (4-byte aligned), arg1 = expected | 0 = woken, 1 = value already differed, `0xFFFF_FFFD` = a signal ended the wait, `u64::MAX` = bad address or no wait slot. **Blocks.** | — |
+| 128 | `SYS_FUTEX_WAIT` | arg0 = addr (4-byte aligned), arg1 = expected | 0 = woken, 1 = value already differed, `0xFFFF_FFFD` = a signal ended the wait, `u64::MAX` = bad address. **Blocks.** | — |
 | 129 | `SYS_FUTEX_WAKE` | arg0 = addr, arg1 = max to wake | number woken | — |
 | 130 | `SYS_FUTEX_WAIT_TIMEOUT` | arg0 = addr, arg1 = expected, arg2 = how long to wait, a span | 0 = woken, 1 = value already differed, 2 = timed out, `0xFFFF_FFFD` = a signal ended the wait, `u64::MAX` = bad address or no wait slot. **Blocks.** | — |
 | 131 | `SYS_EVENT_CREATE` | arg0 = the count it starts at, arg1 = flags (1 = semaphore) | a descriptor readable while the counter is not zero / `u64::MAX` | — |
@@ -1392,6 +1393,12 @@ A timeout of no time makes `SYS_FUTEX_WAIT_TIMEOUT` a check rather than a wait:
 it returns 1 if the value already differs and 2 if it does not, without
 blocking. There is no way to ask for an unbounded wait through this call; that
 is what `SYS_FUTEX_WAIT` is.
+
+No wait is refused for room: a waiter is kept in its task's record. And
+waiters are moved from one word to another by `SYS_FUTEX_REQUEUE` (237, in
+the 0xE0 block), which is Linux's `FUTEX_REQUEUE` and `FUTEX_CMP_REQUEUE`:
+a condition variable's broadcast hands its waiters to the mutex they will
+want, rather than waking them all to fight for it.
 
 **Event counters.** `SYS_EVENT_CREATE` makes a 64-bit counter and returns a
 descriptor for it. A write is eight bytes and adds them; a read is eight bytes
@@ -1957,6 +1964,7 @@ set together or not at all.
 | 234 | `SYS_PACKET_PAIR` | — | `(fd0 << 32) \| fd1`, both in the caller's table / `u64::MAX` | — |
 | 235 | `SYS_FD_LIMIT` | arg0 = 0 to read, 1 to set what the program may have to arg1, 2 to lower how far it may raise that to arg1 | read: `(how far << 32) \| what it may have`; set: 0 / `u64::MAX` | — (the caller's own program) |
 | 236 | `SYS_TASK_NEXT` | arg0 = a task id | the first task at or past it that has not been taken apart, living or dead / `u64::MAX` if there is none | — |
+| 237 | `SYS_FUTEX_REQUEUE` | arg0 = the first word, arg1 = the second (each 4-byte aligned), arg2 = `(how many to wake << 32) \| how many to move`, arg3 = what the first word must hold, arg4 = flags: bit 0, compare it | how many were woken and moved: up to the first number of the first word's waiters woken, up to the second of the rest moved to wait on the second word, as if they had waited there / `0xFFFF_FFFE` if bit 0 was given and the first word does not hold arg3 — nothing is done — / `u64::MAX` = bad address | — |
 
 `SYS_FD_KIND` answers 1 for an IPC endpoint, 2 and 3 for the reading and
 writing ends of a pipe, 4 for a stream, 5 and 6 for a terminal's master and

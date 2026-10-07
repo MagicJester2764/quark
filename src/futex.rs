@@ -2,11 +2,25 @@
 ///
 /// Provides wait/wake operations on user-space atomic words,
 /// enabling efficient blocking synchronization primitives.
+///
+/// A waiter is its task's record (`TaskRec::futex`): the word it waits on,
+/// its deadline, why it woke, and a link into one of [`BUCKETS`] lists, the
+/// one its word's key hashes to. No wait is refused for room: there were
+/// sixty-four waiters for the whole machine, and the sixty-fifth was told no
+/// at once, which a lock's user takes for a wake and goes round again — a
+/// program of a hundred threads waiting on one condition had thirty-six of
+/// them spinning. And a waiter can be moved from one word to another
+/// ([`requeue`]), which is how a condition variable's broadcast hands its
+/// waiters to the mutex instead of waking them all to fight for it.
 
 use crate::scheduler;
 use crate::sync::IrqSpinLock;
 
-const MAX_FUTEX_WAITERS: usize = 64;
+/// Lists a waiter is on, by a hash of its word's key.
+const BUCKETS: usize = 256;
+
+/// The end of a list.
+const END: u16 = u16::MAX;
 
 /// Which word a task is waiting on.
 ///
@@ -26,7 +40,7 @@ const MAX_FUTEX_WAITERS: usize = 64;
 /// that came after it — which is every wake, since what is waited for is a
 /// write to that word.
 #[derive(Clone, Copy, PartialEq, Eq)]
-struct Key {
+pub struct Key {
     /// The address space, for a word in memory it owns; 0 for a frame.
     space: usize,
     /// The address there, or the frame's.
@@ -34,6 +48,14 @@ struct Key {
 }
 
 const NO_KEY: Key = Key { space: 0, at: 0 };
+
+impl Key {
+    /// The list a waiter on this word is on.
+    fn bucket(&self) -> usize {
+        let mixed = (self.space as u64 ^ (self.at as u64).rotate_left(17)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        (mixed >> 56) as usize % BUCKETS
+    }
+}
 
 /// The key of the word at `addr` in `cr3`, if there is a page there.
 fn key_of(cr3: usize, addr: u64) -> Option<Key> {
@@ -47,37 +69,121 @@ fn key_of(cr3: usize, addr: u64) -> Option<Key> {
     }
 }
 
-#[derive(Clone, Copy)]
-struct FutexWaiter {
-    tid: usize,
+/// What this module keeps about a task, in its record (`TaskRec::futex`).
+pub struct PerTask {
+    /// On a list, waiting.
+    waiting: bool,
     /// The word it waits on.
     key: Key,
-    active: bool,
     /// When to give up, in the clock's nanoseconds. 0 = wait indefinitely.
     deadline: u64,
-    /// Set by [`check_timeouts`] when the deadline passed, so the waiter can
-    /// tell why it woke. The slot stays `active` until the waiter reads this,
-    /// or it could be handed to a new waiter first and the answer lost.
+    /// Why it woke, other than a wake: its deadline passed, or a signal the
+    /// kernel runs a handler for ended the wait. Read by the waiter when it
+    /// runs again, and cleared then.
     expired: bool,
-    /// Set by [`interrupt`]: a signal with a handler for the kernel to run
-    /// ended the wait. Kept until the waiter reads it, as `expired` is.
     interrupted: bool,
+    /// The tasks either side of it on its list.
+    next: u16,
+    prev: u16,
+}
+
+impl PerTask {
+    pub const fn new() -> Self {
+        PerTask { waiting: false, key: NO_KEY, deadline: 0, expired: false, interrupted: false, next: END, prev: END }
+    }
+}
+
+/// A list's first and last.
+#[derive(Clone, Copy)]
+struct Bucket {
+    first: u16,
+    last: u16,
 }
 
 struct FutexState {
-    waiters: [FutexWaiter; MAX_FUTEX_WAITERS],
+    buckets: [Bucket; BUCKETS],
 }
 
-static FUTEX: IrqSpinLock<FutexState> = IrqSpinLock::new(FutexState {
-    waiters: [FutexWaiter {
-        tid: 0,
-        key: NO_KEY,
-        active: false,
-        deadline: 0,
-        expired: false,
-        interrupted: false,
-    }; MAX_FUTEX_WAITERS],
-});
+/// The lists, and through them every waiter's record: whoever changes
+/// either holds this.
+static FUTEX: IrqSpinLock<FutexState> =
+    IrqSpinLock::new(FutexState { buckets: [Bucket { first: END, last: END }; BUCKETS] });
+
+/// Task `t`'s record, unless it is the end of a list or no task.
+///
+/// # Safety
+/// `FUTEX` is held, and with it interrupts are off.
+unsafe fn rec(t: u16) -> Option<&'static mut PerTask> {
+    if t == END {
+        return None;
+    }
+    unsafe { scheduler::rec(t as usize).map(|r| &mut r.futex) }
+}
+
+/// `tid` waits on `key`, last on its list.
+///
+/// # Safety
+/// `FUTEX` is held, and `tid` is on no list.
+unsafe fn link(state: &mut FutexState, tid: usize, key: Key) {
+    unsafe {
+        let b = &mut state.buckets[key.bucket()];
+        let Some(me) = rec(tid as u16) else { return };
+        me.waiting = true;
+        me.key = key;
+        me.next = END;
+        me.prev = b.last;
+        match rec(b.last) {
+            Some(last) => last.next = tid as u16,
+            None => b.first = tid as u16,
+        }
+        b.last = tid as u16;
+    }
+}
+
+/// `tid` is off its list, and waits on nothing.
+///
+/// # Safety
+/// `FUTEX` is held.
+unsafe fn unlink(state: &mut FutexState, tid: usize) {
+    unsafe {
+        let Some(me) = rec(tid as u16).filter(|me| me.waiting) else { return };
+        let b = &mut state.buckets[me.key.bucket()];
+        let (next, prev) = (me.next, me.prev);
+        match rec(prev) {
+            Some(p) => p.next = next,
+            None => b.first = next,
+        }
+        match rec(next) {
+            Some(n) => n.prev = prev,
+            None => b.last = prev,
+        }
+        me.waiting = false;
+        me.next = END;
+        me.prev = END;
+    }
+}
+
+/// The waiters on `key`'s list that wait on `key`, in the order they began
+/// to, up to `most` of them: handed to `each`, which may take them off.
+///
+/// # Safety
+/// `FUTEX` is held.
+unsafe fn each_on(state: &mut FutexState, key: Key, most: u64, mut each: impl FnMut(&mut FutexState, usize)) -> u64 {
+    unsafe {
+        let mut t = state.buckets[key.bucket()].first;
+        let mut done = 0u64;
+        while done < most {
+            let Some(r) = rec(t) else { break };
+            let (next, mine) = (r.next, r.key == key);
+            if mine {
+                each(state, t as usize);
+                done += 1;
+            }
+            t = next;
+        }
+        done
+    }
+}
 
 const USER_ADDR_LIMIT: u64 = 0x0000_8000_0000_0000;
 
@@ -101,35 +207,35 @@ pub fn futex_wait_timeout(addr: u64, expected: u32, timeout_ns: u64) -> u64 {
     wait(addr, expected, Some(timeout_ns))
 }
 
-fn wait(addr: u64, expected: u32, timeout_ns: Option<u64>) -> u64 {
-    // Validate user pointer
-    if addr == 0 || addr.checked_add(4).map_or(true, |end| end > USER_ADDR_LIMIT) {
-        return u64::MAX;
-    }
-    if addr % 4 != 0 {
-        return u64::MAX;
-    }
+/// Whether `addr` names a word a program may wait on, or name to be woken.
+fn word_ok(addr: u64) -> bool {
+    addr != 0 && addr % 4 == 0 && addr.checked_add(4).is_some_and(|end| end <= USER_ADDR_LIMIT)
+}
 
-    let tid = scheduler::current_tid();
-    let cr3 = scheduler::current_task_cr3();
-
-    // Confirm the word is actually mapped *before* taking the lock. Faulting on
-    // it while holding FUTEX with interrupts disabled would deadlock: the fault
-    // path wants to reschedule to the pager.
+/// The word at `addr` in the caller's memory, made present and kept so for
+/// the rest of the call, and its key. It is read below with a lock held:
+/// faulting on it there would be a fault in the kernel with interrupts off,
+/// and a page written out and brought back is not the frame it was.
+fn held_word(cr3: usize, addr: u64) -> Option<Key> {
     let usable = unsafe {
         crate::paging::back_range(cr3, addr, 4, false).is_ok()
             && crate::paging::user_range_accessible(cr3, addr, 4, false)
     };
     if !usable {
+        return None;
+    }
+    scheduler::pin(addr, 4);
+    key_of(cr3, addr)
+}
+
+fn wait(addr: u64, expected: u32, timeout_ns: Option<u64>) -> u64 {
+    if !word_ok(addr) {
         return u64::MAX;
     }
-    // The word stays in memory for as long as this waits on it: it is read
-    // below with a lock held, and a page written out and brought back is
-    // not the frame it was.
-    scheduler::pin(addr, 4);
-    let key = match key_of(cr3, addr) {
-        Some(k) => k,
-        None => return u64::MAX,
+    let tid = scheduler::current_tid();
+    let cr3 = scheduler::current_task_cr3();
+    let Some(key) = held_word(cr3, addr) else {
+        return u64::MAX;
     };
 
     let mut state = FUTEX.lock();
@@ -150,15 +256,9 @@ fn wait(addr: u64, expected: u32, timeout_ns: Option<u64>) -> u64 {
         return TIMED_OUT;
     }
 
-    // Find a free slot
-    let slot = match state.waiters.iter().position(|w| !w.active) {
-        Some(i) => i,
-        None => return u64::MAX, // no free slots
-    };
-
-    // 0 in the slot means "no deadline", which is why the arithmetic saturates
-    // rather than wrapping: a far-future deadline must stay far-future, not
-    // land back on the sentinel.
+    // 0 means "no deadline", which is why the arithmetic saturates rather
+    // than wrapping: a far-future deadline must stay far-future, not land
+    // back on the sentinel.
     let deadline = match timeout_ns {
         Some(t) => crate::clock::after(t),
         None => 0,
@@ -171,14 +271,15 @@ fn wait(addr: u64, expected: u32, timeout_ns: Option<u64>) -> u64 {
         return crate::signal::INTERRUPTED;
     }
 
-    state.waiters[slot] = FutexWaiter {
-        tid,
-        key,
-        active: true,
-        deadline,
-        expired: false,
-        interrupted: false,
-    };
+    unsafe {
+        let Some(me) = rec(tid as u16) else {
+            return u64::MAX;
+        };
+        me.deadline = deadline;
+        me.expired = false;
+        me.interrupted = false;
+        link(&mut state, tid, key);
+    }
 
     // Block the task while holding the lock to prevent wake races
     scheduler::block_task(tid);
@@ -190,27 +291,23 @@ fn wait(addr: u64, expected: u32, timeout_ns: Option<u64>) -> u64 {
     // Yield to let the scheduler pick another task
     scheduler::yield_now();
 
-    // Woken. Release our slot unconditionally: futex_wake clears it, but a
-    // signal-driven unblock does not, and a stale active slot both leaks the
-    // entry and lets a later futex_wake unblock a task that is not waiting.
-    //
-    // Finding the slot still active means nobody took it, which is how a
-    // deadline is distinguished from a wake: check_timeouts leaves it in place
-    // precisely so this can read `expired` out of it.
+    // Woken: by a wake, which took it off its list; by its deadline or a
+    // signal, which did too and said so; or by something else entirely,
+    // which did not — it is taken off now, either way.
     let mut state = FUTEX.lock();
-    let mut timed_out = false;
-    let mut interrupted = false;
-    if let Some(w) = state
-        .waiters
-        .iter_mut()
-        .find(|w| w.active && w.tid == tid && w.key == key)
-    {
-        timed_out = w.expired;
-        interrupted = w.interrupted;
-        w.active = false;
-        w.expired = false;
-        w.interrupted = false;
-    }
+    let (timed_out, interrupted) = unsafe {
+        unlink(&mut state, tid);
+        match rec(tid as u16) {
+            Some(me) => {
+                let why = (me.expired, me.interrupted);
+                me.expired = false;
+                me.interrupted = false;
+                me.deadline = 0;
+                why
+            }
+            None => (false, false),
+        }
+    };
     drop(state);
 
     if timed_out {
@@ -226,11 +323,15 @@ fn wait(addr: u64, expected: u32, timeout_ns: Option<u64>) -> u64 {
 /// is, it is woken to say so. True if it was.
 pub fn interrupt(tid: usize) -> bool {
     let mut state = FUTEX.lock();
-    let Some(w) = state.waiters.iter_mut().find(|w| w.active && w.tid == tid && !w.expired && !w.interrupted)
-    else {
-        return false;
-    };
-    w.interrupted = true;
+    unsafe {
+        if !rec(tid as u16).is_some_and(|me| me.waiting) {
+            return false;
+        }
+        unlink(&mut state, tid);
+        if let Some(me) = rec(tid as u16) {
+            me.interrupted = true;
+        }
+    }
     scheduler::unblock_task(tid);
     true
 }
@@ -250,68 +351,106 @@ pub fn wake_in(cr3: usize, addr: u64, max_wake: u64) -> u64 {
     if addr == 0 {
         return 0;
     }
-
     // No page there is no waiter there: a wait gives the page its memory
     // before it waits.
-    let key = match key_of(cr3, addr) {
-        Some(k) => k,
-        None => return 0,
+    let Some(key) = key_of(cr3, addr) else {
+        return 0;
     };
-    let mut woken = 0u64;
-
     let mut state = FUTEX.lock();
-    for waiter in state.waiters.iter_mut() {
-        if woken >= max_wake {
-            break;
-        }
-        // Skip one whose deadline already fired: it is awake and on its way
-        // to reading `expired`, and counting it here would spend a wake that
-        // another waiter is still blocked for.
-        if waiter.active && !waiter.expired && waiter.key == key {
-            waiter.active = false;
-            scheduler::unblock_task(waiter.tid);
-            woken += 1;
+    unsafe {
+        each_on(&mut state, key, max_wake, |state, t| {
+            unlink(state, t);
+            scheduler::unblock_task(t);
+        })
+    }
+}
+
+/// `SYS_FUTEX_REQUEUE`'s answer when the first word does not hold what the
+/// caller said it would: Linux's `EAGAIN`.
+pub const NOT_AS_SAID: u64 = 0xFFFF_FFFE;
+
+/// Wake up to `nr_wake` of the waiters on the word at `first`, and move up to
+/// `nr_requeue` of the rest to wait on the word at `second` instead, as if
+/// they had waited there: Linux's `FUTEX_REQUEUE`, and with `expected`, its
+/// `FUTEX_CMP_REQUEUE`, which does nothing — and answers [`NOT_AS_SAID`] —
+/// unless the first word still holds that. How many were woken and moved.
+pub fn requeue(first: u64, second: u64, nr_wake: u64, nr_requeue: u64, expected: Option<u32>) -> u64 {
+    if !word_ok(first) || !word_ok(second) {
+        return u64::MAX;
+    }
+    let cr3 = scheduler::current_task_cr3();
+    // Both words keyed as a wait keys them: the second as the waiters moved
+    // to it would have keyed it, had they waited there.
+    let (Some(from), Some(to)) = (held_word(cr3, first), held_word(cr3, second)) else {
+        return u64::MAX;
+    };
+    let mut state = FUTEX.lock();
+    if let Some(expected) = expected {
+        let now = {
+            let _ua = crate::cpu::UserAccess::begin();
+            unsafe { *(first as *const u32) }
+        };
+        if now != expected {
+            return NOT_AS_SAID;
         }
     }
-
-    woken
+    unsafe {
+        let woken = each_on(&mut state, from, nr_wake, |state, t| {
+            unlink(state, t);
+            scheduler::unblock_task(t);
+        });
+        if from == to {
+            return woken;
+        }
+        let moved = each_on(&mut state, from, nr_requeue, |state, t| {
+            unlink(state, t);
+            link(state, t, to);
+        });
+        woken + moved
+    }
 }
 
 /// Expire waits whose deadline has passed at `now`, and say when the next
 /// one does: `u64::MAX` if none is waiting on a time. Called from the clock
 /// (`clock::expire`).
 ///
-/// The slot is left active on purpose: the waiter needs to find it to learn
-/// that it timed out rather than being woken, and freeing it here could hand
-/// it to a new waiter before the old one has run.
+/// An expired waiter is taken off its list, and says so in its record, which
+/// it reads when it runs again.
 pub fn check_timeouts(now: u64) -> u64 {
     // Interrupt context, so interrupts are already off.
     let mut next = u64::MAX;
     let mut state = FUTEX.lock();
-    for waiter in state.waiters.iter_mut() {
-        if !waiter.active || waiter.expired || waiter.deadline == 0 {
-            continue;
-        }
-        if now >= waiter.deadline {
-            waiter.deadline = 0;
-            waiter.expired = true;
-            scheduler::unblock_task(waiter.tid);
-        } else {
-            next = next.min(waiter.deadline);
+    unsafe {
+        for b in 0..BUCKETS {
+            let mut t = state.buckets[b].first;
+            while let Some(r) = rec(t) {
+                let (here, after, deadline) = (t as usize, r.next, r.deadline);
+                if deadline != 0 && now >= deadline {
+                    unlink(&mut state, here);
+                    if let Some(me) = rec(here as u16) {
+                        me.expired = true;
+                        me.deadline = 0;
+                    }
+                    scheduler::unblock_task(here);
+                } else if deadline != 0 {
+                    next = next.min(deadline);
+                }
+                t = after;
+            }
         }
     }
     next
 }
 
-/// Clean up futex waiters for a dead task.
+/// A task has died, or is being taken apart: it waits on nothing now. Where
+/// it dies and not only at its reap — a wake counted for a task that will
+/// never run again is one a waiter that would have was not given.
 pub fn cleanup_task(tid: usize) {
     let mut state = FUTEX.lock();
-    for waiter in state.waiters.iter_mut() {
-        if waiter.active && waiter.tid == tid {
-            waiter.active = false;
-            waiter.expired = false;
-            waiter.interrupted = false;
-            waiter.deadline = 0;
+    unsafe {
+        unlink(&mut state, tid);
+        if let Some(me) = rec(tid as u16) {
+            *me = PerTask::new();
         }
     }
 }

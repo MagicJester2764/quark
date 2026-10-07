@@ -481,6 +481,9 @@ pub const SYS_FD_LIMIT: u64 = 235;
 /// The first task at or past a number: how every task is found, one call a
 /// task, now that there are 32,768 numbers to find them among.
 pub const SYS_TASK_NEXT: u64 = 236;
+/// Wake some of a futex word's waiters and move the rest to wait on another:
+/// Linux's `FUTEX_REQUEUE`, and with a value to compare, `FUTEX_CMP_REQUEUE`.
+pub const SYS_FUTEX_REQUEUE: u64 = 237;
 /// `SYS_FD_SERVE`'s flag: the server will say when the object is ready.
 const SERVE_SAYS_READY: u64 = 1;
 /// SYS_FD_SERVE_PIPE: the writing end, and only if the other end is held.
@@ -500,7 +503,7 @@ pub const SYS_ABI_VERSION: u64 = 240;
 /// minor when calls are added. User space can refuse to run against a major it
 /// does not know, which is the point of exposing it at all.
 pub const ABI_VERSION_MAJOR: u64 = 4;
-pub const ABI_VERSION_MINOR: u64 = 1;
+pub const ABI_VERSION_MINOR: u64 = 2;
 
 /// How many tasks a program may have with no capability at all: its own, and
 /// the children it has made and not collected, by `SYS_TASK_CREATE`,
@@ -3659,6 +3662,13 @@ fn dispatch(
         SYS_FUTEX_WAKE => {
             // arg0 = addr, arg1 = max_wake
             crate::futex::futex_wake(arg0, arg1)
+        }
+        SYS_FUTEX_REQUEUE => {
+            // arg0 = the first word, arg1 = the second, arg2 = (how many to
+            // wake << 32) | how many to move, arg3 = what the first must
+            // still hold, arg4 = flags: bit 0, compare it.
+            let expected = (arg4 & 1 != 0).then_some(arg3 as u32);
+            crate::futex::requeue(arg0, arg1, arg2 >> 32, arg2 & 0xFFFF_FFFF, expected)
         }
         SYS_FUTEX_WAIT_TIMEOUT => {
             // arg0 = addr, arg1 = expected value, arg2 = how long to wait
