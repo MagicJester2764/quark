@@ -33,58 +33,105 @@ pub const USER_ADDR_LIMIT: u64 = paging::USER_ADDR_LIMIT;
 /// space. Without this, CAP_TASK_MGMT let a task reinterpret *any* physical
 /// address as a PML4 and have the kernel walk and write to it.
 ///
-/// The third field counts the tasks currently running in the address space.
-/// Threads are tasks that share one, so it cannot be destroyed when the first
-/// of them exits — only when the last does.
-///
-/// The fourth is the space's id: a program's name for as long as the machine
-/// runs. A physical address is no name — the frame is reused as soon as the
-/// space is gone — and neither is a TID, which a thread does not share with
-/// its siblings. Servers key what belongs to a program by this.
+/// A record is made when a space is created and given back when it is
+/// destroyed (`table.rs`).
 pub const MAX_ADDRESS_SPACES: usize = crate::task::MAX_TASKS * 2;
-static mut ADDRESS_SPACES: [(usize, usize, u32, u64); MAX_ADDRESS_SPACES] =
-    [(0, 0, 0, 0); MAX_ADDRESS_SPACES];
+static mut ADDRESS_SPACES: crate::table::Table<Space> = crate::table::Table::new(MAX_ADDRESS_SPACES);
+
+struct Space {
+    cr3: usize,
+    /// The task that created it.
+    owner: usize,
+    /// The tasks currently running in it. Threads are tasks that share one,
+    /// so it cannot be destroyed when the first of them exits — only when
+    /// the last does.
+    users: u32,
+    /// Its id: a program's name for as long as the machine runs. A physical
+    /// address is no name — the frame is reused as soon as the space is
+    /// gone — and neither is a TID, which a thread does not share with its
+    /// siblings. Servers key what belongs to a program by this.
+    id: u64,
+}
+
+/// # Safety
+/// Interrupts are off.
+#[inline(always)]
+unsafe fn spaces() -> &'static mut crate::table::Table<Space> {
+    unsafe { &mut *core::ptr::addr_of_mut!(ADDRESS_SPACES) }
+}
+
+/// The record for the space rooted at `cr3`, if it is a user address space.
+///
+/// # Safety
+/// Interrupts are off for as long as the record is used.
+unsafe fn space_rooted_at(cr3: usize) -> Option<&'static mut Space> {
+    unsafe { (0..spaces().high()).find_map(|i| spaces().get(i).filter(|s| s.cr3 == cr3)) }
+}
+
+#[inline(always)]
+fn irq_save() -> u64 {
+    let flags: u64;
+    unsafe { core::arch::asm!("pushfq; pop {}; cli", out(reg) flags, options(nostack)) };
+    flags
+}
+
+#[inline(always)]
+fn irq_restore(flags: u64) {
+    unsafe { core::arch::asm!("push {}; popfq", in(reg) flags, options(nostack)) };
+}
 
 /// The next space id. Never reused, so a notice about a program that has gone
 /// cannot be mistaken for one about a program that is running.
 static NEXT_SPACE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
 
 /// Record `cr3` as an address space created by `owner`.
-/// Returns false if the registry is full.
+/// Returns false if the registry is full, or there is no memory for its
+/// record.
 fn register_address_space(cr3: usize, owner: usize) -> bool {
-    unsafe {
-        let table = &mut *core::ptr::addr_of_mut!(ADDRESS_SPACES);
-        for slot in table.iter_mut() {
-            if slot.0 == 0 {
-                let id = NEXT_SPACE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-                *slot = (cr3, owner, 0, id);
-                return true;
-            }
-        }
-    }
-    false
+    let flags = irq_save();
+    let done = unsafe {
+        spaces().lowest_free(0).is_some_and(|i| {
+            let id = NEXT_SPACE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            spaces().fill_at(i, Space { cr3, owner, users: 0, id }).is_ok()
+        })
+    };
+    irq_restore(flags);
+    done
 }
 
 /// Drop `cr3` from the registry (called when the address space is destroyed).
 pub fn unregister_address_space(cr3: usize) {
+    if cr3 == 0 {
+        return;
+    }
+    let flags = irq_save();
     unsafe {
-        let table = &mut *core::ptr::addr_of_mut!(ADDRESS_SPACES);
-        for slot in table.iter_mut() {
-            if slot.0 == cr3 {
-                *slot = (0, 0, 0, 0);
+        for i in 0..spaces().high() {
+            if spaces().get(i).is_some_and(|s| s.cr3 == cr3) {
+                spaces().empty(i);
             }
         }
     }
+    irq_restore(flags);
+}
+
+/// One past the highest place in the registry ever used: whoever goes round
+/// all of them (`reclaim.rs`) goes no further.
+pub fn spaces_end() -> usize {
+    let flags = irq_save();
+    let end = unsafe { spaces().high() };
+    irq_restore(flags);
+    end
 }
 
 /// The address space in place `index` of the registry, if there is one
 /// there and a task is running in it: where it is and its id. For whoever
 /// goes round all of them (`reclaim.rs`).
 pub fn space_at(index: usize) -> Option<(usize, u64)> {
-    unsafe {
-        let table = &*core::ptr::addr_of!(ADDRESS_SPACES);
-        table.get(index).filter(|s| s.0 != 0 && s.2 != 0).map(|s| (s.0, s.3))
-    }
+    let flags = irq_save();
+    let found = unsafe { spaces().get(index).filter(|s| s.users != 0).map(|s| (s.cr3, s.id)) };
+    irq_restore(flags);
+    found
 }
 
 /// The id of the address space rooted at `cr3`, or 0 if it is not a user
@@ -93,10 +140,10 @@ pub fn space_of(cr3: usize) -> u64 {
     if cr3 == 0 {
         return 0;
     }
-    unsafe {
-        let table = &*core::ptr::addr_of!(ADDRESS_SPACES);
-        table.iter().find(|s| s.0 == cr3).map_or(0, |s| s.3)
-    }
+    let flags = irq_save();
+    let id = unsafe { space_rooted_at(cr3).map_or(0, |s| s.id) };
+    irq_restore(flags);
+    id
 }
 
 /// True if `cr3` is an address space that `tid` created.
@@ -104,10 +151,10 @@ pub fn is_owned_address_space(tid: usize, cr3: usize) -> bool {
     if cr3 == 0 {
         return false;
     }
-    unsafe {
-        let table = &*core::ptr::addr_of!(ADDRESS_SPACES);
-        table.iter().any(|&(c, owner, _, _)| c == cr3 && owner == tid)
-    }
+    let flags = irq_save();
+    let owned = unsafe { space_rooted_at(cr3).is_some_and(|s| s.owner == tid) };
+    irq_restore(flags);
+    owned
 }
 
 /// Whether `tid` may direct a task into `cr3`.
@@ -127,15 +174,16 @@ pub fn may_use_address_space(tid: usize, cr3: usize) -> bool {
 
 /// Note that another task is now running in `cr3`.
 pub fn addrspace_ref(cr3: usize) {
+    if cr3 == 0 {
+        return;
+    }
+    let flags = irq_save();
     unsafe {
-        let table = &mut *core::ptr::addr_of_mut!(ADDRESS_SPACES);
-        for slot in table.iter_mut() {
-            if slot.0 == cr3 {
-                slot.2 = slot.2.saturating_add(1);
-                return;
-            }
+        if let Some(s) = space_rooted_at(cr3) {
+            s.users = s.users.saturating_add(1);
         }
     }
+    irq_restore(flags);
 }
 
 /// Note that a task has stopped running in `cr3`.
@@ -144,16 +192,18 @@ pub fn addrspace_ref(cr3: usize) {
 /// it. An address space the registry does not know about — the kernel's own —
 /// reports false, so nothing tries to tear it down.
 pub fn addrspace_unref(cr3: usize) -> bool {
-    unsafe {
-        let table = &mut *core::ptr::addr_of_mut!(ADDRESS_SPACES);
-        for slot in table.iter_mut() {
-            if slot.0 == cr3 {
-                slot.2 = slot.2.saturating_sub(1);
-                return slot.2 == 0;
-            }
-        }
+    if cr3 == 0 {
+        return false;
     }
-    false
+    let flags = irq_save();
+    let last = unsafe {
+        space_rooted_at(cr3).is_some_and(|s| {
+            s.users = s.users.saturating_sub(1);
+            s.users == 0
+        })
+    };
+    irq_restore(flags);
+    last
 }
 
 /// Create a new user address space.

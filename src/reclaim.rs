@@ -131,14 +131,14 @@ fn make_room(want: usize, take: usize) -> Found {
         // On to the next address space, and round again after the last.
         let on = |index: &mut usize, va: &mut usize, spaces: &mut usize| {
             *index += 1;
-            if *index >= crate::userspace::MAX_ADDRESS_SPACES {
+            if *index >= crate::userspace::spaces_end() {
                 *index = 0;
                 unsafe { *core::ptr::addr_of_mut!(LAPS) += 1 };
             }
             *va = 0;
             *spaces += 1;
         };
-        while budget > 0 && taken < want && spaces <= crate::userspace::MAX_ADDRESS_SPACES {
+        while budget > 0 && taken < want && spaces <= crate::userspace::spaces_end() {
             let Some((cr3, space)) = crate::userspace::space_at(index) else {
                 on(&mut index, &mut va, &mut spaces);
                 continue;
