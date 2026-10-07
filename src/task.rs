@@ -288,6 +288,7 @@ pub struct TaskRec {
     pub threads: crate::threads::PerTask,
     pub served: crate::served::PerTask,
     pub cap: crate::cap::PerTask,
+    pub pmm: crate::pmm::PerTask,
 }
 
 impl TaskRec {
@@ -303,6 +304,7 @@ impl TaskRec {
             threads: crate::threads::PerTask::new(),
             served: crate::served::PerTask::new(),
             cap: crate::cap::PerTask::new(),
+            pmm: crate::pmm::PerTask::new(),
         }
     }
 }

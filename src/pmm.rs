@@ -24,6 +24,7 @@
 
 use crate::multiboot2::{MemoryRegion, MMAP_TYPE_AVAILABLE, MAX_MEMORY_REGIONS};
 use crate::sync::IrqSpinLock;
+use crate::task::MAX_TASKS;
 
 const PAGE_SIZE: usize = 4096;
 
@@ -268,12 +269,14 @@ pub unsafe fn init(
         .min(MAX_PHYS) as usize;
     let frames = top / PAGE_SIZE;
 
-    // Room for a bit a frame and then two bytes a frame — who owns it, and
-    // how many share it — in memory the boot map reaches, below four
-    // gigabytes, that nothing else is in: not the first megabyte, the
-    // kernel, what the bootloader passed or a module.
+    // Room for a bit a frame and then three bytes a frame — two for who owns
+    // it, on a boundary of their own, and one for how many share it — in
+    // memory the boot map reaches, below four gigabytes, that nothing else
+    // is in: not the first megabyte, the kernel, what the bootloader passed
+    // or a module.
     let bitmap_len = frames.div_ceil(8);
-    let room = (bitmap_len + 2 * frames + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+    let owners_at = bitmap_len.next_multiple_of(8);
+    let room = (owners_at + 3 * frames + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
     let in_the_way = |start: usize, end: usize| -> Option<usize> {
         let hits = |a: usize, b: usize| (start < b && a < end).then_some(b);
         let mut past = hits(0, 0x100000)
@@ -305,17 +308,17 @@ pub unsafe fn init(
         panic!("no room below four gigabytes for the table of frames");
     };
     core::ptr::write_bytes(place as *mut u8, 0xFF, bitmap_len);
-    core::ptr::write_bytes((place + bitmap_len) as *mut u8, 0, 2 * frames);
+    core::ptr::write_bytes((place + owners_at) as *mut u8, 0, 3 * frames);
     {
         let mut owners = FRAME_OWNER.lock();
-        owners.table = (place + bitmap_len) as *mut u8;
+        owners.table = (place + owners_at) as *mut u16;
         owners.frames = frames;
     }
 
     let mut pmm = PMM.lock();
     pmm.bitmap = place as *mut u8;
     pmm.frames = frames;
-    pmm.shares = (place + bitmap_len + frames) as *mut u8;
+    pmm.shares = (place + owners_at + 2 * frames) as *mut u8;
 
     // Step 1: For each available region, clear bits (mark free).
     let mut scraps = 0u64;
@@ -522,19 +525,19 @@ pub fn free(frame: PhysFrame) {
 /// page at a time (init maps ELF images page by page), so any fixed table of
 /// (base, count) reservations is exhausted almost immediately.
 ///
-/// And how many each task owns, so that one that owns none — nearly every
-/// task — is not looked for through a byte for every frame of the machine
-/// when it is reaped.
+/// Two bytes a frame: a byte held task ids below 255, and every task past
+/// that owned nothing it was given.
 struct FrameOwners {
-    table: *mut u8,
+    table: *mut u16,
     frames: usize,
-    owned: [u32; 256],
 }
+
+const _: () = assert!(MAX_TASKS < u16::MAX as usize, "a frame's owner is its task id plus one, in two bytes");
 
 unsafe impl Send for FrameOwners {}
 
 impl FrameOwners {
-    fn bytes(&mut self) -> &mut [u8] {
+    fn owners(&mut self) -> &mut [u16] {
         if self.table.is_null() {
             return &mut [];
         }
@@ -545,13 +548,45 @@ impl FrameOwners {
 static FRAME_OWNER: IrqSpinLock<FrameOwners> = IrqSpinLock::new(FrameOwners {
     table: core::ptr::null_mut(),
     frames: 0,
-    owned: [0; 256],
 });
+
+/// What this module keeps about a task, in its record (`TaskRec::pmm`).
+pub struct PerTask {
+    /// How many frames it owns, so that one that owns none — nearly every
+    /// task — is not looked for through every frame of the machine when it
+    /// is reaped.
+    owned: u32,
+}
+
+impl PerTask {
+    pub const fn new() -> Self {
+        PerTask { owned: 0 }
+    }
+}
+
+/// How many frames task `tid` owns: its record's count, or for an id with
+/// no task a count put back to nought each time it is asked for, so that a
+/// change for a task that is not there goes nowhere. The ownership lock is
+/// held.
+fn owned_of(tid: usize) -> &'static mut u32 {
+    unsafe {
+        match crate::scheduler::rec(tid) {
+            Some(r) => &mut r.pmm.owned,
+            None => {
+                let none = &mut *core::ptr::addr_of_mut!(NO_TASK);
+                *none = 0;
+                none
+            }
+        }
+    }
+}
+
+static mut NO_TASK: u32 = 0;
 
 /// Record that `owner` holds the `count` frames starting at `base`: a
 /// device its program has claimed may reach them now (`iommu::owned`).
 pub fn set_owner(base: usize, count: usize, owner: usize) {
-    if owner >= 0xFF {
+    if owner >= MAX_TASKS {
         return;
     }
     let mut taken = false;
@@ -559,13 +594,14 @@ pub fn set_owner(base: usize, count: usize, owner: usize) {
         let mut owners = FRAME_OWNER.lock();
         for i in 0..count {
             let idx = PmmInner::frame_index(base + i * PAGE_SIZE);
-            let Some(&was) = owners.bytes().get(idx) else { continue };
+            let Some(&was) = owners.owners().get(idx) else { continue };
             if was != 0 {
-                owners.owned[was as usize] = owners.owned[was as usize].saturating_sub(1);
+                let had = owned_of(was as usize - 1);
+                *had = had.saturating_sub(1);
                 taken = true;
             }
-            owners.bytes()[idx] = owner as u8 + 1;
-            owners.owned[owner + 1] += 1;
+            owners.owners()[idx] = owner as u16 + 1;
+            *owned_of(owner) += 1;
         }
     }
     if taken {
@@ -576,14 +612,14 @@ pub fn set_owner(base: usize, count: usize, owner: usize) {
 
 /// True if every frame in `[base, base + count)` is owned by `owner`.
 pub fn owns_range(base: usize, count: usize, owner: usize) -> bool {
-    if owner >= 0xFF {
+    if owner >= MAX_TASKS {
         return false;
     }
-    let want = owner as u8 + 1;
+    let want = owner as u16 + 1;
     let mut owners = FRAME_OWNER.lock();
     (0..count).all(|i| {
         let idx = PmmInner::frame_index(base + i * PAGE_SIZE);
-        owners.bytes().get(idx) == Some(&want)
+        owners.owners().get(idx) == Some(&want)
     })
 }
 
@@ -594,10 +630,11 @@ pub fn clear_owner(base: usize, count: usize) {
         let mut owners = FRAME_OWNER.lock();
         for i in 0..count {
             let idx = PmmInner::frame_index(base + i * PAGE_SIZE);
-            let Some(&was) = owners.bytes().get(idx) else { continue };
+            let Some(&was) = owners.owners().get(idx) else { continue };
             if was != 0 {
-                owners.owned[was as usize] = owners.owned[was as usize].saturating_sub(1);
-                owners.bytes()[idx] = 0;
+                let had = owned_of(was as usize - 1);
+                *had = had.saturating_sub(1);
+                owners.owners()[idx] = 0;
             }
         }
     }
@@ -615,7 +652,7 @@ pub fn each_owned(tasks: u64, mut each: impl FnMut(usize)) {
             let mut owners = FRAME_OWNER.lock();
             let frames = owners.frames;
             while idx < frames && n < batch.len() {
-                let b = owners.bytes()[idx];
+                let b = owners.owners()[idx];
                 if b != 0 && (b as usize - 1) < 64 && tasks & (1 << (b - 1)) != 0 {
                     batch[n] = idx * PAGE_SIZE;
                     n += 1;
@@ -635,10 +672,10 @@ pub fn each_owned(tasks: u64, mut each: impl FnMut(usize)) {
 /// Free every frame still owned by `owner`. Returns the number reclaimed.
 /// Called when a task is reaped so its `sys_phys_alloc` frames are not leaked.
 pub fn release_task_frames(owner: usize) -> usize {
-    if owner >= 0xFF {
+    if owner >= MAX_TASKS {
         return 0;
     }
-    let want = owner as u8 + 1;
+    let want = owner as u16 + 1;
     let mut reclaimed = 0;
 
     // Collect under the ownership lock, free outside it: pmm::free takes the
@@ -649,14 +686,15 @@ pub fn release_task_frames(owner: usize) -> usize {
         let mut n = 0;
         {
             let mut owners = FRAME_OWNER.lock();
-            if owners.owned[want as usize] == 0 {
+            let owned = owned_of(owner);
+            if *owned == 0 {
                 break;
             }
             let frames = owners.frames;
             while idx < frames && n < batch.len() {
-                if owners.bytes()[idx] == want {
-                    owners.bytes()[idx] = 0;
-                    owners.owned[want as usize] -= 1;
+                if owners.owners()[idx] == want {
+                    owners.owners()[idx] = 0;
+                    *owned = owned.saturating_sub(1);
                     batch[n] = idx * PAGE_SIZE;
                     n += 1;
                 }
@@ -665,7 +703,7 @@ pub fn release_task_frames(owner: usize) -> usize {
             if n == 0 {
                 // Looked at every frame and found none: the count was wrong,
                 // and is put right rather than looked for again.
-                owners.owned[want as usize] = 0;
+                *owned = 0;
                 break;
             }
         }
