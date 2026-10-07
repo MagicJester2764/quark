@@ -393,8 +393,7 @@ fn domain_for(space: u64) -> Option<usize> {
     let d = domains.iter().position(|d| d.space == 0)?;
     let table = zeroed()?;
     domains[d] = Domain { space, table };
-    let tasks = crate::scheduler::tasks_of_space_mask(space);
-    crate::pmm::each_owned(tasks, |frame| {
+    crate::pmm::each_owned(|owner| crate::scheduler::task_in_space(owner, space), |frame| {
         map(table, frame as u64);
     });
     Some(d)

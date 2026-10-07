@@ -641,9 +641,9 @@ pub fn clear_owner(base: usize, count: usize) {
     crate::iommu::disowned(base, count);
 }
 
-/// Every frame owned by a task in `tasks` (a bit for each), to `each`: out
-/// of the ownership lock, a batch at a time, as `release_task_frames` does.
-pub fn each_owned(tasks: u64, mut each: impl FnMut(usize)) {
+/// Every frame owned by a task `owner` says yes to, to `each`: out of the
+/// ownership lock, a batch at a time, as `release_task_frames` does.
+pub fn each_owned(owner: impl Fn(usize) -> bool, mut each: impl FnMut(usize)) {
     let mut idx = 0;
     loop {
         let mut batch = [0usize; 64];
@@ -653,7 +653,7 @@ pub fn each_owned(tasks: u64, mut each: impl FnMut(usize)) {
             let frames = owners.frames;
             while idx < frames && n < batch.len() {
                 let b = owners.owners()[idx];
-                if b != 0 && (b as usize - 1) < 64 && tasks & (1 << (b - 1)) != 0 {
+                if b != 0 && owner(b as usize - 1) {
                     batch[n] = idx * PAGE_SIZE;
                     n += 1;
                 }

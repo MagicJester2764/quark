@@ -254,11 +254,7 @@ pub fn of_task(tid: usize) -> Usage {
 /// and those still here.
 pub fn of_program(tid: usize) -> Usage {
     let mut used = crate::fdtable::usage_gone(tid);
-    let mut tasks = [0usize; MAX_TASKS];
-    let n = crate::fdtable::tasks_of(tid, &mut tasks);
-    for &t in &tasks[..n] {
-        used.add(&of_task(t));
-    }
+    crate::fdtable::each_task(tid, |t| used.add(&of_task(t)));
     used
 }
 
@@ -276,8 +272,8 @@ pub fn of_children(tid: usize) -> Usage {
 /// `exit`. So it waits with every task of the process not yet taken apart;
 /// only one of them is anybody's child.
 pub fn task_ended(tid: usize) {
-    let mut tasks = [0usize; MAX_TASKS];
-    let n = crate::fdtable::tasks_of(tid, &mut tasks);
+    let mut n = 0;
+    crate::fdtable::each_task(tid, |_| n += 1);
     if n == 0 {
         // Not in a program: what it used has been counted already.
         return;
@@ -288,12 +284,7 @@ pub fn task_ended(tid: usize) {
     }
     let mut all = crate::fdtable::usage_gone(tid);
     all.add(&crate::fdtable::usage_children(tid));
-    let n = crate::scheduler::tasks_of_process(tid, &mut tasks);
-    let flags = irq_save();
-    for &t in &tasks[..n] {
-        unsafe { st(t).ended = all };
-    }
-    irq_restore(flags);
+    crate::scheduler::each_task_of_process(tid, |t| unsafe { st(t).ended = all });
 }
 
 /// `parent` has collected `child`: what the child's program used, and its

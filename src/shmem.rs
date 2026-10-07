@@ -11,6 +11,7 @@
 /// `pending_destroy` and reclaimed by the last unmapper.
 
 use crate::{paging, pmm, scheduler};
+use crate::grow::Grow;
 use crate::task::MAX_TASKS;
 
 /// Regions in the system.
@@ -47,8 +48,69 @@ struct Run {
     pages: usize,
 }
 
-/// `access`/`mapped` are TID bitmasks, one bit per task.
-const _: () = assert!(MAX_TASKS <= u64::BITS as usize);
+/// Tasks, as a set: their ids, in a small array that grows (`grow.rs`).
+/// Who may map a region and who has it mapped were bits of a word, one for
+/// each task: as many tasks as a word has bits.
+struct Tasks {
+    ids: Grow<u16>,
+    len: usize,
+}
+
+impl Tasks {
+    const fn new() -> Self {
+        Tasks { ids: Grow::new(0), len: 0 }
+    }
+
+    fn at(&self, tid: usize) -> Option<usize> {
+        (0..self.len).find(|&i| self.ids.get(i).is_some_and(|&t| t as usize == tid))
+    }
+
+    fn contains(&self, tid: usize) -> bool {
+        self.at(tid).is_some()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// `tid` is one of them. False if there was no room for it.
+    fn add(&mut self, tid: usize) -> bool {
+        if self.contains(tid) {
+            return true;
+        }
+        match self.ids.ensure(self.len, 4, MAX_TASKS) {
+            Ok(slot) => {
+                *slot = tid as u16;
+                self.len += 1;
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    fn remove(&mut self, tid: usize) {
+        if let Some(i) = self.at(tid) {
+            self.len -= 1;
+            let last = self.ids.get(self.len).copied().unwrap_or(0);
+            if let Some(slot) = self.ids.get_mut(i) {
+                *slot = last;
+            }
+        }
+    }
+
+    /// `with` in `tid`'s place: no room is needed for it.
+    fn replace(&mut self, tid: usize, with: usize) {
+        if self.contains(with) {
+            self.remove(tid);
+        } else if let Some(slot) = self.at(tid).and_then(|i| self.ids.get_mut(i)) {
+            *slot = with as u16;
+        }
+    }
+
+    fn clear(&mut self) {
+        self.len = 0;
+    }
+}
 
 struct ShmemRegion {
     in_use: bool,
@@ -57,10 +119,10 @@ struct ShmemRegion {
     run_count: usize,
     page_count: usize,
     creator: usize,
-    /// Bitmask of TIDs with access (bit N = TID N can map), for the older
-    /// interface that names a region by its handle. A region made as a
-    /// descriptor has none of these: holding the descriptor is the permission.
-    access: u64,
+    /// The tasks that may map it, for the older interface that names a
+    /// region by its handle. A region made as a descriptor has none of these:
+    /// holding the descriptor is the permission.
+    access: Tasks,
     /// Descriptors that name this region, in any program's table or on their
     /// way down a stream.
     ///
@@ -74,8 +136,8 @@ struct ShmemRegion {
     /// or somebody has it mapped, whoever made it. A region made by handle
     /// goes with the task that made it, as it always has.
     by_fd: bool,
-    /// Bitmask of TIDs that currently have the region mapped.
-    mapped: u64,
+    /// The tasks that have the region mapped.
+    mapped: Tasks,
     /// Set when destroy was requested while the region was still mapped.
     /// The last task to unmap frees the frames and releases the handle.
     pending_destroy: bool,
@@ -89,10 +151,10 @@ impl ShmemRegion {
             run_count: 0,
             page_count: 0,
             creator: 0,
-            access: 0,
+            access: Tasks::new(),
             fd_refs: 0,
             by_fd: false,
-            mapped: 0,
+            mapped: Tasks::new(),
             pending_destroy: false,
         }
     }
@@ -221,8 +283,10 @@ fn create_inner(pages: usize, by_fd: bool) -> u64 {
         region.by_fd = by_fd;
         if by_fd {
             region.fd_refs = 1;
-        } else {
-            region.access = 1u64 << tid;
+        } else if !region.access.add(tid) {
+            *region = ShmemRegion::empty();
+            irq_restore(flags);
+            return u64::MAX;
         }
         region.page_count = pages;
     }
@@ -313,7 +377,7 @@ pub fn resize(handle: usize, pages: usize) -> u64 {
         // has been somewhere, or is on its way.
         if !region.in_use
             || region.pending_destroy
-            || region.mapped != 0
+            || !region.mapped.is_empty()
             || !region.by_fd
             || region.fd_refs != 1
         {
@@ -388,8 +452,13 @@ fn map_inner(handle: usize, vaddr: usize, held: bool) -> u64 {
             return u64::MAX;
         }
 
-        // Check access
-        if !held && region.access & (1u64 << tid) == 0 {
+        // Check access, and that there is room to say it is mapped.
+        if !held && !region.access.contains(tid) {
+            irq_restore(flags);
+            return u64::MAX;
+        }
+        let was = region.mapped.contains(tid);
+        if !region.mapped.add(tid) {
             irq_restore(flags);
             return u64::MAX;
         }
@@ -411,6 +480,9 @@ fn map_inner(handle: usize, vaddr: usize, held: bool) -> u64 {
                     for j in 0..i {
                         let _ = paging::unmap_page(cr3, vaddr + j * 4096);
                     }
+                    if !was {
+                        region.mapped.remove(tid);
+                    }
                     irq_restore(flags);
                     return u64::MAX;
                 }
@@ -419,11 +491,13 @@ fn map_inner(handle: usize, vaddr: usize, held: bool) -> u64 {
                 for j in 0..i {
                     let _ = paging::unmap_page(cr3, vaddr + j * 4096);
                 }
+                if !was {
+                    region.mapped.remove(tid);
+                }
                 irq_restore(flags);
                 return u64::MAX;
             }
         }
-        region.mapped |= 1u64 << tid;
         page_count as u64
     };
     irq_restore(flags);
@@ -433,7 +507,7 @@ fn map_inner(handle: usize, vaddr: usize, held: bool) -> u64 {
 /// Nothing can reach the region any more: no task may map it by handle and
 /// no descriptor names it. Interrupts must be off.
 fn unreachable(r: &ShmemRegion) -> bool {
-    r.access == 0 && r.fd_refs == 0
+    r.access.is_empty() && r.fd_refs == 0
 }
 
 /// One more descriptor names this region.
@@ -468,7 +542,7 @@ pub fn fd_release(handle: usize) {
         if r.in_use && r.fd_refs > 0 {
             r.fd_refs -= 1;
             if unreachable(r) {
-                if r.mapped == 0 {
+                if r.mapped.is_empty() {
                     release(r);
                 } else {
                     r.pending_destroy = true;
@@ -499,9 +573,10 @@ pub fn grant(handle: usize, target_tid: usize) -> u64 {
         } else if region.creator != tid && !has_mgmt {
             // Only creator or CAP_TASK_MGMT holders can grant
             u64::MAX
-        } else {
-            region.access |= 1u64 << target_tid;
+        } else if region.access.add(target_tid) {
             0
+        } else {
+            u64::MAX
         }
     };
     irq_restore(flags);
@@ -532,7 +607,7 @@ pub fn unmap(handle: usize, vaddr: usize) -> u64 {
         }
         // Whoever may map it may unmap it, and so may whoever has it mapped:
         // the right to map can have gone since.
-        if region.access & (1u64 << tid) == 0 && region.mapped & (1u64 << tid) == 0 {
+        if !region.access.contains(tid) && !region.mapped.contains(tid) {
             irq_restore(flags);
             return u64::MAX;
         }
@@ -546,9 +621,9 @@ pub fn unmap(handle: usize, vaddr: usize) -> u64 {
             // frame: it belongs to the region, not to this address space.
             let _ = paging::unmap_page(cr3, vaddr + i * 4096);
         }
-        region.mapped &= !(1u64 << tid);
+        region.mapped.remove(tid);
 
-        if region.pending_destroy && region.mapped == 0 {
+        if region.pending_destroy && region.mapped.is_empty() {
             release(region);
         }
         0
@@ -586,8 +661,8 @@ pub fn destroy(handle: usize) -> u64 {
         } else {
             // No further mappings may be created.
             region.pending_destroy = true;
-            region.access = 0;
-            if region.mapped == 0 {
+            region.access.clear();
+            if region.mapped.is_empty() {
                 release(region);
             }
             0
@@ -612,25 +687,22 @@ pub fn cleanup_task(tid: usize, survivor: Option<usize>) {
     if tid >= MAX_TASKS {
         return;
     }
-    let bit = 1u64 << tid;
     let flags = irq_save();
     unsafe {
         for region in regions().iter_mut() {
             if !region.in_use {
                 continue;
             }
-            if region.mapped & bit != 0 {
-                region.mapped &= !bit;
-                if let Some(s) = survivor {
-                    region.mapped |= 1u64 << s;
-                }
+            match survivor {
+                Some(s) => region.mapped.replace(tid, s),
+                None => region.mapped.remove(tid),
             }
-            region.access &= !bit;
+            region.access.remove(tid);
 
             if region.creator == tid {
                 if !region.by_fd {
                     region.pending_destroy = true;
-                    region.access = 0;
+                    region.access.clear();
                 }
                 // The quota it was charged to has gone with the task. A
                 // program that still uses the region carries it from here;
@@ -641,7 +713,7 @@ pub fn cleanup_task(tid: usize, survivor: Option<usize>) {
             if unreachable(region) {
                 region.pending_destroy = true;
             }
-            if region.pending_destroy && region.mapped == 0 {
+            if region.pending_destroy && region.mapped.is_empty() {
                 release(region);
             }
         }

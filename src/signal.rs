@@ -449,16 +449,10 @@ pub fn action(tid: usize, signo: u64, how: u64) -> u64 {
 fn forget(tid: usize, signo: u8) {
     let bit = 1u64 << (signo - 1);
     fdtable::sig_unhold(tid, signo);
-    let mut tasks = [0usize; 16];
-    let n = fdtable::tasks_of(tid, &mut tasks);
-    let flags = irq_save();
-    for &t in &tasks[..n] {
-        unsafe {
-            st(t).tpending &= !bit;
-            st(t).twaiting.forget(signo);
-        }
-    }
-    irq_restore(flags);
+    fdtable::each_task(tid, |t| unsafe {
+        st(t).tpending &= !bit;
+        st(t).twaiting.forget(signo);
+    });
 }
 
 /// `SYS_SIG_ACTION` with 3: the caller's program has a handler for `signo`
@@ -607,55 +601,62 @@ pub fn raise_task(t: usize, signo: u8, info: Info) -> Result<(), NotRaised> {
 /// Whether every task of `tid`'s program holds `signo` back.
 fn held_by_all(tid: usize, signo: u8) -> bool {
     let bit = 1u64 << (signo - 1);
-    let mut tasks = [0usize; 16];
-    let n = fdtable::tasks_of(tid, &mut tasks);
-    let flags = irq_save();
-    let all = n != 0 && tasks[..n].iter().all(|&t| unsafe { st(t).mask } & bit != 0);
-    irq_restore(flags);
-    all
+    let (mut tasks, mut holding) = (0, 0);
+    fdtable::each_task(tid, |t| {
+        tasks += 1;
+        holding += (unsafe { st(t).mask } & bit != 0) as usize;
+    });
+    tasks != 0 && holding == tasks
 }
 
 /// Whether a task of `tid`'s program is waiting to take `signo`.
 fn waited_for(tid: usize, signo: u8) -> bool {
     let bit = 1u64 << (signo - 1);
-    let mut tasks = [0usize; 16];
-    let n = fdtable::tasks_of(tid, &mut tasks);
-    let flags = irq_save();
-    let any = tasks[..n].iter().any(|&t| unsafe { st(t).waitset } & bit != 0);
-    irq_restore(flags);
+    let mut any = false;
+    fdtable::each_task(tid, |t| any |= unsafe { st(t).waitset } & bit != 0);
     any
 }
 
 /// Wake whichever tasks of `tid`'s program are waiting to take `signo`.
 fn waiters(tid: usize, signo: u8) {
     let bit = 1u64 << (signo - 1);
-    let mut tasks = [0usize; 16];
-    let n = fdtable::tasks_of(tid, &mut tasks);
-    for &t in &tasks[..n] {
+    fdtable::each_task(tid, |t| {
         if unsafe { st(t).waitset } & bit != 0 {
             crate::ipc::wake_sleeper(t);
         }
-    }
+    });
 }
 
 /// Make a task of `tid`'s program that does not hold `signo` back look for
 /// it: the kernel runs the handler in whichever of them leaves the kernel
 /// next, and this is what makes one leave.
+///
+/// What [`poke`] does for one task, for every task of the program that lets
+/// `signo` through, in one walk with interrupts off: the caller, if it is
+/// one of them; else one running on another processor; else one in a wait
+/// a signal ends.
 fn prod(tid: usize, signo: u8) {
     let bit = 1u64 << (signo - 1);
-    let mut tasks = [0usize; 16];
-    let n = fdtable::tasks_of(tid, &mut tasks);
-    let mut open = [0usize; 16];
-    let mut m = 0;
+    let open = |t: usize| unsafe { st(t).mask } & bit == 0;
+    let me = scheduler::current_tid();
     let flags = irq_save();
-    for &t in &tasks[..n] {
-        if unsafe { st(t).mask } & bit == 0 {
-            open[m] = t;
-            m += 1;
+    let (mut mine, mut elsewhere) = (false, None);
+    fdtable::each_task(tid, |t| {
+        if open(t) {
+            mine |= t == me;
+            elsewhere = elsewhere.or_else(|| scheduler::running_elsewhere(t));
+        }
+    });
+    if !mine {
+        match elsewhere {
+            Some(cpu) => crate::smp::interrupt(cpu),
+            None => {
+                let mut ended = false;
+                fdtable::each_task(tid, |t| ended = ended || (open(t) && end_wait(t)));
+            }
         }
     }
     irq_restore(flags);
-    poke(&open[..m]);
 }
 
 /// Make one of `tasks` leave the kernel, or ring 3, and so look at what is
@@ -758,13 +759,11 @@ fn tell(tid: usize, word: usize) {
 /// a poll, one reading a terminal, and one waiting for the other end of a
 /// named pipe to be opened.
 fn wake(tid: usize) {
-    let mut tasks = [0usize; 16];
-    let n = fdtable::tasks_of(tid, &mut tasks);
-    for &t in &tasks[..n] {
+    fdtable::each_task(tid, |t| {
         crate::ipc::wake_sleeper(t);
         crate::pty::interrupt(t);
         crate::pipe::interrupt(t);
-    }
+    });
 }
 
 /// `SYS_SIG_ALARM`: have SIGALRM raised for `tid`'s program `first`
@@ -1614,21 +1613,22 @@ pub fn from_terminal(pty: usize, signo: u8) {
             return;
         }
     }
-    let mut holders = [0usize; 32];
-    let n = fdtable::holders(
-        |kind| matches!(kind, FdKind::PtyEnd { pty: p, end: 1 } if *p == pty),
-        &mut holders,
-    );
-    // The caller's own program last, if it is one of them: its default may be
-    // the end of the caller, and the rest must have been told by then.
-    let me = scheduler::current_tid();
-    let mut mine = [0usize; 16];
-    let own = fdtable::tasks_of(me, &mut mine);
-    let is_mine = |tid: usize| mine[..own].contains(&tid);
-    for &tid in holders[..n].iter().filter(|&&tid| !is_mine(tid)) {
-        let _ = raise(tid, signo);
+    // Each program holding the slave, one at a time, as the signal may end
+    // it; the caller's own program last, if it is one of them: its default
+    // may be the end of the caller, and the rest must have been told by then.
+    let holds = |kind: &FdKind| matches!(kind, FdKind::PtyEnd { pty: p, end: 1 } if *p == pty);
+    let mine = fdtable::table_index(scheduler::current_tid());
+    let mut own = None;
+    let mut from = 0;
+    while let Some((table, tid)) = fdtable::next_holder(from, holds) {
+        from = table + 1;
+        if table == mine {
+            own = Some(tid);
+        } else {
+            let _ = raise(tid, signo);
+        }
     }
-    if let Some(&tid) = holders[..n].iter().find(|&&tid| is_mine(tid)) {
+    if let Some(tid) = own {
         let _ = raise(tid, signo);
     }
 }

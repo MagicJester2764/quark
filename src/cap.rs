@@ -727,7 +727,8 @@ pub fn slot_is_valid(cap: &CapSlot) -> bool {
 /// this is asked only when a pager lets go of an object.
 pub fn memobject_held_elsewhere(id: u64, pager: usize) -> bool {
     let own = crate::scheduler::space_of_task(pager);
-    (1..MAX_TASKS).any(|tid| {
+    let flags = irq_save();
+    let held = crate::scheduler::tids().filter(|&tid| tid >= 1).any(|tid| {
         tid != pager
             && crate::scheduler::task_is_live(tid)
             && (own == 0 || crate::scheduler::space_of_task(tid) != own)
@@ -743,7 +744,9 @@ pub fn memobject_held_elsewhere(id: u64, pager: usize) -> bool {
                 irq_restore(flags);
                 held
             }
-    })
+    });
+    irq_restore(flags);
+    held
 }
 
 /// Insert a typed capability into the first free slot of `tid`'s CSpace,

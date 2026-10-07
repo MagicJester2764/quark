@@ -168,6 +168,11 @@ pub struct PerTask {
     /// be waited for.
     pinned: [(u64, u64); PINS],
     npinned: u8,
+    /// The band whose ready queue the task is in, or [`NOT_QUEUED`]; and the
+    /// tasks either side of it there.
+    queued: u8,
+    run_next: u16,
+    run_prev: u16,
 }
 
 impl PerTask {
@@ -192,6 +197,9 @@ impl PerTask {
             unwaited: false,
             pinned: [(0, 0); PINS],
             npinned: 0,
+            queued: NOT_QUEUED,
+            run_next: END,
+            run_prev: END,
         }
     }
 }
@@ -218,8 +226,26 @@ static mut NO_TASK: PerTask = PerTask::new();
 /// Every task's id, in order. Each step looks at the table afresh, so a
 /// walk's body may change it. Interrupts must be off.
 pub(crate) fn tids() -> impl Iterator<Item = usize> {
-    let high = unsafe { table().high() };
-    (0..high).filter(|&i| unsafe { table().used(i) })
+    tids_from(0)
+}
+
+/// Every task there is, from task `start` up and then round from 0 to
+/// before it: for a walk that takes turns. As [`tids`], each step looks
+/// afresh.
+pub(crate) fn tids_from(start: usize) -> impl Iterator<Item = usize> {
+    let (mut at, mut wrapped) = (start, false);
+    core::iter::from_fn(move || {
+        loop {
+            match unsafe { table().next_used(at) } {
+                Some(i) if !wrapped || i < start => {
+                    at = i + 1;
+                    return Some(i);
+                }
+                _ if !wrapped => (at, wrapped) = (0, true),
+                _ => return None,
+            }
+        }
+    })
 }
 
 // Simple circular ready queue (array of TIDs)
@@ -243,10 +269,17 @@ pub const PRIO_NORMAL: u8 = 2;
 /// The idle task, and nothing else.
 pub const PRIO_IDLE: u8 = 3;
 
-static mut READY_QUEUE: [[usize; MAX_TASKS]; NUM_PRIORITIES] = [[0; MAX_TASKS]; NUM_PRIORITIES];
-static mut READY_HEAD: [usize; NUM_PRIORITIES] = [0; NUM_PRIORITIES];
-static mut READY_TAIL: [usize; NUM_PRIORITIES] = [0; NUM_PRIORITIES];
-static mut READY_COUNT: [usize; NUM_PRIORITIES] = [0; NUM_PRIORITIES];
+/// Each band's ready queue: its first task and its last, the rest linked
+/// through their records (`PerTask::run_next`). In the order they were
+/// queued, but for one put at the front. Dead and blocked tasks may still be
+/// in it; whoever next looks at the band takes them out.
+///
+/// It was a ring of task ids as long as there can be tasks, for each band.
+static mut READY: [(u16, u16); NUM_PRIORITIES] = [(END, END); NUM_PRIORITIES];
+/// The end of a ready queue.
+const END: u16 = u16::MAX;
+/// In no ready queue.
+const NOT_QUEUED: u8 = u8::MAX;
 
 static INITIALIZED: AtomicBool = AtomicBool::new(false);
 
@@ -735,7 +768,7 @@ pub fn refresh_priority(tid: usize) {
                 None => return,
             };
             let mut best = base;
-            for t in 0..MAX_TASKS {
+            for t in tids() {
                 if crate::ipc::blocked_on(t) == Some(cur) {
                     if let Some(ref waiter) = *slot(t) {
                         if waiter.priority < best {
@@ -861,55 +894,95 @@ pub fn priority_of(tid: usize) -> usize {
 /// # Safety
 /// Interrupts must be off.
 unsafe fn best_ready_band() -> Option<usize> { unsafe {
-    (0..NUM_PRIORITIES).find(|&p| READY_COUNT[p] > 0)
+    (0..NUM_PRIORITIES).find(|&p| READY[p].0 != END)
+}}
+
+/// Put `tid` in band `p`'s queue, last or first.
+///
+/// # Safety
+/// Interrupts off, and `tid` is in no queue.
+unsafe fn link_ready(tid: usize, p: usize, first: bool) { unsafe {
+    let (head, tail) = READY[p];
+    let t = tid as u16;
+    st(tid).queued = p as u8;
+    if head == END {
+        (st(tid).run_next, st(tid).run_prev) = (END, END);
+        READY[p] = (t, t);
+    } else if first {
+        (st(tid).run_next, st(tid).run_prev) = (head, END);
+        st(head as usize).run_prev = t;
+        READY[p].0 = t;
+    } else {
+        (st(tid).run_next, st(tid).run_prev) = (END, tail);
+        st(tail as usize).run_next = t;
+        READY[p].1 = t;
+    }
+}}
+
+/// Take `tid` out of the queue it is in, if it is in one.
+///
+/// # Safety
+/// Interrupts off.
+unsafe fn unlink_ready(tid: usize) { unsafe {
+    let p = st(tid).queued;
+    if p == NOT_QUEUED {
+        return;
+    }
+    let p = p as usize;
+    let (next, prev) = (st(tid).run_next, st(tid).run_prev);
+    if prev == END {
+        READY[p].0 = next;
+    } else {
+        st(prev as usize).run_next = next;
+    }
+    if next == END {
+        READY[p].1 = prev;
+    } else {
+        st(next as usize).run_prev = prev;
+    }
+    st(tid).queued = NOT_QUEUED;
+    (st(tid).run_next, st(tid).run_prev) = (END, END);
 }}
 
 /// Dequeue the next ready task, best band first.
 unsafe fn dequeue_ready() -> Option<usize> { unsafe {
     for p in 0..NUM_PRIORITIES {
-        // What in the band is still ready, kept in the order it was queued
-        // — dead and blocked tasks may still be in it — and which of it is
-        // to go: one put at the front, the longest there first; or the one
-        // that has run least, as the band sees it, passing over one that
-        // has just yielded when anything else is ready.
-        let head = READY_HEAD[p];
-        let mut kept = 0;
+        // What in the band is still ready — dead and blocked tasks may still
+        // be in it, and are taken out — and which of it is to go: one put at
+        // the front, the first of them; or the one that has run least, as the
+        // band sees it, passing over one that has just yielded when anything
+        // else is ready.
         let mut front: Option<usize> = None;
         let mut least: Option<(usize, u64)> = None;
         let mut least_yielded: Option<(usize, u64)> = None;
-        for k in 0..READY_COUNT[p] {
-            let tid = READY_QUEUE[p][(head + k) % MAX_TASKS];
-            if !matches!(*slot(tid), Some(ref t) if t.state == TaskState::Ready) {
+        let mut t = READY[p].0;
+        while t != END {
+            let tid = t as usize;
+            t = st(tid).run_next;
+            if !matches!(*slot(tid), Some(ref task) if task.state == TaskState::Ready) {
+                unlink_ready(tid);
                 continue;
             }
-            READY_QUEUE[p][(head + kept) % MAX_TASKS] = tid;
             let ran = st(tid).vrun;
             if st(tid).front {
-                front = front.or(Some(kept));
+                front = front.or(Some(tid));
             } else if st(tid).yielded {
                 if least_yielded.is_none_or(|(_, r)| ran < r) {
-                    least_yielded = Some((kept, ran));
+                    least_yielded = Some((tid, ran));
                 }
             } else if least.is_none_or(|(_, r)| ran < r) {
-                least = Some((kept, ran));
+                least = Some((tid, ran));
             }
-            kept += 1;
         }
-        let chosen = front.or(least.map(|(i, _)| i)).or(least_yielded.map(|(i, _)| i));
-        let Some(i) = chosen else {
-            READY_COUNT[p] = 0;
-            READY_TAIL[p] = head;
+        let Some(tid) = front.or(least.map(|(i, _)| i)).or(least_yielded.map(|(i, _)| i)) else {
             continue;
         };
-        let tid = READY_QUEUE[p][(head + i) % MAX_TASKS];
-        for j in i..kept - 1 {
-            READY_QUEUE[p][(head + j) % MAX_TASKS] = READY_QUEUE[p][(head + j + 1) % MAX_TASKS];
-        }
-        READY_COUNT[p] = kept - 1;
-        READY_TAIL[p] = (head + kept - 1) % MAX_TASKS;
+        unlink_ready(tid);
         // A yield is one turn passed, by whoever is left.
-        for j in 0..kept - 1 {
-            st(READY_QUEUE[p][(head + j) % MAX_TASKS]).yielded = false;
+        let mut t = READY[p].0;
+        while t != END {
+            st(t as usize).yielded = false;
+            t = st(t as usize).run_next;
         }
         st(tid).front = false;
         st(tid).yielded = false;
@@ -942,19 +1015,20 @@ unsafe fn join_band(tid: usize, p: usize) { unsafe {
 
 /// Add a task TID to the back of the ready queue. Not a held one: that is
 /// queued when its program is continued. And never the idle loop.
+///
+/// One already queued in its band stays where it is; one queued in another
+/// band, which it has since left, goes to the back of this one.
 unsafe fn enqueue(tid: usize) { unsafe {
     if tid == 0 || st(tid).held {
         return;
     }
     let p = priority_of(tid);
-    if READY_COUNT[p] >= MAX_TASKS {
-        crate::console::puts(b"scheduler: ready queue full, dropping task\n");
+    if st(tid).queued == p as u8 {
         return;
     }
+    unlink_ready(tid);
     join_band(tid, p);
-    READY_QUEUE[p][READY_TAIL[p]] = tid;
-    READY_TAIL[p] = (READY_TAIL[p] + 1) % MAX_TASKS;
-    READY_COUNT[p] += 1;
+    link_ready(tid, p, false);
 }}
 
 /// Put a task at the *front* of the ready queue, so it runs next.
@@ -963,15 +1037,10 @@ unsafe fn enqueue_front(tid: usize) { unsafe {
         return;
     }
     let p = priority_of(tid);
-    if READY_COUNT[p] >= MAX_TASKS {
-        crate::console::puts(b"scheduler: ready queue full, dropping task\n");
-        return;
-    }
+    unlink_ready(tid);
     join_band(tid, p);
     st(tid).front = true;
-    READY_HEAD[p] = (READY_HEAD[p] + MAX_TASKS - 1) % MAX_TASKS;
-    READY_QUEUE[p][READY_HEAD[p]] = tid;
-    READY_COUNT[p] += 1;
+    link_ready(tid, p, true);
 }}
 
 /// Take a task out of every ready queue it is in.
@@ -979,18 +1048,7 @@ unsafe fn enqueue_front(tid: usize) { unsafe {
 /// # Safety
 /// Interrupts must be off.
 unsafe fn unqueue(tid: usize) { unsafe {
-    for p in 0..NUM_PRIORITIES {
-        let mut kept = 0;
-        for k in 0..READY_COUNT[p] {
-            let t = READY_QUEUE[p][(READY_HEAD[p] + k) % MAX_TASKS];
-            if t != tid {
-                READY_QUEUE[p][(READY_HEAD[p] + kept) % MAX_TASKS] = t;
-                kept += 1;
-            }
-        }
-        READY_COUNT[p] = kept;
-        READY_TAIL[p] = (READY_HEAD[p] + kept) % MAX_TASKS;
-    }
+    unlink_ready(tid);
 }}
 
 /// Hold a task: it does not run again until [`release_task`]. For a program
@@ -1400,7 +1458,7 @@ pub fn task_of_pid(pid: u64) -> Option<usize> {
     let flags = irq_save();
     let found = unsafe {
         let is = |want_dead: bool| {
-            (2..MAX_TASKS).find(|&i| {
+            tids().filter(|&i| i >= 2).find(|&i| {
                 st(i).process_id == pid
                     && matches!(*slot(i), Some(ref t) if (t.state == TaskState::Dead) == want_dead)
             })
@@ -1460,7 +1518,7 @@ pub fn sys_wait_for(target: u64, how: Wait) -> u64 {
                 // by an exec from another thread, still has the program's id
                 // until it is taken apart, and the task that took its place
                 // is the one to wait for.
-                let child = (1..MAX_TASKS).find(|&i| {
+                let child = tids().filter(|&i| i >= 1).find(|&i| {
                     st(i).process_id == target
                         && (*slot(i)).as_ref().is_some_and(|t| t.parent_tid == parent)
                         && !joined_by_word(i)
@@ -1493,7 +1551,7 @@ pub fn sys_wait_for(target: u64, how: Wait) -> u64 {
             // Not one that was ended from another processor and is still
             // running there: it is collected when that processor has left
             // it, and the wait below is woken then.
-            for i in 1..MAX_TASKS {
+            for i in tids().filter(|&i| i >= 1) {
                 let collectable = mine(i)
                     && !st(i).reaped
                     && !st(i).unannounced
@@ -1511,7 +1569,7 @@ pub fn sys_wait_for(target: u64, how: Wait) -> u64 {
             }
             // Or one that has stopped or started, if that was asked for.
             if how.reports != 0 {
-                for i in 1..MAX_TASKS {
+                for i in tids().filter(|&i| i >= 1) {
                     let alive = mine(i) && matches!(*slot(i), Some(ref t) if t.state != TaskState::Dead);
                     if !alive {
                         continue;
@@ -1525,7 +1583,7 @@ pub fn sys_wait_for(target: u64, how: Wait) -> u64 {
             }
 
             // Check if we have any living children of the kind asked for at all
-            if !(1..MAX_TASKS).any(mine) {
+            if !tids().filter(|&i| i >= 1).any(mine) {
                 irq_restore(flags);
                 return u64::MAX;
             }
@@ -1697,14 +1755,12 @@ pub fn end_program(tid: usize, code: i32) -> Result<(), ()> {
         exit_program(code);
     }
     let mut ended = Err(());
-    for other in 2..MAX_TASKS {
-        let theirs_too = unsafe {
-            matches!(*slot(other), Some(ref t) if t.space == theirs && t.state != TaskState::Dead)
-        };
-        if theirs_too && end_other(other, code).is_ok() {
+    each_task_of(theirs, |other| {
+        let alive = unsafe { matches!(*slot(other), Some(ref t) if t.state != TaskState::Dead) };
+        if other >= 2 && alive && end_other(other, code).is_ok() {
             ended = Ok(());
         }
-    }
+    });
     irq_restore(flags);
     ended
 }
@@ -1828,14 +1884,12 @@ pub fn exit_program(code: i32) -> ! {
     let flags = irq_save();
     let space = unsafe { (*slot(me)).as_ref().map_or(0, |t| t.space) };
     if space != 0 {
-        for tid in 2..MAX_TASKS {
-            let sibling = unsafe {
-                matches!(*slot(tid), Some(ref t) if tid != me && t.space == space && t.state != TaskState::Dead)
-            };
-            if sibling {
+        each_task_of(space, |tid| {
+            let sibling = unsafe { matches!(*slot(tid), Some(ref t) if tid != me && t.state != TaskState::Dead) };
+            if tid >= 2 && sibling {
                 let _ = end_other(tid, code);
             }
-        }
+        });
     }
     irq_restore(flags);
     exit_with(code)
@@ -2029,12 +2083,20 @@ fn run_ready() -> bool {
 /// parent, or whose parent is gone. A task its parent waits for is reaped by
 /// the wait itself.
 pub fn reap_dead() {
-    for i in 1..MAX_TASKS {
+    let mut at = 1;
+    loop {
         // One task at a time with interrupts off, so a parent reaping the
         // child it just collected can never find it half torn down.
         let flags = irq_save();
-        unsafe { reap(i) };
+        let next = unsafe { table().next_used(at) };
+        if let Some(i) = next {
+            unsafe { reap(i) };
+            at = i + 1;
+        }
         irq_restore(flags);
+        if next.is_none() {
+            break;
+        }
     }
 }
 
@@ -2044,12 +2106,18 @@ pub fn reap_dead() {
 ///
 /// Must run with interrupts off. Nothing in here yields.
 unsafe fn reap(i: usize) { unsafe {
-    const _: () = assert!(MAX_TASKS <= 64, "the orphan set is a u64");
-    let mut pending: u64 = 1 << i;
-    while pending != 0 {
-        let t = pending.trailing_zeros() as usize;
-        pending &= pending - 1;
-        pending |= reap_one(t);
+    // Its children are nobody's now, and the dead among them are taken
+    // apart too, and theirs: a sweep for dead tasks with no parent, again
+    // for as long as one of them had dead children of its own.
+    let mut more = reap_one(i);
+    while more {
+        more = false;
+        let mut at = 1;
+        while let Some(j) = table().next_used(at) {
+            at = j + 1;
+            let orphan = matches!(*slot(j), Some(ref t) if t.state == TaskState::Dead && t.parent_tid == 0);
+            more |= orphan && reap_one(j);
+        }
     }
 }}
 
@@ -2082,17 +2150,17 @@ pub fn close_descriptors(tid: usize) {
     crate::cap::task_gone(tid);
 }
 
-unsafe fn reap_one(i: usize) -> u64 { unsafe {
+unsafe fn reap_one(i: usize) -> bool { unsafe {
     let Some(ref mut task) = *slot(i) else {
-        return 0;
+        return false;
     };
     if task.state != TaskState::Dead {
-        return 0;
+        return false;
     }
     let parent = task.parent_tid;
     let can_reap = st(i).reaped || parent == 0 || (*slot(parent)).is_none();
     if !can_reap {
-        return 0;
+        return false;
     }
     // Its parent was waiting for it, has been woken to collect it, and has
     // not run yet. The parent reads the child's name when it does, and takes
@@ -2101,7 +2169,7 @@ unsafe fn reap_one(i: usize) -> u64 { unsafe {
     // nothing could: the parent was ready, and the idle loop runs when
     // nothing is. With two, the parent was told its child was process 0.
     if parent != 0 && st(parent).wait_result == i {
-        return 0;
+        return false;
     }
     // Ended from another processor, and still running there: what is freed
     // below is what it is standing on. That processor has been interrupted
@@ -2109,7 +2177,7 @@ unsafe fn reap_one(i: usize) -> u64 { unsafe {
     // to do, tries again.
     if st(i).on_cpu != NO_CPU {
         REAP_WANTED.store(true, Ordering::Relaxed);
-        return 0;
+        return false;
     }
     // For a task that died some way other than `exit_with` or `kill_task` —
     // a kernel task, say. Ordinarily it left its table when it died.
@@ -2165,20 +2233,20 @@ unsafe fn reap_one(i: usize) -> u64 { unsafe {
     st(i).unannounced = false;
     st(i).unwaited = false;
     crate::job::forget(i);
+    // Dead, it may still be in a ready queue, which goes through its record.
+    unlink_ready(i);
     table().empty(i);
 
     // Left naming this TID, its children would wait on a parent that is gone,
     // and whatever took the slot next would find them its own — collected by
     // its sys_wait, counted as its threads, and startable by it with whatever
     // user ID they were made with.
-    let mut dead = 0u64;
-    for j in 1..MAX_TASKS {
+    let mut dead = false;
+    for j in tids().filter(|&j| j >= 1) {
         if let Some(ref mut child) = *slot(j) {
             if child.parent_tid == i {
                 child.parent_tid = 0;
-                if child.state == TaskState::Dead {
-                    dead |= 1 << j;
-                }
+                dead |= child.state == TaskState::Dead;
             }
         }
     }
@@ -2352,7 +2420,7 @@ pub fn parent_of(tid: usize) -> Option<usize> {
 pub fn children_of(tid: usize) -> usize {
     unsafe {
         let mut n = 0;
-        for i in 1..MAX_TASKS {
+        for i in tids().filter(|&i| i >= 1) {
             if let Some(ref t) = *slot(i) {
                 if t.parent_tid == tid && t.state != TaskState::Dead {
                     n += 1;
@@ -2655,7 +2723,7 @@ pub fn unpin() {
 /// the page at `va`. Interrupts must be off.
 pub fn pinned(space: u64, va: u64) -> bool {
     unsafe {
-        for tid in 1..MAX_TASKS {
+        for tid in tids().filter(|&t| t >= 1) {
             let n = st(tid).npinned as usize;
             if n == 0 {
                 continue;
@@ -2671,43 +2739,48 @@ pub fn pinned(space: u64, va: u64) -> bool {
     false
 }
 
-/// A bit for every task of program `space`, living or not yet taken apart:
-/// whose frames are the program's.
-pub fn tasks_of_space_mask(space: u64) -> u64 {
-    const _: () = assert!(MAX_TASKS <= 64, "a bit a task");
-    let mut mask = 0u64;
+/// Every task of program `space`, ended or not, until it is taken apart —
+/// the idle task aside — to `f`, with interrupts off.
+pub fn each_task_of(space: u64, mut f: impl FnMut(usize)) {
+    if space == 0 {
+        return;
+    }
     let flags = irq_save();
     unsafe {
-        for t in 1..MAX_TASKS {
+        for t in tids().filter(|&t| t >= 1) {
             if matches!(*slot(t), Some(ref task) if task.space == space) {
-                mask |= 1 << t;
+                f(t);
             }
         }
     }
     irq_restore(flags);
-    mask
+}
+
+/// Whether task `tid` is, or was, a task of program `space`.
+pub fn task_in_space(tid: usize, space: u64) -> bool {
+    let flags = irq_save();
+    let is = space != 0 && unsafe { matches!(*slot(tid), Some(ref t) if t.space == space) };
+    irq_restore(flags);
+    is
 }
 
 /// Every task of the process `tid` is a task of that has not been taken
-/// apart, into `out`: its threads, dead or alive, and what it began as.
-/// Returns how many.
-pub fn tasks_of_process(tid: usize, out: &mut [usize]) -> usize {
+/// apart — its threads, dead or alive, and what it began as — to `f`, with
+/// interrupts off.
+pub fn each_task_of_process(tid: usize, mut f: impl FnMut(usize)) {
     if tid >= MAX_TASKS {
-        return 0;
+        return;
     }
-    let mut n = 0;
     let flags = irq_save();
     unsafe {
         let pid = st(tid).process_id;
-        for t in 0..MAX_TASKS {
-            if n < out.len() && (*slot(t)).is_some() && st(t).process_id == pid {
-                out[n] = t;
-                n += 1;
+        for t in tids() {
+            if st(t).process_id == pid {
+                f(t);
             }
         }
     }
     irq_restore(flags);
-    n
 }
 
 /// The processor task `tid` is running on, if it is running. Interrupts must
@@ -2743,7 +2816,7 @@ pub fn current_is_privileged() -> bool {
 pub fn space_gives_memory(space: u64) -> bool {
     unsafe {
         let mut any = false;
-        for tid in 1..MAX_TASKS {
+        for tid in tids().filter(|&t| t >= 1) {
             if let Some(ref t) = *slot(tid) {
                 if t.space == space && t.state != TaskState::Dead {
                     if t.base_priority < PRIO_NORMAL {
@@ -2986,7 +3059,7 @@ pub fn space_in_use(space: u64) -> bool {
     let flags = irq_save();
     let used = unsafe {
         space_has_live_task(space)
-            || (1..MAX_TASKS).any(|i| {
+            || tids().filter(|&i| i >= 1).any(|i| {
                 st(i).on_cpu != NO_CPU && matches!(*slot(i), Some(ref t) if t.space == space)
             })
     };
@@ -3117,7 +3190,7 @@ pub fn exec_into(cr3: usize, entry: u64, rsp: u64) -> Result<(), ()> {
 /// Interrupts off.
 unsafe fn end_siblings(caller: usize, space: u64) { unsafe {
     let live = |t: usize| matches!(*slot(t), Some(ref x) if x.space == space && x.state != TaskState::Dead);
-    let began = (1..MAX_TASKS).find(|&t| t != caller && live(t) && st(t).process_id == crate::cap::endpoint_of(t));
+    let began = tids().filter(|&t| t >= 1).find(|&t| t != caller && live(t) && st(t).process_id == crate::cap::endpoint_of(t));
     if let Some(first) = began {
         let parent = (*slot(first)).as_ref().map_or(0, |t| t.parent_tid);
         if let Some(me) = (*slot(caller)).as_mut() {
@@ -3128,7 +3201,7 @@ unsafe fn end_siblings(caller: usize, space: u64) { unsafe {
             unblock_task(parent);
         }
     }
-    for t in 1..MAX_TASKS {
+    for t in tids().filter(|&t| t >= 1) {
         if t != caller && live(t) {
             st(t).unwaited = true;
             let _ = end_other(t, -9);

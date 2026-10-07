@@ -45,13 +45,15 @@ fn irq_restore(flags: u64) {
 /// each field was an array of `MAX_TASKS`, and an id with no task reads as
 /// `PerTask::new()` — what an empty slot of those arrays held.
 pub struct PerTask {
-    /// The process group and the session each task's process is in.
+    /// The process group and the session the task's process is in.
     pgid: u64,
     sid: u64,
-    /// The signal that stopped the program each task is of; 0 while it runs.
+    /// The signal that stopped the program the task is of; 0 while it runs.
     stopped: u8,
     /// What a process's parent has not been told yet.
     report: u8,
+    /// Its group is to be hung up on ([`hang_up`]).
+    hang_up: bool,
 }
 
 impl PerTask {
@@ -61,6 +63,7 @@ impl PerTask {
             sid: 0,
             stopped: 0,
             report: 0,
+            hang_up: false,
         }
     }
 }
@@ -154,6 +157,7 @@ pub fn forget(tid: usize) {
             st(tid).sid = 0;
             st(tid).stopped = 0;
             st(tid).report = 0;
+            st(tid).hang_up = false;
         }
     }
 }
@@ -184,38 +188,44 @@ pub fn stopped_by(tid: usize) -> u8 {
     if tid < MAX_TASKS { unsafe { st(tid).stopped } } else { 0 }
 }
 
+/// Every task there is but the idle task and the first, which are nobody's
+/// job: what the walks here go through.
+fn tasks() -> impl Iterator<Item = usize> {
+    scheduler::tids().filter(|&t| t >= 2)
+}
+
 /// Every live task of process `pid`, to `each`.
 ///
 /// Interrupts are off.
 fn each_task_of(pid: u64, mut each: impl FnMut(usize)) {
-    for tid in 2..MAX_TASKS {
+    for tid in tasks() {
         if matches!(live(tid), Some((p, _, _)) if p == pid) {
             each(tid);
         }
     }
 }
 
-/// One live task from each process in group `pgid`, into `out`. Returns how
-/// many.
-pub fn members(pgid: u64, out: &mut [usize]) -> usize {
-    let mut n = 0;
+/// The next process in group `pgid`, by its table's number at or past
+/// `*from`, and a live task of it to raise a signal at; `*from` is moved past
+/// it. One at a time, because a signal raised for one may end it, or the
+/// caller.
+pub fn next_member(pgid: u64, from: &mut usize) -> Option<usize> {
     if pgid == 0 {
-        return 0;
+        return None;
     }
-    let flags = irq_save();
-    for tid in 2..MAX_TASKS {
-        let Some((pid, _, _)) = live(tid) else { continue };
-        if unsafe { st(tid).pgid } != pgid {
-            continue;
-        }
-        let seen = out[..n].iter().any(|&t| scheduler::pid_of(t) == pid);
-        if !seen && n < out.len() {
-            out[n] = tid;
-            n += 1;
+    while let Some((table, first)) = crate::fdtable::next_program(*from) {
+        *from = table + 1;
+        let mut at = None;
+        crate::fdtable::each_task(first, |t| {
+            if at.is_none() && t >= 2 && unsafe { st(t).pgid } == pgid {
+                at = Some(t);
+            }
+        });
+        if at.is_some() {
+            return at;
         }
     }
-    irq_restore(flags);
-    n
+    None
 }
 
 /// Whether group `pgid` exists in session `sid`: some process is in it,
@@ -231,7 +241,7 @@ pub fn group_in_session(pgid: u64, sid: u64) -> bool {
         return false;
     }
     let flags = irq_save();
-    let found = (2..MAX_TASKS)
+    let found = tasks()
         .any(|tid| scheduler::task_info(tid).is_some() && unsafe { st(tid).pgid == pgid && st(tid).sid == sid });
     irq_restore(flags);
     found
@@ -261,7 +271,7 @@ fn tied(tid: usize) -> bool {
 /// command and the login that started them, for good.
 pub fn orphaned(pgid: u64) -> bool {
     let flags = irq_save();
-    let tied_in = (2..MAX_TASKS).any(|tid| unsafe { st(tid).pgid } == pgid && tied(tid));
+    let tied_in = tasks().any(|tid| unsafe { st(tid).pgid } == pgid && tied(tid));
     irq_restore(flags);
     !tied_in
 }
@@ -277,12 +287,12 @@ pub fn set_pgid(caller: usize, pid: u64, pgid: u64) -> Result<(), Refused> {
     let out = (|| {
         let mine = scheduler::pid_of(caller);
         let pid = if pid == 0 { mine } else { pid };
-        let target = (2..MAX_TASKS)
+        let target = tasks()
             .find(|&tid| matches!(live(tid), Some((p, _, _)) if p == pid))
             .ok_or(Refused::NoSuch)?;
         if pid != mine {
             // A child: some task of it was made by a task of the caller's.
-            let is_child = (2..MAX_TASKS).any(|tid| {
+            let is_child = tasks().any(|tid| {
                 matches!(live(tid), Some((p, parent, _)) if p == pid && scheduler::pid_of(parent) == mine)
             });
             if !is_child {
@@ -313,7 +323,7 @@ pub fn set_sid(caller: usize) -> Result<u64, Refused> {
     let flags = irq_save();
     let pid = scheduler::pid_of(caller);
     let leads = pid == 0
-        || (2..MAX_TASKS).any(|tid| live(tid).is_some() && unsafe { st(tid).pgid } == pid);
+        || tasks().any(|tid| live(tid).is_some() && unsafe { st(tid).pgid } == pid);
     let out = if leads {
         Err(Refused::NotAllowed)
     } else {
@@ -401,12 +411,11 @@ pub fn take_report(tid: usize, want: u8) -> Option<u8> {
 /// its default may be the end of the caller, or a stop, and the rest must
 /// have been told by then. Returns how many were told.
 pub fn raise_for_group(pgid: u64, signo: u8) -> usize {
-    let mut tasks = [0usize; MAX_TASKS];
-    let n = members(pgid, &mut tasks);
     let mine = scheduler::pid_of(scheduler::current_tid());
     let mut told = 0;
     let mut own = None;
-    for &tid in &tasks[..n] {
+    let mut from = 0;
+    while let Some(tid) = next_member(pgid, &mut from) {
         if scheduler::pid_of(tid) == mine {
             own = Some(tid);
         } else if crate::signal::raise(tid, signo).is_ok() {
@@ -421,9 +430,10 @@ pub fn raise_for_group(pgid: u64, signo: u8) -> usize {
     told
 }
 
-/// Groups to hang up on: orphaned, with something stopped in them.
-static mut HANGUPS: [u64; MAX_TASKS] = [0; MAX_TASKS];
-static mut HANGUP_COUNT: usize = 0;
+/// A group is to be hung up on: orphaned, with something stopped in it.
+/// Which groups is marked on their tasks (`PerTask::hang_up`), so that
+/// nothing has to be found room for at a death.
+static mut HANGUPS: bool = false;
 
 /// The last task of a process has died. `tid` is that task, already marked
 /// dead.
@@ -453,12 +463,13 @@ pub fn process_ended(tid: usize) {
     // The groups this process tied to its session: its own, if its parent
     // was the tie, and each child's, if it was theirs.
     let check = |g: u64| unsafe {
-        let tied_still = (2..MAX_TASKS).any(|t| st(t).pgid == g && tied(t));
-        let has_stopped = (2..MAX_TASKS).any(|t| live(t).is_some() && st(t).pgid == g && st(t).stopped != 0);
-        let queued = (&*core::ptr::addr_of!(HANGUPS))[..HANGUP_COUNT].contains(&g);
-        if g != 0 && !tied_still && has_stopped && !queued && HANGUP_COUNT < MAX_TASKS {
-            HANGUPS[HANGUP_COUNT] = g;
-            HANGUP_COUNT += 1;
+        let tied_still = tasks().any(|t| st(t).pgid == g && tied(t));
+        let has_stopped = tasks().any(|t| live(t).is_some() && st(t).pgid == g && st(t).stopped != 0);
+        if g != 0 && !tied_still && has_stopped {
+            for t in tasks().filter(|&t| st(t).pgid == g) {
+                st(t).hang_up = true;
+            }
+            *core::ptr::addr_of_mut!(HANGUPS) = true;
         }
     };
     if let Some((_, _, _, parent)) = scheduler::task_info(tid) {
@@ -469,7 +480,7 @@ pub fn process_ended(tid: usize) {
             check(group);
         }
     }
-    for child in 2..MAX_TASKS {
+    for child in tasks() {
         let Some((_, parent, _)) = live(child) else { continue };
         if parent == tid && unsafe { st(child).sid == session && st(child).pgid != group } {
             check(unsafe { st(child).pgid });
@@ -485,27 +496,39 @@ pub fn process_ended(tid: usize) {
 /// seen to before it is raised: this may be the last thing that is done
 /// here. What is still on the list is still there at the next tick.
 pub fn hang_up() {
+    if !unsafe { *core::ptr::addr_of!(HANGUPS) } {
+        return;
+    }
     loop {
+        // A group marked, its marks taken off before anything is raised.
         let flags = irq_save();
         let group = unsafe {
-            if HANGUP_COUNT == 0 {
-                None
-            } else {
-                HANGUP_COUNT -= 1;
-                Some(HANGUPS[HANGUP_COUNT])
+            let group = tasks().find(|&t| st(t).hang_up).map(|t| st(t).pgid);
+            match group {
+                Some(g) => {
+                    for t in tasks().filter(|&t| st(t).pgid == g) {
+                        st(t).hang_up = false;
+                    }
+                }
+                None => *core::ptr::addr_of_mut!(HANGUPS) = false,
             }
+            group
         };
         irq_restore(flags);
         let Some(group) = group else { return };
-        let mut tasks = [0usize; MAX_TASKS];
-        let n = members(group, &mut tasks);
         let mine = scheduler::pid_of(scheduler::current_tid());
-        for &tid in tasks[..n].iter().filter(|&&t| scheduler::pid_of(t) != mine) {
-            let _ = crate::signal::raise(tid, SIGHUP);
-            let _ = crate::signal::raise(tid, SIGCONT);
+        let mut own = None;
+        let mut from = 0;
+        while let Some(tid) = next_member(group, &mut from) {
+            if scheduler::pid_of(tid) == mine {
+                own = Some(tid);
+            } else {
+                let _ = crate::signal::raise(tid, SIGHUP);
+                let _ = crate::signal::raise(tid, SIGCONT);
+            }
         }
         // Running, so not stopped, and there is nothing to continue.
-        if let Some(&tid) = tasks[..n].iter().find(|&&t| scheduler::pid_of(t) == mine) {
+        if let Some(tid) = own {
             let _ = crate::signal::raise(tid, SIGHUP);
         }
     }

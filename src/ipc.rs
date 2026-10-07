@@ -140,8 +140,16 @@ pub struct PerTask {
     /// Atomically read-and-cleared when consumed by sys_recv/sys_recv_timeout.
     notify: u64,
     /// Per-task signal kill deadline (PIT tick). 0 = no pending signal deadline.
-    /// When nonzero, the task will be force-killed after the deadline expires.
+    /// When nonzero, the task will be force-killed after the deadline expires,
+    /// and it is on the list the tick looks at (`DEADLINES`), between these.
     signal_deadline: u64,
+    deadline_next: u16,
+    deadline_prev: u16,
+    /// The watches it has made, still waiting and owed; and the watches on
+    /// it (`Watch`).
+    watching: u16,
+    owed: u16,
+    watched: u16,
 }
 
 impl PerTask {
@@ -154,6 +162,11 @@ impl PerTask {
             recv_rotor: 0,
             notify: 0,
             signal_deadline: 0,
+            deadline_next: END,
+            deadline_prev: END,
+            watching: END,
+            owed: END,
+            watched: END,
         }
     }
 }
@@ -251,43 +264,41 @@ pub fn withdraw_offer(client: usize) {
 
 
 
-/// Who has asked to be told when each task dies.
+/// A watch: `watcher` asked to be told when a task — by its number — or a
+/// program — by its space id — is gone. Made when it is asked for, it is on
+/// one of the watcher's two lists, of what it is still waiting for and of
+/// what it is owed (`PerTask::watching`, `owed`), and a watch of a task is on
+/// that task's list too (`PerTask::watched`). A death moves each watch of
+/// what died to its watcher's owed list, and the watcher's next receive
+/// collects it, and gives it back. Nothing is made at a death, so nothing can
+/// be full then.
 ///
-/// `WATCHERS[t]` is a bitmask of tasks wanting to hear about `t`, the same
-/// shape as an `Endpoint` set and for the same reason: TIDs are small and
-/// there are only 64 of them.
-static mut WATCHERS: [u64; MAX_TASKS] = [0; MAX_TASKS];
+/// They were sets, a bit for each task, in words: as many tasks as a word
+/// has bits, and a program's death in a list of sixty-four for each watcher.
+struct Watch {
+    watcher: u16,
+    /// The task watched, or [`END`] for a program.
+    task: u16,
+    /// The program watched, or 0 for a task.
+    space: u64,
+    /// Its death is owed to the watcher.
+    owed: bool,
+    /// The watcher's other watches, on the list this one is on.
+    next: u16,
+    prev: u16,
+    /// The watched task's other watches.
+    next_on: u16,
+    prev_on: u16,
+}
 
-/// Deaths a watcher is owed and has not yet collected: for each watcher, the
-/// tasks, one bit each.
-///
-/// A set and not a list, because a list has an end. It was eight long, on
-/// the reasoning that a watcher eight deaths behind is not doing its job —
-/// but one call can end more tasks than that with nobody having had a turn
-/// between: a signal for a process group ends every program in it, and
-/// that is every member of a pipeline when it is interrupted. The ninth
-/// was not told of, and whatever a server held for it, it held for good.
-static mut DEATHS: [u64; MAX_TASKS] = [0; MAX_TASKS];
-const _: () = assert!(MAX_TASKS <= 64, "a watcher's deaths are a u64");
+/// The end of a list through records: of watches, or of tasks.
+const END: u16 = u16::MAX;
 
-/// Who has asked to be told when each program — each address space — dies.
-///
-/// A program is gone when the last task running in it has died, which is when
-/// whatever it held as a program (its files, its working directory, its
-/// locks) can go. One entry per watched program, a bitmask of watchers; an
-/// entry is freed when its program dies or its last watcher does.
-const MAX_SPACE_WATCHES: usize = MAX_TASKS * 2;
-static mut SPACE_WATCHES: [(u64, u64); MAX_SPACE_WATCHES] = [(0, 0); MAX_SPACE_WATCHES];
-/// Program deaths a watcher has not collected yet, oldest first.
-///
-/// A program's id is too wide for a set of them to be a word, so this is a
-/// list, and as long as there can be tasks: one call cannot end more
-/// programs than there are, and a watcher that collects what it is owed
-/// before it watches anything else is never owed more. One that does not
-/// loses what does not fit, as it always did.
-const SPACE_DEATH_QUEUE: usize = MAX_TASKS;
-static mut SPACE_DEATHS: [[u64; SPACE_DEATH_QUEUE]; MAX_TASKS] = [[0; SPACE_DEATH_QUEUE]; MAX_TASKS];
-static mut SPACE_DEATHS_LEN: [usize; MAX_TASKS] = [0; MAX_TASKS];
+static mut WATCHES: crate::table::Table<Watch> = crate::table::Table::new(crate::table::MOST);
+
+/// The tasks with a signal deadline, linked through their records: what the
+/// tick looks at.
+static mut DEADLINES: u16 = END;
 
 /// Tag for a program's death: `data[0]` is its space id.
 pub const TAG_SPACE_DIED: u64 = 0xFFFF_0004;
@@ -326,8 +337,6 @@ fn irq_restore(flags: u64) {
     }
 }
 
-/// Asynchronous notification: OR `badge` into dest's notification word.
-/// Non-blocking. Wakes the dest task if it is RecvBlocked(0) or RecvBlocked(TID_ANY).
 /// Who is `tid` waiting on, if anyone.
 ///
 /// The scheduler asks this to work out who is doing work on whose behalf: a
@@ -367,16 +376,27 @@ pub fn sys_task_watch(watcher: usize, target: usize) -> Result<(), IpcError> {
         return Err(IpcError::DeadTask);
     }
     let flags = irq_save();
-    unsafe {
-        WATCHERS[target] |= 1u64 << watcher;
+    let result = unsafe {
         // A death it is owed under this number and has not collected is of
         // whoever had the number before, and it has just said it knows
         // somebody else is there now. Left, it would be taken for this
         // one's.
-        DEATHS[watcher] &= !(1u64 << target);
-    }
+        let mut w = st(watcher).owed;
+        while let Some(x) = watch(w) {
+            let next = x.next;
+            if x.task == target as u16 {
+                drop_watch(w);
+            }
+            w = next;
+        }
+        if watching(watcher, |x| x.task == target as u16) {
+            Ok(())
+        } else {
+            make_watch(watcher, target as u16, 0)
+        }
+    };
     irq_restore(flags);
-    Ok(())
+    result
 }
 
 /// Ask to be told when program `space` has no task left.
@@ -389,47 +409,213 @@ pub fn sys_space_watch(watcher: usize, space: u64) -> Result<(), IpcError> {
     }
     let flags = irq_save();
     let result = unsafe {
-        let table = &mut *core::ptr::addr_of_mut!(SPACE_WATCHES);
-        match table.iter().position(|e| e.0 == space) {
-            Some(i) => {
-                table[i].1 |= 1u64 << watcher;
-                Ok(())
-            }
-            None => match table.iter().position(|e| e.0 == 0) {
-                Some(i) => {
-                    table[i] = (space, 1u64 << watcher);
-                    Ok(())
-                }
-                None => Err(IpcError::WouldBlock),
-            },
+        if watching(watcher, |x| x.task == END && x.space == space) {
+            Ok(())
+        } else {
+            make_watch(watcher, END, space)
         }
     };
     irq_restore(flags);
     result
 }
 
+/// # Safety
+/// Interrupts are off.
+#[inline(always)]
+unsafe fn watches() -> &'static mut crate::table::Table<Watch> {
+    unsafe { &mut *core::ptr::addr_of_mut!(WATCHES) }
+}
+
+/// Watch `w`, unless it is the end of a list.
+///
+/// # Safety
+/// Interrupts are off.
+unsafe fn watch(w: u16) -> Option<&'static mut Watch> {
+    unsafe { if w == END { None } else { watches().get(w as usize) } }
+}
+
+/// Whether `watcher` is waiting for something `wanted` says yes to.
+///
+/// # Safety
+/// Interrupts are off.
+unsafe fn watching(watcher: usize, wanted: impl Fn(&Watch) -> bool) -> bool {
+    unsafe {
+        let mut w = st(watcher).watching;
+        while let Some(x) = watch(w) {
+            if wanted(x) {
+                return true;
+            }
+            w = x.next;
+        }
+        false
+    }
+}
+
+/// A watch by `watcher` of `task`, or of program `space`, on its lists.
+/// `WouldBlock` if there is no room for it.
+///
+/// # Safety
+/// Interrupts are off.
+unsafe fn make_watch(watcher: usize, task: u16, space: u64) -> Result<(), IpcError> {
+    unsafe {
+        let made = Watch { watcher: watcher as u16, task, space, owed: false, next: END, prev: END, next_on: END, prev_on: END };
+        let Some(w) = watches().lowest_free(0) else { return Err(IpcError::WouldBlock) };
+        if watches().fill_at(w, made).is_err() {
+            return Err(IpcError::WouldBlock);
+        }
+        let w = w as u16;
+        push(&mut st(watcher).watching, w);
+        if task != END {
+            push_on(&mut st(task as usize).watched, w);
+        }
+        Ok(())
+    }
+}
+
+/// Put watch `w` first on the watcher's list `head`.
+///
+/// # Safety
+/// Interrupts are off.
+unsafe fn push(head: &mut u16, w: u16) {
+    unsafe {
+        let Some(x) = watch(w) else { return };
+        x.next = *head;
+        x.prev = END;
+        if let Some(first) = watch(*head) {
+            first.prev = w;
+        }
+        *head = w;
+    }
+}
+
+/// Take watch `w` off the watcher's list `head`, which it is on.
+///
+/// # Safety
+/// Interrupts are off.
+unsafe fn remove(head: &mut u16, w: u16) {
+    unsafe {
+        let Some(x) = watch(w) else { return };
+        let (next, prev) = (x.next, x.prev);
+        match watch(prev) {
+            Some(before) => before.next = next,
+            None => *head = next,
+        }
+        if let Some(after) = watch(next) {
+            after.prev = prev;
+        }
+        (x.next, x.prev) = (END, END);
+    }
+}
+
+/// Put watch `w` first on the watched task's list `head`.
+///
+/// # Safety
+/// Interrupts are off.
+unsafe fn push_on(head: &mut u16, w: u16) {
+    unsafe {
+        let Some(x) = watch(w) else { return };
+        x.next_on = *head;
+        x.prev_on = END;
+        if let Some(first) = watch(*head) {
+            first.prev_on = w;
+        }
+        *head = w;
+    }
+}
+
+/// Take watch `w` off the watched task's list `head`, which it is on.
+///
+/// # Safety
+/// Interrupts are off.
+unsafe fn remove_on(head: &mut u16, w: u16) {
+    unsafe {
+        let Some(x) = watch(w) else { return };
+        let (next, prev) = (x.next_on, x.prev_on);
+        match watch(prev) {
+            Some(before) => before.next_on = next,
+            None => *head = next,
+        }
+        if let Some(after) = watch(next) {
+            after.prev_on = prev;
+        }
+        (x.next_on, x.prev_on) = (END, END);
+    }
+}
+
+/// Watch `w` is over, told or not: off every list it is on, and given back.
+/// False if there is no such watch.
+///
+/// # Safety
+/// Interrupts are off.
+unsafe fn drop_watch(w: u16) -> bool {
+    unsafe {
+        let Some(x) = watch(w) else { return false };
+        let watcher = x.watcher as usize;
+        if x.owed {
+            remove(&mut st(watcher).owed, w);
+        } else {
+            remove(&mut st(watcher).watching, w);
+            if x.task != END {
+                remove_on(&mut st(x.task as usize).watched, w);
+            }
+        }
+        watches().empty(w as usize);
+        true
+    }
+}
+
+/// What watch `w` waited for has gone: it is owed to its watcher, who is
+/// woken if it is sitting in a receive that would take it. False if there
+/// is no such watch.
+///
+/// # Safety
+/// Interrupts are off.
+unsafe fn owe(w: u16) -> bool {
+    unsafe {
+        let Some(x) = watch(w) else { return false };
+        let watcher = x.watcher as usize;
+        remove(&mut st(watcher).watching, w);
+        if x.task != END {
+            remove_on(&mut st(x.task as usize).watched, w);
+        }
+        x.owed = true;
+        push(&mut st(watcher).owed, w);
+        wake_receiving(watcher);
+        true
+    }
+}
+
+/// Wake `t` if it is sitting in a receive that would take a notice: from
+/// anybody, or from the kernel.
+///
+/// # Safety
+/// Interrupts are off.
+unsafe fn wake_receiving(t: usize) {
+    unsafe {
+        match st(t).task_ipc.state {
+            IpcState::RecvBlocked(from) if from == 0 || from == TID_ANY => {
+                st(t).task_ipc.state = IpcState::None;
+                scheduler::unblock_task(t);
+            }
+            _ => {}
+        }
+    }
+}
+
 /// Tell everyone watching program `space` that its last task has died.
 ///
-/// Interrupts are off: this is called from the scheduler as a task dies.
+/// Interrupts are off: this is called from the scheduler as a task dies. A
+/// program has no record here to keep its watchers on, and a program ends
+/// once: they are found among the watches.
 pub fn notify_space_watchers(space: u64) {
     unsafe {
-        let table = &mut *core::ptr::addr_of_mut!(SPACE_WATCHES);
-        let Some(i) = table.iter().position(|e| e.0 == space) else { return };
-        let mut mask = table[i].1;
-        table[i] = (0, 0);
-        while mask != 0 {
-            let w = mask.trailing_zeros() as usize;
-            mask &= mask - 1;
-            if SPACE_DEATHS_LEN[w] < SPACE_DEATH_QUEUE {
-                SPACE_DEATHS[w][SPACE_DEATHS_LEN[w]] = space;
-                SPACE_DEATHS_LEN[w] += 1;
-            }
-            match st(w).task_ipc.state {
-                IpcState::RecvBlocked(from) if from == 0 || from == TID_ANY => {
-                    st(w).task_ipc.state = IpcState::None;
-                    scheduler::unblock_task(w);
+        let mut at = 0;
+        while let Some(w) = watches().next_used(at) {
+            at = w + 1;
+            if let Some(x) = watches().get(w) {
+                if x.task == END && x.space == space && !x.owed {
+                    owe(w as u16);
                 }
-                _ => {}
             }
         }
     }
@@ -447,23 +633,34 @@ pub fn notify_watchers(dead: usize) {
     }
     let flags = irq_save();
     unsafe {
-        let mut mask = WATCHERS[dead];
-        WATCHERS[dead] = 0;
-        while mask != 0 {
-            let w = mask.trailing_zeros() as usize;
-            mask &= mask - 1;
-            DEATHS[w] |= 1u64 << dead;
-            // Wake it if it is sitting in a receive that would take this.
-            match st(w).task_ipc.state {
-                IpcState::RecvBlocked(from) if from == 0 || from == TID_ANY => {
-                    st(w).task_ipc.state = IpcState::None;
-                    scheduler::unblock_task(w);
-                }
-                _ => {}
-            }
-        }
+        while st(dead).watched != END && owe(st(dead).watched) {}
+        st(dead).watched = END;
     }
     irq_restore(flags);
+}
+
+/// Take one owed notice of a kind `wanted` says yes to — a task's death or a
+/// program's — as the message that says it.
+///
+/// # Safety
+/// The caller holds interrupts off.
+unsafe fn take_owed(receiver: usize, wanted: impl Fn(&Watch) -> bool) -> Option<Message> {
+    unsafe {
+        let mut w = st(receiver).owed;
+        while let Some(x) = watch(w) {
+            if wanted(x) {
+                let msg = if x.task != END {
+                    Message { sender: 0, tag: TAG_TASK_DIED, data: [x.task as u64, 0, 0, 0, 0, 0] }
+                } else {
+                    Message { sender: 0, tag: TAG_SPACE_DIED, data: [x.space, 0, 0, 0, 0, 0] }
+                };
+                drop_watch(w);
+                return Some(msg);
+            }
+            w = x.next;
+        }
+        None
+    }
 }
 
 /// Take one pending death notification, if there is one.
@@ -471,14 +668,7 @@ pub fn notify_watchers(dead: usize) {
 /// # Safety
 /// The caller holds interrupts off.
 unsafe fn take_death(receiver: usize) -> Option<Message> {
-    unsafe {
-        if DEATHS[receiver] == 0 {
-            return None;
-        }
-        let dead = DEATHS[receiver].trailing_zeros() as u64;
-        DEATHS[receiver] &= DEATHS[receiver] - 1;
-        Some(Message { sender: 0, tag: TAG_TASK_DIED, data: [dead, 0, 0, 0, 0, 0] })
-    }
+    unsafe { take_owed(receiver, |x| x.task != END) }
 }
 
 /// Wake `pager`: an object of its has nothing mapping it any more, which
@@ -489,15 +679,7 @@ pub fn notify_object_idle(pager: usize) {
     if pager >= MAX_TASKS {
         return;
     }
-    unsafe {
-        match st(pager).task_ipc.state {
-            IpcState::RecvBlocked(from) if from == 0 || from == TID_ANY => {
-                st(pager).task_ipc.state = IpcState::None;
-                scheduler::unblock_task(pager);
-            }
-            _ => {}
-        }
-    }
+    unsafe { wake_receiving(pager) }
 }
 
 /// Ask `pager` to write what it has that is dirty (`TAG_OBJECT_CLEAN`).
@@ -602,15 +784,7 @@ unsafe fn take_any_death(receiver: usize) -> Option<Message> {
             st(receiver).clean_wanted = false;
             return Some(Message { sender: 0, tag: TAG_OBJECT_CLEAN, data: [0; 6] });
         }
-        if SPACE_DEATHS_LEN[receiver] == 0 {
-            return None;
-        }
-        let space = SPACE_DEATHS[receiver][0];
-        for i in 1..SPACE_DEATHS_LEN[receiver] {
-            SPACE_DEATHS[receiver][i - 1] = SPACE_DEATHS[receiver][i];
-        }
-        SPACE_DEATHS_LEN[receiver] -= 1;
-        Some(Message { sender: 0, tag: TAG_SPACE_DIED, data: [space, 0, 0, 0, 0, 0] })
+        take_owed(receiver, |x| x.task == END)
     }
 }
 
@@ -640,6 +814,8 @@ pub fn wake_sleeper(tid: usize) -> bool {
     woke
 }
 
+/// Asynchronous notification: OR `badge` into dest's notification word.
+/// Non-blocking. Wakes the dest task if it is RecvBlocked(0) or RecvBlocked(TID_ANY).
 pub fn sys_notify(dest: usize, badge: u64) -> Result<(), IpcError> {
     if dest >= MAX_TASKS || badge == 0 {
         return Err(IpcError::InvalidTid);
@@ -743,11 +919,13 @@ pub fn sys_signal(dest: usize, sig: u64) -> Result<(), IpcError> {
     irq_restore(flags);
 
     // Set force-kill deadline (only if not already set — don't extend)
+    let flags = irq_save();
     unsafe {
         if st(dest).signal_deadline == 0 {
-            st(dest).signal_deadline = crate::clock::after(SIGNAL_KILL_TIMEOUT);
+            set_deadline(dest, crate::clock::after(SIGNAL_KILL_TIMEOUT));
         }
     }
+    irq_restore(flags);
 
     Ok(())
 }
@@ -759,12 +937,47 @@ pub fn check_signal_deadlines() {
     // Already in interrupt context (IRQ handler), so no need for irq_save.
     let now = crate::clock::now();
     unsafe {
-        for tid in 2..MAX_TASKS {
-            let deadline = st(tid).signal_deadline;
-            if deadline != 0 && now >= deadline {
-                st(tid).signal_deadline = 0;
+        let mut t = *core::ptr::addr_of!(DEADLINES);
+        while t != END {
+            let tid = t as usize;
+            t = st(tid).deadline_next;
+            if now >= st(tid).signal_deadline {
+                set_deadline(tid, 0);
                 let _ = scheduler::kill_program(tid);
             }
+        }
+    }
+}
+
+/// Give `tid` a signal deadline at `at`, or none for 0: it is on the list
+/// the tick looks at while it has one.
+///
+/// # Safety
+/// Interrupts are off.
+unsafe fn set_deadline(tid: usize, at: u64) {
+    unsafe {
+        let had = st(tid).signal_deadline != 0;
+        st(tid).signal_deadline = at;
+        let head = &mut *core::ptr::addr_of_mut!(DEADLINES);
+        if !had && at != 0 {
+            st(tid).deadline_next = *head;
+            st(tid).deadline_prev = END;
+            if *head != END {
+                st(*head as usize).deadline_prev = tid as u16;
+            }
+            *head = tid as u16;
+        } else if had && at == 0 {
+            let (next, prev) = (st(tid).deadline_next, st(tid).deadline_prev);
+            if prev != END {
+                st(prev as usize).deadline_next = next;
+            } else {
+                *head = next;
+            }
+            if next != END {
+                st(next as usize).deadline_prev = prev;
+            }
+            st(tid).deadline_next = END;
+            st(tid).deadline_prev = END;
         }
     }
 }
@@ -772,9 +985,9 @@ pub fn check_signal_deadlines() {
 /// Clear signal deadline for a task (called when task exits or is killed).
 pub fn clear_signal_deadline(tid: usize) {
     if tid < MAX_TASKS {
-        unsafe {
-            st(tid).signal_deadline = 0;
-        }
+        let flags = irq_save();
+        unsafe { set_deadline(tid, 0) };
+        irq_restore(flags);
     }
 }
 
@@ -851,8 +1064,7 @@ pub fn sys_recv(from: usize) -> Result<Message, IpcError> {
         }
         // Check if any sender is blocked waiting to send to us, starting one
         // past the last one served so that no sender can monopolise us.
-        for step in 0..MAX_TASKS {
-            let tid = (st(receiver).recv_rotor + step) % MAX_TASKS;
+        for tid in scheduler::tids_from(st(receiver).recv_rotor) {
             if tid == receiver {
                 continue;
             }
@@ -1211,8 +1423,7 @@ pub fn sys_recv_timeout(from: usize, timeout_ns: u64) -> Result<Message, IpcErro
         }
         // Check if any sender is blocked waiting to send to us (same as
         // sys_recv, round robin included).
-        for step in 0..MAX_TASKS {
-            let tid = (st(receiver).recv_rotor + step) % MAX_TASKS;
+        for tid in scheduler::tids_from(st(receiver).recv_rotor) {
             if tid == receiver {
                 continue;
             }
@@ -1404,7 +1615,7 @@ pub fn check_timeouts(now: u64) -> u64 {
     // Already in interrupt context (IRQ handler), interrupts are implicitly off.
     let mut next = u64::MAX;
     unsafe {
-        for tid in 0..MAX_TASKS {
+        for tid in scheduler::tids() {
             let deadline = st(tid).timeout;
             if deadline != 0 && now < deadline {
                 next = next.min(deadline);
@@ -1457,7 +1668,7 @@ pub fn fail_waiters(dead_tid: usize) {
     }
     let error_msg = Message { sender: dead_tid, tag: u64::MAX, data: [0; 6] };
     unsafe {
-        for tid in 0..MAX_TASKS {
+        for tid in scheduler::tids() {
             if tid == dead_tid {
                 continue;
             }
@@ -1495,23 +1706,17 @@ pub fn cleanup_task_ipc(dead_tid: usize) {
 
     let flags = irq_save();
     unsafe {
-        // Withdraw its watches and drop what it never collected. TIDs are
+        // Withdraw its watches and drop what it never collected, and the
+        // watches of it its death did not already tell of. TIDs are
         // recycled, so a registration left behind would fire for whoever
         // lands in the slot next.
-        WATCHERS[dead_tid] = 0;
-        DEATHS[dead_tid] = 0;
-        SPACE_DEATHS_LEN[dead_tid] = 0;
+        while st(dead_tid).watching != END && drop_watch(st(dead_tid).watching) {}
+        while st(dead_tid).owed != END && drop_watch(st(dead_tid).owed) {}
+        while st(dead_tid).watched != END && drop_watch(st(dead_tid).watched) {}
+        st(dead_tid).watching = END;
+        st(dead_tid).owed = END;
+        st(dead_tid).watched = END;
         st(dead_tid).clean_wanted = false;
-        let bit = !(1u64 << dead_tid);
-        for t in 0..MAX_TASKS {
-            WATCHERS[t] &= bit;
-        }
-        for e in (*core::ptr::addr_of_mut!(SPACE_WATCHES)).iter_mut() {
-            e.1 &= bit;
-            if e.1 == 0 {
-                *e = (0, 0);
-            }
-        }
         // Clear the dead task's own IPC state, timeout, notifications, and signal deadline
         st(dead_tid).task_ipc.state = IpcState::None;
         st(dead_tid).task_ipc.pending_msg = None;
@@ -1520,7 +1725,7 @@ pub fn cleanup_task_ipc(dead_tid: usize) {
         st(dead_tid).timeout = 0;
         st(dead_tid).timed_out = false;
         st(dead_tid).notify = 0;
-        st(dead_tid).signal_deadline = 0;
+        set_deadline(dead_tid, 0);
 
         // And whoever is blocked on it, if its death did not already.
     }

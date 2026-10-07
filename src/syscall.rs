@@ -4359,16 +4359,15 @@ fn dispatch(
                     return u64::MAX;
                 }
                 let group = if arg0 == 0 { crate::job::pgid_of(caller) } else { arg0 };
-                let mut tasks = [0usize; crate::task::MAX_TASKS];
-                let n = crate::job::members(group, &mut tasks);
-                if n == 0 {
-                    return u64::MAX;
-                }
                 let mine = scheduler::pid_of(caller);
-                let mut own = None;
-                let mut any = false;
+                let (mut own, mut found, mut any) = (None, false, false);
                 let info = crate::signal::Info::from_task(caller, crate::signal::SI_USER, 0);
-                for &tid in tasks[..n].iter().filter(|&&tid| may(tid)) {
+                let mut from = 0;
+                while let Some(tid) = crate::job::next_member(group, &mut from) {
+                    found = true;
+                    if !may(tid) {
+                        continue;
+                    }
                     any = true;
                     if arg1 == 0 {
                         continue;
@@ -4378,6 +4377,9 @@ fn dispatch(
                     } else {
                         let _ = crate::signal::raise_with(tid, arg1 as u8, info);
                     }
+                }
+                if !found {
+                    return u64::MAX;
                 }
                 if !any {
                     return NOT_ALLOWED;

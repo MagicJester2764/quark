@@ -10,6 +10,11 @@
 //! be filled says so, and never stops the machine. Records of one type are
 //! one size, so a slot given back is the next one's room.
 //!
+//! Which slots hold a record is a bit each, so that a walk of what is there
+//! ([`Table::next_used`]) goes past sixty-four empty slots at a step: the
+//! highest slot ever filled stays where it was, and a machine that once ran
+//! four thousand tasks walks no more slowly for it.
+//!
 //! Everything here is under the one lock, as what it holds always was.
 //! [`Table::slot`] answers for a slot that was never made with a `None` of the
 //! table's own, which is what a fixed array answered for an empty slot: a
@@ -28,6 +33,8 @@ type Block<T> = [*mut Option<T>; PER_BLOCK];
 pub struct Table<T> {
     /// Blocks of slots, a block made the first time one of its slots is.
     blocks: [*mut Block<T>; BLOCKS],
+    /// A bit for each slot that holds a record.
+    filled: [u64; MOST / 64],
     /// One past the highest slot that may be filled.
     limit: usize,
     /// One past the highest slot ever filled: a walk goes no further.
@@ -41,6 +48,7 @@ impl<T> Table<T> {
     pub const fn new(limit: usize) -> Self {
         Table {
             blocks: [core::ptr::null_mut(); BLOCKS],
+            filled: [0; MOST / 64],
             limit: if limit < MOST { limit } else { MOST },
             high: 0,
             missing: None,
@@ -81,8 +89,21 @@ impl<T> Table<T> {
 
     /// Whether slot `i` holds a record.
     pub fn used(&self, i: usize) -> bool {
-        let cell = self.cell(i);
-        !cell.is_null() && unsafe { (*cell).is_some() }
+        i < self.high && self.filled[i / 64] & (1 << (i % 64)) != 0
+    }
+
+    /// The first slot at or past `from` that holds a record.
+    pub fn next_used(&self, from: usize) -> Option<usize> {
+        let mut i = from;
+        while i < self.high {
+            let word = self.filled[i / 64] >> (i % 64);
+            if word != 0 {
+                let at = i + word.trailing_zeros() as usize;
+                return (at < self.high).then_some(at);
+            }
+            i = (i / 64 + 1) * 64;
+        }
+        None
     }
 
     /// One past the highest slot ever filled.
@@ -92,7 +113,16 @@ impl<T> Table<T> {
 
     /// The lowest slot at or above `from` that holds no record.
     pub fn lowest_free(&self, from: usize) -> Option<usize> {
-        (from..self.limit).find(|&i| !self.used(i))
+        let mut i = from;
+        while i < self.limit {
+            let word = !self.filled[i / 64] >> (i % 64);
+            if word != 0 {
+                let at = i + word.trailing_zeros() as usize;
+                return (at < self.limit).then_some(at);
+            }
+            i = (i / 64 + 1) * 64;
+        }
+        None
     }
 
     /// Put `record` in slot `i`. The record comes back if the slot is taken,
@@ -124,6 +154,7 @@ impl<T> Table<T> {
             return Err(record);
         }
         *cell = Some(record);
+        self.filled[i / 64] |= 1 << (i % 64);
         if i >= self.high {
             self.high = i + 1;
         }
@@ -144,6 +175,7 @@ impl<T> Table<T> {
         if cell.is_null() {
             return;
         }
+        self.filled[i / 64] &= !(1 << (i % 64));
         unsafe {
             core::ptr::drop_in_place(cell);
             alloc::alloc::dealloc(cell as *mut u8, Layout::new::<Option<T>>());
