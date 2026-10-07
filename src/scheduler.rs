@@ -2541,15 +2541,17 @@ pub fn create_empty_task() -> Option<usize> {
 /// descriptors, and anything it was given before it started becomes the
 /// program's. A forked child gets a copy, as it gets copies of the
 /// descriptors (`fdtable::copy_into`). Either way the band is the creator's.
-pub fn inherit_from_creator(tid: usize, creator: usize, thread: bool) {
+/// False if a child could not be given all its creator holds: a space grows
+/// as it is written, and there may be no memory for the copy.
+pub fn inherit_from_creator(tid: usize, creator: usize, thread: bool) -> bool {
     if tid >= MAX_TASKS || creator >= MAX_TASKS || tid == creator {
-        return;
+        return false;
     }
-    if thread {
-        crate::cap::share(tid, creator);
+    let whole = if thread {
+        crate::cap::share(tid, creator)
     } else {
-        crate::cap::copy_into(tid, creator);
-    }
+        crate::cap::copy_into(tid, creator)
+    };
     let flags = irq_save();
     unsafe {
         let band = (*slot(creator)).as_ref().map(|t| t.base_priority);
@@ -2559,6 +2561,7 @@ pub fn inherit_from_creator(tid: usize, creator: usize, thread: bool) {
         }
     }
     irq_restore(flags);
+    whole
 }
 
 /// Configure and start a previously created empty task for userspace entry.
@@ -3015,11 +3018,11 @@ pub fn fork_current() -> Option<usize> {
             return None;
         }
     };
-    inherit_from_creator(tid, parent, false);
-    // A second descriptor for everything the parent has open, the working
-    // directory included: the child's own, to close without the parent
-    // noticing. A child that could not have all of them is not made.
-    if !crate::fdtable::copy_into(tid, parent) {
+    // What the parent holds, and a second descriptor for everything it has
+    // open, the working directory included: the child's own, to give up or
+    // close without the parent noticing. A child that could not have all of
+    // them is not made.
+    if !inherit_from_creator(tid, parent, false) || !crate::fdtable::copy_into(tid, parent) {
         let _ = kill_task(tid);
         return None;
     }

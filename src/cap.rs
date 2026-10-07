@@ -1,6 +1,6 @@
 /// Object capability system for the Quark microkernel.
 ///
-/// Each program has a CSpace of MAX_CAPS slots, which its tasks share as they
+/// Each program has a CSpace of slots that grows, which its tasks share as they
 /// share its descriptors: a thread holds what its program holds, and what one
 /// thread is given the others have. A fork gets a copy. Capabilities are
 /// typed objects with parameters (e.g., IoPort with port range, Irq with
@@ -11,13 +11,18 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::task::MAX_TASKS;
 
-/// Slots in a CSpace. A task holds one `Endpoint` for each task it calls, and
-/// a pager one `MemObject` for each object it pages — a file server, one for
-/// every file that is mapped. Sixty-four held a few dozen services' and
-/// thirty files', and rustc maps more than thirty files at once to build an
-/// archive: building the standard library on Quark, the file server could
-/// map no more.
-pub const MAX_CAPS: usize = 256;
+/// The most slots a CSpace can have. A task holds one `Endpoint` for each
+/// task it calls, and a pager one `MemObject` for each object it pages — a
+/// file server, one for every file that is mapped. Sixty-four held a few
+/// dozen services' and thirty files', and rustc maps more than thirty files
+/// at once to build an archive: building the standard library on Quark, the
+/// file server could map no more. Then 256, inline in every program's
+/// holding; now room is made as it is wanted (`CSpace`), up to this.
+pub const MAX_CAPS: usize = 65_536;
+/// The slots a space starts with, when its first is written; and those among
+/// which `init`'s are put last (`insert_last`), so that its numbers do not
+/// move with the ceiling.
+pub const FIRST_CAPS: usize = 256;
 /// Where a capability lands when it is given without naming a slot: clear of
 /// the fixed slots manifests and spawners use, which are all below 16.
 pub const RECEIVED: core::ops::Range<usize> = 16..MAX_CAPS;
@@ -155,7 +160,7 @@ pub struct CapSlot {
     pub cap_type: CapType,
     pub generation: u32,
     /// The slot it was minted from, in the space that minted it.
-    pub root_slot: u8,
+    pub root_slot: u16,
     /// The capability space it was minted from (`root_of`), or
     /// `KERNEL_ROOT`: revoking that slot there revokes this.
     pub root: u16,
@@ -176,10 +181,57 @@ impl CapSlot {
     }
 }
 
-pub type CSpace = [CapSlot; MAX_CAPS];
+/// A program's capability slots, room made as they are written: 256 when
+/// the first is, doubled when a slot past the end is wanted or every slot
+/// there is is full, up to [`MAX_CAPS`]. A slot's number never moves, and a
+/// slot past the room there is reads as empty.
+pub struct CSpace {
+    slots: crate::grow::Grow<CapSlot>,
+}
 
-pub const fn empty_cspace() -> CSpace {
-    [CapSlot::empty(); MAX_CAPS]
+impl CSpace {
+    pub const fn new() -> Self {
+        CSpace { slots: crate::grow::Grow::new(CapSlot::empty()) }
+    }
+
+    /// How many slots there is room for now.
+    pub fn len(&self) -> usize {
+        self.slots.len()
+    }
+
+    /// What is in slot `i`: empty past the room there is.
+    pub fn get(&self, i: usize) -> CapSlot {
+        self.slots.get(i).copied().unwrap_or(CapSlot::empty())
+    }
+
+    /// Put `cap` in slot `i`, room made for it. False past [`MAX_CAPS`], or
+    /// with no memory for the room.
+    pub fn set(&mut self, i: usize, cap: CapSlot) -> bool {
+        match self.slots.ensure(i, FIRST_CAPS, MAX_CAPS) {
+            Ok(at) => {
+                *at = cap;
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// Slot `i`, to change, if there is room for it.
+    pub fn get_mut(&mut self, i: usize) -> Option<&mut CapSlot> {
+        self.slots.get_mut(i)
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &CapSlot> + '_ {
+        self.slots.iter()
+    }
+
+    /// The first empty slot from `from`: one there is room for, or else the
+    /// first past the end, while there can be one.
+    fn first_empty(&self, from: usize) -> Option<usize> {
+        (from..self.len())
+            .find(|&i| self.get(i).cap_type == CapType::Empty)
+            .or_else(|| Some(self.len().max(from)).filter(|&i| i < MAX_CAPS))
+    }
 }
 
 /// What a program holds: its capability slots, and beside them the older
@@ -193,7 +245,6 @@ pub const fn empty_cspace() -> CSpace {
 /// A C library that looked a service up in one thread and called it from
 /// another was refused, as a program written for this system that took a
 /// capability in a worker was.
-#[derive(Clone, Copy)]
 struct Holding {
     slots: CSpace,
     bits: u32,
@@ -204,11 +255,13 @@ struct Holding {
 const NO_HOLDING: u16 = u16::MAX;
 
 /// What a holding and a number's count of revocations are made from, in
-/// their room (`Table::fill_from`): a holding is six kilobytes, which built
-/// on the stack were a kernel stack's.
+/// their room (`Table::fill_from`). A holding was six kilobytes, which built
+/// on the stack were a kernel stack's; its slots are made as they are
+/// written now, and it is a few words.
 static EMPTY_HOLDING: crate::table::Template<Holding> =
-    crate::table::Template(Some(Holding { slots: empty_cspace(), bits: 0, users: 0 }));
-static NO_REVOCATIONS: crate::table::Template<[u32; MAX_CAPS]> = crate::table::Template(Some([0; MAX_CAPS]));
+    crate::table::Template(Some(Holding { slots: CSpace::new(), bits: 0, users: 0 }));
+static NO_REVOCATIONS: crate::table::Template<crate::grow::Grow<u32>> =
+    crate::table::Template(Some(crate::grow::Grow::new(0)));
 
 /// Every program's holding, by number (`table.rs`): made with a task, which
 /// may then join its program's, and given back when the last task using it
@@ -317,9 +370,18 @@ pub fn slot(tid: usize, slot: usize) -> Option<CapSlot> {
         return None;
     }
     let flags = irq_save();
-    let cap = unsafe { cspace_of(tid).map(|cs| cs[slot]) };
+    let cap = unsafe { cspace_of(tid).map(|cs| cs.get(slot)) };
     irq_restore(flags);
     cap
+}
+
+/// How many slots `tid`'s program's space has room for: every slot past that
+/// is empty.
+pub fn room_of(tid: usize) -> Option<usize> {
+    let flags = irq_save();
+    let room = unsafe { cspace_of(tid).map(|cs| cs.len()) };
+    irq_restore(flags);
+    room
 }
 
 /// Run `f` on `tid`'s program's space, with interrupts off: what is looked
@@ -429,7 +491,7 @@ pub fn share(tid: usize, with: usize) -> bool {
                         h.bits |= mine.bits;
                         for cap in mine.slots.iter().filter(|c| c.cap_type != CapType::Empty) {
                             if let Some(slot) = find_empty_slot(&h.slots) {
-                                h.slots[slot] = *cap;
+                                h.slots.set(slot, *cap);
                             }
                         }
                     }
@@ -448,26 +510,31 @@ pub fn share(tid: usize, with: usize) -> bool {
 }
 
 /// `tid` holds a copy of what `from`'s program holds, in the slots its own
-/// has free: a forked child's.
-pub fn copy_into(tid: usize, from: usize) {
+/// has free: a forked child's. False if there was no memory for all of it —
+/// a child that could not have everything its parent holds is not made.
+pub fn copy_into(tid: usize, from: usize) -> bool {
     if tid >= MAX_TASKS || from >= MAX_TASKS || tid == from {
-        return;
+        return false;
     }
     let flags = irq_save();
-    unsafe {
+    let whole = unsafe {
         let (src, dst) = (st(from).holding, st(tid).holding);
-        if src != dst
-            && let (Some(copy), Some(h)) = (holdings().get(src as usize), holdings().get(dst as usize))
-        {
-            for (slot, cap) in copy.slots.iter().enumerate() {
-                if h.slots[slot].cap_type == CapType::Empty {
-                    h.slots[slot] = *cap;
+        match (holdings().get(src as usize), holdings().get(dst as usize)) {
+            (Some(copy), Some(h)) if src != dst => {
+                let mut whole = true;
+                for (slot, cap) in copy.slots.iter().enumerate() {
+                    if cap.cap_type != CapType::Empty && h.slots.get(slot).cap_type == CapType::Empty {
+                        whole &= h.slots.set(slot, *cap);
+                    }
                 }
+                h.bits |= copy.bits;
+                whole
             }
-            h.bits |= copy.bits;
+            _ => false,
         }
-    }
+    };
     irq_restore(flags);
+    whole
 }
 
 /// How many times each slot of each space has been revoked, by the space's
@@ -479,12 +546,15 @@ pub fn copy_into(tid: usize, from: usize) {
 /// holding is given back when its program goes; counts made afresh with the
 /// next holding there would start at nought again, and every capability
 /// revoked at a count the new one passes through would be valid once more.
-static mut GENERATIONS: crate::table::Table<[u32; MAX_CAPS]> = crate::table::Table::new(MAX_TASKS);
+/// A number's counts are room made as its slots are revoked, as a space's
+/// slots are as they are written: a slot past the room there is has been
+/// revoked no times.
+static mut GENERATIONS: crate::table::Table<crate::grow::Grow<u32>> = crate::table::Table::new(MAX_TASKS);
 
 /// # Safety
 /// Interrupts are off.
 #[inline(always)]
-unsafe fn generations() -> &'static mut crate::table::Table<[u32; MAX_CAPS]> {
+unsafe fn generations() -> &'static mut crate::table::Table<crate::grow::Grow<u32>> {
     unsafe { &mut *core::ptr::addr_of_mut!(GENERATIONS) }
 }
 
@@ -774,18 +844,11 @@ pub fn grant_slot(
     let flags = irq_save();
     let done = unsafe {
         match cspace_of(tid) {
-            Some(cs) => match find_empty_slot(cs) {
-                Some(slot) => {
-                    cs[slot] = CapSlot {
-                        cap_type,
-                        generation: current_generation(granter, slot),
-                        root_slot: slot as u8,
-                        root,
-                        param0,
-                        param1,
-                    };
-                    true
-                }
+            Some(cs) => match find_empty_slot(cs).and_then(|slot| Some((slot, generation_for(root, slot)?))) {
+                Some((slot, generation)) => cs.set(
+                    slot,
+                    CapSlot { cap_type, generation, root_slot: slot as u16, root, param0, param1 },
+                ),
                 None => false,
             },
             None => false,
@@ -795,9 +858,11 @@ pub fn grant_slot(
     done
 }
 
-/// Find an empty slot in a task's CSpace. Returns slot index or None.
+/// Find an empty slot in a task's CSpace: one it has room for, or else the
+/// first past its room, which writing it makes. `None` once it is as big as
+/// a space can be and full.
 pub fn find_empty_slot(cspace: &CSpace) -> Option<usize> {
-    cspace.iter().position(|cap| cap.cap_type as u8 == CapType::Empty as u8)
+    cspace.first_empty(0)
 }
 
 /// Where `cap` lands when it is given without naming a slot: wherever `cspace`
@@ -812,35 +877,35 @@ pub fn receive_slot(cspace: &CSpace, cap: &CapSlot) -> Option<usize> {
             return held;
         }
     }
-    RECEIVED.clone().find(|&i| cspace[i].cap_type == CapType::Empty)
+    cspace.first_empty(RECEIVED.start)
 }
 
 /// The copy another task receives of `src`, which `granter` holds in `slot`.
 ///
 /// It keeps the provenance of what it was copied from, so revoking that
 /// revokes this too. A capability the kernel minted has no root to be revoked
-/// through, so the granter becomes its root.
-pub fn derive(granter: usize, slot: usize, src: &CapSlot) -> CapSlot {
-    let (root, root_slot) = if src.root == KERNEL_ROOT {
-        (root_of(granter), slot as u8)
+/// through, so the granter becomes its root — and `None` with no memory for
+/// that slot's count, since a copy that could not be revoked is not made.
+pub fn derive(granter: usize, slot: usize, src: &CapSlot) -> Option<CapSlot> {
+    let (root, root_slot, generation) = if src.root == KERNEL_ROOT {
+        let root = root_of(granter);
+        (root, slot as u16, generation_for(root, slot)?)
     } else {
-        (src.root, src.root_slot)
+        (src.root, src.root_slot, generation_at(src.root, src.root_slot as usize))
     };
-    CapSlot {
+    Some(CapSlot {
         cap_type: src.cap_type,
-        generation: generation_at(root, root_slot as usize),
+        generation,
         root_slot,
         root,
         param0: src.param0,
         param1: src.param1,
-    }
+    })
 }
 
-/// Insert a cap into a specific slot.
-pub fn insert_cap(cspace: &mut CSpace, slot: usize, cap: CapSlot) {
-    if slot < MAX_CAPS {
-        cspace[slot] = cap;
-    }
+/// Insert a cap into a specific slot. False if there is no room for it.
+pub fn insert_cap(cspace: &mut CSpace, slot: usize, cap: CapSlot) -> bool {
+    slot < MAX_CAPS && cspace.set(slot, cap)
 }
 
 /// Populate CSpace from old-style bitmask caps (for backward compatibility).
@@ -848,14 +913,17 @@ pub fn insert_cap(cspace: &mut CSpace, slot: usize, cap: CapSlot) {
 pub fn populate_from_bitmask(cspace: &mut CSpace, caps: u32) {
     if caps & crate::task::CAP_IOPORT != 0 {
         if let Some(slot) = find_empty_slot(cspace) {
-            cspace[slot] = CapSlot {
-                cap_type: CapType::IoPort,
-                generation: 0,
-                root_slot: 0,
-                root: KERNEL_ROOT,
-                param0: 0,        // port_start
-                param1: 0xFFFF,   // port_end
-            };
+            cspace.set(
+                slot,
+                CapSlot {
+                    cap_type: CapType::IoPort,
+                    generation: 0,
+                    root_slot: 0,
+                    root: KERNEL_ROOT,
+                    param0: 0,        // port_start
+                    param1: 0xFFFF,   // port_end
+                },
+            );
         }
     }
     // `CAP_MAP_PHYS` expands to nothing. It used to be a PhysRange over all
@@ -864,38 +932,47 @@ pub fn populate_from_bitmask(cspace: &mut CSpace, caps: u32) {
     // memory is granted as the range it is; see `insert_kernel_range`.
     if caps & crate::task::CAP_IRQ != 0 {
         if let Some(slot) = find_empty_slot(cspace) {
-            cspace[slot] = CapSlot {
-                cap_type: CapType::Irq,
-                generation: 0,
-                root_slot: 0,
-                root: KERNEL_ROOT,
-                param0: 0xFF, // wildcard
-                param1: 0,
-            };
+            cspace.set(
+                slot,
+                CapSlot {
+                    cap_type: CapType::Irq,
+                    generation: 0,
+                    root_slot: 0,
+                    root: KERNEL_ROOT,
+                    param0: 0xFF, // wildcard
+                    param1: 0,
+                },
+            );
         }
     }
     if caps & crate::task::CAP_TASK_MGMT != 0 {
         if let Some(slot) = find_empty_slot(cspace) {
-            cspace[slot] = CapSlot {
-                cap_type: CapType::TaskMgmt,
-                generation: 0,
-                root_slot: 0,
-                root: KERNEL_ROOT,
-                param0: 0, // any target
-                param1: 0,
-            };
+            cspace.set(
+                slot,
+                CapSlot {
+                    cap_type: CapType::TaskMgmt,
+                    generation: 0,
+                    root_slot: 0,
+                    root: KERNEL_ROOT,
+                    param0: 0, // any target
+                    param1: 0,
+                },
+            );
         }
     }
     if caps & crate::task::CAP_PHYS_ALLOC != 0 {
         if let Some(slot) = find_empty_slot(cspace) {
-            cspace[slot] = CapSlot {
-                cap_type: CapType::PhysAlloc,
-                generation: 0,
-                root_slot: 0,
-                root: KERNEL_ROOT,
-                param0: 0, // unlimited
-                param1: 0,
-            };
+            cspace.set(
+                slot,
+                CapSlot {
+                    cap_type: CapType::PhysAlloc,
+                    generation: 0,
+                    root_slot: 0,
+                    root: KERNEL_ROOT,
+                    param0: 0, // unlimited
+                    param1: 0,
+                },
+            );
         }
     }
     // `CAP_ENDPOINT` expands to nothing either. It was a set naming every
@@ -903,14 +980,17 @@ pub fn populate_from_bitmask(cspace: &mut CSpace, caps: u32) {
     // creator, or a holder.
     if caps & crate::task::CAP_SET_UID != 0 {
         if let Some(slot) = find_empty_slot(cspace) {
-            cspace[slot] = CapSlot {
-                cap_type: CapType::SetUid,
-                generation: 0,
-                root_slot: 0,
-                root: KERNEL_ROOT,
-                param0: 0,
-                param1: 0,
-            };
+            cspace.set(
+                slot,
+                CapSlot {
+                    cap_type: CapType::SetUid,
+                    generation: 0,
+                    root_slot: 0,
+                    root: KERNEL_ROOT,
+                    param0: 0,
+                    param1: 0,
+                },
+            );
         }
     }
 }
@@ -921,17 +1001,17 @@ pub fn insert_kernel_range(cspace: &mut CSpace, base: usize, len: usize) -> bool
     let start = base & !0xFFF;
     let end = (base + len + 0xFFF) & !0xFFF;
     match find_empty_slot(cspace) {
-        Some(slot) => {
-            cspace[slot] = CapSlot {
+        Some(slot) => cspace.set(
+            slot,
+            CapSlot {
                 cap_type: CapType::PhysRange,
                 generation: 0,
                 root_slot: 0,
                 root: KERNEL_ROOT,
                 param0: start as u64,
                 param1: end as u64,
-            };
-            true
-        }
+            },
+        ),
         None => false,
     }
 }
@@ -943,24 +1023,26 @@ pub fn insert_kernel_range(cspace: &mut CSpace, base: usize, len: usize) -> bool
 /// right to keep what is written out of memory ([`CapType::Swap`]), the
 /// right to run its network ([`CapType::NetAdmin`]), every
 /// PCI device ([`CapType::PciDevice`], `pci::ANY`) — in its last free
-/// slot. The first task names its
+/// slot of the first [`FIRST_CAPS`]. The first task names its
 /// low slots itself — where it keeps the nameserver's endpoint, where it
 /// mints what it hands on — and counts on the ones it has not filled being
 /// empty; what the kernel adds to what it starts with goes where the task
-/// will not look for room.
+/// will not look for room. Of the first 256 and not of the space's room, so
+/// that the numbers `init` was given stay where they were when the space
+/// could grow.
 pub fn insert_last(cspace: &mut CSpace, cap_type: CapType, param0: u64) -> bool {
-    match cspace.iter().rposition(|cap| cap.cap_type as u8 == CapType::Empty as u8) {
-        Some(slot) => {
-            cspace[slot] = CapSlot {
+    match (0..FIRST_CAPS).rev().find(|&i| cspace.get(i).cap_type == CapType::Empty) {
+        Some(slot) => cspace.set(
+            slot,
+            CapSlot {
                 cap_type,
                 generation: 0,
                 root_slot: 0,
                 root: KERNEL_ROOT,
                 param0,
                 param1: 0,
-            };
-            true
-        }
+            },
+        ),
         None => false,
     }
 }
@@ -1049,8 +1131,11 @@ pub fn revoke(tid: usize, slot: usize) {
     }
     let flags = irq_save();
     unsafe {
-        if let Some(g) = generations().get(root) {
-            g[slot] = g[slot].wrapping_add(1);
+        // A slot's count is made when a capability is first minted from it
+        // (`generation_for`): one with none has had nothing derived from it,
+        // and has nothing to take back.
+        if let Some(g) = generations().get(root).and_then(|g| g.get_mut(slot)) {
+            *g = g.wrapping_add(1);
         }
     }
     irq_restore(flags);
@@ -1091,10 +1176,19 @@ pub fn task_has_pci_device(tid: usize, bdf: u64) -> bool {
     unsafe { task_cspace(tid).is_some_and(|cs| holds_device(cs, bdf)) }
 }
 
-/// The current generation of a slot of `tid`'s program (for creating
-/// derived caps).
-pub fn current_generation(tid: usize, slot: usize) -> u32 {
-    generation_at(root_of(tid), slot)
+/// The count of revocations of slot `slot` of space `root`, made if it has
+/// none yet: what a capability minted from that slot carries. `None` with no
+/// memory for it — a capability that could not be revoked is not made.
+pub fn generation_for(root: u16, slot: usize) -> Option<u32> {
+    if root as usize >= MAX_TASKS || slot >= MAX_CAPS {
+        return None;
+    }
+    let flags = irq_save();
+    let g = unsafe {
+        generations().get(root as usize).and_then(|g| g.ensure(slot, FIRST_CAPS, MAX_CAPS).ok()).map(|g| *g)
+    };
+    irq_restore(flags);
+    g
 }
 
 /// The current generation of slot `slot` of space `root`.
@@ -1103,7 +1197,7 @@ fn generation_at(root: u16, slot: usize) -> u32 {
         return 0;
     }
     let flags = irq_save();
-    let g = unsafe { generations().get(root as usize).map_or(0, |g| g[slot]) };
+    let g = unsafe { generations().get(root as usize).and_then(|g| g.get(slot).copied()).unwrap_or(0) };
     irq_restore(flags);
     g
 }

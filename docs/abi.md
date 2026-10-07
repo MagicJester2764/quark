@@ -275,7 +275,7 @@ numbers, and only 64 could name it before, through a range check.
 
 | Minor | What |
 |---|---|
-| 4.1 | **As many tasks as a desktop runs.** The kernel has up to 32,768 tasks, where it had sixty-four, so a program can no longer find every task by asking about each number below 64: `SYS_TASK_NEXT` (236) answers the first task at or past a number, and a walk of every task is one call a task. A program has 4,096 tasks without `TaskMgmt` — its own that have not died, and the children it has made in other programs and not collected — where a task could have sixteen children and a fork was not counted at all; `SYS_TASK_CREATE`, `SYS_TASK_CREATE_IN` and `SYS_FORK` answer `u64::MAX` past it. **And what a program makes is made when it makes it**, as many as its descriptors and the machine's memory allow: counters, timers, signal descriptors, pipes and shared regions, where there were 16, 16, 32, 256 — 64 a program — and 256 for the machine. `SYS_PIPE_CREATE` counts no budget of the program's; nor does anything else that was made with one. So are terminals, local sockets, streams, poll sets and served descriptors, where there were 8, 32, 64, 64 and 1,024; and what is in them grows: a set watches as many descriptors as a program may have (it watched 32), `SYS_POLL` takes as many entries and refuses more (it took 32 and ignored the rest), a listener's backlog goes to 4,096 (16), a stream holds in flight as many descriptors as its sender may have (32), and a send or receive of several carries 255 (32). Memory objects are 2,047, the most a page-table entry can name (256), and 1,024 a pager (128). |
+| 4.1 | **As many tasks as a desktop runs.** The kernel has up to 32,768 tasks, where it had sixty-four, so a program can no longer find every task by asking about each number below 64: `SYS_TASK_NEXT` (236) answers the first task at or past a number, and a walk of every task is one call a task. A program has 4,096 tasks without `TaskMgmt` — its own that have not died, and the children it has made in other programs and not collected — where a task could have sixteen children and a fork was not counted at all; `SYS_TASK_CREATE`, `SYS_TASK_CREATE_IN` and `SYS_FORK` answer `u64::MAX` past it. **And what a program makes is made when it makes it**, as many as its descriptors and the machine's memory allow: counters, timers, signal descriptors, pipes and shared regions, where there were 16, 16, 32, 256 — 64 a program — and 256 for the machine. `SYS_PIPE_CREATE` counts no budget of the program's; nor does anything else that was made with one. So are terminals, local sockets, streams, poll sets and served descriptors, where there were 8, 32, 64, 64 and 1,024; and what is in them grows: a set watches as many descriptors as a program may have (it watched 32), `SYS_POLL` takes as many entries and refuses more (it took 32 and ignored the rest), a listener's backlog goes to 4,096 (16), a stream holds in flight as many descriptors as its sender may have (32), and a send or receive of several carries 255 (32). Memory objects are 2,047, the most a page-table entry can name (256), and 1,024 a pager (128). And a program's capability space grows: 256 slots when the first is written, doubled as more are wanted, up to 65,536 (it was 256, all of them inline in every program's), a slot's number never moving; `SYS_CAP_READ` answers how many slots a space has room for, where it answered 0. |
 
 ### Deprecated
 
@@ -304,8 +304,13 @@ changed*.
 ## Capabilities
 
 Authority comes from capabilities, not from a privilege level — there is no
-UID 0 bypass in the kernel. Each task has a CSpace of 256 slots holding
-`CapSlot { cap_type, generation, root_slot, root_tid, param0, param1 }`.
+UID 0 bypass in the kernel. Each program has a CSpace — its threads share it,
+a fork is given a copy, `exec` keeps it — whose slots hold
+`CapSlot { cap_type, generation, root_slot, root, param0, param1 }`. It has
+room for 256 slots when the first is written, and twice as many each time a
+slot past its room is written or every slot it has is full, up to 65,536. A
+slot's number never moves, and a slot past the room a space has is empty:
+`SYS_CAP_READ` says how much room that is.
 
 | # | Type | param0 | param1 |
 |---|---|---|---|
@@ -1012,7 +1017,7 @@ reach zero.
 | 84 | `SYS_CAP_DELETE` | arg0 = slot | 0 / `u64::MAX` | — |
 | 85 | `SYS_CAP_TRANSFER` | arg0 = dest tid, arg1 = bits | 0 / `u64::MAX` | — |
 | 91 | `SYS_CAP_TAKE` | arg0 = caller, arg1 = slot or `u64::MAX - 1` for any | the slot used / `u64::MAX` | caller's `SYS_CALL_OFFER` to this task is being served |
-| 92 | `SYS_CAP_READ` | arg0 = tid, arg1 = slot, arg2 = out: four `u64`s — type, param0, param1, valid (1/0) | 0 / `u64::MAX` past the last slot | `TaskMgmt` over tid, unless tid is the caller |
+| 92 | `SYS_CAP_READ` | arg0 = tid, arg1 = slot, arg2 = out: four `u64`s — type, param0, param1, valid (1/0) | how many slots tid's space has room for — every slot past that is empty / `u64::MAX` past the last slot, 65,535 | `TaskMgmt` over tid, unless tid is the caller |
 | 86–90 | *deprecated* | see the deprecation table above | | |
 
 `SYS_CAP_INSPECT` truncates parameters to sixteen bits, so it cannot report an

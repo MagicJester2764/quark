@@ -436,6 +436,17 @@ may keep — are in `../quarkutils/CLAUDE.md`; these are the kernel's.
 - **Capabilities are the authority.** There is no UID 0 bypass; `uid == 0` no
   longer short-circuits `cap::task_has_*`. A service that cannot do something
   is missing a capability, not a privilege level.
+- **A capability space grows, and a slot's number never moves** (`cap::CSpace`):
+  room for 256 when its first slot is written, doubled when a slot past it
+  is wanted or every slot is full, to 65,536; a slot past the room is
+  empty, and `SYS_CAP_READ` says how much room there is — a walk of every
+  slot goes that far, or it misses what is past where it stopped (the C
+  layer's `setuid` gave up `SetUid` in the first sixty-four slots of 256).
+  **And a capability is made only where it can be revoked**: a slot's count
+  of revocations is made when one is first minted, granted or taken from it
+  (`cap::generation_for`), and that is refused with no memory for it. A
+  revoke cannot fail for want of memory, and does nothing to a slot with no
+  count: nothing was derived from it.
 - **Every descriptor has a form that answers instead of waiting.**
   `SYS_FD_READ_NB` and `SYS_FD_WRITE_NB` return "would block" where
   `SYS_FD_READ` and `SYS_FD_WRITE` park, and `SYS_FUTEX_WAIT_TIMEOUT` gives up
@@ -648,8 +659,10 @@ may keep — are in `../quarkutils/CLAUDE.md`; these are the kernel's.
   kind as it is read (`multiboot2::parse_memory_map`); kept one for one, a
   UEFI machine's hundred entries did not fit in sixty-four and the last of
   its memory was never seen. `init`'s capabilities of these kinds go in its
-  *last* free slots: it names its low ones itself and counts on the rest of
-  them being empty.
+  *last* free slots of the first 256 (`cap::insert_last`): it names its low
+  ones itself and counts on the rest of them being empty — of the first 256
+  and not of whatever room its space has, so that its numbers stayed where
+  they were when a space could grow.
 - **A device is its capability, and its configuration is the kernel's.**
   Every PCI function is found once, at boot, before the other processors
   start and before there is a task (`pci::init`): its ids, its class, its
@@ -877,7 +890,9 @@ every Unix program assumes:
   looks again.
 - **`fork` copies the descriptor table and the capabilities; `exec` keeps
   them.** The child gets a second descriptor for everything the parent has
-  open, the working directory included, and a copy of the capability space;
+  open, the working directory included, and a copy of the capability space —
+  all of each, or the fork fails: a table and a space grow as they are
+  written, and their copies can want memory there is not;
   `exec` closes what was marked for it (`SYS_FD_FLAGS`) and nothing else. A
   thread does neither: it uses its program's table and its program's space
   (`cap::share`), so what one thread is given the others have. A thread used

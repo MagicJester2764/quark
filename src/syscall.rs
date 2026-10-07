@@ -3800,18 +3800,28 @@ fn dispatch(
             if !free || crate::memobj::objects_of(caller) >= OBJECTS_PER_PAGER {
                 return u64::MAX;
             }
+            // Room for the capability, and for the slot's count of
+            // revocations, before there is an object to be left holding:
+            // neither can fail once it is made.
+            let root = crate::cap::root_of(caller);
+            let Some(generation) = crate::cap::generation_for(root, slot) else {
+                return u64::MAX;
+            };
+            if crate::cap::with_cspace(caller, |cs| cs.set(slot, cs.get(slot))) != Some(true) {
+                return u64::MAX;
+            }
             let Some((_, id)) = crate::memobj::create(caller, arg0, arg1) else {
                 return u64::MAX;
             };
             let made = crate::cap::CapSlot {
                 cap_type: crate::cap::CapType::MemObject,
-                generation: crate::cap::current_generation(caller, slot),
-                root_slot: slot as u8,
-                root: crate::cap::root_of(caller),
+                generation,
+                root_slot: slot as u16,
+                root,
                 param0: id,
                 param1: crate::cap::OBJECT_READ | crate::cap::OBJECT_WRITE,
             };
-            crate::cap::with_cspace(caller, |cs| cs[slot] = made);
+            crate::cap::with_cspace(caller, |cs| cs.set(slot, made));
             id
         }
         SYS_OBJECT_MAP => {
@@ -4174,24 +4184,30 @@ fn dispatch(
             if d.class >> 16 != 0x03 || !crate::iommu::claimed_by(space, d.bdf) || slot >= crate::cap::MAX_CAPS {
                 return u64::MAX;
             }
-            let empty = crate::cap::with_cspace(tid, |cs| cs[slot].cap_type as u8 == crate::cap::CapType::Empty as u8);
+            // Empty, and with room made for what will be put there.
+            let empty = crate::cap::with_cspace(tid, |cs| {
+                cs.get(slot).cap_type == crate::cap::CapType::Empty && cs.set(slot, crate::cap::CapSlot::empty())
+            });
             if empty != Some(true) {
                 return u64::MAX;
             }
             let Some(base) = crate::display::memory(d.bdf, pages) else {
                 return u64::MAX;
             };
-            let generation = crate::cap::current_generation(tid, slot);
             let (start, end) = (base as u64, (base + pages * 4096) as u64);
+            // The kernel's, never revoked: no count to carry.
             let _ = crate::cap::with_cspace(tid, |cs| {
-                cs[slot] = crate::cap::CapSlot {
-                    cap_type: crate::cap::CapType::PhysRange,
-                    generation,
-                    root_slot: slot as u8,
-                    root: crate::cap::KERNEL_ROOT,
-                    param0: start,
-                    param1: end,
-                };
+                cs.set(
+                    slot,
+                    crate::cap::CapSlot {
+                        cap_type: crate::cap::CapType::PhysRange,
+                        generation: 0,
+                        root_slot: slot as u16,
+                        root: crate::cap::KERNEL_ROOT,
+                        param0: start,
+                        param1: end,
+                    },
+                )
             });
             crate::iommu::reach(space, base, pages);
             start
@@ -4825,7 +4841,12 @@ fn dispatch(
             };
             let tid = scheduler::current_tid();
             let root = crate::cap::root_of(tid);
-            let generation = crate::cap::current_generation(tid, slot);
+            // The slot's *current* count of revocations, made if it has none:
+            // hardcoding 0 meant that after a single sys_cap_revoke on this
+            // slot every capability minted there was born already invalid.
+            let Some(generation) = crate::cap::generation_for(root, slot) else {
+                return u64::MAX;
+            };
             let minted = crate::cap::with_cspace(tid, |cs| {
                 let (param0, param1) = if cap_type == crate::cap::CapType::Endpoint {
                     // Asked for by TID, recorded by the endpoint's number, and
@@ -4839,14 +4860,11 @@ fn dispatch(
                     return None;
                 };
                 // Target slot must be empty
-                if cs[slot].cap_type as u8 != crate::cap::CapType::Empty as u8 {
+                if cs.get(slot).cap_type != crate::cap::CapType::Empty {
                     return None;
                 }
-                // Must adopt the slot's *current* generation. Hardcoding 0
-                // meant that after a single sys_cap_revoke on this slot every
-                // subsequently minted cap was born already-invalid.
-                cs[slot] = crate::cap::CapSlot { cap_type, generation, root_slot: slot as u8, root, param0, param1 };
-                Some(())
+                let cap = crate::cap::CapSlot { cap_type, generation, root_slot: slot as u16, root, param0, param1 };
+                cs.set(slot, cap).then_some(())
             });
             if minted.flatten().is_none() {
                 return u64::MAX;
@@ -4921,19 +4939,21 @@ fn dispatch(
             if !crate::cap::slot_is_valid(&src_cap) {
                 return u64::MAX;
             }
-            let derived = crate::cap::derive(caller_tid, src_slot, &src_cap);
+            let Some(derived) = crate::cap::derive(caller_tid, src_slot, &src_cap) else {
+                return u64::MAX;
+            };
             let landed = crate::cap::with_cspace(dest_tid, |cs| {
                 let slot = if any_slot {
                     crate::cap::receive_slot(cs, &src_cap)?
-                } else if cs[dest_slot].cap_type as u8 == crate::cap::CapType::Empty as u8 {
+                } else if cs.get(dest_slot).cap_type == crate::cap::CapType::Empty {
                     dest_slot
                 } else {
                     return None;
                 };
                 // An endpoint the destination already holds is not copied
                 // again; the slot it is in is the answer.
-                if cs[slot].cap_type == crate::cap::CapType::Empty {
-                    cs[slot] = derived;
+                if cs.get(slot).cap_type == crate::cap::CapType::Empty && !cs.set(slot, derived) {
+                    return None;
                 }
                 Some(slot)
             });
@@ -4966,17 +4986,19 @@ fn dispatch(
             if !crate::cap::slot_is_valid(&offered) {
                 return u64::MAX;
             }
-            let derived = crate::cap::derive(client, from, &offered);
+            let Some(derived) = crate::cap::derive(client, from, &offered) else {
+                return u64::MAX;
+            };
             let landed = crate::cap::with_cspace(taker, |cs| {
                 let slot = if any_slot {
                     crate::cap::receive_slot(cs, &offered)?
-                } else if cs[want].cap_type == crate::cap::CapType::Empty {
+                } else if cs.get(want).cap_type == crate::cap::CapType::Empty {
                     want
                 } else {
                     return None;
                 };
-                if cs[slot].cap_type == crate::cap::CapType::Empty {
-                    cs[slot] = derived;
+                if cs.get(slot).cap_type == crate::cap::CapType::Empty && !cs.set(slot, derived) {
+                    return None;
                 }
                 Some(slot)
             });
@@ -5027,7 +5049,7 @@ fn dispatch(
             if tid != caller && !crate::cap::task_has_task_mgmt(caller, tid) {
                 return u64::MAX;
             }
-            let Some(cap) = crate::cap::slot(tid, slot) else {
+            let (Some(cap), Some(room)) = (crate::cap::slot(tid, slot), crate::cap::room_of(tid)) else {
                 return u64::MAX;
             };
             let out = [
@@ -5038,7 +5060,9 @@ fn dispatch(
             ];
             let _ua = crate::cpu::UserAccess::begin();
             unsafe { core::ptr::copy_nonoverlapping(out.as_ptr(), arg2 as *mut u64, 4) };
-            0
+            // How many slots the space has room for, past which every one is
+            // empty: what a walk of all of them goes to. It answered 0.
+            room as u64
         }
         SYS_CAP_DELETE => {
             // arg0 = slot
@@ -5047,7 +5071,13 @@ fn dispatch(
             if slot >= crate::cap::MAX_CAPS {
                 return u64::MAX;
             }
-            if crate::cap::with_cspace(scheduler::current_tid(), |cs| cs[slot] = crate::cap::CapSlot::empty()).is_none() {
+            // A slot past the room the space has is empty already.
+            let emptied = crate::cap::with_cspace(scheduler::current_tid(), |cs| {
+                if let Some(cap) = cs.get_mut(slot) {
+                    *cap = crate::cap::CapSlot::empty();
+                }
+            });
+            if emptied.is_none() {
                 return u64::MAX;
             }
             0
