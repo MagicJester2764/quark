@@ -28,8 +28,9 @@ pub const MAX_USERS: usize = 64;
 /// This must not collide with a real space. It used to be 0, but the idle
 /// task's is the first — so any cap it minted was silently unrevocable, and
 /// `sys_cap_grant` mistook its caps for kernel-minted ones and re-rooted them
-/// at the granter. There are `MAX_TASKS` spaces, so 0xFF names none.
-pub const KERNEL_ROOT: u8 = 0xFF;
+/// at the granter. Spaces are numbered below `table::MOST`, so `u16::MAX`
+/// names none.
+pub const KERNEL_ROOT: u16 = u16::MAX;
 
 /// Per-user default capability bitmask table.
 /// USER_CAPS[uid] holds the default cap bits for all tasks running as that UID.
@@ -157,7 +158,7 @@ pub struct CapSlot {
     pub root_slot: u8,
     /// The capability space it was minted from (`root_of`), or
     /// `KERNEL_ROOT`: revoking that slot there revokes this.
-    pub root: u8,
+    pub root: u16,
     pub param0: u64,
     pub param1: u64,
 }
@@ -196,18 +197,40 @@ pub const fn empty_cspace() -> CSpace {
 struct Holding {
     slots: CSpace,
     bits: u32,
-    /// How many tasks use it. Free at nought.
-    users: u8,
+    /// How many tasks use it. Given back at nought.
+    users: u16,
 }
 
-const NO_HOLDING: u8 = u8::MAX;
-static mut HOLDINGS: [Holding; MAX_TASKS] = [Holding { slots: empty_cspace(), bits: 0, users: 0 }; MAX_TASKS];
+const NO_HOLDING: u16 = u16::MAX;
+
+/// Every program's holding, by number (`table.rs`): made with a task, which
+/// may then join its program's, and given back when the last task using it
+/// has gone.
+static mut HOLDINGS: crate::table::Table<Holding> = crate::table::Table::new(MAX_TASKS);
+
+/// # Safety
+/// Interrupts are off.
+#[inline(always)]
+unsafe fn holdings() -> &'static mut crate::table::Table<Holding> {
+    unsafe { &mut *core::ptr::addr_of_mut!(HOLDINGS) }
+}
+
+/// What `tid`'s program holds.
+///
+/// # Safety
+/// Interrupts are off for as long as the record is used.
+unsafe fn holding_of(tid: usize) -> Option<&'static mut Holding> {
+    unsafe {
+        let i = st(tid).holding;
+        if i == NO_HOLDING { None } else { holdings().get(i as usize) }
+    }
+}
 /// What this module keeps about a task, in its record (`TaskRec::cap`):
 /// each field was an array of `MAX_TASKS`, and an id with no task reads as
 /// `PerTask::new()` — what an empty slot of those arrays held.
 pub struct PerTask {
-    /// Which each task uses.
-    holding: u8,
+    /// Which holding the task uses.
+    holding: u16,
     /// Each task's endpoint, as a number no endpoint has had before or will again.
     ///
     /// An `Endpoint` capability records this, not the TID, so it names the task it
@@ -263,7 +286,7 @@ fn irq_restore(flags: u64) {
 
 /// The space `tid` uses, as a capability's root names it: `KERNEL_ROOT` for
 /// none.
-pub fn root_of(tid: usize) -> u8 {
+pub fn root_of(tid: usize) -> u16 {
     if tid >= MAX_TASKS {
         return KERNEL_ROOT;
     }
@@ -278,12 +301,7 @@ pub fn root_of(tid: usize) -> u8 {
 /// # Safety
 /// Interrupts are off, for as long as the reference is used.
 pub unsafe fn cspace_of(tid: usize) -> Option<&'static mut CSpace> {
-    unsafe {
-        if tid >= MAX_TASKS || st(tid).holding == NO_HOLDING {
-            return None;
-        }
-        Some(&mut (*core::ptr::addr_of_mut!(HOLDINGS))[st(tid).holding as usize].slots)
-    }
+    unsafe { holding_of(tid).map(|h| &mut h.slots) }
 }
 
 /// What is in slot `slot` of `tid`'s program's space: a copy.
@@ -309,13 +327,7 @@ pub fn with_cspace<R>(tid: usize, f: impl FnOnce(&mut CSpace) -> R) -> Option<R>
 /// The older capability bits `tid`'s program holds.
 pub fn bits_of(tid: usize) -> u32 {
     let flags = irq_save();
-    let bits = unsafe {
-        if tid < MAX_TASKS && st(tid).holding != NO_HOLDING {
-            HOLDINGS[st(tid).holding as usize].bits
-        } else {
-            0
-        }
-    };
+    let bits = unsafe { holding_of(tid).map_or(0, |h| h.bits) };
     irq_restore(flags);
     bits
 }
@@ -325,13 +337,13 @@ pub fn bits_of(tid: usize) -> u32 {
 pub fn add_bits(tid: usize, bits: u32) -> bool {
     let flags = irq_save();
     let done = unsafe {
-        if tid < MAX_TASKS && st(tid).holding != NO_HOLDING {
-            let h = &mut HOLDINGS[st(tid).holding as usize];
-            h.bits |= bits;
-            populate_from_bitmask(&mut h.slots, bits);
-            true
-        } else {
-            false
+        match holding_of(tid) {
+            Some(h) => {
+                h.bits |= bits;
+                populate_from_bitmask(&mut h.slots, bits);
+                true
+            }
+            None => false,
         }
     };
     irq_restore(flags);
@@ -348,12 +360,15 @@ pub fn task_made(tid: usize) {
     unsafe {
         leave(tid);
         // Its own number first: nothing else is using it, unless a program
-        // whose first task had it is still running.
-        let holdings = &mut *core::ptr::addr_of_mut!(HOLDINGS);
-        let free = if holdings[tid].users == 0 { Some(tid) } else { holdings.iter().position(|h| h.users == 0) };
+        // whose first task had it is still running. The number's count of
+        // revocations is made with its first holding and kept for good
+        // (`GENERATIONS`); with no memory for either, it holds nothing.
+        let free = if holdings().used(tid) { holdings().lowest_free(0) } else { Some(tid) };
         if let Some(i) = free {
-            holdings[i] = Holding { slots: empty_cspace(), bits: 0, users: 1 };
-            st(tid).holding = i as u8;
+            let counted = generations().used(i) || generations().fill_at(i, [0; MAX_CAPS]).is_ok();
+            if counted && holdings().fill_at(i, Holding { slots: empty_cspace(), bits: 0, users: 1 }).is_ok() {
+                st(tid).holding = i as u16;
+            }
         }
     }
     irq_restore(flags);
@@ -378,11 +393,11 @@ unsafe fn leave(tid: usize) {
             return;
         }
         st(tid).holding = NO_HOLDING;
-        let h = &mut HOLDINGS[i as usize];
-        h.users = h.users.saturating_sub(1);
-        if h.users == 0 {
-            h.slots = empty_cspace();
-            h.bits = 0;
+        if let Some(h) = holdings().get(i as usize) {
+            h.users = h.users.saturating_sub(1);
+            if h.users == 0 {
+                holdings().empty(i as usize);
+            }
         }
     }
 }
@@ -402,19 +417,20 @@ pub fn share(tid: usize, with: usize) -> bool {
         } else {
             let own = st(tid).holding;
             if own != target {
-                if own != NO_HOLDING {
-                    let given = HOLDINGS[own as usize].slots;
-                    let bits = HOLDINGS[own as usize].bits;
-                    let h = &mut HOLDINGS[target as usize];
-                    h.bits |= bits;
-                    for cap in given.iter().filter(|c| c.cap_type != CapType::Empty) {
-                        if let Some(slot) = find_empty_slot(&h.slots) {
-                            h.slots[slot] = *cap;
+                if let Some(mine) = holdings().get(own as usize) {
+                    if let Some(h) = holdings().get(target as usize) {
+                        h.bits |= mine.bits;
+                        for cap in mine.slots.iter().filter(|c| c.cap_type != CapType::Empty) {
+                            if let Some(slot) = find_empty_slot(&h.slots) {
+                                h.slots[slot] = *cap;
+                            }
                         }
                     }
                     leave(tid);
                 }
-                HOLDINGS[target as usize].users += 1;
+                if let Some(h) = holdings().get(target as usize) {
+                    h.users += 1;
+                }
                 st(tid).holding = target;
             }
             true
@@ -433,9 +449,9 @@ pub fn copy_into(tid: usize, from: usize) {
     let flags = irq_save();
     unsafe {
         let (src, dst) = (st(from).holding, st(tid).holding);
-        if src != NO_HOLDING && dst != NO_HOLDING && src != dst {
-            let copy = HOLDINGS[src as usize];
-            let h = &mut HOLDINGS[dst as usize];
+        if src != dst
+            && let (Some(copy), Some(h)) = (holdings().get(src as usize), holdings().get(dst as usize))
+        {
             for (slot, cap) in copy.slots.iter().enumerate() {
                 if h.slots[slot].cap_type == CapType::Empty {
                     h.slots[slot] = *cap;
@@ -447,10 +463,23 @@ pub fn copy_into(tid: usize, from: usize) {
     irq_restore(flags);
 }
 
-/// Global generation counters for O(1) revocation.
-/// CAP_GENERATIONS[space][slot] tracks the current generation for caps
-/// minted from that slot of that space.
-static mut CAP_GENERATIONS: [[u32; MAX_CAPS]; MAX_TASKS] = [[0; MAX_CAPS]; MAX_TASKS];
+/// How many times each slot of each space has been revoked, by the space's
+/// number: what a capability minted from a slot carries (`generation`), and
+/// what revoking the slot moves on, so that everything minted from it before
+/// is no longer valid (`is_valid`). O(1) revocation.
+///
+/// Made the first time a holding has the number, and kept for good. A
+/// holding is given back when its program goes; counts made afresh with the
+/// next holding there would start at nought again, and every capability
+/// revoked at a count the new one passes through would be valid once more.
+static mut GENERATIONS: crate::table::Table<[u32; MAX_CAPS]> = crate::table::Table::new(MAX_TASKS);
+
+/// # Safety
+/// Interrupts are off.
+#[inline(always)]
+unsafe fn generations() -> &'static mut crate::table::Table<[u32; MAX_CAPS]> {
+    unsafe { &mut *core::ptr::addr_of_mut!(GENERATIONS) }
+}
 
 /// Validate that a cap slot is still valid (not revoked).
 fn is_valid(cap: &CapSlot) -> bool {
@@ -461,12 +490,11 @@ fn is_valid(cap: &CapSlot) -> bool {
     if cap.root == KERNEL_ROOT {
         return true;
     }
-    let root = cap.root as usize;
     let slot = cap.root_slot as usize;
-    if root >= MAX_TASKS || slot >= MAX_CAPS {
+    if cap.root as usize >= MAX_TASKS || slot >= MAX_CAPS {
         return false;
     }
-    unsafe { cap.generation == CAP_GENERATIONS[root][slot] }
+    cap.generation == generation_at(cap.root, slot)
 }
 
 /// Check if a task has IoPort capability covering the given port.
@@ -1009,9 +1037,13 @@ pub fn revoke(tid: usize, slot: usize) {
     if root >= MAX_TASKS || slot >= MAX_CAPS {
         return;
     }
+    let flags = irq_save();
     unsafe {
-        CAP_GENERATIONS[root][slot] = CAP_GENERATIONS[root][slot].wrapping_add(1);
+        if let Some(g) = generations().get(root) {
+            g[slot] = g[slot].wrapping_add(1);
+        }
     }
+    irq_restore(flags);
 }
 
 /// Mint a new cap: find a source cap of the same type in the caller's CSpace
@@ -1056,9 +1088,12 @@ pub fn current_generation(tid: usize, slot: usize) -> u32 {
 }
 
 /// The current generation of slot `slot` of space `root`.
-fn generation_at(root: u8, slot: usize) -> u32 {
+fn generation_at(root: u16, slot: usize) -> u32 {
     if root as usize >= MAX_TASKS || slot >= MAX_CAPS {
         return 0;
     }
-    unsafe { CAP_GENERATIONS[root as usize][slot] }
+    let flags = irq_save();
+    let g = unsafe { generations().get(root as usize).map_or(0, |g| g[slot]) };
+    irq_restore(flags);
+    g
 }
