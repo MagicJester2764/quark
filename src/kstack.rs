@@ -26,8 +26,11 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 
 const PAGE: usize = 4096;
 
-/// A kernel stack's pages.
-pub const KSTACK_PAGES: usize = 16;
+/// A kernel stack's pages: twice the deepest any stack went in an acceptance
+/// of every machine, on one processor and on four — 12,536 bytes — rounded
+/// up to a page. It was sixteen, as much as the heap gave each task when
+/// nothing measured what was used.
+pub const KSTACK_PAGES: usize = 7;
 pub const KSTACK_SIZE: usize = KSTACK_PAGES * PAGE;
 
 /// The gigabyte below the heap's: the second-to-last of PML4[0].
