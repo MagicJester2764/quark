@@ -110,7 +110,7 @@ unsafe fn sets() -> &'static mut [PollSet; MAX_SETS] { unsafe {
 }}
 
 pub fn create(tid: usize) -> Option<usize> {
-    let table = crate::fdtable::table_of(tid);
+    let table = crate::fdtable::table_index(tid);
     if table == usize::MAX {
         return None;
     }
@@ -255,7 +255,7 @@ pub fn ctl(set: usize, tid: usize, op: u64, fd: usize, events: u32, token: u64) 
             }
         }
     }
-    let table = crate::fdtable::table_of(tid);
+    let table = crate::fdtable::table_index(tid);
     let flags = irq_save();
     let out = unsafe {
         let s = &mut sets()[set];
@@ -617,7 +617,7 @@ pub fn scan(set: usize, tid: usize, out: &mut [(u64, u32)]) -> usize {
     if set >= MAX_SETS {
         return 0;
     }
-    let table = crate::fdtable::table_of(tid);
+    let table = crate::fdtable::table_index(tid);
     let flags = irq_save();
     let mine = unsafe { sets()[set].in_use && sets()[set].owner == table };
     irq_restore(flags);

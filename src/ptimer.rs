@@ -4,9 +4,9 @@
 //! one of three clocks, and what to do when the deadline passes: raise a
 //! signal for the program, or for one task of it, carrying a value — or
 //! nothing, for a timer a program only asks how long is left of. They are
-//! kept beside the program's descriptor table, as its alarm is, because they
-//! are the program's: a forked child has none, and `exec` ends them
-//! ([`clear`], which `fdtable` calls wherever a table is begun or ended).
+//! kept in the program's record beside its descriptor table, as its alarm
+//! is, because they are the program's: a forked child has none, and `exec`
+//! ends them ([`Timers::clear`]). The room for them is made with the first.
 //!
 //! The clock sees to them — [`after`] says when it must next look, and
 //! `signal::timers` raises what is [`due`] — one at a time, each re-armed
@@ -16,7 +16,7 @@
 //! more overrun, as Linux's does, and a timer that fires faster than the
 //! clock looks counts the intervals that went by the same way.
 
-use crate::task::MAX_TASKS;
+use core::alloc::Layout;
 
 /// Timers a program may have: POSIX's least, `_POSIX_TIMER_MAX`.
 pub const PER_PROGRAM: usize = 32;
@@ -46,8 +46,47 @@ struct Timer {
 
 const UNUSED: Timer = Timer { used: false, clock: 0, signo: 0, task: 0, endpoint: 0, value: 0, at: 0, every: 0 };
 
-/// Each program's timers, by the number of its descriptor table.
-static mut TIMERS: [[Timer; PER_PROGRAM]; MAX_TASKS] = [[UNUSED; PER_PROGRAM]; MAX_TASKS];
+/// A program's timers, in its record (`fdtable::Program`): no room until it
+/// makes its first, and the room given back with the record, or when the
+/// program becomes another ([`Timers::clear`]).
+pub struct Timers(*mut [Timer; PER_PROGRAM]);
+
+impl Timers {
+    pub const NONE: Timers = Timers(core::ptr::null_mut());
+
+    /// The timers, if the program has made one.
+    fn get(&mut self) -> Option<&'static mut [Timer; PER_PROGRAM]> {
+        unsafe { self.0.as_mut() }
+    }
+
+    /// The timers, room made for them if there is none; `None` if there is
+    /// no memory for it.
+    fn make(&mut self) -> Option<&'static mut [Timer; PER_PROGRAM]> {
+        if self.0.is_null() {
+            let room = unsafe { alloc::alloc::alloc(Layout::new::<[Timer; PER_PROGRAM]>()) } as *mut [Timer; PER_PROGRAM];
+            if room.is_null() {
+                return None;
+            }
+            unsafe { room.write([UNUSED; PER_PROGRAM]) };
+            self.0 = room;
+        }
+        self.get()
+    }
+
+    /// None at all: the program has become another.
+    pub fn clear(&mut self) {
+        let room = core::mem::replace(&mut self.0, core::ptr::null_mut());
+        if !room.is_null() {
+            unsafe { alloc::alloc::dealloc(room as *mut u8, Layout::new::<[Timer; PER_PROGRAM]>()) };
+        }
+    }
+}
+
+impl Drop for Timers {
+    fn drop(&mut self) {
+        self.clear();
+    }
+}
 
 #[inline(always)]
 fn irq_save() -> u64 {
@@ -61,33 +100,16 @@ fn irq_restore(flags: u64) {
     unsafe { core::arch::asm!("push {}; popfq", in(reg) flags, options(nostack)) };
 }
 
-/// # Safety
-/// Interrupts are off.
-unsafe fn timers() -> &'static mut [[Timer; PER_PROGRAM]; MAX_TASKS] {
-    unsafe { &mut *core::ptr::addr_of_mut!(TIMERS) }
-}
-
 /// The timer `id` of `tid`'s program, if it has made one.
 ///
 /// # Safety
 /// Interrupts are off.
 unsafe fn timer(tid: usize, id: usize) -> Option<&'static mut Timer> {
-    let table = crate::fdtable::table_of(tid);
-    if table >= MAX_TASKS || id >= PER_PROGRAM {
+    if id >= PER_PROGRAM {
         return None;
     }
-    let t = unsafe { &mut timers()[table][id] };
+    let t = unsafe { &mut crate::fdtable::table_of(tid)?.timers.get()?[id] };
     t.used.then_some(t)
-}
-
-/// The program whose descriptor table is `table` has begun or ended, or
-/// become another: it has no timers.
-pub fn clear(table: usize) {
-    if table < MAX_TASKS {
-        let flags = irq_save();
-        unsafe { timers()[table] = [UNUSED; PER_PROGRAM] };
-        irq_restore(flags);
-    }
 }
 
 /// When a timer that was due at `at` and fires every `every` is next due,
@@ -120,20 +142,24 @@ pub fn create(tid: usize, clock: u64, signo: u64, own: bool, value: u64, task: u
     if !matches!(clock, REALTIME | MONOTONIC | BOOTTIME) || signo > crate::signal::NSIG as u64 {
         return None;
     }
-    let table = crate::fdtable::table_of(tid);
-    if table >= MAX_TASKS {
+    let table = crate::fdtable::table_index(tid);
+    if table == usize::MAX {
         return None;
     }
     let endpoint = if task == 0 {
         0
-    } else if crate::fdtable::table_of(task) == table && crate::scheduler::task_is_live(task) {
+    } else if crate::fdtable::table_index(task) == table && crate::scheduler::task_is_live(task) {
         crate::cap::endpoint_of(task)
     } else {
         return None;
     };
     let flags = irq_save();
     let made = unsafe {
-        let mine = &mut timers()[table];
+        // The room for its timers is made with its first.
+        let Some(mine) = crate::fdtable::table_of(tid).and_then(|p| p.timers.make()) else {
+            irq_restore(flags);
+            return None;
+        };
         mine.iter().position(|t| !t.used).map(|id| {
             mine[id] = Timer {
                 used: true,
@@ -218,7 +244,8 @@ pub fn due(now: u64) -> Option<Due> {
     let flags = irq_save();
     let mut found = None;
     unsafe {
-        'tables: for (table, mine) in timers().iter_mut().enumerate() {
+        'tables: for (table, p) in crate::fdtable::programs() {
+            let Some(mine) = p.timers.get() else { continue };
             for (id, t) in mine.iter_mut().enumerate() {
                 if !t.used || t.at == 0 || t.at > now {
                     continue;
@@ -244,7 +271,7 @@ pub fn after(now: u64) -> u64 {
     let flags = irq_save();
     let mut next = u64::MAX;
     unsafe {
-        for t in timers().iter().flatten() {
+        for t in crate::fdtable::programs().filter_map(|(_, p)| p.timers.get()).flatten() {
             if !t.used || t.at == 0 {
                 continue;
             }

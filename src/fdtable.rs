@@ -218,8 +218,22 @@ impl Table {
     }
 }
 
-/// As many tables as tasks: each task uses exactly one.
-static mut TABLES: [Table; MAX_TASKS] = [EMPTY; MAX_TASKS];
+/// What a program keeps, in one record: its descriptor table, what came with
+/// the signals waiting for it, and its timers. Made with its first task
+/// (`attach_new`), and given back with everything in it when its last task
+/// goes (`leave`).
+pub struct Program {
+    table: Table,
+    /// What came with each signal waiting for the program, and the
+    /// real-time signals waiting behind one of their number.
+    waiting: Waiting<{ crate::signal::QUEUE }>,
+    /// Its timers (`ptimer.rs`): no room for them until it makes one.
+    pub timers: crate::ptimer::Timers,
+}
+
+/// Every program's record, by its table's number (`table.rs`): as many as
+/// there can be tasks, since each task uses exactly one.
+static mut TABLES: crate::table::Table<Program> = crate::table::Table::new(MAX_TASKS);
 /// What this module keeps about a task, in its record (`TaskRec::fd`):
 /// each field was an array of `MAX_TASKS`, and an id with no task reads as
 /// `PerTask::new()` — what an empty slot of those arrays held.
@@ -257,11 +271,6 @@ unsafe fn st(tid: usize) -> &'static mut PerTask {
 
 static mut NO_TASK: PerTask = PerTask::new();
 
-/// What came with each signal waiting for the program a table is, and the
-/// real-time signals waiting behind one of their number: beside the tables
-/// rather than in them, so that it is zeroed memory and not the kernel's
-/// image.
-static mut WAITING: [Waiting<{ crate::signal::QUEUE }>; MAX_TASKS] = [Waiting::EMPTY; MAX_TASKS];
 
 #[inline(always)]
 fn irq_save() -> u64 {
@@ -278,8 +287,24 @@ fn irq_restore(flags: u64) {
 /// # Safety
 /// Interrupts are off.
 #[inline(always)]
-unsafe fn tables() -> &'static mut [Table; MAX_TASKS] {
+unsafe fn tables() -> &'static mut crate::table::Table<Program> {
     unsafe { &mut *core::ptr::addr_of_mut!(TABLES) }
+}
+
+/// Table number `i`, if a program has it.
+///
+/// # Safety
+/// Interrupts are off.
+unsafe fn table_at(i: usize) -> Option<&'static mut Table> {
+    unsafe { tables().get(i).map(|p| &mut p.table) }
+}
+
+/// Every program's record, with its table's number.
+///
+/// # Safety
+/// Interrupts are off for as long as the records are used.
+pub unsafe fn programs() -> impl Iterator<Item = (usize, &'static mut Program)> {
+    unsafe { (0..tables().high()).filter_map(|i| tables().get(i).map(|p| (i, p))) }
 }
 
 /// The table `tid` uses.
@@ -292,7 +317,7 @@ unsafe fn table_mut(tid: usize) -> Option<&'static mut Table> {
             return None;
         }
         let i = st(tid).table;
-        if i == NONE { None } else { Some(&mut tables()[i as usize]) }
+        if i == NONE { None } else { table_at(i as usize) }
     }
 }
 
@@ -306,11 +331,7 @@ unsafe fn signals_mut(tid: usize) -> Option<(&'static mut Table, &'static mut Wa
             return None;
         }
         let i = st(tid).table;
-        if i == NONE {
-            None
-        } else {
-            Some((&mut tables()[i as usize], &mut (*core::ptr::addr_of_mut!(WAITING))[i as usize]))
-        }
+        if i == NONE { None } else { tables().get(i as usize).map(|p| (&mut p.table, &mut p.waiting)) }
     }
 }
 
@@ -324,17 +345,18 @@ pub fn attach_new(tid: usize) -> bool {
         if st(tid).table != NONE {
             false
         } else {
-            // There is always one: a table per task, and this task has none.
-            match tables().iter().position(|t| t.tasks == 0) {
-                Some(i) => {
-                    tables()[i] = EMPTY;
-                    tables()[i].tasks = 1;
-                    (*core::ptr::addr_of_mut!(WAITING))[i].clear();
-                    crate::ptimer::clear(i);
+            // A number of its own — there is always one, a table per task
+            // and this task having none — and a record, if there is memory
+            // for it.
+            let mut table = EMPTY;
+            table.tasks = 1;
+            let made = Program { table, waiting: Waiting::EMPTY, timers: crate::ptimer::Timers::NONE };
+            match tables().lowest_free(0) {
+                Some(i) if tables().fill_at(i, made).is_ok() => {
                     st(tid).table = i as u16;
                     true
                 }
-                None => false,
+                _ => false,
             }
         }
     };
@@ -342,17 +364,27 @@ pub fn attach_new(tid: usize) -> bool {
     ok
 }
 
-/// Which table a task uses, as a number two tasks of one program agree on.
-/// `usize::MAX` for a task with none.
 /// The word program `space` is told of signals through, or 0 if it has
 /// named none. Interrupts must be off.
 pub fn sig_word_of_space(space: u64) -> usize {
     let Some(tid) = crate::scheduler::task_of_space(space) else { return 0 };
-    let slot = table_of(tid);
-    unsafe { (*core::ptr::addr_of!(TABLES)).get(slot).map_or(0, |t| t.sig_word) }
+    unsafe { table_mut(tid).map_or(0, |t| t.sig_word) }
 }
 
-pub fn table_of(tid: usize) -> usize {
+/// The record of the program `tid` is a task of.
+///
+/// # Safety
+/// Interrupts are off for as long as the record is used.
+pub unsafe fn table_of(tid: usize) -> Option<&'static mut Program> {
+    unsafe {
+        let i = st(tid).table;
+        if i == NONE { None } else { tables().get(i as usize) }
+    }
+}
+
+/// Which table a task uses, as a number two tasks of one program agree on.
+/// `usize::MAX` for a task with none.
+pub fn table_index(tid: usize) -> usize {
     if tid >= MAX_TASKS {
         return usize::MAX;
     }
@@ -398,15 +430,20 @@ fn leave(tid: usize) -> Option<(Grow<Fd>, FdKind)> {
             None
         } else {
             st(tid).table = NONE;
-            let t = &mut tables()[i as usize];
-            t.tasks = t.tasks.saturating_sub(1);
-            if t.tasks == 0 {
-                let held = (t.fds.take(), t.cwd);
-                *t = EMPTY;
-                crate::ptimer::clear(i as usize);
-                Some(held)
-            } else {
-                None
+            match table_at(i as usize) {
+                Some(t) => {
+                    t.tasks = t.tasks.saturating_sub(1);
+                    if t.tasks == 0 {
+                        // The record goes back, its timers with it, and what
+                        // the table held is released by the caller.
+                        let held = (t.fds.take(), t.cwd);
+                        tables().empty(i as usize);
+                        Some(held)
+                    } else {
+                        None
+                    }
+                }
+                None => None,
             }
         }
     };
@@ -462,7 +499,11 @@ pub fn share(tid: usize, with: usize) -> bool {
     }
     // Joined before the old one is left, with the lock held across both, so
     // nothing sees the task with no table.
-    unsafe { tables()[target as usize].tasks += 1 };
+    unsafe {
+        if let Some(t) = table_at(target as usize) {
+            t.tasks += 1;
+        }
+    }
     let old = leave(tid);
     unsafe { st(tid).table = target };
     irq_restore(flags);
@@ -1115,7 +1156,8 @@ pub fn alarm_due(now: u64) -> Option<usize> {
     let flags = irq_save();
     let due = unsafe {
         let mut found = None;
-        for (i, t) in tables().iter_mut().enumerate() {
+        for i in 0..tables().high() {
+            let Some(t) = table_at(i) else { continue };
             if t.tasks == 0 || t.alarm_at == 0 || t.alarm_at > now {
                 continue;
             }
@@ -1137,7 +1179,8 @@ pub fn alarm_after(now: u64) -> u64 {
     let flags = irq_save();
     let mut next = u64::MAX;
     unsafe {
-        for t in tables().iter() {
+        for i in 0..tables().high() {
+            let Some(t) = table_at(i) else { continue };
             if t.tasks == 0 || t.alarm_at == 0 {
                 continue;
             }
@@ -1180,7 +1223,8 @@ pub fn holders(wanted: impl Fn(&FdKind) -> bool, out: &mut [usize]) -> usize {
     let mut n = 0;
     let flags = irq_save();
     unsafe {
-        for (i, table) in tables().iter().enumerate() {
+        for i in 0..tables().high() {
+            let Some(table) = table_at(i) else { continue };
             if table.tasks == 0 || !table.fds.iter().any(|s| wanted(&s.kind)) {
                 continue;
             }
@@ -1439,10 +1483,12 @@ pub fn close_on_exec(tid: usize) {
             t.trap_from = 0;
             t.trap_to = 0;
         }
+        // And its timers, which were set for the program that has gone.
+        if let Some(p) = table_of(tid) {
+            p.timers.clear();
+        }
     }
     irq_restore(flags);
-    // And its timers, which were set for the program that has gone.
-    crate::ptimer::clear(table_of(tid));
     for kind in gone.iter().take(n).filter(|k| !k.is_empty()) {
         crate::pipe::release_fd(kind);
     }
