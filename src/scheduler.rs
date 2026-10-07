@@ -26,14 +26,201 @@
 /// apart.
 
 use crate::context;
-use crate::task::{Task, TaskState, KERNEL_STACK_SIZE, MAX_TASKS};
+use crate::task::{Task, TaskRec, TaskState, KERNEL_STACK_SIZE, MAX_TASKS};
 use core::sync::atomic::{AtomicBool, Ordering};
 
-// Task table: fixed-size array of Option<Task>
-static mut TASKS: [Option<Task>; MAX_TASKS] = {
-    const NONE: Option<Task> = None;
-    [NONE; MAX_TASKS]
-};
+/// The task table: a record for each task, by its id (`table.rs`). A slot
+/// with no task has no record.
+static mut TASKS: crate::table::Table<TaskRec> = crate::table::Table::new(MAX_TASKS);
+
+/// Slot `tid` of the task table: `Some` with the task's record while there is
+/// a task there. Interrupts must be off, as for any look at the table.
+#[inline]
+pub(crate) unsafe fn slot(tid: usize) -> &'static mut Option<TaskRec> {
+    unsafe { (*core::ptr::addr_of_mut!(TASKS)).slot(tid) }
+}
+
+/// Task `tid`'s record. Interrupts must be off.
+#[inline]
+pub(crate) unsafe fn rec(tid: usize) -> Option<&'static mut TaskRec> {
+    unsafe { (*core::ptr::addr_of_mut!(TASKS)).get(tid) }
+}
+
+/// The table itself: what fills a slot and empties one.
+#[inline]
+unsafe fn table() -> &'static mut crate::table::Table<TaskRec> {
+    unsafe { &mut *core::ptr::addr_of_mut!(TASKS) }
+}
+
+/// What the scheduler keeps about a task, in its record (`TaskRec::sched`):
+/// each was an array of `MAX_TASKS`, and a task with no record reads as
+/// `PerTask::new()`, which is what an empty slot of those arrays held.
+pub struct PerTask {
+    /// Per-task wait state. If true, the task is blocked in sys_wait.
+    wait_blocked: bool,
+    /// TID of the dead child collected for a waiting parent. 0 = none yet.
+    wait_result: usize,
+    /// Which child a task blocked in a wait is waiting for: 0 for whichever goes
+    /// first. Another child going is not what it asked to be woken for.
+    wait_target: usize,
+    /// Or which process group of children, when that is what it named; 0 when
+    /// it named a child or none.
+    wait_group: u64,
+    /// What else it asked to hear of besides a child ending: `job::HAS_STOPPED`,
+    /// `job::HAS_CONTINUED`.
+    wait_reports: u8,
+    /// Set when a waiter is woken to look again rather than with a dead child:
+    /// one of its children has stopped, or been continued.
+    wait_again: bool,
+    /// Tasks that may not run: every task of a program a signal has stopped
+    /// (`job.rs`).
+    ///
+    /// It is not a state of its own, because a task goes on being whatever it
+    /// was — blocked in a call, asleep, or ready to run — and has to be that
+    /// again when the program is continued. A held task is simply never put on
+    /// a ready queue, and never switched to. What would have made it runnable
+    /// makes it `Ready` and in no queue, and continuing the program queues
+    /// every task of it that is.
+    held: bool,
+    /// The process id of the program each task belongs to: the number, never
+    /// given out twice, of the task the program began as.
+    ///
+    /// A task id is a slot in a table, and the next task made is given the lowest
+    /// one free — usually the one that has just been let go. Every Unix program
+    /// that remembers a child assumes the opposite: that a number it was told a
+    /// moment ago does not come back as somebody else. A shell would not wait
+    /// for a command because it had been given the number of the last thing it
+    /// had run in the background.
+    ///
+    /// A program started by a spawner or by `fork` has its first task's number,
+    /// which `exec` leaves alone; a thread has its program's. Kept by task and
+    /// not with the program's table, because the table goes when the program
+    /// dies and a parent asks about a child after that.
+    process_id: u64,
+    /// Exit code of the child that woke a waiter, captured at wake time.
+    ///
+    /// It cannot be read from the task afterwards: waking the parent also sets
+    /// REAPED, which makes `reap_dead` free the slot, and `child_exit_code` then
+    /// falls back to 0. Every non-zero status was being lost that way.
+    wait_code: i32,
+    /// Per-task "reaped" flag. If true, parent has collected the exit via sys_wait (or has no parent).
+    reaped: bool,
+    /// Ticks left in each task's slice: how long it may run before it is
+    /// preempted, which is `usage::slice_for` its program's niceness when the
+    /// scheduler chooses it — three ticks for one that has said nothing.
+    ///
+    /// The scheduler used to reschedule on every timer interrupt, which is a
+    /// quantum of one tick and a context switch a hundred times a second whether
+    /// or not anything else wanted the CPU. It also meant a task could never
+    /// finish a short burst of work without being interrupted partway through it.
+    ///
+    /// Three ticks is thirty milliseconds. Anything interactive blocks long before
+    /// that — a server blocks on its next receive, a client on its next call — so
+    /// this only ever bounds work that is genuinely CPU-bound; and so does how
+    /// nice a program is, which is the share of its band it has when it and
+    /// another are both computing.
+    slice_left: u32,
+    /// How far each task has run, as its band sees it: the nanoseconds it has
+    /// had, each counted for more the nicer its program is (`usage::weighted`).
+    /// Within a band the task that has run least goes next, so that two
+    /// programs computing side by side have the band in proportion to their
+    /// weights — on one processor or sixteen. In the order they were queued,
+    /// with one queue for every processor, a task with a short turn comes round
+    /// sooner, and the share a short turn was to cut evened out: a program at
+    /// nice 10 had about half of what one at nought did, on four processors.
+    vrun: u64,
+    /// Put at the front of its band ([`enqueue_front`]): chosen before anything
+    /// else in it, the longest put there first, whatever it has run.
+    front: bool,
+    /// Has just yielded: passed over once if anything else in its band is
+    /// ready. Once, and not sent to the back for good, or a task yielding while
+    /// it waits for another would wait behind everybody for ever.
+    yielded: bool,
+    /// The processor each task is running on, or [`NO_CPU`].
+    ///
+    /// A task is on a processor from the switch to it until the switch away
+    /// from it — in ring 3, in the kernel, or waiting at the kernel's door for
+    /// the lock. Both switches are made with the kernel lock held, and whoever
+    /// holds the lock afterwards finds the second one complete: the lock is
+    /// not given up half way through a switch.
+    ///
+    /// It is what "this task is not running" has to mean with more than one
+    /// processor. A dead task's state says nothing about it: ended from
+    /// another processor, a task goes on in ring 3 until the interrupt that
+    /// tells its processor arrives, on its own kernel stack and in its own
+    /// address space. Neither may be freed under it.
+    on_cpu: u8,
+    /// Dead, ended from another processor while it ran, and still on its own:
+    /// what is said when a task dies — its parent woken to collect it, SIGCHLD
+    /// — has not been said yet, and is said by its processor when it leaves
+    /// the task ([`schedule_inner`]). A parent told sooner would collect a
+    /// child that is still running.
+    unannounced: bool,
+    /// Dead, and nobody is going to wait for it: a thread that is joined
+    /// through the word it asked to have cleared ([`joined_by_word`]). Decided
+    /// as it dies, when the word is forgotten.
+    unwaited: bool,
+    /// What the system call each task is in has checked of its program's
+    /// memory, and may touch with interrupts off until it returns: these pages
+    /// are not taken away to be written out (`reclaim.rs`). A call checks a
+    /// buffer, waits — for a pipe to have something in it — and then copies
+    /// with a lock held, where a page that had gone in the meantime could not
+    /// be waited for.
+    pinned: [(u64, u64); PINS],
+    npinned: u8,
+}
+
+impl PerTask {
+    pub const fn new() -> Self {
+        PerTask {
+            wait_blocked: false,
+            wait_result: 0,
+            wait_target: 0,
+            wait_group: 0,
+            wait_reports: 0,
+            wait_again: false,
+            held: false,
+            process_id: 0,
+            wait_code: 0,
+            reaped: false,
+            slice_left: 0,
+            vrun: 0,
+            front: false,
+            yielded: false,
+            on_cpu: NO_CPU,
+            unannounced: false,
+            unwaited: false,
+            pinned: [(0, 0); PINS],
+            npinned: 0,
+        }
+    }
+}
+
+/// What the scheduler keeps about task `tid`: its record's, or for an id with
+/// no task a copy put back to `PerTask::new()` each time it is asked for —
+/// what an empty slot of the arrays these were answered, and where a write
+/// for a task that is not there goes nowhere. Interrupts must be off.
+unsafe fn st(tid: usize) -> &'static mut PerTask {
+    unsafe {
+        match rec(tid) {
+            Some(r) => &mut r.sched,
+            None => {
+                let none = &mut *core::ptr::addr_of_mut!(NO_TASK);
+                *none = PerTask::new();
+                none
+            }
+        }
+    }
+}
+
+static mut NO_TASK: PerTask = PerTask::new();
+
+/// Every task's id, in order. Each step looks at the table afresh, so a
+/// walk's body may change it. Interrupts must be off.
+pub(crate) fn tids() -> impl Iterator<Item = usize> {
+    let high = unsafe { table().high() };
+    (0..high).filter(|&i| unsafe { table().used(i) })
+}
 
 // Simple circular ready queue (array of TIDs)
 /// Scheduling bands, best first. A task runs only when nothing better is
@@ -63,84 +250,11 @@ static mut READY_COUNT: [usize; NUM_PRIORITIES] = [0; NUM_PRIORITIES];
 
 static INITIALIZED: AtomicBool = AtomicBool::new(false);
 
-/// Per-task wait state. If true, the task is blocked in sys_wait.
-static mut WAIT_BLOCKED: [bool; MAX_TASKS] = [false; MAX_TASKS];
-/// TID of the dead child collected for a waiting parent. 0 = none yet.
-static mut WAIT_RESULT: [usize; MAX_TASKS] = [0; MAX_TASKS];
-/// Which child a task blocked in a wait is waiting for: 0 for whichever goes
-/// first. Another child going is not what it asked to be woken for.
-static mut WAIT_TARGET: [usize; MAX_TASKS] = [0; MAX_TASKS];
-/// Or which process group of children, when that is what it named; 0 when
-/// it named a child or none.
-static mut WAIT_GROUP: [u64; MAX_TASKS] = [0; MAX_TASKS];
-/// What else it asked to hear of besides a child ending: `job::HAS_STOPPED`,
-/// `job::HAS_CONTINUED`.
-static mut WAIT_REPORTS: [u8; MAX_TASKS] = [0; MAX_TASKS];
-/// Set when a waiter is woken to look again rather than with a dead child:
-/// one of its children has stopped, or been continued.
-static mut WAIT_AGAIN: [bool; MAX_TASKS] = [false; MAX_TASKS];
 
-/// Tasks that may not run: every task of a program a signal has stopped
-/// (`job.rs`).
-///
-/// It is not a state of its own, because a task goes on being whatever it
-/// was — blocked in a call, asleep, or ready to run — and has to be that
-/// again when the program is continued. A held task is simply never put on
-/// a ready queue, and never switched to. What would have made it runnable
-/// makes it `Ready` and in no queue, and continuing the program queues
-/// every task of it that is.
-static mut HELD: [bool; MAX_TASKS] = [false; MAX_TASKS];
 
-/// The process id of the program each task belongs to: the number, never
-/// given out twice, of the task the program began as.
-///
-/// A task id is a slot in a table, and the next task made is given the lowest
-/// one free — usually the one that has just been let go. Every Unix program
-/// that remembers a child assumes the opposite: that a number it was told a
-/// moment ago does not come back as somebody else. A shell would not wait
-/// for a command because it had been given the number of the last thing it
-/// had run in the background.
-///
-/// A program started by a spawner or by `fork` has its first task's number,
-/// which `exec` leaves alone; a thread has its program's. Kept by task and
-/// not with the program's table, because the table goes when the program
-/// dies and a parent asks about a child after that.
-static mut PROCESS_ID: [u64; MAX_TASKS] = [0; MAX_TASKS];
 
-/// Exit code of the child that woke a waiter, captured at wake time.
-///
-/// It cannot be read from the task afterwards: waking the parent also sets
-/// REAPED, which makes `reap_dead` free the slot, and `child_exit_code` then
-/// falls back to 0. Every non-zero status was being lost that way.
-static mut WAIT_CODE: [i32; MAX_TASKS] = [0; MAX_TASKS];
-/// Per-task "reaped" flag. If true, parent has collected the exit via sys_wait (or has no parent).
-static mut REAPED: [bool; MAX_TASKS] = [false; MAX_TASKS];
 
-/// Ticks left in each task's slice: how long it may run before it is
-/// preempted, which is `usage::slice_for` its program's niceness when the
-/// scheduler chooses it — three ticks for one that has said nothing.
-///
-/// The scheduler used to reschedule on every timer interrupt, which is a
-/// quantum of one tick and a context switch a hundred times a second whether
-/// or not anything else wanted the CPU. It also meant a task could never
-/// finish a short burst of work without being interrupted partway through it.
-///
-/// Three ticks is thirty milliseconds. Anything interactive blocks long before
-/// that — a server blocks on its next receive, a client on its next call — so
-/// this only ever bounds work that is genuinely CPU-bound; and so does how
-/// nice a program is, which is the share of its band it has when it and
-/// another are both computing.
-static mut SLICE_LEFT: [u32; MAX_TASKS] = [0; MAX_TASKS];
 
-/// How far each task has run, as its band sees it: the nanoseconds it has
-/// had, each counted for more the nicer its program is (`usage::weighted`).
-/// Within a band the task that has run least goes next, so that two
-/// programs computing side by side have the band in proportion to their
-/// weights — on one processor or sixteen. In the order they were queued,
-/// with one queue for every processor, a task with a short turn comes round
-/// sooner, and the share a short turn was to cut evened out: a program at
-/// nice 10 had about half of what one at nought did, on four processors.
-static mut VRUN: [u64; MAX_TASKS] = [0; MAX_TASKS];
 /// The most any task of each band had run, as `VRUN` counts it, when it
 /// was chosen. A task that was not ready joins no further back than a
 /// little behind it ([`SLEEPER_LEAD`]): a program that slept for a minute
@@ -149,41 +263,10 @@ static mut FLOOR: [u64; NUM_PRIORITIES] = [0; NUM_PRIORITIES];
 /// How far behind the floor a task that was waiting may join: one turn of
 /// a program at nought, so that it is chosen next rather than last.
 const SLEEPER_LEAD: u64 = 30_000_000;
-/// Put at the front of its band ([`enqueue_front`]): chosen before anything
-/// else in it, the longest put there first, whatever it has run.
-static mut FRONT: [bool; MAX_TASKS] = [false; MAX_TASKS];
-/// Has just yielded: passed over once if anything else in its band is
-/// ready. Once, and not sent to the back for good, or a task yielding while
-/// it waits for another would wait behind everybody for ever.
-static mut YIELDED: [bool; MAX_TASKS] = [false; MAX_TASKS];
 
-/// The processor each task is running on, or [`NO_CPU`].
-///
-/// A task is on a processor from the switch to it until the switch away
-/// from it — in ring 3, in the kernel, or waiting at the kernel's door for
-/// the lock. Both switches are made with the kernel lock held, and whoever
-/// holds the lock afterwards finds the second one complete: the lock is
-/// not given up half way through a switch.
-///
-/// It is what "this task is not running" has to mean with more than one
-/// processor. A dead task's state says nothing about it: ended from
-/// another processor, a task goes on in ring 3 until the interrupt that
-/// tells its processor arrives, on its own kernel stack and in its own
-/// address space. Neither may be freed under it.
-static mut ON_CPU: [u8; MAX_TASKS] = [NO_CPU; MAX_TASKS];
 const NO_CPU: u8 = u8::MAX;
 
-/// Dead, ended from another processor while it ran, and still on its own:
-/// what is said when a task dies — its parent woken to collect it, SIGCHLD
-/// — has not been said yet, and is said by its processor when it leaves
-/// the task ([`schedule_inner`]). A parent told sooner would collect a
-/// child that is still running.
-static mut UNANNOUNCED: [bool; MAX_TASKS] = [false; MAX_TASKS];
 
-/// Dead, and nobody is going to wait for it: a thread that is joined
-/// through the word it asked to have cleared ([`joined_by_word`]). Decided
-/// as it dies, when the word is forgotten.
-static mut UNWAITED: [bool; MAX_TASKS] = [false; MAX_TASKS];
 
 /// There is a dead task for the kernel to take apart: one nobody will
 /// collect — a thread joined through its word, a task whose creator has
@@ -197,7 +280,7 @@ static REAP_WANTED: AtomicBool = AtomicBool::new(false);
 pub fn init() {
     unsafe {
         // TID 0 = idle task (current context, its stack/context will be saved on switch)
-        TASKS[0] = Some(Task {
+        let idle = TaskRec::new(Task {
             tid: 0,
             state: TaskState::Running,
             context: context::CpuContext::empty(),
@@ -220,6 +303,9 @@ pub fn init() {
             ngroups: 0,
             fpu: crate::fpu::clean(),
         });
+        if table().fill_at(0, idle).is_err() {
+            panic!("scheduler: no memory for the idle task");
+        }
         crate::fdtable::attach_new(0);
         crate::usage::task_made(0);
         // With the UID 0 bypass gone, TID 0's authority has to come from its
@@ -241,7 +327,7 @@ pub fn init() {
 /// Caller must hold interrupts off across the search and the subsequent
 /// install, or another task can claim the same slot.
 unsafe fn find_free_tid() -> Option<usize> { unsafe {
-    (1..MAX_TASKS).find(|&i| TASKS[i].is_none())
+    table().lowest_free(1)
 }}
 
 /// Spawn a new kernel task that begins at `entry_fn`.
@@ -265,18 +351,20 @@ pub fn spawn(entry_fn: fn()) -> usize {
 
         let flags = irq_save();
         unsafe {
-            if TASKS[tid].is_some() {
-                // Raced with another spawn; release this task's stack and retry.
+            if let Err(rec) = table().fill_at(tid, TaskRec::new(task)) {
                 irq_restore(flags);
-                let mut task = task;
+                let mut task = rec.task;
                 task.free_stack();
-                continue;
+                // Raced with another spawn for the slot: another one, then.
+                if table().used(tid) {
+                    continue;
+                }
+                panic!("scheduler: no memory for a task");
             }
-            TASKS[tid] = Some(task);
             crate::cap::open_endpoint(tid);
             crate::cap::task_made(tid);
             crate::usage::task_made(tid);
-            PROCESS_ID[tid] = crate::cap::endpoint_of(tid);
+            st(tid).process_id = crate::cap::endpoint_of(tid);
             crate::fdtable::attach_new(tid);
             enqueue(tid);
             crate::smp::wake_idle();
@@ -314,8 +402,8 @@ pub fn yield_now() {
     let flags = irq_save();
     unsafe {
         let me = crate::percpu::current();
-        if me != 0 && matches!(TASKS[me], Some(ref t) if t.state == TaskState::Running) {
-            YIELDED[me] = true;
+        if me != 0 && matches!(*slot(me), Some(ref t) if t.state == TaskState::Running) {
+            st(me).yielded = true;
         }
     }
     irq_restore(flags);
@@ -339,7 +427,7 @@ pub fn exit_with(code: i32) -> ! {
         // a dying thread holds it — so this is what publishes the thread's
         // removal and lets the next `pthread_join` proceed. It has to happen
         // while the address space is still ours to write.
-        let clear_at = TASKS[current].as_ref().map_or(0, |t| t.clear_child_tid);
+        let clear_at = (*slot(current)).as_ref().map_or(0, |t| t.clear_child_tid);
         if clear_at != 0 {
             let cr3 = read_cr3_of(current);
             // The page is given back its memory first, if it has been
@@ -370,8 +458,8 @@ pub fn exit_with(code: i32) -> ! {
         // gone, and a parent waiting for it went on waiting. Interrupts stay
         // off until the switch, which is the last thing this task does.
         let _ = irq_save();
-        UNWAITED[current] = joined_by_word(current);
-        if let Some(ref mut task) = TASKS[current] {
+        st(current).unwaited = joined_by_word(current);
+        if let Some(ref mut task) = *slot(current) {
             task.clear_child_tid = 0;
             task.state = TaskState::Dead;
             task.exit_code = code;
@@ -417,17 +505,17 @@ pub fn timer_tick() {
         // makes CPU-bound work cheaper would make interrupt-driven work worse.
         if let Some(best) = best_ready_band() {
             if best < priority_of(current) {
-                SLICE_LEFT[current] = 0;
+                st(current).slice_left = 0;
                 schedule_inner(true);
                 return;
             }
         }
 
-        if SLICE_LEFT[current] > 1 {
-            SLICE_LEFT[current] -= 1;
+        if st(current).slice_left > 1 {
+            st(current).slice_left -= 1;
             return; // still has time to run
         }
-        SLICE_LEFT[current] = 0;
+        st(current).slice_left = 0;
         schedule_inner(true);
     }
 }
@@ -452,16 +540,16 @@ unsafe fn schedule_inner(from_irq: bool) { unsafe {
     // Put current task back in ready queue if it's still runnable. Not the
     // idle loop: that is what runs when the queues are empty, and is in none.
     if current_tid != 0 {
-        let state = TASKS[current_tid].as_ref().map(|t| t.state);
+        let state = (*slot(current_tid)).as_ref().map(|t| t.state);
         if state == Some(TaskState::Running) {
-            if let Some(ref mut task) = TASKS[current_tid] {
+            if let Some(ref mut task) = *slot(current_tid) {
                 task.state = TaskState::Ready;
             }
             enqueue(current_tid);
-        } else if state == Some(TaskState::Dead) && UNANNOUNCED[current_tid] {
+        } else if state == Some(TaskState::Dead) && st(current_tid).unannounced {
             // Ended from another processor, and this is the one it was
             // running on, leaving it: now its parent may be told.
-            UNANNOUNCED[current_tid] = false;
+            st(current_tid).unannounced = false;
             announce(current_tid);
         }
     }
@@ -484,7 +572,7 @@ unsafe fn schedule_inner(from_irq: bool) { unsafe {
     // A slice of its own, since this is the scheduler choosing it rather than
     // a task handing over what it had left: as long as its program's
     // niceness says.
-    SLICE_LEFT[next_tid] = crate::usage::slice_for(crate::fdtable::nice_of(next_tid));
+    st(next_tid).slice_left = crate::usage::slice_for(crate::fdtable::nice_of(next_tid));
     switch_to(current_tid, next_tid, flags);
 }}
 
@@ -498,7 +586,7 @@ unsafe fn schedule_inner(from_irq: bool) { unsafe {
 unsafe fn switch_to(current_tid: usize, next_tid: usize, flags: u64) { unsafe {
     if next_tid == current_tid {
         // Same task, just mark running again
-        if let Some(ref mut task) = TASKS[current_tid] {
+        if let Some(ref mut task) = *slot(current_tid) {
             task.state = TaskState::Running;
         }
         restore_flags(flags);
@@ -507,7 +595,7 @@ unsafe fn switch_to(current_tid: usize, next_tid: usize, flags: u64) { unsafe {
 
     // Its turn is over: counted, and as given up if it is waiting rather
     // than being made to make way.
-    let gave_up = !matches!(TASKS[current_tid].as_ref().map(|t| t.state), Some(TaskState::Ready | TaskState::Running));
+    let gave_up = !matches!((*slot(current_tid)).as_ref().map(|t| t.state), Some(TaskState::Ready | TaskState::Running));
     count_turn(current_tid);
     crate::usage::switched(current_tid, gave_up);
     crate::usage::resumed(next_tid);
@@ -516,13 +604,13 @@ unsafe fn switch_to(current_tid: usize, next_tid: usize, flags: u64) { unsafe {
     // processor. The lock is held until the switch is done, so nobody sees
     // the second said before it is true.
     if next_tid != 0 {
-        if let Some(ref mut task) = TASKS[next_tid] {
+        if let Some(ref mut task) = *slot(next_tid) {
             task.state = TaskState::Running;
         }
-        ON_CPU[next_tid] = crate::percpu::index() as u8;
+        st(next_tid).on_cpu = crate::percpu::index() as u8;
     }
     if current_tid != 0 {
-        ON_CPU[current_tid] = NO_CPU;
+        st(current_tid).on_cpu = NO_CPU;
     } else {
         // Leaving the idle loop — from an interrupt it was woken by, as
         // often as not, and so before the loop itself can say it is awake.
@@ -537,13 +625,13 @@ unsafe fn switch_to(current_tid: usize, next_tid: usize, flags: u64) { unsafe {
     // not from the task being left: a task that has just become another
     // program, or one that has not been to ring 3 yet, is not in the
     // address space its record names.
-    let new_cr3 = TASKS[next_tid].as_ref().unwrap().cr3;
+    let new_cr3 = (*slot(next_tid)).as_ref().unwrap().cr3;
     if new_cr3 != 0 && new_cr3 != crate::paging::read_cr3() {
         crate::paging::write_cr3(new_cr3);
     }
 
     // Update kernel RSP for syscall re-entry and TSS RSP0 for exceptions
-    let new_task = TASKS[next_tid].as_ref().unwrap();
+    let new_task = (*slot(next_tid)).as_ref().unwrap();
     if !new_task.kernel_stack_base.is_null() {
         let kernel_stack_top =
             new_task.kernel_stack_base as u64 + new_task.kernel_stack_size as u64;
@@ -568,10 +656,10 @@ unsafe fn switch_to(current_tid: usize, next_tid: usize, flags: u64) { unsafe {
     // processor idles — saved already — and is replaced before anything in
     // ring 3 runs again.
     if current_tid != 0 {
-        crate::fpu::save(&raw mut TASKS[current_tid].as_mut().unwrap().fpu);
+        crate::fpu::save(&raw mut (*slot(current_tid)).as_mut().unwrap().fpu);
     }
     if next_tid != 0 {
-        crate::fpu::restore(&raw const TASKS[next_tid].as_ref().unwrap().fpu);
+        crate::fpu::restore(&raw const (*slot(next_tid)).as_ref().unwrap().fpu);
     }
 
     // Get raw pointers to contexts. The idle loop's is this processor's.
@@ -596,7 +684,7 @@ unsafe fn context_of(tid: usize) -> *mut context::CpuContext { unsafe {
     if tid == 0 {
         crate::percpu::idle_context()
     } else {
-        &raw mut TASKS[tid].as_mut().unwrap().context
+        &raw mut (*slot(tid)).as_mut().unwrap().context
     }
 }}
 
@@ -610,7 +698,7 @@ pub fn set_priority(tid: usize, band: u8) -> Result<(), ()> {
         return Err(());
     }
     unsafe {
-        match TASKS[tid] {
+        match *slot(tid) {
             Some(ref mut task) => {
                 task.base_priority = band;
                 Ok(())
@@ -642,21 +730,21 @@ pub fn refresh_priority(tid: usize) {
             return;
         }
         unsafe {
-            let base = match TASKS[cur] {
+            let base = match *slot(cur) {
                 Some(ref t) => t.base_priority,
                 None => return,
             };
             let mut best = base;
             for t in 0..MAX_TASKS {
                 if crate::ipc::blocked_on(t) == Some(cur) {
-                    if let Some(ref waiter) = TASKS[t] {
+                    if let Some(ref waiter) = *slot(t) {
                         if waiter.priority < best {
                             best = waiter.priority;
                         }
                     }
                 }
             }
-            match TASKS[cur] {
+            match *slot(cur) {
                 Some(ref mut t) if t.priority != best => t.priority = best,
                 _ => return, // unchanged, so nothing downstream changes either
             }
@@ -680,7 +768,7 @@ pub fn make_ready(tid: usize) {
         return;
     }
     unsafe {
-        if let Some(ref mut task) = TASKS[tid] {
+        if let Some(ref mut task) = *slot(tid) {
             if task.state == TaskState::Blocked {
                 task.state = TaskState::Ready;
             }
@@ -719,8 +807,8 @@ pub fn donate_to(tid: usize, flags: u64) {
         // ready, in no queue, and stays so until the program is continued.
         let mut takeable = tid < MAX_TASKS
             && tid != current_tid
-            && !HELD[tid]
-            && TASKS[tid].as_ref().map(|t| t.state == TaskState::Ready).unwrap_or(false);
+            && !st(tid).held
+            && (*slot(tid)).as_ref().map(|t| t.state == TaskState::Ready).unwrap_or(false);
         // Handing the CPU straight to the callee skips the scheduler, so it
         // must not be used to run a worse band ahead of a better one. When
         // something better is waiting, go through the queue instead — the
@@ -741,8 +829,8 @@ pub fn donate_to(tid: usize, flags: u64) {
 
         // At least one tick, so a caller whose slice was already spent still
         // makes progress rather than handing over a turn that ends at once.
-        SLICE_LEFT[tid] = SLICE_LEFT[current_tid].max(1);
-        SLICE_LEFT[current_tid] = 0;
+        st(tid).slice_left = st(current_tid).slice_left.max(1);
+        st(current_tid).slice_left = 0;
         switch_to(current_tid, tid, flags);
     }
 }
@@ -753,7 +841,7 @@ pub fn base_priority_of(tid: usize) -> Option<u8> {
     if tid >= MAX_TASKS {
         return None;
     }
-    unsafe { TASKS[tid].as_ref().filter(|t| t.state != TaskState::Dead).map(|t| t.base_priority) }
+    unsafe { (*slot(tid)).as_ref().filter(|t| t.state != TaskState::Dead).map(|t| t.base_priority) }
 }
 
 pub fn priority_of(tid: usize) -> usize {
@@ -761,7 +849,7 @@ pub fn priority_of(tid: usize) -> usize {
         return PRIO_NORMAL as usize;
     }
     unsafe {
-        TASKS[tid]
+        (*slot(tid))
             .as_ref()
             .map(|t| (t.priority as usize).min(NUM_PRIORITIES - 1))
             .unwrap_or(PRIO_NORMAL as usize)
@@ -791,14 +879,14 @@ unsafe fn dequeue_ready() -> Option<usize> { unsafe {
         let mut least_yielded: Option<(usize, u64)> = None;
         for k in 0..READY_COUNT[p] {
             let tid = READY_QUEUE[p][(head + k) % MAX_TASKS];
-            if !matches!(TASKS[tid], Some(ref t) if t.state == TaskState::Ready) {
+            if !matches!(*slot(tid), Some(ref t) if t.state == TaskState::Ready) {
                 continue;
             }
             READY_QUEUE[p][(head + kept) % MAX_TASKS] = tid;
-            let ran = VRUN[tid];
-            if FRONT[tid] {
+            let ran = st(tid).vrun;
+            if st(tid).front {
                 front = front.or(Some(kept));
-            } else if YIELDED[tid] {
+            } else if st(tid).yielded {
                 if least_yielded.is_none_or(|(_, r)| ran < r) {
                     least_yielded = Some((kept, ran));
                 }
@@ -821,11 +909,11 @@ unsafe fn dequeue_ready() -> Option<usize> { unsafe {
         READY_TAIL[p] = (head + kept - 1) % MAX_TASKS;
         // A yield is one turn passed, by whoever is left.
         for j in 0..kept - 1 {
-            YIELDED[READY_QUEUE[p][(head + j) % MAX_TASKS]] = false;
+            st(READY_QUEUE[p][(head + j) % MAX_TASKS]).yielded = false;
         }
-        FRONT[tid] = false;
-        YIELDED[tid] = false;
-        FLOOR[p] = FLOOR[p].max(VRUN[tid]);
+        st(tid).front = false;
+        st(tid).yielded = false;
+        FLOOR[p] = FLOOR[p].max(st(tid).vrun);
         return Some(tid);
     }
     None
@@ -839,7 +927,7 @@ unsafe fn dequeue_ready() -> Option<usize> { unsafe {
 unsafe fn count_turn(tid: usize) { unsafe {
     let ran = crate::usage::charge(tid);
     if tid != 0 && ran != 0 {
-        VRUN[tid] = VRUN[tid].saturating_add(crate::usage::weighted(ran, crate::fdtable::nice_of(tid)));
+        st(tid).vrun = st(tid).vrun.saturating_add(crate::usage::weighted(ran, crate::fdtable::nice_of(tid)));
     }
 }}
 
@@ -849,13 +937,13 @@ unsafe fn count_turn(tid: usize) { unsafe {
 /// # Safety
 /// Interrupts off.
 unsafe fn join_band(tid: usize, p: usize) { unsafe {
-    VRUN[tid] = VRUN[tid].max(FLOOR[p].saturating_sub(SLEEPER_LEAD));
+    st(tid).vrun = st(tid).vrun.max(FLOOR[p].saturating_sub(SLEEPER_LEAD));
 }}
 
 /// Add a task TID to the back of the ready queue. Not a held one: that is
 /// queued when its program is continued. And never the idle loop.
 unsafe fn enqueue(tid: usize) { unsafe {
-    if tid == 0 || HELD[tid] {
+    if tid == 0 || st(tid).held {
         return;
     }
     let p = priority_of(tid);
@@ -871,7 +959,7 @@ unsafe fn enqueue(tid: usize) { unsafe {
 
 /// Put a task at the *front* of the ready queue, so it runs next.
 unsafe fn enqueue_front(tid: usize) { unsafe {
-    if tid == 0 || HELD[tid] {
+    if tid == 0 || st(tid).held {
         return;
     }
     let p = priority_of(tid);
@@ -880,7 +968,7 @@ unsafe fn enqueue_front(tid: usize) { unsafe {
         return;
     }
     join_band(tid, p);
-    FRONT[tid] = true;
+    st(tid).front = true;
     READY_HEAD[p] = (READY_HEAD[p] + MAX_TASKS - 1) % MAX_TASKS;
     READY_QUEUE[p][READY_HEAD[p]] = tid;
     READY_COUNT[p] += 1;
@@ -916,7 +1004,7 @@ pub fn hold_task(tid: usize) {
     }
     let flags = irq_save();
     unsafe {
-        HELD[tid] = true;
+        st(tid).held = true;
         unqueue(tid);
         // Running on another processor, it goes on until that processor is
         // brought into the kernel to look.
@@ -932,7 +1020,7 @@ pub fn hold_task(tid: usize) {
 /// # Safety
 /// Interrupts off.
 unsafe fn interrupt_if_elsewhere(tid: usize) { unsafe {
-    let cpu = ON_CPU[tid];
+    let cpu = st(tid).on_cpu;
     if cpu != NO_CPU && cpu as usize != crate::percpu::index() {
         crate::smp::interrupt(cpu as usize);
     }
@@ -943,7 +1031,7 @@ unsafe fn interrupt_if_elsewhere(tid: usize) { unsafe {
 /// # Safety
 /// Interrupts off.
 unsafe fn runs_elsewhere(tid: usize) -> bool { unsafe {
-    ON_CPU[tid] != NO_CPU && ON_CPU[tid] as usize != crate::percpu::index()
+    st(tid).on_cpu != NO_CPU && st(tid).on_cpu as usize != crate::percpu::index()
 }}
 
 /// A task has come into the kernel from ring 3, or is about to go back
@@ -973,7 +1061,7 @@ pub fn arrived() {
     }
     let flags = irq_save();
     let (dead, held) = unsafe {
-        (matches!(TASKS[me], Some(ref t) if t.state == TaskState::Dead), HELD[me])
+        (matches!(*slot(me), Some(ref t) if t.state == TaskState::Dead), st(me).held)
     };
     if dead {
         unsafe { schedule_inner(false) };
@@ -1018,7 +1106,7 @@ pub fn woken() {
         if current == 0 {
             schedule_inner(true);
         } else if best < priority_of(current) {
-            SLICE_LEFT[current] = 0;
+            st(current).slice_left = 0;
             schedule_inner(true);
         }
     }
@@ -1032,12 +1120,12 @@ pub fn release_task(tid: usize) {
     }
     let flags = irq_save();
     unsafe {
-        if HELD[tid] {
-            HELD[tid] = false;
+        if st(tid).held {
+            st(tid).held = false;
             // Ready, and not running: one that was stopped from another
             // processor and has not been reached yet is still running, and
             // simply goes on.
-            if matches!(TASKS[tid], Some(ref t) if t.state == TaskState::Ready) && ON_CPU[tid] == NO_CPU {
+            if matches!(*slot(tid), Some(ref t) if t.state == TaskState::Ready) && st(tid).on_cpu == NO_CPU {
                 enqueue(tid);
                 crate::smp::wake_idle();
             }
@@ -1048,7 +1136,7 @@ pub fn release_task(tid: usize) {
 
 /// Whether a task is held.
 pub fn is_held(tid: usize) -> bool {
-    tid < MAX_TASKS && unsafe { HELD[tid] }
+    tid < MAX_TASKS && unsafe { st(tid).held }
 }
 
 /// If the running task's program has just been stopped, stop: give up the
@@ -1079,15 +1167,15 @@ pub fn stop_here() {
 /// # Safety
 /// Interrupts must be off.
 unsafe fn joined_by_word(tid: usize) -> bool { unsafe {
-    if UNWAITED[tid] {
+    if st(tid).unwaited {
         return true;
     }
-    let Some(ref t) = TASKS[tid] else { return false };
+    let Some(ref t) = *slot(tid) else { return false };
     let parent = t.parent_tid;
     t.clear_child_tid != 0
         && t.space != 0
         && parent != 0
-        && TASKS[parent].as_ref().is_some_and(|p| p.space == t.space)
+        && (*slot(parent)).as_ref().is_some_and(|p| p.space == t.space)
 }}
 
 /// `tid` has been given a word to clear. If that makes it a thread nobody
@@ -1105,11 +1193,11 @@ pub fn word_given(tid: usize) {
     let flags = irq_save();
     unsafe {
         if joined_by_word(tid) {
-            let parent = TASKS[tid].as_ref().map_or(0, |t| t.parent_tid);
+            let parent = (*slot(tid)).as_ref().map_or(0, |t| t.parent_tid);
             if parent != 0 && waits_for(parent, tid) {
-                WAIT_BLOCKED[parent] = false;
-                WAIT_RESULT[parent] = 0;
-                WAIT_AGAIN[parent] = true;
+                st(parent).wait_blocked = false;
+                st(parent).wait_result = 0;
+                st(parent).wait_again = true;
                 unblock_task(parent);
             }
         }
@@ -1122,9 +1210,9 @@ pub fn word_given(tid: usize) {
 /// # Safety
 /// Interrupts must be off.
 unsafe fn waits_for(parent: usize, child: usize) -> bool { unsafe {
-    WAIT_BLOCKED[parent]
-        && match WAIT_GROUP[parent] {
-            0 => WAIT_TARGET[parent] == 0 || WAIT_TARGET[parent] == child,
+    st(parent).wait_blocked
+        && match st(parent).wait_group {
+            0 => st(parent).wait_target == 0 || st(parent).wait_target == child,
             group => crate::job::pgid_of(child) == group,
         }
 }}
@@ -1141,16 +1229,16 @@ pub fn child_changed(child: usize, kind: u8) {
     }
     let flags = irq_save();
     unsafe {
-        let (parent, space) = match TASKS[child] {
+        let (parent, space) = match *slot(child) {
             Some(ref t) => (t.parent_tid, t.space),
             None => (0, 0),
         };
-        let theirs = if parent == 0 { 0 } else { TASKS[parent].as_ref().map_or(0, |p| p.space) };
+        let theirs = if parent == 0 { 0 } else { (*slot(parent)).as_ref().map_or(0, |p| p.space) };
         if parent != 0 && !(theirs != 0 && theirs == space) {
-            if waits_for(parent, child) && WAIT_REPORTS[parent] & kind != 0 {
-                WAIT_BLOCKED[parent] = false;
-                WAIT_RESULT[parent] = 0;
-                WAIT_AGAIN[parent] = true;
+            if waits_for(parent, child) && st(parent).wait_reports & kind != 0 {
+                st(parent).wait_blocked = false;
+                st(parent).wait_result = 0;
+                st(parent).wait_again = true;
                 unblock_task(parent);
             }
             let info = if kind == crate::job::HAS_STOPPED {
@@ -1182,7 +1270,7 @@ pub fn block_task(tid: usize) {
         return;
     }
     unsafe {
-        if let Some(ref mut task) = TASKS[tid] {
+        if let Some(ref mut task) = *slot(tid) {
             task.state = TaskState::Blocked;
         }
     }
@@ -1197,7 +1285,7 @@ pub fn unblock_task(tid: usize) {
         return;
     }
     unsafe {
-        if let Some(ref mut task) = TASKS[tid] {
+        if let Some(ref mut task) = *slot(tid) {
             if task.state == TaskState::Blocked {
                 task.state = TaskState::Ready;
                 enqueue(tid);
@@ -1232,7 +1320,7 @@ pub fn unblock_task_next(tid: usize) {
         return;
     }
     unsafe {
-        if let Some(ref mut task) = TASKS[tid] {
+        if let Some(ref mut task) = *slot(tid) {
             if task.state == TaskState::Blocked {
                 task.state = TaskState::Ready;
                 enqueue_front(tid);
@@ -1243,7 +1331,7 @@ pub fn unblock_task_next(tid: usize) {
 
 /// Read a dead child's exit status. Interrupts must be off.
 unsafe fn child_exit_code(tid: usize) -> i32 { unsafe {
-    TASKS[tid].as_ref().map(|t| t.exit_code).unwrap_or(0)
+    (*slot(tid)).as_ref().map(|t| t.exit_code).unwrap_or(0)
 }}
 
 /// Block the current task until a child exits.
@@ -1264,9 +1352,9 @@ pub fn interrupt_wait(tid: usize) -> bool {
     }
     let flags = irq_save();
     let waiting = unsafe {
-        let blocked = matches!(TASKS[tid], Some(ref t) if t.state == TaskState::Blocked);
-        if WAIT_BLOCKED[tid] && blocked && WAIT_RESULT[tid] == 0 {
-            WAIT_AGAIN[tid] = true;
+        let blocked = matches!(*slot(tid), Some(ref t) if t.state == TaskState::Blocked);
+        if st(tid).wait_blocked && blocked && st(tid).wait_result == 0 {
+            st(tid).wait_again = true;
             unblock_task(tid);
             true
         } else {
@@ -1284,7 +1372,7 @@ pub fn pid_of(tid: usize) -> u64 {
         return 0;
     }
     let flags = irq_save();
-    let pid = unsafe { PROCESS_ID[tid] };
+    let pid = unsafe { st(tid).process_id };
     irq_restore(flags);
     pid
 }
@@ -1296,7 +1384,7 @@ pub fn join_process(tid: usize, of: usize) {
         return;
     }
     let flags = irq_save();
-    unsafe { PROCESS_ID[tid] = PROCESS_ID[of] };
+    unsafe { st(tid).process_id = st(of).process_id };
     irq_restore(flags);
     // And in its group and its session, and stopped if it is.
     crate::job::joined(tid, of);
@@ -1313,8 +1401,8 @@ pub fn task_of_pid(pid: u64) -> Option<usize> {
     let found = unsafe {
         let is = |want_dead: bool| {
             (2..MAX_TASKS).find(|&i| {
-                PROCESS_ID[i] == pid
-                    && matches!(TASKS[i], Some(ref t) if (t.state == TaskState::Dead) == want_dead)
+                st(i).process_id == pid
+                    && matches!(*slot(i), Some(ref t) if (t.state == TaskState::Dead) == want_dead)
             })
         };
         is(false).or_else(|| is(true))
@@ -1373,8 +1461,8 @@ pub fn sys_wait_for(target: u64, how: Wait) -> u64 {
                 // until it is taken apart, and the task that took its place
                 // is the one to wait for.
                 let child = (1..MAX_TASKS).find(|&i| {
-                    PROCESS_ID[i] == target
-                        && TASKS[i].as_ref().is_some_and(|t| t.parent_tid == parent)
+                    st(i).process_id == target
+                        && (*slot(i)).as_ref().is_some_and(|t| t.parent_tid == parent)
                         && !joined_by_word(i)
                 });
                 match child {
@@ -1392,14 +1480,14 @@ pub fn sys_wait_for(target: u64, how: Wait) -> u64 {
             };
             // What the child is called in the answer. Asked before it is reaped:
             // afterwards it has no name.
-            let name = |i: usize| if how.by_pid { PROCESS_ID[i] } else { i as u64 };
+            let name = |i: usize| if how.by_pid { st(i).process_id } else { i as u64 };
             let wanted = |i: usize| {
                 if group != 0 { crate::job::pgid_of(i) == group } else { target == 0 || target == i }
             };
             // Not a thread that is joined through its word: that is no
             // child of anybody's.
             let mine = |i: usize| {
-                wanted(i) && TASKS[i].as_ref().is_some_and(|t| t.parent_tid == parent) && !joined_by_word(i)
+                wanted(i) && (*slot(i)).as_ref().is_some_and(|t| t.parent_tid == parent) && !joined_by_word(i)
             };
             // Check if a child is already dead (zombie) and not yet reaped.
             // Not one that was ended from another processor and is still
@@ -1407,11 +1495,11 @@ pub fn sys_wait_for(target: u64, how: Wait) -> u64 {
             // it, and the wait below is woken then.
             for i in 1..MAX_TASKS {
                 let collectable = mine(i)
-                    && !REAPED[i]
-                    && !UNANNOUNCED[i]
-                    && matches!(TASKS[i], Some(ref t) if t.state == TaskState::Dead);
+                    && !st(i).reaped
+                    && !st(i).unannounced
+                    && matches!(*slot(i), Some(ref t) if t.state == TaskState::Dead);
                 if collectable {
-                    REAPED[i] = true;
+                    st(i).reaped = true;
                     let code = child_exit_code(i);
                     let child = name(i);
                     // What it used is what its parent's children used.
@@ -1424,7 +1512,7 @@ pub fn sys_wait_for(target: u64, how: Wait) -> u64 {
             // Or one that has stopped or started, if that was asked for.
             if how.reports != 0 {
                 for i in 1..MAX_TASKS {
-                    let alive = mine(i) && matches!(TASKS[i], Some(ref t) if t.state != TaskState::Dead);
+                    let alive = mine(i) && matches!(*slot(i), Some(ref t) if t.state != TaskState::Dead);
                     if !alive {
                         continue;
                     }
@@ -1456,29 +1544,29 @@ pub fn sys_wait_for(target: u64, how: Wait) -> u64 {
 
             // Block until a child exits. Marking and blocking must both happen
             // before interrupts come back on, or exit() can slip in between them.
-            WAIT_BLOCKED[parent] = true;
-            WAIT_TARGET[parent] = target;
-            WAIT_GROUP[parent] = group;
-            WAIT_REPORTS[parent] = how.reports;
-            WAIT_AGAIN[parent] = false;
-            WAIT_RESULT[parent] = 0;
-            WAIT_CODE[parent] = 0;
+            st(parent).wait_blocked = true;
+            st(parent).wait_target = target;
+            st(parent).wait_group = group;
+            st(parent).wait_reports = how.reports;
+            st(parent).wait_again = false;
+            st(parent).wait_result = 0;
+            st(parent).wait_code = 0;
             block_task(parent);
             irq_restore(flags);
             yield_now();
 
             // Woken up — WAIT_RESULT has the dead child's TID
             let flags = irq_save();
-            let child_tid = WAIT_RESULT[parent];
-            let again = core::mem::replace(&mut WAIT_AGAIN[parent], false);
-            WAIT_BLOCKED[parent] = false;
-            WAIT_RESULT[parent] = 0;
-            WAIT_TARGET[parent] = 0;
-            WAIT_GROUP[parent] = 0;
-            WAIT_REPORTS[parent] = 0;
+            let child_tid = st(parent).wait_result;
+            let again = core::mem::replace(&mut st(parent).wait_again, false);
+            st(parent).wait_blocked = false;
+            st(parent).wait_result = 0;
+            st(parent).wait_target = 0;
+            st(parent).wait_group = 0;
+            st(parent).wait_reports = 0;
             if child_tid != 0 {
-                let code = WAIT_CODE[parent];
-                let child = if how.by_pid { PROCESS_ID[child_tid] } else { child_tid as u64 };
+                let code = st(parent).wait_code;
+                let child = if how.by_pid { st(child_tid).process_id } else { child_tid as u64 };
                 // Reaped now rather than whenever the machine next goes idle.
                 // A dead task keeps all its memory until it is reaped, and a
                 // parent running programs one after another never lets the
@@ -1532,7 +1620,7 @@ pub fn clear_fd(tid: usize, fd: usize) -> Result<(), ()> {
 
 pub unsafe fn get_task_mut(tid: usize) -> Option<&'static mut Task> { unsafe {
     if tid < MAX_TASKS {
-        TASKS[tid].as_mut()
+        (*slot(tid)).as_mut().map(|r| &mut r.task)
     } else {
         None
     }
@@ -1590,8 +1678,8 @@ pub fn end_program(tid: usize, code: i32) -> Result<(), ()> {
     let flags = irq_save();
     let (mine, theirs) = unsafe {
         (
-            TASKS[me].as_ref().map_or(0, |t| t.space),
-            TASKS[tid].as_ref().map_or(0, |t| t.space),
+            (*slot(me)).as_ref().map_or(0, |t| t.space),
+            (*slot(tid)).as_ref().map_or(0, |t| t.space),
         )
     };
     if theirs == 0 {
@@ -1611,7 +1699,7 @@ pub fn end_program(tid: usize, code: i32) -> Result<(), ()> {
     let mut ended = Err(());
     for other in 2..MAX_TASKS {
         let theirs_too = unsafe {
-            matches!(TASKS[other], Some(ref t) if t.space == theirs && t.state != TaskState::Dead)
+            matches!(*slot(other), Some(ref t) if t.space == theirs && t.state != TaskState::Dead)
         };
         if theirs_too && end_other(other, code).is_ok() {
             ended = Ok(());
@@ -1632,12 +1720,12 @@ pub fn end_program(tid: usize, code: i32) -> Result<(), ()> {
 /// that the child is there to collect by the time anything hears of it.
 /// Interrupts are off.
 unsafe fn tell_parent(tid: usize) { unsafe {
-    let Some(ref task) = TASKS[tid] else { return };
+    let Some(ref task) = *slot(tid) else { return };
     let parent = task.parent_tid;
     if parent == 0 {
         return;
     }
-    let theirs = TASKS[parent].as_ref().map_or(0, |p| p.space);
+    let theirs = (*slot(parent)).as_ref().map_or(0, |p| p.space);
     if theirs != 0 && theirs == task.space {
         return;
     }
@@ -1654,9 +1742,9 @@ unsafe fn tell_parent(tid: usize) { unsafe {
 fn end_other(tid: usize, code: i32) -> Result<(), ()> {
     unsafe {
         let unwaited = joined_by_word(tid);
-        match TASKS[tid].as_mut() {
+        match (*slot(tid)).as_mut() {
             Some(task) if task.state != TaskState::Dead => {
-                UNWAITED[tid] = unwaited;
+                st(tid).unwaited = unwaited;
                 task.state = TaskState::Dead;
                 task.exit_code = code;
                 crate::ipc::clear_signal_deadline(tid);
@@ -1674,7 +1762,7 @@ fn end_other(tid: usize, code: i32) -> Result<(), ()> {
             // it do. It has not finished dying until then — it is on its
             // kernel stack and in its address space — so its parent is
             // told by that processor as it leaves ([`schedule_inner`]).
-            UNANNOUNCED[tid] = true;
+            st(tid).unannounced = true;
             interrupt_if_elsewhere(tid);
         } else {
             announce(tid);
@@ -1694,9 +1782,9 @@ fn end_other(tid: usize, code: i32) -> Result<(), ()> {
 /// # Safety
 /// Interrupts off.
 unsafe fn announce(tid: usize) { unsafe {
-    let Some(ref task) = TASKS[tid] else { return };
+    let Some(ref task) = *slot(tid) else { return };
     let (parent, code) = (task.parent_tid, task.exit_code);
-    if UNWAITED[tid] {
+    if st(tid).unwaited {
         // A thread joined through its word, which was cleared as it died:
         // that was the whole of its being collected, and no wait is woken
         // for it. Nobody is coming for what is left, so the kernel takes it
@@ -1704,11 +1792,11 @@ unsafe fn announce(tid: usize) { unsafe {
         // do. Left to its creator's wait, it stayed until its program
         // ended, and a program that made threads one after another used up
         // the machine's places for tasks.
-        REAPED[tid] = true;
+        st(tid).reaped = true;
         REAP_WANTED.store(true, Ordering::Relaxed);
         return;
     }
-    if parent == 0 || TASKS[parent].is_none() {
+    if parent == 0 || (*slot(parent)).is_none() {
         // Nobody's either: whoever made it has gone. A thread made by a
         // thread that has since ended is one of these, so they are not
         // left for a processor with nothing to do — a busy machine has
@@ -1718,10 +1806,10 @@ unsafe fn announce(tid: usize) { unsafe {
     }
     // If parent is blocked in sys_wait, wake it with the dead child's TID
     if waits_for(parent, tid) {
-        WAIT_BLOCKED[parent] = false;
-        WAIT_RESULT[parent] = tid;
-        WAIT_CODE[parent] = code;
-        REAPED[tid] = true;
+        st(parent).wait_blocked = false;
+        st(parent).wait_result = tid;
+        st(parent).wait_code = code;
+        st(tid).reaped = true;
         unblock_task(parent);
     }
     tell_parent(tid);
@@ -1738,11 +1826,11 @@ unsafe fn announce(tid: usize) { unsafe {
 pub fn exit_program(code: i32) -> ! {
     let me = current_tid();
     let flags = irq_save();
-    let space = unsafe { TASKS[me].as_ref().map_or(0, |t| t.space) };
+    let space = unsafe { (*slot(me)).as_ref().map_or(0, |t| t.space) };
     if space != 0 {
         for tid in 2..MAX_TASKS {
             let sibling = unsafe {
-                matches!(TASKS[tid], Some(ref t) if tid != me && t.space == space && t.state != TaskState::Dead)
+                matches!(*slot(tid), Some(ref t) if tid != me && t.space == space && t.state != TaskState::Dead)
             };
             if sibling {
                 let _ = end_other(tid, code);
@@ -1761,7 +1849,7 @@ pub fn space_of_task(tid: usize) -> u64 {
     }
     let flags = irq_save();
     let space = unsafe {
-        match TASKS[tid] {
+        match *slot(tid) {
             Some(ref t) if t.state != TaskState::Dead => t.space,
             _ => 0,
         }
@@ -1781,10 +1869,10 @@ pub fn create_task_in(cr3: usize) -> Option<usize> {
     let tid = create_empty_task()?;
     let flags = irq_save();
     unsafe {
-        if let Some(t) = TASKS[tid].as_mut() {
+        if let Some(t) = (*slot(tid)).as_mut() {
             t.space = space;
         }
-        NPINNED[tid] = 0;
+        st(tid).npinned = 0;
     }
     irq_restore(flags);
     Some(tid)
@@ -1797,9 +1885,7 @@ pub fn task_of_space(space: u64) -> Option<usize> {
         return None;
     }
     unsafe {
-        (*core::ptr::addr_of!(TASKS))
-            .iter()
-            .position(|t| matches!(t, Some(t) if t.space == space && t.state != TaskState::Dead))
+        tids().find(|&i| matches!(*slot(i), Some(ref t) if t.space == space && t.state != TaskState::Dead))
     }
 }
 
@@ -1808,9 +1894,7 @@ pub fn task_of_space(space: u64) -> Option<usize> {
 /// # Safety
 /// Interrupts must be off.
 unsafe fn space_has_live_task(space: u64) -> bool { unsafe {
-    (*core::ptr::addr_of!(TASKS))
-        .iter()
-        .any(|t| matches!(t, Some(t) if t.space == space && t.state != TaskState::Dead))
+    tids().any(|i| matches!(*slot(i), Some(ref t) if t.space == space && t.state != TaskState::Dead))
 }}
 
 /// Tell whoever watches `tid` that it has died, and whoever watches its
@@ -1822,7 +1906,7 @@ unsafe fn space_has_live_task(space: u64) -> bool { unsafe {
 /// Interrupts must be off.
 unsafe fn note_death(tid: usize) { unsafe {
     crate::ipc::notify_watchers(tid);
-    let Some(ref t) = TASKS[tid] else { return };
+    let Some(ref t) = *slot(tid) else { return };
     let space = t.space;
     if space != 0 && !space_has_live_task(space) {
         crate::ipc::notify_space_watchers(space);
@@ -1855,7 +1939,7 @@ pub fn task_is_live(tid: usize) -> bool {
         return false;
     }
     unsafe {
-        TASKS[tid]
+        (*slot(tid))
             .as_ref()
             .is_some_and(|t| t.state != TaskState::Dead)
     }
@@ -1865,7 +1949,7 @@ pub fn task_is_live(tid: usize) -> bool {
 pub fn task_info(tid: usize) -> Option<(TaskState, u32, u32, usize)> {
     if tid >= MAX_TASKS { return None; }
     unsafe {
-        TASKS[tid].as_ref().map(|t| (t.state, t.uid, t.gid, t.parent_tid))
+        (*slot(tid)).as_ref().map(|t| (t.state, t.uid, t.gid, t.parent_tid))
     }
 }
 
@@ -1878,7 +1962,7 @@ pub fn task_info(tid: usize) -> Option<(TaskState, u32, u32, usize)> {
 pub fn current_kernel_stack() -> (usize, usize) {
     unsafe {
         let tid = crate::percpu::current();
-        match TASKS[tid] {
+        match *slot(tid) {
             Some(ref t) if !t.kernel_stack_base.is_null() => {
                 (t.kernel_stack_base as usize, t.kernel_stack_base as usize + t.kernel_stack_size)
             }
@@ -1999,14 +2083,14 @@ pub fn close_descriptors(tid: usize) {
 }
 
 unsafe fn reap_one(i: usize) -> u64 { unsafe {
-    let Some(ref mut task) = TASKS[i] else {
+    let Some(ref mut task) = *slot(i) else {
         return 0;
     };
     if task.state != TaskState::Dead {
         return 0;
     }
     let parent = task.parent_tid;
-    let can_reap = REAPED[i] || parent == 0 || TASKS[parent].is_none();
+    let can_reap = st(i).reaped || parent == 0 || (*slot(parent)).is_none();
     if !can_reap {
         return 0;
     }
@@ -2016,14 +2100,14 @@ unsafe fn reap_one(i: usize) -> u64 { unsafe {
     // with nothing to do — and must not get there first. With one processor
     // nothing could: the parent was ready, and the idle loop runs when
     // nothing is. With two, the parent was told its child was process 0.
-    if parent != 0 && WAIT_RESULT[parent] == i {
+    if parent != 0 && st(parent).wait_result == i {
         return 0;
     }
     // Ended from another processor, and still running there: what is freed
     // below is what it is standing on. That processor has been interrupted
     // and will leave it; whoever next comes into the kernel, or has nothing
     // to do, tries again.
-    if ON_CPU[i] != NO_CPU {
+    if st(i).on_cpu != NO_CPU {
         REAP_WANTED.store(true, Ordering::Relaxed);
         return 0;
     }
@@ -2050,9 +2134,7 @@ unsafe fn reap_one(i: usize) -> u64 { unsafe {
     let survivor = if space == 0 {
         None
     } else {
-        (*core::ptr::addr_of!(TASKS)).iter().position(|t| {
-            matches!(t, Some(t) if t.tid != i && t.space == space && t.state != TaskState::Dead)
-        })
+        tids().find(|&j| matches!(*slot(j), Some(ref t) if t.tid != i && t.space == space && t.state != TaskState::Dead))
     };
     crate::shmem::cleanup_task(i, survivor);
     // Reclaim sys_phys_alloc reservations it never released
@@ -2068,22 +2150,22 @@ unsafe fn reap_one(i: usize) -> u64 { unsafe {
         crate::userspace::unregister_address_space(cr3);
     }
     task.free_stack();
-    REAPED[i] = false;
+    st(i).reaped = false;
     // Clean up wait state if this task was a parent
-    WAIT_BLOCKED[i] = false;
-    WAIT_RESULT[i] = 0;
-    WAIT_TARGET[i] = 0;
-    WAIT_GROUP[i] = 0;
-    WAIT_REPORTS[i] = 0;
-    WAIT_AGAIN[i] = false;
+    st(i).wait_blocked = false;
+    st(i).wait_result = 0;
+    st(i).wait_target = 0;
+    st(i).wait_group = 0;
+    st(i).wait_reports = 0;
+    st(i).wait_again = false;
     // Every capability to it names nothing from here on, whoever holds one.
     crate::cap::close_endpoint(i);
-    PROCESS_ID[i] = 0;
-    HELD[i] = false;
-    UNANNOUNCED[i] = false;
-    UNWAITED[i] = false;
+    st(i).process_id = 0;
+    st(i).held = false;
+    st(i).unannounced = false;
+    st(i).unwaited = false;
     crate::job::forget(i);
-    TASKS[i] = None;
+    table().empty(i);
 
     // Left naming this TID, its children would wait on a parent that is gone,
     // and whatever took the slot next would find them its own — collected by
@@ -2091,7 +2173,7 @@ unsafe fn reap_one(i: usize) -> u64 { unsafe {
     // user ID they were made with.
     let mut dead = 0u64;
     for j in 1..MAX_TASKS {
-        if let Some(ref mut child) = TASKS[j] {
+        if let Some(ref mut child) = *slot(j) {
             if child.parent_tid == i {
                 child.parent_tid = 0;
                 if child.state == TaskState::Dead {
@@ -2107,7 +2189,7 @@ unsafe fn reap_one(i: usize) -> u64 { unsafe {
 pub fn current_task_cr3() -> usize {
     let tid = current_tid();
     unsafe {
-        match TASKS[tid].as_ref() {
+        match (*slot(tid)).as_ref() {
             Some(task) => task.cr3,
             None => 0,
         }
@@ -2128,7 +2210,7 @@ pub fn current_task_has_cap(cap: u32) -> bool {
 pub fn current_task_uid() -> u32 {
     let tid = current_tid();
     unsafe {
-        match TASKS[tid].as_ref() {
+        match (*slot(tid)).as_ref() {
             Some(task) => task.uid,
             None => 0,
         }
@@ -2139,7 +2221,7 @@ pub fn current_task_uid() -> u32 {
 pub fn current_task_gid() -> u32 {
     let tid = current_tid();
     unsafe {
-        match TASKS[tid].as_ref() {
+        match (*slot(tid)).as_ref() {
             Some(task) => task.gid,
             None => 0,
         }
@@ -2150,7 +2232,7 @@ pub fn current_task_gid() -> u32 {
 pub fn task_uid_gid(tid: usize) -> Result<(u32, u32), ()> {
     if tid >= MAX_TASKS { return Err(()); }
     unsafe {
-        match TASKS[tid].as_ref() {
+        match (*slot(tid)).as_ref() {
             Some(task) => Ok((task.uid, task.gid)),
             None => Err(()),
         }
@@ -2161,7 +2243,7 @@ pub fn task_uid_gid(tid: usize) -> Result<(u32, u32), ()> {
 pub fn set_task_uid(tid: usize, uid: u32) -> Result<(), ()> {
     if tid >= MAX_TASKS { return Err(()); }
     unsafe {
-        match TASKS[tid].as_mut() {
+        match (*slot(tid)).as_mut() {
             Some(task) => { task.uid = uid; Ok(()) }
             None => Err(()),
         }
@@ -2175,7 +2257,7 @@ pub fn task_groups(tid: usize, out: &mut [u32; crate::task::MAX_GROUPS]) -> Resu
     }
     let flags = irq_save();
     let got = unsafe {
-        TASKS[tid].as_ref().map(|t| {
+        (*slot(tid)).as_ref().map(|t| {
             *out = t.groups;
             t.ngroups as usize
         })
@@ -2191,7 +2273,7 @@ pub fn set_task_groups(tid: usize, groups: &[u32]) -> Result<(), ()> {
     }
     let flags = irq_save();
     let set = unsafe {
-        TASKS[tid].as_mut().map(|t| {
+        (*slot(tid)).as_mut().map(|t| {
             t.groups = [0; crate::task::MAX_GROUPS];
             t.groups[..groups.len()].copy_from_slice(groups);
             t.ngroups = groups.len() as u8;
@@ -2209,7 +2291,7 @@ pub fn identify(tid: usize, uid: u32, gid: u32, groups: &[u32]) -> Result<(), ()
     }
     let flags = irq_save();
     let set = unsafe {
-        TASKS[tid].as_mut().map(|t| {
+        (*slot(tid)).as_mut().map(|t| {
             t.uid = uid;
             t.gid = gid;
             t.groups = [0; crate::task::MAX_GROUPS];
@@ -2225,7 +2307,7 @@ pub fn identify(tid: usize, uid: u32, gid: u32, groups: &[u32]) -> Result<(), ()
 pub fn set_task_gid(tid: usize, gid: u32) -> Result<(), ()> {
     if tid >= MAX_TASKS { return Err(()); }
     unsafe {
-        match TASKS[tid].as_mut() {
+        match (*slot(tid)).as_mut() {
             Some(task) => { task.gid = gid; Ok(()) }
             None => Err(()),
         }
@@ -2235,7 +2317,7 @@ pub fn set_task_gid(tid: usize, gid: u32) -> Result<(), ()> {
 /// Create an empty task slot (Blocked, cr3=0, caps=0). Returns TID.
 /// The address space a task is running in.
 fn read_cr3_of(tid: usize) -> usize {
-    unsafe { TASKS[tid].as_ref().map_or(0, |t| t.cr3) }
+    unsafe { (*slot(tid)).as_ref().map_or(0, |t| t.cr3) }
 }
 
 /// The address space `tid` runs in, or 0 if there is no such task.
@@ -2255,7 +2337,7 @@ pub fn parent_of(tid: usize) -> Option<usize> {
         return None;
     }
     unsafe {
-        match TASKS[tid].as_ref() {
+        match (*slot(tid)).as_ref() {
             Some(t) if t.parent_tid != 0 => Some(t.parent_tid),
             _ => None,
         }
@@ -2271,7 +2353,7 @@ pub fn children_of(tid: usize) -> usize {
     unsafe {
         let mut n = 0;
         for i in 1..MAX_TASKS {
-            if let Some(ref t) = TASKS[i] {
+            if let Some(ref t) = *slot(i) {
                 if t.parent_tid == tid && t.state != TaskState::Dead {
                     n += 1;
                 }
@@ -2303,15 +2385,15 @@ pub fn create_empty_task() -> Option<usize> {
 
     let parent = current_tid();
     let (parent_uid, parent_gid, parent_groups, parent_ngroups) = unsafe {
-        match TASKS[parent].as_ref() {
+        match (*slot(parent)).as_ref() {
             Some(t) => (t.uid, t.gid, t.groups, t.ngroups),
             None => (0, 0, [0; crate::task::MAX_GROUPS], 0),
         }
     };
     unsafe {
-        NPINNED[tid] = 0;
+        st(tid).npinned = 0;
         crate::signal::task_made(tid);
-        TASKS[tid] = Some(Task {
+        let made = TaskRec::new(Task {
             tid,
             state: TaskState::Blocked,
             context: context::CpuContext::empty(),
@@ -2338,6 +2420,12 @@ pub fn create_empty_task() -> Option<usize> {
             // stranger: it can already read the memory, but not the moment.
             fpu: crate::fpu::clean(),
         });
+        if table().fill_at(tid, made).is_err() {
+            // No memory for its record: nothing was made.
+            irq_restore(flags);
+            alloc::alloc::dealloc(stack_base, layout);
+            return None;
+        }
         crate::cap::open_endpoint(tid);
         // A process id of its own, a table of its own and a capability space
         // of its own, empty. A task started as a thread gives them up for its
@@ -2345,19 +2433,19 @@ pub fn create_empty_task() -> Option<usize> {
         crate::cap::task_made(tid);
         crate::usage::task_made(tid);
         crate::threads::task_made(tid, parent);
-        PROCESS_ID[tid] = crate::cap::endpoint_of(tid);
+        st(tid).process_id = crate::cap::endpoint_of(tid);
         // In its creator's process group and session: a job is whatever a
         // shell started, and what those started.
-        HELD[tid] = false;
-        FRONT[tid] = false;
-        YIELDED[tid] = false;
+        st(tid).held = false;
+        st(tid).front = false;
+        st(tid).yielded = false;
         // It has run nothing, and joining a band puts it where that band
         // has got to.
-        VRUN[tid] = 0;
-        UNANNOUNCED[tid] = false;
-        UNWAITED[tid] = false;
-        ON_CPU[tid] = NO_CPU;
-        crate::job::born(tid, parent, PROCESS_ID[tid]);
+        st(tid).vrun = 0;
+        st(tid).unannounced = false;
+        st(tid).unwaited = false;
+        st(tid).on_cpu = NO_CPU;
+        crate::job::born(tid, parent, st(tid).process_id);
         crate::fdtable::attach_new(tid);
         // As nice as its creator's program, and limited as it is: a child
         // forked or spawned runs as its parent was told to.
@@ -2391,8 +2479,8 @@ pub fn inherit_from_creator(tid: usize, creator: usize, thread: bool) {
     }
     let flags = irq_save();
     unsafe {
-        let band = TASKS[creator].as_ref().map(|t| t.base_priority);
-        if let (Some(band), Some(dst)) = (band, TASKS[tid].as_mut()) {
+        let band = (*slot(creator)).as_ref().map(|t| t.base_priority);
+        if let (Some(band), Some(dst)) = (band, (*slot(tid)).as_mut()) {
             dst.base_priority = band;
             dst.priority = band;
         }
@@ -2422,7 +2510,7 @@ pub fn start_task(tid: usize, rip: u64, rsp: u64, cr3: usize, arg: u64) -> Resul
 /// [`start_task`], with interrupts off.
 unsafe fn start_task_locked(tid: usize, rip: u64, rsp: u64, cr3: usize, arg: u64) -> Result<(), ()> {
     unsafe {
-        let task = match TASKS[tid].as_mut() {
+        let task = match (*slot(tid)).as_mut() {
             Some(t) => t,
             None => return Err(()),
         };
@@ -2472,7 +2560,7 @@ unsafe fn start_task_locked(tid: usize, rip: u64, rsp: u64, cr3: usize, arg: u64
 
 /// Grant a capability to a task.
 pub fn grant_cap(tid: usize, cap: u32) -> Result<(), ()> {
-    if tid >= MAX_TASKS || unsafe { TASKS[tid].is_none() } {
+    if tid >= MAX_TASKS || unsafe { (*slot(tid)).is_none() } {
         return Err(());
     }
     // The bits, and wildcard/full-range caps for them in the CSpace.
@@ -2511,7 +2599,7 @@ pub fn set_pager(tid: usize, pager_tid: usize) -> Result<(), ()> {
         return Err(());
     }
     unsafe {
-        match TASKS[tid].as_mut() {
+        match (*slot(tid)).as_mut() {
             Some(task) => {
                 task.pager_tid = pager_tid;
                 Ok(())
@@ -2525,7 +2613,7 @@ pub fn set_pager(tid: usize, pager_tid: usize) -> Result<(), ()> {
 pub fn current_task_pager() -> usize {
     let tid = current_tid();
     unsafe {
-        match TASKS[tid].as_ref() {
+        match (*slot(tid)).as_ref() {
             Some(task) => task.pager_tid,
             None => 0,
         }
@@ -2536,14 +2624,6 @@ pub fn current_task_pager() -> usize {
 /// to have checked. More than that and all of the program's memory is held.
 const PINS: usize = 8;
 
-/// What the system call each task is in has checked of its program's
-/// memory, and may touch with interrupts off until it returns: these pages
-/// are not taken away to be written out (`reclaim.rs`). A call checks a
-/// buffer, waits — for a pipe to have something in it — and then copies
-/// with a lock held, where a page that had gone in the meantime could not
-/// be waited for.
-static mut PINNED: [[(u64, u64); PINS]; MAX_TASKS] = [[(0, 0); PINS]; MAX_TASKS];
-static mut NPINNED: [u8; MAX_TASKS] = [0; MAX_TASKS];
 
 /// The current task's system call has checked `len` bytes at `addr`.
 pub fn pin(addr: u64, len: u64) {
@@ -2553,12 +2633,12 @@ pub fn pin(addr: u64, len: u64) {
     let tid = current_tid();
     let flags = irq_save();
     unsafe {
-        let n = NPINNED[tid] as usize;
+        let n = st(tid).npinned as usize;
         if n < PINS {
-            PINNED[tid][n] = (addr & !0xFFF, addr.saturating_add(len - 1) | 0xFFF);
+            st(tid).pinned[n] = (addr & !0xFFF, addr.saturating_add(len - 1) | 0xFFF);
         }
         // One past the last there is room for means "everything".
-        NPINNED[tid] = (n + 1).min(PINS + 1) as u8;
+        st(tid).npinned = (n + 1).min(PINS + 1) as u8;
     }
     irq_restore(flags);
 }
@@ -2568,7 +2648,7 @@ pub fn pin(addr: u64, len: u64) {
 #[inline]
 pub fn unpin() {
     let tid = current_tid();
-    unsafe { NPINNED[tid] = 0 };
+    unsafe { st(tid).npinned = 0 };
 }
 
 /// Whether a system call some task of program `space` is in has checked
@@ -2576,14 +2656,14 @@ pub fn unpin() {
 pub fn pinned(space: u64, va: u64) -> bool {
     unsafe {
         for tid in 1..MAX_TASKS {
-            let n = NPINNED[tid] as usize;
+            let n = st(tid).npinned as usize;
             if n == 0 {
                 continue;
             }
-            if !matches!(TASKS[tid], Some(ref t) if t.space == space && t.state != TaskState::Dead) {
+            if !matches!(*slot(tid), Some(ref t) if t.space == space && t.state != TaskState::Dead) {
                 continue;
             }
-            if n > PINS || PINNED[tid][..n].iter().any(|&(from, to)| (from..=to).contains(&va)) {
+            if n > PINS || st(tid).pinned[..n].iter().any(|&(from, to)| (from..=to).contains(&va)) {
                 return true;
             }
         }
@@ -2599,7 +2679,7 @@ pub fn tasks_of_space_mask(space: u64) -> u64 {
     let flags = irq_save();
     unsafe {
         for t in 1..MAX_TASKS {
-            if matches!(TASKS[t], Some(ref task) if task.space == space) {
+            if matches!(*slot(t), Some(ref task) if task.space == space) {
                 mask |= 1 << t;
             }
         }
@@ -2618,9 +2698,9 @@ pub fn tasks_of_process(tid: usize, out: &mut [usize]) -> usize {
     let mut n = 0;
     let flags = irq_save();
     unsafe {
-        let pid = PROCESS_ID[tid];
+        let pid = st(tid).process_id;
         for t in 0..MAX_TASKS {
-            if n < out.len() && TASKS[t].is_some() && PROCESS_ID[t] == pid {
+            if n < out.len() && (*slot(t)).is_some() && st(t).process_id == pid {
                 out[n] = t;
                 n += 1;
             }
@@ -2636,7 +2716,7 @@ pub fn running_on(tid: usize) -> Option<usize> {
     if tid >= MAX_TASKS {
         return None;
     }
-    let cpu = unsafe { ON_CPU[tid] };
+    let cpu = unsafe { st(tid).on_cpu };
     (cpu != NO_CPU).then_some(cpu as usize)
 }
 
@@ -2646,7 +2726,7 @@ pub fn running_elsewhere(tid: usize) -> Option<usize> {
     if tid >= MAX_TASKS {
         return None;
     }
-    let cpu = unsafe { ON_CPU[tid] };
+    let cpu = unsafe { st(tid).on_cpu };
     (cpu != NO_CPU && cpu as usize != crate::percpu::index()).then_some(cpu as usize)
 }
 
@@ -2654,7 +2734,7 @@ pub fn running_elsewhere(tid: usize) -> Option<usize> {
 /// from others for, and not from.
 pub fn current_is_privileged() -> bool {
     let tid = current_tid();
-    unsafe { matches!(TASKS[tid], Some(ref t) if t.base_priority < PRIO_NORMAL) }
+    unsafe { matches!(*slot(tid), Some(ref t) if t.base_priority < PRIO_NORMAL) }
 }
 
 /// Whether memory may be taken from program `space` to be written out:
@@ -2664,7 +2744,7 @@ pub fn space_gives_memory(space: u64) -> bool {
     unsafe {
         let mut any = false;
         for tid in 1..MAX_TASKS {
-            if let Some(ref t) = TASKS[tid] {
+            if let Some(ref t) = *slot(tid) {
                 if t.space == space && t.state != TaskState::Dead {
                     if t.base_priority < PRIO_NORMAL {
                         return false;
@@ -2682,7 +2762,7 @@ pub fn space_gives_memory(space: u64) -> bool {
 pub fn current_task_check_mem(pages: usize) -> bool {
     let tid = current_tid();
     unsafe {
-        match TASKS[tid].as_ref() {
+        match (*slot(tid)).as_ref() {
             Some(task) => {
                 if task.mem_limit == 0 {
                     true // unlimited
@@ -2698,14 +2778,14 @@ pub fn current_task_check_mem(pages: usize) -> bool {
 /// Pages charged to the current task.
 pub fn current_task_mem() -> usize {
     let tid = current_tid();
-    unsafe { TASKS[tid].as_ref().map_or(0, |t| t.mem_pages) }
+    unsafe { (*slot(tid)).as_ref().map_or(0, |t| t.mem_pages) }
 }
 
 /// Add `pages` to the current task's memory usage counter.
 pub fn current_task_charge_mem(pages: usize) {
     let tid = current_tid();
     unsafe {
-        if let Some(ref mut task) = TASKS[tid] {
+        if let Some(ref mut task) = *slot(tid) {
             task.mem_pages += pages;
         }
     }
@@ -2715,7 +2795,7 @@ pub fn current_task_charge_mem(pages: usize) {
 pub fn current_task_uncharge_mem(pages: usize) {
     let tid = current_tid();
     unsafe {
-        if let Some(ref mut task) = TASKS[tid] {
+        if let Some(ref mut task) = *slot(tid) {
             task.mem_pages = task.mem_pages.saturating_sub(pages);
         }
     }
@@ -2727,7 +2807,7 @@ pub fn uncharge_task_mem(tid: usize, pages: usize) {
         return;
     }
     unsafe {
-        if let Some(ref mut task) = TASKS[tid] {
+        if let Some(ref mut task) = *slot(tid) {
             task.mem_pages = task.mem_pages.saturating_sub(pages);
         }
     }
@@ -2739,7 +2819,7 @@ pub fn set_mem_limit(tid: usize, limit: usize) -> Result<(), ()> {
         return Err(());
     }
     unsafe {
-        match TASKS[tid].as_mut() {
+        match (*slot(tid)).as_mut() {
             Some(task) => {
                 task.mem_limit = limit;
                 Ok(())
@@ -2765,7 +2845,7 @@ pub fn current_fd(fd: usize) -> crate::task::FdKind {
 pub fn current_kernel_stack_top() -> u64 {
     let flags = irq_save();
     let top = unsafe {
-        match TASKS[current_tid()].as_ref() {
+        match (*slot(current_tid())).as_ref() {
             Some(t) if !t.kernel_stack_base.is_null() => {
                 t.kernel_stack_base as u64 + t.kernel_stack_size as u64
             }
@@ -2815,7 +2895,7 @@ pub fn fork_current() -> Option<usize> {
     let (parent_cr3, fs_base, mem_limit, uid, gid) = {
         let flags = irq_save();
         let got = unsafe {
-            TASKS[parent]
+            (*slot(parent))
                 .as_ref()
                 .map(|t| (t.cr3, t.fs_base, t.mem_limit, t.uid, t.gid))
         };
@@ -2868,7 +2948,7 @@ pub fn fork_current() -> Option<usize> {
     {
         let flags = irq_save();
         unsafe {
-            if let Some(t) = TASKS[tid].as_mut() {
+            if let Some(t) = (*slot(tid)).as_mut() {
                 t.fs_base = fs_base;
                 t.mem_limit = mem_limit;
                 t.mem_pages = pages;
@@ -2907,7 +2987,7 @@ pub fn space_in_use(space: u64) -> bool {
     let used = unsafe {
         space_has_live_task(space)
             || (1..MAX_TASKS).any(|i| {
-                ON_CPU[i] != NO_CPU && matches!(TASKS[i], Some(ref t) if t.space == space)
+                st(i).on_cpu != NO_CPU && matches!(*slot(i), Some(ref t) if t.space == space)
             })
     };
     irq_restore(flags);
@@ -2918,10 +2998,7 @@ pub fn space_in_use(space: u64) -> bool {
 pub fn space_task_count(space: u64) -> usize {
     let flags = irq_save();
     let n = unsafe {
-        (*core::ptr::addr_of!(TASKS))
-            .iter()
-            .filter(|t| matches!(t, Some(t) if t.space == space && t.state != TaskState::Dead))
-            .count()
+        tids().filter(|&i| matches!(*slot(i), Some(ref t) if t.space == space && t.state != TaskState::Dead)).count()
     };
     irq_restore(flags);
     n
@@ -2959,7 +3036,7 @@ pub fn exec_into(cr3: usize, entry: u64, rsp: u64) -> Result<(), ()> {
     crate::threads::exec(caller);
     let old_space = {
         let flags = irq_save();
-        let s = unsafe { TASKS[caller].as_ref().map(|t| t.space) };
+        let s = unsafe { (*slot(caller)).as_ref().map(|t| t.space) };
         irq_restore(flags);
         s.unwrap_or(0)
     };
@@ -2972,7 +3049,7 @@ pub fn exec_into(cr3: usize, entry: u64, rsp: u64) -> Result<(), ()> {
     {
         let flags = irq_save();
         unsafe {
-            if let Some(t) = TASKS[caller].as_mut() {
+            if let Some(t) = (*slot(caller)).as_mut() {
                 t.cr3 = cr3;
                 t.space = space;
                 // The new image has set no thread pointer and registered no
@@ -2983,7 +3060,7 @@ pub fn exec_into(cr3: usize, entry: u64, rsp: u64) -> Result<(), ()> {
                 t.fpu = crate::fpu::clean();
             }
             // What this call checked was memory of the program it was.
-            NPINNED[caller] = 0;
+            st(caller).npinned = 0;
             crate::signal::task_became(caller);
             // The program it was has no task now, and that is a program
             // gone: whoever watched it is told, as when a program's last
@@ -3039,21 +3116,21 @@ pub fn exec_into(cr3: usize, entry: u64, rsp: u64) -> Result<(), ()> {
 /// # Safety
 /// Interrupts off.
 unsafe fn end_siblings(caller: usize, space: u64) { unsafe {
-    let live = |t: usize| matches!(TASKS[t], Some(ref x) if x.space == space && x.state != TaskState::Dead);
-    let began = (1..MAX_TASKS).find(|&t| t != caller && live(t) && PROCESS_ID[t] == crate::cap::endpoint_of(t));
+    let live = |t: usize| matches!(*slot(t), Some(ref x) if x.space == space && x.state != TaskState::Dead);
+    let began = (1..MAX_TASKS).find(|&t| t != caller && live(t) && st(t).process_id == crate::cap::endpoint_of(t));
     if let Some(first) = began {
-        let parent = TASKS[first].as_ref().map_or(0, |t| t.parent_tid);
-        if let Some(me) = TASKS[caller].as_mut() {
+        let parent = (*slot(first)).as_ref().map_or(0, |t| t.parent_tid);
+        if let Some(me) = (*slot(caller)).as_mut() {
             me.parent_tid = parent;
         }
-        if parent != 0 && WAIT_BLOCKED[parent] && WAIT_RESULT[parent] == 0 {
-            WAIT_AGAIN[parent] = true;
+        if parent != 0 && st(parent).wait_blocked && st(parent).wait_result == 0 {
+            st(parent).wait_again = true;
             unblock_task(parent);
         }
     }
     for t in 1..MAX_TASKS {
         if t != caller && live(t) {
-            UNWAITED[t] = true;
+            st(t).unwaited = true;
             let _ = end_other(t, -9);
         }
     }
@@ -3078,7 +3155,7 @@ fn start_forked(tid: usize, cr3: usize, frame: &crate::task::UserFrame) -> Resul
     }
     let flags = irq_save();
     unsafe {
-        let Some(task) = TASKS[tid].as_mut() else {
+        let Some(task) = (*slot(tid)).as_mut() else {
             irq_restore(flags);
             return Err(());
         };

@@ -270,6 +270,37 @@ impl Task {
     }}
 }
 
+/// Everything kept about one task: the task itself, and each module's own part
+/// of it, in one record the task table makes when the task is made and gives
+/// back when it is taken apart (`scheduler.rs`, `table.rs`). It was an array of
+/// sixty-four in each module, every slot spent whether or not a task was in
+/// it; a slot with no task has no record now, and nothing in it to zero.
+///
+/// A record reads as its task (`Deref`), so code that had the task has it.
+pub struct TaskRec {
+    pub task: Task,
+    pub sched: crate::scheduler::PerTask,
+}
+
+impl TaskRec {
+    pub fn new(task: Task) -> Self {
+        TaskRec { task, sched: crate::scheduler::PerTask::new() }
+    }
+}
+
+impl core::ops::Deref for TaskRec {
+    type Target = Task;
+    fn deref(&self) -> &Task {
+        &self.task
+    }
+}
+
+impl core::ops::DerefMut for TaskRec {
+    fn deref_mut(&mut self) -> &mut Task {
+        &mut self.task
+    }
+}
+
 /// Trampoline that runs when a task function returns.
 /// Marks the task as dead and yields to the scheduler.
 pub fn task_exit_trampoline() {
