@@ -146,7 +146,7 @@ pub fn destroy(set: usize) {
 /// a caller waiting for ever on something that cannot arrive deserves an error
 /// and not silence.
 pub fn watchable(tid: usize, fd: usize) -> bool {
-    if fd >= crate::task::MAX_FDS {
+    if fd >= crate::task::FD_MOST {
         return false;
     }
     matches!(
@@ -214,7 +214,7 @@ fn owner_task(set: usize) -> Option<usize> {
 
 /// The set descriptor `fd` of `tid`'s table names, if it names one.
 fn set_named(tid: usize, fd: usize) -> Option<usize> {
-    if fd >= crate::task::MAX_FDS {
+    if fd >= crate::task::FD_MOST {
         return None;
     }
     match crate::fdtable::get(tid, fd) {
@@ -296,7 +296,7 @@ pub fn ctl(set: usize, tid: usize, op: u64, fd: usize, events: u32, token: u64) 
 
 /// What a descriptor can do right now, `level` sets below the one waited on.
 fn readiness_at(tid: usize, fd: usize, level: usize) -> u32 {
-    if fd >= crate::task::MAX_FDS {
+    if fd >= crate::task::FD_MOST {
         return 0;
     }
     let kind = crate::fdtable::get(tid, fd);
@@ -444,7 +444,7 @@ pub fn unpark(set: usize) {
 
 /// Does this task's descriptor `fd` name pipe `handle`?
 fn names_pipe(tid: usize, fd: usize, handle: usize) -> bool {
-    if fd >= crate::task::MAX_FDS {
+    if fd >= crate::task::FD_MOST {
         return false;
     }
     let kind = crate::fdtable::get(tid, fd);
@@ -569,7 +569,7 @@ pub fn note_pty(pty: usize) {
 /// scan is cheaper than working out whose. An edge on a timer is stirred by
 /// any of them firing, and the scan says whether its own is ready.
 pub fn note_timer() {
-    note(|tid, fd| fd < crate::task::MAX_FDS && matches!(crate::fdtable::get(tid, fd), FdKind::Timer { .. }));
+    note(|tid, fd| fd < crate::task::FD_MOST && matches!(crate::fdtable::get(tid, fd), FdKind::Timer { .. }));
     wake_all();
 }
 
@@ -577,31 +577,31 @@ pub fn note_timer() {
 /// reader would take it: wake whoever is waiting on a set that watches one,
 /// and let the scan say whose it was.
 pub fn note_signals() {
-    note(|tid, fd| fd < crate::task::MAX_FDS && matches!(crate::fdtable::get(tid, fd), FdKind::Signals { .. }));
+    note(|tid, fd| fd < crate::task::FD_MOST && matches!(crate::fdtable::get(tid, fd), FdKind::Signals { .. }));
 }
 
 /// What served object `obj` is ready for has changed, as its server said:
 /// wake whoever is waiting on a set that watches it.
 pub fn note_served(obj: usize) {
-    note(|tid, fd| fd < crate::task::MAX_FDS && crate::fdtable::get(tid, fd) == FdKind::Served { obj });
+    note(|tid, fd| fd < crate::task::FD_MOST && crate::fdtable::get(tid, fd) == FdKind::Served { obj });
 }
 
 /// A connection has come to wait on listener `l`: wake whoever is waiting on
 /// a set that watches it.
 pub fn note_local(l: usize) {
-    note(|tid, fd| fd < crate::task::MAX_FDS && crate::fdtable::get(tid, fd) == FdKind::Local { l });
+    note(|tid, fd| fd < crate::task::FD_MOST && crate::fdtable::get(tid, fd) == FdKind::Local { l });
 }
 
 /// A counter was added to or taken from: same reasoning as `note_timer`, and
 /// the same scan. There are sixteen of these in the machine; finding out which
 /// sets name this one costs more than waking them to look.
 pub fn note_event() {
-    note(|tid, fd| fd < crate::task::MAX_FDS && matches!(crate::fdtable::get(tid, fd), FdKind::Event { .. }));
+    note(|tid, fd| fd < crate::task::FD_MOST && matches!(crate::fdtable::get(tid, fd), FdKind::Event { .. }));
     wake_all();
 }
 
 fn names_pty(tid: usize, fd: usize, pty: usize) -> bool {
-    if fd >= crate::task::MAX_FDS {
+    if fd >= crate::task::FD_MOST {
         return false;
     }
     let kind = crate::fdtable::get(tid, fd);

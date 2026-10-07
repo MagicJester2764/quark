@@ -9,16 +9,16 @@ use alloc::alloc::{alloc, dealloc, Layout};
 pub const MAX_TASKS: usize = 64;
 pub const KERNEL_STACK_SIZE: usize = 65536; // 64 KiB per task
 const STACK_ALIGN: usize = 16;
-/// Descriptors per program.
+/// The most descriptors a program can have: the highest its limit goes.
 ///
-/// Eight was three spoken for and five left, which is not enough for a program
-/// holding a display-server connection, a memory object per buffer pool and a
-/// pipe or two. Thirty-two was enough until files became descriptors too: a C
-/// program then had thirty-two of the kernel's and sixteen of its library's,
-/// and the two are one table now. Sixty-four costs about a hundred kilobytes
-/// for the whole system, spent whether or not it is used — see `fdtable.rs`,
-/// which is where the tables are.
-pub const MAX_FDS: usize = 64;
+/// Eight was three spoken for and five left; thirty-two was enough until files
+/// became descriptors too; sixty-four was a table of a fixed size for every
+/// program, spent whether or not it was used and too small for a desktop's.
+/// A program's table grows now (`fdtable.rs`), to the limit the program has —
+/// [`FD_SOFT`] to start, raised by the program as far as this.
+pub const FD_MOST: usize = 65_536;
+/// The limit a program starts with: Linux's, and what `RLIMIT_NOFILE` says.
+pub const FD_SOFT: usize = 1_024;
 /// How many groups a task may be in besides its own.
 pub const MAX_GROUPS: usize = 16;
 

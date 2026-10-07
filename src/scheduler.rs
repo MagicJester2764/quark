@@ -1524,7 +1524,7 @@ pub fn free_fd_at_or_above(tid: usize, floor: usize) -> Option<usize> {
 ///
 /// For unwinding a partial install, where the caller releases the object.
 pub fn clear_fd(tid: usize, fd: usize) -> Result<(), ()> {
-    if fd >= crate::task::MAX_FDS {
+    if fd >= crate::task::FD_MOST {
         return Err(());
     }
     crate::fdtable::replace(tid, fd, crate::task::FdKind::Empty).map(|_| ())
@@ -2481,7 +2481,7 @@ pub fn grant_cap(tid: usize, cap: u32) -> Result<(), ()> {
 
 /// Set a file descriptor entry on a task.
 pub fn set_fd(tid: usize, fd: usize, entry: crate::task::FdKind) -> Result<(), ()> {
-    if tid >= MAX_TASKS || fd >= crate::task::MAX_FDS {
+    if tid >= MAX_TASKS || fd >= crate::task::FD_MOST {
         return Err(());
     }
     let old = crate::fdtable::replace(tid, fd, entry)?;
@@ -2751,7 +2751,7 @@ pub fn set_mem_limit(tid: usize, limit: usize) -> Result<(), ()> {
 
 /// Get a file descriptor entry for the current task.
 pub fn current_fd(fd: usize) -> crate::task::FdKind {
-    if fd >= crate::task::MAX_FDS {
+    if fd >= crate::task::FD_MOST {
         return crate::task::FdKind::Empty;
     }
     crate::fdtable::get(crate::percpu::current(), fd)
@@ -2860,8 +2860,11 @@ pub fn fork_current() -> Option<usize> {
     inherit_from_creator(tid, parent, false);
     // A second descriptor for everything the parent has open, the working
     // directory included: the child's own, to close without the parent
-    // noticing.
-    crate::fdtable::copy_into(tid, parent);
+    // noticing. A child that could not have all of them is not made.
+    if !crate::fdtable::copy_into(tid, parent) {
+        let _ = kill_task(tid);
+        return None;
+    }
     {
         let flags = irq_save();
         unsafe {

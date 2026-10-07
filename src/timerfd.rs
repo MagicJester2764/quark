@@ -11,7 +11,7 @@
 //! and on the next tick where it has not.
 
 use crate::scheduler;
-use crate::task::{FdKind, MAX_FDS};
+use crate::task::{FdKind, FD_MOST};
 
 pub const MAX_TIMERS: usize = 16;
 const MAX_WAITERS: usize = 4;
@@ -298,7 +298,7 @@ pub fn expire(now: u64) -> u64 {
 
 /// The timer a descriptor names.
 pub fn of_fd(tid: usize, fd: usize) -> Option<usize> {
-    if fd >= MAX_FDS {
+    if fd >= FD_MOST {
         return None;
     }
     match crate::fdtable::get(tid, fd) {

@@ -12,11 +12,15 @@
 //! thread exits is still a program. A table goes when the last task using it
 //! does, and that is when what it named is let go.
 //!
-//! One slot past the ordinary ones, `FD_CWD`, holds the program's working
-//! directory. It is a descriptor like the rest — copied by `fork`, kept by
-//! `exec`, handed to a child by its spawner — so that where a program *is*
-//! follows it the way what it has *open* does, and no server has to be told
-//! that one program became another.
+//! Beside the numbered ones, `FD_CWD` names the program's working directory.
+//! It is a descriptor like the rest — copied by `fork`, kept by `exec`, handed
+//! to a child by its spawner — so that where a program *is* follows it the way
+//! what it has *open* does, and no server has to be told that one program
+//! became another.
+//!
+//! The numbered descriptors are an array that grows (`grow.rs`) to the
+//! program's limit, which the program can raise: a desktop's programs hold
+//! hundreds.
 //!
 //! Sharing is what makes every operation here take the lock. With a table per
 //! task, only that task changed it. Now a sibling can be preempted half way
@@ -26,24 +30,46 @@
 //! descriptor would free the object under it, and the next thing to take the
 //! slot would be read by a task that never held it.
 
+use crate::grow::Grow;
 use crate::signal::{Info, Waiting};
-use crate::task::{FdKind, MAX_FDS, MAX_TASKS};
+use crate::task::{FdKind, FD_MOST, FD_SOFT, MAX_TASKS};
 
-/// The working directory's slot: a descriptor number one past the last
-/// ordinary one. It can be copied to and from and asked about; it is never
-/// read, written or waited on, and no allocation ever chooses it.
-pub const FD_CWD: usize = MAX_FDS;
-/// Every slot of a table, the working directory included.
-pub const SLOTS: usize = MAX_FDS + 1;
+/// The working directory: not one of the numbered descriptors but a field of
+/// its own, named by Linux's `AT_FDCWD` (−100) as an unsigned word. It was 64,
+/// one past a table of sixty-four, and a table that grows would have moved it
+/// with every limit; this moves for none. It can be copied to and from and
+/// asked about; it is never read, written or waited on, and no allocation
+/// ever chooses it.
+pub const FD_CWD: usize = 0xFFFF_FFFF_FFFF_FF9C;
+
+/// The room a table's descriptors are given when it first needs any.
+const FIRST: usize = 64;
+
+/// One numbered descriptor, and whether it is closed when the program becomes
+/// another (`exec`).
+#[derive(Clone, Copy)]
+struct Fd {
+    kind: FdKind,
+    cloexec: bool,
+}
+
+const NO_FD: Fd = Fd { kind: FdKind::Empty, cloexec: false };
 
 const NONE: u16 = u16::MAX;
 
 struct Table {
     /// Tasks using this table. Zero is a free table.
     tasks: u16,
-    fds: [FdKind; SLOTS],
-    /// One bit per slot: closed when the program becomes another (`exec`).
-    cloexec: u128,
+    /// The numbered descriptors, in room that grows to `fd_soft`.
+    fds: Grow<Fd>,
+    /// The working directory (`FD_CWD`).
+    cwd: FdKind,
+    /// How many descriptors the program may have, and how far it may raise
+    /// that: `RLIMIT_NOFILE`'s two. `fork` copies them and `exec` keeps them.
+    /// A descriptor already above a limit the program lowered stays; no new
+    /// one is made there.
+    fd_soft: u32,
+    fd_hard: u32,
     /// The permission bits this program does not want on what it makes.
     ///
     /// The kernel makes no files and never reads this. It is here because it
@@ -127,8 +153,10 @@ const DEFAULT_UMASK: u16 = 0o022;
 
 const EMPTY: Table = Table {
     tasks: 0,
-    fds: [FdKind::Empty; SLOTS],
-    cloexec: 0,
+    fds: Grow::new(NO_FD),
+    cwd: FdKind::Empty,
+    fd_soft: FD_SOFT as u32,
+    fd_hard: FD_MOST as u32,
     umask: DEFAULT_UMASK,
     sig_ignore: 0,
     sig_catch: 0,
@@ -155,6 +183,40 @@ const EMPTY: Table = Table {
     cmdline: [0; CMDLINE],
     cmdline_len: 0,
 };
+
+impl Table {
+    /// What `fd` names: the working directory for `FD_CWD`, nothing past the
+    /// room there is.
+    fn kind(&self, fd: usize) -> FdKind {
+        if fd == FD_CWD { self.cwd } else { self.fds.get(fd).map_or(FdKind::Empty, |s| s.kind) }
+    }
+
+    /// The lowest free number at or above `floor` the program may have.
+    fn lowest_free(&self, floor: usize) -> Option<usize> {
+        let soft = self.fd_soft as usize;
+        (floor..self.fds.len().min(soft))
+            .find(|&fd| self.fds.get(fd).is_some_and(|s| s.kind.is_empty()))
+            .or_else(|| Some(floor.max(self.fds.len())).filter(|&fd| fd < soft))
+    }
+
+    /// Put `kind` at `fd`, the close-on-exec mark cleared, and answer what
+    /// was there. Placing something needs `fd` below the program's limit and
+    /// room for it; emptying a slot needs neither.
+    fn put(&mut self, fd: usize, kind: FdKind) -> Result<FdKind, ()> {
+        if fd == FD_CWD {
+            return Ok(core::mem::replace(&mut self.cwd, kind));
+        }
+        if kind.is_empty() {
+            return Ok(self.fds.get_mut(fd).map_or(FdKind::Empty, |s| core::mem::replace(s, NO_FD).kind));
+        }
+        if fd >= self.fd_soft as usize {
+            return Err(());
+        }
+        let slot = self.fds.ensure(fd, FIRST, FD_MOST).map_err(|_| ())?;
+        slot.cloexec = false;
+        Ok(core::mem::replace(&mut slot.kind, kind))
+    }
+}
 
 /// As many tables as tasks: each task uses exactly one.
 static mut TABLES: [Table; MAX_TASKS] = [EMPTY; MAX_TASKS];
@@ -293,7 +355,7 @@ pub fn sig_timer_bump(tid: usize, signo: u8, id: u64, by: u64) -> bool {
 /// Leave the table `tid` uses. If no task uses it any more, what it held is
 /// returned for the caller to release — outside the lock, since releasing a
 /// pipe end wakes whoever was waiting on it.
-fn leave(tid: usize) -> Option<[FdKind; SLOTS]> {
+fn leave(tid: usize) -> Option<(Grow<Fd>, FdKind)> {
     if tid >= MAX_TASKS {
         return None;
     }
@@ -308,10 +370,10 @@ fn leave(tid: usize) -> Option<[FdKind; SLOTS]> {
             let t = &mut tables()[i as usize];
             t.tasks = t.tasks.saturating_sub(1);
             if t.tasks == 0 {
-                let fds = t.fds;
+                let held = (t.fds.take(), t.cwd);
                 *t = EMPTY;
                 crate::ptimer::clear(i as usize);
-                Some(fds)
+                Some(held)
             } else {
                 None
             }
@@ -321,8 +383,8 @@ fn leave(tid: usize) -> Option<[FdKind; SLOTS]> {
     out
 }
 
-fn release_all(fds: &[FdKind; SLOTS]) {
-    for kind in fds.iter() {
+fn release_all((fds, cwd): &(Grow<Fd>, FdKind)) {
+    for kind in fds.iter().map(|s| &s.kind).chain(core::iter::once(cwd)) {
         if !kind.is_empty() {
             crate::pipe::release_fd(kind);
         }
@@ -344,8 +406,8 @@ pub fn task_gone(tid: usize) {
         }
     }
     unhold(tid);
-    if let Some(fds) = leave(tid) {
-        release_all(&fds);
+    if let Some(held) = leave(tid) {
+        release_all(&held);
     }
 }
 
@@ -373,28 +435,34 @@ pub fn share(tid: usize, with: usize) -> bool {
     let old = leave(tid);
     unsafe { (*core::ptr::addr_of_mut!(OF_TASK))[tid] = target };
     irq_restore(flags);
-    if let Some(fds) = old {
-        release_all(&fds);
+    if let Some(held) = old {
+        release_all(&held);
     }
     true
 }
 
 /// Give `child`'s table a copy of everything in `parent`'s, as `fork` does:
-/// a second descriptor for each object, the working directory and the
-/// close-on-exec marks included. A descriptor that cannot be copied — a poll
-/// set counts no holders — is left out.
-pub fn copy_into(child: usize, parent: usize) {
+/// a second descriptor for each object, the working directory, the
+/// close-on-exec marks and the limits included. A descriptor that cannot be
+/// copied — a poll set counts no holders — is left out. False, with nothing
+/// of the parent's copied, if there was no memory for the child's room.
+pub fn copy_into(child: usize, parent: usize) -> bool {
     if child >= MAX_TASKS || parent >= MAX_TASKS {
-        return;
+        return false;
     }
     // One step: a sibling of the parent closing a descriptor between its being
     // read and its being retained would have this retain something freed.
     let flags = irq_save();
     unsafe {
-        let (src_fds, src_cloexec, src_umask, src_signals, src_run, src_name, src_trap) = match table_mut(parent) {
+        let src: *const Table = match table_mut(parent) {
+            Some(t) => t,
+            None => {
+                irq_restore(flags);
+                return false;
+            }
+        };
+        let (src_umask, src_signals, src_run, src_name, src_trap) = match table_mut(parent) {
             Some(t) => (
-                t.fds,
-                t.cloexec,
                 t.umask,
                 (t.sig_ignore, t.sig_catch, t.sig_word),
                 (t.sig_run, t.sig_masks, t.sig_flags, t.sig_cookies, t.sig_entry, t.sig_unix),
@@ -403,10 +471,19 @@ pub fn copy_into(child: usize, parent: usize) {
             ),
             None => {
                 irq_restore(flags);
-                return;
+                return false;
             }
         };
         if let Some((dst, dst_waiting)) = signals_mut(child) {
+            // Room first, as much as the parent has, so a copy either has
+            // every descriptor or none of them.
+            let room = (*src).fds.len();
+            if room > 0 && dst.fds.ensure(room - 1, room, FD_MOST).is_err() {
+                irq_restore(flags);
+                return false;
+            }
+            dst.fd_soft = (*src).fd_soft;
+            dst.fd_hard = (*src).fd_hard;
             dst.umask = src_umask;
             (dst.cmdline, dst.cmdline_len) = src_name;
             // The child is a copy of the program, handlers and the word they
@@ -419,34 +496,28 @@ pub fn copy_into(child: usize, parent: usize) {
             dst.sig_held = 0;
             dst_waiting.clear();
             dst.sig_interrupt = false;
-            for (i, kind) in src_fds.iter().enumerate() {
-                if kind.is_empty() || !dst.fds[i].is_empty() {
+            for (i, from) in (*src).fds.iter().enumerate() {
+                let Some(to) = dst.fds.get_mut(i) else { break };
+                if from.kind.is_empty() || !to.kind.is_empty() {
                     continue;
                 }
-                if crate::pipe::retain_fd(kind).is_ok() {
-                    dst.fds[i] = *kind;
-                    if src_cloexec & (1u128 << i) != 0 {
-                        dst.cloexec |= 1u128 << i;
-                    }
+                if crate::pipe::retain_fd(&from.kind).is_ok() {
+                    *to = *from;
                 }
+            }
+            if !(*src).cwd.is_empty() && dst.cwd.is_empty() && crate::pipe::retain_fd(&(*src).cwd).is_ok() {
+                dst.cwd = (*src).cwd;
             }
         }
     }
     irq_restore(flags);
+    true
 }
 
-/// What descriptor `fd` of `tid`'s program names. `FD_CWD` is a slot too.
+/// What descriptor `fd` of `tid`'s program names. `FD_CWD` is one too.
 pub fn get(tid: usize, fd: usize) -> FdKind {
-    if fd >= SLOTS {
-        return FdKind::Empty;
-    }
     let flags = irq_save();
-    let kind = unsafe {
-        match table_mut(tid) {
-            Some(t) => t.fds[fd],
-            None => FdKind::Empty,
-        }
-    };
+    let kind = unsafe { table_mut(tid).map_or(FdKind::Empty, |t| t.kind(fd)) };
     irq_restore(flags);
     kind
 }
@@ -455,16 +526,10 @@ pub fn get(tid: usize, fd: usize) -> FdKind {
 /// descriptor and retaining what it names are one step, so a sibling closing
 /// it in between cannot leave the caller retaining something freed.
 pub fn get_retained(tid: usize, fd: usize) -> Option<FdKind> {
-    if fd >= SLOTS {
-        return None;
-    }
     let flags = irq_save();
     let out = unsafe {
-        match table_mut(tid) {
-            Some(t) if !t.fds[fd].is_empty() => {
-                let kind = t.fds[fd];
-                if crate::pipe::retain_fd(&kind).is_ok() { Some(kind) } else { None }
-            }
+        match table_mut(tid).map(|t| t.kind(fd)) {
+            Some(kind) if !kind.is_empty() => crate::pipe::retain_fd(&kind).is_ok().then_some(kind),
             _ => None,
         }
     };
@@ -474,20 +539,10 @@ pub fn get_retained(tid: usize, fd: usize) -> Option<FdKind> {
 
 /// Put `kind` at `fd`, and return what was there for the caller to release.
 /// The slot's close-on-exec mark is cleared: it belonged to what was there.
+/// Refused at or above the program's limit, or with no memory for the room.
 pub fn replace(tid: usize, fd: usize, kind: FdKind) -> Result<FdKind, ()> {
-    if fd >= SLOTS {
-        return Err(());
-    }
     let flags = irq_save();
-    let out = unsafe {
-        match table_mut(tid) {
-            Some(t) => {
-                t.cloexec &= !(1u128 << fd);
-                Ok(core::mem::replace(&mut t.fds[fd], kind))
-            }
-            None => Err(()),
-        }
-    };
+    let out = unsafe { table_mut(tid).map_or(Err(()), |t| t.put(fd, kind)) };
     irq_restore(flags);
     out
 }
@@ -497,17 +552,17 @@ pub fn replace(tid: usize, fd: usize, kind: FdKind) -> Result<FdKind, ()> {
 /// What was there is the caller's to release. False, and nothing changed,
 /// if the slot holds something else.
 pub fn swap_if(tid: usize, fd: usize, expected: FdKind, new: FdKind) -> bool {
-    if fd >= SLOTS {
-        return false;
-    }
     let flags = irq_save();
     let swapped = unsafe {
         table_mut(tid).is_some_and(|t| {
-            let same = t.fds[fd] == expected;
-            if same {
-                t.fds[fd] = new;
+            let slot = if fd == FD_CWD { Some(&mut t.cwd) } else { t.fds.get_mut(fd).map(|s| &mut s.kind) };
+            match slot {
+                Some(k) if *k == expected => {
+                    *k = new;
+                    true
+                }
+                _ => false,
             }
-            same
         })
     };
     irq_restore(flags);
@@ -524,17 +579,10 @@ pub fn take(tid: usize, fd: usize) -> FdKind {
 pub fn install(tid: usize, kind: FdKind, floor: usize) -> Option<usize> {
     let flags = irq_save();
     let out = unsafe {
-        match table_mut(tid) {
-            Some(t) => match (floor..MAX_FDS).find(|&fd| t.fds[fd].is_empty()) {
-                Some(fd) => {
-                    t.fds[fd] = kind;
-                    t.cloexec &= !(1u128 << fd);
-                    Some(fd)
-                }
-                None => None,
-            },
-            None => None,
-        }
+        table_mut(tid).and_then(|t| {
+            let fd = t.lowest_free(floor)?;
+            t.put(fd, kind).ok().map(|_| fd)
+        })
     };
     irq_restore(flags);
     out
@@ -545,26 +593,63 @@ pub fn install(tid: usize, kind: FdKind, floor: usize) -> Option<usize> {
 /// the caller does; `replace` then closes what they put there, as `dup2` would.
 pub fn free_at_or_above(tid: usize, floor: usize) -> Option<usize> {
     let flags = irq_save();
-    let out = unsafe {
-        match table_mut(tid) {
-            Some(t) => (floor..MAX_FDS).find(|&fd| t.fds[fd].is_empty()),
-            None => None,
-        }
-    };
+    let out = unsafe { table_mut(tid).and_then(|t| t.lowest_free(floor)) };
     irq_restore(flags);
     out
 }
 
-/// Whether any descriptor of `tid`'s program — the working directory's slot
+/// `tid`'s program's descriptor limits: what it may have, and how far it may
+/// raise that.
+pub fn limit_of(tid: usize) -> Option<(usize, usize)> {
+    let flags = irq_save();
+    let out = unsafe { table_mut(tid).map(|t| (t.fd_soft as usize, t.fd_hard as usize)) };
+    irq_restore(flags);
+    out
+}
+
+/// Set what `tid`'s program may have, no higher than how far it may raise it.
+pub fn set_soft_limit(tid: usize, n: usize) -> bool {
+    let flags = irq_save();
+    let ok = unsafe {
+        table_mut(tid).is_some_and(|t| {
+            let ok = n <= t.fd_hard as usize;
+            if ok {
+                t.fd_soft = n as u32;
+            }
+            ok
+        })
+    };
+    irq_restore(flags);
+    ok
+}
+
+/// Lower how far `tid`'s program may raise its limit, never below the limit.
+pub fn lower_hard_limit(tid: usize, n: usize) -> bool {
+    let flags = irq_save();
+    let ok = unsafe {
+        table_mut(tid).is_some_and(|t| {
+            let ok = n >= t.fd_soft as usize && n <= t.fd_hard as usize;
+            if ok {
+                t.fd_hard = n as u32;
+            }
+            ok
+        })
+    };
+    irq_restore(flags);
+    ok
+}
+
+/// Whether any descriptor of `tid`'s program — the working directory
 /// included — is one `wanted` says yes to.
 pub fn any(tid: usize, wanted: impl Fn(&FdKind) -> bool) -> bool {
     let flags = irq_save();
-    let fds = unsafe { table_mut(tid).map(|t| t.fds) };
+    let found = unsafe {
+        table_mut(tid).is_some_and(|t| {
+            t.fds.iter().map(|s| &s.kind).chain(core::iter::once(&t.cwd)).any(|k| !k.is_empty() && wanted(k))
+        })
+    };
     irq_restore(flags);
-    match fds {
-        Some(fds) => fds.iter().any(|k| !k.is_empty() && wanted(k)),
-        None => false,
-    }
+    found
 }
 
 /// What a program has said to do about a signal.
@@ -1068,7 +1153,7 @@ pub fn holders(wanted: impl Fn(&FdKind) -> bool, out: &mut [usize]) -> usize {
     unsafe {
         let of = &*core::ptr::addr_of!(OF_TASK);
         for (i, table) in tables().iter().enumerate() {
-            if table.tasks == 0 || !table.fds[..MAX_FDS].iter().any(&wanted) {
+            if table.tasks == 0 || !table.fds.iter().any(|s| wanted(&s.kind)) {
                 continue;
             }
             if let Some(tid) = of.iter().position(|&t| t as usize == i && t != NONE) {
@@ -1266,13 +1351,10 @@ pub fn trap_of(tid: usize) -> Option<(usize, usize)> {
 
 /// Whether `fd` is closed when the program becomes another.
 pub fn cloexec(tid: usize, fd: usize) -> Option<bool> {
-    if fd >= SLOTS {
-        return None;
-    }
     let flags = irq_save();
     let out = unsafe {
-        match table_mut(tid) {
-            Some(t) if !t.fds[fd].is_empty() => Some(t.cloexec & (1u128 << fd) != 0),
+        match table_mut(tid).and_then(|t| t.fds.get(fd)) {
+            Some(s) if !s.kind.is_empty() => Some(s.cloexec),
             _ => None,
         }
     };
@@ -1281,18 +1363,11 @@ pub fn cloexec(tid: usize, fd: usize) -> Option<bool> {
 }
 
 pub fn set_cloexec(tid: usize, fd: usize, on: bool) -> bool {
-    if fd >= SLOTS {
-        return false;
-    }
     let flags = irq_save();
     let ok = unsafe {
-        match table_mut(tid) {
-            Some(t) if !t.fds[fd].is_empty() => {
-                if on {
-                    t.cloexec |= 1u128 << fd;
-                } else {
-                    t.cloexec &= !(1u128 << fd);
-                }
+        match table_mut(tid).and_then(|t| t.fds.get_mut(fd)) {
+            Some(s) if !s.kind.is_empty() => {
+                s.cloexec = on;
                 true
             }
             _ => false,
@@ -1304,16 +1379,24 @@ pub fn set_cloexec(tid: usize, fd: usize, on: bool) -> bool {
 
 /// The program is becoming another: close every descriptor marked for it.
 pub fn close_on_exec(tid: usize) {
-    let mut gone = [FdKind::Empty; SLOTS];
+    // What is closed, released once the lock is given up, as `leave`'s is.
+    // Room for it is the heap's; where there is none, it is released here.
+    let mut gone = Grow::new(FdKind::Empty);
+    let mut n = 0;
     let flags = irq_save();
     unsafe {
         if let Some((t, w)) = signals_mut(tid) {
-            for fd in 0..SLOTS {
-                if t.cloexec & (1u128 << fd) != 0 {
-                    gone[fd] = core::mem::replace(&mut t.fds[fd], FdKind::Empty);
+            for s in t.fds.iter_mut().filter(|s| s.cloexec) {
+                let kind = core::mem::replace(s, NO_FD).kind;
+                match gone.ensure(n, FIRST, FD_MOST) {
+                    Ok(g) => {
+                        *g = kind;
+                        n += 1;
+                    }
+                    Err(_) if !kind.is_empty() => crate::pipe::release_fd(&kind),
+                    Err(_) => {}
                 }
             }
-            t.cloexec = 0;
             // A handler is an address in the program that has just gone, and
             // so is the word it was told through. What was ignored still is.
             t.sig_catch = 0;
@@ -1332,7 +1415,9 @@ pub fn close_on_exec(tid: usize) {
     irq_restore(flags);
     // And its timers, which were set for the program that has gone.
     crate::ptimer::clear(table_of(tid));
-    release_all(&gone);
+    for kind in gone.iter().take(n).filter(|k| !k.is_empty()) {
+        crate::pipe::release_fd(kind);
+    }
 }
 
 /// A signal has arrived for `tid`, which may be parked on what it is using:
@@ -1359,16 +1444,11 @@ pub fn interrupt(tid: usize) -> bool {
 /// while it waits. This takes one for the task itself, which `unhold` gives
 /// back — or `task_gone`, for a task killed where it was waiting.
 pub fn hold(tid: usize, fd: usize) -> FdKind {
-    if tid >= MAX_TASKS || fd >= MAX_FDS {
+    if tid >= MAX_TASKS || fd >= FD_MOST {
         return FdKind::Empty;
     }
     let flags = irq_save();
-    let kind = unsafe {
-        match table_mut(tid) {
-            Some(t) => t.fds[fd],
-            None => FdKind::Empty,
-        }
-    };
+    let kind = unsafe { table_mut(tid).map_or(FdKind::Empty, |t| t.kind(fd)) };
     // Only what a task can be parked on. Memory and poll sets are never
     // waited on through a read or a write, and an endpoint has no object.
     let waits = matches!(

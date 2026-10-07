@@ -1,6 +1,6 @@
 # Quark syscall ABI
 
-**Version 3.37.** Query the running kernel with `SYS_ABI_VERSION` (240), which
+**Version 4.0.** Query the running kernel with `SYS_ABI_VERSION` (240), which
 returns `(major << 16) | minor`.
 
 This document is the contract between the Quark kernel and everything above it.
@@ -249,6 +249,27 @@ returning at once turned that loop into a spin.
 3.0 calls anything that means something else now. What it could have relied on
 is a thread's copy of a descriptor outliving its sibling's `close`, and no
 program did.
+
+### What 4.0 changed
+
+**The working directory moves from descriptor 64 to `FD_CWD`,
+`0xFFFF_FFFF_FFFF_FF9C`** — Linux's `AT_FDCWD`, −100, as an unsigned word —
+because a program's descriptors are no longer sixty-four. The table grows to
+the program's limit: 1,024 to start, which the program can raise as far as
+65,536 (`RLIMIT_NOFILE`'s two, said with `SYS_FD_LIMIT`). Descriptor 64 is an
+ordinary number now. The calls that took 64 for the working directory —
+`SYS_FD_SERVE`, `SYS_FD_SERVED`, `SYS_FD_COOKIE`, `SYS_FD_DUP` and
+`SYS_FD_KIND` — take `FD_CWD`; `SYS_FD_HOLDS` still answers for it. A number
+moved, so the major says so: a userland built for 3 is refused by `init`.
+
+Added with it:
+
+| Call | What |
+|---|---|
+| `SYS_FD_LIMIT` (235) | A program's descriptor limits. 0 reads them, answering `(how far it may raise it << 32) \| what it may have`; 1 sets what it may have, no higher than how far; 2 lowers how far, no lower than what it may have. A descriptor already above a limit the program lowered stays; no new one is made there. `SYS_FORK` copies the limits and `SYS_EXEC_SPACE` keeps them. |
+
+Also: `SYS_FD_SEND` carries no working directory: its descriptors are 32-bit
+numbers, and only 64 could name it before, through a range check.
 
 ### Deprecated
 
@@ -869,7 +890,9 @@ shared region is one object to every task that maps it, wherever each has it
 
 ### File descriptors and pipes (0x40)
 
-Sixty-four descriptors per program. 0, 1 and 2 are stdin, stdout and stderr by
+A program has as many descriptors as its limit says: 1,024 to start, raised
+by the program as far as 65,536 (`SYS_FD_LIMIT`). The table grows as the
+numbers are used. 0, 1 and 2 are stdin, stdout and stderr by
 convention. A descriptor is one of: unset, an IPC endpoint (a service TID plus a
 tag), a pipe read end, a pipe write end, one end of a stream, shared memory, a
 set of descriptors to wait on, one end of a pseudo-terminal, a timer, an event
@@ -1907,17 +1930,18 @@ set together or not at all.
 
 | # | Name | Arguments | Returns | Cap |
 |---|---|---|---|---|
-| 224 | `SYS_FD_SERVE` | arg0 = client tid, arg1 = cookie, arg2 = where: a free descriptor number, `u64::MAX - 1` for the lowest free from 3, or 64 for the working directory; arg3 = flags: 1, the caller will say when the object is ready (`SYS_FD_READY`) | the descriptor / `u64::MAX` | the client is in a call to the caller |
-| 225 | `SYS_FD_SERVED` | arg0 = one of the caller's descriptors (64 allowed), arg1 = two words to fill | 0, and `[server tid, cookie]` / `u64::MAX` if it is not a served descriptor or its server has gone | — |
+| 224 | `SYS_FD_SERVE` | arg0 = client tid, arg1 = cookie, arg2 = where: a free descriptor number, `u64::MAX - 1` for the lowest free from 3, or `FD_CWD` for the working directory; arg3 = flags: 1, the caller will say when the object is ready (`SYS_FD_READY`) | the descriptor / `u64::MAX` | the client is in a call to the caller |
+| 225 | `SYS_FD_SERVED` | arg0 = one of the caller's descriptors (`FD_CWD` allowed), arg1 = two words to fill | 0, and `[server tid, cookie]` / `u64::MAX` if it is not a served descriptor or its server has gone | — |
 | 226 | `SYS_FD_HOLDS` | arg0 = tid, arg1 = cookie | 1 if that task's program holds a descriptor for the caller's object `cookie`, else 0 | — |
-| 227 | `SYS_FD_COOKIE` | arg0 = tid, arg1 = one of its descriptors (64 allowed) | the caller's cookie there / `u64::MAX` if what is there is not the caller's | — |
+| 227 | `SYS_FD_COOKIE` | arg0 = tid, arg1 = one of its descriptors (`FD_CWD` allowed) | the caller's cookie there / `u64::MAX` if what is there is not the caller's | — |
 | 228 | `SYS_FD_FLAGS` | arg0 = fd, arg1 = 0 to read or 1 to set, arg2 = flags (1 = close when the program becomes another) | the flags, or 0 on a set / `u64::MAX` | — |
 | 229 | `SYS_FD_REAP` | — | the cookie of one of the caller's objects that no descriptor names any more / `u64::MAX` when there is none | — |
-| 230 | `SYS_FD_KIND` | arg0 = one of the caller's descriptors (64 allowed) | what it names, `\| 0x100` if its other end has gone / `u64::MAX` if it names nothing | — |
+| 230 | `SYS_FD_KIND` | arg0 = one of the caller's descriptors (`FD_CWD` allowed) | what it names, `\| 0x100` if its other end has gone / `u64::MAX` if it names nothing | — |
 | 231 | `SYS_FD_SERVE_PIPE` | arg0 = client tid, arg1 = a key of the caller's choosing, arg2 = bit 0 for the writing end rather than the reading, bit 1 to give it only if the other end is held | the descriptor, the lowest free from 3 in the client, with what to wait for above it: `fd \| wait << 32`, where `wait` is 0 if the other end is held; `0xFFFF_FFFE` if bit 1 was set and it is not / `u64::MAX` | the client is in a call to the caller |
 | 232 | `SYS_PIPE_PEER` | arg0 = a descriptor for one end of a named pipe, arg1 = the `wait` that came with it | 0 when the other end has been opened; `0xFFFF_FFFD` if a signal the program handles came first / `u64::MAX`. **Blocks.** | — |
 | 233 | `SYS_FD_READY` | arg0 = a cookie of the caller's, made with flag 1; arg1 = what it is ready for: 1 readable, 2 writable, 4 hung up | 0 / `u64::MAX` | — |
 | 234 | `SYS_PACKET_PAIR` | — | `(fd0 << 32) \| fd1`, both in the caller's table / `u64::MAX` | — |
+| 235 | `SYS_FD_LIMIT` | arg0 = 0 to read, 1 to set what the program may have to arg1, 2 to lower how far it may raise that to arg1 | read: `(how far << 32) \| what it may have`; set: 0 / `u64::MAX` | — (the caller's own program) |
 
 `SYS_FD_KIND` answers 1 for an IPC endpoint, 2 and 3 for the reading and
 writing ends of a pipe, 4 for a stream, 5 and 6 for a terminal's master and
@@ -2024,13 +2048,15 @@ one at a time, by programs that have not met, and three things follow.
 
 A copy of an end — `SYS_FD_DUP`, `SYS_FORK` — is not an opening of it.
 
-**Descriptor 64 is the working directory.** It is one more slot of the
-program's table, past the ordinary numbers, and holds a served descriptor for
-a directory or nothing. `SYS_FORK` copies it and `SYS_EXEC_SPACE` keeps it, so
+**`FD_CWD` is the working directory**: `0xFFFF_FFFF_FFFF_FF9C`, Linux's
+`AT_FDCWD` as an unsigned word (it was 64 until 4.0). It is one more slot of
+the program's table, beside the numbered ones, and holds a served descriptor
+for a directory or nothing. `SYS_FORK` copies it and `SYS_EXEC_SPACE` keeps it, so
 a program's children start where it is without anybody telling a server that
 one program became another. It can be the source or the destination of
 `SYS_FD_DUP` — onto it is `fchdir`, and a spawner gives a child its directory
-with `SYS_FD_DUP(child, 64, 64)` — and `SYS_FD_SERVED` and `SYS_FD_COOKIE`
+with `SYS_FD_DUP(child, FD_CWD, FD_CWD)` — and `SYS_FD_SERVED`, `SYS_FD_COOKIE`
+and `SYS_FD_KIND`
 answer for it. It cannot be read, written, waited on or closed, and no call
 that chooses a number ever chooses it.
 

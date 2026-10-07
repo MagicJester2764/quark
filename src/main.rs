@@ -62,6 +62,7 @@ mod tlb;
 mod usage;
 mod eventfd;
 mod fdtable;
+mod grow;
 pub mod serial;
 pub mod task;
 mod userspace;

@@ -474,6 +474,9 @@ pub const SYS_FD_READY: u64 = 233;
 /// A connected pair whose writes are messages, each read whole:
 /// `socketpair` of `SOCK_SEQPACKET`.
 pub const SYS_PACKET_PAIR: u64 = 234;
+/// A program's descriptor limits: read them, set what it may have, lower how
+/// far it may raise that (`RLIMIT_NOFILE`).
+pub const SYS_FD_LIMIT: u64 = 235;
 /// `SYS_FD_SERVE`'s flag: the server will say when the object is ready.
 const SERVE_SAYS_READY: u64 = 1;
 /// SYS_FD_SERVE_PIPE: the writing end, and only if the other end is held.
@@ -492,8 +495,8 @@ pub const SYS_ABI_VERSION: u64 = 240;
 /// Major changes when a call's meaning or signature changes incompatibly;
 /// minor when calls are added. User space can refuse to run against a major it
 /// does not know, which is the point of exposing it at all.
-pub const ABI_VERSION_MAJOR: u64 = 3;
-pub const ABI_VERSION_MINOR: u64 = 37;
+pub const ABI_VERSION_MAJOR: u64 = 4;
+pub const ABI_VERSION_MINOR: u64 = 0;
 
 /// Threads a task may make with no capability at all.
 ///
@@ -686,7 +689,7 @@ const FD_MANY_MOST: usize = 32;
 
 /// The set a descriptor names, or `None` if it names something else.
 fn pollset_of(tid: usize, fd: usize) -> Option<usize> {
-    if fd >= crate::task::MAX_FDS {
+    if fd >= crate::task::FD_MOST {
         return None;
     }
     match crate::fdtable::get(tid, fd) {
@@ -697,7 +700,7 @@ fn pollset_of(tid: usize, fd: usize) -> Option<usize> {
 
 /// The stream and end a descriptor names, or `None` if it names something else.
 fn stream_end_of(tid: usize, fd: usize) -> Option<(usize, u8)> {
-    if fd >= crate::task::MAX_FDS {
+    if fd >= crate::task::FD_MOST {
         return None;
     }
     match crate::fdtable::get(tid, fd) {
@@ -982,7 +985,7 @@ fn dispatch(
                     }
                     Err(()) => None,
                 }
-            } else if (arg2 as usize) < crate::task::MAX_FDS
+            } else if (arg2 as usize) < crate::task::FD_MOST
                 && crate::fdtable::get(client, arg2 as usize).is_empty()
             {
                 // A number of the server's choosing has to be free. It closes
@@ -1003,7 +1006,7 @@ fn dispatch(
             // arg0 = one of the caller's descriptors, arg1 = two words out:
             // the server's TID and its cookie.
             let fd = arg0 as usize;
-            if fd > crate::fdtable::FD_CWD || !validate_user_ptr_mut(arg1, 16) {
+            if (fd != crate::fdtable::FD_CWD && fd >= crate::task::FD_MOST) || !validate_user_ptr_mut(arg1, 16) {
                 return u64::MAX;
             }
             let me = scheduler::current_tid();
@@ -1042,7 +1045,7 @@ fn dispatch(
             // cookie there, if what is there is the caller's.
             let me = scheduler::current_tid();
             let fd = arg1 as usize;
-            if fd > crate::fdtable::FD_CWD {
+            if fd != crate::fdtable::FD_CWD && fd >= crate::task::FD_MOST {
                 return u64::MAX;
             }
             match crate::fdtable::get(arg0 as usize, fd) {
@@ -1135,10 +1138,23 @@ fn dispatch(
             };
             kind | if gone { FD_KIND_GONE } else { 0 }
         }
+        SYS_FD_LIMIT => {
+            // arg0 = 0 to read, answering (how far it may go << 32) | what
+            // the program may have; 1 to set what it may have to arg1, no
+            // higher than how far; 2 to lower how far to arg1, no lower than
+            // what it may have. Its own program's, and needs nothing.
+            let me = scheduler::current_tid();
+            match arg0 {
+                0 => crate::fdtable::limit_of(me).map_or(u64::MAX, |(soft, hard)| ((hard as u64) << 32) | soft as u64),
+                1 if crate::fdtable::set_soft_limit(me, arg1 as usize) => 0,
+                2 if crate::fdtable::lower_hard_limit(me, arg1 as usize) => 0,
+                _ => u64::MAX,
+            }
+        }
         SYS_FD_FLAGS => {
             // arg0 = fd, arg1 = 0 to read or 1 to set, arg2 = the flags
             let fd = arg0 as usize;
-            if fd >= crate::task::MAX_FDS {
+            if fd >= crate::task::FD_MOST {
                 return u64::MAX;
             }
             let tid = scheduler::current_tid();
@@ -3005,12 +3021,12 @@ fn dispatch(
                 return u64::MAX;
             }
             let source_fd = arg2 as usize;
-            // One past the ordinary numbers is the working directory, which
-            // can be copied to and from: `fchdir` is a copy onto it, and a
+            // The working directory (`FD_CWD`, beside the numbered ones) can
+            // be copied to and from: `fchdir` is a copy onto it, and a
             // spawner gives a child its directory by copying its own there.
             // Only something a server serves can be a directory.
             let cwd = crate::fdtable::FD_CWD;
-            if source_fd > cwd {
+            if source_fd != cwd && source_fd >= crate::task::FD_MOST {
                 return u64::MAX;
             }
             if (source_fd == cwd || arg1 == cwd as u64)
@@ -3325,7 +3341,7 @@ fn dispatch(
             let len = arg2 as usize;
             let pass = arg3;
             let tid = scheduler::current_tid();
-            if fd >= crate::task::MAX_FDS {
+            if fd >= crate::task::FD_MOST {
                 return u64::MAX;
             }
             if len > 0 && !validate_user_ptr(arg1, arg2) {
@@ -3409,7 +3425,7 @@ fn dispatch(
             let len = arg2 as usize;
             let at = arg3;
             let tid = scheduler::current_tid();
-            if fd >= crate::task::MAX_FDS {
+            if fd >= crate::task::FD_MOST {
                 return u64::MAX;
             }
             if len > 0 && !validate_user_ptr_mut(arg1, arg2) {
@@ -3497,7 +3513,7 @@ fn dispatch(
                 let room = if at == ANY_FD {
                     scheduler::lowest_free_fd(tid).is_some()
                 } else {
-                    (at as usize) < crate::task::MAX_FDS
+                    (at as usize) < crate::task::FD_MOST
                         && crate::fdtable::get(tid, at as usize).is_empty()
                 };
                 if room {
@@ -3549,7 +3565,7 @@ fn dispatch(
             // arg0 = descriptor naming memory, arg1 = size in bytes
             let fd = arg0 as usize;
             let bytes = arg1 as usize;
-            if fd >= crate::task::MAX_FDS {
+            if fd >= crate::task::FD_MOST {
                 return u64::MAX;
             }
             let tid = scheduler::current_tid();
@@ -3567,7 +3583,7 @@ fn dispatch(
             let fd = arg0 as usize;
             let vaddr = arg1 as usize;
             let tid = scheduler::current_tid();
-            if fd >= crate::task::MAX_FDS {
+            if fd >= crate::task::FD_MOST {
                 return u64::MAX;
             }
             let handle = match crate::fdtable::get(tid, fd) {
@@ -3591,7 +3607,7 @@ fn dispatch(
             // what turns the peer's next read into end-of-file. Nothing here
             // needs a capability — a task may always drop its own.
             let fd = arg0 as usize;
-            if fd >= crate::task::MAX_FDS {
+            if fd >= crate::task::FD_MOST {
                 return u64::MAX;
             }
             let tid = scheduler::current_tid();

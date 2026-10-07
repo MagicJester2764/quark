@@ -761,9 +761,15 @@ names (`pipe::open_named`), for as long as anybody holds an end.
   `poll` says a named pipe has ended only once a writer has been; said
   sooner, a program waiting for its first writer spins.
 
-Descriptor 64 — one past the ordinary numbers — is the program's working
-directory, a served descriptor like any other. It is in the table so that it
-follows a program through `fork` and `exec` with no server being told.
+`FD_CWD` — Linux's `AT_FDCWD`, −100, as an unsigned word, beside the
+numbered descriptors — is the program's working directory, a served
+descriptor like any other. It is in the table so that it follows a program
+through `fork` and `exec` with no server being told. It was 64, one past a
+table of sixty-four; a program's descriptors go to its limit now (1,024 to
+start, raised by the program as far as 65,536, `SYS_FD_LIMIT`), in an array
+that grows (`grow.rs`), and a number that moved with the limit would have
+moved with every raise. Nothing copies a table onto a stack: one of 65,536
+would be the stack many times over.
 
 Adding a kind means touching every place that enumerates them, and missing one
 is quiet: `FdKind` in `task.rs`, read and write in both their blocking and

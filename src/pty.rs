@@ -40,7 +40,7 @@
 //! that a program which saves and restores it gets what it left.
 
 use crate::scheduler;
-use crate::task::{FdKind, MAX_FDS};
+use crate::task::{FdKind, FD_MOST};
 
 /// Save RFLAGS and disable interrupts, as `pipe.rs` does and for the same
 /// reason: a timer interrupt in the middle of a ring's bookkeeping is another
@@ -1035,7 +1035,7 @@ pub fn set_winsize(pty: usize, size: &WinSize) -> bool {
 
 /// The pty and end a descriptor names, if it names one.
 pub fn of_fd(tid: usize, fd: usize) -> Option<(usize, u8)> {
-    if fd >= MAX_FDS {
+    if fd >= FD_MOST {
         return None;
     }
     match crate::fdtable::get(tid, fd) {
