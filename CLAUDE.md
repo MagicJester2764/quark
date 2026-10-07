@@ -560,6 +560,14 @@ may keep — are in `../quarkutils/CLAUDE.md`; these are the kernel's.
   descriptor and taking a reference for a copy of it is `get_retained`. A call
   that looks a descriptor up and then acts on it in two steps has a window in
   which a sibling closes it and somebody else is given the slot.
+- **A task waits on one thing at a time, and where is a link in its own
+  record** (`waitlist.rs`): a counter's, a timer's and a pipe's waiters are a
+  list through those links, which has no length to fill — the arrays of four
+  and eight they were refused the fifth or the ninth, whose read came back at
+  once. A task comes off by its own link: when it is woken, when a signal
+  ends its wait, when it dies, and at the reap before its record is freed.
+  A new kind's waiters go the same way: an `On`, its lists' ends in the
+  object, and a `waiters()` that `waitlist::forget` finds them by.
 - **A task about to wait on what a descriptor names holds it** (`fdtable::hold`,
   given back by `unhold`, or by `task_gone` for a task killed where it
   waited). Without it a sibling's `close` frees the pipe under a parked read,
@@ -798,7 +806,8 @@ Adding a kind means touching every place that enumerates them, and missing one
 is quiet: `FdKind` in `task.rs`, read and write in both their blocking and
 non-blocking forms in `syscall.rs`, `pipe::release_fd` and `pipe::retain_fd`
 (a kind in one and not the other leaks or double-frees), `fdtable::hold`'s
-list of what a task can be parked on, and `pollset::watchable` and
+list of what a task can be parked on, `waitlist::On` and `forget` for a kind
+whose waiters are links, and `pollset::watchable` and
 `readiness_at` — `poll` answered `POLLNVAL` for a terminal until the last of
 those knew about it. And whatever changes what one is ready for says so with
 a `pollset::note_*`: a set somebody is parked on can be woken by anything,
@@ -895,7 +904,17 @@ every Unix program assumes:
   before, and a program that had spent its eight left the next task to take
   that number unable to make any. Space ids are never reused; TIDs are. The
   same trap is written down for servers in `../quarkutils/CLAUDE.md`, and it
-  is worth looking for anywhere in the kernel that remembers a number.
+  is worth looking for anywhere in the kernel that remembers a number. Pipes
+  have no budget now — what a program makes is bounded by its descriptors and
+  by `reclaim::may_make` — and the tasks a program may have are counted by
+  its program (`scheduler::program_tasks`).
+- **What a program makes is made when it makes it**: a counter, a timer, a
+  signal descriptor, a pipe — whose buffer is a frame of its own — and a
+  shared region are each a record in a table that grows (`table.rs`), made
+  through `reclaim::may_make` so that a program making them without end is
+  refused while the kernel can still work, and given back with the last
+  thing that names it. They were tables for the whole machine, of sixteen,
+  thirty-two and 256.
 - **Descriptors are released when a task dies, not when it is reaped.** Its
   memory waits for a parent to collect it, which is where the exit status
   lives; a descriptor is something another task can be *waiting on*, and the

@@ -16,6 +16,7 @@ mod fat32;
 mod fpu;
 mod heap;
 mod kstack;
+mod waitlist;
 mod idt;
 mod intc;
 mod io;

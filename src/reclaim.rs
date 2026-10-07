@@ -92,10 +92,19 @@ pub fn reserve() -> usize {
 /// none at all, or for a program that is not a driver or a server none
 /// beyond what is kept back. Whoever can wait asks [`wait`] and tries again.
 pub fn frame() -> Option<usize> {
-    if !scheduler::current_is_privileged() && pmm::free_count() <= reserve() {
+    if !may_make() {
         return None;
     }
     pmm::alloc().map(|f| f.address())
+}
+
+/// Whether the current task may be given what the kernel makes for it — a
+/// frame for its page, or a pipe, a counter, a timer: not a program that is
+/// not a driver or a server, while what is free is no more than what is kept
+/// back. A program making them without end is refused while the kernel can
+/// still work.
+pub fn may_make() -> bool {
+    scheduler::current_is_privileged() || pmm::free_count() > reserve()
 }
 
 /// Whether the current task could be given a frame now.

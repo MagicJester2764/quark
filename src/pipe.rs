@@ -9,46 +9,27 @@
 
 use crate::scheduler;
 use crate::task::FdKind;
+use crate::waitlist::{self, On, Waiters};
 
-/// Pipes in the system.
-///
-/// Every stream is two of these, so a compositor holding a connection per
-/// client spends them quickly: two hundred and fifty-six is a hundred and
-/// twenty-eight ordinary pipes plus two apiece for the sixty-four streams.
-/// Each carries a 4 KiB buffer inline, so the number is a megabyte of
-/// kernel memory and is spent up front. It was ninety-six, and a build
-/// running four jobs at once — a pipe or two for each job's output, a pair
-/// to hear how each start went — is a good many of them.
-const MAX_PIPES: usize = 256;
+/// A pipe's buffer: a frame of its own.
 const PIPE_BUF_SIZE: usize = 4096;
-const MAX_WAITERS: usize = 8;
 
 struct Pipe {
-    in_use: bool,
     /// Task that created this pipe, so an orphan (created but never wired to
     /// any fd, hence refcount 0) can be reclaimed when its creator dies.
     /// Without this, sys_pipe_create leaked a slot permanently on every
     /// failed spawn and the 31 slots could be exhausted for good.
     creator: usize,
-    /// The *program* that created it, for the cap below.
-    ///
-    /// A TID is recycled and a space id is not, which matters because a pipe
-    /// outlives its creator: its ends are descriptors other tasks hold. Counted
-    /// by TID, a fresh task inherited the pipe budget of whatever had its
-    /// number before — and a program that had spent its eight left the next
-    /// task to take that number unable to make any. dtest found it by asking
-    /// for eight pipes after a compositor session had ended.
-    owner_space: u64,
-    buf: [u8; PIPE_BUF_SIZE],
+    /// The ring the bytes go round: a frame, given back with the pipe.
+    buf: *mut u8,
     read_pos: usize,
     write_pos: usize,
     len: usize,
     readers: usize,
     writers: usize,
-    read_waiters: [usize; MAX_WAITERS],
-    read_waiter_count: usize,
-    write_waiters: [usize; MAX_WAITERS],
-    write_waiter_count: usize,
+    /// Who is waiting to read, and to write (`waitlist.rs`).
+    read_waiters: Waiters,
+    write_waiters: Waiters,
     /// A pipe a server's key names (see [`open_named`]): a FIFO.
     named: bool,
     /// How many times each end of a named pipe has been opened: the reading
@@ -58,42 +39,40 @@ struct Pipe {
     /// the reader ran again has still been, and the reader's wait is over.
     opens: [u32; 2],
     /// Tasks waiting for the other end to be opened by somebody.
-    peer_waiters: [usize; MAX_WAITERS],
-    peer_waiter_count: usize,
+    peer_waiters: Waiters,
     /// Each write is a record kept whole — two bytes of length and its
     /// bytes — and each read takes one record, what does not fit the reader
     /// dropped: a stream made to keep messages whole (`SOCK_SEQPACKET`).
     /// What is in the buffer is always whole records, so what it holds and
     /// whether it is empty mean what they mean for bytes.
     packets: bool,
-    /// One of a stream's two, which the stream's own table bounds: not
-    /// counted against its program's pipes.
-    for_stream: bool,
 }
 
 impl Pipe {
-    const fn new() -> Self {
+    const fn new(creator: usize, buf: *mut u8) -> Self {
         Pipe {
-            in_use: false,
-            creator: 0,
-            owner_space: 0,
-            buf: [0; PIPE_BUF_SIZE],
+            creator,
+            buf,
             read_pos: 0,
             write_pos: 0,
             len: 0,
             readers: 0,
             writers: 0,
-            read_waiters: [0; MAX_WAITERS],
-            read_waiter_count: 0,
-            write_waiters: [0; MAX_WAITERS],
-            write_waiter_count: 0,
+            read_waiters: Waiters::NONE,
+            write_waiters: Waiters::NONE,
             named: false,
             opens: [0; 2],
-            peer_waiters: [0; MAX_WAITERS],
-            peer_waiter_count: 0,
+            peer_waiters: Waiters::NONE,
             packets: false,
-            for_stream: false,
         }
+    }
+
+    /// Byte `i` of the ring.
+    ///
+    /// # Safety
+    /// `i` is below `PIPE_BUF_SIZE`.
+    unsafe fn at(&self, i: usize) -> *mut u8 {
+        unsafe { self.buf.add(i) }
     }
 
     /// Take what is next for a reader with room for `max_len`: bytes up to
@@ -104,22 +83,24 @@ impl Pipe {
     /// Interrupts off, something to take, and `buf` a user range the call
     /// has checked.
     unsafe fn take(&mut self, buf: *mut u8, max_len: usize) -> usize {
-        let (from, n, used) = if self.packets {
-            let n = self.buf[self.read_pos] as usize | (self.buf[(self.read_pos + 1) % PIPE_BUF_SIZE] as usize) << 8;
-            ((self.read_pos + 2) % PIPE_BUF_SIZE, n.min(max_len), 2 + n)
-        } else {
-            let n = self.len.min(max_len);
-            (self.read_pos, n, n)
-        };
-        {
-            let _ua = crate::cpu::UserAccess::begin();
-            for i in 0..n {
-                unsafe { buf.add(i).write(self.buf[(from + i) % PIPE_BUF_SIZE]) };
+        unsafe {
+            let (from, n, used) = if self.packets {
+                let n = *self.at(self.read_pos) as usize | (*self.at((self.read_pos + 1) % PIPE_BUF_SIZE) as usize) << 8;
+                ((self.read_pos + 2) % PIPE_BUF_SIZE, n.min(max_len), 2 + n)
+            } else {
+                let n = self.len.min(max_len);
+                (self.read_pos, n, n)
+            };
+            {
+                let _ua = crate::cpu::UserAccess::begin();
+                for i in 0..n {
+                    buf.add(i).write(*self.at((from + i) % PIPE_BUF_SIZE));
+                }
             }
+            self.read_pos = (self.read_pos + used) % PIPE_BUF_SIZE;
+            self.len -= used;
+            n
         }
-        self.read_pos = (self.read_pos + used) % PIPE_BUF_SIZE;
-        self.len -= used;
-        n
     }
 
     /// Room for a write of `len`: any for bytes, and for a record the whole
@@ -142,20 +123,22 @@ impl Pipe {
     /// Interrupts off, room for them ([`Pipe::room_for`]), and `buf` a user
     /// range the call has checked.
     unsafe fn put(&mut self, buf: *const u8, n: usize) {
-        if self.packets {
-            self.buf[self.write_pos] = n as u8;
-            self.buf[(self.write_pos + 1) % PIPE_BUF_SIZE] = (n >> 8) as u8;
-            self.write_pos = (self.write_pos + 2) % PIPE_BUF_SIZE;
-            self.len += 2;
-        }
-        {
-            let _ua = crate::cpu::UserAccess::begin();
-            for i in 0..n {
-                self.buf[(self.write_pos + i) % PIPE_BUF_SIZE] = unsafe { buf.add(i).read() };
+        unsafe {
+            if self.packets {
+                *self.at(self.write_pos) = n as u8;
+                *self.at((self.write_pos + 1) % PIPE_BUF_SIZE) = (n >> 8) as u8;
+                self.write_pos = (self.write_pos + 2) % PIPE_BUF_SIZE;
+                self.len += 2;
             }
+            {
+                let _ua = crate::cpu::UserAccess::begin();
+                for i in 0..n {
+                    *self.at((self.write_pos + i) % PIPE_BUF_SIZE) = buf.add(i).read();
+                }
+            }
+            self.write_pos = (self.write_pos + n) % PIPE_BUF_SIZE;
+            self.len += n;
         }
-        self.write_pos = (self.write_pos + n) % PIPE_BUF_SIZE;
-        self.len += n;
     }
 }
 
@@ -173,16 +156,39 @@ impl Pipe {
 /// keys nobody can ask for, and they go with the last end like any other.
 #[derive(Clone, Copy)]
 struct Named {
-    /// The server's endpoint number; 0 is a free entry.
+    /// The server's endpoint number.
     server: u64,
     key: u64,
     pipe: usize,
 }
 
-/// More than a system has names for at once, and a table small enough to
-/// search.
-const MAX_NAMED: usize = 32;
-static mut NAMED: [Named; MAX_NAMED] = [Named { server: 0, key: 0, pipe: 0 }; MAX_NAMED];
+/// Every name, made when a named pipe is first opened and given back with
+/// the pipe (`table.rs`). There were thirty-two.
+static mut NAMED: crate::table::Table<Named> = crate::table::Table::new(crate::table::MOST);
+
+/// # Safety
+/// Interrupts off.
+#[inline(always)]
+unsafe fn named() -> &'static mut crate::table::Table<Named> {
+    unsafe { &mut *core::ptr::addr_of_mut!(NAMED) }
+}
+
+/// The pipe `key` names for `server`, if it names one.
+///
+/// # Safety
+/// Interrupts off.
+unsafe fn named_pipe(server: u64, key: u64) -> Option<usize> {
+    unsafe {
+        let mut at = 0;
+        while let Some(i) = named().next_used(at) {
+            at = i + 1;
+            if let Some(n) = named().get(i).filter(|n| n.server == server && n.key == key) {
+                return Some(n.pipe);
+            }
+        }
+        None
+    }
+}
 
 /// What opening a named pipe came to.
 pub enum Opened {
@@ -202,45 +208,36 @@ pub enum Opened {
 /// Finding it, counting the end and looking at the other are one step. In
 /// two, a writer could come and go between a reader being given its end and
 /// the reader asking whether to wait, and the reader would wait for a writer
-/// that had already been.
-///
-/// Not counted against any program's pipes: the server did not ask for a
-/// pipe, a client of it opened a name.
+/// that had already been. The pipe it may have to make is made before that
+/// step — making one asks for a frame — and given back if it was not needed.
 pub fn open_named(server: u64, key: u64, write: bool, only_with_peer: bool) -> Opened {
     if server == 0 {
         return Opened::Full;
     }
-    let creator = scheduler::current_tid();
+    let mut spare = make(scheduler::current_tid(), false);
     let flags = irq_save();
     let out = unsafe {
-        let table = &mut *core::ptr::addr_of_mut!(NAMED);
-        let known = table.iter().position(|n| n.server == server && n.key == key);
-        let held = |i: usize| if write { PIPES[i].readers > 0 } else { PIPES[i].writers > 0 };
-        if only_with_peer && !known.is_some_and(|slot| held(table[slot].pipe)) {
+        let known = named_pipe(server, key);
+        let held = |i: usize| pipes().get(i).is_some_and(|p| if write { p.readers > 0 } else { p.writers > 0 });
+        if only_with_peer && !known.is_some_and(held) {
             Opened::NoPeer
         } else {
             let handle = match known {
-                Some(slot) => Some(table[slot].pipe),
-                None => {
-                    let free = table.iter().position(|n| n.server == 0);
-                    let pipe = (1..MAX_PIPES).find(|&i| !PIPES[i].in_use);
-                    match (free, pipe) {
-                        (Some(slot), Some(i)) => {
-                            PIPES[i] = Pipe::new();
-                            PIPES[i].in_use = true;
-                            PIPES[i].creator = creator;
-                            PIPES[i].named = true;
-                            table[slot] = Named { server, key, pipe: i };
-                            Some(i)
+                Some(i) => Some(i),
+                None => match (spare, named().lowest_free(0)) {
+                    (Some(i), Some(n)) if named().fill_at(n, Named { server, key, pipe: i }).is_ok() => {
+                        spare = None;
+                        if let Some(p) = pipes().get(i) {
+                            p.named = true;
                         }
-                        _ => None,
+                        Some(i)
                     }
-                }
+                    _ => None,
+                },
             };
-            match handle {
+            match handle.and_then(|i| pipes().get(i).map(|p| (i, p))) {
                 None => Opened::Full,
-                Some(i) => {
-                    let pipe = &mut PIPES[i];
+                Some((i, pipe)) => {
                     let (mine, theirs) = if write { (1, 0) } else { (0, 1) };
                     if write {
                         pipe.writers += 1;
@@ -250,10 +247,7 @@ pub fn open_named(server: u64, key: u64, write: bool, only_with_peer: bool) -> O
                     pipe.opens[mine] = pipe.opens[mine].wrapping_add(1);
                     // Whoever was waiting for this end to be opened has what
                     // it was waiting for.
-                    for w in 0..pipe.peer_waiter_count {
-                        scheduler::unblock_task(pipe.peer_waiters[w]);
-                    }
-                    pipe.peer_waiter_count = 0;
+                    waitlist::wake_all(&mut pipe.peer_waiters);
                     let others = if write { pipe.readers } else { pipe.writers };
                     let wait = if others > 0 { 0 } else { since(pipe.opens[theirs]) };
                     Opened::End(i, wait)
@@ -261,6 +255,9 @@ pub fn open_named(server: u64, key: u64, write: bool, only_with_peer: bool) -> O
             }
         }
     };
+    if let Some(i) = spare {
+        unsafe { gone(i) };
+    }
     irq_restore(flags);
     out
 }
@@ -268,9 +265,11 @@ pub fn open_named(server: u64, key: u64, write: bool, only_with_peer: bool) -> O
 /// A pipe has gone: whatever key named it names nothing. Interrupts are off.
 unsafe fn forget_name(handle: usize) {
     unsafe {
-        for n in (*core::ptr::addr_of_mut!(NAMED)).iter_mut() {
-            if n.server != 0 && n.pipe == handle {
-                n.server = 0;
+        let mut at = 0;
+        while let Some(i) = named().next_used(at) {
+            at = i + 1;
+            if named().get(i).is_some_and(|n| n.pipe == handle) {
+                named().empty(i);
             }
         }
     }
@@ -290,7 +289,7 @@ pub enum Peer {
     There,
     /// A signal the program handles arrived first.
     Interrupted,
-    /// Not a pipe, or too many are waiting on this one already.
+    /// Not a pipe.
     Failed,
 }
 
@@ -307,11 +306,10 @@ pub fn wait_peer(handle: usize, is_write: bool, since: u64) -> Peer {
     loop {
         let flags = irq_save();
         unsafe {
-            if handle >= MAX_PIPES || !PIPES[handle].in_use {
+            let Some(pipe) = pipes().get(handle) else {
                 irq_restore(flags);
                 return Peer::Failed;
-            }
-            let pipe = &mut PIPES[handle];
+            };
             let (others, opens) = if is_write {
                 (pipe.readers, pipe.opens[0])
             } else {
@@ -327,12 +325,7 @@ pub fn wait_peer(handle: usize, is_write: bool, since: u64) -> Peer {
                 irq_restore(flags);
                 return Peer::Interrupted;
             }
-            if pipe.peer_waiter_count >= MAX_WAITERS {
-                irq_restore(flags);
-                return Peer::Failed;
-            }
-            pipe.peer_waiters[pipe.peer_waiter_count] = tid;
-            pipe.peer_waiter_count += 1;
+            waitlist::add(&mut pipe.peer_waiters, tid, On::PipePeer(handle as u32));
             scheduler::block_task(tid);
         }
         irq_restore(flags);
@@ -343,29 +336,27 @@ pub fn wait_peer(handle: usize, is_write: bool, since: u64) -> Peer {
 /// A signal has arrived for a task that may be waiting for the other end of
 /// a pipe: if it is, it stops waiting and goes to see.
 pub fn interrupt(tid: usize) -> bool {
-    let mut found = false;
     let flags = irq_save();
-    unsafe {
-        for i in 1..MAX_PIPES {
-            let pipe = &mut PIPES[i];
-            if pipe.in_use && pipe.peer_waiter_count > 0 {
-                let before = pipe.peer_waiter_count;
-                forget_in(&mut pipe.peer_waiters, &mut pipe.peer_waiter_count, tid);
-                found |= pipe.peer_waiter_count != before;
-            }
-        }
-    }
-    irq_restore(flags);
+    let found = unsafe { matches!(waitlist::on(tid), On::PipePeer(_)) && waitlist::forget(tid) };
     if found {
         scheduler::unblock_task(tid);
     }
+    irq_restore(flags);
     found
 }
 
-static mut PIPES: [Pipe; MAX_PIPES] = {
-    const P: Pipe = Pipe::new();
-    [P; MAX_PIPES]
-};
+/// Every pipe, by its number: made when somebody makes one, its buffer a
+/// frame of its own, and given back with its last end (`table.rs`). Number
+/// 0 is never one, so that 0 can mean "no pipe". There were 256, each with
+/// its 4 KiB inline — a megabyte, spent up front — and 64 a program.
+static mut PIPES: crate::table::Table<Pipe> = crate::table::Table::new(crate::table::MOST);
+
+/// # Safety
+/// Interrupts off.
+#[inline(always)]
+unsafe fn pipes() -> &'static mut crate::table::Table<Pipe> {
+    unsafe { &mut *core::ptr::addr_of_mut!(PIPES) }
+}
 
 /// Save RFLAGS and disable interrupts. Returns saved flags.
 #[inline(always)]
@@ -385,50 +376,56 @@ fn irq_restore(flags: u64) {
     }
 }
 
-/// The most ordinary pipes one program may have made and not yet seen
-/// closed: a quarter of the table, so that one program cannot take the
-/// rest's. It was eight, and a pipe a program made for a child's output is
-/// still its own while the child writes to it: cargo, running four jobs,
-/// has two for each job and one for its jobserver, and could not start its
-/// fourth rustc — which it reported as being out of descriptors.
-const MAX_PIPES_PER_PROGRAM: usize = MAX_PIPES / 4;
-
-/// Create a new pipe. Returns the pipe handle index.
-/// Handles start at 1 (slot 0 is reserved so that 0 can mean "no pipe").
-/// A pipe for a stream, exempt from the per-task cap.
-///
-/// That cap exists because `sys_pipe_create` needs no capability, so one task
-/// could otherwise drain the table. A stream is bounded by its own table
-/// instead, and charging its two pipes against a task's eight would have meant
-/// four connections per program.
-pub fn create_for_stream(packets: bool) -> Option<usize> {
-    let creator = scheduler::current_tid();
-    let space = scheduler::space_of_task(creator);
+/// A new pipe, made by `creator`: its number, or `None` if there is no room
+/// for it — no frame for its buffer, as `reclaim` gives a program frames,
+/// or no number left.
+fn make(creator: usize, packets: bool) -> Option<usize> {
+    if !crate::reclaim::may_make() {
+        return None;
+    }
+    let frame = crate::reclaim::frame()?;
     let flags = irq_save();
-    let result = unsafe {
-        let mut found = None;
-        for i in 1..MAX_PIPES {
-            if !PIPES[i].in_use {
-                PIPES[i] = Pipe::new();
-                PIPES[i].in_use = true;
-                PIPES[i].creator = creator;
-                PIPES[i].owner_space = space;
-                PIPES[i].packets = packets;
-                PIPES[i].for_stream = true;
-                found = Some(i);
-                break;
-            }
-        }
-        found
+    let made = unsafe {
+        pipes().lowest_free(1).filter(|&i| {
+            let mut pipe = Pipe::new(creator, frame as *mut u8);
+            pipe.packets = packets;
+            pipes().fill_at(i, pipe).is_ok()
+        })
     };
     irq_restore(flags);
-    result
+    if made.is_none() {
+        crate::pmm::free(crate::pmm::PhysFrame::from_address(frame));
+    }
+    made
+}
+
+/// Pipe `handle` goes: whoever is still on one of its lists looks again and
+/// finds nothing, its name names nothing, and its buffer goes back.
+///
+/// # Safety
+/// Interrupts off.
+unsafe fn gone(handle: usize) {
+    unsafe {
+        let Some(pipe) = pipes().get(handle) else { return };
+        waitlist::wake_all(&mut pipe.read_waiters);
+        waitlist::wake_all(&mut pipe.write_waiters);
+        waitlist::wake_all(&mut pipe.peer_waiters);
+        let frame = pipe.buf as usize;
+        pipes().empty(handle);
+        forget_name(handle);
+        crate::pmm::free(crate::pmm::PhysFrame::from_address(frame));
+    }
+}
+
+/// A pipe for a stream, bounded as every pipe is by what the machine has.
+pub fn create_for_stream(packets: bool) -> Option<usize> {
+    make(scheduler::current_tid(), packets)
 }
 
 /// No writer remains, so a read will never block again.
 pub fn no_writers(handle: usize) -> bool {
     let flags = irq_save();
-    let out = unsafe { handle < MAX_PIPES && PIPES[handle].in_use && PIPES[handle].writers == 0 };
+    let out = unsafe { pipes().get(handle).is_some_and(|p| p.writers == 0) };
     irq_restore(flags);
     out
 }
@@ -436,7 +433,7 @@ pub fn no_writers(handle: usize) -> bool {
 /// No reader remains, so a write has nowhere to go.
 pub fn no_readers(handle: usize) -> bool {
     let flags = irq_save();
-    let out = unsafe { handle < MAX_PIPES && PIPES[handle].in_use && PIPES[handle].readers == 0 };
+    let out = unsafe { pipes().get(handle).is_some_and(|p| p.readers == 0) };
     irq_restore(flags);
     out
 }
@@ -448,12 +445,7 @@ pub fn no_readers(handle: usize) -> bool {
 /// read nothing, and ask again as fast as it could.
 pub fn ended(handle: usize) -> bool {
     let flags = irq_save();
-    let out = unsafe {
-        handle < MAX_PIPES && PIPES[handle].in_use && {
-            let pipe = &PIPES[handle];
-            pipe.writers == 0 && (pipe.opens[1] > 0 || !pipe.named)
-        }
-    };
+    let out = unsafe { pipes().get(handle).is_some_and(|p| p.writers == 0 && (p.opens[1] > 0 || !p.named)) };
     irq_restore(flags);
     out
 }
@@ -462,7 +454,7 @@ pub fn ended(handle: usize) -> bool {
 /// departed writer means?
 pub fn readable(handle: usize) -> bool {
     let flags = irq_save();
-    let out = unsafe { handle < MAX_PIPES && PIPES[handle].in_use && PIPES[handle].len > 0 };
+    let out = unsafe { pipes().get(handle).is_some_and(|p| p.len > 0) };
     irq_restore(flags);
     out || ended(handle)
 }
@@ -470,9 +462,7 @@ pub fn readable(handle: usize) -> bool {
 /// Is there room to write?
 pub fn writable(handle: usize) -> bool {
     let flags = irq_save();
-    let out = unsafe {
-        handle < MAX_PIPES && PIPES[handle].in_use && PIPES[handle].room_for(1) > 0
-    };
+    let out = unsafe { pipes().get(handle).is_some_and(|p| p.room_for(1) > 0) };
     irq_restore(flags);
     out
 }
@@ -481,49 +471,21 @@ pub fn writable(handle: usize) -> bool {
 pub fn drop_unreferenced(handle: usize) {
     let flags = irq_save();
     unsafe {
-        if handle < MAX_PIPES
-            && PIPES[handle].in_use
-            && PIPES[handle].readers == 0
-            && PIPES[handle].writers == 0
-        {
-            PIPES[handle].in_use = false;
-            forget_name(handle);
+        if pipes().get(handle).is_some_and(|p| p.readers == 0 && p.writers == 0) {
+            gone(handle);
         }
     }
     irq_restore(flags);
 }
 
+/// Create a new pipe. Returns the pipe handle index, from 1.
+///
+/// `sys_pipe_create` needs no capability — the shell needs it for `|` — and
+/// a program is bounded by what `reclaim` lets it have, and how many it can
+/// keep by its descriptors. It was 64 a program, counted by space id, and a
+/// build running four jobs at once came close to it.
 pub fn create() -> Option<usize> {
-    let creator = scheduler::current_tid();
-    let space = scheduler::space_of_task(creator);
-    let flags = irq_save();
-    let result = unsafe {
-        // Per-program cap: sys_pipe_create needs no capability (the shell needs
-        // it for `|`), so bound it here rather than letting one program drain
-        // the global table. By program rather than by task, because a space id
-        // is never reused and a TID is: see `owner_space`.
-        let held = (1..MAX_PIPES)
-            .filter(|&i| PIPES[i].in_use && PIPES[i].owner_space == space && !PIPES[i].for_stream)
-            .count();
-        if held >= MAX_PIPES_PER_PROGRAM {
-            None
-        } else {
-            let mut found = None;
-            for i in 1..MAX_PIPES {
-                if !PIPES[i].in_use {
-                    PIPES[i] = Pipe::new();
-                    PIPES[i].in_use = true;
-                    PIPES[i].creator = creator;
-                    PIPES[i].owner_space = space;
-                    found = Some(i);
-                    break;
-                }
-            }
-            found
-        }
-    };
-    irq_restore(flags);
-    result
+    make(scheduler::current_tid(), false)
 }
 
 /// Release pipes created by a dying task that were never wired to an fd.
@@ -533,14 +495,11 @@ pub fn create() -> Option<usize> {
 pub fn cleanup_orphans(tid: usize) {
     let flags = irq_save();
     unsafe {
-        for i in 1..MAX_PIPES {
-            if PIPES[i].in_use
-                && PIPES[i].creator == tid
-                && PIPES[i].readers == 0
-                && PIPES[i].writers == 0
-            {
-                PIPES[i].in_use = false;
-                forget_name(i);
+        let mut at = 1;
+        while let Some(i) = pipes().next_used(at) {
+            at = i + 1;
+            if pipes().get(i).is_some_and(|p| p.creator == tid && p.readers == 0 && p.writers == 0) {
+                gone(i);
             }
         }
     }
@@ -551,15 +510,16 @@ pub fn cleanup_orphans(tid: usize) {
 pub fn add_ref(handle: usize, is_write: bool) -> Result<(), ()> {
     let flags = irq_save();
     let result = unsafe {
-        if handle >= MAX_PIPES || !PIPES[handle].in_use {
-            Err(())
-        } else {
-            if is_write {
-                PIPES[handle].writers += 1;
-            } else {
-                PIPES[handle].readers += 1;
+        match pipes().get(handle) {
+            Some(p) => {
+                if is_write {
+                    p.writers += 1;
+                } else {
+                    p.readers += 1;
+                }
+                Ok(())
             }
-            Ok(())
+            None => Err(()),
         }
     };
     irq_restore(flags);
@@ -583,27 +543,16 @@ fn read_inner(handle: usize, buf: *mut u8, max_len: usize) -> u64 {
         loop {
             let flags = irq_save();
 
-            if handle >= MAX_PIPES || !PIPES[handle].in_use {
+            let Some(pipe) = pipes().get(handle) else {
                 irq_restore(flags);
                 return u64::MAX;
-            }
-
-            let pipe = &mut PIPES[handle];
+            };
 
             if pipe.len > 0 {
                 // Copy data out of ring buffer
                 let to_copy = pipe.take(buf, max_len);
-
                 // Wake one blocked writer if any
-                if pipe.write_waiter_count > 0 {
-                    let tid = pipe.write_waiters[0];
-                    pipe.write_waiter_count -= 1;
-                    for j in 0..pipe.write_waiter_count {
-                        pipe.write_waiters[j] = pipe.write_waiters[j + 1];
-                    }
-                    scheduler::unblock_task(tid);
-                }
-
+                waitlist::wake_one(&mut pipe.write_waiters);
                 irq_restore(flags);
                 return to_copy as u64;
             }
@@ -622,15 +571,8 @@ fn read_inner(handle: usize, buf: *mut u8, max_len: usize) -> u64 {
                 return crate::signal::INTERRUPTED;
             }
 
-            // Block until data is available. If the waiter table is full we
-            // must NOT block -- an unregistered waiter is never woken, so the
-            // 9th reader used to sleep forever.
-            if pipe.read_waiter_count >= MAX_WAITERS {
-                irq_restore(flags);
-                return u64::MAX;
-            }
-            pipe.read_waiters[pipe.read_waiter_count] = tid;
-            pipe.read_waiter_count += 1;
+            // Block until data is available.
+            waitlist::add(&mut pipe.read_waiters, tid, On::PipeRead(handle as u32));
             scheduler::block_task(tid);
 
             irq_restore(flags);
@@ -662,29 +604,15 @@ pub fn read_nonblock(handle: usize, buf: *mut u8, max_len: usize) -> u64 {
 fn read_nonblock_inner(handle: usize, buf: *mut u8, max_len: usize) -> u64 {
     let flags = irq_save();
     let result = unsafe {
-        if handle >= MAX_PIPES || !PIPES[handle].in_use {
-            u64::MAX
-        } else {
-            let pipe = &mut PIPES[handle];
-
-            if pipe.len > 0 {
+        match pipes().get(handle) {
+            None => u64::MAX,
+            Some(pipe) if pipe.len > 0 => {
                 let to_copy = pipe.take(buf, max_len);
-
-                if pipe.write_waiter_count > 0 {
-                    let tid = pipe.write_waiters[0];
-                    pipe.write_waiter_count -= 1;
-                    for j in 0..pipe.write_waiter_count {
-                        pipe.write_waiters[j] = pipe.write_waiters[j + 1];
-                    }
-                    scheduler::unblock_task(tid);
-                }
-
+                waitlist::wake_one(&mut pipe.write_waiters);
                 to_copy as u64
-            } else if pipe.writers == 0 {
-                0 // EOF
-            } else {
-                WOULD_BLOCK
             }
+            Some(pipe) if pipe.writers == 0 => 0, // EOF
+            Some(_) => WOULD_BLOCK,
         }
     };
     irq_restore(flags);
@@ -700,30 +628,18 @@ fn read_nonblock_inner(handle: usize, buf: *mut u8, max_len: usize) -> u64 {
 pub fn write_nonblock(handle: usize, buf: *const u8, len: usize) -> u64 {
     let flags = irq_save();
     let result = unsafe {
-        if handle >= MAX_PIPES || !PIPES[handle].in_use {
-            u64::MAX
-        } else {
-            let pipe = &mut PIPES[handle];
-            if pipe.readers == 0 {
-                u64::MAX
-            } else if pipe.packets && len + 2 > PIPE_BUF_SIZE {
-                // A record bigger than the buffer never fits.
-                u64::MAX
-            } else {
+        match pipes().get(handle) {
+            None => u64::MAX,
+            Some(pipe) if pipe.readers == 0 => u64::MAX,
+            // A record bigger than the buffer never fits.
+            Some(pipe) if pipe.packets && len + 2 > PIPE_BUF_SIZE => u64::MAX,
+            Some(pipe) => {
                 let to_copy = pipe.room_for(len).min(len);
                 if to_copy == 0 {
                     WOULD_BLOCK
                 } else {
                     pipe.put(buf, to_copy);
-
-                    if pipe.read_waiter_count > 0 {
-                        let tid = pipe.read_waiters[0];
-                        pipe.read_waiter_count -= 1;
-                        for j in 0..pipe.read_waiter_count {
-                            pipe.read_waiters[j] = pipe.read_waiters[j + 1];
-                        }
-                        scheduler::unblock_task(tid);
-                    }
+                    waitlist::wake_one(&mut pipe.read_waiters);
                     to_copy as u64
                 }
             }
@@ -754,12 +670,10 @@ fn write_inner(handle: usize, buf: *const u8, len: usize) -> u64 {
         while offset < len {
             let flags = irq_save();
 
-            if handle >= MAX_PIPES || !PIPES[handle].in_use {
+            let Some(pipe) = pipes().get(handle) else {
                 irq_restore(flags);
                 return u64::MAX;
-            }
-
-            let pipe = &mut PIPES[handle];
+            };
 
             // Broken pipe — no readers
             if pipe.readers == 0 {
@@ -781,14 +695,7 @@ fn write_inner(handle: usize, buf: *const u8, len: usize) -> u64 {
                 offset += to_copy;
 
                 // Wake one blocked reader if any
-                if pipe.read_waiter_count > 0 {
-                    let tid = pipe.read_waiters[0];
-                    pipe.read_waiter_count -= 1;
-                    for j in 0..pipe.read_waiter_count {
-                        pipe.read_waiters[j] = pipe.read_waiters[j + 1];
-                    }
-                    scheduler::unblock_task(tid);
-                }
+                waitlist::wake_one(&mut pipe.read_waiters);
 
                 irq_restore(flags);
                 // And whoever is polling for it, now, if there is more to
@@ -802,21 +709,15 @@ fn write_inner(handle: usize, buf: *const u8, len: usize) -> u64 {
                     crate::pollset::note_pipe(handle);
                 }
             } else {
-                // Buffer full — block until space available. Same rule as the
-                // read path: no waiter slot means no wakeup, so fail instead.
-                // And a signal ends the wait as it ends a read's, unless some
-                // of it went: then that is the answer.
+                // Buffer full — block until space available. A signal ends
+                // the wait as it ends a read's, unless some of it went: then
+                // that is the answer.
                 let tid = scheduler::current_tid();
                 if crate::signal::ends_wait(tid) {
                     irq_restore(flags);
                     return if offset > 0 { offset as u64 } else { crate::signal::INTERRUPTED };
                 }
-                if pipe.write_waiter_count >= MAX_WAITERS {
-                    irq_restore(flags);
-                    return if offset > 0 { offset as u64 } else { u64::MAX };
-                }
-                pipe.write_waiters[pipe.write_waiter_count] = tid;
-                pipe.write_waiter_count += 1;
+                waitlist::add(&mut pipe.write_waiters, tid, On::PipeWrite(handle as u32));
                 scheduler::block_task(tid);
 
                 irq_restore(flags);
@@ -857,17 +758,18 @@ pub fn release_fd(kind: &FdKind) {
 /// an id is given to the next task made: a wake meant for the dead one would
 /// reach whatever has its number now, and if that is blocked on something
 /// else — a call to a server — it is woken with nothing, and the call fails.
-/// A kind that parks tasks and is missing here leaves that open.
+/// A kind that parks tasks and is missing here leaves that open. A pipe's
+/// waiters, a stream's pipes', a counter's and a timer's are lists through
+/// the waiters' records (`waitlist.rs`), and a task comes off by its own link.
 pub fn forget_waiter(kind: &FdKind, tid: usize) -> bool {
     match kind {
-        FdKind::PipeRead(handle) | FdKind::PipeWrite(handle) => forget_on_pipe(*handle, tid),
-        FdKind::StreamEnd { stream, end } => match crate::stream::pipes_for(*stream, *end) {
-            Some((rd, wr)) => forget_on_pipe(rd, tid) | forget_on_pipe(wr, tid),
-            None => false,
-        },
+        FdKind::PipeRead(_) | FdKind::PipeWrite(_) | FdKind::StreamEnd { .. } | FdKind::Timer { .. } | FdKind::Event { .. } => {
+            let flags = irq_save();
+            let found = unsafe { waitlist::forget(tid) };
+            irq_restore(flags);
+            found
+        }
         FdKind::PtyEnd { pty, .. } => crate::pty::forget_waiter(*pty, tid),
-        FdKind::Timer { timer } => crate::timerfd::forget_waiter(*timer, tid),
-        FdKind::Event { ev } => crate::eventfd::forget_waiter(*ev, tid),
         FdKind::Local { l } => crate::local::forget_waiter(*l, tid),
         _ => false,
     }
@@ -888,20 +790,19 @@ pub fn forget_in(list: &mut [usize], count: &mut usize, tid: usize) -> bool {
     found
 }
 
-fn forget_on_pipe(handle: usize, tid: usize) -> bool {
-    if handle >= MAX_PIPES {
-        return false;
+/// Pipe `handle`'s list of waiters: 0 its readers, 1 its writers, 2 those
+/// waiting for its other end. For `waitlist::forget`.
+///
+/// # Safety
+/// Interrupts off.
+pub unsafe fn waiters(handle: usize, which: u8) -> Option<&'static mut Waiters> {
+    unsafe {
+        pipes().get(handle).map(|p| match which {
+            0 => &mut p.read_waiters,
+            1 => &mut p.write_waiters,
+            _ => &mut p.peer_waiters,
+        })
     }
-    let flags = irq_save();
-    let found = unsafe {
-        let pipe = &mut PIPES[handle];
-        pipe.in_use
-            && (forget_in(&mut pipe.read_waiters, &mut pipe.read_waiter_count, tid)
-                | forget_in(&mut pipe.write_waiters, &mut pipe.write_waiter_count, tid)
-                | forget_in(&mut pipe.peer_waiters, &mut pipe.peer_waiter_count, tid))
-    };
-    irq_restore(flags);
-    found
 }
 
 /// Take a reference on whatever a descriptor names, for a copy of it.
@@ -964,34 +865,26 @@ pub fn drop_ref(handle: usize, is_write: bool) {
 fn drop_ref_inner(handle: usize, is_write: bool) {
     let flags = irq_save();
     unsafe {
-        if handle >= MAX_PIPES || !PIPES[handle].in_use {
+        let Some(pipe) = pipes().get(handle) else {
             irq_restore(flags);
             return;
-        }
-        let pipe = &mut PIPES[handle];
+        };
         if is_write {
             pipe.writers = pipe.writers.saturating_sub(1);
             if pipe.writers == 0 {
                 // Wake all blocked readers — they'll get EOF
-                for i in 0..pipe.read_waiter_count {
-                    scheduler::unblock_task(pipe.read_waiters[i]);
-                }
-                pipe.read_waiter_count = 0;
+                waitlist::wake_all(&mut pipe.read_waiters);
             }
         } else {
             pipe.readers = pipe.readers.saturating_sub(1);
             if pipe.readers == 0 {
                 // Wake all blocked writers — they'll get broken pipe
-                for i in 0..pipe.write_waiter_count {
-                    scheduler::unblock_task(pipe.write_waiters[i]);
-                }
-                pipe.write_waiter_count = 0;
+                waitlist::wake_all(&mut pipe.write_waiters);
             }
         }
         // Free pipe if both sides closed
         if pipe.readers == 0 && pipe.writers == 0 {
-            pipe.in_use = false;
-            forget_name(handle);
+            gone(handle);
         }
     }
     irq_restore(flags);

@@ -16,39 +16,31 @@
 //! turns the same object into "wait for one of N things".
 
 use crate::scheduler;
-
-pub const MAX_EVENTS: usize = 16;
-const MAX_WAITERS: usize = 4;
+use crate::waitlist::{self, On, Waiters};
 
 /// The largest value a write may leave behind. Linux reserves the top value so
 /// that a write of `u64::MAX` is always an error rather than a wrap.
 const MAX_COUNT: u64 = u64::MAX - 1;
 
-#[derive(Clone, Copy)]
 struct Event {
-    in_use: bool,
     creator: usize,
     refs: usize,
     count: u64,
     /// A read takes one rather than all of it.
     semaphore: bool,
-    waiters: [usize; MAX_WAITERS],
-    nwaiters: usize,
+    /// Who is waiting for it not to be zero (`waitlist.rs`).
+    waiters: Waiters,
 }
 
-const NO_EVENT: Event = Event {
-    in_use: false,
-    creator: 0,
-    refs: 0,
-    count: 0,
-    semaphore: false,
-    waiters: [0; MAX_WAITERS],
-    nwaiters: 0,
-};
+/// Every counter, by its number: made when a program makes one, given back
+/// when nothing names it (`table.rs`). Sixteen for the whole machine, they
+/// were, and four waiting on each.
+static mut EVENTS: crate::table::Table<Event> = crate::table::Table::new(crate::table::MOST);
 
-static mut EVENTS: [Event; MAX_EVENTS] = [NO_EVENT; MAX_EVENTS];
-
-fn events() -> &'static mut [Event; MAX_EVENTS] {
+/// # Safety
+/// Interrupts off.
+#[inline(always)]
+unsafe fn events() -> &'static mut crate::table::Table<Event> {
     unsafe { &mut *core::ptr::addr_of_mut!(EVENTS) }
 }
 
@@ -69,64 +61,74 @@ fn irq_restore(flags: u64) {
 }
 
 pub fn create(creator: usize, initial: u64, semaphore: bool) -> Option<usize> {
-    if initial > MAX_COUNT {
+    if initial > MAX_COUNT || !crate::reclaim::may_make() {
         return None;
     }
     let flags = irq_save();
-    let out = (0..MAX_EVENTS).find(|&i| !events()[i].in_use).inspect(|&i| {
-        events()[i] = NO_EVENT;
-        events()[i].in_use = true;
-        events()[i].creator = creator;
-        events()[i].count = initial;
-        events()[i].semaphore = semaphore;
-    });
+    let made = unsafe {
+        events().lowest_free(0).filter(|&i| {
+            events().fill_at(i, Event { creator, refs: 0, count: initial, semaphore, waiters: Waiters::NONE }).is_ok()
+        })
+    };
     irq_restore(flags);
-    out
+    made
 }
 
 pub fn retain(ev: usize) {
-    if ev >= MAX_EVENTS {
-        return;
-    }
     let flags = irq_save();
-    if events()[ev].in_use {
-        events()[ev].refs += 1;
-    }
-    irq_restore(flags);
-}
-
-pub fn release(ev: usize) {
-    if ev >= MAX_EVENTS {
-        return;
-    }
-    let flags = irq_save();
-    let e = &mut events()[ev];
-    if e.in_use {
-        e.refs = e.refs.saturating_sub(1);
-        if e.refs == 0 {
-            *e = NO_EVENT;
+    unsafe {
+        if let Some(e) = events().get(ev) {
+            e.refs += 1;
         }
     }
     irq_restore(flags);
 }
 
+pub fn release(ev: usize) {
+    let flags = irq_save();
+    unsafe {
+        if let Some(e) = events().get(ev) {
+            e.refs = e.refs.saturating_sub(1);
+            if e.refs == 0 {
+                gone(ev);
+            }
+        }
+    }
+    irq_restore(flags);
+}
+
+/// Counter `ev` goes: anybody still on its list — which a waiter's own
+/// reference should have made nobody — looks again, and finds nothing.
+///
+/// # Safety
+/// Interrupts off.
+unsafe fn gone(ev: usize) {
+    unsafe {
+        if let Some(e) = events().get(ev) {
+            waitlist::wake_all(&mut e.waiters);
+        }
+        events().empty(ev);
+    }
+}
+
 /// Throw away counters a task made and never installed anywhere.
 pub fn cleanup_orphans(creator: usize) {
     let flags = irq_save();
-    for e in events().iter_mut() {
-        if e.in_use && e.creator == creator && e.refs == 0 {
-            *e = NO_EVENT;
+    unsafe {
+        let mut at = 0;
+        while let Some(ev) = events().next_used(at) {
+            at = ev + 1;
+            if events().get(ev).is_some_and(|e| e.creator == creator && e.refs == 0) {
+                gone(ev);
+            }
         }
     }
     irq_restore(flags);
 }
 
 pub fn readable(ev: usize) -> bool {
-    if ev >= MAX_EVENTS {
-        return false;
-    }
     let flags = irq_save();
-    let r = events()[ev].in_use && events()[ev].count > 0;
+    let r = unsafe { events().get(ev).is_some_and(|e| e.count > 0) };
     irq_restore(flags);
     r
 }
@@ -134,11 +136,8 @@ pub fn readable(ev: usize) -> bool {
 /// Writable while there is room for one more, which is every counter that is
 /// not at its ceiling — so, in practice, always.
 pub fn writable(ev: usize) -> bool {
-    if ev >= MAX_EVENTS {
-        return false;
-    }
     let flags = irq_save();
-    let w = events()[ev].in_use && events()[ev].count < MAX_COUNT;
+    let w = unsafe { events().get(ev).is_some_and(|e| e.count < MAX_COUNT) };
     irq_restore(flags);
     w
 }
@@ -146,21 +145,15 @@ pub fn writable(ev: usize) -> bool {
 /// Take what is there. `None` when the counter is zero, which is what the
 /// caller turns into a wait or into `EAGAIN`.
 pub fn take(ev: usize) -> Option<u64> {
-    if ev >= MAX_EVENTS {
-        return None;
-    }
     let flags = irq_save();
-    let out = {
-        let e = &mut events()[ev];
-        if !e.in_use || e.count == 0 {
-            None
-        } else if e.semaphore {
-            e.count -= 1;
-            Some(1)
-        } else {
-            let n = e.count;
-            e.count = 0;
-            Some(n)
+    let out = unsafe {
+        match events().get(ev) {
+            Some(e) if e.count > 0 && e.semaphore => {
+                e.count -= 1;
+                Some(1)
+            }
+            Some(e) if e.count > 0 => Some(core::mem::replace(&mut e.count, 0)),
+            _ => None,
         }
     };
     irq_restore(flags);
@@ -173,66 +166,48 @@ pub fn take(ev: usize) -> Option<u64> {
 /// Add to the counter and wake whoever is waiting. `false` when it would go
 /// past the ceiling, which the caller turns into a wait or into `EAGAIN`.
 pub fn add(ev: usize, n: u64) -> bool {
-    if ev >= MAX_EVENTS || n == 0 {
+    if n == 0 {
         return false;
     }
-    let mut wake = [0usize; MAX_WAITERS];
-    let mut nwake = 0;
     let flags = irq_save();
-    let ok = {
-        let e = &mut events()[ev];
-        if !e.in_use || MAX_COUNT - e.count < n {
-            false
-        } else {
-            e.count += n;
-            for i in 0..e.nwaiters {
-                wake[nwake] = e.waiters[i];
-                nwake += 1;
+    let ok = unsafe {
+        match events().get(ev) {
+            Some(e) if MAX_COUNT - e.count >= n => {
+                e.count += n;
+                waitlist::wake_all(&mut e.waiters);
+                true
             }
-            e.nwaiters = 0;
-            true
+            _ => false,
         }
     };
     irq_restore(flags);
     if ok {
-        for &tid in &wake[..nwake] {
-            scheduler::unblock_task(tid);
-        }
         crate::pollset::note_event();
     }
     ok
 }
 
-/// A task parked on this counter has died: it is waiting for nothing now.
-pub fn forget_waiter(ev: usize, tid: usize) -> bool {
-    if ev >= MAX_EVENTS {
-        return false;
-    }
-    let flags = irq_save();
-    let e = &mut events()[ev];
-    let found = e.in_use && crate::pipe::forget_in(&mut e.waiters, &mut e.nwaiters, tid);
-    irq_restore(flags);
-    found
+/// Counter `ev`'s list of waiters, for `waitlist::forget`.
+///
+/// # Safety
+/// Interrupts off.
+pub unsafe fn waiters(ev: usize) -> Option<&'static mut Waiters> {
+    unsafe { events().get(ev).map(|e| &mut e.waiters) }
 }
 
-/// Park until the counter is not zero. `false` when there was no room to be
-/// recorded as a waiter — which must not become a wait, since an unrecorded
-/// waiter is never woken.
+/// Park until the counter is not zero. `false` when there is no need, or a
+/// signal has ended the wait before it began.
 pub fn wait(ev: usize) -> bool {
-    if ev >= MAX_EVENTS {
-        return false;
-    }
     let tid = scheduler::current_tid();
     let flags = irq_save();
-    let parked = {
-        let e = &mut events()[ev];
-        if !e.in_use || e.count > 0 || e.nwaiters >= MAX_WAITERS || crate::signal::ends_wait(tid) {
-            false
-        } else {
-            e.waiters[e.nwaiters] = tid;
-            e.nwaiters += 1;
-            scheduler::block_task(tid);
-            true
+    let parked = unsafe {
+        match events().get(ev) {
+            Some(e) if e.count == 0 && !crate::signal::ends_wait(tid) => {
+                waitlist::add(&mut e.waiters, tid, On::Event(ev as u32));
+                scheduler::block_task(tid);
+                true
+            }
+            _ => false,
         }
     };
     irq_restore(flags);

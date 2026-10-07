@@ -275,7 +275,7 @@ numbers, and only 64 could name it before, through a range check.
 
 | Minor | What |
 |---|---|
-| 4.1 | **As many tasks as a desktop runs.** The kernel has up to 32,768 tasks, where it had sixty-four, so a program can no longer find every task by asking about each number below 64: `SYS_TASK_NEXT` (236) answers the first task at or past a number, and a walk of every task is one call a task. A program has 4,096 tasks without `TaskMgmt` — its own that have not died, and the children it has made in other programs and not collected — where a task could have sixteen children and a fork was not counted at all; `SYS_TASK_CREATE`, `SYS_TASK_CREATE_IN` and `SYS_FORK` answer `u64::MAX` past it. |
+| 4.1 | **As many tasks as a desktop runs.** The kernel has up to 32,768 tasks, where it had sixty-four, so a program can no longer find every task by asking about each number below 64: `SYS_TASK_NEXT` (236) answers the first task at or past a number, and a walk of every task is one call a task. A program has 4,096 tasks without `TaskMgmt` — its own that have not died, and the children it has made in other programs and not collected — where a task could have sixteen children and a fork was not counted at all; `SYS_TASK_CREATE`, `SYS_TASK_CREATE_IN` and `SYS_FORK` answer `u64::MAX` past it. **And what a program makes is made when it makes it**, as many as its descriptors and the machine's memory allow: counters, timers, signal descriptors, pipes and shared regions, where there were 16, 16, 32, 256 — 64 a program — and 256 for the machine. `SYS_PIPE_CREATE` counts no budget of the program's; nor does anything else that was made with one. |
 
 ### Deprecated
 
@@ -930,7 +930,7 @@ would on Linux, and the pipe is freed when the read returns.
 | 66 | `SYS_FD_READ_NB` | arg0 = fd, arg1 = buf, arg2 = max len | bytes, `0` = EOF, **`0xFFFF_FFFE` = would block**, `u64::MAX` = error | — |
 | 67 | `SYS_FD_SET` | arg0 = target tid, arg1 = fd, arg2 = service tid, arg3 = tag. A read or a write through the descriptor is a call to the service with that tag; the service is the task arg2 names now, and once it is gone the descriptor names nothing, whoever has its number | 0 / `u64::MAX`, also if arg2 names no task | `TaskMgmt` |
 | 68 | `SYS_FD_DUP` | arg0 = target tid, arg1 = target fd or `u64::MAX - 1` for any free one, arg2 = source fd, arg3 = lowest acceptable fd when arg1 asks for any | the fd it took / `u64::MAX` | `TaskMgmt` over the target, unless the target is the caller or a child it has not started |
-| 69 | `SYS_PIPE_CREATE` | — | handle / `u64::MAX` | — (bounded per program: 64 not yet closed, a stream's not counted) |
+| 69 | `SYS_PIPE_CREATE` | — | handle / `u64::MAX` | — (no count of its own: a program is bounded by its descriptors, and by what the machine has room for) |
 | 70 | `SYS_PIPE_FD_SET` | arg0 = target tid, arg1 = fd or `u64::MAX - 1` for any free one, arg2 = pipe handle, arg3 = 1 for write end | the fd it took / `u64::MAX` | `TaskMgmt` over the target, unless the target is the caller or a child it has not started |
 | 71 | `SYS_FD_CLOSE` | arg0 = fd | 0 / `u64::MAX` | — |
 | 72 | `SYS_SOCKETPAIR` | — | `(fd0 << 32) \| fd1`, both in the caller's table / `u64::MAX` | — |

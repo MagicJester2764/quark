@@ -559,6 +559,9 @@ pub fn task_gone(tid: usize) {
     if tid < MAX_TASKS {
         let flags = irq_save();
         let held = unsafe { st(tid).held };
+        // And off whatever list its own link names (`waitlist.rs`): a named
+        // pipe's other end, say, which it holds nothing for.
+        unsafe { crate::waitlist::forget(tid) };
         irq_restore(flags);
         if !held.is_empty() {
             crate::pipe::forget_waiter(&held, tid);

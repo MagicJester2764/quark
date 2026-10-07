@@ -24,9 +24,8 @@
 use crate::pipe;
 use crate::task::FdKind;
 
-/// Streams in the system. Two pipes apiece, which `pipe::MAX_PIPES` accounts
-/// for: a compositor's clients, and the pairs a program starting others
-/// makes to hear how each start went.
+/// Streams in the system, two pipes apiece: a compositor's clients, and the
+/// pairs a program starting others makes to hear how each start went.
 const MAX_STREAMS: usize = 64;
 
 /// Descriptors in flight in one direction: a burst of messages, each with a

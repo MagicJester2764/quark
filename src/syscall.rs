@@ -5258,9 +5258,7 @@ fn event_read(ev: usize, ptr: *mut u8, max_len: usize) -> u64 {
             && !crate::eventfd::readable(ev)
             && !crate::signal::ends_wait(scheduler::current_tid())
         {
-            // Either it was added to while we were looking, or there was no
-            // room to be recorded as a waiter. The loop takes the first; the
-            // second must return rather than sleep unwoken.
+            // Not waited on and not readable: it has gone.
             return u64::MAX;
         }
     }

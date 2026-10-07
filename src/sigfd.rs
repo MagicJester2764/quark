@@ -11,17 +11,16 @@
 //! one sent down a stream) sees a change made through either. A read is
 //! `signal::read_for`.
 
-pub const MAX_SIGFDS: usize = 32;
-
 #[derive(Clone, Copy)]
 struct SigFd {
     refs: usize,
     mask: u64,
 }
 
-const FREE: SigFd = SigFd { refs: 0, mask: 0 };
-
-static mut SIGFDS: [SigFd; MAX_SIGFDS] = [FREE; MAX_SIGFDS];
+/// Every one, by its number: made when a program makes one, given back with
+/// its last descriptor (`table.rs`). Thirty-two for the whole machine, they
+/// were.
+static mut SIGFDS: crate::table::Table<SigFd> = crate::table::Table::new(crate::table::MOST);
 
 #[inline(always)]
 fn irq_save() -> u64 {
@@ -37,68 +36,62 @@ fn irq_restore(flags: u64) {
 
 /// # Safety
 /// Interrupts are off.
-unsafe fn sigfds() -> &'static mut [SigFd; MAX_SIGFDS] {
+unsafe fn sigfds() -> &'static mut crate::table::Table<SigFd> {
     unsafe { &mut *core::ptr::addr_of_mut!(SIGFDS) }
 }
 
 /// A new one, read for `mask`, with one reference: the descriptor about to
 /// name it.
 pub fn create(mask: u64) -> Option<usize> {
+    if !crate::reclaim::may_make() {
+        return None;
+    }
     let flags = irq_save();
-    let made = unsafe {
-        sigfds().iter().position(|s| s.refs == 0).inspect(|&s| {
-            sigfds()[s] = SigFd { refs: 1, mask };
-        })
-    };
+    let made = unsafe { sigfds().lowest_free(0).filter(|&s| sigfds().fill_at(s, SigFd { refs: 1, mask }).is_ok()) };
     irq_restore(flags);
     made
 }
 
 /// What `s` is read for.
 pub fn mask(s: usize) -> u64 {
-    if s >= MAX_SIGFDS {
-        return 0;
-    }
     let flags = irq_save();
-    let mask = unsafe { sigfds()[s].mask };
+    let mask = unsafe { sigfds().get(s).map_or(0, |it| it.mask) };
     irq_restore(flags);
     mask
 }
 
 /// `s` is read for `mask` from now on.
 pub fn set_mask(s: usize, mask: u64) {
-    if s < MAX_SIGFDS {
-        let flags = irq_save();
-        unsafe {
-            if sigfds()[s].refs != 0 {
-                sigfds()[s].mask = mask;
-            }
+    let flags = irq_save();
+    unsafe {
+        if let Some(it) = sigfds().get(s) {
+            it.mask = mask;
         }
-        irq_restore(flags);
     }
+    irq_restore(flags);
 }
 
 /// Another descriptor names `s`.
 pub fn retain(s: usize) {
-    if s < MAX_SIGFDS {
-        let flags = irq_save();
-        unsafe {
-            if sigfds()[s].refs != 0 {
-                sigfds()[s].refs += 1;
-            }
+    let flags = irq_save();
+    unsafe {
+        if let Some(it) = sigfds().get(s) {
+            it.refs += 1;
         }
-        irq_restore(flags);
     }
+    irq_restore(flags);
 }
 
 /// A descriptor for `s` is gone; the last takes it with it.
 pub fn release(s: usize) {
-    if s < MAX_SIGFDS {
-        let flags = irq_save();
-        unsafe {
-            let it = &mut sigfds()[s];
+    let flags = irq_save();
+    unsafe {
+        if let Some(it) = sigfds().get(s) {
             it.refs = it.refs.saturating_sub(1);
+            if it.refs == 0 {
+                sigfds().empty(s);
+            }
         }
-        irq_restore(flags);
     }
+    irq_restore(flags);
 }

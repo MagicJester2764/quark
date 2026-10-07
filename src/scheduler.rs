@@ -2241,8 +2241,10 @@ unsafe fn reap_one(i: usize) -> bool { unsafe {
     st(i).unannounced = false;
     st(i).unwaited = false;
     crate::job::forget(i);
-    // Dead, it may still be in a ready queue, which goes through its record.
+    // Dead, it may still be in a ready queue, or on a list of waiters, each of
+    // which goes through its record.
     unlink_ready(i);
+    crate::waitlist::forget(i);
     table().empty(i);
 
     // Left naming this TID, its children would wait on a parent that is gone,

@@ -313,6 +313,8 @@ pub struct TaskRec {
     pub served: crate::served::PerTask,
     pub cap: crate::cap::PerTask,
     pub pmm: crate::pmm::PerTask,
+    /// What it waits on, and the tasks either side of it there.
+    pub wait: crate::waitlist::WaitLink,
 }
 
 impl TaskRec {
@@ -331,6 +333,7 @@ impl TaskRec {
             served: crate::served::PerTask::new(),
             cap: crate::cap::PerTask::new(),
             pmm: crate::pmm::PerTask::new(),
+            wait: crate::waitlist::WaitLink::NONE,
         }
     }
 
@@ -347,6 +350,7 @@ impl TaskRec {
             served: crate::served::PerTask::new(),
             cap: crate::cap::PerTask::new(),
             pmm: crate::pmm::PerTask::new(),
+            wait: crate::waitlist::WaitLink::NONE,
         }
     }
 }

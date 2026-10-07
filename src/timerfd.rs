@@ -12,13 +12,9 @@
 
 use crate::scheduler;
 use crate::task::{FdKind, FD_MOST};
+use crate::waitlist::{self, On, Waiters};
 
-pub const MAX_TIMERS: usize = 16;
-const MAX_WAITERS: usize = 4;
-
-#[derive(Clone, Copy)]
 struct Timer {
-    in_use: bool,
     creator: usize,
     refs: usize,
     /// When it next expires, in the clock's nanoseconds, or 0 for a timer
@@ -30,24 +26,19 @@ struct Timer {
     /// is what makes a slow reader see "it fired four times" rather than four
     /// wake-ups it has to count itself.
     count: u64,
-    waiters: [usize; MAX_WAITERS],
-    nwaiters: usize,
+    /// Who is waiting for it to fire (`waitlist.rs`).
+    waiters: Waiters,
 }
 
-const NO_TIMER: Timer = Timer {
-    in_use: false,
-    creator: 0,
-    refs: 0,
-    deadline: 0,
-    interval: 0,
-    count: 0,
-    waiters: [0; MAX_WAITERS],
-    nwaiters: 0,
-};
+/// Every timer, by its number: made when a program makes one, given back
+/// when nothing names it (`table.rs`). Sixteen for the whole machine, they
+/// were, and four waiting on each.
+static mut TIMERS: crate::table::Table<Timer> = crate::table::Table::new(crate::table::MOST);
 
-static mut TIMERS: [Timer; MAX_TIMERS] = [NO_TIMER; MAX_TIMERS];
-
-fn timers() -> &'static mut [Timer; MAX_TIMERS] {
+/// # Safety
+/// Interrupts off.
+#[inline(always)]
+unsafe fn timers() -> &'static mut crate::table::Table<Timer> {
     unsafe { &mut *core::ptr::addr_of_mut!(TIMERS) }
 }
 
@@ -68,47 +59,66 @@ fn irq_restore(flags: u64) {
 }
 
 pub fn create(creator: usize) -> Option<usize> {
+    if !crate::reclaim::may_make() {
+        return None;
+    }
     let flags = irq_save();
-    let out = (0..MAX_TIMERS).find(|&i| !timers()[i].in_use).inspect(|&i| {
-        timers()[i] = NO_TIMER;
-        timers()[i].in_use = true;
-        timers()[i].creator = creator;
-    });
+    let made = unsafe {
+        timers().lowest_free(0).filter(|&i| {
+            let t = Timer { creator, refs: 0, deadline: 0, interval: 0, count: 0, waiters: Waiters::NONE };
+            timers().fill_at(i, t).is_ok()
+        })
+    };
     irq_restore(flags);
-    out
+    made
 }
 
 pub fn retain(timer: usize) {
-    if timer >= MAX_TIMERS {
-        return;
-    }
     let flags = irq_save();
-    if timers()[timer].in_use {
-        timers()[timer].refs += 1;
-    }
-    irq_restore(flags);
-}
-
-pub fn release(timer: usize) {
-    if timer >= MAX_TIMERS {
-        return;
-    }
-    let flags = irq_save();
-    let t = &mut timers()[timer];
-    if t.in_use {
-        t.refs = t.refs.saturating_sub(1);
-        if t.refs == 0 {
-            *t = NO_TIMER;
+    unsafe {
+        if let Some(t) = timers().get(timer) {
+            t.refs += 1;
         }
     }
     irq_restore(flags);
 }
 
+pub fn release(timer: usize) {
+    let flags = irq_save();
+    unsafe {
+        if let Some(t) = timers().get(timer) {
+            t.refs = t.refs.saturating_sub(1);
+            if t.refs == 0 {
+                gone(timer);
+            }
+        }
+    }
+    irq_restore(flags);
+}
+
+/// Timer `timer` goes: anybody still on its list looks again, and finds
+/// nothing.
+///
+/// # Safety
+/// Interrupts off.
+unsafe fn gone(timer: usize) {
+    unsafe {
+        if let Some(t) = timers().get(timer) {
+            waitlist::wake_all(&mut t.waiters);
+        }
+        timers().empty(timer);
+    }
+}
+
 pub fn cleanup_orphans(creator: usize) {
     let flags = irq_save();
-    for t in timers().iter_mut() {
-        if t.in_use && t.creator == creator && t.refs == 0 {
-            *t = NO_TIMER;
+    unsafe {
+        let mut at = 0;
+        while let Some(i) = timers().next_used(at) {
+            at = i + 1;
+            if timers().get(i).is_some_and(|t| t.creator == creator && t.refs == 0) {
+                gone(i);
+            }
         }
     }
     irq_restore(flags);
@@ -117,22 +127,19 @@ pub fn cleanup_orphans(creator: usize) {
 /// Arm or disarm. `first` is nanoseconds from now (0 disarms), `interval`
 /// nanoseconds between expirations after that.
 pub fn set(timer: usize, first: u64, interval: u64) -> bool {
-    if timer >= MAX_TIMERS {
-        return false;
-    }
     let flags = irq_save();
-    let ok = {
-        let t = &mut timers()[timer];
-        if !t.in_use {
-            false
-        } else {
-            t.deadline = if first == 0 { 0 } else { crate::clock::after(first) };
-            t.interval = interval;
-            t.count = 0;
-            if t.deadline != 0 {
-                crate::clock::due(t.deadline);
+    let ok = unsafe {
+        match timers().get(timer) {
+            Some(t) => {
+                t.deadline = if first == 0 { 0 } else { crate::clock::after(first) };
+                t.interval = interval;
+                t.count = 0;
+                if t.deadline != 0 {
+                    crate::clock::due(t.deadline);
+                }
+                true
             }
-            true
+            None => false,
         }
     };
     irq_restore(flags);
@@ -141,20 +148,9 @@ pub fn set(timer: usize, first: u64, interval: u64) -> bool {
 
 /// What is left: nanoseconds until the next expiration, and the interval.
 pub fn get(timer: usize) -> Option<(u64, u64)> {
-    if timer >= MAX_TIMERS {
-        return None;
-    }
     let now = crate::clock::now();
     let flags = irq_save();
-    let out = {
-        let t = &timers()[timer];
-        if !t.in_use {
-            None
-        } else {
-            let left = if t.deadline > now { t.deadline - now } else { 0 };
-            Some((left, t.interval))
-        }
-    };
+    let out = unsafe { timers().get(timer).map(|t| (t.deadline.saturating_sub(now), t.interval)) };
     irq_restore(flags);
     out
 }
@@ -189,68 +185,50 @@ fn catch_up(t: &mut Timer, now: u64) -> bool {
 
 /// How many times it has fired since the last read.
 pub fn pending(timer: usize) -> u64 {
-    if timer >= MAX_TIMERS {
-        return 0;
-    }
     let flags = irq_save();
-    let n = if timers()[timer].in_use { timers()[timer].count } else { 0 };
+    let n = unsafe { timers().get(timer).map_or(0, |t| t.count) };
     irq_restore(flags);
     n
 }
 
 /// Take the count, or `None` if it has not fired yet.
 pub fn take(timer: usize) -> Option<u64> {
-    if timer >= MAX_TIMERS {
-        return None;
-    }
     let now = crate::clock::now();
     let flags = irq_save();
-    let out = {
-        let t = &mut timers()[timer];
-        if t.in_use {
-            catch_up(t, now);
-        }
-        if !t.in_use || t.count == 0 {
-            None
-        } else {
-            let n = t.count;
-            t.count = 0;
-            Some(n)
+    let out = unsafe {
+        match timers().get(timer) {
+            Some(t) => {
+                catch_up(t, now);
+                (t.count > 0).then(|| core::mem::replace(&mut t.count, 0))
+            }
+            None => None,
         }
     };
     irq_restore(flags);
     out
 }
 
-/// A task parked on this timer has died: it is waiting for nothing now.
-pub fn forget_waiter(timer: usize, tid: usize) -> bool {
-    if timer >= MAX_TIMERS {
-        return false;
-    }
-    let flags = irq_save();
-    let t = &mut timers()[timer];
-    let found = t.in_use && crate::pipe::forget_in(&mut t.waiters, &mut t.nwaiters, tid);
-    irq_restore(flags);
-    found
+/// Timer `timer`'s list of waiters, for `waitlist::forget`.
+///
+/// # Safety
+/// Interrupts off.
+pub unsafe fn waiters(timer: usize) -> Option<&'static mut Waiters> {
+    unsafe { timers().get(timer).map(|t| &mut t.waiters) }
 }
 
-/// Wait for it to fire. False when there was no room to be recorded as a
-/// waiter, which must not become a wait.
+/// Wait for it to fire. False when there is no need, it is gone, or a
+/// signal has ended the wait before it began.
 pub fn wait(timer: usize) -> bool {
-    if timer >= MAX_TIMERS {
-        return false;
-    }
     let tid = scheduler::current_tid();
     let flags = irq_save();
-    let parked = {
-        let t = &mut timers()[timer];
-        if !t.in_use || t.count > 0 || t.nwaiters >= MAX_WAITERS || crate::signal::ends_wait(tid) {
-            false
-        } else {
-            t.waiters[t.nwaiters] = tid;
-            t.nwaiters += 1;
-            scheduler::block_task(tid);
-            true
+    let parked = unsafe {
+        match timers().get(timer) {
+            Some(t) if t.count == 0 && !crate::signal::ends_wait(tid) => {
+                waitlist::add(&mut t.waiters, tid, On::Timer(timer as u32));
+                scheduler::block_task(tid);
+                true
+            }
+            _ => false,
         }
     };
     irq_restore(flags);
@@ -263,32 +241,23 @@ pub fn wait(timer: usize) -> bool {
 /// Fire what is due at `now`, and say when the next one is: the earliest
 /// deadline left, or `u64::MAX` if no timer is armed.
 ///
-/// Called with interrupts already off, from the clock (`clock::expire`), so
-/// it takes the waiters out and wakes them after — waking is a scheduler
-/// operation and this is not the place for one.
+/// Called with interrupts already off, from the clock (`clock::expire`).
 pub fn expire(now: u64) -> u64 {
-    let mut wake = [0usize; MAX_TIMERS * MAX_WAITERS];
-    let mut n = 0;
     let mut fired = false;
     let mut next = u64::MAX;
-    for t in timers().iter_mut() {
-        if !t.in_use {
-            continue;
-        }
-        if catch_up(t, now) {
-            fired = true;
-            for i in 0..t.nwaiters {
-                wake[n] = t.waiters[i];
-                n += 1;
+    unsafe {
+        let mut at = 0;
+        while let Some(i) = timers().next_used(at) {
+            at = i + 1;
+            let Some(t) = timers().get(i) else { continue };
+            if catch_up(t, now) {
+                fired = true;
+                waitlist::wake_all(&mut t.waiters);
             }
-            t.nwaiters = 0;
+            if t.deadline != 0 {
+                next = next.min(t.deadline);
+            }
         }
-        if t.deadline != 0 {
-            next = next.min(t.deadline);
-        }
-    }
-    for &tid in &wake[..n] {
-        scheduler::unblock_task(tid);
     }
     if fired {
         crate::pollset::note_timer();

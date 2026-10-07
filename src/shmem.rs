@@ -14,16 +14,6 @@ use crate::{paging, pmm, scheduler};
 use crate::grow::Grow;
 use crate::task::MAX_TASKS;
 
-/// Regions in the system.
-///
-/// Thirty-two was half a region per task. Linux's System V limit is 4096 and
-/// its POSIX shared memory has no count at all; macOS's 32 is a legacy knob
-/// nothing modern uses. This is a fixed array like everything else in this
-/// kernel, so the number is what it costs. With the run list below a region is
-/// about 304 bytes, so 256 of them is roughly seventy-six kilobytes — most of
-/// it the runs, which is the price of not needing one contiguous span.
-const MAX_SHMEM: usize = 256;
-
 /// Pages one region may hold.
 ///
 /// Sixteen once, which was fine for passing a buffer between two services and
@@ -113,7 +103,6 @@ impl Tasks {
 }
 
 struct ShmemRegion {
-    in_use: bool,
     /// The contiguous runs this region is assembled from, in order.
     runs: [Run; MAX_RUNS],
     run_count: usize,
@@ -146,7 +135,6 @@ struct ShmemRegion {
 impl ShmemRegion {
     const fn empty() -> Self {
         ShmemRegion {
-            in_use: false,
             runs: [Run { base: 0, pages: 0 }; MAX_RUNS],
             run_count: 0,
             page_count: 0,
@@ -160,10 +148,11 @@ impl ShmemRegion {
     }
 }
 
-static mut REGIONS: [ShmemRegion; MAX_SHMEM] = {
-    const INIT: ShmemRegion = ShmemRegion::empty();
-    [INIT; MAX_SHMEM]
-};
+/// Every region, by its handle: made when one is created, given back when
+/// its frames are (`table.rs`). Linux's System V limit is 4096 and its
+/// POSIX shared memory has no count at all; this has the machine's memory.
+/// There were 256, a fixed array of them spent whether used or not.
+static mut REGIONS: crate::table::Table<ShmemRegion> = crate::table::Table::new(crate::table::MOST);
 
 /// Save RFLAGS and disable interrupts. Returns saved flags.
 #[inline(always)]
@@ -185,9 +174,17 @@ fn irq_restore(flags: u64) {
 
 /// Borrow the region table. Callers must already hold interrupts off.
 #[inline(always)]
-unsafe fn regions() -> &'static mut [ShmemRegion; MAX_SHMEM] { unsafe {
+unsafe fn regions() -> &'static mut crate::table::Table<ShmemRegion> { unsafe {
     &mut *core::ptr::addr_of_mut!(REGIONS)
 }}
+
+/// Region `handle`, if there is one.
+///
+/// # Safety
+/// Interrupts off.
+unsafe fn region(handle: usize) -> Option<&'static mut ShmemRegion> {
+    unsafe { regions().get(handle) }
+}
 
 impl ShmemRegion {
     /// Physical address of the region's `index`-th page.
@@ -206,13 +203,16 @@ impl ShmemRegion {
     }
 }
 
-/// Release a region's frames and reset the slot. Interrupts must be off.
-unsafe fn release(region: &mut ShmemRegion) {
-    let creator = region.creator;
-    let freed = unsafe { release_frames(region) };
-    // Refund the creator's quota.
-    scheduler::uncharge_task_mem(creator, freed);
-    *region = ShmemRegion::empty();
+/// Release a region's frames, and the region. Interrupts must be off.
+unsafe fn release(handle: usize) {
+    unsafe {
+        let Some(region) = region(handle) else { return };
+        let creator = region.creator;
+        let freed = release_frames(region);
+        // Refund the creator's quota.
+        scheduler::uncharge_task_mem(creator, freed);
+        regions().empty(handle);
+    }
 }
 
 /// Return a region's frames to the allocator and empty its run list, leaving
@@ -262,29 +262,30 @@ fn create_inner(pages: usize, by_fd: bool) -> u64 {
         return u64::MAX;
     }
 
+    if !crate::reclaim::may_make() {
+        return u64::MAX;
+    }
+
     // Claim the slot before allocating. pmm::alloc takes a lock that re-enables
     // interrupts on release, so a preempting task used to be able to pick the
     // same "free" handle and scribble over this region.
     let flags = irq_save();
-    let handle = unsafe {
-        match regions().iter().position(|r| !r.in_use) {
-            Some(h) => h,
-            None => {
-                irq_restore(flags);
-                return u64::MAX;
-            }
-        }
+    let handle = unsafe { regions().lowest_free(0).filter(|&h| regions().fill_at(h, ShmemRegion::empty()).is_ok()) };
+    let Some(handle) = handle else {
+        irq_restore(flags);
+        return u64::MAX;
     };
     unsafe {
-        let region = &mut regions()[handle];
-        *region = ShmemRegion::empty();
-        region.in_use = true;
+        let Some(region) = region(handle) else {
+            irq_restore(flags);
+            return u64::MAX;
+        };
         region.creator = tid;
         region.by_fd = by_fd;
         if by_fd {
             region.fd_refs = 1;
         } else if !region.access.add(tid) {
-            *region = ShmemRegion::empty();
+            regions().empty(handle);
             irq_restore(flags);
             return u64::MAX;
         }
@@ -329,10 +330,11 @@ fn fill(handle: usize, pages: usize) -> bool {
         // it the partial one rather than leaking it.
         let flags = irq_save();
         unsafe {
-            let region = &mut regions()[handle];
-            region.runs = runs;
-            region.run_count = run_count;
-            release(region);
+            if let Some(region) = region(handle) {
+                region.runs = runs;
+                region.run_count = run_count;
+            }
+            release(handle);
         }
         irq_restore(flags);
         return false;
@@ -343,10 +345,11 @@ fn fill(handle: usize, pages: usize) -> bool {
     }
     let flags = irq_save();
     unsafe {
-        let region = &mut regions()[handle];
-        region.runs = runs;
-        region.run_count = run_count;
-        region.page_count = pages;
+        if let Some(region) = region(handle) {
+            region.runs = runs;
+            region.run_count = run_count;
+            region.page_count = pages;
+        }
     }
     irq_restore(flags);
     true
@@ -361,7 +364,7 @@ fn fill(handle: usize, pages: usize) -> bool {
 /// has been anywhere — and outside that window growing a region would change
 /// what is behind somebody else's live mapping.
 pub fn resize(handle: usize, pages: usize) -> u64 {
-    if handle >= MAX_SHMEM || pages == 0 || pages > MAX_PAGES_PER_REGION {
+    if pages == 0 || pages > MAX_PAGES_PER_REGION {
         return u64::MAX;
     }
     let tid = scheduler::current_tid();
@@ -371,12 +374,14 @@ pub fn resize(handle: usize, pages: usize) -> u64 {
 
     let flags = irq_save();
     let old_pages = unsafe {
-        let region = &mut regions()[handle];
+        let Some(region) = region(handle) else {
+            irq_restore(flags);
+            return u64::MAX;
+        };
         // One descriptor names it — the caller's, which the system call
         // checked — and nothing has it mapped. A second descriptor is one that
         // has been somewhere, or is on its way.
-        if !region.in_use
-            || region.pending_destroy
+        if region.pending_destroy
             || !region.mapped.is_empty()
             || !region.by_fd
             || region.fd_refs != 1
@@ -408,7 +413,11 @@ pub fn resize(handle: usize, pages: usize) -> u64 {
         // Put it back the way it was found, so a refused resize does not also
         // destroy the memory the caller already had.
         let flags = irq_save();
-        unsafe { regions()[handle].page_count = 0 };
+        unsafe {
+            if let Some(region) = region(handle) {
+                region.page_count = 0;
+            }
+        }
         irq_restore(flags);
         let _ = fill(handle, old_pages);
         return u64::MAX;
@@ -434,10 +443,6 @@ pub fn map_held(handle: usize, vaddr: usize) -> u64 {
 }
 
 fn map_inner(handle: usize, vaddr: usize, held: bool) -> u64 {
-    if handle >= MAX_SHMEM {
-        return u64::MAX;
-    }
-
     let tid = scheduler::current_tid();
     if tid >= MAX_TASKS {
         return u64::MAX;
@@ -446,11 +451,10 @@ fn map_inner(handle: usize, vaddr: usize, held: bool) -> u64 {
 
     let flags = irq_save();
     let result = unsafe {
-        let region = &mut regions()[handle];
-        if !region.in_use || region.pending_destroy {
+        let Some(region) = region(handle).filter(|r| !r.pending_destroy) else {
             irq_restore(flags);
             return u64::MAX;
-        }
+        };
 
         // Check access, and that there is room to say it is mapped.
         if !held && !region.access.contains(tid) {
@@ -512,17 +516,14 @@ fn unreachable(r: &ShmemRegion) -> bool {
 
 /// One more descriptor names this region.
 pub fn fd_retain(handle: usize) -> bool {
-    if handle >= MAX_SHMEM {
-        return false;
-    }
     let flags = irq_save();
     let ok = unsafe {
-        let r = &mut regions()[handle];
-        if r.in_use && !r.pending_destroy {
-            r.fd_refs += 1;
-            true
-        } else {
-            false
+        match region(handle) {
+            Some(r) if !r.pending_destroy => {
+                r.fd_refs += 1;
+                true
+            }
+            _ => false,
         }
     };
     irq_restore(flags);
@@ -533,17 +534,13 @@ pub fn fd_retain(handle: usize) -> bool {
 /// closing a descriptor governs the right to map, not mappings that already
 /// exist, so the frames then go when the last mapper unmaps.
 pub fn fd_release(handle: usize) {
-    if handle >= MAX_SHMEM {
-        return;
-    }
     let flags = irq_save();
     unsafe {
-        let r = &mut regions()[handle];
-        if r.in_use && r.fd_refs > 0 {
+        if let Some(r) = region(handle).filter(|r| r.fd_refs > 0) {
             r.fd_refs -= 1;
             if unreachable(r) {
                 if r.mapped.is_empty() {
-                    release(r);
+                    release(handle);
                 } else {
                     r.pending_destroy = true;
                 }
@@ -556,7 +553,7 @@ pub fn fd_release(handle: usize) {
 /// Grant access to a shared memory region to another task.
 /// Must be the creator or have CAP_TASK_MGMT.
 pub fn grant(handle: usize, target_tid: usize) -> u64 {
-    if handle >= MAX_SHMEM || target_tid >= MAX_TASKS {
+    if target_tid >= MAX_TASKS {
         return u64::MAX;
     }
 
@@ -565,8 +562,11 @@ pub fn grant(handle: usize, target_tid: usize) -> u64 {
 
     let flags = irq_save();
     let result = unsafe {
-        let region = &mut regions()[handle];
-        if !region.in_use || region.pending_destroy || region.by_fd {
+        let Some(region) = region(handle) else {
+            irq_restore(flags);
+            return u64::MAX;
+        };
+        if region.pending_destroy || region.by_fd {
             // A descriptor's region is reached by holding a descriptor, and
             // handed on by handing one on.
             u64::MAX
@@ -588,10 +588,6 @@ pub fn grant(handle: usize, target_tid: usize) -> u64 {
 /// Frees the physical pages only if this was the last mapping and the region
 /// was already marked for destruction.
 pub fn unmap(handle: usize, vaddr: usize) -> u64 {
-    if handle >= MAX_SHMEM {
-        return u64::MAX;
-    }
-
     let tid = scheduler::current_tid();
     if tid >= MAX_TASKS {
         return u64::MAX;
@@ -600,11 +596,10 @@ pub fn unmap(handle: usize, vaddr: usize) -> u64 {
 
     let flags = irq_save();
     let result = unsafe {
-        let region = &mut regions()[handle];
-        if !region.in_use {
+        let Some(region) = region(handle) else {
             irq_restore(flags);
             return u64::MAX;
-        }
+        };
         // Whoever may map it may unmap it, and so may whoever has it mapped:
         // the right to map can have gone since.
         if !region.access.contains(tid) && !region.mapped.contains(tid) {
@@ -624,7 +619,7 @@ pub fn unmap(handle: usize, vaddr: usize) -> u64 {
         region.mapped.remove(tid);
 
         if region.pending_destroy && region.mapped.is_empty() {
-            release(region);
+            release(handle);
         }
         0
     };
@@ -638,10 +633,6 @@ pub fn unmap(handle: usize, vaddr: usize) -> u64 {
 /// the region mapped, the frames are not released yet — the region is marked
 /// `pending_destroy` and the last task to unmap reclaims it.
 pub fn destroy(handle: usize) -> u64 {
-    if handle >= MAX_SHMEM {
-        return u64::MAX;
-    }
-
     let tid = scheduler::current_tid();
     if tid >= MAX_TASKS {
         return u64::MAX;
@@ -650,22 +641,20 @@ pub fn destroy(handle: usize) -> u64 {
 
     let flags = irq_save();
     let result = unsafe {
-        let region = &mut regions()[handle];
-        if !region.in_use {
-            u64::MAX
-        } else if region.creator != tid && !has_mgmt {
-            u64::MAX
-        } else if region.by_fd {
+        match region(handle) {
+            None => u64::MAX,
+            Some(region) if region.creator != tid && !has_mgmt => u64::MAX,
             // A descriptor's region ends when its descriptors do.
-            u64::MAX
-        } else {
-            // No further mappings may be created.
-            region.pending_destroy = true;
-            region.access.clear();
-            if region.mapped.is_empty() {
-                release(region);
+            Some(region) if region.by_fd => u64::MAX,
+            Some(region) => {
+                // No further mappings may be created.
+                region.pending_destroy = true;
+                region.access.clear();
+                if region.mapped.is_empty() {
+                    release(handle);
+                }
+                0
             }
-            0
         }
     };
     irq_restore(flags);
@@ -689,10 +678,10 @@ pub fn cleanup_task(tid: usize, survivor: Option<usize>) {
     }
     let flags = irq_save();
     unsafe {
-        for region in regions().iter_mut() {
-            if !region.in_use {
-                continue;
-            }
+        let mut at = 0;
+        while let Some(handle) = regions().next_used(at) {
+            at = handle + 1;
+            let Some(region) = region(handle) else { continue };
             match survivor {
                 Some(s) => region.mapped.replace(tid, s),
                 None => region.mapped.remove(tid),
@@ -714,7 +703,7 @@ pub fn cleanup_task(tid: usize, survivor: Option<usize>) {
                 region.pending_destroy = true;
             }
             if region.pending_destroy && region.mapped.is_empty() {
-                release(region);
+                release(handle);
             }
         }
     }
