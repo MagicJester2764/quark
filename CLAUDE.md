@@ -805,8 +805,10 @@ holds no `TaskMgmt`, and when this rule left the band out every driver it
 started ran as an ordinary program, whose memory is taken when memory is
 short — a disk's driver written out to the disk it drives, and the machine
 waiting on it for good. `TaskMgmt` buys the unbounded form; without it a
-program may have sixteen children at once, which is also how many threads it
-may have.
+program may have 4,096 tasks of the machine's 32,768 — its own, and the
+children it has made and not collected, a fork counted as any other
+(`syscall::A_PROGRAMS_TASKS`). It was sixteen children for each task that
+made them, with a fork not counted at all.
 
 Or a program **forks** and **execs**, which is what a C program does and what
 every Unix program assumes:
@@ -895,7 +897,7 @@ every Unix program assumes:
   kernel takes it apart itself (`UNWAITED`) — at the next door
   (`arrived`), not when a processor next has nothing to do, and the same
   for a dead task whose creator has gone. Left as its creator's child, an
-  ended thread kept its place among sixty-four until its program ended, a
+  ended thread kept its slot in the task table until its program ended, a
   `waitpid(-1)` could be answered with one, and a program whose only
   "children" were its threads was told to go on waiting. The creator gives
   the word, before the thread is started: one that gave its own was a
@@ -1073,7 +1075,7 @@ stopped is one the scheduler does not run.
   of ending a program, and a hangup can end the caller's own — but from the
   next tick (`job::hang_up`), which is already where an alarm may end
   whatever was running. A stopped program nobody can start is a task slot
-  gone for good, and there are sixty-four.
+  gone for good, and its program's allowance with it.
 - **A terminal knows its session and who is in front** (`pty.rs`). Its
   signals go there. A read by any other group of the session stops the
   reader (SIGTTIN) and is asked again when it is continued — and looked at

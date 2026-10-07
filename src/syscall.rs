@@ -477,6 +477,9 @@ pub const SYS_PACKET_PAIR: u64 = 234;
 /// A program's descriptor limits: read them, set what it may have, lower how
 /// far it may raise that (`RLIMIT_NOFILE`).
 pub const SYS_FD_LIMIT: u64 = 235;
+/// The first task at or past a number: how every task is found, one call a
+/// task, now that there are 32,768 numbers to find them among.
+pub const SYS_TASK_NEXT: u64 = 236;
 /// `SYS_FD_SERVE`'s flag: the server will say when the object is ready.
 const SERVE_SAYS_READY: u64 = 1;
 /// SYS_FD_SERVE_PIPE: the writing end, and only if the other end is held.
@@ -496,13 +499,18 @@ pub const SYS_ABI_VERSION: u64 = 240;
 /// minor when calls are added. User space can refuse to run against a major it
 /// does not know, which is the point of exposing it at all.
 pub const ABI_VERSION_MAJOR: u64 = 4;
-pub const ABI_VERSION_MINOR: u64 = 0;
+pub const ABI_VERSION_MINOR: u64 = 1;
 
-/// Threads a task may make with no capability at all.
+/// How many tasks a program may have with no capability at all: its own, and
+/// the children it has made and not collected, by `SYS_TASK_CREATE`,
+/// `SYS_TASK_CREATE_IN` and `SYS_FORK` alike. A browser's or a compiler's
+/// threads, and an eighth of the machine's tasks: one program is refused
+/// long before the machine is full. `TaskMgmt` lifts it, which is what a
+/// spawner holds.
 ///
-/// Enough for any program that has one, and far short of exhausting a table of
-/// sixty-four. `TaskMgmt` lifts it, which is what a spawner holds.
-const THREADS_WITHOUT_CAP: usize = 16;
+/// It was sixteen, counted for each task that made them and not for its
+/// program, with a fork not counted at all.
+pub const A_PROGRAMS_TASKS: usize = 4_096;
 
 /// May `caller` set `tid` up?
 ///
@@ -1826,9 +1834,7 @@ fn dispatch(
             // spawner needs. What decides whether the new task may actually
             // *run* is SYS_TASK_START, which checks the address space.
             let caller = scheduler::current_tid();
-            if !crate::cap::task_has_task_mgmt(caller, 0)
-                && scheduler::children_of(caller) >= THREADS_WITHOUT_CAP
-            {
+            if !crate::cap::task_has_task_mgmt(caller, 0) && scheduler::program_tasks(caller) >= A_PROGRAMS_TASKS {
                 return u64::MAX;
             }
             match scheduler::create_empty_task() {
@@ -1842,7 +1848,12 @@ fn dispatch(
             // may always make a copy of itself, because everything the copy
             // gets is already the caller's — its pages are copied out of the
             // caller's own and charged to the child, and the descriptors and
-            // capabilities are the ones the caller holds.
+            // capabilities are the ones the caller holds. Counted as any task
+            // a program makes is.
+            let caller = scheduler::current_tid();
+            if !crate::cap::task_has_task_mgmt(caller, 0) && scheduler::program_tasks(caller) >= A_PROGRAMS_TASKS {
+                return u64::MAX;
+            }
             match scheduler::fork_current() {
                 Some(tid) => tid as u64,
                 None => u64::MAX,
@@ -1875,9 +1886,7 @@ fn dispatch(
             // built holds nothing until the caller puts something in it. The
             // capability buys the unbounded form, which is what a spawner
             // that runs many programs needs.
-            if !crate::cap::task_has_task_mgmt(caller, 0)
-                && scheduler::children_of(caller) >= THREADS_WITHOUT_CAP
-            {
+            if !crate::cap::task_has_task_mgmt(caller, 0) && scheduler::program_tasks(caller) >= A_PROGRAMS_TASKS {
                 return u64::MAX;
             }
             match scheduler::create_task_in(cr3) {
@@ -4704,6 +4713,12 @@ fn dispatch(
                 Ok(()) => 0,
                 Err(()) => u64::MAX,
             }
+        }
+        SYS_TASK_NEXT => {
+            // arg0 = a task id. The first task at or past it that has not been
+            // taken apart, living or dead, or u64::MAX if none is: what
+            // SYS_TASK_INFO says about each number, one call a task.
+            scheduler::next_task(arg0 as usize).map_or(u64::MAX, |t| t as u64)
         }
         SYS_TASK_INFO => {
             // arg0 = tid. Returns packed info or u64::MAX if no task.

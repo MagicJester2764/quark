@@ -35,7 +35,7 @@ pub const USER_ADDR_LIMIT: u64 = paging::USER_ADDR_LIMIT;
 ///
 /// A record is made when a space is created and given back when it is
 /// destroyed (`table.rs`).
-pub const MAX_ADDRESS_SPACES: usize = crate::task::MAX_TASKS * 2;
+pub const MAX_ADDRESS_SPACES: usize = crate::table::MOST;
 static mut ADDRESS_SPACES: crate::table::Table<Space> = crate::table::Table::new(MAX_ADDRESS_SPACES);
 
 struct Space {

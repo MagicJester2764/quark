@@ -1,6 +1,6 @@
 # Quark syscall ABI
 
-**Version 4.0.** Query the running kernel with `SYS_ABI_VERSION` (240), which
+**Version 4.1.** Query the running kernel with `SYS_ABI_VERSION` (240), which
 returns `(major << 16) | minor`.
 
 This document is the contract between the Quark kernel and everything above it.
@@ -270,6 +270,12 @@ Added with it:
 
 Also: `SYS_FD_SEND` carries no working directory: its descriptors are 32-bit
 numbers, and only 64 could name it before, through a range check.
+
+### What each minor of 4 added
+
+| Minor | What |
+|---|---|
+| 4.1 | **As many tasks as a desktop runs.** The kernel has up to 32,768 tasks, where it had sixty-four, so a program can no longer find every task by asking about each number below 64: `SYS_TASK_NEXT` (236) answers the first task at or past a number, and a walk of every task is one call a task. A program has 4,096 tasks without `TaskMgmt` — its own that have not died, and the children it has made in other programs and not collected — where a task could have sixteen children and a fork was not counted at all; `SYS_TASK_CREATE`, `SYS_TASK_CREATE_IN` and `SYS_FORK` answer `u64::MAX` past it. |
 
 ### Deprecated
 
@@ -1024,7 +1030,7 @@ cannot resurrect a revoked capability in practice.
 
 | # | Name | Arguments | Returns | Cap |
 |---|---|---|---|---|
-| 96 | `SYS_TASK_CREATE` | — | TID / `u64::MAX` | — for up to sixteen children at once; `TaskMgmt` for more |
+| 96 | `SYS_TASK_CREATE` | — | TID / `u64::MAX` | — while the caller's program has fewer than 4,096 tasks; `TaskMgmt` for more |
 | 97 | `SYS_TASK_START` | arg0 = tid, arg1 = rip, arg2 = rsp, arg3 = cr3 | 0 / `u64::MAX` | `TaskMgmt`; or none, for a child of the caller's started in the caller's own address space (a thread) or in one the caller made (a spawn) |
 | 103 | `SYS_TASK_START_ARG` | as `SYS_TASK_START`, and arg4 = the value the task finds in RDI | 0 / `u64::MAX` | as `SYS_TASK_START` |
 | 98 | `SYS_GET_UID` | — | `uid << 32 \| gid` of the caller | — |
@@ -1037,7 +1043,7 @@ cannot resurrect a revoked capability in practice.
 | 107 | `SYS_TASK_SPACE` | arg0 = tid | that task's space id / `u64::MAX` | — |
 | 108 | `SYS_SPACE_WATCH` | arg0 = space id | 0, or `u64::MAX` if no task of it is alive | — |
 | 109 | `SYS_TASK_CREATE_IN` | arg0 = cr3 of an address space the caller created | TID / `u64::MAX` | as `SYS_TASK_CREATE` |
-| 110 | `SYS_FORK` | — | the child's TID, `0` in the child / `u64::MAX` | — |
+| 110 | `SYS_FORK` | — | the child's TID, `0` in the child / `u64::MAX` | as `SYS_TASK_CREATE` |
 | 111 | `SYS_EXEC_SPACE` | arg0 = cr3 the caller made, arg1 = entry, arg2 = rsp | does not return / `u64::MAX` | — |
 | 105 | `SYS_TASK_PRIORITY` | arg0 = tid, arg1 = band, or `u64::MAX` to ask | 0, or the band asked about / `u64::MAX` | to set: `TaskMgmt` for the target, or the target a child the caller made and has not started; and the caller's own band or worse — the band it is in, not one lent it while a better task waits on it. To ask: none |
 
@@ -1045,8 +1051,9 @@ A program starts one of two ways. A parent may *build* one: it creates a task,
 makes its address space, loads its image, sets its arguments, descriptors and
 capabilities, and starts it. A task the caller created and has not started is
 its own to fill — nobody else can name it, it holds nothing and it cannot run —
-so none of that asks for `TaskMgmt`; the capability buys more than sixteen
-children at once, and the right to touch a task that is already running. Or a
+so none of that asks for `TaskMgmt`; the capability buys more than 4,096
+tasks a program — its own, and the children it has made and not collected —
+and the right to touch a task that is already running. Or a
 task may `SYS_FORK`, which copies it, and `SYS_EXEC_SPACE`, which keeps the
 task and replaces the program it runs. The copy is of the caller's memory as
 it is at the call, and is made when it is needed: the two share a page until
@@ -1942,6 +1949,7 @@ set together or not at all.
 | 233 | `SYS_FD_READY` | arg0 = a cookie of the caller's, made with flag 1; arg1 = what it is ready for: 1 readable, 2 writable, 4 hung up | 0 / `u64::MAX` | — |
 | 234 | `SYS_PACKET_PAIR` | — | `(fd0 << 32) \| fd1`, both in the caller's table / `u64::MAX` | — |
 | 235 | `SYS_FD_LIMIT` | arg0 = 0 to read, 1 to set what the program may have to arg1, 2 to lower how far it may raise that to arg1 | read: `(how far << 32) \| what it may have`; set: 0 / `u64::MAX` | — (the caller's own program) |
+| 236 | `SYS_TASK_NEXT` | arg0 = a task id | the first task at or past it that has not been taken apart, living or dead / `u64::MAX` if there is none | — |
 
 `SYS_FD_KIND` answers 1 for an IPC endpoint, 2 and 3 for the reading and
 writing ends of a pipe, 4 for a stream, 5 and 6 for a terminal's master and

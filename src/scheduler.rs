@@ -229,6 +229,14 @@ pub(crate) fn tids() -> impl Iterator<Item = usize> {
     tids_from(0)
 }
 
+/// The first task at or past `from`: `SYS_TASK_NEXT`.
+pub fn next_task(from: usize) -> Option<usize> {
+    let flags = irq_save();
+    let next = unsafe { table().next_used(from) };
+    irq_restore(flags);
+    next
+}
+
 /// Every task there is, from task `start` up and then round from 0 to
 /// before it: for a walk that takes turns. As [`tids`], each step looks
 /// afresh.
@@ -2412,23 +2420,29 @@ pub fn parent_of(tid: usize) -> Option<usize> {
     }
 }
 
-/// How many live tasks `tid` has created.
+/// How many tasks `tid`'s program has, as its allowance counts them
+/// (`syscall::A_PROGRAMS_TASKS`): its own that have not died, and every task
+/// one of them made in another program that has not been collected.
 ///
-/// The bound on making threads without any authority: a task may make itself
-/// more stacks, and cannot make so many that it exhausts the table for
-/// everybody else.
-pub fn children_of(tid: usize) -> usize {
-    unsafe {
-        let mut n = 0;
-        for i in tids().filter(|&i| i >= 1) {
-            if let Some(ref t) = *slot(i) {
-                if t.parent_tid == tid && t.state != TaskState::Dead {
-                    n += 1;
-                }
-            }
-        }
-        n
-    }
+/// The bound on making tasks without any authority: a program may make
+/// itself threads and children, and cannot make so many that it exhausts the
+/// table for everybody else.
+pub fn program_tasks(tid: usize) -> usize {
+    let flags = irq_save();
+    let n = unsafe {
+        let space = (*slot(tid)).as_ref().map_or(0, |t| t.space);
+        let of_program = |t: usize| space != 0 && matches!(*slot(t), Some(ref x) if x.space == space);
+        tids()
+            .filter(|&t| t >= 1)
+            .filter(|&t| match *slot(t) {
+                Some(ref x) if x.space == space && space != 0 => x.state != TaskState::Dead,
+                Some(ref x) => x.parent_tid != 0 && of_program(x.parent_tid),
+                None => false,
+            })
+            .count()
+    };
+    irq_restore(flags);
+    n
 }
 
 pub fn create_empty_task() -> Option<usize> {

@@ -6,7 +6,10 @@
 use crate::context::CpuContext;
 use alloc::alloc::{alloc, dealloc, Layout};
 
-pub const MAX_TASKS: usize = 64;
+/// How many tasks there can be: as many as a table has slots (`table.rs`).
+/// A task's record is made when it is, so this is a ceiling and not a cost.
+/// It was sixty-four, a desktop's limit and a fixed array's.
+pub const MAX_TASKS: usize = crate::table::MOST;
 pub const KERNEL_STACK_SIZE: usize = 65536; // 64 KiB per task
 const STACK_ALIGN: usize = 16;
 /// The most descriptors a program can have: the highest its limit goes.
