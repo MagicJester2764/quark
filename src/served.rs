@@ -92,8 +92,40 @@ struct Object {
 const NONE: Object = Object { state: State::Free, server: 0, endpoint: 0, cookie: 0, refs: 0, ready: None };
 
 static mut OBJECTS: [Object; MAX_SERVED] = [NONE; MAX_SERVED];
-/// Per server: something is waiting to be collected, and it has not been told.
-static mut NOTICE: [bool; MAX_TASKS] = [false; MAX_TASKS];
+/// What this module keeps about a task, in its record (`TaskRec::served`):
+/// each field was an array of `MAX_TASKS`, and an id with no task reads as
+/// `PerTask::new()` — what an empty slot of those arrays held.
+pub struct PerTask {
+    /// Per server: something is waiting to be collected, and it has not been told.
+    notice: bool,
+}
+
+impl PerTask {
+    pub const fn new() -> Self {
+        PerTask {
+            notice: false,
+        }
+    }
+}
+
+/// What this module keeps about task `tid`: its record's, or for an id with
+/// no task a copy put back to `PerTask::new()` each time it is asked for, so
+/// a write for a task that is not there goes nowhere. Interrupts must be off.
+unsafe fn st(tid: usize) -> &'static mut PerTask {
+    unsafe {
+        match crate::scheduler::rec(tid) {
+            Some(r) => &mut r.served,
+            None => {
+                let none = &mut *core::ptr::addr_of_mut!(NO_TASK);
+                *none = PerTask::new();
+                none
+            }
+        }
+    }
+}
+
+static mut NO_TASK: PerTask = PerTask::new();
+
 
 #[inline(always)]
 fn irq_save() -> u64 {
@@ -195,7 +227,7 @@ pub fn release(obj: usize) {
                 if server_alive(o) {
                     o.state = State::Released;
                     let server = o.server;
-                    (*core::ptr::addr_of_mut!(NOTICE))[server] = true;
+                    st(server).notice = true;
                     wake = Some(server);
                 } else {
                     // Nobody to collect it.
@@ -220,7 +252,7 @@ pub unsafe fn take_notice(server: usize) -> bool {
         if server >= MAX_TASKS {
             return false;
         }
-        let n = &mut (*core::ptr::addr_of_mut!(NOTICE))[server];
+        let n = &mut st(server).notice;
         core::mem::replace(n, false)
     }
 }
@@ -323,7 +355,7 @@ pub fn server_gone(server: usize) {
     let flags = irq_save();
     unsafe {
         if server < MAX_TASKS {
-            (*core::ptr::addr_of_mut!(NOTICE))[server] = false;
+            st(server).notice = false;
         }
         if endpoint != 0 {
             for o in objects().iter_mut() {

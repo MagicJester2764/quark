@@ -20,7 +20,7 @@
 //! A program's use is its tasks': what those that have ended used, kept with
 //! the program (`fdtable`), and what those still here have. A program that
 //! ends leaves its use, and that of the children it collected, for whoever
-//! collects it (`ENDED`), and that is what a parent is told its children
+//! collects it (`PerTask::ended`), and that is what a parent is told its children
 //! used. Only time already divided is ever added up.
 
 use crate::percpu::MAX_CPUS;
@@ -77,14 +77,49 @@ impl Raw {
     const ZERO: Raw = Raw { run_ns: 0, sys_ns: 0, voluntary: 0, involuntary: 0 };
 }
 
-static mut TASK: [Raw; MAX_TASKS] = [Raw::ZERO; MAX_TASKS];
-/// Whether each task is in the kernel, and since when on this turn. A task
-/// is made in the kernel, and first leaves for its program.
-static mut IN_KERNEL: [bool; MAX_TASKS] = [true; MAX_TASKS];
-static mut KERNEL_SINCE: [u64; MAX_TASKS] = [0; MAX_TASKS];
-/// What a program's last task leaves for whoever collects it: what the
-/// program used, and what the children it collected did.
-static mut ENDED: [Usage; MAX_TASKS] = [Usage::ZERO; MAX_TASKS];
+/// What this module keeps about a task, in its record (`TaskRec::usage`):
+/// each field was an array of `MAX_TASKS`, and an id with no task reads as
+/// `PerTask::new()` — what an empty slot of those arrays held.
+pub struct PerTask {
+    raw: Raw,
+    /// Whether each task is in the kernel, and since when on this turn. A task
+    /// is made in the kernel, and first leaves for its program.
+    in_kernel: bool,
+    kernel_since: u64,
+    /// What a program's last task leaves for whoever collects it: what the
+    /// program used, and what the children it collected did.
+    ended: Usage,
+}
+
+impl PerTask {
+    pub const fn new() -> Self {
+        PerTask {
+            raw: Raw::ZERO,
+            in_kernel: true,
+            kernel_since: 0,
+            ended: Usage::ZERO,
+        }
+    }
+}
+
+/// What this module keeps about task `tid`: its record's, or for an id with
+/// no task a copy put back to `PerTask::new()` each time it is asked for, so
+/// a write for a task that is not there goes nowhere. Interrupts must be off.
+unsafe fn st(tid: usize) -> &'static mut PerTask {
+    unsafe {
+        match crate::scheduler::rec(tid) {
+            Some(r) => &mut r.usage,
+            None => {
+                let none = &mut *core::ptr::addr_of_mut!(NO_TASK);
+                *none = PerTask::new();
+                none
+            }
+        }
+    }
+}
+
+static mut NO_TASK: PerTask = PerTask::new();
+
 /// When each processor began running what it is running.
 static mut SINCE: [u64; MAX_CPUS] = [0; MAX_CPUS];
 
@@ -93,9 +128,9 @@ pub fn task_made(tid: usize) {
     if tid < MAX_TASKS {
         let flags = irq_save();
         unsafe {
-            TASK[tid] = Raw::ZERO;
-            ENDED[tid] = Usage::ZERO;
-            IN_KERNEL[tid] = true;
+            st(tid).raw = Raw::ZERO;
+            st(tid).ended = Usage::ZERO;
+            st(tid).in_kernel = true;
         }
         irq_restore(flags);
     }
@@ -116,10 +151,10 @@ pub unsafe fn charge(tid: usize) -> u64 {
         if tid == 0 || tid >= MAX_TASKS {
             return 0;
         }
-        TASK[tid].run_ns += ran;
-        if IN_KERNEL[tid] {
-            TASK[tid].sys_ns += now.saturating_sub(KERNEL_SINCE[tid]);
-            KERNEL_SINCE[tid] = now;
+        st(tid).raw.run_ns += ran;
+        if st(tid).in_kernel {
+            st(tid).raw.sys_ns += now.saturating_sub(st(tid).kernel_since);
+            st(tid).kernel_since = now;
         }
         ran
     }
@@ -132,8 +167,8 @@ pub unsafe fn charge(tid: usize) -> u64 {
 /// Interrupts off, after [`charge`] for whatever this processor ran.
 pub unsafe fn resumed(tid: usize) {
     unsafe {
-        if tid != 0 && tid < MAX_TASKS && IN_KERNEL[tid] {
-            KERNEL_SINCE[tid] = SINCE[crate::percpu::index()];
+        if tid != 0 && tid < MAX_TASKS && st(tid).in_kernel {
+            st(tid).kernel_since = SINCE[crate::percpu::index()];
         }
     }
 }
@@ -151,8 +186,8 @@ pub unsafe fn entered(tid: usize) {
         return;
     }
     unsafe {
-        IN_KERNEL[tid] = true;
-        KERNEL_SINCE[tid] = crate::clock::now_here();
+        st(tid).in_kernel = true;
+        st(tid).kernel_since = crate::clock::now_here();
     }
 }
 
@@ -166,9 +201,9 @@ pub unsafe fn leaving(tid: usize) {
         return;
     }
     unsafe {
-        if IN_KERNEL[tid] {
-            TASK[tid].sys_ns += crate::clock::now_here().saturating_sub(KERNEL_SINCE[tid]);
-            IN_KERNEL[tid] = false;
+        if st(tid).in_kernel {
+            st(tid).raw.sys_ns += crate::clock::now_here().saturating_sub(st(tid).kernel_since);
+            st(tid).in_kernel = false;
         }
     }
 }
@@ -182,9 +217,9 @@ pub unsafe fn switched(from: usize, gave_up: bool) {
     unsafe {
         if from != 0 && from < MAX_TASKS {
             if gave_up {
-                TASK[from].voluntary += 1;
+                st(from).raw.voluntary += 1;
             } else {
-                TASK[from].involuntary += 1;
+                st(from).raw.involuntary += 1;
             }
         }
     }
@@ -197,13 +232,13 @@ pub fn of_task(tid: usize) -> Usage {
     }
     let flags = irq_save();
     let used = unsafe {
-        let raw = TASK[tid];
+        let raw = st(tid).raw;
         let (mut run, mut sys) = (raw.run_ns, raw.sys_ns);
         if let Some(cpu) = crate::scheduler::running_on(tid) {
             let now = crate::clock::now();
             run += now.saturating_sub(SINCE[cpu]);
-            if IN_KERNEL[tid] {
-                sys += now.saturating_sub(KERNEL_SINCE[tid]);
+            if st(tid).in_kernel {
+                sys += now.saturating_sub(st(tid).kernel_since);
             }
         }
         // The kernel's part is part of what it ran, counted from the same
@@ -256,7 +291,7 @@ pub fn task_ended(tid: usize) {
     let n = crate::scheduler::tasks_of_process(tid, &mut tasks);
     let flags = irq_save();
     for &t in &tasks[..n] {
-        unsafe { ENDED[t] = all };
+        unsafe { st(t).ended = all };
     }
     irq_restore(flags);
 }
@@ -268,7 +303,7 @@ pub fn collected(parent: usize, child: usize) {
         return;
     }
     let flags = irq_save();
-    let ended = unsafe { core::mem::replace(&mut ENDED[child], Usage::ZERO) };
+    let ended = unsafe { core::mem::replace(&mut st(child).ended, Usage::ZERO) };
     irq_restore(flags);
     crate::fdtable::usage_children_add(parent, &ended);
 }

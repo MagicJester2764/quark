@@ -355,20 +355,57 @@ pub struct Frame {
     pub info: Info,
 }
 
-/// Each task's mask: the signals it holds back.
-static mut MASK: [u64; MAX_TASKS] = [0; MAX_TASKS];
-/// A mask to put back when the wait a task is in has ended: it put another
-/// on for the length of the wait (`SYS_SIG_MASK`, wait).
-static mut RESTORE: [Option<u64>; MAX_TASKS] = [None; MAX_TASKS];
-/// The stack each task has named for handlers: where it is and how long.
-static mut STACK: [(usize, usize); MAX_TASKS] = [(0, 0); MAX_TASKS];
-/// Signals raised for one task and no other ([`raise_task`]), and what
-/// came with each.
-static mut TPENDING: [u64; MAX_TASKS] = [0; MAX_TASKS];
-static mut TWAITING: [Waiting<TQUEUE>; MAX_TASKS] = [Waiting::EMPTY; MAX_TASKS];
-/// The signals each task is waiting to take rather than have run
-/// (`SYS_SIG_WAIT`).
-static mut WAITSET: [u64; MAX_TASKS] = [0; MAX_TASKS];
+/// What this module keeps about a task, in its record (`TaskRec::sig`):
+/// each field was an array of `MAX_TASKS`, and an id with no task reads as
+/// `PerTask::new()` — what an empty slot of those arrays held.
+pub struct PerTask {
+    /// Each task's mask: the signals it holds back.
+    mask: u64,
+    /// A mask to put back when the wait a task is in has ended: it put another
+    /// on for the length of the wait (`SYS_SIG_MASK`, wait).
+    restore: Option<u64>,
+    /// The stack each task has named for handlers: where it is and how long.
+    stack: (usize, usize),
+    /// Signals raised for one task and no other ([`raise_task`]), and what
+    /// came with each.
+    tpending: u64,
+    twaiting: Waiting<TQUEUE>,
+    /// The signals each task is waiting to take rather than have run
+    /// (`SYS_SIG_WAIT`).
+    waitset: u64,
+}
+
+impl PerTask {
+    pub const fn new() -> Self {
+        PerTask {
+            mask: 0,
+            restore: None,
+            stack: (0, 0),
+            tpending: 0,
+            twaiting: Waiting::EMPTY,
+            waitset: 0,
+        }
+    }
+}
+
+/// What this module keeps about task `tid`: its record's, or for an id with
+/// no task a copy put back to `PerTask::new()` each time it is asked for, so
+/// a write for a task that is not there goes nowhere. Interrupts must be off.
+unsafe fn st(tid: usize) -> &'static mut PerTask {
+    unsafe {
+        match crate::scheduler::rec(tid) {
+            Some(r) => &mut r.sig,
+            None => {
+                let none = &mut *core::ptr::addr_of_mut!(NO_TASK);
+                *none = PerTask::new();
+                none
+            }
+        }
+    }
+}
+
+static mut NO_TASK: PerTask = PerTask::new();
+
 
 /// The signals that do nothing to a program that has said nothing: Linux's
 /// list. SIGCONT is here because what it does — start a stopped program —
@@ -417,8 +454,8 @@ fn forget(tid: usize, signo: u8) {
     let flags = irq_save();
     for &t in &tasks[..n] {
         unsafe {
-            TPENDING[t] &= !bit;
-            TWAITING[t].forget(signo);
+            st(t).tpending &= !bit;
+            st(t).twaiting.forget(signo);
         }
     }
     irq_restore(flags);
@@ -536,7 +573,7 @@ pub fn raise_task(t: usize, signo: u8, info: Info) -> Result<(), NotRaised> {
     let bit = 1u64 << (signo - 1);
     let said = fdtable::sig_action(t, signo, None).ok_or(NotRaised::Nobody)?;
     let flags = irq_save();
-    let (held, waiting) = unsafe { (MASK[t] & bit != 0, WAITSET[t] & bit != 0) };
+    let (held, waiting) = unsafe { (st(t).mask & bit != 0, st(t).waitset & bit != 0) };
     irq_restore(flags);
     match said {
         // Told: the program runs it, from whichever task looks.
@@ -546,9 +583,9 @@ pub fn raise_task(t: usize, signo: u8, info: Info) -> Result<(), NotRaised> {
         _ => {
             let flags = irq_save();
             let put = unsafe {
-                let ok = TWAITING[t].put(signo, info, TPENDING[t] & bit != 0);
+                let ok = st(t).twaiting.put(signo, info, st(t).tpending & bit != 0);
                 if ok {
-                    TPENDING[t] |= bit;
+                    st(t).tpending |= bit;
                 }
                 ok
             };
@@ -573,7 +610,7 @@ fn held_by_all(tid: usize, signo: u8) -> bool {
     let mut tasks = [0usize; 16];
     let n = fdtable::tasks_of(tid, &mut tasks);
     let flags = irq_save();
-    let all = n != 0 && tasks[..n].iter().all(|&t| unsafe { MASK[t] } & bit != 0);
+    let all = n != 0 && tasks[..n].iter().all(|&t| unsafe { st(t).mask } & bit != 0);
     irq_restore(flags);
     all
 }
@@ -584,7 +621,7 @@ fn waited_for(tid: usize, signo: u8) -> bool {
     let mut tasks = [0usize; 16];
     let n = fdtable::tasks_of(tid, &mut tasks);
     let flags = irq_save();
-    let any = tasks[..n].iter().any(|&t| unsafe { WAITSET[t] } & bit != 0);
+    let any = tasks[..n].iter().any(|&t| unsafe { st(t).waitset } & bit != 0);
     irq_restore(flags);
     any
 }
@@ -595,7 +632,7 @@ fn waiters(tid: usize, signo: u8) {
     let mut tasks = [0usize; 16];
     let n = fdtable::tasks_of(tid, &mut tasks);
     for &t in &tasks[..n] {
-        if unsafe { WAITSET[t] } & bit != 0 {
+        if unsafe { st(t).waitset } & bit != 0 {
             crate::ipc::wake_sleeper(t);
         }
     }
@@ -612,7 +649,7 @@ fn prod(tid: usize, signo: u8) {
     let mut m = 0;
     let flags = irq_save();
     for &t in &tasks[..n] {
-        if unsafe { MASK[t] } & bit == 0 {
+        if unsafe { st(t).mask } & bit == 0 {
             open[m] = t;
             m += 1;
         }
@@ -792,7 +829,7 @@ fn task_timer_bump(t: usize, signo: u8, id: u64, by: u64) -> bool {
         return false;
     }
     let flags = irq_save();
-    let bumped = unsafe { TWAITING[t].bump_timer(signo, id, TPENDING[t] & 1 << (signo - 1) != 0, by) };
+    let bumped = unsafe { st(t).twaiting.bump_timer(signo, id, st(t).tpending & 1 << (signo - 1) != 0, by) };
     irq_restore(flags);
     bumped
 }
@@ -830,7 +867,7 @@ pub fn ends_wait(tid: usize) -> bool {
     if tid >= MAX_TASKS {
         return false;
     }
-    ready(tid) || unsafe { WAITSET[tid] } & pending_for(tid) != 0
+    ready(tid) || unsafe { st(tid).waitset } & pending_for(tid) != 0
 }
 
 /// Every signal waiting for task `tid`: its own, and its program's — what a
@@ -869,11 +906,11 @@ pub fn read_for(tid: usize, set: u64, ptr: *mut u8, max_len: usize, block: bool)
             // Woken by one of `set` arriving, or ended by another signal
             // with a handler to run.
             let flags = irq_save();
-            unsafe { WAITSET[tid] = set };
+            unsafe { st(tid).waitset = set };
             irq_restore(flags);
             let slept = crate::ipc::sys_recv_timeout(tid, u64::MAX);
             let flags = irq_save();
-            unsafe { WAITSET[tid] = 0 };
+            unsafe { st(tid).waitset = 0 };
             let mine = pending_for(tid) & set != 0;
             irq_restore(flags);
             if matches!(slept, Err(crate::ipc::IpcError::Interrupted)) && !mine && ready(tid) {
@@ -920,18 +957,18 @@ fn linux_record(signo: u8, info: &Info) -> [u8; 128] {
 /// Whether task `tid` has something to do on its way out of the kernel: a
 /// handler to run, or a signal it lets through that does what it does.
 fn ready(tid: usize) -> bool {
-    let mask = unsafe { MASK[tid] };
-    (unsafe { TPENDING[tid] } & !mask) != 0 || fdtable::sig_ready(tid, mask)
+    let mask = unsafe { st(tid).mask };
+    (unsafe { st(tid).tpending } & !mask) != 0 || fdtable::sig_ready(tid, mask)
 }
 
 /// Every signal waiting for task `tid`: its own, and its program's.
 fn pending_for(tid: usize) -> u64 {
-    (unsafe { TPENDING[tid] }) | fdtable::sig_pending_set(tid)
+    (unsafe { st(tid).tpending }) | fdtable::sig_pending_set(tid)
 }
 
 /// Whether the way out of the kernel has anything to do for task `tid`.
 fn due(tid: usize) -> bool {
-    (unsafe { RESTORE[tid].is_some() }) || ready(tid)
+    (unsafe { st(tid).restore.is_some() }) || ready(tid)
 }
 
 /// The signals task `tid` holds back.
@@ -939,28 +976,14 @@ pub fn mask_of(tid: usize) -> u64 {
     if tid >= MAX_TASKS {
         return 0;
     }
-    unsafe { MASK[tid] }
-}
-
-/// A task has been made: it holds nothing back and has named no stack.
-pub fn task_made(tid: usize) {
-    if tid < MAX_TASKS {
-        unsafe {
-            MASK[tid] = 0;
-            RESTORE[tid] = None;
-            STACK[tid] = (0, 0);
-            TPENDING[tid] = 0;
-            TWAITING[tid].clear();
-            WAITSET[tid] = 0;
-        }
-    }
+    unsafe { st(tid).mask }
 }
 
 /// Task `tid` begins as `from` is: a thread of its program, or a forked
 /// child. It holds back what its maker does.
 pub fn task_like(tid: usize, from: usize) {
     if tid < MAX_TASKS && from < MAX_TASKS {
-        unsafe { MASK[tid] = MASK[from] };
+        unsafe { st(tid).mask = st(from).mask };
     }
 }
 
@@ -969,8 +992,8 @@ pub fn task_like(tid: usize, from: usize) {
 pub fn task_became(tid: usize) {
     if tid < MAX_TASKS {
         unsafe {
-            RESTORE[tid] = None;
-            STACK[tid] = (0, 0);
+            st(tid).restore = None;
+            st(tid).stack = (0, 0);
         }
     }
 }
@@ -988,21 +1011,21 @@ pub fn mask(tid: usize, how: u64, set: u64) -> u64 {
     }
     if how == 4 {
         let flags = irq_save();
-        let waiting = pending_for(tid) & unsafe { MASK[tid] };
+        let waiting = pending_for(tid) & unsafe { st(tid).mask };
         irq_restore(flags);
         return waiting;
     }
     let set = set & !UNBLOCKABLE;
     let flags = irq_save();
     let old = unsafe {
-        let old = MASK[tid];
+        let old = st(tid).mask;
         match how {
-            0 => MASK[tid] = old | set,
-            1 => MASK[tid] = old & !set,
-            2 => MASK[tid] = set,
+            0 => st(tid).mask = old | set,
+            1 => st(tid).mask = old & !set,
+            2 => st(tid).mask = set,
             3 => {
-                RESTORE[tid] = Some(old);
-                MASK[tid] = set;
+                st(tid).restore = Some(old);
+                st(tid).mask = set;
             }
             _ => {}
         }
@@ -1052,13 +1075,13 @@ pub fn wait_for(tid: usize, set: u64, span: u64, at: u64, whole: bool) -> u64 {
             return 0;
         }
         let flags = irq_save();
-        unsafe { WAITSET[tid] = set };
+        unsafe { st(tid).waitset = set };
         irq_restore(flags);
         // Ended by one of `set` arriving, by the time, or by another signal
         // with a handler to run, which is an interruption.
         let slept = crate::ipc::sys_recv_timeout(tid, deadline.saturating_sub(now).max(1));
         let flags = irq_save();
-        unsafe { WAITSET[tid] = 0 };
+        unsafe { st(tid).waitset = 0 };
         let mine = pending_for(tid) & set != 0;
         irq_restore(flags);
         if matches!(slept, Err(crate::ipc::IpcError::Interrupted)) && !mine && ready(tid) {
@@ -1071,7 +1094,7 @@ pub fn wait_for(tid: usize, set: u64, span: u64, at: u64, whole: bool) -> u64 {
 /// signal and what came with it.
 fn take_one(tid: usize, set: u64) -> Option<(u8, Info)> {
     let flags = irq_save();
-    let own = unsafe { TPENDING[tid] } & set;
+    let own = unsafe { st(tid).tpending } & set;
     let out = if own != 0 {
         let signo = own.trailing_zeros() as u8 + 1;
         Some((signo, unsafe { take_own(tid, signo) }))
@@ -1086,9 +1109,9 @@ fn take_one(tid: usize, set: u64) -> Option<(u8, Info)> {
 /// of its number behind it is waiting now in its place. Interrupts are off.
 unsafe fn take_own(tid: usize, signo: u8) -> Info {
     unsafe {
-        let (info, more) = TWAITING[tid].take(signo);
+        let (info, more) = st(tid).twaiting.take(signo);
         if !more {
-            TPENDING[tid] &= !(1 << (signo - 1));
+            st(tid).tpending &= !(1 << (signo - 1));
         }
         info
     }
@@ -1112,9 +1135,9 @@ pub fn stack(tid: usize, base: u64, size: u64, old: u64) -> u64 {
         return u64::MAX;
     }
     let flags = irq_save();
-    let was = unsafe { STACK[tid] };
+    let was = unsafe { st(tid).stack };
     if change {
-        unsafe { STACK[tid] = if size == 0 { (0, 0) } else { (base as usize, size as usize) } };
+        unsafe { st(tid).stack = if size == 0 { (0, 0) } else { (base as usize, size as usize) } };
     }
     irq_restore(flags);
     if old != 0 {
@@ -1135,9 +1158,9 @@ pub fn wait_under(tid: usize, set: u64) {
     }
     let flags = irq_save();
     unsafe {
-        let old = MASK[tid];
-        RESTORE[tid] = Some(RESTORE[tid].unwrap_or(old));
-        MASK[tid] = set & !UNBLOCKABLE;
+        let old = st(tid).mask;
+        st(tid).restore = Some(st(tid).restore.unwrap_or(old));
+        st(tid).mask = set & !UNBLOCKABLE;
     }
     irq_restore(flags);
 }
@@ -1161,8 +1184,8 @@ fn sti() {
 fn take_next(tid: usize) -> Option<(u8, Handler, Info)> {
     loop {
         let flags = irq_save();
-        let mask = unsafe { MASK[tid] };
-        let own = unsafe { TPENDING[tid] } & !mask;
+        let mask = unsafe { st(tid).mask };
+        let own = unsafe { st(tid).tpending } & !mask;
         let mine = (own != 0).then(|| {
             let signo = own.trailing_zeros() as u8 + 1;
             (signo, unsafe { take_own(tid, signo) })
@@ -1198,8 +1221,8 @@ fn take_next(tid: usize) -> Option<(u8, Handler, Info)> {
 fn settle(tid: usize) {
     let flags = irq_save();
     unsafe {
-        if let Some(m) = RESTORE[tid].take() {
-            MASK[tid] = m;
+        if let Some(m) = st(tid).restore.take() {
+            st(tid).mask = m;
         }
     }
     irq_restore(flags);
@@ -1215,7 +1238,7 @@ fn run(tid: usize, regs: &mut Regs, signo: u8, how: Handler, info: Info) {
     // The mask to go back to afterwards: the one a wait replaced, if this
     // ends that wait, and otherwise the one it has.
     let flags = irq_save();
-    let before = unsafe { RESTORE[tid].take().unwrap_or(MASK[tid]) };
+    let before = unsafe { st(tid).restore.take().unwrap_or(st(tid).mask) };
     irq_restore(flags);
     let old = info.old_value();
     let (code, value) = if old >> 63 != 0 { (BY_PROGRAM, old & !(1 << 63)) } else { (BY_KERNEL, old) };
@@ -1230,7 +1253,7 @@ fn run(tid: usize, regs: &mut Regs, signo: u8, how: Handler, info: Info) {
 fn push(tid: usize, regs: &mut Regs, signo: u8, code: u64, value: u64, before: u64, how: Handler, info: Info) -> bool {
     let size = core::mem::size_of::<Frame>();
     let sp = regs[RSP] as usize;
-    let (base, len) = unsafe { STACK[tid] };
+    let (base, len) = unsafe { st(tid).stack };
     let on_it = len != 0 && sp > base && sp <= base + len;
     // Below the 128 bytes a function may be using under its stack pointer —
     // or at the top of the stack named for this, if the handler asks for
@@ -1279,7 +1302,7 @@ fn push(tid: usize, regs: &mut Regs, signo: u8, code: u64, value: u64, before: u
             // program asked for, and the signal itself unless it asked for
             // that not to be.
             let own = if how.flags & NODEFER as u32 != 0 { 0 } else { 1u64 << (signo - 1) };
-            unsafe { MASK[tid] = (MASK[tid] | how.mask | own) & !UNBLOCKABLE };
+            unsafe { st(tid).mask = (st(tid).mask | how.mask | own) & !UNBLOCKABLE };
             written = true;
         }
         irq_restore(flags);
@@ -1433,8 +1456,8 @@ pub fn ret(at: u64) -> ! {
     regs[RFLAGS] = clean_flags(regs[RFLAGS]);
     let flags = irq_save();
     unsafe {
-        MASK[tid] = frame.mask & !UNBLOCKABLE;
-        RESTORE[tid] = None;
+        st(tid).mask = frame.mask & !UNBLOCKABLE;
+        st(tid).restore = None;
     }
     irq_restore(flags);
     // Whatever that lets through is run now, before the task is back.

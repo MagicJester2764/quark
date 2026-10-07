@@ -280,11 +280,30 @@ impl Task {
 pub struct TaskRec {
     pub task: Task,
     pub sched: crate::scheduler::PerTask,
+    pub ipc: crate::ipc::PerTask,
+    pub sig: crate::signal::PerTask,
+    pub job: crate::job::PerTask,
+    pub fd: crate::fdtable::PerTask,
+    pub usage: crate::usage::PerTask,
+    pub threads: crate::threads::PerTask,
+    pub served: crate::served::PerTask,
+    pub cap: crate::cap::PerTask,
 }
 
 impl TaskRec {
     pub fn new(task: Task) -> Self {
-        TaskRec { task, sched: crate::scheduler::PerTask::new() }
+        TaskRec {
+            task,
+            sched: crate::scheduler::PerTask::new(),
+            ipc: crate::ipc::PerTask::new(),
+            sig: crate::signal::PerTask::new(),
+            job: crate::job::PerTask::new(),
+            fd: crate::fdtable::PerTask::new(),
+            usage: crate::usage::PerTask::new(),
+            threads: crate::threads::PerTask::new(),
+            served: crate::served::PerTask::new(),
+            cap: crate::cap::PerTask::new(),
+        }
     }
 }
 

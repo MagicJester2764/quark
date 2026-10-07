@@ -202,8 +202,52 @@ struct Holding {
 
 const NO_HOLDING: u8 = u8::MAX;
 static mut HOLDINGS: [Holding; MAX_TASKS] = [Holding { slots: empty_cspace(), bits: 0, users: 0 }; MAX_TASKS];
-/// Which each task uses.
-static mut HOLDING_OF: [u8; MAX_TASKS] = [NO_HOLDING; MAX_TASKS];
+/// What this module keeps about a task, in its record (`TaskRec::cap`):
+/// each field was an array of `MAX_TASKS`, and an id with no task reads as
+/// `PerTask::new()` — what an empty slot of those arrays held.
+pub struct PerTask {
+    /// Which each task uses.
+    holding: u8,
+    /// Each task's endpoint, as a number no endpoint has had before or will again.
+    ///
+    /// An `Endpoint` capability records this, not the TID, so it names the task it
+    /// was minted for and nothing else. When that task is reaped its number is
+    /// gone, and a capability holding it names nothing; whatever takes the slot
+    /// next has a number of its own. The TID sets needed a sweep of every CSpace at
+    /// reap time to approximate that.
+    ///
+    /// Numbers start past the last TID, so that one passed where the other belongs
+    /// fails a bounds check rather than naming some task.
+    endpoint: u64,
+}
+
+impl PerTask {
+    pub const fn new() -> Self {
+        PerTask {
+            holding: NO_HOLDING,
+            endpoint: 0,
+        }
+    }
+}
+
+/// What this module keeps about task `tid`: its record's, or for an id with
+/// no task a copy put back to `PerTask::new()` each time it is asked for, so
+/// a write for a task that is not there goes nowhere. Interrupts must be off.
+unsafe fn st(tid: usize) -> &'static mut PerTask {
+    unsafe {
+        match crate::scheduler::rec(tid) {
+            Some(r) => &mut r.cap,
+            None => {
+                let none = &mut *core::ptr::addr_of_mut!(NO_TASK);
+                *none = PerTask::new();
+                none
+            }
+        }
+    }
+}
+
+static mut NO_TASK: PerTask = PerTask::new();
+
 
 #[inline(always)]
 fn irq_save() -> u64 {
@@ -224,7 +268,7 @@ pub fn root_of(tid: usize) -> u8 {
         return KERNEL_ROOT;
     }
     let flags = irq_save();
-    let i = unsafe { HOLDING_OF[tid] };
+    let i = unsafe { st(tid).holding };
     irq_restore(flags);
     if i == NO_HOLDING { KERNEL_ROOT } else { i }
 }
@@ -235,10 +279,10 @@ pub fn root_of(tid: usize) -> u8 {
 /// Interrupts are off, for as long as the reference is used.
 pub unsafe fn cspace_of(tid: usize) -> Option<&'static mut CSpace> {
     unsafe {
-        if tid >= MAX_TASKS || HOLDING_OF[tid] == NO_HOLDING {
+        if tid >= MAX_TASKS || st(tid).holding == NO_HOLDING {
             return None;
         }
-        Some(&mut (*core::ptr::addr_of_mut!(HOLDINGS))[HOLDING_OF[tid] as usize].slots)
+        Some(&mut (*core::ptr::addr_of_mut!(HOLDINGS))[st(tid).holding as usize].slots)
     }
 }
 
@@ -266,8 +310,8 @@ pub fn with_cspace<R>(tid: usize, f: impl FnOnce(&mut CSpace) -> R) -> Option<R>
 pub fn bits_of(tid: usize) -> u32 {
     let flags = irq_save();
     let bits = unsafe {
-        if tid < MAX_TASKS && HOLDING_OF[tid] != NO_HOLDING {
-            HOLDINGS[HOLDING_OF[tid] as usize].bits
+        if tid < MAX_TASKS && st(tid).holding != NO_HOLDING {
+            HOLDINGS[st(tid).holding as usize].bits
         } else {
             0
         }
@@ -281,8 +325,8 @@ pub fn bits_of(tid: usize) -> u32 {
 pub fn add_bits(tid: usize, bits: u32) -> bool {
     let flags = irq_save();
     let done = unsafe {
-        if tid < MAX_TASKS && HOLDING_OF[tid] != NO_HOLDING {
-            let h = &mut HOLDINGS[HOLDING_OF[tid] as usize];
+        if tid < MAX_TASKS && st(tid).holding != NO_HOLDING {
+            let h = &mut HOLDINGS[st(tid).holding as usize];
             h.bits |= bits;
             populate_from_bitmask(&mut h.slots, bits);
             true
@@ -309,7 +353,7 @@ pub fn task_made(tid: usize) {
         let free = if holdings[tid].users == 0 { Some(tid) } else { holdings.iter().position(|h| h.users == 0) };
         if let Some(i) = free {
             holdings[i] = Holding { slots: empty_cspace(), bits: 0, users: 1 };
-            HOLDING_OF[tid] = i as u8;
+            st(tid).holding = i as u8;
         }
     }
     irq_restore(flags);
@@ -329,11 +373,11 @@ pub fn task_gone(tid: usize) {
 /// Interrupts are off.
 unsafe fn leave(tid: usize) {
     unsafe {
-        let i = HOLDING_OF[tid];
+        let i = st(tid).holding;
         if i == NO_HOLDING {
             return;
         }
-        HOLDING_OF[tid] = NO_HOLDING;
+        st(tid).holding = NO_HOLDING;
         let h = &mut HOLDINGS[i as usize];
         h.users = h.users.saturating_sub(1);
         if h.users == 0 {
@@ -352,11 +396,11 @@ pub fn share(tid: usize, with: usize) -> bool {
     }
     let flags = irq_save();
     let done = unsafe {
-        let target = HOLDING_OF[with];
+        let target = st(with).holding;
         if target == NO_HOLDING {
             false
         } else {
-            let own = HOLDING_OF[tid];
+            let own = st(tid).holding;
             if own != target {
                 if own != NO_HOLDING {
                     let given = HOLDINGS[own as usize].slots;
@@ -371,7 +415,7 @@ pub fn share(tid: usize, with: usize) -> bool {
                     leave(tid);
                 }
                 HOLDINGS[target as usize].users += 1;
-                HOLDING_OF[tid] = target;
+                st(tid).holding = target;
             }
             true
         }
@@ -388,7 +432,7 @@ pub fn copy_into(tid: usize, from: usize) {
     }
     let flags = irq_save();
     unsafe {
-        let (src, dst) = (HOLDING_OF[from], HOLDING_OF[tid]);
+        let (src, dst) = (st(from).holding, st(tid).holding);
         if src != NO_HOLDING && dst != NO_HOLDING && src != dst {
             let copy = HOLDINGS[src as usize];
             let h = &mut HOLDINGS[dst as usize];
@@ -523,37 +567,26 @@ pub fn task_has_phys_alloc(tid: usize) -> bool {
     }
 }
 
-/// Each task's endpoint, as a number no endpoint has had before or will again.
-///
-/// An `Endpoint` capability records this, not the TID, so it names the task it
-/// was minted for and nothing else. When that task is reaped its number is
-/// gone, and a capability holding it names nothing; whatever takes the slot
-/// next has a number of its own. The TID sets needed a sweep of every CSpace at
-/// reap time to approximate that.
-///
-/// Numbers start past the last TID, so that one passed where the other belongs
-/// fails a bounds check rather than naming some task.
-static mut ENDPOINTS: [u64; MAX_TASKS] = [0; MAX_TASKS];
 static NEXT_ENDPOINT: AtomicU64 = AtomicU64::new(MAX_TASKS as u64);
 
 /// Give `tid` a fresh endpoint. Called when a task slot is filled.
 pub fn open_endpoint(tid: usize) {
     if tid < MAX_TASKS {
         let number = NEXT_ENDPOINT.fetch_add(1, Ordering::Relaxed);
-        unsafe { ENDPOINTS[tid] = number };
+        unsafe { st(tid).endpoint = number };
     }
 }
 
 /// `tid`'s endpoint is gone, and its number with it. Called when it is reaped.
 pub fn close_endpoint(tid: usize) {
     if tid < MAX_TASKS {
-        unsafe { ENDPOINTS[tid] = 0 };
+        unsafe { st(tid).endpoint = 0 };
     }
 }
 
 /// The number of `tid`'s endpoint, or 0 if there is no such task.
 pub fn endpoint_of(tid: usize) -> u64 {
-    if tid < MAX_TASKS { unsafe { ENDPOINTS[tid] } } else { 0 }
+    if tid < MAX_TASKS { unsafe { st(tid).endpoint } } else { 0 }
 }
 
 /// Check if `tid` may originate IPC to `dest`.

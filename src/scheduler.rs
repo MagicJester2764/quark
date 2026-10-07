@@ -2391,8 +2391,6 @@ pub fn create_empty_task() -> Option<usize> {
         }
     };
     unsafe {
-        st(tid).npinned = 0;
-        crate::signal::task_made(tid);
         let made = TaskRec::new(Task {
             tid,
             state: TaskState::Blocked,
@@ -2426,6 +2424,8 @@ pub fn create_empty_task() -> Option<usize> {
             alloc::alloc::dealloc(stack_base, layout);
             return None;
         }
+        // A new record is a clean one: nothing pinned, no signals held back
+        // or waiting.
         crate::cap::open_endpoint(tid);
         // A process id of its own, a table of its own and a capability space
         // of its own, empty. A task started as a thread gives them up for its

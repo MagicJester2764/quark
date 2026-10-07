@@ -220,15 +220,48 @@ impl Table {
 
 /// As many tables as tasks: each task uses exactly one.
 static mut TABLES: [Table; MAX_TASKS] = [EMPTY; MAX_TASKS];
-/// Which table each task uses.
-static mut OF_TASK: [u16; MAX_TASKS] = [NONE; MAX_TASKS];
+/// What this module keeps about a task, in its record (`TaskRec::fd`):
+/// each field was an array of `MAX_TASKS`, and an id with no task reads as
+/// `PerTask::new()` — what an empty slot of those arrays held.
+pub struct PerTask {
+    /// Which table each task uses.
+    table: u16,
+    /// What each task is in the middle of using, held so that it cannot go away.
+    held: FdKind,
+}
+
+impl PerTask {
+    pub const fn new() -> Self {
+        PerTask {
+            table: NONE,
+            held: FdKind::Empty,
+        }
+    }
+}
+
+/// What this module keeps about task `tid`: its record's, or for an id with
+/// no task a copy put back to `PerTask::new()` each time it is asked for, so
+/// a write for a task that is not there goes nowhere. Interrupts must be off.
+unsafe fn st(tid: usize) -> &'static mut PerTask {
+    unsafe {
+        match crate::scheduler::rec(tid) {
+            Some(r) => &mut r.fd,
+            None => {
+                let none = &mut *core::ptr::addr_of_mut!(NO_TASK);
+                *none = PerTask::new();
+                none
+            }
+        }
+    }
+}
+
+static mut NO_TASK: PerTask = PerTask::new();
+
 /// What came with each signal waiting for the program a table is, and the
 /// real-time signals waiting behind one of their number: beside the tables
 /// rather than in them, so that it is zeroed memory and not the kernel's
 /// image.
 static mut WAITING: [Waiting<{ crate::signal::QUEUE }>; MAX_TASKS] = [Waiting::EMPTY; MAX_TASKS];
-/// What each task is in the middle of using, held so that it cannot go away.
-static mut HELD: [FdKind; MAX_TASKS] = [FdKind::Empty; MAX_TASKS];
 
 #[inline(always)]
 fn irq_save() -> u64 {
@@ -258,7 +291,7 @@ unsafe fn table_mut(tid: usize) -> Option<&'static mut Table> {
         if tid >= MAX_TASKS {
             return None;
         }
-        let i = (*core::ptr::addr_of!(OF_TASK))[tid];
+        let i = st(tid).table;
         if i == NONE { None } else { Some(&mut tables()[i as usize]) }
     }
 }
@@ -272,7 +305,7 @@ unsafe fn signals_mut(tid: usize) -> Option<(&'static mut Table, &'static mut Wa
         if tid >= MAX_TASKS {
             return None;
         }
-        let i = (*core::ptr::addr_of!(OF_TASK))[tid];
+        let i = st(tid).table;
         if i == NONE {
             None
         } else {
@@ -288,8 +321,7 @@ pub fn attach_new(tid: usize) -> bool {
     }
     let flags = irq_save();
     let ok = unsafe {
-        let of = &mut *core::ptr::addr_of_mut!(OF_TASK);
-        if of[tid] != NONE {
+        if st(tid).table != NONE {
             false
         } else {
             // There is always one: a table per task, and this task has none.
@@ -299,7 +331,7 @@ pub fn attach_new(tid: usize) -> bool {
                     tables()[i].tasks = 1;
                     (*core::ptr::addr_of_mut!(WAITING))[i].clear();
                     crate::ptimer::clear(i);
-                    of[tid] = i as u16;
+                    st(tid).table = i as u16;
                     true
                 }
                 None => false,
@@ -325,7 +357,7 @@ pub fn table_of(tid: usize) -> usize {
         return usize::MAX;
     }
     let flags = irq_save();
-    let i = unsafe { (*core::ptr::addr_of!(OF_TASK))[tid] };
+    let i = unsafe { st(tid).table };
     irq_restore(flags);
     if i == NONE { usize::MAX } else { i as usize }
 }
@@ -334,7 +366,7 @@ pub fn table_of(tid: usize) -> usize {
 pub fn a_task_of(table: usize) -> Option<usize> {
     let flags = irq_save();
     let found = unsafe {
-        (*core::ptr::addr_of!(OF_TASK)).iter().position(|&t| t != NONE && t as usize == table)
+        crate::scheduler::tids().find(|&t| st(t).table != NONE && st(t).table as usize == table)
     };
     irq_restore(flags);
     found
@@ -361,12 +393,11 @@ fn leave(tid: usize) -> Option<(Grow<Fd>, FdKind)> {
     }
     let flags = irq_save();
     let out = unsafe {
-        let of = &mut *core::ptr::addr_of_mut!(OF_TASK);
-        let i = of[tid];
+        let i = st(tid).table;
         if i == NONE {
             None
         } else {
-            of[tid] = NONE;
+            st(tid).table = NONE;
             let t = &mut tables()[i as usize];
             t.tasks = t.tasks.saturating_sub(1);
             if t.tasks == 0 {
@@ -399,7 +430,7 @@ pub fn task_gone(tid: usize) {
     // the next task will be given. Off it before the reference goes.
     if tid < MAX_TASKS {
         let flags = irq_save();
-        let held = unsafe { (*core::ptr::addr_of!(HELD))[tid] };
+        let held = unsafe { st(tid).held };
         irq_restore(flags);
         if !held.is_empty() {
             crate::pipe::forget_waiter(&held, tid);
@@ -420,12 +451,12 @@ pub fn share(tid: usize, with: usize) -> bool {
         return false;
     }
     let flags = irq_save();
-    let target = unsafe { (*core::ptr::addr_of!(OF_TASK))[with] };
+    let target = unsafe { st(with).table };
     if target == NONE {
         irq_restore(flags);
         return false;
     }
-    if unsafe { (*core::ptr::addr_of!(OF_TASK))[tid] } == target {
+    if unsafe { st(tid).table } == target {
         irq_restore(flags);
         return true;
     }
@@ -433,7 +464,7 @@ pub fn share(tid: usize, with: usize) -> bool {
     // nothing sees the task with no table.
     unsafe { tables()[target as usize].tasks += 1 };
     let old = leave(tid);
-    unsafe { (*core::ptr::addr_of_mut!(OF_TASK))[tid] = target };
+    unsafe { st(tid).table = target };
     irq_restore(flags);
     if let Some(held) = old {
         release_all(&held);
@@ -1083,14 +1114,13 @@ fn alarm_next(at: u64, every: u64, now: u64) -> u64 {
 pub fn alarm_due(now: u64) -> Option<usize> {
     let flags = irq_save();
     let due = unsafe {
-        let of = &*core::ptr::addr_of!(OF_TASK);
         let mut found = None;
         for (i, t) in tables().iter_mut().enumerate() {
             if t.tasks == 0 || t.alarm_at == 0 || t.alarm_at > now {
                 continue;
             }
             t.alarm_at = alarm_next(t.alarm_at, t.alarm_every, now);
-            found = of.iter().position(|&table| table != NONE && table as usize == i);
+            found = crate::scheduler::tids().find(|&tid| st(tid).table != NONE && st(tid).table as usize == i);
             if found.is_some() {
                 break;
             }
@@ -1130,11 +1160,10 @@ pub fn tasks_of(tid: usize, out: &mut [usize]) -> usize {
     let mut n = 0;
     let flags = irq_save();
     unsafe {
-        let of = &*core::ptr::addr_of!(OF_TASK);
-        let table = of[tid];
+        let table = st(tid).table;
         if table != NONE {
-            for (other, &t) in of.iter().enumerate() {
-                if t == table && n < out.len() {
+            for other in crate::scheduler::tids() {
+                if st(other).table == table && n < out.len() {
                     out[n] = other;
                     n += 1;
                 }
@@ -1151,12 +1180,11 @@ pub fn holders(wanted: impl Fn(&FdKind) -> bool, out: &mut [usize]) -> usize {
     let mut n = 0;
     let flags = irq_save();
     unsafe {
-        let of = &*core::ptr::addr_of!(OF_TASK);
         for (i, table) in tables().iter().enumerate() {
             if table.tasks == 0 || !table.fds.iter().any(|s| wanted(&s.kind)) {
                 continue;
             }
-            if let Some(tid) = of.iter().position(|&t| t as usize == i && t != NONE) {
+            if let Some(tid) = crate::scheduler::tids().find(|&t| st(t).table != NONE && st(t).table as usize == i) {
                 if n < out.len() {
                     out[n] = tid;
                     n += 1;
@@ -1428,7 +1456,7 @@ pub fn interrupt(tid: usize) -> bool {
         return false;
     }
     let flags = irq_save();
-    let held = unsafe { (*core::ptr::addr_of!(HELD))[tid] };
+    let held = unsafe { st(tid).held };
     let found = !held.is_empty() && crate::pipe::forget_waiter(&held, tid);
     if found {
         crate::scheduler::unblock_task(tid);
@@ -1464,7 +1492,7 @@ pub fn hold(tid: usize, fd: usize) -> FdKind {
             | FdKind::Local { .. }
     );
     if waits && crate::pipe::retain_fd(&kind).is_ok() {
-        unsafe { (*core::ptr::addr_of_mut!(HELD))[tid] = kind };
+        unsafe { st(tid).held = kind };
     }
     irq_restore(flags);
     kind
@@ -1477,7 +1505,7 @@ pub fn unhold(tid: usize) {
     }
     let flags = irq_save();
     let kind = unsafe {
-        core::mem::replace(&mut (*core::ptr::addr_of_mut!(HELD))[tid], FdKind::Empty)
+        core::mem::replace(&mut st(tid).held, FdKind::Empty)
     };
     irq_restore(flags);
     if !kind.is_empty() {

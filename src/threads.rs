@@ -32,10 +32,43 @@ const WAITERS: u32 = 0x8000_0000;
 /// The owner's id, in the rest of the word.
 const OWNER: u32 = 0x3FFF_FFFF;
 
-/// Each task's name, its length in the first byte.
-static mut NAMES: [[u8; NAME_MAX + 1]; MAX_TASKS] = [[0; NAME_MAX + 1]; MAX_TASKS];
-/// Where each task's robust list's head is, in its memory: 0 for none.
-static mut ROBUST: [u64; MAX_TASKS] = [0; MAX_TASKS];
+/// What this module keeps about a task, in its record (`TaskRec::threads`):
+/// each field was an array of `MAX_TASKS`, and an id with no task reads as
+/// `PerTask::new()` — what an empty slot of those arrays held.
+pub struct PerTask {
+    /// Each task's name, its length in the first byte.
+    name: [u8; NAME_MAX + 1],
+    /// Where each task's robust list's head is, in its memory: 0 for none.
+    robust: u64,
+}
+
+impl PerTask {
+    pub const fn new() -> Self {
+        PerTask {
+            name: [0; NAME_MAX + 1],
+            robust: 0,
+        }
+    }
+}
+
+/// What this module keeps about task `tid`: its record's, or for an id with
+/// no task a copy put back to `PerTask::new()` each time it is asked for, so
+/// a write for a task that is not there goes nowhere. Interrupts must be off.
+unsafe fn st(tid: usize) -> &'static mut PerTask {
+    unsafe {
+        match crate::scheduler::rec(tid) {
+            Some(r) => &mut r.threads,
+            None => {
+                let none = &mut *core::ptr::addr_of_mut!(NO_TASK);
+                *none = PerTask::new();
+                none
+            }
+        }
+    }
+}
+
+static mut NO_TASK: PerTask = PerTask::new();
+
 
 #[inline(always)]
 fn irq_save() -> u64 {
@@ -56,9 +89,9 @@ pub fn task_made(tid: usize, maker: usize) {
     }
     let flags = irq_save();
     unsafe {
-        let names = &mut *core::ptr::addr_of_mut!(NAMES);
-        names[tid] = if maker < MAX_TASKS && maker != tid { names[maker] } else { [0; NAME_MAX + 1] };
-        (*core::ptr::addr_of_mut!(ROBUST))[tid] = 0;
+        let name = if maker < MAX_TASKS && maker != tid { st(maker).name } else { [0; NAME_MAX + 1] };
+        st(tid).name = name;
+        st(tid).robust = 0;
     }
     irq_restore(flags);
 }
@@ -71,7 +104,7 @@ pub fn name_of(tid: usize) -> ([u8; NAME_MAX], usize) {
     }
     let flags = irq_save();
     let len = unsafe {
-        let n = &(*core::ptr::addr_of!(NAMES))[tid];
+        let n = &st(tid).name;
         let len = (n[0] as usize).min(NAME_MAX);
         out[..len].copy_from_slice(&n[1..1 + len]);
         len
@@ -88,7 +121,7 @@ pub fn set_name(tid: usize, name: &[u8]) {
     let len = name.iter().take(NAME_MAX).position(|&b| b == 0).unwrap_or(name.len().min(NAME_MAX));
     let flags = irq_save();
     unsafe {
-        let n = &mut (*core::ptr::addr_of_mut!(NAMES))[tid];
+        let n = &mut st(tid).name;
         n[0] = len as u8;
         n[1..1 + len].copy_from_slice(&name[..len]);
     }
@@ -106,7 +139,7 @@ pub fn robust_list(tid: usize, head: u64) -> u64 {
     }
     let flags = irq_save();
     let was = unsafe {
-        let r = &mut (*core::ptr::addr_of_mut!(ROBUST))[tid];
+        let r = &mut st(tid).robust;
         let was = *r;
         if head != u64::MAX {
             *r = head;

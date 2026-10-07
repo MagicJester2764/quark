@@ -41,15 +41,50 @@ fn irq_restore(flags: u64) {
     unsafe { core::arch::asm!("push {}; popfq", in(reg) flags, options(nostack)) };
 }
 
-/// The process group and the session each task's process is in.
-static mut PGID: [u64; MAX_TASKS] = [0; MAX_TASKS];
-static mut SID: [u64; MAX_TASKS] = [0; MAX_TASKS];
-/// The signal that stopped the program each task is of; 0 while it runs.
-static mut STOPPED: [u8; MAX_TASKS] = [0; MAX_TASKS];
-/// What a process's parent has not been told yet.
-static mut REPORT: [u8; MAX_TASKS] = [0; MAX_TASKS];
+/// What this module keeps about a task, in its record (`TaskRec::job`):
+/// each field was an array of `MAX_TASKS`, and an id with no task reads as
+/// `PerTask::new()` — what an empty slot of those arrays held.
+pub struct PerTask {
+    /// The process group and the session each task's process is in.
+    pgid: u64,
+    sid: u64,
+    /// The signal that stopped the program each task is of; 0 while it runs.
+    stopped: u8,
+    /// What a process's parent has not been told yet.
+    report: u8,
+}
 
-/// In [`REPORT`], and what a wait asks to hear of.
+impl PerTask {
+    pub const fn new() -> Self {
+        PerTask {
+            pgid: 0,
+            sid: 0,
+            stopped: 0,
+            report: 0,
+        }
+    }
+}
+
+/// What this module keeps about task `tid`: its record's, or for an id with
+/// no task a copy put back to `PerTask::new()` each time it is asked for, so
+/// a write for a task that is not there goes nowhere. Interrupts must be off.
+unsafe fn st(tid: usize) -> &'static mut PerTask {
+    unsafe {
+        match crate::scheduler::rec(tid) {
+            Some(r) => &mut r.job,
+            None => {
+                let none = &mut *core::ptr::addr_of_mut!(NO_TASK);
+                *none = PerTask::new();
+                none
+            }
+        }
+    }
+}
+
+static mut NO_TASK: PerTask = PerTask::new();
+
+
+/// In a task's `report`, and what a wait asks to hear of.
 pub const HAS_STOPPED: u8 = 1;
 pub const HAS_CONTINUED: u8 = 2;
 
@@ -85,11 +120,11 @@ pub fn born(tid: usize, creator: usize, pid: u64) {
         return;
     }
     unsafe {
-        let (group, session) = if creator < MAX_TASKS { (PGID[creator], SID[creator]) } else { (0, 0) };
-        PGID[tid] = if group != 0 { group } else { pid };
-        SID[tid] = if session != 0 { session } else { pid };
-        STOPPED[tid] = 0;
-        REPORT[tid] = 0;
+        let (group, session) = if creator < MAX_TASKS { (st(creator).pgid, st(creator).sid) } else { (0, 0) };
+        st(tid).pgid = if group != 0 { group } else { pid };
+        st(tid).sid = if session != 0 { session } else { pid };
+        st(tid).stopped = 0;
+        st(tid).report = 0;
     }
 }
 
@@ -101,10 +136,10 @@ pub fn joined(tid: usize, of: usize) {
     }
     let flags = irq_save();
     unsafe {
-        PGID[tid] = PGID[of];
-        SID[tid] = SID[of];
-        STOPPED[tid] = STOPPED[of];
-        REPORT[tid] = 0;
+        st(tid).pgid = st(of).pgid;
+        st(tid).sid = st(of).sid;
+        st(tid).stopped = st(of).stopped;
+        st(tid).report = 0;
     }
     irq_restore(flags);
 }
@@ -115,10 +150,10 @@ pub fn joined(tid: usize, of: usize) {
 pub fn forget(tid: usize) {
     if tid < MAX_TASKS {
         unsafe {
-            PGID[tid] = 0;
-            SID[tid] = 0;
-            STOPPED[tid] = 0;
-            REPORT[tid] = 0;
+            st(tid).pgid = 0;
+            st(tid).sid = 0;
+            st(tid).stopped = 0;
+            st(tid).report = 0;
         }
     }
 }
@@ -128,7 +163,7 @@ pub fn pgid_of(tid: usize) -> u64 {
     if tid >= MAX_TASKS {
         return 0;
     }
-    unsafe { PGID[tid] }
+    unsafe { st(tid).pgid }
 }
 
 /// The session `tid`'s process is in; 0 for no task.
@@ -136,17 +171,17 @@ pub fn sid_of(tid: usize) -> u64 {
     if tid >= MAX_TASKS {
         return 0;
     }
-    unsafe { SID[tid] }
+    unsafe { st(tid).sid }
 }
 
 /// Whether `tid`'s program is stopped.
 pub fn is_stopped(tid: usize) -> bool {
-    tid < MAX_TASKS && unsafe { STOPPED[tid] != 0 }
+    tid < MAX_TASKS && unsafe { st(tid).stopped != 0 }
 }
 
 /// The signal that stopped the program `tid` is a task of; 0 if it runs.
 pub fn stopped_by(tid: usize) -> u8 {
-    if tid < MAX_TASKS { unsafe { STOPPED[tid] } } else { 0 }
+    if tid < MAX_TASKS { unsafe { st(tid).stopped } } else { 0 }
 }
 
 /// Every live task of process `pid`, to `each`.
@@ -170,7 +205,7 @@ pub fn members(pgid: u64, out: &mut [usize]) -> usize {
     let flags = irq_save();
     for tid in 2..MAX_TASKS {
         let Some((pid, _, _)) = live(tid) else { continue };
-        if unsafe { PGID[tid] } != pgid {
+        if unsafe { st(tid).pgid } != pgid {
             continue;
         }
         let seen = out[..n].iter().any(|&t| scheduler::pid_of(t) == pid);
@@ -197,7 +232,7 @@ pub fn group_in_session(pgid: u64, sid: u64) -> bool {
     }
     let flags = irq_save();
     let found = (2..MAX_TASKS)
-        .any(|tid| scheduler::task_info(tid).is_some() && unsafe { PGID[tid] == pgid && SID[tid] == sid });
+        .any(|tid| scheduler::task_info(tid).is_some() && unsafe { st(tid).pgid == pgid && st(tid).sid == sid });
     irq_restore(flags);
     found
 }
@@ -211,7 +246,7 @@ fn tied(tid: usize) -> bool {
     }
     let Some((_, _, parent_space)) = live(parent) else { return false };
     // A thread's parent is the task that made it, in the program they share.
-    parent_space != space && unsafe { SID[parent] == SID[tid] && PGID[parent] != PGID[tid] }
+    parent_space != space && unsafe { st(parent).sid == st(tid).sid && st(parent).pgid != st(tid).pgid }
 }
 
 /// Is group `pgid` orphaned: has it no member whose parent is in another
@@ -226,7 +261,7 @@ fn tied(tid: usize) -> bool {
 /// command and the login that started them, for good.
 pub fn orphaned(pgid: u64) -> bool {
     let flags = irq_save();
-    let tied_in = (2..MAX_TASKS).any(|tid| unsafe { PGID[tid] } == pgid && tied(tid));
+    let tied_in = (2..MAX_TASKS).any(|tid| unsafe { st(tid).pgid } == pgid && tied(tid));
     irq_restore(flags);
     !tied_in
 }
@@ -254,7 +289,7 @@ pub fn set_pgid(caller: usize, pid: u64, pgid: u64) -> Result<(), Refused> {
                 return Err(Refused::NoSuch);
             }
         }
-        let (session, target_session) = unsafe { (SID[caller], SID[target]) };
+        let (session, target_session) = unsafe { (st(caller).sid, st(target).sid) };
         if target_session != session || target_session == pid {
             return Err(Refused::NotAllowed);
         }
@@ -262,7 +297,7 @@ pub fn set_pgid(caller: usize, pid: u64, pgid: u64) -> Result<(), Refused> {
         if pgid != pid && !group_in_session(pgid, session) {
             return Err(Refused::NotAllowed);
         }
-        each_task_of(pid, |tid| unsafe { PGID[tid] = pgid });
+        each_task_of(pid, |tid| unsafe { st(tid).pgid = pgid });
         Ok(())
     })();
     irq_restore(flags);
@@ -278,13 +313,13 @@ pub fn set_sid(caller: usize) -> Result<u64, Refused> {
     let flags = irq_save();
     let pid = scheduler::pid_of(caller);
     let leads = pid == 0
-        || (2..MAX_TASKS).any(|tid| live(tid).is_some() && unsafe { PGID[tid] } == pid);
+        || (2..MAX_TASKS).any(|tid| live(tid).is_some() && unsafe { st(tid).pgid } == pid);
     let out = if leads {
         Err(Refused::NotAllowed)
     } else {
         each_task_of(pid, |tid| unsafe {
-            PGID[tid] = pid;
-            SID[tid] = pid;
+            st(tid).pgid = pid;
+            st(tid).sid = pid;
         });
         Ok(pid)
     };
@@ -308,8 +343,8 @@ pub fn stop(tid: usize, signo: u8) {
     if pid != 0 && !is_stopped(tid) {
         each_task_of(pid, |t| {
             unsafe {
-                STOPPED[t] = signo;
-                REPORT[t] = HAS_STOPPED;
+                st(t).stopped = signo;
+                st(t).report = HAS_STOPPED;
             }
             scheduler::hold_task(t);
         });
@@ -331,8 +366,8 @@ pub fn resume(tid: usize) {
     if pid != 0 && is_stopped(tid) {
         each_task_of(pid, |t| {
             unsafe {
-                STOPPED[t] = 0;
-                REPORT[t] = HAS_CONTINUED;
+                st(t).stopped = 0;
+                st(t).report = HAS_CONTINUED;
             }
             scheduler::release_task(t);
         });
@@ -353,12 +388,12 @@ pub fn take_report(tid: usize, want: u8) -> Option<u8> {
     if tid >= MAX_TASKS {
         return None;
     }
-    let report = unsafe { REPORT[tid] } & want;
+    let report = unsafe { st(tid).report } & want;
     if report == 0 {
         return None;
     }
-    let (pid, signo) = (scheduler::pid_of(tid), unsafe { STOPPED[tid] });
-    each_task_of(pid, |t| unsafe { REPORT[t] = 0 });
+    let (pid, signo) = (scheduler::pid_of(tid), unsafe { st(tid).stopped });
+    each_task_of(pid, |t| unsafe { st(t).report = 0 });
     Some(if report & HAS_STOPPED != 0 { signo } else { 0 })
 }
 
@@ -411,15 +446,15 @@ pub fn process_ended(tid: usize) {
         return;
     }
     let pid = scheduler::pid_of(tid);
-    let (group, session) = unsafe { (PGID[tid], SID[tid]) };
+    let (group, session) = unsafe { (st(tid).pgid, st(tid).sid) };
     if pid != 0 && session == pid {
         crate::pty::session_gone(session);
     }
     // The groups this process tied to its session: its own, if its parent
     // was the tie, and each child's, if it was theirs.
     let check = |g: u64| unsafe {
-        let tied_still = (2..MAX_TASKS).any(|t| PGID[t] == g && tied(t));
-        let has_stopped = (2..MAX_TASKS).any(|t| live(t).is_some() && PGID[t] == g && STOPPED[t] != 0);
+        let tied_still = (2..MAX_TASKS).any(|t| st(t).pgid == g && tied(t));
+        let has_stopped = (2..MAX_TASKS).any(|t| live(t).is_some() && st(t).pgid == g && st(t).stopped != 0);
         let queued = (&*core::ptr::addr_of!(HANGUPS))[..HANGUP_COUNT].contains(&g);
         if g != 0 && !tied_still && has_stopped && !queued && HANGUP_COUNT < MAX_TASKS {
             HANGUPS[HANGUP_COUNT] = g;
@@ -429,15 +464,15 @@ pub fn process_ended(tid: usize) {
     if let Some((_, _, _, parent)) = scheduler::task_info(tid) {
         let was_tie = parent != 0
             && live(parent).is_some()
-            && unsafe { SID[parent] == session && PGID[parent] != group };
+            && unsafe { st(parent).sid == session && st(parent).pgid != group };
         if was_tie {
             check(group);
         }
     }
     for child in 2..MAX_TASKS {
         let Some((_, parent, _)) = live(child) else { continue };
-        if parent == tid && unsafe { SID[child] == session && PGID[child] != group } {
-            check(unsafe { PGID[child] });
+        if parent == tid && unsafe { st(child).sid == session && st(child).pgid != group } {
+            check(unsafe { st(child).pgid });
         }
     }
 }
