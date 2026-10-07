@@ -6,6 +6,11 @@ edition = "2024"
 [dependencies]
 font8x8 = { version = "0.3", default-features = false }
 
+[features]
+# A kernel for testing its stacks: SYS_MEM_INFO 6 calls itself until its
+# kernel stack has run out, which ends the machine with a fault that says so.
+stacktest = []
+
 [profile.dev]
 panic = "abort"
 

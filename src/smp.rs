@@ -34,8 +34,6 @@ use crate::multiboot2::{MemoryRegion, MMAP_TYPE_AVAILABLE};
 use crate::percpu::{self, MAX_CPUS};
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 
-/// The stack a processor's idle loop runs on, and an interrupt taken there.
-const IDLE_STACK_SIZE: usize = 65536;
 const PAGE: usize = 4096;
 
 unsafe extern "C" {
@@ -191,7 +189,6 @@ pub unsafe fn start(regions: &[MemoryRegion], mb_info: (usize, usize)) {
         word32(&raw const ap_word_cr3, crate::paging::kernel_cr3() as u32);
         word64(&raw const ap_word_entry, arrive as extern "C" fn(usize) -> ! as usize as u64);
 
-        let layout = core::alloc::Layout::from_size_align(IDLE_STACK_SIZE, 16).unwrap();
         let mut index = 1;
         for cpu in &info.cpus[..info.ncpus] {
             if cpu.apic_id == me {
@@ -200,12 +197,14 @@ pub unsafe fn start(regions: &[MemoryRegion], mb_info: (usize, usize)) {
             if index >= MAX_CPUS {
                 break;
             }
-            let stack = alloc::alloc::alloc(layout);
-            if stack.is_null() {
+            // The stack its idle loop runs on, and an interrupt taken there,
+            // and the one it takes a double fault on: each with a page below
+            // it that faults (`kstack.rs`).
+            let (Some((stack, top)), Some((_, df))) = (crate::kstack::alloc(), crate::kstack::alloc()) else {
                 break;
-            }
-            let top = stack as usize + IDLE_STACK_SIZE;
-            *(&raw mut ARRIVING_STACK) = (stack as usize, top);
+            };
+            percpu::set_df_stack(index, df);
+            *(&raw mut ARRIVING_STACK) = (stack, top);
             word64(&raw const ap_word_stack, top as u64);
             word64(&raw const ap_word_index, index as u64);
 

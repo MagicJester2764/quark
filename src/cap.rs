@@ -203,6 +203,13 @@ struct Holding {
 
 const NO_HOLDING: u16 = u16::MAX;
 
+/// What a holding and a number's count of revocations are made from, in
+/// their room (`Table::fill_from`): a holding is six kilobytes, which built
+/// on the stack were a kernel stack's.
+static EMPTY_HOLDING: crate::table::Template<Holding> =
+    crate::table::Template(Some(Holding { slots: empty_cspace(), bits: 0, users: 0 }));
+static NO_REVOCATIONS: crate::table::Template<[u32; MAX_CAPS]> = crate::table::Template(Some([0; MAX_CAPS]));
+
 /// Every program's holding, by number (`table.rs`): made with a task, which
 /// may then join its program's, and given back when the last task using it
 /// has gone.
@@ -365,8 +372,8 @@ pub fn task_made(tid: usize) {
         // (`GENERATIONS`); with no memory for either, it holds nothing.
         let free = if holdings().used(tid) { holdings().lowest_free(0) } else { Some(tid) };
         if let Some(i) = free {
-            let counted = generations().used(i) || generations().fill_at(i, [0; MAX_CAPS]).is_ok();
-            if counted && holdings().fill_at(i, Holding { slots: empty_cspace(), bits: 0, users: 1 }).is_ok() {
+            let counted = generations().used(i) || generations().fill_from(i, &NO_REVOCATIONS, |_| {}).is_ok();
+            if counted && holdings().fill_from(i, &EMPTY_HOLDING, |h| h.users = 1).is_ok() {
                 st(tid).holding = i as u16;
             }
         }

@@ -251,9 +251,10 @@ pub fn identity_end() -> usize {
 /// The map is the first entry of the top-level table, and every address
 /// space is made with a copy of the table under it
 /// (`userspace::create_address_space`): so this is done once, at boot,
-/// before there is an address space to have missed it. The last gigabyte of
-/// that entry is the kernel's heap (`heap.rs`), which is why memory past
-/// `pmm::MAX_PHYS` is not used.
+/// before there is an address space to have missed it. The last two
+/// gigabytes of that entry are the kernel's stacks and its heap
+/// (`kstack.rs`, `heap.rs`), which is why memory past `pmm::MAX_PHYS` is not
+/// used.
 ///
 /// # Safety
 /// Once, on the first processor, before the heap, before any address space
@@ -267,7 +268,7 @@ pub unsafe fn map_all_memory(top: usize) { unsafe {
     let whole = core::arch::x86_64::__cpuid(0x8000_0000).eax >= 0x8000_0001
         && core::arch::x86_64::__cpuid(0x8000_0001).edx & (1 << 26) != 0;
     let mut end = identity_end();
-    for i in end / GIB..top.div_ceil(GIB).min(511) {
+    for i in end / GIB..top.div_ceil(GIB).min(510) {
         if !pdpt.entries[i].is_present() {
             if whole {
                 pdpt.entries[i].set(i * GIB, PRESENT | WRITABLE | HUGE_PAGE);
@@ -404,6 +405,20 @@ unsafe fn walk_create(
 
     // Level 1: PT
     Ok(table_at(pd.entries[pdi].frame_address()))
+}}
+
+/// Leave the page at `virt` with nothing behind it, the tables down to it made
+/// and a page of two megabytes it was in split: the page below a kernel
+/// stack (`kstack.rs`), which the kernel wants a fault on.
+///
+/// # Safety
+/// At boot, on the first processor, with interrupts off.
+pub unsafe fn leave_unmapped(pml4_phys: usize, virt_addr: usize) -> Result<(), PagingError> { unsafe {
+    let (_, _, _, pti) = table_indices(virt_addr);
+    let pt = walk_create(pml4_phys, virt_addr, 0)?;
+    pt.entries[pti] = PageTableEntry(0);
+    core::arch::asm!("invlpg [{}]", in(reg) virt_addr, options(nostack, preserves_flags));
+    Ok(())
 }}
 
 /// The page directory that holds `virt`'s entry, made if it is not there.

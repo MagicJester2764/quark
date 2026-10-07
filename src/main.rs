@@ -15,6 +15,7 @@ mod display;
 mod fat32;
 mod fpu;
 mod heap;
+mod kstack;
 mod idt;
 mod intc;
 mod io;
@@ -108,6 +109,9 @@ pub extern "C" fn kernel_main(multiboot_info: usize) -> ! {
     // otherwise reach.
     paging::save_kernel_cr3();
     unsafe { paging::map_all_memory(pmm::top_of_memory()) };
+    // Where kernel stacks are, with a page below each that faults: made
+    // before there is an address space, which every one shares.
+    unsafe { kstack::init() };
 
     // Initialize console (VGA driver receives kernel services)
     console::init(fb);

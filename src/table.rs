@@ -30,6 +30,13 @@ const BLOCKS: usize = MOST / PER_BLOCK;
 
 type Block<T> = [*mut Option<T>; PER_BLOCK];
 
+/// What a record is made from by [`Table::fill_from`]: a whole one, copied
+/// into a slot's room. It owns nothing — whatever it would point to is null —
+/// so a copy of it is a record of its own.
+pub struct Template<T>(pub Option<T>);
+
+unsafe impl<T> Sync for Template<T> {}
+
 pub struct Table<T> {
     /// Blocks of slots, a block made the first time one of its slots is.
     blocks: [*mut Block<T>; BLOCKS],
@@ -125,17 +132,17 @@ impl<T> Table<T> {
         None
     }
 
-    /// Put `record` in slot `i`. The record comes back if the slot is taken,
-    /// past the limit, or there is no memory for it.
-    pub fn fill_at(&mut self, i: usize, record: T) -> Result<(), T> {
+    /// Slot `i`'s room, made if it is not there: `None` past the limit, or
+    /// with no memory for it.
+    fn room(&mut self, i: usize) -> Option<*mut Option<T>> {
         if i >= self.limit {
-            return Err(record);
+            return None;
         }
         let b = i / PER_BLOCK;
         if self.blocks[b].is_null() {
             let block = unsafe { alloc::alloc::alloc(Layout::new::<Block<T>>()) } as *mut Block<T>;
             if block.is_null() {
-                return Err(record);
+                return None;
             }
             unsafe { block.write([core::ptr::null_mut(); PER_BLOCK]) };
             self.blocks[b] = block;
@@ -144,20 +151,50 @@ impl<T> Table<T> {
         if at.is_null() {
             let cell = unsafe { alloc::alloc::alloc(Layout::new::<Option<T>>()) } as *mut Option<T>;
             if cell.is_null() {
-                return Err(record);
+                return None;
             }
             unsafe { cell.write(None) };
             *at = cell;
         }
-        let cell = unsafe { &mut **at };
-        if cell.is_some() {
-            return Err(record);
-        }
-        *cell = Some(record);
+        Some(*at)
+    }
+
+    fn mark(&mut self, i: usize) {
         self.filled[i / 64] |= 1 << (i % 64);
         if i >= self.high {
             self.high = i + 1;
         }
+    }
+
+    /// Put `record` in slot `i`. The record comes back if the slot is taken,
+    /// past the limit, or there is no memory for it.
+    pub fn fill_at(&mut self, i: usize, record: T) -> Result<(), T> {
+        let Some(cell) = self.room(i) else { return Err(record) };
+        let cell = unsafe { &mut *cell };
+        if cell.is_some() {
+            return Err(record);
+        }
+        *cell = Some(record);
+        self.mark(i);
+        Ok(())
+    }
+
+    /// Put a copy of `template` in slot `i`, and have `init` make it this
+    /// one: a record made in its room. Built on the stack and moved, a record
+    /// costs a kernel stack its size, and more than once — a task's is six
+    /// kilobytes. Fails where [`fill_at`](Table::fill_at) would.
+    pub fn fill_from(&mut self, i: usize, template: &'static Template<T>, init: impl FnOnce(&mut T)) -> Result<(), ()> {
+        let cell = self.room(i).ok_or(())?;
+        unsafe {
+            if (*cell).is_some() {
+                return Err(());
+            }
+            core::ptr::copy_nonoverlapping(&template.0 as *const Option<T>, cell, 1);
+            if let Some(record) = (*cell).as_mut() {
+                init(record);
+            }
+        }
+        self.mark(i);
         Ok(())
     }
 

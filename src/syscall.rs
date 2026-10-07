@@ -512,6 +512,18 @@ pub const ABI_VERSION_MINOR: u64 = 1;
 /// program, with a fork not counted at all.
 pub const A_PROGRAMS_TASKS: usize = 4_096;
 
+/// Call itself until the kernel stack has run out (`SYS_MEM_INFO` 6, in a
+/// kernel built with `stacktest`): each call keeps half a kilobyte, and adds
+/// to what the next returns, so that none of it can be left out.
+#[cfg(feature = "stacktest")]
+#[inline(never)]
+fn run_out_of_stack(depth: u64) -> u64 {
+    let mut kept = [0u8; 512];
+    kept[(depth % 512) as usize] = depth as u8;
+    core::hint::black_box(&mut kept);
+    run_out_of_stack(depth + 1).wrapping_add(kept[(depth % 512) as usize] as u64)
+}
+
 /// May `caller` set `tid` up?
 ///
 /// A task it created and has not started is its own to fill: nobody else can
@@ -3919,6 +3931,12 @@ fn dispatch(
                     let (out, back) = crate::memobj::swap_traffic();
                     (out.min(u32::MAX as u64) << 32) | back.min(u32::MAX as u64)
                 }
+                // In a kernel built to test its stacks (`stacktest`): call
+                // itself until the stack has run out, which is the end of the
+                // machine, and a fault that says why. Any other kernel answers
+                // that it was not built.
+                #[cfg(feature = "stacktest")]
+                6 => run_out_of_stack(0),
                 _ => u64::MAX,
             }
         }

@@ -34,8 +34,9 @@ check-abi:
 
 all: check-abi $(KERNEL) drivers
 
+# FEATURES=stacktest builds a kernel for testing (Cargo.toml says what).
 $(KERNEL): FORCE
-	cargo rustc --release -- -C link-arg=-Tlinker.ld
+	cargo rustc --release $(if $(FEATURES),--features $(FEATURES)) -- -C link-arg=-Tlinker.ld
 	cp $(BINARY) $(KERNEL)
 
 drivers: $(VGA_DRV_BIN) $(FAT32_DRV_BIN)

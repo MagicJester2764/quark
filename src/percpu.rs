@@ -42,10 +42,6 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 /// long; a machine with more has the rest left stopped.
 pub const MAX_CPUS: usize = 16;
 
-/// The stack a double fault is taken on, per processor: the one fault that
-/// may mean the ordinary stack is gone.
-const DF_STACK_SIZE: usize = 16384;
-
 /// The 64-bit task state segment: where the processor finds a stack when it
 /// changes privilege or takes an interrupt with an IST index.
 #[repr(C, packed)]
@@ -104,6 +100,9 @@ pub struct PerCpu {
     /// The stack the idle loop runs on, for a fault report to check a stack
     /// pointer against.
     idle_stack: (usize, usize),
+    /// The top of the stack a double fault is taken on: the one fault that
+    /// may mean the ordinary stack is gone (`kstack.rs`).
+    df_top: u64,
     /// The address space it has loaded: what is in its CR3. Written by the
     /// processor itself (`paging::write_cr3`), and read by one that has
     /// changed a space's tables and needs to know who may be holding the
@@ -150,6 +149,7 @@ const EMPTY: PerCpu = PerCpu {
     gdt: [0; GDT_ENTRIES],
     idle_context: CpuContext::empty(),
     idle_stack: (0, 0),
+    df_top: 0,
     cr3: AtomicUsize::new(0),
     apic_id: AtomicU32::new(0),
     napping: AtomicBool::new(false),
@@ -163,9 +163,6 @@ static mut CPUS: [PerCpu; MAX_CPUS] = [EMPTY; MAX_CPUS];
 /// they came, so the processors are `0..count()` with no gaps.
 static ONLINE: AtomicUsize = AtomicUsize::new(1);
 
-#[repr(C, align(16))]
-struct DfStack([u8; DF_STACK_SIZE]);
-static mut DF_STACKS: [DfStack; MAX_CPUS] = [const { DfStack([0; DF_STACK_SIZE]) }; MAX_CPUS];
 
 const MSR_GS_BASE: u32 = 0xC000_0101;
 const MSR_KERNEL_GS_BASE: u32 = 0xC000_0102;
@@ -393,6 +390,13 @@ pub unsafe fn init(index: usize, stack: (usize, usize)) {
     }
 }
 
+/// Processor `index` takes a double fault on the stack whose top is `top`,
+/// from when it loads its tables. Before it is started, or by itself before
+/// it has.
+pub fn set_df_stack(index: usize, top: usize) {
+    unsafe { (*(&raw mut CPUS[index])).df_top = top as u64 };
+}
+
 #[repr(C, packed)]
 struct TablePtr {
     limit: u16,
@@ -412,10 +416,7 @@ struct TablePtr {
 pub unsafe fn load_tables() {
     unsafe {
         let cpu = this();
-        let index = (*cpu).index as usize;
-
-        let df_top = (&raw const DF_STACKS[index]) as u64 + DF_STACK_SIZE as u64;
-        (*cpu).tss.ist[0] = df_top;
+        (*cpu).tss.ist[0] = (*cpu).df_top;
         (*cpu).tss.iomap_base = TSS_SIZE as u16;
 
         let base = (&raw const (*cpu).tss) as u64;

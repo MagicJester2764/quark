@@ -1689,7 +1689,7 @@ where it is memory, is kept from the allocator in the same way.
 | # | Name | Arguments | Returns | Cap |
 |---|---|---|---|---|
 | 192 | `SYS_MAP_ANON` | arg0 = address, arg1 = pages (at most 2^27), arg2 = flags (1 = back every page now, 2 = no more pages than the machine has) | 0 / `u64::MAX` | — |
-| 193 | `SYS_MEM_INFO` | arg0 = what: 0 to 4 | 0: `(free frames << 32) \| pages charged to the caller`; 1: how many frames of memory the machine has; 2: the number of the frame after its last; 3: `(pages of room to write memory out to << 32) \| pages of it in use`; 4: `(pages written out << 32) \| pages read back`, since the machine started / `u64::MAX` | — |
+| 193 | `SYS_MEM_INFO` | arg0 = what: 0 to 4, and 6 in a kernel built to test its stacks | 0: `(free frames << 32) \| pages charged to the caller`; 1: how many frames of memory the machine has; 2: the number of the frame after its last; 3: `(pages of room to write memory out to << 32) \| pages of it in use`; 4: `(pages written out << 32) \| pages read back`, since the machine started; 6, only in a kernel built with `stacktest`: the call calls itself in the kernel until its kernel stack has run out, which ends the machine with a fault that says so — any other kernel answers `u64::MAX` / `u64::MAX` | — |
 | 194 | `SYS_OBJECT_CREATE` | arg0 = cookie, arg1 = bytes, arg2 = slot | object id / `u64::MAX` | — |
 | 195 | `SYS_OBJECT_MAP` | arg0 = slot, arg1 = address, arg2 = pages, arg3 = first page, arg4 = flags (1 write, 2 shared, 4 exec) | 0 / `u64::MAX` | `MemObject`: read; write too for a shared writable mapping |
 | 196 | `SYS_OBJECT_CTL` | arg0 = object id, arg1 = op, arg2, arg3 | per op / `u64::MAX` | the object's pager |

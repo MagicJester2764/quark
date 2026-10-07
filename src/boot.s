@@ -64,7 +64,13 @@ pd2:
 pd3:
     .skip 4096
 
-.align 16
+// The page below the boot stack is left unmapped (`kstack::init`), so that
+// running out of it is a fault that says so, where it was a page directory
+// written over.
+.align 4096
+.global boot_stack_guard
+boot_stack_guard:
+    .skip 4096
 .global boot_stack_bottom
 boot_stack_bottom:
     .skip 65536         // 64 KiB: the stack the first processor boots and idles on

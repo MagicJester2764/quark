@@ -200,6 +200,11 @@ with the odd stale entry from a frame since left;
 `nm -n target/x86_64-unknown-none/release/quark` says which function each is
 in. It is what turned `rip=0x1029`, which names nothing, into "in
 `timerfd::tick`, from the timer interrupt, with the direction flag set".
+It says how much of the stack the task had used (`used=`), and a stack that
+ran out says so — `kernel stack overflow, task T name=...` — with its
+`calls` read from the stack's bottom, where the calls that did it are.
+`[kstack] deepest N of M bytes` on serial is the deepest any kernel stack has
+gone, said each time it is passed and at shutdown.
 
 ## Invariants that must not regress
 
@@ -225,17 +230,35 @@ may keep — are in `../quarkutils/CLAUDE.md`; these are the kernel's.
   makes SMAP safe: no USER bit exists anywhere in the kernel's identity map.
   Validate with `paging::user_range_ok`.
 - **The kernel's own map of memory is made once, at boot, and is all of
-  PML4[0] but its last gigabyte.** `boot.s` maps four gigabytes;
+  PML4[0] but its last two gigabytes.** `boot.s` maps four gigabytes;
   `paging::map_all_memory` extends that over all the memory the firmware
   reports, before the heap exists and before any address space is made —
   because every address space is made with a *copy* of the table under
   PML4[0], and a gigabyte mapped afterwards is one that only the kernel's
   own table has. The heap is the last gigabyte of that entry (`heap.rs`):
   it used to sit at four gigabytes, just past a map that ended there, which
-  is where a machine's fifth gigabyte of memory is. What the kernel can
+  is where a machine's fifth gigabyte of memory is. Kernel stacks are the
+  gigabyte below it (`kstack.rs`), whose page directory is made before
+  there is an address space for the same reason. What the kernel can
   touch as itself ends at `paging::identity_end()`, not at a constant: a
   check against `1 << 32` is a signal that is silently not told on a
   machine with more memory than that.
+- **A kernel stack has a page below it that faults** (`kstack.rs`): every
+  task's, every processor's idle stack and every stack a double fault is
+  taken on, in their region with 4 KiB pages, and the first processor's
+  boot stack, whose page is split out of the image's two-megabyte pages.
+  A stack that runs out faults there, and the report says so. It ran into
+  whatever the heap had below it, for as long as there was heap: down
+  through other tasks' records, to a double fault at the heap's bottom
+  that named a stack that was not the task's. A stack given back is
+  unmapped, and every processor told before its frames are anybody else's
+  (`tlb::stale_everywhere`: every address space has the region).
+  **What a stack holds is kept small**: a record kilobytes long is made in
+  its room (`Table::fill_from`, from a template), not built in a frame and
+  moved — making a task built its record, its holding and its program's
+  record so, and took thirty kilobytes of its caller's stack. A new path
+  that builds something that size on the stack is read for that; the
+  stacks are sized at twice the deepest the acceptance measures.
 - **Ordinary memory comes from the top, and memory a device is told the
   address of from below four gigabytes** (`pmm::alloc`, `pmm::alloc_low`).
   A network card's ring is named in a register thirty-two bits wide; given
@@ -1385,6 +1408,8 @@ breaking any of them is quiet until it is a machine that stops.
 
 ## Known gaps
 
+- Memory past 510 GiB is not used: the kernel's map of it is PML4[0] less
+  the gigabytes its stacks and its heap are in.
 - Memory is written out only where a system starts a pager for it
   (`swapd` in `../quarkutils`), and only as fast as that pager's disk: it
   writes through the file server, a page a call. With none, or with it

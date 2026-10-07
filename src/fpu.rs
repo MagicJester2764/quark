@@ -207,6 +207,28 @@ pub fn clean() -> FpuState {
     unsafe { CLEAN }
 }
 
+/// The state a task starts with, written into `area` where it is: a copy of
+/// [`clean`] is two and a half kilobytes of a kernel stack on its way there.
+///
+/// # Safety
+/// `area` must be valid for writes of an `FpuState`.
+pub unsafe fn clean_into(area: *mut FpuState) {
+    unsafe { core::ptr::copy_nonoverlapping(&raw const CLEAN, area, 1) };
+}
+
+/// Put the processor's floating-point registers back to the state a task
+/// starts with, from where it is kept.
+///
+/// # Safety
+/// As [`restore`].
+pub unsafe fn restore_clean() {
+    unsafe { restore(&raw const CLEAN) };
+}
+
+/// Nothing at all: what a record is made from before it is a task's
+/// (`TaskRec::empty`).
+pub const ZERO: FpuState = FpuState([0; AREA_SIZE]);
+
 /// Save the processor's current floating-point state into `area`.
 ///
 /// # Safety

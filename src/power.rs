@@ -66,6 +66,7 @@ pub fn off() {
         return;
     };
     stop_everything_else();
+    crate::kstack::say_deepest();
     crate::serial::puts(b"Power: off.\n");
     let port = info.pm1a_cnt as u16;
     unsafe {
@@ -102,6 +103,7 @@ pub fn off() {
 pub fn restart() -> ! {
     let info = acpi::info();
     stop_everything_else();
+    crate::kstack::say_deepest();
     crate::serial::puts(b"Power: restarting.\n");
     unsafe {
         if let Some(reset) = info.reset {

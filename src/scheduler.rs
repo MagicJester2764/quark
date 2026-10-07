@@ -2445,22 +2445,20 @@ pub fn program_tasks(tid: usize) -> usize {
     n
 }
 
+/// What a task's record is made from (`Table::fill_from`).
+static TASK_TEMPLATE: crate::table::Template<TaskRec> = crate::table::Template(Some(TaskRec::empty()));
+
 pub fn create_empty_task() -> Option<usize> {
-    // Allocate the stack up front: this takes the heap lock and can re-enable
-    // interrupts, so it must happen before the slot is claimed.
-    let layout = core::alloc::Layout::from_size_align(KERNEL_STACK_SIZE, 16)
-        .expect("scheduler: invalid stack layout");
-    let stack_base = unsafe { alloc::alloc::alloc(layout) };
-    if stack_base.is_null() {
-        return None;
-    }
+    // The stack up front, before the slot is claimed (`kstack.rs`).
+    let (stack_base, _) = crate::kstack::alloc()?;
+    let stack_base = stack_base as *mut u8;
 
     let flags = irq_save();
     let tid = match unsafe { find_free_tid() } {
         Some(t) => t,
         None => {
             irq_restore(flags);
-            unsafe { alloc::alloc::dealloc(stack_base, layout) };
+            crate::kstack::free(stack_base as usize);
             return None;
         }
     };
@@ -2473,37 +2471,28 @@ pub fn create_empty_task() -> Option<usize> {
         }
     };
     unsafe {
-        let made = TaskRec::new(Task {
-            tid,
-            state: TaskState::Blocked,
-            context: context::CpuContext::empty(),
-            kernel_stack_base: stack_base,
-            kernel_stack_size: KERNEL_STACK_SIZE,
-            priority: crate::scheduler::PRIO_NORMAL,
-            base_priority: crate::scheduler::PRIO_NORMAL,
-            cr3: 0,
-            space: 0,
-            pager_tid: 0,
-            parent_tid: parent,
-            mem_pages: 0,
-            mem_limit: 0,
-            exit_code: 0,
-            fs_base: 0,
-            clear_child_tid: 0,
-            uid: parent_uid,
-            gid: parent_gid,
-            groups: parent_groups,
-            ngroups: parent_ngroups,
+        // Made in its room, from what every task starts as: built here and
+        // moved, the record took six kilobytes of the caller's kernel stack.
+        let made = table().fill_from(tid, &TASK_TEMPLATE, |r| {
+            let t = &mut r.task;
+            t.tid = tid;
+            t.kernel_stack_base = stack_base;
+            t.kernel_stack_size = KERNEL_STACK_SIZE;
+            t.parent_tid = parent;
+            t.uid = parent_uid;
+            t.gid = parent_gid;
+            t.groups = parent_groups;
+            t.ngroups = parent_ngroups;
             // Clean, not the parent's. A new task inheriting whatever the
             // registers held when it was created would be reading its
             // creator's data, and a thread has no more right to that than a
             // stranger: it can already read the memory, but not the moment.
-            fpu: crate::fpu::clean(),
+            crate::fpu::clean_into(&raw mut t.fpu);
         });
-        if table().fill_at(tid, made).is_err() {
+        if made.is_err() {
             // No memory for its record: nothing was made.
             irq_restore(flags);
-            alloc::alloc::dealloc(stack_base, layout);
+            crate::kstack::free(stack_base as usize);
             return None;
         }
         // A new record is a clean one: nothing pinned, no signals held back
@@ -3144,7 +3133,7 @@ pub fn exec_into(cr3: usize, entry: u64, rsp: u64) -> Result<(), ()> {
                 t.fs_base = 0;
                 t.clear_child_tid = 0;
                 t.mem_pages = 0;
-                t.fpu = crate::fpu::clean();
+                crate::fpu::clean_into(&raw mut t.fpu);
             }
             // What this call checked was memory of the program it was.
             st(caller).npinned = 0;
@@ -3178,7 +3167,7 @@ pub fn exec_into(cr3: usize, entry: u64, rsp: u64) -> Result<(), ()> {
     unsafe {
         crate::paging::write_cr3(cr3);
         crate::cpu::set_fs_base(0);
-        crate::fpu::restore(&crate::fpu::clean());
+        crate::fpu::restore_clean();
     }
     if crate::userspace::addrspace_unref(old_cr3) {
         drop_unused_space(old_cr3);

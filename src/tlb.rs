@@ -81,6 +81,24 @@ pub fn stale(cr3: usize) {
     }
 }
 
+/// A mapping every address space has has been taken out — a kernel stack's
+/// (`kstack.rs`) — and every processor is to be told, whatever it has
+/// loaded. The caller holds the kernel lock.
+pub fn stale_everywhere() {
+    if percpu::count() == 1 {
+        return;
+    }
+    let flags: u64;
+    unsafe {
+        core::arch::asm!("pushfq; pop {}; cli", out(reg) flags, options(nostack));
+        *(&raw mut EVERY_SPACE) = true;
+        ANY.store(true, Ordering::Release);
+        if flags & (1 << 9) != 0 {
+            core::arch::asm!("sti", options(nostack, nomem));
+        }
+    }
+}
+
 /// Tell every other processor that has a changed address space loaded to
 /// forget its translations, and wait until each has.
 ///

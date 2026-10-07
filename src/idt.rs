@@ -551,8 +551,10 @@ fn report_kernel_state(tag: &[u8], frame: &InterruptFrame, kbase: usize, ktop: u
 
     // Only a stack pointer inside the task's own kernel stack is read from:
     // one that is not is part of what went wrong, and reading through it
-    // would fault again inside the report.
+    // would fault again inside the report. One on the page below it is the
+    // stack run out, and what is read is from its bottom: the calls that did.
     let rsp = frame.rsp as usize & !7;
+    let rsp = if crate::kstack::is_guard(rsp) { kbase } else { rsp };
     if kbase == 0 || rsp < kbase || rsp >= ktop {
         puts(tag);
         puts(b" stack: rsp is not in the task's kernel stack]\n");
@@ -694,7 +696,7 @@ fn exception(frame: &mut InterruptFrame) {
     // whose faults write it: read again afterwards, it named another
     // program's page, and that is what a program ended for the fault was
     // told it had touched.
-    let cr2: u64 = if vec == 14 {
+    let cr2: u64 = if vec == 14 || vec == 8 {
         let at: u64;
         unsafe { core::arch::asm!("mov {}, cr2", out(reg) at, options(nostack, nomem)) };
         at
@@ -952,6 +954,32 @@ fn exception(frame: &mut InterruptFrame) {
     crate::serial::put_hex_usize(kbase);
     crate::serial::puts(b"..0x");
     crate::serial::put_hex_usize(ktop);
+    if kbase != 0 {
+        crate::serial::puts(b" used=");
+        crate::serial::put_usize(crate::kstack::used(kbase, ktop));
+    }
+    // A fault on the page below a kernel stack is the stack run out: taken
+    // there, or — the processor having nowhere to put the fault's frame — a
+    // double fault, with the stack pointer or the address there.
+    let overflow = (vec == 14 || vec == 8)
+        && (crate::kstack::is_guard(cr2 as usize) || (vec == 8 && crate::kstack::is_guard(frame.rsp as usize)));
+    if overflow {
+        let tid = crate::scheduler::current_tid();
+        crate::serial::puts(b" kernel stack overflow, task ");
+        crate::serial::put_usize(tid);
+        let mut name = [0u8; crate::fdtable::CMDLINE];
+        if let Some(len) = crate::fdtable::cmdline_of(tid, &mut name) {
+            crate::serial::puts(b" name=");
+            let len = name[..len].iter().rposition(|&b| b != 0).map_or(0, |i| i + 1);
+            for &b in &name[..len] {
+                crate::serial::putb(match b {
+                    0 => b' ',
+                    0x20..0x7f => b,
+                    _ => b'?',
+                });
+            }
+        }
+    }
     crate::serial::puts(b"]\n");
     report_kernel_state(b"[KFAULT", frame, kbase, ktop);
     console::puts(b"\n!!! EXCEPTION: ");

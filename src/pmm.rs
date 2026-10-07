@@ -32,9 +32,9 @@ const PAGE_SIZE: usize = 4096;
 const LOW_END: usize = 1 << 32;
 
 /// The most memory the kernel uses. Its own map of memory is the first
-/// entry of the top-level page table — 512 GiB — and the last gigabyte of
-/// that is the kernel's heap (`heap.rs`).
-pub const MAX_PHYS: u64 = 511 << 30;
+/// entry of the top-level page table — 512 GiB — and the last two gigabytes
+/// of that are the kernel's stacks and its heap (`kstack.rs`, `heap.rs`).
+pub const MAX_PHYS: u64 = 510 << 30;
 
 unsafe extern "C" {
     static __bss_end: u8;

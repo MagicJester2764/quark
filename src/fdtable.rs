@@ -237,6 +237,11 @@ pub struct Program {
 /// The end of a program's list of tasks.
 const END: u16 = u16::MAX;
 
+/// What a program's record is made from, in its room (`Table::fill_from`):
+/// five kilobytes, which built on the stack were a kernel stack's.
+static PROGRAM_TEMPLATE: crate::table::Template<Program> =
+    crate::table::Template(Some(Program { table: EMPTY, waiting: Waiting::EMPTY, timers: crate::ptimer::Timers::NONE, first: END }));
+
 /// Every program's record, by its table's number (`table.rs`): as many as
 /// there can be tasks, since each task uses exactly one.
 static mut TABLES: crate::table::Table<Program> = crate::table::Table::new(MAX_TASKS);
@@ -437,11 +442,8 @@ pub fn attach_new(tid: usize) -> bool {
             // A number of its own — there is always one, a table per task
             // and this task having none — and a record, if there is memory
             // for it.
-            let mut table = EMPTY;
-            table.tasks = 1;
-            let made = Program { table, waiting: Waiting::EMPTY, timers: crate::ptimer::Timers::NONE, first: END };
             match tables().lowest_free(0) {
-                Some(i) if tables().fill_at(i, made).is_ok() => {
+                Some(i) if tables().fill_from(i, &PROGRAM_TEMPLATE, |p| p.table.tasks = 1).is_ok() => {
                     st(tid).table = i as u16;
                     link(i, tid);
                     true

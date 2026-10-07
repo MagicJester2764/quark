@@ -4,14 +4,13 @@
 
 
 use crate::context::CpuContext;
-use alloc::alloc::{alloc, dealloc, Layout};
 
 /// How many tasks there can be: as many as a table has slots (`table.rs`).
 /// A task's record is made when it is, so this is a ceiling and not a cost.
 /// It was sixty-four, a desktop's limit and a fixed array's.
 pub const MAX_TASKS: usize = crate::table::MOST;
-pub const KERNEL_STACK_SIZE: usize = 65536; // 64 KiB per task
-const STACK_ALIGN: usize = 16;
+/// A task's kernel stack (`kstack.rs`): with a page below it that faults.
+pub const KERNEL_STACK_SIZE: usize = crate::kstack::KSTACK_SIZE;
 /// The most descriptors a program can have: the highest its limit goes.
 ///
 /// Eight was three spoken for and five left; thirty-two was enough until files
@@ -195,17 +194,41 @@ pub struct Task {
 unsafe impl Send for Task {}
 
 impl Task {
+    /// A task that is nothing yet: what a new record starts as (`TaskRec`'s
+    /// template), every field that is the task's made afterwards.
+    pub const EMPTY: Task = Task {
+        tid: 0,
+        state: TaskState::Blocked,
+        context: CpuContext::empty(),
+        kernel_stack_base: core::ptr::null_mut(),
+        kernel_stack_size: 0,
+        priority: crate::scheduler::PRIO_NORMAL,
+        base_priority: crate::scheduler::PRIO_NORMAL,
+        cr3: 0,
+        space: 0,
+        pager_tid: 0,
+        parent_tid: 0,
+        mem_pages: 0,
+        mem_limit: 0,
+        exit_code: 0,
+        fs_base: 0,
+        clear_child_tid: 0,
+        uid: 0,
+        gid: 0,
+        groups: [0; MAX_GROUPS],
+        ngroups: 0,
+        fpu: crate::fpu::ZERO,
+    };
+
     /// Create a new task that will start executing at `entry_fn`.
     ///
-    /// Allocates a kernel stack from the heap and sets up the initial context
+    /// Takes a kernel stack (`kstack.rs`) and sets up the initial context
     /// so that the first `context_switch` into this task "returns" into `entry_fn`.
     pub fn new(tid: usize, entry_fn: fn()) -> Self {
-        let layout = Layout::from_size_align(KERNEL_STACK_SIZE, STACK_ALIGN)
-            .expect("task: invalid stack layout");
-        let stack_base = unsafe { alloc(layout) };
-        if stack_base.is_null() {
-            panic!("task: failed to allocate kernel stack");
-        }
+        let Some((base, _)) = crate::kstack::alloc() else {
+            panic!("task: no kernel stack to be had");
+        };
+        let stack_base = base as *mut u8;
 
         // Stack grows downward: top = base + size
         let stack_top = stack_base as usize + KERNEL_STACK_SIZE;
@@ -263,14 +286,12 @@ impl Task {
     ///
     /// # Safety
     /// Must not be called while this task is running or its stack is in use.
-    pub unsafe fn free_stack(&mut self) { unsafe {
+    pub unsafe fn free_stack(&mut self) {
         if !self.kernel_stack_base.is_null() {
-            let layout = Layout::from_size_align(self.kernel_stack_size, STACK_ALIGN)
-                .expect("task: invalid stack layout");
-            dealloc(self.kernel_stack_base, layout);
+            crate::kstack::free(self.kernel_stack_base as usize);
             self.kernel_stack_base = core::ptr::null_mut();
         }
-    }}
+    }
 }
 
 /// Everything kept about one task: the task itself, and each module's own part
@@ -295,6 +316,24 @@ pub struct TaskRec {
 }
 
 impl TaskRec {
+    /// A record of nothing yet: what a task's is copied from
+    /// (`scheduler::TASK_TEMPLATE`).
+    pub const fn empty() -> Self {
+        TaskRec {
+            task: Task::EMPTY,
+            sched: crate::scheduler::PerTask::new(),
+            ipc: crate::ipc::PerTask::new(),
+            sig: crate::signal::PerTask::new(),
+            job: crate::job::PerTask::new(),
+            fd: crate::fdtable::PerTask::new(),
+            usage: crate::usage::PerTask::new(),
+            threads: crate::threads::PerTask::new(),
+            served: crate::served::PerTask::new(),
+            cap: crate::cap::PerTask::new(),
+            pmm: crate::pmm::PerTask::new(),
+        }
+    }
+
     pub fn new(task: Task) -> Self {
         TaskRec {
             task,
