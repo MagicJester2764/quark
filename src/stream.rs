@@ -21,16 +21,9 @@
 //! program that made it; for a connection made by a name (`local.rs`), the
 //! listener as it listened and the connector as it connected.
 
+use crate::grow::Grow;
 use crate::pipe;
 use crate::task::FdKind;
-
-/// Streams in the system, two pipes apiece: a compositor's clients, and the
-/// pairs a program starting others makes to hear how each start went.
-const MAX_STREAMS: usize = 64;
-
-/// Descriptors in flight in one direction: a burst of messages, each with a
-/// few. A send that would overfill it is refused whole.
-const FD_QUEUE: usize = 32;
 
 /// Who a program is, as one end of a stream is told of the other: a process
 /// id, a user and a group.
@@ -49,16 +42,92 @@ impl Creds {
     }
 }
 
+/// Descriptors travelling towards one end, oldest first: room made as they
+/// come. A send that would overfill it is refused whole, and "full" is as
+/// many as the sender may hold — Linux's bound, its sender's
+/// `RLIMIT_NOFILE`. There was room for thirty-two.
+struct Queue {
+    kinds: Grow<FdKind>,
+    /// The oldest is at `head`, and there are `len` from there.
+    head: usize,
+    len: usize,
+}
+
+impl Queue {
+    const fn new() -> Self {
+        Queue { kinds: Grow::new(FdKind::Empty), head: 0, len: 0 }
+    }
+
+    /// Room for `more` behind what is there, made now: moved to the front,
+    /// or grown. False if there is no memory for it.
+    fn room_for(&mut self, more: usize) -> bool {
+        if more == 0 {
+            return true;
+        }
+        if self.head > 0 && self.head + self.len + more > self.kinds.len() {
+            for i in 0..self.len {
+                let kind = self.kinds.get(self.head + i).copied().unwrap_or(FdKind::Empty);
+                if let Some(at) = self.kinds.get_mut(i) {
+                    *at = kind;
+                }
+            }
+            self.head = 0;
+        }
+        self.kinds.ensure(self.head + self.len + more - 1, 8, crate::task::FD_MOST).is_ok()
+    }
+
+    /// Put `kind` behind the rest. Room was made for it.
+    fn push(&mut self, kind: FdKind) {
+        if let Some(at) = self.kinds.get_mut(self.head + self.len) {
+            *at = kind;
+            self.len += 1;
+        }
+    }
+
+    fn pop(&mut self) -> Option<FdKind> {
+        if self.len == 0 {
+            return None;
+        }
+        let kind = self.kinds.get(self.head).copied();
+        self.head += 1;
+        self.len -= 1;
+        if self.len == 0 {
+            self.head = 0;
+        }
+        kind
+    }
+
+    /// The last `kinds.len()` are `kinds`: taken off, and true.
+    fn take_back(&mut self, kinds: &[FdKind]) -> bool {
+        let n = kinds.len();
+        if n > self.len {
+            return false;
+        }
+        let from = self.head + self.len - n;
+        let same = kinds.iter().enumerate().all(|(i, k)| self.kinds.get(from + i) == Some(k));
+        if same {
+            self.len -= n;
+        }
+        same
+    }
+
+    /// Everything, taken out: this is left empty.
+    fn take(&mut self) -> Queue {
+        core::mem::replace(self, Queue::new())
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &FdKind> + '_ {
+        self.kinds.iter().skip(self.head).take(self.len)
+    }
+}
+
 struct Stream {
-    in_use: bool,
-    creator: usize,
     /// Written by end 0, read by end 1.
     zero_to_one: usize,
     /// Written by end 1, read by end 0.
     one_to_zero: usize,
     /// Descriptors travelling towards end 0, then towards end 1.
-    q: [[FdKind; FD_QUEUE]; 2],
-    q_len: [usize; 2],
+    q: [Queue; 2],
     /// How many descriptors name each end.
     ///
     /// A count and not a flag, because `SYS_FD_DUP` makes a second descriptor
@@ -73,26 +142,10 @@ struct Stream {
     passcred: [bool; 2],
 }
 
-impl Stream {
-    const fn empty() -> Self {
-        Stream {
-            in_use: false,
-            creator: 0,
-            zero_to_one: 0,
-            one_to_zero: 0,
-            q: [[FdKind::Empty; FD_QUEUE]; 2],
-            q_len: [0; 2],
-            refs: [0; 2],
-            peer: [Creds { pid: 0, uid: 0, gid: 0 }; 2],
-            passcred: [false; 2],
-        }
-    }
-}
-
-static mut STREAMS: [Stream; MAX_STREAMS] = {
-    const S: Stream = Stream::empty();
-    [S; MAX_STREAMS]
-};
+/// Every stream, from its making until both its ends have gone
+/// (`table.rs`): a compositor's clients, and the pairs a program starting
+/// others makes to hear how each start went. There were sixty-four.
+static mut STREAMS: crate::table::Table<Stream> = crate::table::Table::new(crate::table::MOST);
 
 #[inline(always)]
 fn irq_save() -> u64 {
@@ -106,26 +159,23 @@ fn irq_restore(flags: u64) {
     unsafe { core::arch::asm!("push {}; popfq", in(reg) flags, options(nostack)) };
 }
 
+/// Stream `stream`, if there is one.
+///
+/// # Safety
+/// Interrupts off.
 #[inline(always)]
-unsafe fn streams() -> &'static mut [Stream; MAX_STREAMS] { unsafe {
-    &mut *core::ptr::addr_of_mut!(STREAMS)
-}}
+unsafe fn stream_at(stream: usize) -> Option<&'static mut Stream> {
+    unsafe { (*core::ptr::addr_of_mut!(STREAMS)).get(stream) }
+}
 
 /// The pipe an end reads from, and the one it writes to.
 pub fn pipes_for(stream: usize, end: u8) -> Option<(usize, usize)> {
-    if stream >= MAX_STREAMS || end > 1 {
+    if end > 1 {
         return None;
     }
     let flags = irq_save();
     let out = unsafe {
-        let s = &streams()[stream];
-        if !s.in_use {
-            None
-        } else if end == 0 {
-            Some((s.one_to_zero, s.zero_to_one))
-        } else {
-            Some((s.zero_to_one, s.one_to_zero))
-        }
+        stream_at(stream).map(|s| if end == 0 { (s.one_to_zero, s.zero_to_one) } else { (s.zero_to_one, s.one_to_zero) })
     };
     irq_restore(flags);
     out
@@ -152,47 +202,45 @@ pub fn create(tid: usize, packets: bool) -> Option<usize> {
     let _ = pipe::add_ref(b, false);
     let _ = pipe::add_ref(b, true);
 
+    let me = Creds::of(tid);
     let flags = irq_save();
-    let idx = unsafe { streams().iter().position(|s| !s.in_use) };
-    match idx {
-        Some(i) => {
-            unsafe {
-                let s = &mut streams()[i];
-                *s = Stream::empty();
-                s.in_use = true;
-                s.creator = tid;
-                s.zero_to_one = a;
-                s.one_to_zero = b;
-                s.refs = [1, 1];
-                s.peer = [Creds::of(tid); 2];
-            }
-            irq_restore(flags);
-            Some(i)
-        }
-        None => {
-            irq_restore(flags);
-            pipe::drop_ref(a, false);
-            pipe::drop_ref(a, true);
-            pipe::drop_ref(b, false);
-            pipe::drop_ref(b, true);
-            None
-        }
+    let made = unsafe {
+        let streams = &mut *core::ptr::addr_of_mut!(STREAMS);
+        streams.lowest_free(0).filter(|&i| {
+            let s = Stream {
+                zero_to_one: a,
+                one_to_zero: b,
+                q: [Queue::new(), Queue::new()],
+                refs: [1, 1],
+                peer: [me; 2],
+                passcred: [false; 2],
+            };
+            streams.fill_at(i, s).is_ok()
+        })
+    };
+    irq_restore(flags);
+    if made.is_none() {
+        pipe::drop_ref(a, false);
+        pipe::drop_ref(a, true);
+        pipe::drop_ref(b, false);
+        pipe::drop_ref(b, true);
     }
+    made
 }
 
 /// Take a reference on an end, for a second descriptor naming it.
 pub fn retain_end(stream: usize, end: u8) -> Result<(), ()> {
-    if stream >= MAX_STREAMS || end > 1 {
+    if end > 1 {
         return Err(());
     }
     let flags = irq_save();
     let ok = unsafe {
-        let s = &mut streams()[stream];
-        if s.in_use && s.refs[end as usize] > 0 {
-            s.refs[end as usize] += 1;
-            true
-        } else {
-            false
+        match stream_at(stream) {
+            Some(s) if s.refs[end as usize] > 0 => {
+                s.refs[end as usize] += 1;
+                true
+            }
+            _ => false,
         }
     };
     irq_restore(flags);
@@ -201,16 +249,15 @@ pub fn retain_end(stream: usize, end: u8) -> Result<(), ()> {
 
 /// One descriptor naming this end has gone. The end goes with the last of them.
 pub fn close_end(stream: usize, end: u8) {
-    if stream >= MAX_STREAMS || end > 1 {
+    if end > 1 {
         return;
     }
     let flags = irq_save();
     let gone = unsafe {
-        let s = &mut streams()[stream];
-        if !s.in_use || s.refs[end as usize] == 0 {
+        let Some(s) = stream_at(stream).filter(|s| s.refs[end as usize] > 0) else {
             irq_restore(flags);
             return;
-        }
+        };
         s.refs[end as usize] -= 1;
         if s.refs[end as usize] > 0 {
             // Somebody else still holds this end; nothing observable happens.
@@ -232,27 +279,24 @@ pub fn close_end(stream: usize, end: u8) {
         //
         // Taken out under the lock and released after, since releasing a
         // descriptor can reach back into this table.
-        let mut orphans = [FdKind::Empty; FD_QUEUE * 2];
-        let mut n = 0;
+        let mut orphans = [Queue::new(), Queue::new()];
         for side in 0..2 {
             if side == end as usize || both {
-                for i in 0..s.q_len[side] {
-                    orphans[n] = s.q[side][i];
-                    n += 1;
-                }
-                s.q_len[side] = 0;
+                orphans[side] = s.q[side].take();
             }
         }
         if both {
-            *s = Stream::empty();
+            (*core::ptr::addr_of_mut!(STREAMS)).empty(stream);
         }
-        (pipes, orphans, n)
+        (pipes, orphans)
     };
     irq_restore(flags);
 
-    let (gone, orphans, n) = gone;
-    for kind in &orphans[..n] {
-        crate::pipe::release_fd(kind);
+    let (gone, orphans) = gone;
+    for q in &orphans {
+        for kind in q.iter() {
+            crate::pipe::release_fd(kind);
+        }
     }
 
     // Dropping the writer this end held is what gives the peer end-of-file,
@@ -263,27 +307,31 @@ pub fn close_end(stream: usize, end: u8) {
     pipe::drop_ref(wr, true);
 }
 
-/// Queue descriptors for the peer of `end`, all of them or none. False if
-/// there is not room for them all, or the peer has gone.
+/// Queue descriptors for the peer of `end`, all of them or none: no more
+/// than `most` waiting there with them. False if there is not room for them
+/// all, or the peer has gone.
 ///
 /// The caller has already taken an in-flight reference on each; on refusal
 /// they are the caller's to give back.
-pub fn push_fds(stream: usize, end: u8, kinds: &[FdKind]) -> bool {
-    if stream >= MAX_STREAMS || end > 1 {
+pub fn push_fds(stream: usize, end: u8, kinds: &[FdKind], most: usize) -> bool {
+    if end > 1 {
         return false;
     }
     let to = 1 - end as usize;
     let flags = irq_save();
     let ok = unsafe {
-        let s = &mut streams()[stream];
-        if !s.in_use || s.refs[to] == 0 || s.q_len[to] + kinds.len() > FD_QUEUE {
-            false
-        } else {
-            for &kind in kinds {
-                s.q[to][s.q_len[to]] = kind;
-                s.q_len[to] += 1;
+        match stream_at(stream) {
+            Some(s) if s.refs[to] > 0 && s.q[to].len + kinds.len() <= most => {
+                let q = &mut s.q[to];
+                let room = q.room_for(kinds.len());
+                if room {
+                    for &kind in kinds {
+                        q.push(kind);
+                    }
+                }
+                room
             }
-            true
+            _ => false,
         }
     };
     irq_restore(flags);
@@ -295,35 +343,23 @@ pub fn push_fds(stream: usize, end: u8, kinds: &[FdKind]) -> bool {
 /// descriptor either. Their in-flight references are the caller's to
 /// release.
 pub fn take_back_fds(stream: usize, end: u8, kinds: &[FdKind]) -> bool {
-    if stream >= MAX_STREAMS || end > 1 {
+    if end > 1 {
         return false;
     }
     let to = 1 - end as usize;
     let flags = irq_save();
-    let taken = unsafe {
-        let s = &mut streams()[stream];
-        let n = s.q_len[to];
-        if s.in_use && n >= kinds.len() && s.q[to][n - kinds.len()..n] == *kinds {
-            s.q_len[to] -= kinds.len();
-            true
-        } else {
-            false
-        }
-    };
+    let taken = unsafe { stream_at(stream).is_some_and(|s| s.q[to].take_back(kinds)) };
     irq_restore(flags);
     taken
 }
 
 /// Who is at the other end of `end`.
 pub fn peer_of(stream: usize, end: u8) -> Option<Creds> {
-    if stream >= MAX_STREAMS || end > 1 {
+    if end > 1 {
         return None;
     }
     let flags = irq_save();
-    let out = unsafe {
-        let s = &streams()[stream];
-        s.in_use.then_some(s.peer[end as usize])
-    };
+    let out = unsafe { stream_at(stream).map(|s| s.peer[end as usize]) };
     irq_restore(flags);
     out
 }
@@ -331,27 +367,25 @@ pub fn peer_of(stream: usize, end: u8) -> Option<Creds> {
 /// A connection made by a name: end 0's peer is `of_zero`'s and end 1's is
 /// `of_one`'s; and end 1 has asked to be told who sent what, if `passcred`.
 pub fn connected(stream: usize, of_zero: Creds, of_one: Creds, passcred: bool) {
-    if stream < MAX_STREAMS {
-        let flags = irq_save();
-        unsafe {
-            let s = &mut streams()[stream];
+    let flags = irq_save();
+    unsafe {
+        if let Some(s) = stream_at(stream) {
             s.peer = [of_zero, of_one];
             s.passcred[1] = passcred;
         }
-        irq_restore(flags);
     }
+    irq_restore(flags);
 }
 
 /// Whether `end` has asked to be told who sent what it receives; and, with
 /// `set`, that it has or has not.
 pub fn passcred(stream: usize, end: u8, set: Option<bool>) -> Option<bool> {
-    if stream >= MAX_STREAMS || end > 1 {
+    if end > 1 {
         return None;
     }
     let flags = irq_save();
     let out = unsafe {
-        let s = &mut streams()[stream];
-        s.in_use.then(|| {
+        stream_at(stream).map(|s| {
             let was = s.passcred[end as usize];
             if let Some(on) = set {
                 s.passcred[end as usize] = on;
@@ -368,24 +402,11 @@ pub fn passcred(stream: usize, end: u8, set: Option<bool>) -> Option<bool> {
 /// Its in-flight reference comes with it and is the caller's to convert into
 /// an owned one or to release.
 pub fn pop_fd(stream: usize, end: u8) -> Option<FdKind> {
-    if stream >= MAX_STREAMS || end > 1 {
+    if end > 1 {
         return None;
     }
-    let me = end as usize;
     let flags = irq_save();
-    let out = unsafe {
-        let s = &mut streams()[stream];
-        if !s.in_use || s.q_len[me] == 0 {
-            None
-        } else {
-            let head = s.q[me][0];
-            for i in 1..s.q_len[me] {
-                s.q[me][i - 1] = s.q[me][i];
-            }
-            s.q_len[me] -= 1;
-            Some(head)
-        }
-    };
+    let out = unsafe { stream_at(stream).and_then(|s| s.q[end as usize].pop()) };
     irq_restore(flags);
     out
 }
@@ -408,14 +429,11 @@ pub fn writable(stream: usize, end: u8) -> bool {
 
 /// Has the other end's last descriptor gone?
 pub fn peer_gone(stream: usize, end: u8) -> bool {
-    if stream >= MAX_STREAMS || end > 1 {
+    if end > 1 {
         return true;
     }
     let flags = irq_save();
-    let out = unsafe {
-        let s = &streams()[stream];
-        !s.in_use || s.refs[1 - end as usize] == 0
-    };
+    let out = unsafe { stream_at(stream).is_none_or(|s| s.refs[1 - end as usize] == 0) };
     irq_restore(flags);
     out
 }

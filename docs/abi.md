@@ -275,7 +275,7 @@ numbers, and only 64 could name it before, through a range check.
 
 | Minor | What |
 |---|---|
-| 4.1 | **As many tasks as a desktop runs.** The kernel has up to 32,768 tasks, where it had sixty-four, so a program can no longer find every task by asking about each number below 64: `SYS_TASK_NEXT` (236) answers the first task at or past a number, and a walk of every task is one call a task. A program has 4,096 tasks without `TaskMgmt` — its own that have not died, and the children it has made in other programs and not collected — where a task could have sixteen children and a fork was not counted at all; `SYS_TASK_CREATE`, `SYS_TASK_CREATE_IN` and `SYS_FORK` answer `u64::MAX` past it. **And what a program makes is made when it makes it**, as many as its descriptors and the machine's memory allow: counters, timers, signal descriptors, pipes and shared regions, where there were 16, 16, 32, 256 — 64 a program — and 256 for the machine. `SYS_PIPE_CREATE` counts no budget of the program's; nor does anything else that was made with one. |
+| 4.1 | **As many tasks as a desktop runs.** The kernel has up to 32,768 tasks, where it had sixty-four, so a program can no longer find every task by asking about each number below 64: `SYS_TASK_NEXT` (236) answers the first task at or past a number, and a walk of every task is one call a task. A program has 4,096 tasks without `TaskMgmt` — its own that have not died, and the children it has made in other programs and not collected — where a task could have sixteen children and a fork was not counted at all; `SYS_TASK_CREATE`, `SYS_TASK_CREATE_IN` and `SYS_FORK` answer `u64::MAX` past it. **And what a program makes is made when it makes it**, as many as its descriptors and the machine's memory allow: counters, timers, signal descriptors, pipes and shared regions, where there were 16, 16, 32, 256 — 64 a program — and 256 for the machine. `SYS_PIPE_CREATE` counts no budget of the program's; nor does anything else that was made with one. So are terminals, local sockets, streams, poll sets and served descriptors, where there were 8, 32, 64, 64 and 1,024; and what is in them grows: a set watches as many descriptors as a program may have (it watched 32), `SYS_POLL` takes as many entries and refuses more (it took 32 and ignored the rest), a listener's backlog goes to 4,096 (16), a stream holds in flight as many descriptors as its sender may have (32), and a send or receive of several carries 255 (32). Memory objects are 2,047, the most a page-table entry can name (256), and 1,024 a pager (128). |
 
 ### Deprecated
 
@@ -934,12 +934,12 @@ would on Linux, and the pipe is freed when the read returns.
 | 70 | `SYS_PIPE_FD_SET` | arg0 = target tid, arg1 = fd or `u64::MAX - 1` for any free one, arg2 = pipe handle, arg3 = 1 for write end | the fd it took / `u64::MAX` | `TaskMgmt` over the target, unless the target is the caller or a child it has not started |
 | 71 | `SYS_FD_CLOSE` | arg0 = fd | 0 / `u64::MAX` | — |
 | 72 | `SYS_SOCKETPAIR` | — | `(fd0 << 32) \| fd1`, both in the caller's table / `u64::MAX` | — |
-| 73 | `SYS_FD_SEND` | arg0 = stream fd, arg1 = buf, arg2 = len, arg3 = fd to pass or `u64::MAX` — or, with flag 2, where an array of descriptors to pass is, `u32`s, as many as bits 8 to 15 of arg4 say (at most 32); arg4 = flags (1 = do not wait, 2 = several) | bytes written, `0xFFFF_FFFE` if it would have blocked, `0xFFFF_FFFD` if a signal ended the wait — nothing sent, the descriptors included / `u64::MAX` | — |
+| 73 | `SYS_FD_SEND` | arg0 = stream fd, arg1 = buf, arg2 = len, arg3 = fd to pass or `u64::MAX` — or, with flag 2, where an array of descriptors to pass is, `u32`s, as many as bits 8 to 15 of arg4 say (at most 255); arg4 = flags (1 = do not wait, 2 = several) | bytes written, `0xFFFF_FFFE` if it would have blocked, `0xFFFF_FFFD` if a signal ended the wait — nothing sent, the descriptors included / `u64::MAX` | — |
 | 74 | `SYS_FD_RECV` | arg0 = stream fd, arg1 = buf, arg2 = len, arg3 = fd to install a passed descriptor at, `u64::MAX - 1` for any free one, or `u64::MAX` to leave it queued — or, with flag 2, where to write the descriptors installed, `u32`s, room for as many as bits 8 to 15 of arg4 say; arg4 = flags (1 = do not wait, 2 = several) | `((fd + 1) << 32) \| bytes` — with flag 2, `(how many << 32) \| bytes` — high half 0 if none arrived, `0xFFFF_FFFE` if it would have blocked, `0xFFFF_FFFD` if a signal ended the wait — nothing taken / `u64::MAX` | — |
 | 75 | `SYS_POLLSET_CREATE` | — | fd naming the set / `u64::MAX` | — |
 | 76 | `SYS_POLLSET_CTL` | arg0 = set fd, arg1 = op (0 add, 1 modify, 2 remove), with bit 8 to be told why not; arg2 = fd, arg3 = events: 1 readable, 2 writable, `0x10` the other end gone, with bit 16 for an edge and bit 17 for a one-shot; arg4 = token | 0 / `u64::MAX`, or with bit 8: 1 not a set of the caller's or the set itself, 2 watched already, 3 not watched, 4 can never be ready, 5 a set that leads back or too deep, 6 full | — |
 | 77 | `SYS_POLLSET_WAIT` | arg0 = set fd, arg1 = array of `(u64 token, u32 events, u32 pad)`, arg2 = capacity, arg3 = how long to wait, a span, arg4 = the signals to hold back while it waits, with bit 8 set to say there are some | entries filled, 0 = timed out, `0xFFFF_FFFD` = a signal ended the wait / `u64::MAX` | — |
-| 78 | `SYS_POLL` | arg0 = array of `(u32 fd, u32 events, u32 revents, u32 pad)`, arg1 = count, arg2 = how long to wait, a span; arg3 = the signals to hold back while it waits, if arg4 = 1 | entries with non-zero `revents`, `0xFFFF_FFFD` = a signal ended the wait / `u64::MAX` | — |
+| 78 | `SYS_POLL` | arg0 = array of `(u32 fd, u32 events, u32 revents, u32 pad)`, arg1 = count, no more than the program may have descriptors, arg2 = how long to wait, a span; arg3 = the signals to hold back while it waits, if arg4 = 1 | entries with non-zero `revents`, `0xFFFF_FFFD` = a signal ended the wait / `u64::MAX` | — |
 | 79 | `SYS_FD_WRITE_NB` | arg0 = fd, arg1 = buf, arg2 = len | bytes written, **`0xFFFF_FFFE` = would block**, `u64::MAX` = error | — |
 
 **Streams.** `SYS_SOCKETPAIR` makes two connected ends and puts both in the
@@ -952,10 +952,12 @@ the peer the connection has gone.
 copying a descriptor onto itself changes nothing. A poll set cannot be copied or
 sent at all: it counts no holders, so it has exactly one.
 
-**Several at once.** With flag 2 a send carries up to 32 descriptors, all or
-none, and a receive takes as many as are queued and it has room for, each in
-the lowest free slot from 3, in the order they were sent. A stream holds 32
-in flight each way, and a send that would overfill it is refused. What is
+**Several at once.** With flag 2 a send carries up to 255 descriptors — as
+many as eight bits say — all or none, and a receive takes as many as are
+queued and it has room for, each in the lowest free slot from 3, in the order
+they were sent. A stream holds in flight each way as many as the sender may
+have descriptors, and a send that would overfill it is refused. It was 32 of
+each. What is
 queued is not tied to the bytes: a send queues its descriptors before its
 bytes, so the receive that reads a message's first byte can take them, and
 may take a later message's as well — which is what every program that
@@ -1549,7 +1551,7 @@ it was set.
 | 177 | `SYS_SOCK_INFO` | arg0 = fd | `(net_tid << 32) \| handle` / `u64::MAX` | — |
 | 178 | `SYS_SOCKET` | arg0 = what: 0, a local stream | a descriptor for a local socket that is nothing yet / `u64::MAX` | — |
 | 179 | `SYS_SOCKET_BIND` | arg0 = a task that is calling the caller, arg1 = its descriptor (a local socket that is nothing yet), arg2 = a key of the caller's | 0; 1 if another socket has that name / `u64::MAX` | — |
-| 180 | `SYS_SOCKET_LISTEN` | arg0 = a named local socket of the caller's, arg1 = how many connections may wait (at most 16) | 0 / `u64::MAX` | — |
+| 180 | `SYS_SOCKET_LISTEN` | arg0 = a named local socket of the caller's, arg1 = how many connections may wait (at most 4,096, Linux's `somaxconn`) | 0 / `u64::MAX` | — |
 | 181 | `SYS_SOCKET_CONNECT` | arg0 = a task that is calling the caller, arg1 = its descriptor (a local socket that is nothing yet), arg2 = a key of the caller's | 0; 1 if nothing listens there; `0xFFFF_FFFE` if what does has as many waiting as it has room for / `u64::MAX` | — |
 | 182 | `SYS_SOCKET_ACCEPT` | arg0 = a listening socket of the caller's, arg1 = flags (1 = do not wait) | a descriptor for the connection; `0xFFFF_FFFE` if it would have waited; `0xFFFF_FFFD` if a signal ended the wait / `u64::MAX` | — |
 | 183 | `SYS_SOCKET_PEER` | arg0 = a stream of the caller's, arg1 = where to write who is at the other end: three `u32`s, process id, user, group | 0 / `u64::MAX` | — |

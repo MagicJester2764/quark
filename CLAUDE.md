@@ -561,13 +561,17 @@ may keep — are in `../quarkutils/CLAUDE.md`; these are the kernel's.
   that looks a descriptor up and then acts on it in two steps has a window in
   which a sibling closes it and somebody else is given the slot.
 - **A task waits on one thing at a time, and where is a link in its own
-  record** (`waitlist.rs`): a counter's, a timer's and a pipe's waiters are a
-  list through those links, which has no length to fill — the arrays of four
-  and eight they were refused the fifth or the ninth, whose read came back at
-  once. A task comes off by its own link: when it is woken, when a signal
-  ends its wait, when it dies, and at the reap before its record is freed.
-  A new kind's waiters go the same way: an `On`, its lists' ends in the
-  object, and a `waiters()` that `waitlist::forget` finds them by.
+  record** (`waitlist.rs`): a counter's, a timer's, a pipe's, a terminal's
+  and a listener's waiters, and those parked on a poll set, are a list
+  through those links, which has no length to fill — the arrays of four and
+  eight they were refused the fifth or the ninth, whose read came back at
+  once, and a set had one, which a second thread waiting on it took from the
+  first. A task comes off by its own link: when it is woken, when a signal
+  ends its wait, when it dies, and at the reap before its record is freed;
+  and a set that goes takes everybody off its list first, or a set made
+  with its number would be handed their links. A new kind's waiters go the
+  same way: an `On`, its lists' ends in the object, and a `waiters()` that
+  `waitlist::forget` finds them by.
 - **A task about to wait on what a descriptor names holds it** (`fdtable::hold`,
   given back by `unhold`, or by `task_gone` for a task killed where it
   waited). Without it a sibling's `close` frees the pipe under a parked read,
@@ -909,12 +913,20 @@ every Unix program assumes:
   by `reclaim::may_make` — and the tasks a program may have are counted by
   its program (`scheduler::program_tasks`).
 - **What a program makes is made when it makes it**: a counter, a timer, a
-  signal descriptor, a pipe — whose buffer is a frame of its own — and a
-  shared region are each a record in a table that grows (`table.rs`), made
+  signal descriptor, a pipe — whose buffer is a frame of its own — a shared
+  region, a terminal, a local socket, a stream, a poll set, and a served
+  descriptor are each a record in a table that grows (`table.rs`), made
   through `reclaim::may_make` so that a program making them without end is
   refused while the kernel can still work, and given back with the last
-  thing that names it. They were tables for the whole machine, of sixteen,
-  thirty-two and 256.
+  thing that names it. They were tables for the whole machine, of eight,
+  sixteen, thirty-two, sixty-four, 256 and 1,024. What is in them grows
+  too: a set's watches, a listener's queue (to 4,096, `somaxconn`), a
+  stream's descriptors in flight (as many as the sender may have) — and
+  nothing that grows is gathered on a kernel stack: a `poll`'s entries are
+  read and answered where the program has them. A memory object is a
+  record made when it is, but its slot is written into page-table entries
+  in eleven bits, so there are at most 2,047 (`memobj::MAX_OBJECTS`), 1,024
+  a pager.
 - **Descriptors are released when a task dies, not when it is reaped.** Its
   memory waits for a parent to collect it, which is where the exit status
   lives; a descriptor is something another task can be *waiting on*, and the
@@ -1462,7 +1474,7 @@ breaking any of them is quiet until it is a machine that stops.
   the first processor is running, or a processor is idle: one of the same
   band waits its turn, as any woken task does.
 - The page cache holds a quarter of memory's pages — at least 8192, at
-  most a million — across 256 objects, memory on its way out included, and
+  most a million — across 2,047 objects, memory on its way out included, and
   a machine taking pages from programs faster than its pager writes them
   takes no more until some have been written. Its table is made at boot
   and does not grow.

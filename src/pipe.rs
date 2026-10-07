@@ -759,35 +759,25 @@ pub fn release_fd(kind: &FdKind) {
 /// reach whatever has its number now, and if that is blocked on something
 /// else — a call to a server — it is woken with nothing, and the call fails.
 /// A kind that parks tasks and is missing here leaves that open. A pipe's
-/// waiters, a stream's pipes', a counter's and a timer's are lists through
-/// the waiters' records (`waitlist.rs`), and a task comes off by its own link.
+/// waiters, a stream's pipes', a counter's, a timer's, a terminal's and a
+/// listener's are lists through the waiters' records (`waitlist.rs`), and a
+/// task comes off by its own link.
 pub fn forget_waiter(kind: &FdKind, tid: usize) -> bool {
     match kind {
-        FdKind::PipeRead(_) | FdKind::PipeWrite(_) | FdKind::StreamEnd { .. } | FdKind::Timer { .. } | FdKind::Event { .. } => {
+        FdKind::PipeRead(_)
+        | FdKind::PipeWrite(_)
+        | FdKind::StreamEnd { .. }
+        | FdKind::Timer { .. }
+        | FdKind::Event { .. }
+        | FdKind::PtyEnd { .. }
+        | FdKind::Local { .. } => {
             let flags = irq_save();
             let found = unsafe { waitlist::forget(tid) };
             irq_restore(flags);
             found
         }
-        FdKind::PtyEnd { pty, .. } => crate::pty::forget_waiter(*pty, tid),
-        FdKind::Local { l } => crate::local::forget_waiter(*l, tid),
         _ => false,
     }
-}
-
-/// `tid` out of a list of `count` waiters, the rest closed up. True if it
-/// was on it.
-pub fn forget_in(list: &mut [usize], count: &mut usize, tid: usize) -> bool {
-    let mut kept = 0;
-    for i in 0..*count {
-        if list[i] != tid {
-            list[kept] = list[i];
-            kept += 1;
-        }
-    }
-    let found = kept != *count;
-    *count = kept;
-    found
 }
 
 /// Pipe `handle`'s list of waiters: 0 its readers, 1 its writers, 2 those

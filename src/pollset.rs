@@ -9,7 +9,7 @@
 //!
 //! Readiness is evaluated at wake-up rather than stored. A stored bit has to be
 //! invalidated by everything that could change it, and the way to get that
-//! wrong is a task that sleeps through data already waiting for it. Thirty-two
+//! wrong is a task that sleeps through data already waiting for it. A set's
 //! entries scanned is cheaper than being wrong.
 //!
 //! What is stored is whether something happened. A watch is reported at every
@@ -25,11 +25,11 @@
 //! report something. A chain of them goes no deeper than Linux lets it
 //! ([`DEEPEST`]), and no set watches itself, through others or not.
 
+use crate::grow::Grow;
 use crate::task::FdKind;
+use crate::waitlist::{self, On, Waiters};
 use crate::{pipe, stream};
 
-const MAX_SETS: usize = 64;
-const MAX_WATCHED: usize = 32;
 /// How many sets a chain of them may have below the one waited on: Linux's
 /// EP_MAX_NESTS.
 const DEEPEST: usize = 4;
@@ -72,25 +72,23 @@ struct Watch {
 const UNUSED: Watch = Watch { fd: 0, events: 0, token: 0, used: false, stirred: false, spent: false };
 
 struct PollSet {
-    in_use: bool,
     /// The descriptor table its watches are numbers in — a program's, so any
     /// thread of the program that made the set may use it.
     owner: usize,
     /// Some watch is an edge, which every change that reaches it has to stir.
     edges: bool,
-    watches: [Watch; MAX_WATCHED],
+    /// What it watches, room made as watches are added — one removed leaves
+    /// its room to the next — and never more than a program can have
+    /// descriptors. There was room for thirty-two.
+    watches: Grow<Watch>,
+    /// Who is parked on it (`waitlist.rs`), asleep in a receive from
+    /// themselves. There was one.
+    waiters: Waiters,
 }
 
-impl PollSet {
-    const fn empty() -> Self {
-        PollSet { in_use: false, owner: 0, edges: false, watches: [UNUSED; MAX_WATCHED] }
-    }
-}
-
-static mut SETS: [PollSet; MAX_SETS] = {
-    const S: PollSet = PollSet::empty();
-    [S; MAX_SETS]
-};
+/// Every set, from its making to its descriptor's close — or the end of the
+/// `poll` that made it (`table.rs`). There were sixty-four.
+static mut SETS: crate::table::Table<PollSet> = crate::table::Table::new(crate::table::MOST);
 
 #[inline(always)]
 fn irq_save() -> u64 {
@@ -105,37 +103,51 @@ fn irq_restore(flags: u64) {
 }
 
 #[inline(always)]
-unsafe fn sets() -> &'static mut [PollSet; MAX_SETS] { unsafe {
+unsafe fn sets() -> &'static mut crate::table::Table<PollSet> { unsafe {
     &mut *core::ptr::addr_of_mut!(SETS)
 }}
 
-pub fn create(tid: usize) -> Option<usize> {
+/// Set `set`, if there is one.
+///
+/// # Safety
+/// Interrupts off.
+#[inline(always)]
+unsafe fn set_at(set: usize) -> Option<&'static mut PollSet> {
+    unsafe { sets().get(set) }
+}
+
+/// A set for `tid`'s program. One a program keeps (`SYS_POLLSET_CREATE`) is
+/// made as whatever a program makes is, through `reclaim`; one made for the
+/// length of a call (`SYS_POLL`, `for_a_call`) is not: refused while memory
+/// is short, a poll would fail a main loop over a moment's pressure.
+pub fn create(tid: usize, for_a_call: bool) -> Option<usize> {
     let table = crate::fdtable::table_index(tid);
-    if table == usize::MAX {
+    if table == usize::MAX || (!for_a_call && !crate::reclaim::may_make()) {
         return None;
     }
     let flags = irq_save();
     let out = unsafe {
-        match sets().iter().position(|s| !s.in_use) {
-            Some(i) => {
-                sets()[i] = PollSet::empty();
-                sets()[i].in_use = true;
-                sets()[i].owner = table;
-                Some(i)
-            }
-            None => None,
-        }
+        sets().lowest_free(0).filter(|&i| {
+            let s = PollSet { owner: table, edges: false, watches: Grow::new(UNUSED), waiters: Waiters::NONE };
+            sets().fill_at(i, s).is_ok()
+        })
     };
     irq_restore(flags);
     out
 }
 
+/// The set goes, with its watches. Whoever is parked on it — a thread whose
+/// sibling closed it — is woken to look again, and finds it gone.
 pub fn destroy(set: usize) {
-    if set >= MAX_SETS {
-        return;
-    }
     let flags = irq_save();
-    unsafe { sets()[set] = PollSet::empty() };
+    unsafe {
+        if let Some(s) = set_at(set) {
+            waitlist::take_each(&mut s.waiters, |t| {
+                crate::ipc::wake_sleeper(t);
+            });
+            sets().empty(set);
+        }
+    }
     irq_restore(flags);
 }
 
@@ -183,12 +195,20 @@ pub enum Refused {
     Full = 6,
 }
 
-/// Watch `i` of `set`, as it is now.
+/// Watch `i` of `set`, as it is now: unused, past the end or with no set.
 fn watch(set: usize, i: usize) -> Watch {
     let flags = irq_save();
-    let w = unsafe { sets()[set].watches[i] };
+    let w = unsafe { set_at(set).and_then(|s| s.watches.get(i).copied()).unwrap_or(UNUSED) };
     irq_restore(flags);
     w
+}
+
+/// How much room `set` has for watches: one past the last there can be.
+fn room(set: usize) -> usize {
+    let flags = irq_save();
+    let n = unsafe { set_at(set).map_or(0, |s| s.watches.len()) };
+    irq_restore(flags);
+    n
 }
 
 /// Change watch `i` of `set`, if it is still the one `was` was: what a scan
@@ -196,9 +216,10 @@ fn watch(set: usize, i: usize) -> Watch {
 fn update(set: usize, i: usize, was: &Watch, change: impl FnOnce(&mut Watch)) {
     let flags = irq_save();
     unsafe {
-        let w = &mut sets()[set].watches[i];
-        if w.used && w.fd == was.fd && w.token == was.token {
-            change(w);
+        if let Some(w) = set_at(set).and_then(|s| s.watches.get_mut(i)) {
+            if w.used && w.fd == was.fd && w.token == was.token {
+                change(w);
+            }
         }
     }
     irq_restore(flags);
@@ -207,7 +228,7 @@ fn update(set: usize, i: usize, was: &Watch, change: impl FnOnce(&mut Watch)) {
 /// A task whose table `set`'s watches are numbers in.
 fn owner_task(set: usize) -> Option<usize> {
     let flags = irq_save();
-    let owner = unsafe { sets()[set].in_use.then(|| sets()[set].owner) };
+    let owner = unsafe { set_at(set).map(|s| s.owner) };
     irq_restore(flags);
     crate::fdtable::a_task_of(owner?)
 }
@@ -218,7 +239,7 @@ fn set_named(tid: usize, fd: usize) -> Option<usize> {
         return None;
     }
     match crate::fdtable::get(tid, fd) {
-        FdKind::PollSet { set } if set < MAX_SETS => Some(set),
+        FdKind::PollSet { set } => Some(set),
         _ => None,
     }
 }
@@ -231,7 +252,7 @@ fn may_go_under(set: usize, target: usize, level: usize) -> bool {
         return false;
     }
     let Some(tid) = owner_task(set) else { return true };
-    (0..MAX_WATCHED).all(|i| {
+    (0..room(set)).all(|i| {
         let w = watch(set, i);
         !w.used || set_named(tid, w.fd).is_none_or(|inner| may_go_under(inner, target, level + 1))
     })
@@ -241,7 +262,7 @@ fn may_go_under(set: usize, target: usize, level: usize) -> bool {
 /// reported: an edge is reported if what it watches is ready, as Linux has
 /// it, and a one-shot is armed again.
 pub fn ctl(set: usize, tid: usize, op: u64, fd: usize, events: u32, token: u64) -> Result<(), Refused> {
-    if set >= MAX_SETS || op > 2 {
+    if op > 2 {
         return Err(Refused::NotOne);
     }
     // A set watched by a set: never itself, and never one that leads back.
@@ -258,36 +279,45 @@ pub fn ctl(set: usize, tid: usize, op: u64, fd: usize, events: u32, token: u64) 
     let table = crate::fdtable::table_index(tid);
     let flags = irq_save();
     let out = unsafe {
-        let s = &mut sets()[set];
-        if !s.in_use || s.owner != table {
-            Err(Refused::NotOne)
-        } else {
-            let at = s.watches.iter().position(|w| w.used && w.fd == fd);
-            let done = match (op, at) {
-                (2, Some(i)) => {
-                    s.watches[i] = UNUSED;
-                    Ok(())
-                }
-                (1, Some(i)) => {
-                    let w = &mut s.watches[i];
-                    w.events = events;
-                    w.token = token;
-                    w.stirred = true;
-                    w.spent = false;
-                    Ok(())
-                }
-                (_, None) if op != 0 => Err(Refused::Absent),
-                (_, Some(_)) => Err(Refused::Exists),
-                (_, None) => match s.watches.iter().position(|w| !w.used) {
-                    Some(i) => {
-                        s.watches[i] = Watch { fd, events, token, used: true, stirred: true, spent: false };
+        match set_at(set) {
+            Some(s) if s.owner == table => {
+                let at = s.watches.iter().position(|w| w.used && w.fd == fd);
+                let done = match (op, at) {
+                    (2, Some(i)) => {
+                        if let Some(w) = s.watches.get_mut(i) {
+                            *w = UNUSED;
+                        }
                         Ok(())
                     }
-                    None => Err(Refused::Full),
-                },
-            };
-            s.edges = s.watches.iter().any(|w| w.used && w.events & EDGE != 0);
-            done
+                    (1, Some(i)) => {
+                        if let Some(w) = s.watches.get_mut(i) {
+                            w.events = events;
+                            w.token = token;
+                            w.stirred = true;
+                            w.spent = false;
+                        }
+                        Ok(())
+                    }
+                    (_, None) if op != 0 => Err(Refused::Absent),
+                    (_, Some(_)) => Err(Refused::Exists),
+                    // In the room of one removed, or in new room: none past
+                    // as many descriptors as a program can have, and none
+                    // with no memory for it.
+                    (_, None) => {
+                        let free = s.watches.iter().position(|w| !w.used).unwrap_or(s.watches.len());
+                        match s.watches.ensure(free, 8, crate::task::FD_MOST) {
+                            Ok(w) => {
+                                *w = Watch { fd, events, token, used: true, stirred: true, spent: false };
+                                Ok(())
+                            }
+                            Err(_) => Err(Refused::Full),
+                        }
+                    }
+                };
+                s.edges = s.watches.iter().any(|w| w.used && w.events & EDGE != 0);
+                done
+            }
+            _ => Err(Refused::NotOne),
         }
     };
     irq_restore(flags);
@@ -375,7 +405,7 @@ fn readiness_at(tid: usize, fd: usize, level: usize) -> u32 {
         }
         // A set is readable while a wait on it would report something.
         FdKind::PollSet { set } => {
-            if set < MAX_SETS && level <= DEEPEST && reports(set, level + 1) {
+            if level <= DEEPEST && reports(set, level + 1) {
                 out |= READABLE;
             }
         }
@@ -402,7 +432,7 @@ fn hit(tid: usize, w: &Watch, level: usize) -> u32 {
 /// It takes nothing: an edge stays stirred, a one-shot armed.
 fn reports(set: usize, level: usize) -> bool {
     let Some(tid) = owner_task(set) else { return false };
-    (0..MAX_WATCHED).any(|i| {
+    (0..room(set)).any(|i| {
         let w = watch(set, i);
         w.used && !w.spent && (w.events & EDGE == 0 || w.stirred) && hit(tid, &w, level) != 0
     })
@@ -413,33 +443,58 @@ pub fn readiness_of(tid: usize, fd: usize) -> u32 {
     readiness_at(tid, fd, 1)
 }
 
-/// The task blocked in a wait on this set, if any.
-///
-/// One waiter per set. Two tasks waiting on one set would each have to be told
-/// which of them takes an event, and nothing here shares a set.
-static mut WAITERS: [usize; MAX_SETS] = [usize::MAX; MAX_SETS];
-
-/// Register as the waiter on a set, before the last scan and the block.
+/// Register as a waiter on a set, before the last scan and the block.
 ///
 /// The order matters and is the whole of why this is correct: anything that
 /// becomes ready after this either happened before the scan that follows — so
 /// the scan sees it and we never block — or after it, and then `note_pipe`
 /// finds us parked and wakes us. There is no window between looking and
 /// sleeping.
+///
+/// Any number may be parked on one set, each woken by what they are all
+/// waiting for, as epoll's are: one waiter a set, and a second thread
+/// waiting on it took the first one's place, which was then woken by
+/// nothing.
 pub fn park(set: usize, tid: usize) {
-    if set < MAX_SETS {
-        let flags = irq_save();
-        unsafe { (*core::ptr::addr_of_mut!(WAITERS))[set] = tid };
-        irq_restore(flags);
+    let flags = irq_save();
+    unsafe {
+        if let Some(s) = set_at(set) {
+            waitlist::add(&mut s.waiters, tid, On::PollSet(set as u32));
+        }
     }
+    irq_restore(flags);
 }
 
-pub fn unpark(set: usize) {
-    if set < MAX_SETS {
-        let flags = irq_save();
-        unsafe { (*core::ptr::addr_of_mut!(WAITERS))[set] = usize::MAX };
-        irq_restore(flags);
+pub fn unpark(set: usize, tid: usize) {
+    let flags = irq_save();
+    unsafe {
+        if let Some(s) = set_at(set) {
+            waitlist::remove(&mut s.waiters, tid, On::PollSet(set as u32));
+        }
     }
+    irq_restore(flags);
+}
+
+/// Set `set`'s waiters. For `waitlist::forget`.
+///
+/// # Safety
+/// Interrupts off.
+pub unsafe fn waiters(set: usize) -> Option<&'static mut Waiters> {
+    unsafe { set_at(set).map(|s| &mut s.waiters) }
+}
+
+/// Wake everybody parked on `set`, to look again. They stay on its list:
+/// each takes itself off when it has looked.
+fn wake_parked(set: usize) {
+    let flags = irq_save();
+    unsafe {
+        if let Some(s) = set_at(set) {
+            waitlist::each(&s.waiters, |t| {
+                crate::ipc::wake_sleeper(t);
+            });
+        }
+    }
+    irq_restore(flags);
 }
 
 /// Does this task's descriptor `fd` name pipe `handle`?
@@ -460,10 +515,11 @@ fn names_pipe(tid: usize, fd: usize, handle: usize) -> bool {
 
 /// A pipe changed state. Wake any set watching a descriptor that names it.
 ///
-/// Sets are scanned rather than pipes carrying a list of their watchers: there
-/// are sixty-four sets, and the alternative puts a back pointer in every pipe
-/// for the benefit of the rare one anybody watches. The parked check comes
-/// first, so a system with nobody waiting pays sixty-four comparisons.
+/// Sets are scanned rather than pipes carrying a list of their watchers: the
+/// alternative puts a back pointer in every pipe for the benefit of the rare
+/// one anybody watches. Only sets somebody is parked on, or that have an
+/// edge, are looked at, so a system with nobody waiting pays a walk of the
+/// sets that are there.
 pub fn note_pipe(handle: usize) {
     note(|tid, fd| names_pipe(tid, fd, handle));
 }
@@ -479,7 +535,7 @@ fn leads_to(tid: usize, fd: usize, names: &dyn Fn(usize, usize) -> bool, level: 
     }
     let Some(inner) = set_named(tid, fd) else { return false };
     let Some(owner) = owner_task(inner) else { return false };
-    (0..MAX_WATCHED).any(|i| {
+    (0..room(inner)).any(|i| {
         let w = watch(inner, i);
         w.used && leads_to(owner, w.fd, names, level + 1)
     })
@@ -495,29 +551,28 @@ fn leads_to(tid: usize, fd: usize, names: &dyn Fn(usize, usize) -> bool, level: 
 /// looked at — it used to be the first set that task owned, which is a
 /// different set for a program holding two.
 fn note(names: impl Fn(usize, usize) -> bool) {
-    // Which sets to look at, and who is parked on each. Only the pairs: a
-    // set's watches are most of a kilobyte, and this runs on the kernel stack
-    // of whatever wrote to the pipe.
-    let mut look = [(0usize, usize::MAX); MAX_SETS];
-    let mut n = 0;
-
-    let flags = irq_save();
-    unsafe {
-        let waiters = &*core::ptr::addr_of!(WAITERS);
-        for i in 0..MAX_SETS {
-            let waiter = waiters[i];
-            if sets()[i].in_use && (waiter != usize::MAX || sets()[i].edges) {
-                look[n] = (i, waiter);
-                n += 1;
+    // The sets to look at, one at a time: those somebody is parked on, and
+    // those with an edge.
+    let mut at = 0;
+    loop {
+        let flags = irq_save();
+        let next = unsafe {
+            let mut found = None;
+            while let Some(i) = sets().next_used(at) {
+                at = i + 1;
+                if set_at(i).is_some_and(|s| !s.waiters.is_empty() || s.edges) {
+                    found = Some(i);
+                    break;
+                }
             }
-        }
-    }
-    irq_restore(flags);
+            found
+        };
+        irq_restore(flags);
+        let Some(set) = next else { break };
 
-    for &(set, waiter) in look[..n].iter() {
         let Some(tid) = owner_task(set) else { continue };
         let mut found = false;
-        for i in 0..MAX_WATCHED {
+        for i in 0..room(set) {
             let w = watch(set, i);
             if !w.used || !leads_to(tid, w.fd, &names, 1) {
                 continue;
@@ -527,30 +582,27 @@ fn note(names: impl Fn(usize, usize) -> bool) {
                 update(set, i, &w, |w| w.stirred = true);
             }
         }
-        if found && waiter != usize::MAX {
-            crate::ipc::wake_sleeper(waiter);
+        if found {
+            wake_parked(set);
         }
     }
 }
 
 /// Wake whoever is parked on any set, to look again.
 fn wake_all() {
-    let mut wake = [usize::MAX; MAX_SETS];
-    let mut n = 0;
     let flags = irq_save();
     unsafe {
-        let waiters = &*core::ptr::addr_of!(WAITERS);
-        for i in 0..MAX_SETS {
-            if waiters[i] != usize::MAX && sets()[i].in_use {
-                wake[n] = waiters[i];
-                n += 1;
+        let mut at = 0;
+        while let Some(i) = sets().next_used(at) {
+            at = i + 1;
+            if let Some(s) = set_at(i) {
+                waitlist::each(&s.waiters, |t| {
+                    crate::ipc::wake_sleeper(t);
+                });
             }
         }
     }
     irq_restore(flags);
-    for &tid in &wake[..n] {
-        crate::ipc::wake_sleeper(tid);
-    }
 }
 
 /// Something changed at one end of a pty: wake whoever is waiting on a set
@@ -593,8 +645,8 @@ pub fn note_local(l: usize) {
 }
 
 /// A counter was added to or taken from: same reasoning as `note_timer`, and
-/// the same scan. There are sixteen of these in the machine; finding out which
-/// sets name this one costs more than waking them to look.
+/// the same scan: finding out which sets name this one costs more than
+/// waking them to look.
 pub fn note_event() {
     note(|tid, fd| fd < crate::task::FD_MOST && matches!(crate::fdtable::get(tid, fd), FdKind::Event { .. }));
     wake_all();
@@ -608,26 +660,24 @@ fn names_pty(tid: usize, fd: usize, pty: usize) -> bool {
     matches!(kind, FdKind::PtyEnd { pty: p, .. } if p == pty)
 }
 
-/// Collect what is ready. Returns how many entries of `out` were filled.
+/// Collect what is ready: up to `most` of it, each handed to `out` with its
+/// token. Returns how many were.
 ///
 /// This takes what it reports: an edge looked at waits for the next noting,
 /// ready now or not, and a one-shot reported is quiet until it is modified.
 /// One there was no room for is left as it was, for the next wait.
-pub fn scan(set: usize, tid: usize, out: &mut [(u64, u32)]) -> usize {
-    if set >= MAX_SETS {
-        return 0;
-    }
+pub fn scan(set: usize, tid: usize, most: usize, mut out: impl FnMut(u64, u32)) -> usize {
     let table = crate::fdtable::table_index(tid);
     let flags = irq_save();
-    let mine = unsafe { sets()[set].in_use && sets()[set].owner == table };
+    let mine = unsafe { set_at(set).is_some_and(|s| s.owner == table) };
     irq_restore(flags);
     if !mine {
         return 0;
     }
 
     let mut n = 0;
-    for i in 0..MAX_WATCHED {
-        if n == out.len() {
+    for i in 0..room(set) {
+        if n == most {
             break;
         }
         let w = watch(set, i);
@@ -645,7 +695,7 @@ pub fn scan(set: usize, tid: usize, out: &mut [(u64, u32)]) -> usize {
         if hit == 0 {
             continue;
         }
-        out[n] = (w.token, hit);
+        out(w.token, hit);
         n += 1;
         if w.events & ONCE != 0 {
             update(set, i, &w, |w| w.spent = true);

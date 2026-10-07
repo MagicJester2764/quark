@@ -29,16 +29,20 @@
 //! is theirs alone again when they touch it: it leaves the cache, and its
 //! number is free (`SWAP_REFS`).
 //!
-//! Everything here runs with interrupts off except the pager call, and nothing
-//! here allocates from the heap, which can turn them back on.
+//! Everything here runs with interrupts off except the pager call. Nothing
+//! here allocates from the heap but the making of an object's record, which
+//! leaves them as it found them; and nothing that serves a fault does.
 
 use crate::ipc;
 use crate::paging::Fault;
 use crate::pmm;
 use core::sync::atomic::{AtomicU64, Ordering};
 
-/// Object slots, 1 up: 0 means none, and a slot has to fit in 11 bits.
-pub const MAX_OBJECTS: usize = 256;
+/// Object slots, 1 up: 0 means none, and a slot has to fit in the 11 bits
+/// an entry keeps it in — 2,047 objects, the most an entry can name. There
+/// were 256; a record is made when an object is, and room for every slot
+/// is not spent up front.
+pub const MAX_OBJECTS: usize = 2048;
 
 /// `SYS_OBJECT_CTL`'s operations.
 pub const CTL_RESIZE: u64 = 0;
@@ -66,7 +70,6 @@ pub const MAX_PAGE: u64 = (1 << 40) - 1;
 
 #[derive(Clone, Copy)]
 struct Object {
-    in_use: bool,
     /// Never reused, so a capability naming a released object names nothing.
     id: u64,
     pager: usize,
@@ -91,19 +94,6 @@ struct Object {
 }
 
 impl Object {
-    const EMPTY: Object = Object {
-        in_use: false,
-        id: 0,
-        pager: 0,
-        pager_number: 0,
-        cookie: 0,
-        bytes: 0,
-        mapped: 0,
-        writable: 0,
-        end: 0,
-        idle: false,
-    };
-
     fn pages(&self) -> u64 {
         self.bytes.div_ceil(PAGE as u64)
     }
@@ -113,7 +103,8 @@ impl Object {
     }
 }
 
-static mut OBJECTS: [Object; MAX_OBJECTS] = [Object::EMPTY; MAX_OBJECTS];
+/// Every object, by its slot (`table.rs`).
+static mut OBJECTS: crate::table::Table<Object> = crate::table::Table::new(MAX_OBJECTS);
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
 /// The page cache: open addressing on `(slot, page)`, in a table made at
@@ -190,8 +181,19 @@ fn irq_restore(flags: u64) {
     }
 }
 
-fn objects() -> &'static mut [Object; MAX_OBJECTS] {
+fn objects() -> &'static mut crate::table::Table<Object> {
     unsafe { &mut *core::ptr::addr_of_mut!(OBJECTS) }
+}
+
+/// The first object from slot `from` that `is` says is the one: its slot.
+fn find_object(mut from: usize, is: impl Fn(&Object) -> bool) -> Option<usize> {
+    while let Some(slot) = objects().next_used(from) {
+        from = slot + 1;
+        if objects().get(slot).is_some_and(|o| is(o)) {
+            return Some(slot);
+        }
+    }
+    None
 }
 
 fn cache() -> &'static mut [Cached] {
@@ -257,8 +259,9 @@ fn insert(key: u64, frame: usize) -> bool {
             if let Some(at) = (frame / PAGE < unsafe { FRAMES }).then(|| unsafe { PLACES.add(frame / PAGE) }) {
                 unsafe { *at = i as u32 };
             }
-            let o = &mut objects()[(key >> 40) as usize];
-            o.end = o.end.max((key & MAX_PAGE) + 1);
+            if let Some(o) = objects().get((key >> 40) as usize) {
+                o.end = o.end.max((key & MAX_PAGE) + 1);
+            }
             return true;
         }
         i = (i + 1) % n;
@@ -297,7 +300,7 @@ fn forget(i: usize) {
 /// table is looked through for the rest, which with a table as big as a
 /// quarter of memory is to be done once in a while and not once a page.
 fn lowest(slot: usize, from: u64, wanted: impl Fn(&Cached) -> bool) -> Option<usize> {
-    let end = objects()[slot].end;
+    let end = objects().get(slot).map_or(0, |o| o.end);
     let walked = end.min(from.saturating_add((slots() / 8) as u64));
     for page in from..walked {
         if let Some(i) = place(key(slot, page)).filter(|&i| wanted(&cache()[i])) {
@@ -322,8 +325,8 @@ fn lowest(slot: usize, from: u64, wanted: impl Fn(&Cached) -> bool) -> Option<us
 
 /// A live object in `slot`, by id if `id` is not 0.
 fn object(slot: usize, id: u64) -> Option<&'static mut Object> {
-    let o = objects().get_mut(slot)?;
-    (slot != 0 && o.in_use && (id == 0 || o.id == id)).then_some(o)
+    let o = objects().get(slot)?;
+    (slot != 0 && (id == 0 || o.id == id)).then_some(o)
 }
 
 /// One object `pager` pages for that nothing maps and that it has not been
@@ -332,7 +335,8 @@ fn object(slot: usize, id: u64) -> Option<&'static mut Object> {
 /// # Safety
 /// Interrupts off.
 pub unsafe fn take_idle(pager: usize) -> Option<(u64, u64)> {
-    let o = objects().iter_mut().find(|o| o.in_use && o.idle && o.pager == pager && o.pager_alive())?;
+    let slot = find_object(1, |o| o.idle && o.pager == pager && o.pager_alive())?;
+    let o = objects().get(slot)?;
     o.idle = false;
     Some((o.cookie, o.id))
 }
@@ -340,7 +344,12 @@ pub unsafe fn take_idle(pager: usize) -> Option<(u64, u64)> {
 /// How many objects `pager` pages for.
 pub fn objects_of(pager: usize) -> usize {
     let flags = irq_save();
-    let n = objects().iter().filter(|o| o.in_use && o.pager == pager && o.pager_alive()).count();
+    let mut n = 0;
+    let mut at = 1;
+    while let Some(slot) = find_object(at, |o| o.pager == pager && o.pager_alive()) {
+        at = slot + 1;
+        n += 1;
+    }
     irq_restore(flags);
     n
 }
@@ -351,20 +360,19 @@ pub fn slot_of(id: u64) -> Option<usize> {
         return None;
     }
     let flags = irq_save();
-    let slot = objects().iter().position(|o| o.in_use && o.id == id);
+    let slot = find_object(1, |o| o.id == id);
     irq_restore(flags);
     slot
 }
 
 /// Make an object of `bytes` bytes that `pager` will page in, and which it
-/// knows as `cookie`. Returns its slot and id.
+/// knows as `cookie`. Returns its slot and id; `None` when every slot an
+/// entry can name is taken, or there is no memory for its record.
 pub fn create(pager: usize, cookie: u64, bytes: u64) -> Option<(usize, u64)> {
     let flags = irq_save();
-    let found = objects().iter().skip(1).position(|o| !o.in_use).map(|i| i + 1);
-    let result = found.map(|slot| {
+    let result = objects().lowest_free(1).and_then(|slot| {
         let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-        objects()[slot] = Object {
-            in_use: true,
+        let o = Object {
             id,
             pager,
             pager_number: crate::cap::endpoint_of(pager),
@@ -375,7 +383,7 @@ pub fn create(pager: usize, cookie: u64, bytes: u64) -> Option<(usize, u64)> {
             end: 0,
             idle: false,
         };
-        (slot, id)
+        objects().fill_at(slot, o).is_ok().then_some((slot, id))
     });
     irq_restore(flags);
     result
@@ -393,7 +401,7 @@ fn release(slot: usize) {
     };
     // By its pages, where it has had fewer than an eighth of the table's
     // places: it nearly always has.
-    let end = objects()[slot].end;
+    let end = objects().get(slot).map_or(0, |o| o.end);
     if end <= (slots() / 8) as u64 {
         for page in 0..end {
             if let Some(i) = place(key(slot, page)) {
@@ -408,7 +416,7 @@ fn release(slot: usize) {
             }
         }
     }
-    objects()[slot] = Object::EMPTY;
+    objects().empty(slot);
     swap_gone(slot);
 }
 
@@ -499,9 +507,10 @@ pub fn unmap_ref(slot: usize, n: u64) {
 pub fn task_gone(tid: usize) {
     let flags = irq_save();
     let number = crate::cap::endpoint_of(tid);
-    for slot in 1..MAX_OBJECTS {
-        let o = &mut objects()[slot];
-        if o.in_use && o.pager == tid && o.pager_number == number {
+    let mut at = 1;
+    while let Some(slot) = find_object(at, |o| o.pager == tid && o.pager_number == number) {
+        at = slot + 1;
+        if let Some(o) = objects().get(slot) {
             o.pager_number = 0;
             if o.mapped == 0 {
                 release(slot);
@@ -581,10 +590,12 @@ pub fn ctl(caller: usize, id: u64, op: u64, a: u64, b: u64) -> u64 {
 }
 
 fn ctl_locked(caller: usize, id: u64, op: u64, a: u64, b: u64) -> u64 {
-    let Some(slot) = objects().iter().position(|o| o.in_use && o.id == id) else {
+    let Some(slot) = find_object(1, |o| o.id == id) else {
         return u64::MAX;
     };
-    let o = &mut objects()[slot];
+    let Some(o) = objects().get(slot) else {
+        return u64::MAX;
+    };
     if o.pager != caller || !o.pager_alive() {
         return u64::MAX;
     }
@@ -752,7 +763,7 @@ fn swap_on(slot: usize) -> bool {
     if s.slot != 0 {
         return false;
     }
-    let pages = objects()[slot].pages().min(MAX_PAGE) as usize;
+    let pages = objects().get(slot).map_or(0, |o| o.pages()).min(MAX_PAGE) as usize;
     if pages == 0 {
         return false;
     }

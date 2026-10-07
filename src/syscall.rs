@@ -445,8 +445,9 @@ pub const SYS_PAGE_OUT: u64 = 198;
 const OBJECT_MAP_WRITE: u64 = 1;
 const OBJECT_MAP_SHARED: u64 = 2;
 const OBJECT_MAP_EXEC: u64 = 4;
-/// Objects one pager may have at once, so that no one task fills the table.
-const OBJECTS_PER_PAGER: usize = 128;
+/// Objects one pager may have at once, so that no one task fills the table:
+/// half of the 2,047 an entry can name. There were 128, of 256.
+const OBJECTS_PER_PAGER: usize = 1024;
 
 // --- 0xE0  descriptors, continued ---
 /// A server gives the task calling it a descriptor for one of its objects.
@@ -704,8 +705,9 @@ pub const FD_DONTWAIT: u64 = 1;
 /// is, `u32`s, as many as bits 8 to 15 of the flags say — to send, or room
 /// to write those received.
 pub const FD_MANY: u64 = 2;
-/// The most one send carries, and one receive takes.
-const FD_MANY_MOST: usize = 32;
+/// The most one send carries, and one receive takes: as many as the eight
+/// bits that say how many can say. Linux's is 253 (`SCM_MAX_FD`). It was 32.
+const FD_MANY_MOST: usize = 255;
 
 /// The set a descriptor names, or `None` if it names something else.
 fn pollset_of(tid: usize, fd: usize) -> Option<usize> {
@@ -2021,7 +2023,7 @@ fn dispatch(
                     break crate::signal::INTERRUPTED;
                 }
                 if !crate::local::wait(l) && !crate::local::readable(l) && !crate::signal::ends_wait(me) {
-                    // It does not listen, or there is no room to wait.
+                    // It does not listen.
                     break u64::MAX;
                 }
             };
@@ -3143,12 +3145,17 @@ fn dispatch(
             // it create, fill and destroy a set from user space would be three
             // calls where one will do. Waiting cannot be done without a set,
             // because that is what a pipe becoming ready looks for.
-            let n = (arg1 as usize).min(32);
+            let tid = scheduler::current_tid();
+            // As many as the program may have descriptors, as on Linux;
+            // there were thirty-two.
+            let n = arg1 as usize;
+            if n > crate::fdtable::limit_of(tid).map_or(0, |(soft, _)| soft) {
+                return u64::MAX;
+            }
             if n == 0 {
                 // Waiting on nothing at all is a sleep, and a main loop whose
                 // sources are all timeouts does exactly that. Returning at once
                 // turned that loop into a spin.
-                let tid = scheduler::current_tid();
                 let deadline = crate::clock::now().saturating_add(crate::clock::span(arg2));
                 loop {
                     let now = crate::clock::now();
@@ -3166,59 +3173,62 @@ fn dispatch(
             if !validate_user_ptr_mut(arg0, (n * 16) as u64) {
                 return u64::MAX;
             }
-            let tid = scheduler::current_tid();
-
-            let mut want = [(0usize, 0u32); 32];
-            {
+            // The entries are read, and what each reports written, where the
+            // program has them: there may be as many as it has descriptors.
+            let entry = |i: usize| -> (usize, u32) {
                 let _ua = crate::cpu::UserAccess::begin();
-                for i in 0..n {
-                    unsafe {
-                        let p = (arg0 as *const u8).add(i * 16);
-                        want[i] = (*(p as *const u32) as usize, *(p.add(4) as *const u32));
-                    }
+                unsafe {
+                    let p = (arg0 as *const u8).add(i * 16);
+                    (*(p as *const u32) as usize, *(p.add(4) as *const u32))
                 }
-            }
+            };
+            let report = |i: usize, events: u32, add: bool| {
+                let _ua = crate::cpu::UserAccess::begin();
+                unsafe {
+                    let p = (arg0 as *mut u8).add(i * 16 + 8) as *mut u32;
+                    *p = if add { *p | events } else { events };
+                }
+            };
 
-            let set = match crate::pollset::create(tid) {
+            let set = match crate::pollset::create(tid, true) {
                 Some(s) => s,
                 None => return u64::MAX,
             };
-            let mut rev = [0u32; 32];
             let mut invalid = 0;
             for i in 0..n {
-                if crate::pollset::watchable(tid, want[i].0) {
+                let (fd, want) = entry(i);
+                if crate::pollset::watchable(tid, fd) {
                     // The index is the token, so a hit names its own entry.
-                    let events = want[i].1 & (crate::pollset::READABLE | crate::pollset::WRITABLE);
-                    let _ = crate::pollset::ctl(set, tid, 0, want[i].0, events, i as u64);
+                    let events = want & (crate::pollset::READABLE | crate::pollset::WRITABLE);
+                    let _ = crate::pollset::ctl(set, tid, 0, fd, events, i as u64);
+                    report(i, 0, false);
                 } else {
-                    rev[i] = crate::pollset::INVALID;
+                    report(i, crate::pollset::INVALID, false);
                     invalid += 1;
                 }
             }
+            let mut found = |token: u64, events: u32| {
+                if (token as usize) < n {
+                    report(token as usize, events, true);
+                }
+            };
 
             let deadline = crate::clock::now().saturating_add(crate::clock::span(arg2));
-            let mut found = [(0u64, 0u32); 32];
             let mut hits = 0usize;
             let mut interrupted = false;
             loop {
-                let mut got = crate::pollset::scan(set, tid, &mut found[..n]);
+                let mut got = crate::pollset::scan(set, tid, n, &mut found);
                 // An invalid entry is an answer, so do not sleep on top of it.
                 let now = crate::clock::now();
                 if got == 0 && invalid == 0 && now < deadline {
                     // The last look, parked: what it finds is the answer.
                     crate::pollset::park(set, tid);
-                    got = crate::pollset::scan(set, tid, &mut found[..n]);
+                    got = crate::pollset::scan(set, tid, n, &mut found);
                     if got > 0 {
-                        crate::pollset::unpark(set);
+                        crate::pollset::unpark(set, tid);
                     }
                 }
                 if got > 0 {
-                    for i in 0..got {
-                        let idx = found[i].0 as usize;
-                        if idx < n {
-                            rev[idx] |= found[i].1;
-                        }
-                    }
                     hits = got;
                     break;
                 }
@@ -3226,29 +3236,22 @@ fn dispatch(
                     break;
                 }
                 let slept = crate::ipc::sys_recv_timeout(tid, deadline - now);
-                crate::pollset::unpark(set);
+                crate::pollset::unpark(set, tid);
                 if let Err(crate::ipc::IpcError::Interrupted) = slept {
                     interrupted = true;
                     break;
                 }
             }
-            crate::pollset::unpark(set);
+            crate::pollset::unpark(set, tid);
             crate::pollset::destroy(set);
             if interrupted {
                 return crate::signal::INTERRUPTED;
-            }
-
-            {
-                let _ua = crate::cpu::UserAccess::begin();
-                for i in 0..n {
-                    unsafe { *((arg0 as *mut u8).add(i * 16 + 8) as *mut u32) = rev[i] };
-                }
             }
             (hits + invalid) as u64
         }
         SYS_POLLSET_CREATE => {
             let tid = scheduler::current_tid();
-            match crate::pollset::create(tid) {
+            match crate::pollset::create(tid, false) {
                 Some(set) => match scheduler::install_fd(tid, crate::task::FdKind::PollSet { set }) {
                     Some(fd) => fd as u64,
                     None => {
@@ -3296,15 +3299,28 @@ fn dispatch(
                 Some(s) => s,
                 None => return u64::MAX,
             };
-            let cap = (arg2 as usize).min(64);
+            // As many as there is room for, and no more than a set can watch.
+            // There were sixty-four.
+            let cap = (arg2 as usize).min(crate::task::FD_MOST);
             if cap == 0 || !validate_user_ptr_mut(arg1, (cap * 16) as u64) {
                 return u64::MAX;
             }
+            // Each written where the program has room for it, as it is found.
+            let found = |at: &mut usize, token: u64, events: u32| {
+                let _ua = crate::cpu::UserAccess::begin();
+                unsafe {
+                    let p = (arg1 as *mut u8).add(*at * 16);
+                    *(p as *mut u64) = token;
+                    *(p.add(8) as *mut u32) = events;
+                    *(p.add(12) as *mut u32) = 0;
+                }
+                *at += 1;
+            };
 
             let deadline = crate::clock::now().saturating_add(crate::clock::span(arg3));
-            let mut found = [(0u64, 0u32); 64];
             let out = loop {
-                let n = crate::pollset::scan(set, tid, &mut found[..cap]);
+                let mut at = 0;
+                let n = crate::pollset::scan(set, tid, cap, |token, events| found(&mut at, token, events));
                 if n > 0 {
                     break n as u64;
                 }
@@ -3320,9 +3336,10 @@ fn dispatch(
                 // window between looking and sleeping. What the last look
                 // finds is the answer: a scan takes the edges it reports.
                 crate::pollset::park(set, tid);
-                let n = crate::pollset::scan(set, tid, &mut found[..cap]);
+                let mut at = 0;
+                let n = crate::pollset::scan(set, tid, cap, |token, events| found(&mut at, token, events));
                 if n > 0 {
-                    crate::pollset::unpark(set);
+                    crate::pollset::unpark(set, tid);
                     break n as u64;
                 }
 
@@ -3333,23 +3350,12 @@ fn dispatch(
                 // means the existing timeout sweep abandons the block and no
                 // second sweep had to be written.
                 let slept = crate::ipc::sys_recv_timeout(tid, deadline - now);
-                crate::pollset::unpark(set);
+                crate::pollset::unpark(set, tid);
                 if let Err(crate::ipc::IpcError::Interrupted) = slept {
                     return crate::signal::INTERRUPTED;
                 }
             };
-            crate::pollset::unpark(set);
-            if out > 0 {
-                let _ua = crate::cpu::UserAccess::begin();
-                for i in 0..(out as usize) {
-                    unsafe {
-                        let p = (arg1 as *mut u8).add(i * 16);
-                        *(p as *mut u64) = found[i].0;
-                        *(p.add(8) as *mut u32) = found[i].1;
-                        *(p.add(12) as *mut u32) = 0;
-                    }
-                }
-            }
+            crate::pollset::unpark(set, tid);
             out
         }
         SYS_FD_SEND => {
@@ -3375,43 +3381,57 @@ fn dispatch(
 
             // What to pass: one descriptor, or with FD_MANY an array of
             // them.
-            let mut fds = [0u32; FD_MANY_MOST];
             let count = if arg4 & FD_MANY != 0 {
                 let count = ((arg4 >> 8) & 0xFF) as usize;
                 if count > FD_MANY_MOST || (count > 0 && !validate_user_ptr(pass, count as u64 * 4)) {
                     return u64::MAX;
                 }
-                let _ua = crate::cpu::UserAccess::begin();
-                for (i, fd) in fds[..count].iter_mut().enumerate() {
-                    *fd = unsafe { core::ptr::read_unaligned((pass as *const u32).add(i)) };
-                }
                 count
-            } else if pass != u64::MAX {
-                fds[0] = pass.min(u32::MAX as u64) as u32;
-                1
             } else {
-                0
+                (pass != u64::MAX) as usize
+            };
+            let nth = |i: usize| -> usize {
+                if arg4 & FD_MANY != 0 {
+                    let _ua = crate::cpu::UserAccess::begin();
+                    unsafe { core::ptr::read_unaligned((pass as *const u32).add(i)) as usize }
+                } else {
+                    pass.min(u32::MAX as u64) as usize
+                }
             };
             // Held on the queue's behalf, each of them. Without this the
             // sender closing its own copy frees the object underneath a
-            // descriptor still travelling.
-            let mut passed = [crate::task::FdKind::Empty; FD_MANY_MOST];
+            // descriptor still travelling. Gathered on the heap: as many as
+            // a send may carry are more than a kernel stack should hold.
+            let mut passed = crate::grow::Grow::new(crate::task::FdKind::Empty);
             for i in 0..count {
-                match crate::fdtable::get_retained(tid, fds[i] as usize) {
-                    Some(kind) => passed[i] = kind,
-                    None => {
-                        for kind in &passed[..i] {
+                let kind = crate::fdtable::get_retained(tid, nth(i));
+                let room = kind.is_some() && passed.ensure(i, count, count).is_ok();
+                match kind {
+                    Some(kind) if room => {
+                        if let Some(at) = passed.get_mut(i) {
+                            *at = kind;
+                        }
+                    }
+                    _ => {
+                        if let Some(kind) = kind {
+                            crate::pipe::release_fd(&kind);
+                        }
+                        for kind in passed.iter().take(i) {
                             crate::pipe::release_fd(kind);
                         }
                         return u64::MAX;
                     }
                 }
             }
+            let passed: &[crate::task::FdKind] =
+                if count > 0 { unsafe { core::slice::from_raw_parts(passed.get(0).unwrap(), count) } } else { &[] };
             // The descriptors go on the queue before the bytes, so a peer
             // that reads the bytes never has to wonder whether they are
-            // still coming.
-            if count > 0 && !crate::stream::push_fds(stream, end, &passed[..count]) {
-                for kind in &passed[..count] {
+            // still coming. No more wait there than the sender may hold —
+            // Linux's bound on what is in flight.
+            let most = crate::fdtable::limit_of(tid).map_or(0, |(soft, _)| soft);
+            if count > 0 && !crate::stream::push_fds(stream, end, passed, most) {
+                for kind in passed {
                     crate::pipe::release_fd(kind);
                 }
                 return u64::MAX;
@@ -3428,11 +3448,8 @@ fn dispatch(
             };
             // A signal ended the wait with nothing sent: nor are the
             // descriptors, which the call made again would send a second time.
-            if sent == crate::signal::INTERRUPTED
-                && count > 0
-                && crate::stream::take_back_fds(stream, end, &passed[..count])
-            {
-                for kind in &passed[..count] {
+            if sent == crate::signal::INTERRUPTED && count > 0 && crate::stream::take_back_fds(stream, end, passed) {
+                for kind in passed {
                     crate::pipe::release_fd(kind);
                 }
             }
@@ -3502,25 +3519,21 @@ fn dispatch(
             // table has a slot, in the order they were sent. Whether there is
             // a slot is asked before each is taken, as below.
             if many {
-                let mut landed = [0u32; FD_MANY_MOST];
+                // Each number written as it lands, into what the call
+                // checked and holds in memory.
                 let mut k = 0;
                 while k < room && scheduler::lowest_free_fd(tid).is_some() {
                     let Some(kind) = crate::stream::pop_fd(stream, end) else { break };
                     match crate::fdtable::install(tid, kind, 3) {
                         Some(fd) => {
-                            landed[k] = fd as u32;
+                            let _ua = crate::cpu::UserAccess::begin();
+                            unsafe { core::ptr::write_unaligned((at as *mut u32).add(k), fd as u32) };
                             k += 1;
                         }
                         None => {
                             crate::pipe::release_fd(&kind);
                             break;
                         }
-                    }
-                }
-                if k > 0 {
-                    let _ua = crate::cpu::UserAccess::begin();
-                    for (i, &fd) in landed[..k].iter().enumerate() {
-                        unsafe { core::ptr::write_unaligned((at as *mut u32).add(i), fd) };
                     }
                 }
                 return (k as u64) << 32 | n;

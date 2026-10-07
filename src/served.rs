@@ -42,10 +42,6 @@
 use crate::scheduler;
 use crate::task::MAX_TASKS;
 
-/// Objects at once, for every server together. The file server has 512
-/// handles; this leaves room for a second server before anybody has to count.
-pub const MAX_SERVED: usize = 1024;
-
 /// The most one kernel-made read or write lends: what `SYS_LENT_READ` and
 /// `SYS_LENT_WRITE` copy in one go. A longer one is a short read or write.
 const IO_MAX: usize = crate::lend::COPY_MAX;
@@ -68,7 +64,6 @@ const NOTHING_YET: u64 = 0xFFFF_FFFE;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum State {
-    Free,
     /// A descriptor names it.
     Live,
     /// None does, and its server has not collected it yet.
@@ -89,9 +84,10 @@ struct Object {
     ready: Option<u32>,
 }
 
-const NONE: Object = Object { state: State::Free, server: 0, endpoint: 0, cookie: 0, refs: 0, ready: None };
-
-static mut OBJECTS: [Object; MAX_SERVED] = [NONE; MAX_SERVED];
+/// Every object, from the descriptor a server made for it until its server
+/// has collected it (`table.rs`). There were 1,024, for every server
+/// together.
+static mut OBJECTS: crate::table::Table<Object> = crate::table::Table::new(crate::table::MOST);
 /// What this module keeps about a task, in its record (`TaskRec::served`):
 /// each field was an array of `MAX_TASKS`, and an id with no task reads as
 /// `PerTask::new()` — what an empty slot of those arrays held.
@@ -142,8 +138,33 @@ fn irq_restore(flags: u64) {
 /// # Safety
 /// Interrupts are off.
 #[inline(always)]
-unsafe fn objects() -> &'static mut [Object; MAX_SERVED] {
+unsafe fn objects() -> &'static mut crate::table::Table<Object> {
     unsafe { &mut *core::ptr::addr_of_mut!(OBJECTS) }
+}
+
+/// Object `obj`, if there is one.
+///
+/// # Safety
+/// Interrupts are off.
+#[inline(always)]
+unsafe fn object(obj: usize) -> Option<&'static mut Object> {
+    unsafe { objects().get(obj) }
+}
+
+/// The first object from `from` that `is` says is the one.
+///
+/// # Safety
+/// Interrupts are off.
+unsafe fn find(mut from: usize, is: impl Fn(&Object) -> bool) -> Option<usize> {
+    unsafe {
+        while let Some(i) = objects().next_used(from) {
+            from = i + 1;
+            if object(i).is_some_and(|o| is(o)) {
+                return Some(i);
+            }
+        }
+        None
+    }
 }
 
 /// Is the server that made this object still the task at its TID?
@@ -158,25 +179,15 @@ fn server_alive(o: &Object) -> bool {
 /// is ready, and until it does it is ready for nothing.
 pub fn create(server: usize, cookie: u64, says_ready: bool) -> Option<usize> {
     let endpoint = crate::cap::endpoint_of(server);
-    if endpoint == 0 {
+    if endpoint == 0 || !crate::reclaim::may_make() {
         return None;
     }
     let flags = irq_save();
     let out = unsafe {
-        match objects().iter().position(|o| o.state == State::Free) {
-            Some(i) => {
-                objects()[i] = Object {
-                    state: State::Live,
-                    server,
-                    endpoint,
-                    cookie,
-                    refs: 1,
-                    ready: says_ready.then_some(0),
-                };
-                Some(i)
-            }
-            None => None,
-        }
+        objects().lowest_free(0).filter(|&i| {
+            let o = Object { state: State::Live, server, endpoint, cookie, refs: 1, ready: says_ready.then_some(0) };
+            objects().fill_at(i, o).is_ok()
+        })
     };
     irq_restore(flags);
     out
@@ -185,26 +196,20 @@ pub fn create(server: usize, cookie: u64, says_ready: bool) -> Option<usize> {
 /// Forget an object whose descriptor never got installed. The server is not
 /// told: it has not been told the object exists.
 pub fn discard(obj: usize) {
-    if obj >= MAX_SERVED {
-        return;
-    }
     let flags = irq_save();
-    unsafe { objects()[obj] = NONE };
+    unsafe { objects().empty(obj) };
     irq_restore(flags);
 }
 
 pub fn retain(obj: usize) -> bool {
-    if obj >= MAX_SERVED {
-        return false;
-    }
     let flags = irq_save();
     let ok = unsafe {
-        let o = &mut objects()[obj];
-        if o.state == State::Live {
-            o.refs += 1;
-            true
-        } else {
-            false
+        match object(obj) {
+            Some(o) if o.state == State::Live => {
+                o.refs += 1;
+                true
+            }
+            _ => false,
         }
     };
     irq_restore(flags);
@@ -214,14 +219,10 @@ pub fn retain(obj: usize) -> bool {
 /// One descriptor fewer. The last one hands the object back to its server:
 /// it waits, counted by nobody, until the server collects it.
 pub fn release(obj: usize) {
-    if obj >= MAX_SERVED {
-        return;
-    }
     let mut wake = None;
     let flags = irq_save();
     unsafe {
-        let o = &mut objects()[obj];
-        if o.state == State::Live && o.refs > 0 {
+        if let Some(o) = object(obj).filter(|o| o.state == State::Live && o.refs > 0) {
             o.refs -= 1;
             if o.refs == 0 {
                 if server_alive(o) {
@@ -231,7 +232,7 @@ pub fn release(obj: usize) {
                     wake = Some(server);
                 } else {
                     // Nobody to collect it.
-                    *o = NONE;
+                    objects().empty(obj);
                 }
             }
         }
@@ -266,17 +267,11 @@ pub fn reap(server: usize) -> Option<u64> {
     }
     let flags = irq_save();
     let out = unsafe {
-        match objects()
-            .iter()
-            .position(|o| o.state == State::Released && o.endpoint == endpoint)
-        {
-            Some(i) => {
-                let cookie = objects()[i].cookie;
-                objects()[i] = NONE;
-                Some(cookie)
-            }
-            None => None,
-        }
+        find(0, |o| o.state == State::Released && o.endpoint == endpoint).and_then(|i| {
+            let cookie = object(i).map(|o| o.cookie);
+            objects().empty(i);
+            cookie
+        })
     };
     irq_restore(flags);
     out
@@ -284,13 +279,9 @@ pub fn reap(server: usize) -> Option<u64> {
 
 /// The server and the cookie an object names, while its server lives.
 pub fn of(obj: usize) -> Option<(usize, u64)> {
-    if obj >= MAX_SERVED {
-        return None;
-    }
     let flags = irq_save();
     let out = unsafe {
-        let o = &objects()[obj];
-        if o.state == State::Live && server_alive(o) { Some((o.server, o.cookie)) } else { None }
+        object(obj).filter(|o| o.state == State::Live && server_alive(o)).map(|o| (o.server, o.cookie))
     };
     irq_restore(flags);
     out
@@ -300,13 +291,12 @@ pub fn of(obj: usize) -> Option<(usize, u64)> {
 /// server says nothing, ready whichever way it is asked. One whose server has
 /// gone is ended, which a read finds out at once.
 pub fn readiness(obj: usize) -> Option<u32> {
-    if obj >= MAX_SERVED {
-        return None;
-    }
     let flags = irq_save();
     let out = unsafe {
-        let o = &objects()[obj];
-        if o.state != State::Live || !server_alive(o) { Some(crate::pollset::READABLE | crate::pollset::HANGUP) } else { o.ready }
+        match object(obj) {
+            Some(o) if o.state == State::Live && server_alive(o) => o.ready,
+            _ => Some(crate::pollset::READABLE | crate::pollset::HANGUP),
+        }
     };
     irq_restore(flags);
     out
@@ -322,9 +312,12 @@ pub fn set_ready(server: usize, cookie: u64, bits: u32) -> bool {
     }
     let flags = irq_save();
     let found = unsafe {
-        objects().iter_mut().position(|o| o.state == State::Live && o.endpoint == endpoint && o.cookie == cookie)
-            .filter(|&i| objects()[i].ready.is_some())
-            .inspect(|&i| objects()[i].ready = Some(bits))
+        find(0, |o| o.state == State::Live && o.endpoint == endpoint && o.cookie == cookie && o.ready.is_some())
+            .inspect(|&i| {
+                if let Some(o) = object(i) {
+                    o.ready = Some(bits);
+                }
+            })
     };
     irq_restore(flags);
     if let Some(obj) = found {
@@ -336,14 +329,11 @@ pub fn set_ready(server: usize, cookie: u64, bits: u32) -> bool {
 /// The cookie an object names, if it is one of `server`'s.
 pub fn cookie_for(obj: usize, server: usize) -> Option<u64> {
     let endpoint = crate::cap::endpoint_of(server);
-    if obj >= MAX_SERVED || endpoint == 0 {
+    if endpoint == 0 {
         return None;
     }
     let flags = irq_save();
-    let out = unsafe {
-        let o = &objects()[obj];
-        if o.state == State::Live && o.endpoint == endpoint { Some(o.cookie) } else { None }
-    };
+    let out = unsafe { object(obj).filter(|o| o.state == State::Live && o.endpoint == endpoint).map(|o| o.cookie) };
     irq_restore(flags);
     out
 }
@@ -358,10 +348,10 @@ pub fn server_gone(server: usize) {
             st(server).notice = false;
         }
         if endpoint != 0 {
-            for o in objects().iter_mut() {
-                if o.state == State::Released && o.endpoint == endpoint {
-                    *o = NONE;
-                }
+            let mut at = 0;
+            while let Some(i) = find(at, |o| o.state == State::Released && o.endpoint == endpoint) {
+                at = i + 1;
+                objects().empty(i);
             }
         }
     }
