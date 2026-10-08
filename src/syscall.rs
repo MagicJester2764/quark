@@ -487,6 +487,9 @@ pub const SYS_FUTEX_REQUEUE: u64 = 237;
 /// How one task is scheduled: its niceness, and its class — ordinary, or
 /// real-time FIFO or round-robin, at a priority.
 pub const SYS_SCHED: u64 = 238;
+/// Lock, try to lock, or unlock a priority-inheriting word: Linux's
+/// FUTEX_LOCK_PI, FUTEX_TRYLOCK_PI and FUTEX_UNLOCK_PI.
+pub const SYS_FUTEX_PI: u64 = 239;
 /// `SYS_FD_SERVE`'s flag: the server will say when the object is ready.
 const SERVE_SAYS_READY: u64 = 1;
 /// SYS_FD_SERVE_PIPE: the writing end, and only if the other end is held.
@@ -506,7 +509,7 @@ pub const SYS_ABI_VERSION: u64 = 240;
 /// minor when calls are added. User space can refuse to run against a major it
 /// does not know, which is the point of exposing it at all.
 pub const ABI_VERSION_MAJOR: u64 = 4;
-pub const ABI_VERSION_MINOR: u64 = 3;
+pub const ABI_VERSION_MINOR: u64 = 4;
 
 /// How many tasks a program may have with no capability at all: its own, and
 /// the children it has made and not collected, by `SYS_TASK_CREATE`,
@@ -3668,6 +3671,16 @@ fn dispatch(
         SYS_FUTEX_WAKE => {
             // arg0 = addr, arg1 = max_wake
             crate::futex::futex_wake(arg0, arg1)
+        }
+        SYS_FUTEX_PI => {
+            // arg0 = op (0 lock, 1 try, 2 unlock), arg1 = the word, arg2 =
+            // for a lock how long to wait at most, a span, 0 for no end.
+            match arg0 {
+                0 => crate::futex::lock_pi(arg1, arg2, false),
+                1 => crate::futex::lock_pi(arg1, 0, true),
+                2 => crate::futex::unlock_pi(arg1),
+                _ => u64::MAX,
+            }
         }
         SYS_SCHED => {
             // arg0 = op (0 nice, 1 set nice, 2 set class, 3 class), arg1 =

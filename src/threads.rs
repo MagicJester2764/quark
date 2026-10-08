@@ -12,7 +12,9 @@
 //! or becomes another program. Then it walks the list in the task's own
 //! memory, as it was, a word at a time through its tables; each mutex still
 //! marked with the task's id is marked as one whose owner died
-//! (FUTEX_OWNER_DIED), and a waiter is woken. A C library that ends a
+//! (FUTEX_OWNER_DIED), and a waiter is woken — or, for a priority-inheriting
+//! one somebody waits in the kernel to lock, handed to the best of them
+//! (`futex::pi_owner_died`). A C library that ends a
 //! thread itself walks the list first, and musl does: what is left for this
 //! is a program that ends without it — `_exit`, a kill, a fault — holding a
 //! mutex another program waits on, in memory they share. A page that is not
@@ -26,11 +28,12 @@ pub const NAME_MAX: usize = 15;
 /// The most entries a walk follows, as Linux's ROBUST_LIST_LIMIT: a list
 /// that loops is the program's mistake, and not the kernel's to follow.
 const MOST: usize = 2048;
-/// In a robust mutex's word: the owner died, and somebody waits.
-const OWNER_DIED: u32 = 0x4000_0000;
-const WAITERS: u32 = 0x8000_0000;
-/// The owner's id, in the rest of the word.
-const OWNER: u32 = 0x3FFF_FFFF;
+/// In a robust mutex's word: the owner died, and somebody waits; and the
+/// owner's id, in the rest of the word. Linux's, as a priority-inheriting
+/// word's are (`futex.rs`).
+const OWNER_DIED: u32 = crate::futex::PI_OWNER_DIED;
+const WAITERS: u32 = crate::futex::PI_WAITERS;
+const OWNER: u32 = crate::futex::PI_OWNER;
 
 /// What this module keeps about a task, in its record (`TaskRec::threads`):
 /// each field was an array of `MAX_TASKS`, and an id with no task reads as
@@ -173,6 +176,9 @@ fn owner_died(cr3: usize, at: u64, tid: usize) {
     if word & OWNER != tid as u32 {
         return;
     }
+    if crate::futex::pi_owner_died(cr3, at, tid) {
+        return;
+    }
     let flags = irq_save();
     let written = unsafe {
         // Reached by its frame, so a page it shares since a fork is made
@@ -234,5 +240,7 @@ pub fn let_go(tid: usize) {
 /// is called by its new name.
 pub fn exec(tid: usize) {
     let_go(tid);
+    // And what it held that was not on the list, nobody lends it any more.
+    crate::futex::owner_gone(tid);
     set_name(tid, &[]);
 }

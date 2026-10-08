@@ -1,6 +1,6 @@
 # Quark syscall ABI
 
-**Version 4.3.** Query the running kernel with `SYS_ABI_VERSION` (240), which
+**Version 4.4.** Query the running kernel with `SYS_ABI_VERSION` (240), which
 returns `(major << 16) | minor`.
 
 This document is the contract between the Quark kernel and everything above it.
@@ -278,6 +278,7 @@ numbers, and only 64 could name it before, through a range check.
 | 4.1 | **As many tasks as a desktop runs.** The kernel has up to 32,768 tasks, where it had sixty-four, so a program can no longer find every task by asking about each number below 64: `SYS_TASK_NEXT` (236) answers the first task at or past a number, and a walk of every task is one call a task. A program has 4,096 tasks without `TaskMgmt` — its own that have not died, and the children it has made in other programs and not collected — where a task could have sixteen children and a fork was not counted at all; `SYS_TASK_CREATE`, `SYS_TASK_CREATE_IN` and `SYS_FORK` answer `u64::MAX` past it. **And what a program makes is made when it makes it**, as many as its descriptors and the machine's memory allow: counters, timers, signal descriptors, pipes and shared regions, where there were 16, 16, 32, 256 — 64 a program — and 256 for the machine. `SYS_PIPE_CREATE` counts no budget of the program's; nor does anything else that was made with one. So are terminals, local sockets, streams, poll sets and served descriptors, where there were 8, 32, 64, 64 and 1,024; and what is in them grows: a set watches as many descriptors as a program may have (it watched 32), `SYS_POLL` takes as many entries and refuses more (it took 32 and ignored the rest), a listener's backlog goes to 4,096 (16), a stream holds in flight as many descriptors as its sender may have (32), and a send or receive of several carries 255 (32). Memory objects are 2,047, the most a page-table entry can name (256), and 1,024 a pager (128). And a program's capability space grows: 256 slots when the first is written, doubled as more are wanted, up to 65,536 (it was 256, all of them inline in every program's), a slot's number never moving; `SYS_CAP_READ` answers how many slots a space has room for, where it answered 0. |
 | 4.2 | **A futex keeps every waiter, and moves them.** A futex wait is never refused for room: there were sixty-four waiters for the machine, and the sixty-fifth was answered `u64::MAX` at once. `SYS_FUTEX_REQUEUE` (237) wakes some of a word's waiters and moves the rest to wait on another word — Linux's `FUTEX_REQUEUE`, and with a value to compare, `FUTEX_CMP_REQUEUE`, which answers `0xFFFF_FFFE` when the word has changed. |
 | 4.3 | **How one task is scheduled.** Nice is a task's, given to the threads and children it makes, where it was a program's: `SYS_NICE` says it of every task of a program, and `SYS_SCHED` (238) of one — and puts a task in a real-time class, Linux's `SCHED_FIFO` or `SCHED_RR` at a priority from 1 to 99, which takes the new right `RealTime` (capability 16) to enter. Within its band a real-time task runs before every ordinary one, the best priority first: FIFO until it blocks, yields or something better is ready, round-robin for a turn of 100 ms among its equals; one woken by a call runs as the call returns. A processor's real-time tasks have at most 950 ms of each second, and past that wait for whatever ordinary task is ready. A task waited on runs at the place — band, then real-time priority — of the best of its waiters. |
+| 4.4 | **A lock that lends its holder its waiter's place.** `SYS_FUTEX_PI` (239) locks, tries to lock and unlocks a priority-inheriting word — Linux's `FUTEX_LOCK_PI`, `FUTEX_TRYLOCK_PI` and `FUTEX_UNLOCK_PI`: nought when nobody holds it, its holder's task id when somebody does, with `FUTEX_WAITERS` (bit 31) and `FUTEX_OWNER_DIED` (bit 30). A task waiting to lock one lends the holder its place, band and real-time priority, through holders waiting for holders 32 deep; one that would wait for itself is answered at once. An unlock hands the word to the best placed waiter. A holder that dies or execs holding one on its robust list hands it to its best waiter told `FUTEX_OWNER_DIED`; one held otherwise is lent nothing by its waiters from then on. |
 
 ### Deprecated
 
@@ -1398,7 +1399,7 @@ second, as on Linux. A child it forks or spawns has its limits, and
 |---|---|---|---|---|
 | 128 | `SYS_FUTEX_WAIT` | arg0 = addr (4-byte aligned), arg1 = expected | 0 = woken, 1 = value already differed, `0xFFFF_FFFD` = a signal ended the wait, `u64::MAX` = bad address. **Blocks.** | — |
 | 129 | `SYS_FUTEX_WAKE` | arg0 = addr, arg1 = max to wake | number woken | — |
-| 130 | `SYS_FUTEX_WAIT_TIMEOUT` | arg0 = addr, arg1 = expected, arg2 = how long to wait, a span | 0 = woken, 1 = value already differed, 2 = timed out, `0xFFFF_FFFD` = a signal ended the wait, `u64::MAX` = bad address or no wait slot. **Blocks.** | — |
+| 130 | `SYS_FUTEX_WAIT_TIMEOUT` | arg0 = addr, arg1 = expected, arg2 = how long to wait, a span | 0 = woken, 1 = value already differed, 2 = timed out, `0xFFFF_FFFD` = a signal ended the wait, `u64::MAX` = bad address. **Blocks.** | — |
 | 131 | `SYS_EVENT_CREATE` | arg0 = the count it starts at, arg1 = flags (1 = semaphore) | a descriptor readable while the counter is not zero / `u64::MAX` | — |
 | 132 | `SYS_ROBUST_LIST` | arg0 = where the caller's robust list's head is, three words — the first entry, the offset from an entry to its mutex's word, the entry being changed — or 0 for none, or `u64::MAX` to ask | where it was / `u64::MAX` for an address that cannot be one | — |
 
@@ -1421,19 +1422,35 @@ the 0xE0 block), which is Linux's `FUTEX_REQUEUE` and `FUTEX_CMP_REQUEUE`:
 a condition variable's broadcast hands its waiters to the mutex they will
 want, rather than waking them all to fight for it.
 
+**A lock that lends.** `SYS_FUTEX_PI` (239, in the 0xE0 block) is Linux's
+`FUTEX_LOCK_PI`, `FUTEX_TRYLOCK_PI` and `FUTEX_UNLOCK_PI`, on a word that is
+nought when nobody holds it and its holder's task id when somebody does, with
+`FUTEX_WAITERS` (bit 31) set while somebody waits for it in the kernel and
+`FUTEX_OWNER_DIED` (bit 30) when its holder died holding it. A C library
+takes it from nought, and lets go of it to nought, in its own memory, and
+calls the kernel only when that fails: to lock it, the kernel sets the
+waiters' bit and the caller waits, lending the holder its place — band, and
+real-time priority — where that is better than the holder's own, and through
+the holder to whatever it waits to lock, 32 deep. A caller that holds the
+word, or would come round to waiting for itself, is answered 3 (Linux's
+`EDEADLK`) without waiting. An unlock hands the word to the best placed of
+its waiters, the longest waiting of equals: the word is that one's id, with
+the waiters' bit if more wait, and it is woken holding it; with nobody
+waiting the word is nought. A word nobody holds that says its holder died is
+taken keeping the bit, which is how a robust mutex's next holder is told.
+When a holder dies or becomes another program, the robust list's walk hands
+each word on it somebody waits in the kernel for to the best of them, with
+`FUTEX_OWNER_DIED`; a word it held that was not on its list keeps its
+waiters, who lend it nothing from then on.
+
 **Event counters.** `SYS_EVENT_CREATE` makes a 64-bit counter and returns a
 descriptor for it. A write is eight bytes and adds them; a read is eight bytes
 and takes the whole count, leaving zero — or takes one, leaving the rest, if
 the counter was made with the semaphore flag. A read waits while the count is
 zero and `SYS_FD_READ_NB` answers "would block" instead. The descriptor is
 readable while the count is not zero. The largest count is `u64::MAX - 1`;
-writing `u64::MAX`, or zero, is refused. There are sixteen in the machine.
-
-A timed wait that expires leaves its wait slot claimed until the woken task
-returns through the kernel and reads why it woke, so a task blocked on a futex
-holds its slot from the moment it waits to the moment it runs again. With
-`MAX_FUTEX_WAITERS` slots in total, a caller that gets `u64::MAX` should treat
-it as a resource limit rather than as a bad argument.
+writing `u64::MAX`, or zero, is refused. A program has as many as its
+descriptors and the machine's memory allow.
 
 ### Signals, continued again (0x88)
 
@@ -1546,7 +1563,8 @@ last read, which a read clears. It waits while that is zero, and
 its own beat — every interval after the first firing, however late any one
 of them was seen to — and one that fell behind its reader does not fire in
 a burst to catch up: the intervals that went by are counted, and the next
-deadline is the first one still to come. There are sixteen in the machine.
+deadline is the first one still to come. A program has as many as its
+descriptors and the machine's memory allow.
 
 **A program's timers** (`SYS_PTIMER`) raise a signal rather than wake a
 reader: POSIX's `timer_create` and the rest. A program has up to 32, each on
@@ -1987,6 +2005,7 @@ set together or not at all.
 | 236 | `SYS_TASK_NEXT` | arg0 = a task id | the first task at or past it that has not been taken apart, living or dead / `u64::MAX` if there is none | — |
 | 237 | `SYS_FUTEX_REQUEUE` | arg0 = the first word, arg1 = the second (each 4-byte aligned), arg2 = `(how many to wake << 32) \| how many to move`, arg3 = what the first word must hold, arg4 = flags: bit 0, compare it | how many were woken and moved: up to the first number of the first word's waiters woken, up to the second of the rest moved to wait on the second word, as if they had waited there / `0xFFFF_FFFE` if bit 0 was given and the first word does not hold arg3 — nothing is done — / `u64::MAX` = bad address | — |
 | 238 | `SYS_SCHED` | arg0 = op: 0 how nice, 1 make as nice as arg2 (-20 to 19, signed), 2 put in class arg2 — 0 ordinary, 1 `SCHED_FIFO`, 2 `SCHED_RR` — at real-time priority arg3 (1 to 99, or 0 for ordinary), 3 the class; arg1 = a task id, 0 for the caller | op 0: 20 + how nice; op 3: `(class << 8) \| priority`; ops 1 and 2: 0; `u64::MAX - 1` when it may not / `u64::MAX` | a task of the caller's program, or one `SYS_NICE` would let it say this of; `TaskMgmt` for it to be less nice; `RealTime` to enter a real-time class |
+| 239 | `SYS_FUTEX_PI` | arg0 = op: 0 lock, 1 try to lock, 2 unlock; arg1 = the word (4-byte aligned); arg2 = for a lock, how long to wait at most, a span, 0 for no end | 0 = locked, or unlocked; 1 = held by another (a try); 2 = timed out; 3 = the caller holds it, or would wait for itself; 4 = the task the word names is not there; `0xFFFF_FFFD` = a signal ended the wait; `u64::MAX - 1` = an unlock of a word the caller does not hold; `u64::MAX` = bad address. **Blocks.** | — |
 
 `SYS_FD_KIND` answers 1 for an IPC endpoint, 2 and 3 for the reading and
 writing ends of a pipe, 4 for a stream, 5 and 6 for a terminal's master and

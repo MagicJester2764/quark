@@ -593,6 +593,25 @@ may keep — are in `../quarkutils/CLAUDE.md`; these are the kernel's.
   its record, for it to read when it runs; and a task that dies waiting is
   taken off where it dies (`close_descriptors`), not at its reap — a wake
   counted for it would be one a waiter that runs again was not given.
+- **A word whose holder is lent its waiters' places is the kernel's to hand
+  on** (`futex::lock_pi`, `SYS_FUTEX_PI`; Linux's FUTEX_LOCK_PI, a word that
+  holds its holder's task id). A waiter for one is a futex waiter that knows
+  whose the word is (`pi_owner`), and the scheduler asks it as it asks IPC
+  (`pi_waits_on`, `waits_on`): the holder runs at the best of its waiters'
+  places, and so does whatever it waits for in turn, 32 deep. Whatever ends
+  such a wait — a hand-on, a deadline, a signal, a death — takes the lending
+  back *where the waiter comes off its list* (`refresh_priority` of the
+  holder): left to the waiter for when it next ran, a holder lent a
+  real-time place would keep the processor from the very waiter that would
+  take it back. An unlock hands the word to the best placed waiter, and the
+  robust list's walk to the best waiter with FUTEX_OWNER_DIED
+  (`pi_owner_died`); a holder that dies or execs holding one that was not on
+  its list is lent nothing more (`owner_gone`) — its task id will be
+  somebody else's. The word is written through its frame after
+  `paging::own` (`word_at`), so nothing faults with the futex lock held.
+  And wakes and requeues never touch a PI waiter (`each_on`'s `pi`): one
+  woken without the word would look again, and one moved would lend to a
+  holder it no longer waits for.
 - **A task about to wait on what a descriptor names holds it** (`fdtable::hold`,
   given back by `unhold`, or by `task_gone` for a task killed where it
   waited). Without it a sibling's `close` frees the pipe under a parked read,
@@ -1209,8 +1228,10 @@ What follows from that, and breaking any of it is quiet:
   in three seconds and caught it on its first run.
 - **A task runs at the place of whoever is waiting on it** — the band, and
   the real-time priority in it (`place_of`) — for as long as that is true.
-  Without it a server called by something urgent is preempted by anything in
-  between. It is also what lets the direct switch stay safe: the callee
+  Waiting on it is calling it, or waiting to lock a priority-inheriting word
+  it holds (`waits_on`). Without it a server called by something urgent is
+  preempted by anything in between, and a holder of what a real-time thread
+  waits for by anything between the two. It is also what lets the direct switch stay safe: the callee
   already carries the caller's place when the scheduler decides whether
   handing straight over would run something ahead of its betters.
 - **Within a band, whoever has run least goes next**, each nanosecond counted

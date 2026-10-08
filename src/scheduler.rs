@@ -330,7 +330,7 @@ pub fn place_of(tid: usize) -> (u8, u8) {
 }
 
 /// Whether place `a` is better than place `b`.
-fn better(a: (u8, u8), b: (u8, u8)) -> bool {
+pub fn better(a: (u8, u8), b: (u8, u8)) -> bool {
     a.0 < b.0 || (a.0 == b.0 && a.1 > b.1)
 }
 
@@ -997,15 +997,20 @@ pub fn set_priority(tid: usize, band: u8) -> Result<(), ()> {
 /// for: a server in an ordinary band, called by something in a better one, is
 /// preempted by any middling task that comes along — and the caller, which
 /// outranks that task, waits behind it. The work is being done on the caller's
-/// behalf, so it should be done at the caller's urgency.
+/// behalf, so it should be done at the caller's urgency. Waiting on it is
+/// calling it, or waiting to lock a priority-inheriting word it holds
+/// (`futex::lock_pi`): the same problem, between threads.
 ///
-/// Called whenever the set of tasks waiting on `tid` changes.
+/// Called whenever the set of tasks waiting on `tid` changes, with
+/// interrupts off.
 pub fn refresh_priority(tid: usize) {
     let mut cur = tid;
-    // Chains of one server calling another are short. The bound is so that a
-    // cycle — which should not exist, and would mean a deadlock if it did —
-    // cannot turn into a hang here.
-    for _ in 0..8 {
+    // Chains of one server calling another are short. One of holders of
+    // priority-inheriting words, each waiting for the next, is lent along as
+    // far as `futex::lock_pi` searches one for a cycle (`futex::PI_DEPTH`).
+    // The bound is so that a cycle — which should not exist, and would mean
+    // a deadlock if it did — cannot turn into a hang here.
+    for _ in 0..crate::futex::PI_DEPTH {
         if cur >= MAX_TASKS {
             return;
         }
@@ -1018,7 +1023,7 @@ pub fn refresh_priority(tid: usize) {
             };
             let mut best = base;
             for t in tids() {
-                if crate::ipc::blocked_on(t) == Some(cur) && (*slot(t)).is_some() {
+                if waits_on(t) == Some(cur) && (*slot(t)).is_some() {
                     let waiter = place_of(t);
                     if better(waiter, best) {
                         best = waiter;
@@ -1034,11 +1039,18 @@ pub fn refresh_priority(tid: usize) {
             st(cur).rt = best.1;
         }
         // Whatever `cur` is itself waiting on inherits this too.
-        match crate::ipc::blocked_on(cur) {
+        match waits_on(cur) {
             Some(next) => cur = next,
             None => return,
         }
     }
+}
+
+/// The task `t` is waiting on, for as long as it waits: the server it calls,
+/// or the holder of the priority-inheriting word it waits to lock. That one
+/// runs at `t`'s place where it is better than its own.
+fn waits_on(t: usize) -> Option<usize> {
+    crate::ipc::blocked_on(t).or_else(|| crate::futex::pi_waits_on(t))
 }
 
 /// Make a blocked task runnable without putting it in the ready queue.
