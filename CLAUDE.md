@@ -572,8 +572,13 @@ may keep — are in `../quarkutils/CLAUDE.md`; these are the kernel's.
     page, which `back` calls nothing promised — of four threads that
     touched the same new pages as memory ran out, three were ended so — or
     the page may have gone. And where the fault was is read once, at the
-    door: CR2 is the processor's, and the faults of whatever ran while
-    this one waited write it.
+    door, before anything there can wait — the lock, or a stop
+    (`arrived`): CR2 is the processor's, and the faults of whatever ran
+    while this one waited write it. Read after the stop, a child stopped
+    straight after its fork was served at another program's page, or at
+    nought on a processor that had never faulted, and ended for touching
+    it; jobtest met it once in an acceptance on four processors, and
+    `stopfault` in `../quarkutils` meets it in seconds.
 - **Mapping authority is ownership first, `PhysRange` second.** `sys_map_phys`
   and the deprecated `sys_addrspace_map` accept frames the caller owns
   (`pmm::owns_range`), so a task that allocated a frame may map it holding no

@@ -601,12 +601,27 @@ fn report_kernel_state(tag: &[u8], frame: &InterruptFrame, kbase: usize, ktop: u
 /// no fault to be told about.
 #[unsafe(no_mangle)]
 extern "C" fn exception_handler(frame: &mut InterruptFrame) {
+    // Where a page fault was, read once, and before anything that can wait.
+    // CR2 is the processor's, and a fault that waits lets other tasks run
+    // on it, whose faults write it: in `exception`, for memory or a pager,
+    // and here, for a task stopped at the door, which is continued on
+    // whichever processor has room — one that last faulted on another
+    // program's page, or has never faulted at all. Read after the stop, it
+    // named that page, or nought, and the program was ended for touching
+    // it: a child stopped straight after its fork, at its first write.
+    let cr2: u64 = if frame.vector == 14 || frame.vector == 8 {
+        let at: u64;
+        unsafe { core::arch::asm!("mov {}, cr2", out(reg) at, options(nostack, nomem)) };
+        at
+    } else {
+        0
+    };
     let took = crate::klock::enter();
     if frame.cs & 3 != 0 {
         unsafe { crate::usage::entered(scheduler::current_tid()) };
         scheduler::arrived();
     }
-    exception(frame);
+    exception(frame, cr2);
     // Back to ring 3, by way of a handler if there is one to run.
     if frame.cs & 3 != 0 {
         crate::signal::leaving_interrupt(frame);
@@ -688,21 +703,11 @@ fn no_page(cr2: u64, oom: bool) -> ! {
     scheduler::exit_program(-SIGBUS)
 }
 
-fn exception(frame: &mut InterruptFrame) {
+/// A fault, and `cr2` where it was if it was a page fault: read at the door
+/// (`exception_handler`).
+fn exception(frame: &mut InterruptFrame, cr2: u64) {
     let vec = frame.vector as usize;
     let from_user = frame.cs & 3 != 0;
-    // Where a page fault was, read once. CR2 is the processor's, and a fault
-    // that waits — for memory, for a pager — lets other tasks run on it,
-    // whose faults write it: read again afterwards, it named another
-    // program's page, and that is what a program ended for the fault was
-    // told it had touched.
-    let cr2: u64 = if vec == 14 || vec == 8 {
-        let at: u64;
-        unsafe { core::arch::asm!("mov {}, cr2", out(reg) at, options(nostack, nomem)) };
-        at
-    } else {
-        0
-    };
 
     // A page fault that the page tables no longer agree with. The fault was
     // taken in ring 3 and then waited for the kernel; meanwhile another
