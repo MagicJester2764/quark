@@ -1626,6 +1626,16 @@ breaking any of them is quiet until it is a machine that stops.
   is, a better task waking that interrupts whichever processor is running
   the worst rather than waiting for its tick, and an idle processor that
   takes no ticks.
+- **Choosing what runs looks at every ready task of the band.** A band's
+  ready tasks are one list, and the choice of whoever has run least walks
+  it whole (`dequeue_ready`), as does asking at every wake between ticks
+  and every call's hand-over whether a real-time task is ready
+  (`outranked`). With a few ready that is nothing; with thousands it is
+  most of what the kernel does. A program of 4,095 threads that each wake
+  ten times a second kept the list thousands long and the kernel choosing,
+  and its own first thread — which had run longest, making them, and so
+  was chosen last — waited three minutes and more on four processors and
+  nearly seven on eight before it could end them.
 - Every device interrupts the first processor, a message included. The
   I/O APIC's lines above the sixteen ISA interrupts are not used: which
   device is on which is in the firmware's bytecode, not its tables. A
