@@ -130,9 +130,15 @@ pub fn object_marker(slot: usize, page: u64, write: bool, shared: bool, exec: bo
         | if exec { 0 } else { NO_EXECUTE }
 }
 
-/// Highest canonical user address (exclusive). Everything at or above this is
-/// kernel/non-canonical and must never be mapped on behalf of user space.
-pub const USER_ADDR_LIMIT: u64 = 0x0000_8000_0000_0000;
+/// One past the highest user address. Everything at or above this is the
+/// kernel's, not canonical, or the page below 2^47 that is nobody's: a
+/// `syscall` in its last two bytes would go back to 2^47, which is not an
+/// address, and Intel's `sysret` faults on that in ring 0, after `swapgs`,
+/// with the program's stack pointer already loaded — a fault the kernel
+/// takes on a stack the program chose (CVE-2012-0217). Linux keeps the same
+/// page out of every program. No layout here ever reached it: every stack
+/// ends at 0x7FFF_FFFF_F000.
+pub const USER_ADDR_LIMIT: u64 = 0x0000_7FFF_FFFF_F000;
 
 /// Lowest virtual address a user address space may map into.
 ///

@@ -1,6 +1,6 @@
 # Quark syscall ABI
 
-**Version 4.4.** Query the running kernel with `SYS_ABI_VERSION` (240), which
+**Version 4.5.** Query the running kernel with `SYS_ABI_VERSION` (240), which
 returns `(major << 16) | minor`.
 
 This document is the contract between the Quark kernel and everything above it.
@@ -279,6 +279,7 @@ numbers, and only 64 could name it before, through a range check.
 | 4.2 | **A futex keeps every waiter, and moves them.** A futex wait is never refused for room: there were sixty-four waiters for the machine, and the sixty-fifth was answered `u64::MAX` at once. `SYS_FUTEX_REQUEUE` (237) wakes some of a word's waiters and moves the rest to wait on another word — Linux's `FUTEX_REQUEUE`, and with a value to compare, `FUTEX_CMP_REQUEUE`, which answers `0xFFFF_FFFE` when the word has changed. |
 | 4.3 | **How one task is scheduled.** Nice is a task's, given to the threads and children it makes, where it was a program's: `SYS_NICE` says it of every task of a program, and `SYS_SCHED` (238) of one — and puts a task in a real-time class, Linux's `SCHED_FIFO` or `SCHED_RR` at a priority from 1 to 99, which takes the new right `RealTime` (capability 16) to enter. Within its band a real-time task runs before every ordinary one, the best priority first: FIFO until it blocks, yields or something better is ready, round-robin for a turn of 100 ms among its equals; one woken by a call runs as the call returns. A processor's real-time tasks have at most 950 ms of each second, and past that wait for whatever ordinary task is ready. A task waited on runs at the place — band, then real-time priority — of the best of its waiters. |
 | 4.4 | **A lock that lends its holder its waiter's place.** `SYS_FUTEX_PI` (239) locks, tries to lock and unlocks a priority-inheriting word — Linux's `FUTEX_LOCK_PI`, `FUTEX_TRYLOCK_PI` and `FUTEX_UNLOCK_PI`: nought when nobody holds it, its holder's task id when somebody does, with `FUTEX_WAITERS` (bit 31) and `FUTEX_OWNER_DIED` (bit 30). A task waiting to lock one lends the holder its place, band and real-time priority, through holders waiting for holders 32 deep; one that would wait for itself is answered at once. An unlock hands the word to the best placed waiter. A holder that dies or execs holding one on its robust list hands it to its best waiter told `FUTEX_OWNER_DIED`; one held otherwise is lent nothing by its waiters from then on. |
+| 4.5 | **A program's own FS and GS bases, and the ways into the kernel and out made safe for them.** No new number. Where the processor has FSGSBASE (CPUID leaf 7, EBX bit 0) it is on: a program reads and writes its FS and GS bases itself (`rdfsbase`, `wrfsbase`, `rdgsbase`, `wrgsbase`), where each was refused as an invalid instruction. A task's two are its own — kept across a switch, copied by `SYS_FORK`, cleared by `SYS_EXEC_SPACE` — and `SYS_SET_FS_BASE` still sets the first. A userland that builds a program's auxiliary vector says so with `AT_HWCAP2` bit 1 (`HWCAP2_FSGSBASE`), for a kernel of 4.5 or later on such a processor. And three ways for any program to halt the machine are gone, each of which FSGSBASE would have let it make worse by choosing the GS base the kernel then ran on: the page below 2^47 is nobody's (`USER_ADDR_LIMIT` is 0x7FFF_FFFF_F000, where it was 2^47: a `syscall` in its last two bytes went back to 2^47, which is no address, and Intel's `sysret` faults on that in ring 0); `SYS_EXEC_SPACE` refuses an entry or a stack outside the program's half, where it looked only at the bottom (the `iretq` into one at 2^47 faulted in ring 0, on any processor); and a `syscall` clears TF and NT of its caller's flags (with TF set the call trapped at the kernel's first instruction, on the program's stack; with NT the return from a signal handler faulted). |
 
 ### Deprecated
 
@@ -841,6 +842,9 @@ no server needs a range for that — and none is given one.
 **All user mappings must be at or above `USER_MIN_ADDR` (0x80_0000_0000).**
 Lower addresses are rejected: address spaces share the page directories beneath
 PML4[0], so a low mapping would write into tables every address space shares.
+**And below `USER_ADDR_LIMIT` (0x7FFF_FFFF_F000)**, one page short of 2^47:
+that page is nobody's, since a `syscall` in its last two bytes would go back to
+2^47, which is no address — and Intel's `sysret` faults on that in ring 0.
 
 **Where a frame is.** `SYS_PHYS_ALLOC` answers with a physical address,
 and what the address is for decides which it should be. Ordinary memory —
@@ -1048,14 +1052,14 @@ cannot resurrect a revoked capability in practice.
 | 99 | `SYS_SET_UID` | arg0 = tid, arg1 = uid | 0 / `u64::MAX` | `SetUid` |
 | 100 | `SYS_SET_GID` | arg0 = tid, arg1 = gid | 0 / `u64::MAX` | `SetUid` |
 | 101 | `SYS_GET_TUID` | arg0 = tid | `uid << 32 \| gid` of that task / `u64::MAX` | — |
-| 102 | `SYS_SET_FS_BASE` | arg0 = the caller's new FS base, a user address | 0 / `u64::MAX` | — |
+| 102 | `SYS_SET_FS_BASE` | arg0 = the caller's new FS base, a user address — which, where FSGSBASE is on (4.5), a program can also set itself; either way it is its task's | 0 / `u64::MAX` | — |
 | 104 | `SYS_TASK_WATCH` | arg0 = tid | 0, or `u64::MAX` if that task is already gone | — |
 | 106 | `SYS_SET_CLEAR_TID` | arg0 = address of a `u32`, or 0; arg1 = whose: 0 for the caller's, or a task the caller made and has not started | that task's id / `u64::MAX` | — |
 | 107 | `SYS_TASK_SPACE` | arg0 = tid | that task's space id / `u64::MAX` | — |
 | 108 | `SYS_SPACE_WATCH` | arg0 = space id | 0, or `u64::MAX` if no task of it is alive | — |
 | 109 | `SYS_TASK_CREATE_IN` | arg0 = cr3 of an address space the caller created | TID / `u64::MAX` | as `SYS_TASK_CREATE` |
 | 110 | `SYS_FORK` | — | the child's TID, `0` in the child / `u64::MAX` | as `SYS_TASK_CREATE` |
-| 111 | `SYS_EXEC_SPACE` | arg0 = cr3 the caller made, arg1 = entry, arg2 = rsp | does not return / `u64::MAX` | — |
+| 111 | `SYS_EXEC_SPACE` | arg0 = cr3 the caller made, arg1 = entry, arg2 = rsp — each at or above `USER_MIN_ADDR` and below `USER_ADDR_LIMIT` | does not return / `u64::MAX` | — |
 | 105 | `SYS_TASK_PRIORITY` | arg0 = tid, arg1 = band, or `u64::MAX` to ask | 0, or the band asked about / `u64::MAX` | to set: `TaskMgmt` for the target, or the target a child the caller made and has not started; and the caller's own band or worse — the band it is in, not one lent it while a better task waits on it. To ask: none |
 
 A program starts one of two ways. A parent may *build* one: it creates a task,

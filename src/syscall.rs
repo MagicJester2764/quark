@@ -509,7 +509,7 @@ pub const SYS_ABI_VERSION: u64 = 240;
 /// minor when calls are added. User space can refuse to run against a major it
 /// does not know, which is the point of exposing it at all.
 pub const ABI_VERSION_MAJOR: u64 = 4;
-pub const ABI_VERSION_MINOR: u64 = 4;
+pub const ABI_VERSION_MINOR: u64 = 5;
 
 /// How many tasks a program may have with no capability at all: its own, and
 /// the children it has made and not collected, by `SYS_TASK_CREATE`,
@@ -569,7 +569,14 @@ fn may_prepare(caller: usize, tid: usize) -> bool {
 
 
 
-const SFMASK_VALUE: u64 = (1 << 9) | (1 << 10) | (1 << 18); // clear IF | DF | AC
+/// What a `syscall` clears of the caller's flags: IF, DF and AC, which are
+/// the kernel's (see `idt.rs`); and TF and NT, which were the program's to
+/// set and the kernel's to fall over. With TF, single-stepping, every
+/// instruction of the call trapped in ring 0, which is a kernel fault. With
+/// NT, the `iretq` a signal handler's return goes out by faulted in ring 0:
+/// a handler that set it and returned halted the machine. `sysret` gives
+/// the program its own flags back.
+const SFMASK_VALUE: u64 = (1 << 8) | (1 << 9) | (1 << 10) | (1 << 14) | (1 << 18); // TF | IF | DF | NT | AC
 
 fn read_msr(msr: u32) -> u64 {
     let lo: u32;
@@ -940,6 +947,13 @@ extern "C" fn syscall_dispatch(
     // to the handler, with where it was going on its stack.
     let answer = crate::signal::leaving_call(answer);
     unsafe { core::arch::asm!("cli", options(nostack, nomem)) };
+    // Never a `sysret` to what is not a program's address. Every way the
+    // frame's RIP is set says so already — the call's own return, a handler's
+    // entry, a program's start — and this is where a new one that forgot
+    // would make Intel's `sysret` fault in ring 0 on the program's stack.
+    if scheduler::current_user_frame_mut().is_some_and(|f| f.rip >= USER_ADDR_LIMIT) {
+        scheduler::exit_program(-11);
+    }
     unsafe { crate::usage::leaving(scheduler::current_tid()) };
     crate::klock::release();
     answer

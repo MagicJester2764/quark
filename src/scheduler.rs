@@ -531,6 +531,7 @@ pub fn init() {
             mem_limit: 0,
             exit_code: 0,
             fs_base: 0,
+            gs_base: 0,
             clear_child_tid: 0,
             uid: 0,
             gid: 0,
@@ -921,8 +922,18 @@ unsafe fn switch_to(current_tid: usize, next_tid: usize, flags: u64) { unsafe {
     // Threads share an address space, so FS is what tells one thread's
     // thread-locals from another's. Written unconditionally: comparing against
     // the outgoing value first would need per-CPU state for no measurable gain
-    // at this scheduler's switch rate.
+    // at this scheduler's switch rate. Where FSGSBASE is on a program changes
+    // its FS and GS bases without a call, so the outgoing task's are read back
+    // from the processor first — its GS base is where `swapgs` left it.
+    if crate::cpu::fsgsbase() && current_tid != 0 {
+        if let Some(ref mut t) = *slot(current_tid) {
+            t.fs_base = crate::cpu::fs_base();
+            t.gs_base = crate::cpu::user_gs_base();
+        }
+    }
+    let new_task = (*slot(next_tid)).as_ref().unwrap();
     crate::cpu::set_fs_base(new_task.fs_base);
+    crate::cpu::set_user_gs_base(new_task.gs_base);
 
     // The floating-point and SSE registers, which are nobody's until this says
     // whose. Saved from the outgoing task and loaded for the incoming one
@@ -3268,12 +3279,14 @@ fn current_user_frame() -> Option<crate::task::UserFrame> {
 pub fn fork_current() -> Option<usize> {
     let frame = current_user_frame()?;
     let parent = current_tid();
-    let (parent_cr3, fs_base, mem_limit, uid, gid) = {
+    let (parent_cr3, fs_base, gs_base, mem_limit, uid, gid) = {
         let flags = irq_save();
+        // The parent is the caller, running: its bases are the processor's,
+        // which its program may have changed since it last was switched out.
         let got = unsafe {
             (*slot(parent))
                 .as_ref()
-                .map(|t| (t.cr3, t.fs_base, t.mem_limit, t.uid, t.gid))
+                .map(|t| (t.cr3, crate::cpu::fs_base(), crate::cpu::user_gs_base(), t.mem_limit, t.uid, t.gid))
         };
         irq_restore(flags);
         got?
@@ -3326,6 +3339,7 @@ pub fn fork_current() -> Option<usize> {
         unsafe {
             if let Some(t) = (*slot(tid)).as_mut() {
                 t.fs_base = fs_base;
+                t.gs_base = gs_base;
                 t.mem_limit = mem_limit;
                 t.mem_pages = pages;
                 t.parent_tid = parent;
@@ -3400,7 +3414,12 @@ pub fn exec_into(cr3: usize, entry: u64, rsp: u64) -> Result<(), ()> {
     if cr3 == 0 || cr3 == old_cr3 || !crate::userspace::is_owned_address_space(caller, cr3) {
         return Err(());
     }
-    if entry < crate::paging::USER_MIN_ADDR || rsp < crate::paging::USER_MIN_ADDR {
+    // Both a program's, or the way into it faults in the kernel: an `iretq`
+    // to an address that is not canonical faults in ring 0, after `swapgs`,
+    // on any processor — and a program could ask for one, and halt the
+    // machine.
+    let users = crate::paging::USER_MIN_ADDR..crate::paging::USER_ADDR_LIMIT;
+    if !users.contains(&entry) || !users.contains(&rsp) {
         return Err(());
     }
     let space = crate::userspace::space_of(cr3);
@@ -3431,6 +3450,7 @@ pub fn exec_into(cr3: usize, entry: u64, rsp: u64) -> Result<(), ()> {
                 // The new image has set no thread pointer and registered no
                 // word to clear: both named memory that is about to go.
                 t.fs_base = 0;
+                t.gs_base = 0;
                 t.clear_child_tid = 0;
                 t.mem_pages = 0;
                 crate::fpu::clean_into(&raw mut t.fpu);
@@ -3467,6 +3487,7 @@ pub fn exec_into(cr3: usize, entry: u64, rsp: u64) -> Result<(), ()> {
     unsafe {
         crate::paging::write_cr3(cr3);
         crate::cpu::set_fs_base(0);
+        crate::cpu::set_user_gs_base(0);
         crate::fpu::restore_clean();
     }
     if crate::userspace::addrspace_unref(old_cr3) {

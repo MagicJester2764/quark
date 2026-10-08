@@ -1206,7 +1206,53 @@ fn print_dec(val: usize) {
 // Extern symbols from boot.s and exception stubs
 // ---------------------------------------------------------------------------
 
+// An NMI: this kernel sends none, and one from the firmware or a monitor is
+// let pass. It can arrive between any two instructions — between `syscall`
+// and `swapgs`, or `swapgs` and `sysretq` — so it does nothing that uses GS,
+// which there is the program's: it is over at once.
+core::arch::global_asm!(
+    ".global nmi_stub",
+    "nmi_stub:",
+    "    iretq",
+    options(att_syntax)
+);
+
+// A machine check: the processor says its hardware has failed, wherever it
+// was — on the program's GS, for all it knows. Said on the serial port with
+// no lock and nothing through GS, and this processor stops.
+core::arch::global_asm!(
+    ".global machine_check_stub",
+    "machine_check_stub:",
+    "    cli",
+    "    cld",
+    "    call {stop}",
+    stop = sym machine_check_stop,
+    options(att_syntax)
+);
+
+/// [`machine_check_stub`]'s end: a line straight to the first serial port,
+/// waiting on the port and on nothing else, and a halt that does not end.
+extern "C" fn machine_check_stop() -> ! {
+    for &b in b"\n[KFAULT machine check: this processor has stopped]\n" {
+        unsafe {
+            loop {
+                let lsr: u8;
+                core::arch::asm!("in al, dx", out("al") lsr, in("dx") 0x3FDu16, options(nomem, nostack));
+                if lsr & 0x20 != 0 {
+                    break;
+                }
+            }
+            core::arch::asm!("out dx, al", in("dx") 0x3F8u16, in("al") b, options(nomem, nostack));
+        }
+    }
+    loop {
+        unsafe { core::arch::asm!("cli; hlt", options(nomem, nostack)) };
+    }
+}
+
 unsafe extern "C" {
+    fn nmi_stub();
+    fn machine_check_stub();
     fn exception_stub_0();
     fn exception_stub_1();
     fn exception_stub_2();
@@ -1351,6 +1397,12 @@ unsafe fn setup_idt() { unsafe {
         let ist = if i == 8 { 1 } else { 0 };
         (*idt_ptr).entries[i].set_handler(stubs[i] as u64, 0x08, ist);
     }
+    // Two that can arrive anywhere, the instruction after `syscall` and the
+    // one before `sysretq` included — where GS is still, or already, the
+    // program's, and where FSGSBASE lets the program choose it. Neither
+    // touches GS (`nmi_stub`, `machine_check_stub`).
+    (*idt_ptr).entries[2].set_handler(nmi_stub as *const () as u64, 0x08, 0);
+    (*idt_ptr).entries[18].set_handler(machine_check_stub as *const () as u64, 0x08, 0);
 
     // IRQ stubs at vectors 32–47
     let irq_stubs: [unsafe extern "C" fn(); 48] = [

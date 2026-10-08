@@ -169,6 +169,11 @@ pub struct Task {
     /// register to distinguish one thread's copy from another's. FS is that
     /// register: `thread_local!` compiles to an offset from it.
     pub fs_base: u64,
+    /// The GS base it runs with in ring 3, likewise. Nought until a program
+    /// sets one, which it can only where FSGSBASE is on (`wrgsbase`); and
+    /// both bases are read back from the processor when it is switched out,
+    /// since a program can then change either without a call.
+    pub gs_base: u64,
     /// A word in this task's address space to clear and wake when it exits.
     ///
     /// Linux calls this `CLONE_CHILD_CLEARTID`, and musl does not treat it as
@@ -212,6 +217,7 @@ impl Task {
         mem_limit: 0,
         exit_code: 0,
         fs_base: 0,
+        gs_base: 0,
         clear_child_tid: 0,
         uid: 0,
         gid: 0,
@@ -273,6 +279,7 @@ impl Task {
             mem_limit: 0,
             exit_code: 0,
             fs_base: 0,
+            gs_base: 0,
             clear_child_tid: 0,
             uid: 0,
             gid: 0,

@@ -13,6 +13,18 @@ use core::sync::atomic::{AtomicBool, Ordering};
 
 const CR4_SMEP: u64 = 1 << 20;
 const CR4_SMAP: u64 = 1 << 21;
+/// RDFSBASE, WRFSBASE, RDGSBASE and WRGSBASE in ring 3.
+const CR4_FSGSBASE: u64 = 1 << 16;
+
+/// Whether a program may read and write its own FS and GS bases: set once, at
+/// boot, before the other processors take the first one's CR4.
+static FSGSBASE_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// Whether FSGSBASE is on: a program can change its FS and GS bases without
+/// a call, and what they are is read back from the processor.
+pub fn fsgsbase() -> bool {
+    FSGSBASE_ENABLED.load(Ordering::Relaxed)
+}
 // CR4.PKE (bit 22) must stay clear. Memory objects keep their slot in bits
 // 52–62 of page-table entries, and with protection keys on the CPU reads bits
 // 59–62 of a present entry as the page's key.
@@ -150,6 +162,7 @@ pub unsafe fn init_protections() { unsafe {
     let features = cpuid_7_0_ebx();
     let smep = features & (1 << 7) != 0;
     let smap = features & (1 << 20) != 0;
+    let fsgsbase = features & 1 != 0;
 
     let mut cr4 = read_cr4();
     if smep {
@@ -158,15 +171,24 @@ pub unsafe fn init_protections() { unsafe {
     if smap {
         cr4 |= CR4_SMAP;
     }
-    if smep || smap {
+    // A program's own FS and GS bases, read and written in the program. Safe
+    // only because nothing in the kernel that can run on the program's GS
+    // uses it: see `idt.rs` (NMI and machine checks) and `syscall.rs` (what
+    // a `syscall` clears, and the return address `sysret` is given).
+    if fsgsbase {
+        cr4 |= CR4_FSGSBASE;
+    }
+    if smep || smap || fsgsbase {
         write_cr4(cr4);
     }
 
     // Set only after CR4 is live: the guard checks this before issuing stac.
     SMAP_ENABLED.store(smap, Ordering::SeqCst);
+    FSGSBASE_ENABLED.store(fsgsbase, Ordering::SeqCst);
 
     let smep_s: &[u8] = if smep { b"on" } else { b"unavailable" };
     let smap_s: &[u8] = if smap { b"on" } else { b"unavailable" };
+    let fsgs_s: &[u8] = if fsgsbase { b"on" } else { b"unavailable" };
     for out in [
         crate::console::puts as fn(&[u8]),
         crate::serial::puts as fn(&[u8]),
@@ -175,6 +197,8 @@ pub unsafe fn init_protections() { unsafe {
         out(smep_s);
         out(b", SMAP ");
         out(smap_s);
+        out(b"; FSGSBASE ");
+        out(fsgs_s);
         out(b".\n");
     }
 }}
@@ -209,6 +233,33 @@ impl Drop for UserAccess {
 /// IA32_FS_BASE. The base FS-relative addressing resolves against, which is
 /// where a thread's thread-locals live.
 const MSR_FS_BASE: u32 = 0xC000_0100;
+
+/// IA32_KERNEL_GS_BASE: while the kernel runs, the program's GS base, which
+/// `swapgs` put there on the way in and takes back on the way out.
+const MSR_KERNEL_GS_BASE: u32 = 0xC000_0102;
+
+/// The running task's FS base, as the processor has it.
+pub fn fs_base() -> u64 {
+    if fsgsbase() {
+        let v: u64;
+        unsafe { core::arch::asm!("rdfsbase {}", out(reg) v, options(nostack, nomem, preserves_flags)) };
+        v
+    } else {
+        rdmsr(MSR_FS_BASE)
+    }
+}
+
+/// The running task's GS base in ring 3: in the kernel it waits in
+/// IA32_KERNEL_GS_BASE, where `swapgs` left it.
+pub fn user_gs_base() -> u64 {
+    rdmsr(MSR_KERNEL_GS_BASE)
+}
+
+/// Give the task about to run its GS base in ring 3, where `swapgs` takes it
+/// from on the way out.
+pub fn set_user_gs_base(base: u64) {
+    unsafe { wrmsr(MSR_KERNEL_GS_BASE, base) };
+}
 
 /// Set the FS segment base for the task about to run.
 ///

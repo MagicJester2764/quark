@@ -228,7 +228,11 @@ may keep — are in `../quarkutils/CLAUDE.md`; these are the kernel's.
   directories beneath it, so a mapping below that writes into tables every
   address space shares and promotes them to USER everywhere. It is also what
   makes SMAP safe: no USER bit exists anywhere in the kernel's identity map.
-  Validate with `paging::user_range_ok`.
+  Validate with `paging::user_range_ok`. **And they end below
+  `paging::USER_ADDR_LIMIT`, one page short of 2^47**: a `syscall` in the
+  last two bytes of that page goes back to 2^47, which is no address, and
+  Intel's `sysret` faults on it in ring 0 with the program's stack pointer
+  loaded (CVE-2012-0217) — the page could be mapped until 4.5.
 - **The kernel's own map of memory is made once, at boot, and is all of
   PML4[0] but its last two gigabytes.** `boot.s` maps four gigabytes;
   `paging::map_all_memory` extends that over all the memory the firmware
@@ -474,7 +478,38 @@ may keep — are in `../quarkutils/CLAUDE.md`; these are the kernel's.
   `SFMASK` does it for `syscall`, and `_start` clears DF for the boot. A new
   way into the kernel does the same. `dtest flags` takes page faults and
   ticks with DF set; nothing outside the kernel can see AC being cleared, so
-  that one is kept by reading the stub.
+  that one is kept by reading the stub. *TF and NT* are the program's too,
+  and `SFMASK` clears both on `syscall` (`kernelentry` in `../quarkutils`
+  has each): with TF set the call's trap came at `syscall_entry`'s first
+  instruction, before `swapgs`, on the program's stack — a double fault
+  under SMAP, and without it a handler running on a stack the program
+  chose; with NT set the `iretq` a signal handler's return goes out by
+  faulted in ring 0. Each halted the machine.
+- **Every way back to ring 3 goes to an address that is the program's, and
+  nothing that can run on the program's GS uses it.** A `sysret` or an
+  `iretq` to an address that is not canonical faults in ring 0, after
+  `swapgs` — on the program's GS, and for `sysret` on Intel on the
+  program's stack. So what a task goes back to is checked where it is set:
+  `exec_into`'s entry and stack (a program started at 2^47 halted the
+  machine, on AMD as on Intel), `signal::ret`'s record, the handler a
+  program names, `SYS_TASK_START`'s entry; and the end of a call checks the
+  frame's RIP again before the `sysretq`, for whatever new way forgets.
+  Where FSGSBASE is on (`cpu::fsgsbase`, from 4.5) a program sets its GS
+  base itself, so a fault taken there would run the kernel on a GS base the
+  program chose. An NMI or a machine check can arrive between `syscall` and
+  `swapgs`, or `swapgs` and `sysretq`: neither touches GS (`nmi_stub`, which
+  lets an NMI pass — the kernel sends none — and `machine_check_stub`, which
+  writes to the serial port with no lock and stops the processor). A double
+  fault can only happen after `swapgs`, once the above holds, and uses GS.
+- **A task's FS and GS bases are its own** (`Task::fs_base`, `gs_base`).
+  Where FSGSBASE is on a program changes them without a call, so a switch
+  reads the outgoing task's back from the processor — the FS base with
+  `rdfsbase`, the GS base from `IA32_KERNEL_GS_BASE`, where `swapgs` keeps
+  it while the kernel runs — before it gives the incoming its own (`switch_to`).
+  `fork` copies the parent's as the processor has them, not as last
+  recorded; `exec` clears both; `SYS_SET_FS_BASE` still sets the first. A
+  program is told it may (`AT_HWCAP2` bit 1) by whoever builds its
+  auxiliary vector, for a kernel of 4.5 or later: the kernel builds none.
 - **Validate user pointers with `validate_user_ptr{,_mut}`, not a range check.**
   The kernel runs on the caller's CR3; an in-range but unmapped address faults
   *inside* the kernel, sometimes with a lock held and interrupts off.
@@ -1603,3 +1638,8 @@ breaking any of them is quiet until it is a machine that stops.
   only that, and above four gigabytes there is none.
 - Sixteen processors at most, and local APIC ids below 256 unless the
   firmware left the APICs in x2APIC mode.
+- An NMI and a machine check are taken on the stack they arrive on: neither
+  has one of its own (an IST entry, as a double fault has). In the three
+  instructions `syscall_entry` runs on the program's stack before it finds
+  its own, that is the program's — under SMAP a double fault. Nothing a
+  program does raises either.

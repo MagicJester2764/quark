@@ -242,7 +242,7 @@ unsafe fn each_on(
     }
 }
 
-const USER_ADDR_LIMIT: u64 = 0x0000_8000_0000_0000;
+const USER_ADDR_LIMIT: u64 = crate::paging::USER_ADDR_LIMIT;
 
 /// Wait on a futex word. If `*addr == expected`, block the calling task.
 /// Returns 0 on wake, 1 if value mismatch, u64::MAX on error.

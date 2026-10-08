@@ -8,7 +8,7 @@ use crate::{elf, paging, pmm, scheduler, syscall};
 const PAGE_SIZE: usize = 4096;
 
 /// User-space address constants.
-/// User code/data lives in the lower half (below 0x0000_8000_0000_0000).
+/// User code/data lives in the lower half, below [`USER_ADDR_LIMIT`].
 ///
 /// The highest a stack the kernel makes may reach. Where in the two
 /// gigabytes below it the first program's stack ends is chosen at random
