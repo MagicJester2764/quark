@@ -58,6 +58,10 @@ struct HeapInner {
     heap_end: usize,
     total_size: usize,
     initialized: bool,
+    /// What its blocks hold now, headers and padding included, and the most
+    /// they have held: said at shutdown ([`say_usage`]).
+    in_use: usize,
+    most: usize,
 }
 
 unsafe impl Send for HeapInner {}
@@ -78,6 +82,8 @@ impl LockedHeap {
                 heap_end: 0,
                 total_size: 0,
                 initialized: false,
+                in_use: 0,
+                most: 0,
             }),
         }
     }
@@ -163,6 +169,8 @@ unsafe fn alloc_inner(heap: &mut HeapInner, layout: Layout) -> *mut u8 { unsafe 
                 (*header).block_start = block_addr;
                 (*header).block_size = actual_block_size;
 
+                heap.in_use += actual_block_size;
+                heap.most = heap.most.max(heap.in_use);
                 return aligned_data as *mut u8;
             }
 
@@ -185,6 +193,7 @@ unsafe fn dealloc_inner(heap: &mut HeapInner, ptr: *mut u8) { unsafe {
     let header = (ptr as usize - HEADER_SIZE) as *const AllocHeader;
     let block_start = (*header).block_start;
     let block_size = (*header).block_size;
+    heap.in_use = heap.in_use.saturating_sub(block_size);
 
     let new_block = block_start as *mut FreeBlock;
     (*new_block).size = block_size;
@@ -343,6 +352,29 @@ pub unsafe fn init() { unsafe {
 // ---------------------------------------------------------------------------
 // OOM handler
 // ---------------------------------------------------------------------------
+
+/// What the heap's blocks hold now and the most they have held, and how far
+/// it has grown, in bytes: of the gigabyte it may have.
+pub fn usage() -> (usize, usize, usize) {
+    let inner = ALLOCATOR.inner.lock();
+    (inner.in_use, inner.most, inner.total_size)
+}
+
+/// At shutdown, beside the deepest kernel stack: what the heap held at most,
+/// which is what a gigabyte has to be enough for — a thousand threads'
+/// records and everything programs make are in it.
+pub fn say_usage() {
+    let (now, most, grown) = usage();
+    crate::serial::puts(b"[heap] ");
+    crate::serial::put_usize(now);
+    crate::serial::puts(b" bytes in use, at most ");
+    crate::serial::put_usize(most);
+    crate::serial::puts(b", grown to ");
+    crate::serial::put_usize(grown);
+    crate::serial::puts(b" of ");
+    crate::serial::put_usize(HEAP_MAX_END - HEAP_START);
+    crate::serial::puts(b"\n");
+}
 
 #[alloc_error_handler]
 fn alloc_error(layout: Layout) -> ! {

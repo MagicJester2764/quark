@@ -20,11 +20,11 @@ for.
   and one that can say where it runs, a task woken that runs at once on
   whichever processor runs the worst instead of at its band's next turn,
   and an idle processor that takes no ticks. Sixteen processors at most.
-- **Threads in full.** More than sixty-four tasks; a child that is its
-  program's, so that any thread may collect it, where it is the task's
-  that made it; and the rest of the futex — requeue, which the C library
-  answers by waking every waiter it would have moved, and priority
-  inheritance.
+- **A child that is its program's**, so that any thread may collect it,
+  where it is the task's that made it. The rest of what threads lacked is
+  done: 32,768 tasks where there were sixty-four, the futex's requeue and
+  priority inheritance, how nice a thread is and the real-time classes, and
+  a program's own FS and GS bases.
 - **Several messages for a device.** A device is its own capability
   (`PciDevice`), with its registers wherever the firmware put them, and its
   driver has one message: the kernel aims it where the device has MSI, and
@@ -80,33 +80,30 @@ for.
 
 ## Fixed tables
 
-Everything here is an array with a size, and each size is a limit somebody
-will meet:
+Most of what this list was is made when a program makes it now (4.1):
+pipes and named pipes, streams, local sockets and their queues, poll sets
+and what they watch, pseudo-terminals, the objects servers serve, timers,
+counters, descriptors read for signals, shared regions and futex waiters
+are each a record a program's call makes, bounded by its descriptors and by
+what memory the kernel can spare (`reclaim::may_make`). What is still an
+array with a size, each a limit somebody will meet:
 
 | | |
 |---|---|
 | Processors | 16 |
-| Tasks | 64, threads included |
+| Tasks | 32,768; 4,096 a program, its children included, without `TaskMgmt` |
 | Interrupts of a device's own (MSI) | 32 |
 | Entries of the firmware's memory map | 64, once neighbours are joined |
-| Descriptors per program | 64, and one more for its working directory |
-| Capability slots per program | 256 |
-| Pipes | 256 in the machine, 64 made by any one program |
-| Named pipes | 32 with somebody holding an end |
-| Connected streams | 64 |
-| Local sockets | 32 not yet connected, each with 16 waiting to be accepted |
-| Poll sets | 64, each watching 32 descriptors |
-| Pseudo-terminals | 8 |
-| Objects servers serve (open files) | 1024 |
-| Timers, event counters, descriptors read for signals | 16, 16 and 32 |
+| Descriptors per program | 1,024 to start, and as many as 65,536 if it raises its limit |
+| Capability slots per program | 65,536, room made 256 at a time |
+| A shared memory region | 4,096 pages |
 | A program's own timers | 32 |
 | Real-time signals waiting | 64 a program and 16 a task, behind the first of each number |
 | Groups a task is in besides its own | 16 |
-| Shared memory regions | 256, of at most 4096 pages |
-| Memory objects | 256, and a cache of their pages a quarter of memory — at least 8192 pages, at most a million |
+| Memory objects | 2,047 — the slot is eleven bits of a page-table entry — and 1,024 a pager; a cache of their pages a quarter of memory, at least 8192 pages, at most a million |
 | PCI functions | 128, of the first segment |
 | Programs whose devices an IOMMU guards | 8, with 32 devices between them |
-| Futex waiters | 64 at once |
+| A kernel stack | 28 KiB a task: twice the deepest an acceptance has measured |
 | Kernel heap | 1 GiB of address space |
 | Memory | 511 GiB |
 
