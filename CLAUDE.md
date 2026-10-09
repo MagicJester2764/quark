@@ -1261,7 +1261,13 @@ What follows from that, and breaking any of it is quiet:
 - **A synchronous call hands over the CPU.** The caller has blocked and has
   nothing to contribute until the reply, so the callee is switched to directly
   and runs on what is left of the caller's slice rather than a fresh one. A
-  server does not earn a quantum every time it is called.
+  server does not earn a quantum every time it is called — and the caller
+  does not when it is answered: it goes first (`unblock_task_next`), on what
+  was left of the turn it called in (`PerTask::handed`). Given a whole turn
+  each time, as it was, a pair of tasks calling each other never came to
+  the end of one, and nothing else of their band ran on their processor
+  while they called: `kstress` found it, two pairs to a processor, as a
+  call unanswered for a second; `dtest turns` holds it.
 - **A hand-over keeps interrupts off from waking the callee to switching to
   it.** `make_ready` leaves the callee runnable but in no queue, since it is
   about to run, so `donate_to` takes the flags `call_inner` saved instead of

@@ -221,8 +221,11 @@ rather than at its tick. A task preempted waits where it was.
 
 Not a reply to a call, though: the caller goes to the front of the queue
 of the processor answering, which is about to wait for the next call, and
-runs there in its place. Woken elsewhere, the two would go back and forth
-between processors, with an interrupt each way for every call.
+runs there in its place — on what was left of the turn it called in, which
+its answerer ran on, and not a new one, or a pair calling each other
+would never come to the end of a turn. Woken elsewhere, the two would go
+back and forth between processors, with an interrupt each way for every
+call.
 
 Work moves only towards a processor that would otherwise have less: one
 with nothing of its own takes the best task waiting on the busiest — of its

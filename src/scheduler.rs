@@ -159,6 +159,10 @@ pub struct PerTask {
     /// ever.
     yielded: bool,
     yield_turn: u64,
+    /// Woken by the answer to its call, it runs on what was left of the
+    /// turn the call was made in (`unblock_task_next`) — kept when it is
+    /// chosen, and not made a whole one.
+    handed: bool,
     /// The processor each task is running on, or [`NO_CPU`].
     ///
     /// A task is on a processor from the switch to it until the switch away
@@ -252,6 +256,7 @@ impl PerTask {
             rt: 0,
             yielded: false,
             yield_turn: 0,
+            handed: false,
             on_cpu: NO_CPU,
             last_cpu: 0,
             unannounced: false,
@@ -890,12 +895,19 @@ unsafe fn schedule_inner(from_irq: bool) { unsafe {
     }
     // A slice of its own, since this is the scheduler choosing it rather than
     // a task handing over what it had left: as long as its niceness says,
-    // or a round-robin task's turn. A FIFO task's is not counted down.
-    st(next_tid).slice_left = if st(next_tid).policy == SCHED_RR && st(next_tid).rt > 0 {
-        RR_TICKS
+    // or a round-robin task's turn. A FIFO task's is not counted down. But
+    // not for a caller its answer woke: it has what was left of the turn it
+    // called in, which its answerer was running on (`unblock_task_next`).
+    if st(next_tid).handed {
+        st(next_tid).handed = false;
+        st(next_tid).slice_left = st(next_tid).slice_left.max(1);
     } else {
-        crate::usage::slice_for(st(next_tid).nice)
-    };
+        st(next_tid).slice_left = if st(next_tid).policy == SCHED_RR && st(next_tid).rt > 0 {
+            RR_TICKS
+        } else {
+            crate::usage::slice_for(st(next_tid).nice)
+        };
+    }
     switch_to(current_tid, next_tid, flags);
 }}
 
@@ -1707,8 +1719,12 @@ pub fn unblock_task(tid: usize) {
 /// mean. The caller has stopped to wait, so this is its remaining time being
 /// handed to the task it is waiting for, not a queue-jump for free.
 ///
-/// Fairness is unaffected: the woken task still yields at the end of its
-/// timeslice, and a task that never blocks is never overtaken by this.
+/// Fairness is unaffected: the woken task runs on what is left of the turn
+/// it called in — which its answerer ran on (`donate_to`) — and yields at
+/// its end, and a task that never blocks is never overtaken by this. Given
+/// a whole turn each time, as it was, a pair of tasks calling each other
+/// never came to the end of one, and nothing else of their band ran on
+/// their processor while they called.
 ///
 /// No processor is woken for it, where [`unblock_task`] wakes one. Whoever
 /// answers a call is about to wait for the next, and the caller runs here
@@ -1725,6 +1741,11 @@ pub fn unblock_task_next(tid: usize) {
         if let Some(ref mut task) = *slot(tid) {
             if task.state == TaskState::Blocked {
                 task.state = TaskState::Ready;
+                let answerer = crate::percpu::current();
+                if answerer != 0 {
+                    st(tid).slice_left = st(answerer).slice_left;
+                    st(tid).handed = true;
+                }
                 enqueue_front(tid);
             }
         }
