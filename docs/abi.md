@@ -1317,7 +1317,7 @@ block function against the RFC's test vector at boot and will not start if it
 is wrong.
 
 **Processors.** `SYS_CPUS` says how many processors are running the system:
-the ones the firmware listed that could be started, sixteen at most, and 1
+the ones the firmware listed that could be started, 256 at most, and 1
 on a machine with no ACPI tables or no local APIC. They are numbered from 0,
 and the upper half of the answer is the one the caller was on when it asked
 — which is true of that instant and no other, since a task is run by

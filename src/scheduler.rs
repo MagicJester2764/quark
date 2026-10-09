@@ -542,6 +542,7 @@ static REAP_WANTED: AtomicBool = AtomicBool::new(false);
 /// the current execution context (kernel_main's continuation).
 pub fn init() {
     unsafe {
+        runq::init();
         // TID 0 = idle task (current context, its stack/context will be saved on switch)
         let idle = TaskRec::new(Task {
             tid: 0,

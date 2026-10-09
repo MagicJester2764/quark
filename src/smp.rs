@@ -199,6 +199,12 @@ pub unsafe fn start(regions: &[MemoryRegion], mb_info: (usize, usize)) {
             if index >= MAX_CPUS {
                 break;
             }
+            // Eight bits name a processor in xAPIC mode, and the last of
+            // them is everybody.
+            if !crate::lapic::x2() && cpu.apic_id >= 0xFF {
+                puts(b"SMP: a processor named in more than eight bits, and no x2APIC mode to name it in.\n");
+                continue;
+            }
             // The stack its idle loop runs on, and an interrupt taken there,
             // and the one it takes a double fault on: each with a page below
             // it that faults (`kstack.rs`).
@@ -254,17 +260,26 @@ pub unsafe fn start(regions: &[MemoryRegion], mb_info: (usize, usize)) {
                     }
                 }
             } else {
+                // Not here. It is reset where it is, if it is anywhere,
+                // and waits for a STARTUP it is never sent: one that came
+                // late would read the next processor's words in the page
+                // and run on its stack. Then its place is the next one's.
+                // The stacks stay its.
                 STARTED[index].store(GIVEN_UP_ON, Ordering::Release);
-                puts(b"SMP: a processor did not start.\n");
-                // Its place in the table is spent; the stack stays its.
-                break;
+                crate::lapic::send_init(cpu.apic_id);
+                wait_ticks(2);
+                STARTED[index].store(WAITED_FOR, Ordering::Release);
+                puts(b"SMP: the processor with APIC id ");
+                put_usize(cpu.apic_id as usize);
+                puts(b" did not start.\n");
             }
         }
     }
 
     puts(b"SMP: ");
     put_usize(percpu::count());
-    puts(if percpu::count() == 1 { b" processor.\n" } else { b" processors.\n" });
+    puts(if percpu::count() == 1 { b" processor" } else { b" processors" });
+    puts(if crate::lapic::x2() { b", x2APIC.\n" } else { b".\n" });
 }
 
 /// Where a processor other than the first arrives, from `ap_boot.s`: in
@@ -284,6 +299,7 @@ extern "C" fn arrive(index: usize) -> ! {
         crate::idt::load();
         crate::fpu::init_processor();
         crate::syscall::init_processor();
+        crate::lapic::init_other();
         crate::lapic::init_local(false);
     }
     // Here, and waiting to be told it was in time.

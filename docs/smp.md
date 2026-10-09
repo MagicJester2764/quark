@@ -77,7 +77,21 @@ There it loads what the first loaded, turns on what the first turned on,
 waits for the kernel lock and goes to the idle loop.
 
 A processor that arrives after the first has stopped waiting for it halts.
-Nothing would know it was there.
+Nothing would know it was there. And one that has not arrived by then is
+sent INIT again, which resets it wherever it is, to wait for a STARTUP it
+is never sent: the page's words — its stack, its number — are the next
+processor's, and one that came late would read them. Then the next is
+started, with its number.
+
+The local APICs are in x2APIC mode wherever the processor has it, which
+the kernel turns on itself — on the first processor, and on each other as
+it arrives (`lapic::init_other`), since one that has been reset is in
+xAPIC mode. In x2APIC mode a processor is named in thirty-two bits rather
+than eight, and an interrupt to another is one write. There may be 256
+processors (`percpu::MAX_CPUS`, declared once), listed once each though
+the firmware lists one as an APIC and as an x2APIC. A processor the table
+says is not enabled is not started, whether or not it says it could be
+brought online — those are counted, and said.
 
 A machine with no ACPI tables, one processor, or no usable local APIC is one
 processor with an 8259, as every machine was.
@@ -233,4 +247,5 @@ uses them well, and the difference is a list:
   kernel with one has not.
 - **Interrupts from devices on any processor.** The I/O APIC can send one
   anywhere; every one still goes to the first.
-- **More than sixteen processors**, and x2APIC ids above 255.
+- **A device's interrupt for a processor above 255**, which needs the
+  IOMMU's interrupt remapping: a message names a processor in eight bits.

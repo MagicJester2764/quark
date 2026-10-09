@@ -10,7 +10,7 @@
 //! - **A timer of its own.** The 8254 interrupts one processor. Every other
 //!   needs a tick to end a task's turn with, and its local APIC has one.
 //!   The first processor's is set, a shot at a time, for whatever is due
-//!   before the next tick (`clock.rs`).
+//!   soonest (`clock.rs`).
 //! - **The way the others are started**: INIT and STARTUP are messages sent
 //!   through it.
 //!
@@ -21,9 +21,12 @@
 //! the first processor's local APIC passes them on as the firmware set it
 //! up to.
 //!
-//! Registers are reached through memory, or through MSRs where the firmware
-//! left the APIC in x2APIC mode — which it must on a machine with more than
-//! 255 processors, and may on any.
+//! Registers are reached through MSRs in x2APIC mode, which the kernel turns
+//! on wherever the processor has it — on the first processor here, on each
+//! other as it starts ([`init_other`]) — and through memory where it has
+//! not. In x2APIC mode a processor is named in thirty-two bits rather than
+//! eight, which a machine with more than 255 processors needs, and an
+//! interrupt to another is one write rather than two and a wait.
 
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
@@ -113,7 +116,12 @@ pub unsafe fn init() -> bool {
         // that is not one to start more processors on.
         return false;
     }
-    if base & APIC_BASE_X2 != 0 {
+    // x2APIC, where the processor has it and the firmware has not turned
+    // it on already: from xAPIC mode it is one bit more.
+    if base & APIC_BASE_X2 == 0 && crate::cpu::has_x2apic() {
+        unsafe { crate::cpu::wrmsr(MSR_APIC_BASE, base | APIC_BASE_X2) };
+    }
+    if crate::cpu::rdmsr(MSR_APIC_BASE) & APIC_BASE_X2 != 0 {
         X2.store(true, Ordering::Relaxed);
     } else {
         let addr = base & 0x000F_FFFF_FFFF_F000;
@@ -126,6 +134,27 @@ pub unsafe fn init() -> bool {
     PRESENT.store(true, Ordering::Relaxed);
     unsafe { init_local(true) };
     true
+}
+
+/// Put the local APIC of a processor being started in the mode the first
+/// processor's is in: one that has been reset is in xAPIC mode, and a
+/// register reached as an MSR in that mode is a fault.
+///
+/// # Safety
+/// On that processor, before anything else of its local APIC is touched,
+/// interrupts off.
+pub unsafe fn init_other() {
+    if X2.load(Ordering::Relaxed) {
+        let base = crate::cpu::rdmsr(MSR_APIC_BASE);
+        if base & APIC_BASE_X2 == 0 {
+            unsafe { crate::cpu::wrmsr(MSR_APIC_BASE, base | APIC_BASE_ENABLE | APIC_BASE_X2) };
+        }
+    }
+}
+
+/// Whether the local APICs are in x2APIC mode.
+pub fn x2() -> bool {
+    X2.load(Ordering::Relaxed)
 }
 
 /// Set up the local APIC of the processor this runs on.
@@ -209,10 +238,12 @@ pub fn send(apic_id: u32, vector: u8) {
 
 /// Reset another processor: it stops, and waits to be told where to start.
 /// Asserted and then taken away, which is what the oldest local APICs need
-/// and the rest ignore.
+/// and the rest ignore — and which x2APIC mode has no message for.
 pub fn send_init(apic_id: u32) {
     send_raw(apic_id, ICR_INIT | ICR_LEVEL | ICR_ASSERT);
-    send_raw(apic_id, ICR_INIT | ICR_LEVEL);
+    if !X2.load(Ordering::Relaxed) {
+        send_raw(apic_id, ICR_INIT | ICR_LEVEL);
+    }
 }
 
 /// Tell a processor that has been reset where to start: in real mode, at

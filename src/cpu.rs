@@ -118,6 +118,24 @@ pub fn has_apic() -> bool {
     edx & (1 << 9) != 0
 }
 
+/// CPUID leaf 1: ECX bit 21 = the local APIC has an x2APIC mode.
+pub fn has_x2apic() -> bool {
+    let ecx: u32;
+    unsafe {
+        core::arch::asm!(
+            "mov {tmp:r}, rbx",
+            "cpuid",
+            "mov rbx, {tmp:r}",
+            tmp = out(reg) _,
+            inout("eax") 1 => _,
+            inout("ecx") 0 => ecx,
+            out("edx") _,
+            options(nostack),
+        );
+    }
+    ecx & (1 << 21) != 0
+}
+
 /// CR0 and CR4 as this processor has them: what it has turned on.
 pub fn control_registers() -> (u64, u64) {
     let cr0: u64;

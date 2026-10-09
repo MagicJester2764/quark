@@ -40,7 +40,7 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
 /// How many processors the kernel will run on. The table of them is this
 /// long; a machine with more has the rest left stopped.
-pub const MAX_CPUS: usize = 16;
+pub const MAX_CPUS: usize = 256;
 
 /// The 64-bit task state segment: where the processor finds a stack when it
 /// changes privilege or takes an interrupt with an IST index.
@@ -129,34 +129,10 @@ const CR3: usize = offset_of!(PerCpu, cr3);
 // The stub in `syscall.rs` says `%gs:0`, `%gs:8` and `%gs:16`.
 const _: () = assert!(USER_RSP == 0 && KERNEL_RSP == 8 && SYSCALL_R9 == 16);
 
-const EMPTY: PerCpu = PerCpu {
-    user_rsp: 0,
-    kernel_rsp: 0,
-    syscall_r9: 0,
-    index: 0,
-    current: 0,
-    tss: Tss {
-        reserved0: 0,
-        rsp0: 0,
-        rsp1: 0,
-        rsp2: 0,
-        reserved1: 0,
-        ist: [0; 7],
-        reserved2: 0,
-        reserved3: 0,
-        iomap_base: TSS_SIZE as u16,
-    },
-    gdt: [0; GDT_ENTRIES],
-    idle_context: CpuContext::empty(),
-    idle_stack: (0, 0),
-    df_top: 0,
-    cr3: AtomicUsize::new(0),
-    apic_id: AtomicU32::new(0),
-    napping: AtomicBool::new(false),
-    flush: AtomicBool::new(false),
-};
-
-static mut CPUS: [PerCpu; MAX_CPUS] = [EMPTY; MAX_CPUS];
+/// Each processor's, filled in as it starts (`init`, `load_tables`), and
+/// noughts until then: written out as records, 256 of them were eighty
+/// kilobytes of the kernel's image.
+static mut CPUS: [PerCpu; MAX_CPUS] = unsafe { core::mem::zeroed() };
 
 /// How many processors are running the kernel: the first, and each of the
 /// others once it has arrived (`smp.rs`). They are numbered in the order
@@ -410,6 +386,7 @@ pub unsafe fn init(index: usize, stack: (usize, usize)) {
         let cpu = (&raw mut CPUS[index]) as *mut PerCpu;
         (*cpu).index = index as u64;
         (*cpu).current = 0;
+        (*cpu).idle_context = CpuContext::empty();
         (*cpu).idle_stack = stack;
         (*(&raw const (*cpu).cr3)).store(crate::paging::read_cr3(), Ordering::Relaxed);
         // In the kernel, this processor's state; in a program, nothing. The

@@ -83,7 +83,21 @@ impl Queue {
     const EMPTY: Queue = Queue { rt: END, front: (END, END), fair: END, len: 0, load: 0, floor: 0, turns: 0 };
 }
 
-static mut QUEUES: [[Queue; NUM_PRIORITIES]; MAX_CPUS] = [[Queue::EMPTY; NUM_PRIORITIES]; MAX_CPUS];
+/// Every processor's, empty from [`init`]: noughts until then, rather than
+/// forty kilobytes of empty queues in the kernel's image.
+static mut QUEUES: [[Queue; NUM_PRIORITIES]; MAX_CPUS] = unsafe { core::mem::zeroed() };
+
+/// Make every processor's queues empty: before the first task is made.
+///
+/// # Safety
+/// Once, on the first processor, before anything is queued.
+pub(super) unsafe fn init() {
+    unsafe {
+        for queues in (*(&raw mut QUEUES)).iter_mut() {
+            *queues = [Queue::EMPTY; NUM_PRIORITIES];
+        }
+    }
+}
 /// The order tasks were queued in, for those otherwise equal.
 static mut SEQ: u64 = 0;
 /// A task that ran on a processor less than this long ago is warm there:

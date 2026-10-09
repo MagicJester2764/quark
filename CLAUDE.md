@@ -1657,9 +1657,12 @@ breaking any of them is quiet until it is a machine that stops.
   driver with the capability for any line could take another's.
 - **The other processors are started before there is a task** (`smp::start`
   in `kernel_main`), with what the first processor has turned on: CR0, CR4,
-  EFER, the `syscall` MSRs. Something turned on later on the first — a CR4
-  bit, an MSR — has to be turned on on the others, or a task that moves
-  finds it gone. And what is a processor's own each says as it starts:
+  EFER, the `syscall` MSRs, x2APIC mode (`lapic::init_other`: one that has
+  been reset is in xAPIC mode, and its registers as MSRs are a fault).
+  Something turned on later on the first — a CR4 bit, an MSR — has to be
+  turned on on the others, or a task that moves finds it gone. One that
+  does not answer is reset again (INIT) before the next is started on the
+  same page, whose words it would otherwise read late. And what is a processor's own each says as it starts:
   its index in TSC_AUX (`cpu::say_processor_index`), where a program's
   `RDPID` and `RDTSCP` find it — left at nought, every processor said it
   was the first — and where it sits (`cpu::place`), which only CPUID on
@@ -1743,8 +1746,14 @@ breaking any of them is quiet until it is a machine that stops.
   authority for every device's registers, and is still handed to `init`,
   though nothing asks for it now; a device that is not a PCI function has
   only that, and above four gigabytes there is none.
-- Sixteen processors at most, and local APIC ids below 256 unless the
-  firmware left the APICs in x2APIC mode.
+- 256 processors at most (`percpu::MAX_CPUS`). An APIC id past 254 needs
+  x2APIC mode, which the kernel turns on wherever the processor has it;
+  one past 255 is never sent a device's interrupt — without the IOMMU's
+  interrupt remapping a message names a processor in eight bits — which
+  costs nothing while every device interrupts the first. The processors'
+  own stacks are kernel stacks (`kstack.rs`): on a machine of 256, 511 of
+  the 32,768, and a task the kernel has no stack for is not made. A
+  processor the firmware says could be brought online is not.
 - An NMI and a machine check are taken on the stack they arrive on: neither
   has one of its own (an IST entry, as a double fault has). In the three
   instructions `syscall_entry` runs on the program's stack before it finds

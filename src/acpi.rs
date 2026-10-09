@@ -23,9 +23,10 @@
 //! does not come to nothing, an entry shorter than its kind. The tables are
 //! the firmware's and usually right; "usually" is a fault in ring 0.
 
-/// How many processors, I/O APICs and overrides are kept. More than that is
-/// a bigger machine than this kernel runs on, and the rest are left out.
-pub const MAX_CPUS: usize = 16;
+// How many processors, I/O APICs and overrides are kept. More than that is
+// a bigger machine than this kernel runs on, and the rest are left out.
+// Processors: as many as the kernel runs on.
+use crate::percpu::MAX_CPUS;
 pub const MAX_IOAPICS: usize = 4;
 pub const MAX_OVERRIDES: usize = 16;
 pub const MAX_DRHDS: usize = 4;
@@ -98,6 +99,9 @@ pub struct Info {
     pub has_pic: bool,
     pub cpus: [Cpu; MAX_CPUS],
     pub ncpus: usize,
+    /// Processors listed as not enabled and able to be brought online:
+    /// counted, and not started.
+    pub capable: usize,
     pub ioapics: [IoApic; MAX_IOAPICS],
     pub nioapics: usize,
     pub overrides: [Override; MAX_OVERRIDES],
@@ -144,6 +148,7 @@ static mut INFO: Info = Info {
     has_pic: true,
     cpus: [NO_CPU; MAX_CPUS],
     ncpus: 0,
+    capable: 0,
     ioapics: [NO_IOAPIC; MAX_IOAPICS],
     nioapics: 0,
     overrides: [NO_OVERRIDE; MAX_OVERRIDES],
@@ -327,13 +332,8 @@ fn madt(t: &[u8], info: &mut Info) {
         }
         let e = &t[at..at + len];
         match kind {
-            // A processor's local APIC. Bit 0 of the flags: it can be used.
-            0 if len >= 8 => {
-                if le32(e, 4) & 1 != 0 && info.ncpus < MAX_CPUS {
-                    info.cpus[info.ncpus] = Cpu { apic_id: e[3] as u32 };
-                    info.ncpus += 1;
-                }
-            }
+            // A processor's local APIC.
+            0 if len >= 8 => processor(info, e[3] as u32, le32(e, 4)),
             1 if len >= 12 => {
                 if info.nioapics < MAX_IOAPICS {
                     info.ioapics[info.nioapics] = IoApic { id: e[2], addr: le32(e, 4), gsi_base: le32(e, 8) };
@@ -348,17 +348,30 @@ fn madt(t: &[u8], info: &mut Info) {
             }
             // The local APICs are somewhere a 32-bit field cannot say.
             5 if len >= 12 => info.lapic_addr = le64(e, 4),
-            // A processor whose id needs more than eight bits.
-            9 if len >= 16 => {
-                if le32(e, 8) & 1 != 0 && info.ncpus < MAX_CPUS {
-                    info.cpus[info.ncpus] = Cpu { apic_id: le32(e, 4) };
-                    info.ncpus += 1;
-                }
-            }
+            // A processor whose id may need more than eight bits.
+            9 if len >= 16 => processor(info, le32(e, 4), le32(e, 8)),
             _ => {}
         }
         at += len;
     }
+}
+
+/// A processor the MADT lists, with its flags: bit 0, it is enabled and
+/// may be used; bit 1, it is not but could be brought online (ACPI 6.3),
+/// which is counted and not started. One listed twice — as an APIC and as
+/// an x2APIC, which some firmware does for every processor — is one.
+fn processor(info: &mut Info, apic_id: u32, flags: u32) {
+    if flags & 1 == 0 {
+        if flags & 2 != 0 {
+            info.capable += 1;
+        }
+        return;
+    }
+    if info.cpus[..info.ncpus].iter().any(|c| c.apic_id == apic_id) || info.ncpus == MAX_CPUS {
+        return;
+    }
+    info.cpus[info.ncpus] = Cpu { apic_id };
+    info.ncpus += 1;
 }
 
 fn fadt(t: &[u8], info: &mut Info) {
@@ -491,6 +504,11 @@ fn report(info: &Info) {
     puts(b"ACPI: ");
     put_dec(info.ncpus as u64);
     puts(if info.ncpus == 1 { b" processor" } else { b" processors" });
+    if info.capable != 0 {
+        puts(b" (and ");
+        put_dec(info.capable as u64);
+        puts(b" that could be brought online)");
+    }
     puts(b", local APIC at ");
     put_hex(info.lapic_addr);
     for io in &info.ioapics[..info.nioapics] {

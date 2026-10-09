@@ -121,19 +121,19 @@ fn settle() {
         let every = core::mem::replace(&mut *(&raw mut EVERY_SPACE), false);
         let me = percpu::index();
         let count = percpu::count();
-        let mut asked: u32 = 0;
+        let mut asked = [0u64; percpu::MAX_CPUS / 64];
         for cpu in (0..count).filter(|&cpu| cpu != me) {
             if every || known[..n].contains(&percpu::cr3_of(cpu)) {
                 percpu::ask_flush(cpu);
                 crate::lapic::send(percpu::apic_id(cpu), crate::idt::VEC_FLUSH);
-                asked |= 1 << cpu;
+                asked[cpu / 64] |= 1 << (cpu % 64);
             }
         }
         // Each answers from wherever it is: ring 3, its idle loop, or the
         // wait for the lock this processor holds. None of those can be
         // waiting for this one, except for the lock.
         let mut turns: u64 = 0;
-        while (0..count).any(|cpu| asked & (1 << cpu) != 0 && percpu::flush_pending(cpu)) {
+        while (0..count).any(|cpu| asked[cpu / 64] >> (cpu % 64) & 1 != 0 && percpu::flush_pending(cpu)) {
             crate::smp::while_waiting();
             core::hint::spin_loop();
             turns += 1;
