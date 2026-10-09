@@ -242,6 +242,14 @@ at the moment of the tick sent the computing programs there elsewhere. A task th
 least to run. A task that moves keeps how far it has run, measured from
 where its band has got to on each processor.
 
+All of it is among the processors a task may run on (`SYS_AFFINITY`; all
+of them unless it is told otherwise): where it is put to wait, what is
+pulled and what balancing moves, a reply put at the front, a call handed
+over and a turn put back each ask (`may_run_on`), and a task found running
+where it may no longer — its set changed, or its processor taken offline —
+moves as that processor next comes into the kernel. A task whose set has no
+processor online in it may run on any.
+
 A queue is found by band, and within one each part by what it holds: the
 real-time tasks in order of priority, the tasks put at the front in the
 order they came, and the rest by how far they have run — heaps linked
@@ -256,7 +264,11 @@ This is a kernel that runs on several processors. It is not yet one that
 uses them well, and the difference is a list:
 
 - **The one lock.** Four programs making calls make no more calls than one.
-  Taking it apart means a lock for the scheduler, one for each address
+  `callbench sweep 10` — pairs of threads calling each other, a pair to a
+  processor — made 653,000 calls a second with one pair on eight
+  processors under KVM, 563,000 with two, 506,000 with four and 421,000
+  with eight: fewer the more there are, each waiting at the door for the
+  rest. Taking it apart means a lock for the scheduler, one for each address
   space's tables, one for the frame allocator, and a call between two tasks
   that does not stop a third — and an order to take them in, written down,
   because a kernel with more than one lock has a way to deadlock that a

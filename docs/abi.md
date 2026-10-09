@@ -1170,8 +1170,9 @@ never handed to a wait.
 2 ordinary programs, 3 the idle task. A task runs only when nothing in a better
 band is waiting, and within its own the one that has run least goes next,
 by how nice it is (`SYS_NICE`, `SYS_SCHED`); a task woken into a better band
-than the running one preempts it at the next tick rather than waiting out its
-slice.
+than one a processor it may run on is running preempts that one at once — as
+the call that woke it returns, or with an interrupt to that processor —
+rather than at its next tick.
 
 Within a band, a task in a real-time class (`SYS_SCHED`, op 2: Linux's
 `SCHED_FIFO` and `SCHED_RR`, at a priority from 1 to 99) runs before every
@@ -1225,7 +1226,7 @@ to hear from.
 | 114 | `SYS_IOPORT` | arg0 = port, arg1 = op, arg2 = value | read value, or 0 / `u64::MAX`; the PCI configuration ports, 0xCF8 and 0xCFC to 0xCFF, are refused | `IoPort` covering the port |
 | 115 | `SYS_IOPORT_REP` | arg0 = port, arg1 = buf, arg2 = words, arg3 = op | 0 / `u64::MAX`; the same ports refused | `IoPort` covering the port |
 | 116 | `SYS_GETRANDOM` | arg0 = buf, arg1 = len, arg2 = flags (none yet) | bytes written, at most 1 MiB / `u64::MAX` | — |
-| 117 | `SYS_CPUS` | — | `(the processor the caller is on << 32) \| how many processors there are` | — |
+| 117 | `SYS_CPUS` | — | `(the processor the caller is on << 32) \| how many processors were started` | — |
 | 118 | `SYS_MSI_ALLOC` | arg1 = 0; or arg1 = 1 and arg0 = a PCI device, whose MSI capability the kernel then programs | `(irq << 48) \| (data << 32) \| address` / `u64::MAX` | `Irq` for any line (0xFF); with a device, `PciDevice` for it |
 | 119 | `SYS_POWER` | arg0 = 0 to turn the machine off, 1 to start it again | does not return / `u64::MAX` | `Power` |
 | 127 | `SYS_DEVICE_CLAIM` | arg0 = a PCI device, `bus << 8 \| device << 3 \| function`, on the first segment; arg1 = 1 to ask how many times it reached for what it may not | 1 if it now reaches only the caller's program's memory, 0 if nothing on this machine can make it; with arg1 = 1 the count; `u64::MAX - 1` if it is another program's or the caller may not / `u64::MAX` | `PciDevice` for the device |
@@ -2020,8 +2021,8 @@ and those running or ready to (`procs_running`). For `u64::MAX` the first
 six are every processor's together. A processor's time is divided where it
 changes: at a door into the kernel and on the way back, going to the idle
 loop and leaving it, and around each interrupt's handling. One with nothing
-to do still takes its tick, and what any is doing at the moment of the call
-is counted up to it.
+to do takes no tick, and what any is doing at the moment of the call is
+counted up to it.
 
 Op 2's four words are what the processor said of itself when it was
 started: its APIC id — the x2APIC id, where its extended topology leaf

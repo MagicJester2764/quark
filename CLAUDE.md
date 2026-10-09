@@ -138,21 +138,28 @@ system hung.
 
 There are no tests in this tree, and that is the shape of a microkernel rather
 than an omission: the kernel is tested from outside, through the ABI, by a
-program. `dtest` in `../quarkutils` makes 1057 checks — capabilities, IPC,
+program. `dtest` in `../quarkutils` makes 1072 checks — capabilities, IPC,
 memory, descriptors, signals, scheduling, users and terminals, `dtest calls`
 with three million calls in three seconds, `dtest smp` for what a second
-processor changes, `dtest clock` for what time it is and whether a wait ends
-when it should, `dtest fork` for what a fork shares and who a write is seen
-by, `dtest handlers` for a handler the kernel runs, `dtest usage` for what
-a program has used and its share of the processor, `dtest devices` for who
-holds which device; twenty-five more (`dtest pressure`) on a machine with
-somewhere to write memory out to, twelve (`dtest msi`, `dtest devices`)
-with a device that interrupts by message and its driver running, eight
-(`dtest iommu`) where an IOMMU stands between that device and memory,
-eleven (`dtest usb`) with a keyboard, a mouse and a disk on USB, three
-(`dtest display`) where the display can be had another size, and seventeen
-(`dtest sound`) with a sound card: 1094 on the machine ExplOSion tests on —
-and `qfuzz` throws random requests at every service.
+processor changes, `dtest turns` for whose turn a call runs on, `dtest idle`
+for a machine with nothing to do, `dtest clock` for what time it is and
+whether a wait ends when it should, `dtest fork` for what a fork shares and
+who a write is seen by, `dtest handlers` for a handler the kernel runs,
+`dtest usage` for what a program has used and its share of the processor,
+`dtest devices` for who holds which device; eighteen more on four
+processors (`dtest placement` for where a task is put to wait, `dtest
+offline` for a processor taken away and brought back); twenty-five more
+(`dtest pressure`) on a machine with somewhere to write memory out to,
+twelve (`dtest msi`, `dtest devices`) with a device that interrupts by
+message and its driver running, eight (`dtest iommu`) where an IOMMU stands
+between that device and memory, eleven (`dtest usb`) with a keyboard, a
+mouse and a disk on USB, three (`dtest display`) where the display can be
+had another size, and seventeen (`dtest sound`) with a sound card: 1109 on
+the machine ExplOSion tests on, and 1127 on it with four processors — and
+`qfuzz` throws random requests at every service. `callbench` says how many
+calls a second pairs of threads make, a pair to a processor, and `kstress`
+has every processor making calls, taking faults, waking and writing at
+once, and checks each.
 
 So a kernel change is verified by booting an image:
 
@@ -1740,10 +1747,10 @@ breaking any of them is quiet until it is a machine that stops.
   not *invariant*, on hardware that is not a hypervisor's — keeps time by the
   tick, ten milliseconds wide, as every machine did. One with no local APIC
   has the fine clock and wakes on ticks.
-- A task woken on time runs at once only if it is of a better band than what
-  the first processor is running, or of a higher real-time priority in the
-  same band, or a processor is idle: one of the same band waits its turn, as
-  any woken task does. A FIFO task that is preempted goes
+- A task woken runs at once only if it is of a better band than what a
+  processor it may run on is running, or of a higher real-time priority in
+  the same band, or a processor is idle: one of the same band waits its
+  turn, on time or not. A FIFO task that is preempted goes
   behind its equals rather than ahead of them, as POSIX would have it, and
   `SCHED_BATCH`, `SCHED_IDLE`, `SCHED_DEADLINE` and `SCHED_RESET_ON_FORK`
   are refused.
