@@ -327,6 +327,14 @@ pub fn wake_idle() {
     }
 }
 
+/// Wake processor `cpu`, if it is asleep: something has been put in its
+/// queue for it to run.
+pub fn wake(cpu: usize) {
+    if cpu < percpu::count() && cpu != percpu::index() && percpu::wake_from_nap(cpu) {
+        crate::lapic::send(percpu::apic_id(cpu), crate::idt::VEC_RESCHED);
+    }
+}
+
 /// Bring processor `cpu` into the kernel to look at what it is running:
 /// the task has just been ended or stopped, by this one.
 pub fn interrupt(cpu: usize) {

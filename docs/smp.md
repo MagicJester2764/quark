@@ -173,17 +173,43 @@ sentence on the serial line rather than without one.
 
 ## Who runs what
 
-The ready queues are the machine's. Each processor takes the best task
-waiting: on its tick, when it has nothing to do, and when it is woken.
+Each processor has run queues of its own, a queue for each band
+(`scheduler/runq.rs`), and runs the best of them: on its tick, when it has
+nothing to do, and when it is woken. A task made ready waits on the
+processor it last ran on — where what it uses may still be in the cache —
+if it would run there at once: that one has nothing to do, or runs
+something the task outranks. If not, it waits on one that is asleep, which
+is woken — one whose core has nothing else to run first, then one in the
+same package — or, if it outranks something running and none sleeps, on
+the processor running the worst. A task preempted waits where it was.
 
-A task made ready wakes a processor that is asleep, if there is one. Not for
-a reply to a call, though: whoever answers is about to wait for the next
-call, and the caller runs there in its place. Waking another processor for
-it would send the two of them back and forth between processors, with an
-interrupt each way for every call.
+Not a reply to a call, though: the caller goes to the front of the queue
+of the processor answering, which is about to wait for the next call, and
+runs there in its place. Woken elsewhere, the two would go back and forth
+between processors, with an interrupt each way for every call.
 
-Nothing says which processor a task runs on, and nothing keeps one where its
-cache is.
+Work moves only towards a processor that would otherwise have less: one
+with nothing of its own takes the best task waiting on the busiest — of its
+own package first, and of those as good one that has not run in the last
+two milliseconds, whose cache it has lost anyway — and every fourth tick
+one with less to run than the busiest takes a task waiting there that
+weighs less than the difference, so that the two end nearer even. What a
+processor has to run is weighed by how nice each task is, as a band's
+share is: counted instead, two programs at nought on one processor and two
+at nice 10 on another were even, and the nicer had half the machine where
+they are owed a tenth of it. And each band is weighed alone, since fairness
+is a question within one: weighed together, a server's turn on a processor
+at the moment of the tick sent the computing programs there elsewhere. A task that has never run goes where there is
+least to run. A task that moves keeps how far it has run, measured from
+where its band has got to on each processor.
+
+A queue is found by band, and within one each part by what it holds: the
+real-time tasks in order of priority, the tasks put at the front in the
+order they came, and the rest by how far they have run — heaps linked
+through the tasks' own records, so that choosing is never a walk of what
+is waiting. It was, of one list for the machine, at every choice and every
+wake: a program of four thousand threads waking ten times a second kept
+the kernel choosing, and its own first thread waited minutes to run.
 
 ## What would have to change
 
@@ -196,8 +222,6 @@ uses them well, and the difference is a list:
   that does not stop a third — and an order to take them in, written down,
   because a kernel with more than one lock has a way to deadlock that a
   kernel with one has not.
-- **A queue for each processor**, with work moved from a busy one to an idle
-  one, and a task otherwise left where it was.
 - **A better task waking that interrupts the processor running the worst**,
   instead of waiting for a tick.
 - **A processor that takes no ticks while it has nothing to do.**

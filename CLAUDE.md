@@ -1194,8 +1194,9 @@ stopped is one the scheduler does not run.
 - **Stopped is not a state.** A task of a stopped program goes on being
   what it was — blocked in a call, asleep, ready — and has to be that when
   the program is continued. It is *held* (`scheduler::HELD`): never put on a
-  ready queue and never switched to. `enqueue` and `donate_to` are the two
-  places a task becomes runnable, and both ask. What would have woken it
+  run queue and never switched to. `enqueue` — with `requeue_here` and
+  `enqueue_front` — and `donate_to` are where a task becomes runnable, and
+  each asks. What would have woken it
   leaves it `Ready` and in no queue; continuing queues every task that is.
   A new way to make a task run has to ask too.
 - **The running task can be the one stopped** — a program that stops
@@ -1280,9 +1281,23 @@ What follows from that, and breaking any of it is quiet:
   here). In the order they were queued, a nicer program's shorter turn came
   round sooner, and on four processors nice 10 had about half of nice 0's
   share. A task that was waiting joins a little behind where its band has
-  got to (`FLOOR`), not where it left off: started late or woken after a
-  minute, it is not owed the minute, and with no floor it took a
-  processor until it had caught up. Two things are not by run time: a
+  got to on the processor it waits on (a queue's `floor`, `runq::join`),
+  not where it left off: started late or woken after a minute, it is not
+  owed the minute, and with no floor it took a processor until it had
+  caught up. Where the band has got to is the least that what the
+  processor runs and has waiting have run, never going back
+  (`runq::settle`; Linux's `min_vruntime`). It was the most any task had
+  run when chosen, which only rises: a nice task's strides, a call handed
+  over and a server lent another band's place drove it up, and since a
+  task that moves keeps its distance from it, run times grew without end
+  — every task's the largest a run time can be, in a full dtest, and two
+  tasks of a processor taking turns whatever their weights. So a task's
+  run time is in one processor's measure and one band's
+  (`PerTask::measured_on`, `measured_in`), and every way a task comes to
+  run, to wait or to another band converts it (`runq::moved`): a move, a
+  pull, a hand-over, a lent place. A task whose turn ends keeps its run
+  time (`requeue_here`): passed through the floor as if back from sleep,
+  one at nought lost its lead each time one at nice 10 beside it ran. Two things are not by run time: a
   caller woken by its reply goes first (`unblock_task_next`), and a yield
   lets everything else ready in the band go first — once (`YIELDED`): sent
   behind everybody for good, a task that yields while it waits for another
@@ -1294,7 +1309,7 @@ What follows from that, and breaking any of it is quiet:
   is ready, a round-robin one for ten ticks among its equals. Entering a
   class takes `RealTime`; a task's class is given to what it makes. Its run
   time is not counted where its band's ordinary tasks' is (`count_turn`, and
-  `FLOOR` moves only for an ordinary task): counted there, three seconds of
+  a queue's floor moves only for an ordinary task): counted there, three seconds of
   FIFO would put the floor three seconds on, and every ordinary task that
   woke would join that far behind those that had not slept.
 - **A processor's real-time tasks have 950 ms of each second**, and past
@@ -1526,10 +1541,39 @@ breaking any of them is quiet until it is a machine that stops.
   into a loop.
 - **A processor says it is going to sleep before it gives up the lock**
   (`percpu::nap`), so that whoever next makes a task ready — which takes the
-  lock — knows to wake it (`smp::wake_idle`), and stops saying so the moment
-  it runs anything. `unblock_task` wakes one. `unblock_task_next`, which is
-  a reply to a call, wakes nobody: the answerer is about to wait, and the
-  caller runs in its place.
+  lock — knows it may put the task there and wake it (`runq::place_for`,
+  `smp::wake`), and stops saying so the moment it runs anything.
+  `unblock_task_next`, which is a reply to a call, wakes nobody: the caller
+  goes to the front of the answerer's processor's queue, the answerer is
+  about to wait, and the caller runs in its place.
+- **Each processor has run queues of its own, and choosing is never a walk
+  of them** (`scheduler/runq.rs`): a queue for each band, each in three
+  parts — the real-time tasks by priority, the tasks put at the front in
+  the order they came, the rest by how far they have run — the first and
+  last pairing heaps linked through the tasks' records. A task made ready
+  waits where it last ran if it would run there at once, and on a sleeping
+  processor, or the one running the worst, if not; a processor with
+  nothing of its own takes from the busiest, cold tasks first; and every
+  fourth tick one with less to run than the busiest takes a task light
+  enough that the two end nearer even. What a processor has to run is
+  weighed, not counted (`usage::weight`, a queue's `load`): counted, two
+  programs at nought on one processor and two at nice 10 on another were
+  even, and the nicer had half the machine where they are owed a tenth of
+  it. And weighed band by band: what a better band runs for a moment is
+  no reason for a task of a worse one to move — weighed together, a
+  server's turn on a processor at the tick sent computing programs
+  elsewhere, and the nice ones had a third of the machine in a full dtest
+  run. Whoever holds the kernel lock may
+  touch any processor's queues. What asks whether something better is
+  waiting — a tick, a wake between ticks, a call's hand-over — asks the
+  queues of the processor it is on, in one step (`runq::best_band`,
+  `best_rt`). With one list for the machine, walked at every choice, a
+  program of 4,095 threads waking ten times a second kept the kernel
+  choosing, and its own first thread waited minutes to run; and as many
+  computing threads as processors went round them, each going back into
+  the one list at the end of its turn for whichever processor looked
+  next. A new question about what is waiting is answered by the queues'
+  own structure, not by looking through them.
 - **The clock and every device interrupt the first processor.** The others
   have a tick of their own from their local APIC, and it does one thing:
   `scheduler::timer_tick`. What is due — timeouts, timers, alarms — is seen
@@ -1635,21 +1679,9 @@ breaking any of them is quiet until it is a machine that stops.
   processor; a system call, a fault or an interrupt waits for the kernel to
   be empty. So `IrqSpinLock` still panics on contention, and rightly: under
   the kernel lock, contention can still only mean re-entrancy. Taking the
-  lock apart is its own project. With it go: a ready queue for each
-  processor rather than one for the machine, a task kept where its cache
-  is, a better task waking that interrupts whichever processor is running
-  the worst rather than waiting for its tick, and an idle processor that
-  takes no ticks.
-- **Choosing what runs looks at every ready task of the band.** A band's
-  ready tasks are one list, and the choice of whoever has run least walks
-  it whole (`dequeue_ready`), as does asking at every wake between ticks
-  and every call's hand-over whether a real-time task is ready
-  (`outranked`). With a few ready that is nothing; with thousands it is
-  most of what the kernel does. A program of 4,095 threads that each wake
-  ten times a second kept the list thousands long and the kernel choosing,
-  and its own first thread — which had run longest, making them, and so
-  was chosen last — waited three minutes and more on four processors and
-  nearly seven on eight before it could end them.
+  lock apart is its own project. With it go: a better task waking that
+  interrupts whichever processor is running the worst rather than waiting
+  for its tick, and an idle processor that takes no ticks.
 - Every device interrupts the first processor, a message included. The
   I/O APIC's lines above the sixteen ISA interrupts are not used: which
   device is on which is in the firmware's bytecode, not its tables. A

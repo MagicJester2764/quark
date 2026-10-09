@@ -8,11 +8,13 @@
 /// one task with a saved context per processor. It is in no ready queue.
 /// It is what is left when the queues are empty.
 ///
-/// **More than one processor.** The queues are the machine's, under the
-/// kernel lock (`klock.rs`), and every processor takes from them: on its
-/// tick, when it has nothing to do, and when it is woken because a task was
-/// made ready while it slept. Nothing here says which processor a task
-/// runs on, and a task that is preempted may be run next by another.
+/// **More than one processor.** Each processor has run queues of its own,
+/// under the kernel lock (`klock.rs`): a task waits on the processor it last
+/// ran on, unless another would run it sooner (`runq::place_for`); a
+/// processor with nothing of its own takes from the busiest, and one with
+/// fewer waiting than the busiest takes one every fourth tick. A task that
+/// is preempted waits where it was, and is run next by another only when
+/// that one would otherwise have nothing to do.
 ///
 /// What a second processor changes is that a task which is not the caller
 /// may be *running* — in ring 3, on another processor — at the moment the
@@ -28,6 +30,11 @@
 use crate::context;
 use crate::task::{Task, TaskRec, TaskState, KERNEL_STACK_SIZE, MAX_TASKS};
 use core::sync::atomic::{AtomicBool, Ordering};
+
+mod runq;
+
+/// Each processor's ticks, for what it does every so many of them.
+static mut TICKS: [u32; crate::percpu::MAX_CPUS] = [0; crate::percpu::MAX_CPUS];
 
 /// The task table: a record for each task, by its id (`table.rs`). A slot
 /// with no task has no record.
@@ -141,13 +148,13 @@ pub struct PerTask {
     /// The real-time priority it runs at: its own, or the better one of a
     /// task waiting on it, as `priority` is its band (`refresh_priority`).
     rt: u8,
-    /// Put at the front of its band ([`enqueue_front`]): chosen before anything
-    /// else in it, the longest put there first, whatever it has run.
-    front: bool,
-    /// Has just yielded: passed over once if anything else in its band is
-    /// ready. Once, and not sent to the back for good, or a task yielding while
-    /// it waits for another would wait behind everybody for ever.
+    /// Has just yielded: passed over once if anything else in its queue is
+    /// ready — while the queue's turn is the one it was queued in
+    /// (`yield_turn`). Once, and not sent to the back for good, or a task
+    /// yielding while it waits for another would wait behind everybody for
+    /// ever.
     yielded: bool,
+    yield_turn: u64,
     /// The processor each task is running on, or [`NO_CPU`].
     ///
     /// A task is on a processor from the switch to it until the switch away
@@ -161,7 +168,7 @@ pub struct PerTask {
     /// another processor, a task goes on in ring 3 until the interrupt that
     /// tells its processor arrives, on its own kernel stack and in its own
     /// address space. Neither may be freed under it.
-    on_cpu: u8,
+    on_cpu: u16,
     /// The processor it last ran on — or runs on — as `SYS_CPU_INFO` says
     /// it: Linux's thirty-ninth field of `/proc/PID/stat`. Kept when it
     /// leaves, where `on_cpu` is not.
@@ -184,11 +191,35 @@ pub struct PerTask {
     /// be waited for.
     pinned: [(u64, u64); PINS],
     npinned: u8,
-    /// The band whose ready queue the task is in, or [`NOT_QUEUED`]; and the
-    /// tasks either side of it there.
+    /// The band whose run queue the task is in, or [`NOT_QUEUED`]; the
+    /// processor whose it is; and which part of it (`runq::IN_RT`,
+    /// `IN_FRONT`, `IN_FAIR`).
     queued: u8,
+    queued_on: u16,
+    heap_in: u8,
+    /// The tasks either side of it in a queue's front list.
     run_next: u16,
     run_prev: u16,
+    /// Its links in a queue's heap: its first child, its next sibling, and
+    /// its elder sibling — or its parent, if it is the first child.
+    heap_child: u16,
+    heap_next: u16,
+    heap_prev: u16,
+    /// When it was put in its queue, in the order of all of them: of two
+    /// otherwise equal, the first queued goes first.
+    seq: u64,
+    /// What it weighed when it was put in its queue (`usage::weight`), and
+    /// takes out of the queue's load with it.
+    weight: u32,
+    /// The processor, and the band there, whose measure its run time is in:
+    /// where it last ran or was last put to wait, which are not the same
+    /// for a task put to wait somewhere and taken out again unrun — stopped,
+    /// say — nor for one handed a call, or lent a caller's band
+    /// (`runq::moved`).
+    measured_on: u16,
+    measured_in: u8,
+    /// When it last left a processor, by the clock.
+    ran_at: u64,
 }
 
 impl PerTask {
@@ -210,8 +241,8 @@ impl PerTask {
             policy: SCHED_OTHER,
             rt_base: 0,
             rt: 0,
-            front: false,
             yielded: false,
+            yield_turn: 0,
             on_cpu: NO_CPU,
             last_cpu: 0,
             unannounced: false,
@@ -219,8 +250,18 @@ impl PerTask {
             pinned: [(0, 0); PINS],
             npinned: 0,
             queued: NOT_QUEUED,
+            queued_on: 0,
+            heap_in: 0,
             run_next: END,
             run_prev: END,
+            heap_child: END,
+            heap_next: END,
+            heap_prev: END,
+            seq: 0,
+            weight: 0,
+            measured_on: 0,
+            measured_in: PRIO_NORMAL,
+            ran_at: 0,
         }
     }
 }
@@ -372,36 +413,21 @@ unsafe fn charge_rt(ran: u64) { unsafe {
     u.2 = now;
 }}
 
-/// Whether a task ready in band `p` is one `which` says of.
-///
-/// # Safety
-/// Interrupts off.
-unsafe fn ready_in(p: usize, which: impl Fn(usize) -> bool) -> bool { unsafe {
-    let mut t = READY[p].0;
-    while t != END {
-        let tid = t as usize;
-        if matches!(*slot(tid), Some(ref task) if task.state == TaskState::Ready) && which(tid) {
-            return true;
-        }
-        t = st(tid).run_next;
-    }
-    false
-}}
-
-/// Whether something ready should run before `tid` does: a task in a better
-/// band, or in its own a real-time one of a higher priority while this
-/// processor's real-time tasks have time left. What a reschedule now would
-/// choose over it, and so what a hand-over to it must not skip.
+/// Whether something waiting on this processor should run before `tid`
+/// does: a task in a better band, or in its own a real-time one of a higher
+/// priority while this processor's real-time tasks have time left. What a
+/// reschedule now would choose over it, and so what a hand-over to it must
+/// not skip. Each answered without looking at what is waiting (`runq`).
 ///
 /// # Safety
 /// Interrupts off.
 unsafe fn outranked(tid: usize) -> bool { unsafe {
+    let me = crate::percpu::index();
     let band = priority_of(tid);
-    if best_ready_band().is_some_and(|b| b < band) {
+    if runq::best_band(me).is_some_and(|b| b < band) {
         return true;
     }
-    let rt = st(tid).rt;
-    !throttled() && ready_in(band, |t| st(t).rt > rt)
+    !throttled() && runq::best_rt(me, band) > st(tid).rt
 }}
 
 /// A real-time task made ready on this processor that is better placed than
@@ -476,14 +502,7 @@ pub fn set_sched(tid: usize, policy: u8, priority: u8) {
     irq_restore(flags);
 }
 
-/// Each band's ready queue: its first task and its last, the rest linked
-/// through their records (`PerTask::run_next`). In the order they were
-/// queued, but for one put at the front. Dead and blocked tasks may still be
-/// in it; whoever next looks at the band takes them out.
-///
-/// It was a ring of task ids as long as there can be tasks, for each band.
-static mut READY: [(u16, u16); NUM_PRIORITIES] = [(END, END); NUM_PRIORITIES];
-/// The end of a ready queue.
+/// The end of a run queue's list, and no task in a heap's links.
 const END: u16 = u16::MAX;
 /// In no ready queue.
 const NOT_QUEUED: u8 = u8::MAX;
@@ -495,18 +514,12 @@ static INITIALIZED: AtomicBool = AtomicBool::new(false);
 
 
 
-/// The most any task of each band had run, as `VRUN` counts it, when it
-/// was chosen. A task that was not ready joins no further back than a
-/// little behind it ([`SLEEPER_LEAD`]): a program that slept for a minute
-/// is not owed the minute.
-static mut FLOOR: [u64; NUM_PRIORITIES] = [0; NUM_PRIORITIES];
-/// How far behind the floor a task that was waiting may join: one turn of
-/// a program at nought, so that it is chosen next rather than last.
+/// How far behind where its band has got to a task that was waiting may
+/// join a queue: one turn of a program at nought, so that it is chosen next
+/// rather than last (`runq::join`).
 const SLEEPER_LEAD: u64 = 30_000_000;
 
-const NO_CPU: u8 = u8::MAX;
-
-
+const NO_CPU: u16 = u16::MAX;
 
 /// There is a dead task for the kernel to take apart: one nobody will
 /// collect — a thread joined through its word, a task whose creator has
@@ -731,10 +744,19 @@ pub fn timer_tick() {
     }
     unsafe {
         let current = crate::percpu::current();
+        let me = crate::percpu::index();
 
-        // A processor with nothing to do: whatever is ready is its to run.
+        // Every fourth tick, a processor with two fewer waiting than the
+        // busiest takes one of them to wait here instead.
+        TICKS[me] = TICKS[me].wrapping_add(1);
+        if TICKS[me] % 4 == 0 {
+            runq::balance(me);
+        }
+
+        // A processor with nothing to do: whatever is ready is its to run,
+        // its own or another's.
         if current == 0 {
-            if best_ready_band().is_some() {
+            if anything_to_run() {
                 schedule_inner(true);
             }
             return;
@@ -767,7 +789,7 @@ pub fn timer_tick() {
         }
         let throttled = throttled();
         if rt > 0 && !throttled {
-            if ready_in(band, |t| st(t).rt > rt) {
+            if runq::best_rt(me, band) > rt {
                 st(current).slice_left = 0;
                 schedule_inner(true);
                 return;
@@ -777,7 +799,7 @@ pub fn timer_tick() {
                     st(current).slice_left -= 1;
                     return;
                 }
-                if ready_in(band, |t| st(t).rt >= rt) {
+                if runq::best_rt(me, band) >= rt {
                     st(current).slice_left = 0;
                     schedule_inner(true);
                     return;
@@ -786,7 +808,7 @@ pub fn timer_tick() {
             }
             return;
         }
-        let first = if rt > 0 { ready_in(band, |t| st(t).rt == 0) } else { !throttled && ready_in(band, |t| st(t).rt > 0) };
+        let first = if rt > 0 { runq::has_ordinary(me, band) } else { !throttled && runq::best_rt(me, band) > 0 };
         if first {
             st(current).slice_left = 0;
             schedule_inner(true);
@@ -827,7 +849,7 @@ unsafe fn schedule_inner(from_irq: bool) { unsafe {
             if let Some(ref mut task) = *slot(current_tid) {
                 task.state = TaskState::Ready;
             }
-            enqueue(current_tid);
+            requeue_here(current_tid);
         } else if state == Some(TaskState::Dead) && st(current_tid).unannounced {
             // Ended from another processor, and this is the one it was
             // running on, leaving it: now its parent may be told.
@@ -843,11 +865,11 @@ unsafe fn schedule_inner(from_irq: bool) { unsafe {
         restore_flags(flags);
         return;
     }
-    // More is ready than this processor is about to run: one that is
-    // asleep can have it. This is how a task that was preempted, or woken
+    // More is waiting here than this processor is about to run: one that
+    // is asleep can take it. This is how a task that was preempted, or woken
     // by a reply and left for its waker to make way for, comes to run
     // somewhere else.
-    if best_ready_band().is_some() {
+    if runq::waiting(crate::percpu::index()) > 0 {
         crate::smp::wake_idle();
     }
 
@@ -893,11 +915,17 @@ unsafe fn switch_to(current_tid: usize, next_tid: usize, flags: u64) { unsafe {
         if let Some(ref mut task) = *slot(next_tid) {
             task.state = TaskState::Running;
         }
-        st(next_tid).on_cpu = crate::percpu::index() as u8;
+        st(next_tid).on_cpu = crate::percpu::index() as u16;
         st(next_tid).last_cpu = crate::percpu::index() as u16;
+        // What it runs here is counted as this processor counts it: one
+        // handed a call, or taken from another, comes from another's.
+        runq::moved(next_tid, crate::percpu::index(), priority_of(next_tid));
     }
     if current_tid != 0 {
         st(current_tid).on_cpu = NO_CPU;
+        // When it left: a processor that takes it soon after takes it warm
+        // from this one's cache (`runq::pull`).
+        st(current_tid).ran_at = crate::clock::now();
     } else {
         // Leaving the idle loop — from an interrupt it was woken by, as
         // often as not, and so before the loop itself can say it is awake.
@@ -1050,10 +1078,20 @@ pub fn refresh_priority(tid: usize) {
             if place_of(cur) == best {
                 return; // unchanged, so nothing downstream changes either
             }
+            // A task waiting in a run queue is where its place put it: taken
+            // out first, and put back by its new one, on the same processor.
+            let queued = (st(cur).queued != NOT_QUEUED).then_some(st(cur).queued_on as usize);
+            if queued.is_some() {
+                unlink_ready(cur);
+            }
             if let Some(ref mut t) = *slot(cur) {
                 t.priority = best.0;
             }
             st(cur).rt = best.1;
+            if let Some(cpu) = queued {
+                runq::moved(cur, cpu, priority_of(cur));
+                runq::link(cur, cpu, priority_of(cur), false);
+            }
         }
         // Whatever `cur` is itself waiting on inherits this too.
         match waits_on(cur) {
@@ -1166,126 +1204,43 @@ pub fn priority_of(tid: usize) -> usize {
     }
 }
 
-/// The best band with a task waiting in it, if any.
+/// The best band with a task waiting in this processor's queues, if any.
 ///
 /// # Safety
 /// Interrupts must be off.
 unsafe fn best_ready_band() -> Option<usize> { unsafe {
-    (0..NUM_PRIORITIES).find(|&p| READY[p].0 != END)
+    runq::best_band(crate::percpu::index())
 }}
 
-/// Put `tid` in band `p`'s queue, last or first.
+/// Whether this processor has anything to run: of its own, or waiting on
+/// another for it to take (`runq::pull`).
 ///
 /// # Safety
-/// Interrupts off, and `tid` is in no queue.
-unsafe fn link_ready(tid: usize, p: usize, first: bool) { unsafe {
-    let (head, tail) = READY[p];
-    let t = tid as u16;
-    st(tid).queued = p as u8;
-    if head == END {
-        (st(tid).run_next, st(tid).run_prev) = (END, END);
-        READY[p] = (t, t);
-    } else if first {
-        (st(tid).run_next, st(tid).run_prev) = (head, END);
-        st(head as usize).run_prev = t;
-        READY[p].0 = t;
-    } else {
-        (st(tid).run_next, st(tid).run_prev) = (END, tail);
-        st(tail as usize).run_next = t;
-        READY[p].1 = t;
-    }
+/// Interrupts must be off.
+unsafe fn anything_to_run() -> bool { unsafe {
+    let me = crate::percpu::index();
+    runq::best_band(me).is_some() || (0..crate::percpu::count()).any(|cpu| cpu != me && runq::waiting(cpu) > 0)
 }}
 
-/// Take `tid` out of the queue it is in, if it is in one.
+/// Take `tid` out of the run queue it is in, if it is in one.
 ///
 /// # Safety
 /// Interrupts off.
 unsafe fn unlink_ready(tid: usize) { unsafe {
-    let p = st(tid).queued;
-    if p == NOT_QUEUED {
-        return;
-    }
-    let p = p as usize;
-    let (next, prev) = (st(tid).run_next, st(tid).run_prev);
-    if prev == END {
-        READY[p].0 = next;
-    } else {
-        st(prev as usize).run_next = next;
-    }
-    if next == END {
-        READY[p].1 = prev;
-    } else {
-        st(next as usize).run_prev = prev;
-    }
-    st(tid).queued = NOT_QUEUED;
-    (st(tid).run_next, st(tid).run_prev) = (END, END);
+    runq::unlink(tid);
 }}
 
-/// Dequeue the next ready task, best band first.
+/// What this processor runs next: the best of its own queues, best band
+/// first; or, with nothing of its own, the best of the busiest processor's.
 unsafe fn dequeue_ready() -> Option<usize> { unsafe {
+    let me = crate::percpu::index();
     let throttled = throttled();
     for p in 0..NUM_PRIORITIES {
-        // What in the band is still ready — dead and blocked tasks may still
-        // be in it, and are taken out — and which of it is to go: a
-        // real-time one, the best priority and of those the first queued;
-        // then one put at the front, the first of them; or the one that has
-        // run least, as the band sees it, passing over one that has just
-        // yielded when anything else is ready. Real-time tasks that have had
-        // their share of this processor's window go last.
-        let mut realtime: Option<(usize, u8)> = None;
-        let mut front: Option<usize> = None;
-        let mut least: Option<(usize, u64)> = None;
-        let mut least_yielded: Option<(usize, u64)> = None;
-        let mut t = READY[p].0;
-        while t != END {
-            let tid = t as usize;
-            t = st(tid).run_next;
-            if !matches!(*slot(tid), Some(ref task) if task.state == TaskState::Ready) {
-                unlink_ready(tid);
-                continue;
-            }
-            let rt = st(tid).rt;
-            if rt > 0 {
-                if realtime.is_none_or(|(_, r)| rt > r) {
-                    realtime = Some((tid, rt));
-                }
-                continue;
-            }
-            let ran = st(tid).vrun;
-            if st(tid).front {
-                front = front.or(Some(tid));
-            } else if st(tid).yielded {
-                if least_yielded.is_none_or(|(_, r)| ran < r) {
-                    least_yielded = Some((tid, ran));
-                }
-            } else if least.is_none_or(|(_, r)| ran < r) {
-                least = Some((tid, ran));
-            }
+        if let Some(tid) = runq::take(me, p, throttled) {
+            return Some(tid);
         }
-        let ordinary = front.or(least.map(|(i, _)| i)).or(least_yielded.map(|(i, _)| i));
-        let realtime = realtime.map(|(i, _)| i);
-        let chosen = if throttled { ordinary.or(realtime) } else { realtime.or(ordinary) };
-        let Some(tid) = chosen else {
-            continue;
-        };
-        unlink_ready(tid);
-        // A yield is one turn passed, by whoever is left.
-        let mut t = READY[p].0;
-        while t != END {
-            st(t as usize).yielded = false;
-            t = st(t as usize).run_next;
-        }
-        st(tid).front = false;
-        st(tid).yielded = false;
-        // Where the band has got to is its ordinary tasks' measure: a
-        // real-time one is chosen by priority, and what it has run is not
-        // counted in it.
-        if st(tid).rt == 0 {
-            FLOOR[p] = FLOOR[p].max(st(tid).vrun);
-        }
-        return Some(tid);
     }
-    None
+    runq::pull(me, throttled)
 }}
 
 /// Count the turn `tid` is having on this processor, to now: in what it has
@@ -1305,25 +1260,33 @@ unsafe fn count_turn(tid: usize) { unsafe {
         if st(tid).rt > 0 {
             charge_rt(ran);
         } else {
+            // What it has run is what a queue orders it by, and it can be
+            // in one while it runs: put back by the scheduler before the
+            // switch away counts the last of its turn, or made ready by an
+            // interrupt after it blocked and before it gave the processor
+            // up. Changed in a heap, it would be out of its order there;
+            // so out while it changes, and back where it was.
+            let queued = st(tid).queued;
+            let at = (st(tid).queued_on as usize, st(tid).heap_in == runq::IN_FRONT);
+            if queued != NOT_QUEUED {
+                unlink_ready(tid);
+            }
             st(tid).vrun = st(tid).vrun.saturating_add(crate::usage::weighted(ran, st(tid).nice));
+            if queued != NOT_QUEUED {
+                runq::link(tid, at.0, queued as usize, at.1);
+            }
+            // Where its band has got to here, now that it has run further.
+            runq::settle(crate::percpu::index(), priority_of(tid), tid);
         }
     }
 }}
 
-/// A task joining band `p` that may have been away from it: no further back
-/// than a little behind where the band has got to.
+/// Put a task made ready in a run queue: on the processor `runq::place_for`
+/// says, waking it if it is asleep. Not a held one: that is queued when its
+/// program is continued. And never the idle loop.
 ///
-/// # Safety
-/// Interrupts off.
-unsafe fn join_band(tid: usize, p: usize) { unsafe {
-    st(tid).vrun = st(tid).vrun.max(FLOOR[p].saturating_sub(SLEEPER_LEAD));
-}}
-
-/// Add a task TID to the back of the ready queue. Not a held one: that is
-/// queued when its program is continued. And never the idle loop.
-///
-/// One already queued in its band stays where it is; one queued in another
-/// band, which it has since left, goes to the back of this one.
+/// One already waiting in its band stays where it is; one waiting in
+/// another, which it has since left, goes to this one.
 unsafe fn enqueue(tid: usize) { unsafe {
     if tid == 0 || st(tid).held {
         return;
@@ -1333,25 +1296,47 @@ unsafe fn enqueue(tid: usize) { unsafe {
         return;
     }
     unlink_ready(tid);
-    join_band(tid, p);
-    link_ready(tid, p, false);
+    let cpu = runq::place_for(tid);
+    runq::moved(tid, cpu, p);
+    runq::join(tid, cpu, p);
+    runq::link(tid, cpu, p, false);
     note_ready(tid);
+    crate::smp::wake(cpu);
 }}
 
-/// Put a task at the *front* of the ready queue, so it runs next.
+/// Put the task this processor was running back in its queue here: its
+/// turn is over, or something better has come. As far as it has run: it
+/// has not been away. Passed through the floor a task that slept joins
+/// behind, a task at nought whose turn ended alongside one at nice 10 lost
+/// its lead each time the nicer ran — the floor is where the nicer had got
+/// to — and had three times its share where it is owed nine.
+unsafe fn requeue_here(tid: usize) { unsafe {
+    if tid == 0 || st(tid).held {
+        return;
+    }
+    let p = priority_of(tid);
+    unlink_ready(tid);
+    // In the band it ran in, unless its place changed meanwhile.
+    runq::moved(tid, crate::percpu::index(), p);
+    runq::link(tid, crate::percpu::index(), p, false);
+}}
+
+/// Put a task at the *front* of this processor's queue, so it runs next:
+/// the caller of whoever is replying here.
 unsafe fn enqueue_front(tid: usize) { unsafe {
     if tid == 0 || st(tid).held {
         return;
     }
     let p = priority_of(tid);
     unlink_ready(tid);
-    join_band(tid, p);
-    st(tid).front = true;
-    link_ready(tid, p, true);
+    let me = crate::percpu::index();
+    runq::moved(tid, me, p);
+    runq::join(tid, me, p);
+    runq::link(tid, me, p, true);
     note_ready(tid);
 }}
 
-/// Take a task out of every ready queue it is in.
+/// Take a task out of the run queue it is in.
 ///
 /// # Safety
 /// Interrupts must be off.
@@ -1451,7 +1436,7 @@ pub fn kicked() {
         return;
     }
     unsafe {
-        if crate::percpu::current() == 0 && best_ready_band().is_some() {
+        if crate::percpu::current() == 0 && anything_to_run() {
             schedule_inner(true);
         }
     }
@@ -1496,7 +1481,6 @@ pub fn release_task(tid: usize) {
             // simply goes on.
             if matches!(*slot(tid), Some(ref t) if t.state == TaskState::Ready) && st(tid).on_cpu == NO_CPU {
                 enqueue(tid);
-                crate::smp::wake_idle();
             }
         }
     }
@@ -1658,7 +1642,6 @@ pub fn unblock_task(tid: usize) {
             if task.state == TaskState::Blocked {
                 task.state = TaskState::Ready;
                 enqueue(tid);
-                crate::smp::wake_idle();
             }
         }
     }
@@ -2404,7 +2387,7 @@ pub fn idle() -> ! {
 /// Comes back when this processor next has nothing to do.
 fn run_ready() -> bool {
     unsafe {
-        if best_ready_band().is_none() {
+        if !anything_to_run() {
             return false;
         }
         schedule_inner(false);
@@ -2840,7 +2823,6 @@ pub fn create_empty_task() -> Option<usize> {
         // In its creator's process group and session: a job is whatever a
         // shell started, and what those started.
         st(tid).held = false;
-        st(tid).front = false;
         st(tid).yielded = false;
         // As nice as its creator, and in its class: a thread or a child runs
         // as the task that made it was told to, as on Linux.
@@ -2854,6 +2836,9 @@ pub fn create_empty_task() -> Option<usize> {
         st(tid).unannounced = false;
         st(tid).unwaited = false;
         st(tid).on_cpu = NO_CPU;
+        // Where its creator is, which has just written what it starts with.
+        st(tid).last_cpu = crate::percpu::index() as u16;
+        st(tid).measured_on = crate::percpu::index() as u16;
         crate::job::born(tid, parent, st(tid).process_id);
         crate::fdtable::attach_new(tid);
         // Limited as its creator's program is: a child forked or spawned

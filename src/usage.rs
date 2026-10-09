@@ -497,6 +497,12 @@ const WEIGHTS: [u64; 40] = [
     36, 29, 23, 18, 15, // 15
 ];
 
+/// What a task this nice weighs: the share of its band it is owed, against
+/// 1024 at nought. A processor's load is the weight of what it has to run.
+pub fn weight(nice: i8) -> u64 {
+    WEIGHTS[(nice.clamp(-20, 19) + 20) as usize]
+}
+
 /// `ns` of running, as it counts against a task of a program this nice:
 /// for longer the nicer it is.
 pub fn weighted(ns: u64, nice: i8) -> u64 {

@@ -344,6 +344,18 @@ pub unsafe fn woke() {
     unsafe { (*(&raw const (*this()).napping)).store(false, Ordering::Release) };
 }
 
+/// Whether processor `cpu` is waiting with nothing to do.
+pub fn napping(cpu: usize) -> bool {
+    unsafe { (*(&raw const CPUS[cpu].napping)).load(Ordering::Acquire) }
+}
+
+/// The task processor `cpu` is running, 0 for its idle loop. It does not
+/// change while the caller holds the kernel lock: a processor switches only
+/// in the kernel.
+pub fn current_of(cpu: usize) -> usize {
+    unsafe { core::ptr::read_volatile(&raw const CPUS[cpu].current) as usize }
+}
+
 /// If processor `cpu` is waiting with nothing to do, it is now the caller's
 /// to wake: true once, for one caller.
 pub fn wake_from_nap(cpu: usize) -> bool {
