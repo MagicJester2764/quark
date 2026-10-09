@@ -438,6 +438,12 @@ pub fn halt_here() -> ! {
     }
 }
 
+/// Whether the machine is being stopped (`halt_others`).
+#[inline]
+pub fn halting() -> bool {
+    HALTING.load(Ordering::Relaxed)
+}
+
 /// What a processor does each time round while it waits, with interrupts
 /// off, for another: the things that cannot wait for it.
 #[inline]

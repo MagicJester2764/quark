@@ -126,6 +126,15 @@ pub struct PerCpu {
     parked: AtomicBool,
     /// Asked to come back.
     back: AtomicBool,
+    /// The ranks of the locks it holds, a bit each, the one lock's bit 0
+    /// (`sync.rs`): what the next lock it takes is checked against.
+    held: u64,
+    /// For each rank it holds, where the lock is: what it is called when the
+    /// order is broken, and what a second of a kind must come after.
+    held_at: [usize; 64],
+    /// Interrupts were on when it took the first of the locks it holds, and
+    /// come back on when it gives back the last.
+    locks_irq: bool,
 }
 
 const USER_RSP: usize = offset_of!(PerCpu, user_rsp);
@@ -205,6 +214,55 @@ pub fn index() -> usize {
 /// Interrupts off for as long as the pointer is used.
 unsafe fn this() -> *mut PerCpu {
     unsafe { (&raw mut CPUS[index()]) as *mut PerCpu }
+}
+
+/// The ranks of the locks this processor holds, a bit each (`sync.rs`).
+/// Interrupts must be off.
+#[inline]
+pub fn locks_held() -> u64 {
+    unsafe { (*this()).held }
+}
+
+/// Where the lock this processor holds at `rank` is, or 0.
+/// Interrupts must be off.
+#[inline]
+pub fn lock_held(rank: u8) -> usize {
+    unsafe {
+        let me = this();
+        if (*me).held >> rank & 1 == 1 { (*me).held_at[rank as usize] } else { 0 }
+    }
+}
+
+/// This processor has taken the lock at `at`, at `rank`.
+/// Interrupts must be off.
+#[inline]
+pub fn lock_taken(rank: u8, at: usize) {
+    unsafe {
+        let me = this();
+        (*me).held |= 1 << rank;
+        (*me).held_at[rank as usize] = at;
+    }
+}
+
+/// This processor has given back the lock it held at `rank`.
+/// Interrupts must be off.
+#[inline]
+pub fn lock_given(rank: u8) {
+    unsafe { (*this()).held &= !(1 << rank) };
+}
+
+/// Whether interrupts were on when this processor took the first of the
+/// locks it holds. Interrupts must be off.
+#[inline]
+pub fn locks_irq() -> bool {
+    unsafe { (*this()).locks_irq }
+}
+
+/// Say whether interrupts were on before the first lock. Interrupts must be
+/// off.
+#[inline]
+pub fn set_locks_irq(on: bool) {
+    unsafe { (*this()).locks_irq = on };
 }
 
 /// Where the running task's kernel stack ends: the stack a system call

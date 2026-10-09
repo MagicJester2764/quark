@@ -27,7 +27,7 @@ struct Display {
     pages: usize,
 }
 
-static DISPLAYS: IrqSpinLock<[Option<Display>; MAX_DISPLAYS]> = IrqSpinLock::new([None; MAX_DISPLAYS]);
+static DISPLAYS: IrqSpinLock<[Option<Display>; MAX_DISPLAYS]> = IrqSpinLock::new(crate::sync::RANK_DISPLAY, "the displays", [None; MAX_DISPLAYS]);
 
 /// Device `bdf`'s screen, at least `pages` long: where it begins. Made the
 /// first time — one contiguous run, from the top of memory — and the same

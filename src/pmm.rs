@@ -228,7 +228,7 @@ impl PmmInner {
     }
 }
 
-static PMM: IrqSpinLock<PmmInner> = IrqSpinLock::new(PmmInner {
+static PMM: IrqSpinLock<PmmInner> = IrqSpinLock::new(crate::sync::RANK_FRAMES, "the frames", PmmInner {
     bitmap: core::ptr::null_mut(),
     frames: 0,
     shares: core::ptr::null_mut(),
@@ -545,7 +545,7 @@ impl FrameOwners {
     }
 }
 
-static FRAME_OWNER: IrqSpinLock<FrameOwners> = IrqSpinLock::new(FrameOwners {
+static FRAME_OWNER: IrqSpinLock<FrameOwners> = IrqSpinLock::new(crate::sync::RANK_FRAME_OWNER, "who owns which frame", FrameOwners {
     table: core::ptr::null_mut(),
     frames: 0,
 });

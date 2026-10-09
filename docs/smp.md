@@ -11,8 +11,9 @@ change.
 Everything this kernel knows about being safe it knows in one form: with
 interrupts off, nothing else runs. Twenty thousand lines lean on it — every
 `irq_save` in the scheduler, every table that is searched and then filled,
-`IrqSpinLock` panicking when it finds a lock taken because on one processor
-that can only be the same code coming round again.
+and, until the locks under it were made to wait, `IrqSpinLock` panicking
+when it found a lock taken, because on one processor that could only be
+the same code coming round again.
 
 On more than one processor that stays true of the *kernel* if only one of
 them is ever in it, and `klock.rs` is the lock that makes it so. Programs
@@ -49,6 +50,56 @@ processor that had the lock last, and finds somebody waiting, stands aside
 for a moment before asking again — without that, a program making one call
 after another gets it back every time, and the clock, which is an interrupt
 on one processor, never gets in.
+
+## The order locks are taken in
+
+Below the one lock are locks of their own (`sync.rs`): each keeps
+interrupts off while it is held, waits for whoever has it — reading until
+it looks free, then trying, a little longer between reads each time, and
+answering what other processors ask meanwhile — and has a rank. A
+processor takes a lock only above every rank it holds, and anything else
+stops the machine on the spot, naming both: a lock order kept by checking
+every use finds a deadlock the first time the code that could make one
+runs, rather than the first time two processors are unlucky together.
+
+Two of one kind — two tasks' records for a call, two run queues for a move,
+two buckets for a requeue — are taken in the order of where they are in
+memory, which every processor agrees on; the second is held at the rank
+after its kind's, which is its alone.
+
+| Rank | Lock | Keeps |
+|---|---|---|
+| 0 | the kernel (`klock.rs`) | what has not come out from under it; taken first or not at all |
+| 4 | a program's descriptor table | its descriptors, their flags, its signals' state |
+| 6 | a poll set | what it watches; it asks each whether it is ready |
+| 8, 9 | an object a program makes | a pipe, a counter, a timer, a signal descriptor, a terminal, a stream, a local socket, a served descriptor |
+| 12, 13 | the futex's waiters (`futex.rs`) | a bucket of waiters; a requeue takes two |
+| 16, 17 | a task's record | its calls, its wait, what others change of how it is scheduled; a call takes the caller's and the callee's |
+| 20, 21 | a capability space | its slots; a transfer takes two |
+| 24, 25 | an address space | its tables and reservations; a fork or a move takes two |
+| 28, 29 | a processor's run queues | what waits to run there; a move takes two |
+| 32 | the clock | what is due, and when the timer is set to look |
+| 36 | interrupts (`irq_dispatch.rs`) | who is told of which |
+| 40 | the displays (`display.rs`) | memory given to display drivers, which takes frames |
+| 44 | the heap (`heap.rs`) | the kernel's own allocations, which take frames when it grows |
+| 48 | who owns which frame (`pmm.rs`) | the owners; never held with the frames' lock |
+| 52 | the frames (`pmm.rs`) | which are free |
+| 60 | the console's screen | what the kernel prints, from anywhere: innermost |
+
+The one lock's place is the reason for the rest: whatever comes out from
+under it does so by taking the locks of what it touches, in this order,
+and the one lock is never taken by a processor that holds any of them.
+The table is what the paths that come out first take: a call takes the two
+tasks' records, then a run queue; a fault takes the address space, then
+the frames; a futex wake takes a bucket, then the woken task's record, then
+a run queue; a pipe's read takes the pipe, then a waiter's record. Of
+these, only the futex's, the interrupts', the displays', the heap's, the
+frames' and their owners' and the console's are locks yet; the others
+have their ranks here before they have their locks.
+
+A processor that has waited thirty seconds for a lock says which, and
+which processor has it, and the machine stops; each processor that was
+waiting for a lock when it was stopped says which, with what it held.
 
 ## What each processor has
 

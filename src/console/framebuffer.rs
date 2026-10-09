@@ -103,7 +103,7 @@ impl FbState {
     }
 }
 
-static FB_STATE: IrqSpinLock<FbState> = IrqSpinLock::new(FbState {
+static FB_STATE: IrqSpinLock<FbState> = IrqSpinLock::new(crate::sync::RANK_CONSOLE, "the console's screen", FbState {
     fb: 0,
     pitch: 0,
     width: 0,

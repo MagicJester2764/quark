@@ -59,7 +59,7 @@ struct IrqDispatchState {
     rings: [IrqRing; MAX_IRQS],
 }
 
-static IRQ_STATE: IrqSpinLock<IrqDispatchState> = IrqSpinLock::new(IrqDispatchState {
+static IRQ_STATE: IrqSpinLock<IrqDispatchState> = IrqSpinLock::new(crate::sync::RANK_IRQ, "who is told of which interrupt", IrqDispatchState {
     handlers: [0; MAX_IRQS],
     has_handler: [false; MAX_IRQS],
     rings: {

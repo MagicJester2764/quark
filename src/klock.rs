@@ -65,12 +65,14 @@
 //! waiter panics. By the fine clock only: the tick is counted by the first
 //! processor, which may be the one waiting.
 //!
-//! **`IrqSpinLock` still means what it says.** The locks inside the kernel
-//! (`sync.rs`) panic if they are found taken, on the reasoning that with
-//! interrupts off nobody else could have taken them. Under this lock that
-//! is still so: only one processor is in the kernel.
+//! **It is rank 0 of the kernel's locks** (`sync.rs`): the outermost, taken
+//! first or not at all. A processor holding any other lock that came to
+//! take this one would be holding what another processor, in here, may be
+//! waiting for — and the order check stops it saying so. The locks inside
+//! the kernel wait now, as this one does; while nearly everything is still
+//! under this one, they are seldom found taken.
 
-use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU32, Ordering};
 
 /// The processor in the kernel: its index and one, or 0 for none.
 static OWNER: AtomicU32 = AtomicU32::new(0);
@@ -84,23 +86,14 @@ static LAST: AtomicU32 = AtomicU32::new(0);
 /// a processor that is not running at all just now.
 const STAND_ASIDE: u32 = 4096;
 
-/// How long a processor waits for the kernel before it calls it stuck, and
-/// how much longer it then gives it: a machine that was itself stopped for
-/// a while — it is usually a virtual one — comes back with the wait
-/// looking long and the holder a moment from done.
-const STUCK_NS: u64 = 30_000_000_000;
-const GRACE_NS: u64 = 1_000_000_000;
-/// How many turns of the wait between looks at the clock.
+/// How many turns of the wait between looks at the clock, which says when
+/// the wait has been too long (`sync::waited_long`: thirty seconds).
 const LOOK: u32 = 1 << 20;
 
-/// A processor has waited that long: whoever has the kernel says where it
-/// is when it is stopped.
-static STUCK: AtomicBool = AtomicBool::new(false);
-
-/// Whether this processor is the one that has had the kernel too long.
-/// Interrupts must be off.
+/// Whether this processor has the kernel while the machine is stopped for a
+/// lock held too long: it says where it was. Interrupts must be off.
 pub fn stuck() -> bool {
-    STUCK.load(Ordering::Relaxed) && held()
+    crate::sync::stuck() && held()
 }
 
 /// What this processor is called here.
@@ -121,6 +114,9 @@ pub fn held() -> bool {
 /// Take the lock, waiting for it. Interrupts must be off, and stay off.
 pub fn acquire() {
     let me = me();
+    // First, or not at all: with another lock held this is a wait that the
+    // holder of the kernel may be waiting for in turn.
+    crate::sync::kernel_taking();
     // Let whoever is waiting go first, if this processor went last.
     if LAST.load(Ordering::Relaxed) == me {
         let mut turns = 0;
@@ -144,53 +140,40 @@ pub fn acquire() {
             Err(_) => {}
         }
         while OWNER.load(Ordering::Relaxed) != 0 {
+            if crate::smp::halting() && crate::sync::stuck() {
+                // Stopped for a lock held too long while it waited here.
+                crate::serial::puts(b"[KSTUCK processor ");
+                crate::serial::put_usize(me.saturating_sub(1) as usize);
+                crate::serial::puts(b" was waiting for the kernel, which processor ");
+                crate::serial::put_usize(OWNER.load(Ordering::Relaxed).saturating_sub(1) as usize);
+                crate::serial::puts(b" has]\n");
+                crate::smp::halt_here();
+            }
             crate::smp::while_waiting();
             core::hint::spin_loop();
             turns = turns.wrapping_add(1);
-            if turns % LOOK == 0 {
-                waited(&mut since, &mut late);
+            if turns % LOOK == 0 && crate::sync::waited_long(&mut since, &mut late) {
+                waited();
             }
         }
     }
     WAITERS.fetch_sub(1, Ordering::Relaxed);
+    crate::sync::kernel_taken();
 }
 
-/// This processor has been waiting a while: for how long, and whether that
-/// is too long.
+/// This processor has waited thirty seconds for the kernel: it says which
+/// processor has it, that one is stopped with the rest and says where it
+/// is (`[KSTUCK ...]`, read as a kernel fault is) if its interrupts are on,
+/// and the machine stops.
 #[cold]
-fn waited(since: &mut u64, late: &mut bool) {
-    if !crate::clock::fine() {
-        return;
-    }
-    let now = crate::clock::now();
-    if *since == 0 {
-        *since = now;
-        return;
-    }
-    if now.saturating_sub(*since) < STUCK_NS {
-        return;
-    }
-    if !*late {
-        // Once more, a little later, before believing it.
-        *late = true;
-        *since = now.saturating_sub(STUCK_NS - GRACE_NS);
-        return;
-    }
+fn waited() -> ! {
     let owner = OWNER.load(Ordering::Relaxed);
     crate::serial::puts(b"\n[KSTUCK the kernel has been processor ");
     crate::serial::put_usize(owner.saturating_sub(1) as usize);
     crate::serial::puts(b"'s for thirty seconds; processor ");
     crate::serial::put_usize(me().saturating_sub(1) as usize);
     crate::serial::puts(b" is waiting for it]\n");
-    // The holder is stopped with the rest, and says where it was — if it
-    // can be interrupted at all. Half a second for it to say so.
-    STUCK.store(true, Ordering::SeqCst);
-    crate::smp::halt_others();
-    let until = crate::clock::now() + 500_000_000;
-    while crate::clock::now() < until {
-        core::hint::spin_loop();
-    }
-    panic!("the kernel was one processor's for thirty seconds");
+    crate::sync::stop_stuck("the kernel was one processor's for thirty seconds")
 }
 
 /// Give the lock up. Interrupts must be off.
@@ -204,6 +187,7 @@ pub fn release() {
         panic!("kernel lock: given up by a processor that does not have it");
     }
     crate::tlb::sync();
+    crate::sync::kernel_given();
     LAST.store(me, Ordering::Relaxed);
     OWNER.store(0, Ordering::Release);
 }

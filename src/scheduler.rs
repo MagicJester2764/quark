@@ -919,6 +919,13 @@ unsafe fn schedule_inner(from_irq: bool) { unsafe {
 /// # Safety
 /// Interrupts must be disabled and both tasks must exist.
 unsafe fn switch_to(current_tid: usize, next_tid: usize, flags: u64) { unsafe {
+    // No lock but the one lock is carried across a switch: it would be held
+    // by a processor its task had left, and said to be held by whatever ran
+    // there next (`sync::holding_any`).
+    if crate::sync::holding_any() {
+        crate::serial::puts(b"\n[KLOCK a lock held across a switch]\n");
+        panic!("a lock held across a switch");
+    }
     if next_tid == current_tid {
         // Same task, just mark running again
         if let Some(ref mut task) = *slot(current_tid) {

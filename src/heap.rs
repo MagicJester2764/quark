@@ -77,7 +77,7 @@ pub struct LockedHeap {
 impl LockedHeap {
     const fn new() -> Self {
         LockedHeap {
-            inner: IrqSpinLock::new(HeapInner {
+            inner: IrqSpinLock::new(crate::sync::RANK_HEAP, "the heap", HeapInner {
                 free_list_head: ptr::null_mut(),
                 heap_end: 0,
                 total_size: 0,

@@ -10,6 +10,9 @@ font8x8 = { version = "0.3", default-features = false }
 # A kernel for testing its stacks: SYS_MEM_INFO 6 calls itself until its
 # kernel stack has run out, which ends the machine with a fault that says so.
 stacktest = []
+# A kernel that tests the order of its locks at boot, and says so on the
+# serial line: "[lockcheck] order kept".
+lockcheck = []
 
 [profile.dev]
 panic = "abort"

@@ -121,6 +121,8 @@ pub extern "C" fn kernel_main(multiboot_info: usize) -> ! {
     console::clear();
     unsafe { heap::init() };
     console::puts(b"Heap initialized.\n");
+    #[cfg(feature = "lockcheck")]
+    lock_order_test();
     // The cache of files' pages, as big as the machine.
     memobj::init();
     // What the machine is made of, as its firmware tells it: how many
@@ -285,6 +287,46 @@ fn print_dec(val: usize) {
     console::puts(&out[..i]);
 }
 
+/// `lockcheck`: the order the kernel's locks are taken in, at boot. Two
+/// locks taken in order are taken; then one of a rank not above them would
+/// be refused and one above them would not; a second of a kind is taken
+/// after the first, where it is after it; and once all are given back,
+/// nothing but the one lock is said to be held.
+#[cfg(feature = "lockcheck")]
+fn lock_order_test() {
+    use crate::sync::{IrqSpinLock, RANK_DISPLAY, RANK_HEAP, RANK_TASK, would_refuse};
+    static OUTER: IrqSpinLock<u32> = IrqSpinLock::new(RANK_DISPLAY, "lockcheck outer", 0);
+    static INNER: IrqSpinLock<u32> = IrqSpinLock::new(RANK_HEAP, "lockcheck inner", 0);
+    static PAIR: [IrqSpinLock<u32>; 2] = [const { IrqSpinLock::new(RANK_TASK, "lockcheck pair", 0) }; 2];
+    let in_order = {
+        let outer = OUTER.lock();
+        let inner = INNER.lock();
+        let held = would_refuse(RANK_DISPLAY) && would_refuse(RANK_HEAP) && !would_refuse(RANK_HEAP + 1);
+        drop(inner);
+        drop(outer);
+        held
+    };
+    let pair = {
+        let first = PAIR[0].lock();
+        let second = PAIR[1].lock_second();
+        let held = would_refuse(RANK_TASK + 1) && !would_refuse(RANK_TASK + 2);
+        drop(second);
+        drop(first);
+        held
+    };
+    let let_go = !would_refuse(RANK_KERNEL_NEXT) && would_refuse(crate::sync::RANK_KERNEL);
+    serial::puts(if in_order && pair && let_go {
+        b"[lockcheck] order kept\n"
+    } else {
+        b"[lockcheck] ORDER NOT KEPT\n"
+    });
+}
+
+/// The rank just after the one lock's: refused only while another lock is
+/// held.
+#[cfg(feature = "lockcheck")]
+const RANK_KERNEL_NEXT: u8 = crate::sync::RANK_KERNEL + 1;
+
 #[panic_handler]
 fn panic(_info: &PanicInfo) -> ! {
     // Stop the machine. The old handler spun with interrupts still enabled, so
@@ -292,6 +334,14 @@ fn panic(_info: &PanicInfo) -> ! {
     // panic — running the rest of the system on top of whatever inconsistent
     // kernel state caused it.
     unsafe { core::arch::asm!("cli", options(nostack, nomem)) };
+    // A panic in the middle of this one says nothing more: what it would say
+    // is in the way of what the first is saying.
+    static PANICKED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+    if PANICKED.swap(true, core::sync::atomic::Ordering::SeqCst) {
+        loop {
+            unsafe { core::arch::asm!("cli; hlt", options(nostack, nomem)) };
+        }
+    }
     // And the other processors with it, before they can do more with
     // whatever state this one found itself unable to go on with.
     smp::halt_others();
@@ -308,7 +358,10 @@ fn panic(_info: &PanicInfo) -> ! {
         serial::puts(said.as_bytes());
     }
     serial::puts(b"\n");
-    console::puts(b"\nKERNEL PANIC!");
+    // The screen too, unless its lock is held, or one that comes after it.
+    if !sync::would_refuse(sync::RANK_CONSOLE) {
+        console::puts(b"\nKERNEL PANIC!");
+    }
     loop {
         unsafe { core::arch::asm!("hlt", options(nostack, nomem)) };
     }

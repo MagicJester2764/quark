@@ -155,7 +155,7 @@ struct FutexState {
 /// The lists, and through them every waiter's record: whoever changes
 /// either holds this.
 static FUTEX: IrqSpinLock<FutexState> =
-    IrqSpinLock::new(FutexState { buckets: [Bucket { first: END, last: END }; BUCKETS] });
+    IrqSpinLock::new(crate::sync::RANK_FUTEX, "the futex's waiters", FutexState { buckets: [Bucket { first: END, last: END }; BUCKETS] });
 
 /// Task `t`'s record, unless it is the end of a list or no task.
 ///

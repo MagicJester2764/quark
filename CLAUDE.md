@@ -1536,6 +1536,24 @@ breaking any of them is quiet until it is a machine that stops.
   (`klock::enter`, `leave`) and gives back exactly that. A new way into the
   kernel takes it; a new way out — a new trampoline to ring 3 — gives it
   up. Either mistake panics rather than hangs: the lock knows who has it.
+- **The kernel's locks are taken in the order of their ranks**
+  (`sync.rs`; the table is in `docs/smp.md`). Each lock has a rank, the
+  one lock's 0, and a processor takes a lock only above every rank it
+  holds; two of one kind — two tasks' records, two run queues — are taken
+  in the order of where they are, the second at the rank after its kind's
+  (`IrqSpinLock::lock_second`). Anything else stops the machine at once,
+  naming both (`[KLOCK order: <held> held, <taken> taken]`), whether or not
+  another processor was about to take the other: a lock order is a
+  deadlock found by its first use, not its first unlucky one. Always
+  checked, in every build — `lockcheck` adds a test of the check at boot.
+  A new lock gets a rank from the table, and a new place one is taken
+  under another keeps to it. And none is held across a switch
+  (`switch_to` stops the machine if it is): interrupts are off while one
+  is held, and they come back on only with the last one given back, if
+  they were on before the first. A processor that has waited thirty
+  seconds for any lock says which and whose, and the machine stops; every
+  processor then waiting for a lock says which, so that a deadlock says
+  where it is.
 - **A wait in the kernel parks, or it can end by itself.** A loop that
   tries, finds it cannot, asks whether to wait, is told there is no need
   and tries again is waiting for somebody else — and with the kernel one
@@ -1778,9 +1796,9 @@ breaking any of them is quiet until it is a machine that stops.
   timeout. A one-shot `SYS_POLL` makes a set of its own and is not affected.
 - **The kernel is one processor's at a time.** Programs run on every
   processor; a system call, a fault or an interrupt waits for the kernel to
-  be empty. So `IrqSpinLock` still panics on contention, and rightly: under
-  the kernel lock, contention can still only mean re-entrancy. Taking the
-  lock apart is its own project.
+  be empty. The locks under the one lock wait now and are taken in order
+  (`sync.rs`), but almost nothing is kept under them alone yet: what comes
+  out from under the one lock does so a path at a time, each measured.
 - Every deadline on the machine is the first processor's to fire and to be
   told of: a program on another processor that sets one sooner than the
   first's timer is set for interrupts it to say so, and each wakes it when
