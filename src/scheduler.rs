@@ -220,6 +220,11 @@ pub struct PerTask {
     measured_in: u8,
     /// When it last left a processor, by the clock.
     ran_at: u64,
+    /// The processors it may run on, a bit each of 256: all of them unless
+    /// it, or its program, or whoever manages it said otherwise
+    /// (`SYS_AFFINITY`). Given to the threads and children it makes, and
+    /// kept by `exec`.
+    allowed: [u64; 4],
 }
 
 impl PerTask {
@@ -262,6 +267,7 @@ impl PerTask {
             measured_on: 0,
             measured_in: PRIO_NORMAL,
             ran_at: 0,
+            allowed: [u64::MAX; 4],
         }
     }
 }
@@ -1165,7 +1171,7 @@ pub fn donate_to(tid: usize, flags: u64) {
         // ordinary task ahead of a real-time one. When something better is
         // waiting, go through the queue instead — the callee is ready and
         // will be picked in its turn.
-        if takeable && outranked(tid) {
+        if takeable && (outranked(tid) || !may_run_on(tid, crate::percpu::index())) {
             enqueue(tid);
             takeable = false;
         }
@@ -1314,6 +1320,12 @@ unsafe fn requeue_here(tid: usize) { unsafe {
     if tid == 0 || st(tid).held {
         return;
     }
+    // Not here, if it may not run here: where it may.
+    if !may_run_on(tid, crate::percpu::index()) {
+        unlink_ready(tid);
+        enqueue(tid);
+        return;
+    }
     let p = priority_of(tid);
     unlink_ready(tid);
     // In the band it ran in, unless its place changed meanwhile.
@@ -1325,6 +1337,10 @@ unsafe fn requeue_here(tid: usize) { unsafe {
 /// the caller of whoever is replying here.
 unsafe fn enqueue_front(tid: usize) { unsafe {
     if tid == 0 || st(tid).held {
+        return;
+    }
+    if !may_run_on(tid, crate::percpu::index()) {
+        enqueue(tid);
         return;
     }
     let p = priority_of(tid);
@@ -1421,9 +1437,14 @@ pub fn arrived() {
             core::hint::spin_loop();
         }
     }
+    let barred = unsafe { !may_run_on(me, crate::percpu::index()) };
     irq_restore(flags);
     if held {
         stop_here();
+    }
+    // Told it may not run here while it ran: off, to one it may.
+    if barred {
+        yield_now();
     }
 }
 
@@ -2293,6 +2314,52 @@ pub fn task_is_live(tid: usize) -> bool {
     }
 }
 
+/// Whether task `tid` may run on processor `cpu`.
+///
+/// # Safety
+/// Interrupts off.
+unsafe fn may_run_on(tid: usize, cpu: usize) -> bool { unsafe {
+    cpu < 256 && st(tid).allowed[cpu / 64] >> (cpu % 64) & 1 == 1
+}}
+
+/// The processors task `tid` may run on, a bit each.
+pub fn affinity_of(tid: usize) -> [u64; 4] {
+    let flags = irq_save();
+    let set = unsafe { st(tid).allowed };
+    irq_restore(flags);
+    set
+}
+
+/// Let task `tid` run only on the processors `set` has, of which one is
+/// online. Waiting on one it may not run on, it is put to wait on one it
+/// may; running on one, it moves off when that processor next looks
+/// (`arrived`) — at once, if that is this one.
+pub fn set_affinity(tid: usize, set: [u64; 4]) {
+    let flags = irq_save();
+    let here = unsafe {
+        st(tid).allowed = set;
+        if st(tid).queued != NOT_QUEUED && !may_run_on(tid, st(tid).queued_on as usize) {
+            unlink_ready(tid);
+            enqueue(tid);
+        }
+        let on = st(tid).on_cpu;
+        if on != NO_CPU && !may_run_on(tid, on as usize) {
+            if on as usize == crate::percpu::index() {
+                true
+            } else {
+                crate::smp::interrupt(on as usize);
+                false
+            }
+        } else {
+            false
+        }
+    };
+    irq_restore(flags);
+    if here {
+        yield_now();
+    }
+}
+
 /// The processor task `tid` last ran on, or runs on; `None` if there is no
 /// such task.
 pub fn last_cpu(tid: usize) -> Option<usize> {
@@ -2390,8 +2457,12 @@ fn run_ready() -> bool {
         if !anything_to_run() {
             return false;
         }
+        // Whether anything ran: what waits elsewhere may be nothing this
+        // processor may run, and an idle loop that went round again for it
+        // would go round for ever, with the kernel's lock.
+        let switches = crate::usage::switches_here();
         schedule_inner(false);
-        true
+        crate::usage::switches_here() != switches
     }
 }
 
@@ -2827,6 +2898,7 @@ pub fn create_empty_task() -> Option<usize> {
         // As nice as its creator, and in its class: a thread or a child runs
         // as the task that made it was told to, as on Linux.
         st(tid).nice = st(parent).nice;
+        st(tid).allowed = st(parent).allowed;
         st(tid).policy = st(parent).policy;
         st(tid).rt_base = st(parent).rt_base;
         st(tid).rt = st(parent).rt_base;

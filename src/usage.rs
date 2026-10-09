@@ -186,6 +186,14 @@ pub unsafe fn now_doing(doing: u8) -> u8 {
     }
 }
 
+/// How many times this processor has gone from one task to another.
+///
+/// # Safety
+/// Interrupts off.
+pub unsafe fn switches_here() -> u64 {
+    unsafe { SPENT[crate::percpu::index()].switches }
+}
+
 /// This processor has taken an interrupt: any, the ones that take nothing
 /// from the kernel included.
 ///
@@ -625,6 +633,61 @@ pub fn sched(caller: usize, op: u64, tid: u64, a: u64, b: u64) -> u64 {
         SCHED_CLASS => {
             let (policy, priority) = crate::scheduler::sched_of(target);
             (policy as u64) << 8 | priority as u64
+        }
+        _ => u64::MAX,
+    }
+}
+
+/// `SYS_AFFINITY`: which processors task `tid` (0 for the caller) may run
+/// on, a set of 256 bits at `buf` (32 bytes): op 0 writes there those of
+/// them that are online, op 1 makes it what is there. A task of the caller's own program, or one it
+/// may say this of as `SYS_NICE` decides. A set with no processor that is
+/// online is refused; one that leaves out where the task is moves it.
+pub fn affinity(caller: usize, op: u64, tid: u64, buf: u64) -> u64 {
+    let target = if tid == 0 { caller } else { tid as usize };
+    if !crate::scheduler::task_is_live(target) {
+        return u64::MAX;
+    }
+    match op {
+        0 => {
+            if !crate::syscall::validate_user_ptr_mut(buf, 32) {
+                return u64::MAX;
+            }
+            // As Linux answers it: of the processors it may run on, those that
+            // are online. As kept, a task told nothing may run on all 256 —
+            // and a C library that counts the bits to say how many processors
+            // there are said 256.
+            let mut set = crate::scheduler::affinity_of(target);
+            let count = crate::percpu::count().min(256);
+            for (i, word) in set.iter_mut().enumerate() {
+                let online = match count.saturating_sub(i * 64) {
+                    0 => 0,
+                    n if n >= 64 => u64::MAX,
+                    n => (1u64 << n) - 1,
+                };
+                *word &= online;
+            }
+            let _ua = crate::cpu::UserAccess::begin();
+            unsafe { core::ptr::write_unaligned(buf as *mut [u64; 4], set) };
+            0
+        }
+        1 => {
+            if !crate::syscall::validate_user_ptr(buf, 32) {
+                return u64::MAX;
+            }
+            let ours = crate::scheduler::space_of_task(target) == crate::scheduler::space_of_task(caller);
+            if !ours && !may(caller, target) {
+                return NOT_ALLOWED;
+            }
+            let set = {
+                let _ua = crate::cpu::UserAccess::begin();
+                unsafe { core::ptr::read_unaligned(buf as *const [u64; 4]) }
+            };
+            if !(0..crate::percpu::count().min(256)).any(|cpu| set[cpu / 64] >> (cpu % 64) & 1 == 1) {
+                return u64::MAX;
+            }
+            crate::scheduler::set_affinity(target, set);
+            0
         }
         _ => u64::MAX,
     }

@@ -1574,6 +1574,17 @@ breaking any of them is quiet until it is a machine that stops.
   the one list at the end of its turn for whichever processor looked
   next. A new question about what is waiting is answered by the queues'
   own structure, not by looking through them.
+- **A task runs only where its affinity lets it** (`SYS_AFFINITY`,
+  `PerTask::allowed`, `may_run_on`): placement, a pull, balancing, a
+  reply put at the front, a call's hand-over and a task put back after its
+  turn each keep to it, and a task found running where it may no longer is
+  moved at its processor's next door (`arrived`). It is given to threads
+  and children and kept by `exec`. Read, it is the online processors of
+  it, as Linux answers: a C library counts its bits for how many
+  processors there are, and as kept — all 256, for a task told nothing —
+  musl's `sysconf` said 256. An idle processor goes round its loop again
+  only if something ran (`run_ready`): what waits elsewhere may be
+  nothing it may run, and the loop holds the kernel's lock.
 - **The clock and every device interrupt the first processor.** The others
   have a tick of their own from their local APIC, and it does one thing:
   `scheduler::timer_tick`. What is due — timeouts, timers, alarms — is seen

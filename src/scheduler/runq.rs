@@ -320,52 +320,23 @@ pub(super) unsafe fn unlink(tid: usize) {
     }
 }
 
-/// The best real-time task ready in processor `cpu`'s queue of band `p`,
-/// taken out of it.
-unsafe fn take_rt(cpu: usize, p: usize) -> Option<usize> {
+/// The best real-time task ready in processor `cpu`'s queue of band `p`
+/// that may run on processor `for_cpu`, taken out of it. Those that may
+/// not — eight at most are looked past — stay where they were.
+unsafe fn take_rt(cpu: usize, p: usize, for_cpu: usize) -> Option<usize> {
     unsafe {
         let q = queue(cpu, p);
-        while q.rt != END {
-            let t = q.rt as usize;
-            q.rt = h_pop(q.rt, rt_first);
-            out(q, t);
-            if ready(t) {
-                return Some(t);
-            }
-        }
-        None
-    }
-}
-
-/// The ordinary task to go next of processor `cpu`'s queue of band `p`,
-/// taken out of it: the first put at the front, or else whoever has run
-/// least — passing over one that yielded this turn, and with `cold` one
-/// that ran within [`WARM_NS`], while another is ready. Four at most are
-/// passed over; with nothing else ready, the first of them goes after all.
-unsafe fn take_ordinary(cpu: usize, p: usize, cold: bool) -> Option<usize> {
-    unsafe {
-        let q = queue(cpu, p);
-        while q.front.0 != END {
-            let t = q.front.0 as usize;
-            unlink(t);
-            if ready(t) {
-                return Some(t);
-            }
-        }
-        let now = if cold { crate::clock::now() } else { 0 };
-        let mut aside = [END; 4];
+        let mut aside = [END; 8];
         let mut set = 0;
         let mut found = None;
-        while q.fair != END {
-            let t = q.fair as usize;
-            q.fair = h_pop(q.fair, fair_first);
+        while q.rt != END && set < aside.len() {
+            let t = q.rt as usize;
+            q.rt = h_pop(q.rt, rt_first);
             if !ready(t) {
                 out(q, t);
                 continue;
             }
-            let yielded = st(t).yielded && st(t).yield_turn == q.turns;
-            let warm = cold && now.saturating_sub(st(t).ran_at) < WARM_NS;
-            if (yielded || warm) && set < aside.len() {
+            if !super::may_run_on(t, for_cpu) {
                 aside[set] = t as u16;
                 set += 1;
                 continue;
@@ -374,13 +345,75 @@ unsafe fn take_ordinary(cpu: usize, p: usize, cold: bool) -> Option<usize> {
             found = Some(t);
             break;
         }
-        for (i, &t) in aside[..set].iter().enumerate() {
+        for &t in &aside[..set] {
+            q.rt = h_push(q.rt, t, rt_first);
+        }
+        found
+    }
+}
+
+/// The ordinary task to go next of processor `cpu`'s queue of band `p` that
+/// may run on processor `for_cpu`, taken out of it: the first put at the
+/// front, or else whoever has run least — passing over one that yielded
+/// this turn, and with `cold` one that ran within [`WARM_NS`], while another
+/// is ready; with nothing else ready, the first of those goes after all. A
+/// task that may not run on `for_cpu` never goes, and stays where it was;
+/// eight at most of all these are looked past.
+unsafe fn take_ordinary(cpu: usize, p: usize, cold: bool, for_cpu: usize) -> Option<usize> {
+    unsafe {
+        let q = queue(cpu, p);
+        let mut t = q.front.0;
+        while t != END {
+            let next = st(t as usize).run_next;
+            if !ready(t as usize) {
+                unlink(t as usize);
+            } else if super::may_run_on(t as usize, for_cpu) {
+                unlink(t as usize);
+                return Some(t as usize);
+            }
+            t = next;
+        }
+        let now = if cold { crate::clock::now() } else { 0 };
+        // Passed over, which may still go; and kept off this processor,
+        // which may not. Both go back.
+        let mut passed = [END; 4];
+        let mut npassed = 0;
+        let mut barred = [END; 8];
+        let mut nbarred = 0;
+        let mut found = None;
+        while q.fair != END && npassed < passed.len() && nbarred < barred.len() {
+            let t = q.fair as usize;
+            q.fair = h_pop(q.fair, fair_first);
+            if !ready(t) {
+                out(q, t);
+                continue;
+            }
+            if !super::may_run_on(t, for_cpu) {
+                barred[nbarred] = t as u16;
+                nbarred += 1;
+                continue;
+            }
+            let yielded = st(t).yielded && st(t).yield_turn == q.turns;
+            let warm = cold && now.saturating_sub(st(t).ran_at) < WARM_NS;
+            if yielded || warm {
+                passed[npassed] = t as u16;
+                npassed += 1;
+                continue;
+            }
+            out(q, t);
+            found = Some(t);
+            break;
+        }
+        for (i, &t) in passed[..npassed].iter().enumerate() {
             if found.is_none() && i == 0 {
                 out(q, t as usize);
                 found = Some(t as usize);
             } else {
                 q.fair = h_push(q.fair, t, fair_first);
             }
+        }
+        for &t in &barred[..nbarred] {
+            q.fair = h_push(q.fair, t, fair_first);
         }
         found
     }
@@ -429,9 +462,9 @@ pub(super) unsafe fn settle(cpu: usize, p: usize, running: usize) {
 pub(super) unsafe fn take(cpu: usize, p: usize, throttled: bool) -> Option<usize> {
     unsafe {
         let chosen = if throttled {
-            take_ordinary(cpu, p, false).or_else(|| take_rt(cpu, p))
+            take_ordinary(cpu, p, false, cpu).or_else(|| take_rt(cpu, p, cpu))
         } else {
-            take_rt(cpu, p).or_else(|| take_ordinary(cpu, p, false))
+            take_rt(cpu, p, cpu).or_else(|| take_ordinary(cpu, p, false, cpu))
         }?;
         chosen_from(cpu, p, chosen);
         Some(chosen)
@@ -522,8 +555,9 @@ pub(super) unsafe fn moved(tid: usize, to: usize, p: usize) {
 /// nothing else to run first, then one of the same package as its last;
 /// else the one running the worst, if `tid` outranks what that runs; else,
 /// for a task that has never run, the one with least to run, and for any
-/// other its last. Waiting on its last processor behind something no
-/// better while another slept, a thread a futex woke waited out a turn for
+/// other its last. Each of them one it may run on (`may_run_on`, its
+/// affinity). Waiting on its last processor behind something no better
+/// while another slept, a thread a futex woke waited out a turn for
 /// nothing.
 ///
 /// # Safety
@@ -531,18 +565,21 @@ pub(super) unsafe fn moved(tid: usize, to: usize, p: usize) {
 pub(super) unsafe fn place_for(tid: usize) -> usize {
     unsafe {
         let count = crate::percpu::count();
+        let may = |cpu: usize| super::may_run_on(tid, cpu);
+        let last = (st(tid).last_cpu as usize).min(count - 1);
+        // Where it may run at all, if not its last.
+        let anywhere = if may(last) { last } else { (0..count).find(|&cpu| may(cpu)).unwrap_or(last) };
         if count == 1 {
             return 0;
         }
-        let last = (st(tid).last_cpu as usize).min(count - 1);
         let mine = place_of(tid);
         let running = crate::percpu::current_of;
-        if running(last) == 0 || better(mine, place_of(running(last))) {
+        if may(last) && (running(last) == 0 || better(mine, place_of(running(last)))) {
             return last;
         }
-        let near = crate::percpu::place(last);
+        let near = crate::percpu::place(anywhere);
         let mut asleep: Option<(u8, usize)> = None;
-        for cpu in (0..count).filter(|&cpu| crate::percpu::napping(cpu)) {
+        for cpu in (0..count).filter(|&cpu| may(cpu) && crate::percpu::napping(cpu)) {
             let here = crate::percpu::place(cpu);
             let mate_busy = (0..count).any(|other| {
                 let there = crate::percpu::place(other);
@@ -556,8 +593,8 @@ pub(super) unsafe fn place_for(tid: usize) -> usize {
         if let Some((_, cpu)) = asleep {
             return cpu;
         }
-        let mut worst = last;
-        for cpu in 0..count {
+        let mut worst = anywhere;
+        for cpu in (0..count).filter(|&cpu| may(cpu)) {
             if better(place_of(running(worst)), place_of(running(cpu))) {
                 worst = cpu;
             }
@@ -569,9 +606,9 @@ pub(super) unsafe fn place_for(tid: usize) -> usize {
         // there is least to run.
         if st(tid).ran_at == 0 {
             let p = super::priority_of(tid);
-            return (0..count).min_by_key(|&cpu| load(cpu, Some(p))).unwrap_or(last);
+            return (0..count).filter(|&cpu| may(cpu)).min_by_key(|&cpu| load(cpu, Some(p))).unwrap_or(anywhere);
         }
-        last
+        anywhere
     }
 }
 
@@ -629,9 +666,9 @@ pub(super) unsafe fn pull(me: usize, throttled: bool) -> Option<usize> {
         let from = busiest(me, None)?;
         for p in 0..NUM_PRIORITIES {
             let taken = if throttled {
-                take_ordinary(from, p, true).or_else(|| take_rt(from, p))
+                take_ordinary(from, p, true, me).or_else(|| take_rt(from, p, me))
             } else {
-                take_rt(from, p).or_else(|| take_ordinary(from, p, true))
+                take_rt(from, p, me).or_else(|| take_ordinary(from, p, true, me))
             };
             if let Some(t) = taken {
                 moved(t, me, p);
@@ -644,9 +681,10 @@ pub(super) unsafe fn pull(me: usize, throttled: bool) -> Option<usize> {
 }
 
 /// Of the next few ordinary tasks waiting by run time in processor
-/// `cpu`'s queue of band `p`, the first weighing less than `under` — a
-/// cold one before a warm one — taken out; the others left as they were.
-unsafe fn take_lighter(cpu: usize, p: usize, under: u64) -> Option<usize> {
+/// `cpu`'s queue of band `p`, the first weighing less than `under` that may
+/// run on processor `for_cpu` — a cold one before a warm one — taken out;
+/// the others left as they were.
+unsafe fn take_lighter(cpu: usize, p: usize, under: u64, for_cpu: usize) -> Option<usize> {
     unsafe {
         let q = queue(cpu, p);
         let now = crate::clock::now();
@@ -661,7 +699,7 @@ unsafe fn take_lighter(cpu: usize, p: usize, under: u64) -> Option<usize> {
                 out(q, t);
                 continue;
             }
-            let fits = (st(t).weight as u64) < under;
+            let fits = (st(t).weight as u64) < under && super::may_run_on(t, for_cpu);
             if fits && now.saturating_sub(st(t).ran_at) >= WARM_NS {
                 out(q, t);
                 found = Some(t);
@@ -706,7 +744,7 @@ pub(super) unsafe fn balance(me: usize) {
             if theirs <= mine {
                 continue;
             }
-            if let Some(t) = take_lighter(from, p, theirs - mine) {
+            if let Some(t) = take_lighter(from, p, theirs - mine, me) {
                 moved(t, me, p);
                 link(t, me, p, false);
                 return;
