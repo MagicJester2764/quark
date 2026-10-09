@@ -36,6 +36,10 @@ mod runq;
 /// Each processor's ticks, for what it does every so many of them.
 static mut TICKS: [u32; crate::percpu::MAX_CPUS] = [0; crate::percpu::MAX_CPUS];
 
+/// Whether each processor's tick is stopped: while it has nothing to run
+/// (`stop_tick`, `start_tick`).
+static mut TICK_STOPPED: [bool; crate::percpu::MAX_CPUS] = [false; crate::percpu::MAX_CPUS];
+
 /// The task table: a record for each task, by its id (`table.rs`). A slot
 /// with no task has no record.
 static mut TASKS: crate::table::Table<TaskRec> = crate::table::Table::new(MAX_TASKS);
@@ -627,7 +631,6 @@ pub fn spawn(entry_fn: fn()) -> usize {
             st(tid).process_id = crate::cap::endpoint_of(tid);
             crate::fdtable::attach_new(tid);
             enqueue(tid);
-            crate::smp::wake_idle();
         }
         irq_restore(flags);
         return tid;
@@ -759,6 +762,19 @@ pub fn timer_tick() {
             runq::balance(me);
         }
 
+        // Something still waits here that a processor asleep may run: it
+        // goes to wait there, and that one is woken to run it. Asleep, a
+        // processor takes no tick of its own to find it by; and it is done
+        // here, a tick on, rather than as the task is left waiting, because
+        // a task left waiting is nearly always one a driver or a server
+        // preempted for a moment — woken then, the other processor found it
+        // gone, every time.
+        if current != 0 {
+            if let Some(cpu) = runq::hand_to_sleeper(me) {
+                crate::smp::wake(cpu);
+            }
+        }
+
         // A processor with nothing to do: whatever is ready is its to run,
         // its own or another's.
         if current == 0 {
@@ -871,14 +887,6 @@ unsafe fn schedule_inner(from_irq: bool) { unsafe {
         restore_flags(flags);
         return;
     }
-    // More is waiting here than this processor is about to run: one that
-    // is asleep can take it. This is how a task that was preempted, or woken
-    // by a reply and left for its waker to make way for, comes to run
-    // somewhere else.
-    if runq::waiting(crate::percpu::index()) > 0 {
-        crate::smp::wake_idle();
-    }
-
     // A slice of its own, since this is the scheduler choosing it rather than
     // a task handing over what it had left: as long as its niceness says,
     // or a round-robin task's turn. A FIFO task's is not counted down.
@@ -939,6 +947,8 @@ unsafe fn switch_to(current_tid: usize, next_tid: usize, flags: u64) { unsafe {
         // next task made ready, while it ran this one, and that task would
         // wait for a tick.
         crate::percpu::woke();
+        // And it has something to run, which a tick shares out.
+        start_tick();
     }
     crate::percpu::set_current(next_tid);
 
@@ -1225,7 +1235,7 @@ unsafe fn best_ready_band() -> Option<usize> { unsafe {
 /// Interrupts must be off.
 unsafe fn anything_to_run() -> bool { unsafe {
     let me = crate::percpu::index();
-    runq::best_band(me).is_some() || (0..crate::percpu::count()).any(|cpu| cpu != me && runq::waiting(cpu) > 0)
+    runq::best_band(me).is_some() || runq::takeable(me)
 }}
 
 /// Take `tid` out of the run queue it is in, if it is in one.
@@ -2452,9 +2462,14 @@ pub fn idle() -> ! {
                 break;
             }
         }
+        // Nothing to run, so nothing for a tick to share out: what is due
+        // is the clock's to fire (`clock::due`), and whatever is made ready
+        // here wakes this processor (`smp::wake`). Started again when it
+        // runs something (`switch_to`).
+        unsafe { stop_tick() };
         // Said before the lock goes, so that whoever makes a task ready
         // next — which takes the lock — knows there is a processor to wake
-        // for it (`smp::wake_idle`).
+        // for it (`smp::wake`).
         unsafe { crate::percpu::nap() };
         crate::klock::release();
         // An interrupt is not taken between `sti` and the instruction after
@@ -2467,6 +2482,47 @@ pub fn idle() -> ! {
         crate::klock::acquire();
     }
 }
+
+/// Stop this processor's tick: it has nothing to run, and a tick would
+/// only find that out a hundred times a second. The first processor's is
+/// the 8254's line, masked — where the clock is the counter and its own
+/// timer fires what is due (`clock::tick_may_stop`); elsewhere the tick is
+/// the clock, and goes on. Every other processor's is its own timer.
+///
+/// # Safety
+/// Interrupts off.
+unsafe fn stop_tick() { unsafe {
+    let me = crate::percpu::index();
+    if TICK_STOPPED[me] {
+        return;
+    }
+    if me == 0 {
+        if !crate::clock::tick_may_stop() {
+            return;
+        }
+        crate::intc::disable(0);
+    } else {
+        crate::lapic::tick(false);
+    }
+    TICK_STOPPED[me] = true;
+}}
+
+/// Start this processor's tick again: it is about to run something.
+///
+/// # Safety
+/// Interrupts off.
+unsafe fn start_tick() { unsafe {
+    let me = crate::percpu::index();
+    if !TICK_STOPPED[me] {
+        return;
+    }
+    if me == 0 {
+        crate::intc::enable(0);
+    } else {
+        crate::lapic::tick(true);
+    }
+    TICK_STOPPED[me] = false;
+}}
 
 /// From the idle loop: run whatever is ready, and say whether anything was.
 /// Comes back when this processor next has nothing to do.
@@ -3040,7 +3096,6 @@ unsafe fn start_task_locked(tid: usize, rip: u64, rsp: u64, cr3: usize, arg: u64
 
         task.state = TaskState::Ready;
         enqueue(tid);
-        crate::smp::wake_idle();
         Ok(())
     }
 }
@@ -3682,7 +3737,6 @@ fn start_forked(tid: usize, cr3: usize, frame: &crate::task::UserFrame) -> Resul
         task.context.r14 = cr3 as u64;
         task.state = TaskState::Ready;
         enqueue(tid);
-        crate::smp::wake_idle();
     }
     irq_restore(flags);
     Ok(())

@@ -39,7 +39,15 @@ const GSTS: usize = 0x1C;
 const RTADDR: usize = 0x20;
 const CCMD: usize = 0x28;
 const FSTS: usize = 0x34;
+const FECTL: usize = 0x38;
+const FEDATA: usize = 0x3C;
+const FEADDR: usize = 0x40;
+const FEUADDR: usize = 0x44;
 const PMEN: usize = 0x64;
+
+/// The fault event control's mask: set, a unit says nothing when it
+/// records a fault.
+const IM: u32 = 1 << 31;
 
 // The global command and status bits.
 const TE: u32 = 1 << 31;
@@ -292,6 +300,13 @@ pub unsafe fn init() {
         if !command(u, TE, true) {
             return;
         }
+        // What it stops is said as it stops it: a message to this
+        // processor, the first (`idt::VEC_IOMMU`). It was looked for on
+        // every tick, and a processor with nothing to run takes none.
+        write32(u.regs + FEDATA, crate::idt::VEC_IOMMU as u32);
+        write32(u.regs + FEADDR, 0xFEE0_0000 | (crate::lapic::id() & 0xFF) << 12);
+        write32(u.regs + FEUADDR, 0);
+        write32(u.regs + FECTL, read32(u.regs + FECTL) & !IM);
     }
     ON.store(true, Ordering::SeqCst);
     crate::serial::puts(b"IOMMU: on; a device reaches only what its driver was given.\n");
@@ -578,7 +593,9 @@ pub fn disowned(base: usize, count: usize) {
 
 /// What the units have stopped since they were last asked, counted against
 /// the device that tried, and said on the serial line: the first few of
-/// each device. From the first processor's tick.
+/// each device. When a unit says it has stopped something
+/// (`idt::VEC_IOMMU`), which it does again only once what it recorded has
+/// been taken.
 pub fn poll() {
     if !on() {
         return;

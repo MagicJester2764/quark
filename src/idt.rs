@@ -276,10 +276,12 @@ pub const VEC_TIMER: u8 = 0xE0;
 /// waiting to run (`smp.rs`).
 pub const VEC_RESCHED: u8 = 0xE1;
 /// The clock: something is due (`clock.rs`). The first processor's own
-/// timer, set for whatever is due before the next tick; or another
-/// processor, which has written down something due sooner than that timer
-/// is set for.
+/// timer, set for whatever is due soonest; or another processor, which has
+/// written down something due sooner than that timer is set for.
 pub const VEC_CLOCK: u8 = 0xE2;
+/// An IOMMU has stopped a device reaching memory (`iommu.rs`): a message
+/// the unit sends the first processor.
+pub const VEC_IOMMU: u8 = 0xE3;
 /// From another processor: forget your translations (`tlb.rs`). Answered
 /// without the kernel lock.
 pub const VEC_FLUSH: u8 = 0xF0;
@@ -307,6 +309,7 @@ macro_rules! apic_stub {
 apic_stub!("apic_stub_timer", "0xE0");
 apic_stub!("apic_stub_resched", "0xE1");
 apic_stub!("apic_stub_clock", "0xE2");
+apic_stub!("apic_stub_iommu", "0xE3");
 apic_stub!("apic_stub_flush", "0xF0");
 apic_stub!("apic_stub_halt", "0xF1");
 apic_stub!("apic_stub_spurious", "0xFF");
@@ -1128,6 +1131,11 @@ fn irq(frame: &InterruptFrame) {
             scheduler::woken();
             return;
         }
+        VEC_IOMMU => {
+            crate::lapic::eoi();
+            crate::iommu::poll();
+            return;
+        }
         _ => {}
     }
     // A device, by its ISA number: that is what the sixteen stubs leave in
@@ -1350,6 +1358,7 @@ unsafe extern "C" {
     fn apic_stub_timer();
     fn apic_stub_resched();
     fn apic_stub_clock();
+    fn apic_stub_iommu();
     fn apic_stub_flush();
     fn apic_stub_halt();
     fn apic_stub_spurious();
@@ -1472,10 +1481,11 @@ unsafe fn setup_idt() { unsafe {
         (*idt_ptr).entries[32 + i].set_handler(*stub as u64, 0x08, 0);
     }
 
-    let apic_stubs: [(u8, unsafe extern "C" fn()); 6] = [
+    let apic_stubs: [(u8, unsafe extern "C" fn()); 7] = [
         (VEC_TIMER, apic_stub_timer),
         (VEC_RESCHED, apic_stub_resched),
         (VEC_CLOCK, apic_stub_clock),
+        (VEC_IOMMU, apic_stub_iommu),
         (VEC_FLUSH, apic_stub_flush),
         (VEC_HALT, apic_stub_halt),
         (VEC_SPURIOUS, apic_stub_spurious),

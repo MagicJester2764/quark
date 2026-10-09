@@ -86,14 +86,21 @@ processor with an 8259, as every machine was.
 
 Devices and the clock interrupt the first processor. What time it is, is a
 counter any processor reads (`clock.rs`); seeing to what is due is the
-first processor's, on its tick and between ticks by its own local APIC's
-timer. They come in through the I/O APIC where the firmware lists
+first processor's, by its own local APIC's timer, set for the soonest thing
+due however far off — and on its tick, in case something was not said. They come in through the I/O APIC where the firmware lists
 one (`ioapic.rs`) — which could send each to any processor, and sends all
 of them to the first, because nothing yet gives a reason for another — and
 through the 8259 where it does not. `intc.rs` is whichever there is.
 
 Every other processor has its local APIC's timer, at the same hundred times
-a second, and it does one thing: ends a task's turn.
+a second, and it does one thing: ends a task's turn. A processor with
+nothing to run takes no tick, the first included — its 8254's line is
+masked while it sleeps, where the clock is the counter — and is woken by
+whatever gives it something to run: a task put to wait there — one left
+waiting on a busy processor among them, which that one's tick sends
+(`runq::hand_to_sleeper`).
+What the first processor's tick did besides is the clock's now, or an
+interrupt's: an IOMMU says what it stops.
 
 One processor tells another something by interrupting it, and there are
 three things to say — and a fourth that only the first processor is told,
@@ -224,7 +231,6 @@ uses them well, and the difference is a list:
   that does not stop a third — and an order to take them in, written down,
   because a kernel with more than one lock has a way to deadlock that a
   kernel with one has not.
-- **A processor that takes no ticks while it has nothing to do.**
 - **Interrupts from devices on any processor.** The I/O APIC can send one
   anywhere; every one still goes to the first.
 - **More than sixteen processors**, and x2APIC ids above 255.

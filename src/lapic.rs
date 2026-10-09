@@ -313,16 +313,26 @@ pub unsafe fn start_one_shot() -> bool {
 }
 
 /// Set this processor's timer to interrupt `ns` nanoseconds from now,
-/// instead of whenever it was set for. No more than two ticks away: the
-/// tick sets it again.
+/// instead of whenever it was set for. As far off as it counts — a minute
+/// or more, by how fast it counts — and sooner past that: an interrupt
+/// that finds nothing due sets it again.
 ///
 /// A thousandth late rather than at all early: an interrupt before the time
 /// finds nothing due and has to be taken again.
 pub fn one_shot(ns: u64) {
-    let per_tick = PER_TICK.load(Ordering::Relaxed) as u64;
-    let ns = ns.min(2 * crate::clock::TICK_NS);
-    let count = ns * per_tick / crate::clock::TICK_NS;
-    write(REG_TIMER_INITIAL, (count + count / 1024 + 1).min(u32::MAX as u64) as u32);
+    let per_tick = PER_TICK.load(Ordering::Relaxed) as u128;
+    let count = ns as u128 * per_tick / crate::clock::TICK_NS as u128;
+    write(REG_TIMER_INITIAL, (count + count / 1024 + 1).min(u32::MAX as u128) as u32);
+}
+
+/// This processor's tick, stopped while it has nothing to run and started
+/// again when it has (`scheduler::idle`). Not the first processor's: that
+/// is the 8254's, and its own timer is the clock's.
+///
+/// # Safety
+/// After [`start_timer`] on this processor, interrupts off.
+pub unsafe fn tick(on: bool) {
+    write(REG_TIMER_INITIAL, if on { PER_TICK.load(Ordering::Relaxed) } else { 0 });
 }
 
 /// Take back whatever this processor's timer was set for.

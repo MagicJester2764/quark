@@ -21,12 +21,14 @@
 //! counter reads the same, which is looked at as each one is started
 //! (`smp.rs`, [`distrust`]).
 //!
-//! **What is due between two ticks is fired by the first processor's own
-//! timer**, the one in its local APIC, which the kernel had no use for: that
-//! processor is ticked by the 8254. It is set, once, for the earliest thing
-//! due — if that is sooner than the next tick, which looks at everything
-//! anyway — and the interrupt it raises does what a tick does about time
-//! and nothing else ([`expire`]).
+//! **What is due is fired by the first processor's own timer**, the one in
+//! its local APIC, which the kernel had no use for: that processor is ticked
+//! by the 8254. It is set, once, for the earliest thing due, however far
+//! off, and the interrupt it raises does what a tick does about time and
+//! nothing else ([`expire`]). That is what lets the tick stop: a processor
+//! with nothing to run takes none (`scheduler::idle`), the first included,
+//! and what is due comes when it is due. It was set only for what came
+//! before the next tick, and the tick looked at the rest.
 //!
 //! Where there is no counter to trust, the clock is the count of ticks, as
 //! it was, and everything here answers in multiples of ten milliseconds.
@@ -369,19 +371,21 @@ pub fn raw() -> u64 {
 
 // --- Seeing that what is due is looked at ----------------------------------
 
-/// Something is due at `at`: if that is before the next tick, and before
-/// what the first processor's timer is already set for, set it.
+/// Something is due at `at`: if that is before what the first processor's
+/// timer is already set for, set it.
 ///
 /// Called by whatever writes a deadline down, after it has. The timer is
 /// the first processor's, so anywhere else this asks that processor to look
 /// (`idt::VEC_CLOCK`): it will find the deadline, and set its timer itself.
+/// Whatever is not said here is not seen to while the first processor
+/// sleeps: it takes no tick then to find it by.
 pub fn due(at: u64) {
     if !TIMER.load(Ordering::Relaxed) {
         return;
     }
     let flags = irq_save();
     let now = now();
-    if at < SET_FOR.load(Ordering::Relaxed) && at < now.saturating_add(TICK_NS) {
+    if at < SET_FOR.load(Ordering::Relaxed) {
         if crate::percpu::index() == 0 {
             set(at, now);
         } else {
@@ -405,33 +409,52 @@ fn set(at: u64, now: u64) {
 /// Wake what is due, and see that what is due next is looked at when it is.
 ///
 /// The whole of what the kernel does about time passing: from the tick, and
-/// from the first processor's timer between ticks (`shot`). On the first
-/// processor, interrupts off, the kernel lock held.
+/// from the first processor's timer (`shot`). On the first processor,
+/// interrupts off, the kernel lock held.
 ///
-/// It may not return. The last thing it does is raise the alarms that are
-/// due, and the signals of programs' timers, and for a program that has
-/// said nothing about that signal one is the end — if that is the program
-/// this interrupted, there is nothing to come back to. So the timer is set
-/// before, for what will be due once those have been seen to.
+/// It may not return. First it ends the programs whose signal deadline has
+/// passed, raises the alarms that are due and the signals of programs'
+/// timers, and hangs up on the groups a death left stopped — and for a
+/// program that has said nothing about the signal, one is the end: if that
+/// is the program this interrupted, there is nothing to come back to. So
+/// while those are seen to the timer is set for a tick from now, which is
+/// when the rest is looked at if this does not come back; and once they
+/// have been, for what is due next. Left to the next tick, as it was, the
+/// rest waited for a tick that a processor with nothing to run no longer
+/// takes.
 pub fn expire(shot: bool) {
     let now = now();
     if shot {
         LAST_SHOT.store(now, Ordering::Relaxed);
     }
+    let timer = TIMER.load(Ordering::Relaxed);
+    if timer {
+        set(now.saturating_add(TICK_NS), now);
+    }
+    crate::ipc::check_signal_deadlines(now);
+    crate::signal::alarms(now);
+    crate::signal::timers(now);
+    crate::job::hang_up();
     let next = crate::timerfd::expire(now)
         .min(crate::ipc::check_timeouts(now))
         .min(crate::futex::check_timeouts(now))
+        .min(crate::ipc::signal_deadline_after(now))
         .min(crate::fdtable::alarm_after(now))
         .min(crate::ptimer::after(now));
-    if TIMER.load(Ordering::Relaxed) {
-        if next < now.saturating_add(TICK_NS) {
-            set(next, now);
-        } else {
-            // The next tick is sooner, and looks at everything.
+    if timer {
+        if next == u64::MAX {
             SET_FOR.store(u64::MAX, Ordering::Relaxed);
             crate::lapic::cancel_one_shot();
+        } else {
+            set(next, now);
         }
     }
-    crate::signal::alarms(now);
-    crate::signal::timers(now);
+}
+
+/// Whether the first processor may stop its tick while it has nothing to
+/// run: where the clock is the counter, and its timer is there to fire
+/// what is due. Elsewhere the tick is the clock, or the only thing that
+/// sees to what is due.
+pub fn tick_may_stop() -> bool {
+    FINE.load(Ordering::Relaxed) && TIMER.load(Ordering::Relaxed)
 }

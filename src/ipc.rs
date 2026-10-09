@@ -922,7 +922,9 @@ pub fn sys_signal(dest: usize, sig: u64) -> Result<(), IpcError> {
     let flags = irq_save();
     unsafe {
         if st(dest).signal_deadline == 0 {
-            set_deadline(dest, crate::clock::after(SIGNAL_KILL_TIMEOUT));
+            let at = crate::clock::after(SIGNAL_KILL_TIMEOUT);
+            set_deadline(dest, at);
+            crate::clock::due(at);
         }
     }
     irq_restore(flags);
@@ -930,12 +932,11 @@ pub fn sys_signal(dest: usize, sig: u64) -> Result<(), IpcError> {
     Ok(())
 }
 
-/// Check signal deadlines and force-kill unresponsive tasks.
-/// Called from `pit::tick()` on every timer interrupt: five seconds is not
-/// a time anybody needs kept to better than a tick.
-pub fn check_signal_deadlines() {
-    // Already in interrupt context (IRQ handler), so no need for irq_save.
-    let now = crate::clock::now();
+/// End the program of every task whose signal deadline is `now` or past.
+/// From the clock (`clock::expire`), with the rest of what may not return:
+/// a deadline can be the program the clock interrupted.
+pub fn check_signal_deadlines(now: u64) {
+    // From the clock, so interrupts are off.
     unsafe {
         let mut t = *core::ptr::addr_of!(DEADLINES);
         while t != END {
@@ -949,8 +950,25 @@ pub fn check_signal_deadlines() {
     }
 }
 
+/// The earliest signal deadline after `now`, for the clock to be set by;
+/// `u64::MAX` for none.
+pub fn signal_deadline_after(now: u64) -> u64 {
+    let mut next = u64::MAX;
+    unsafe {
+        let mut t = *core::ptr::addr_of!(DEADLINES);
+        while t != END {
+            let at = st(t as usize).signal_deadline;
+            if at > now {
+                next = next.min(at);
+            }
+            t = st(t as usize).deadline_next;
+        }
+    }
+    next
+}
+
 /// Give `tid` a signal deadline at `at`, or none for 0: it is on the list
-/// the tick looks at while it has one.
+/// the clock looks at while it has one.
 ///
 /// # Safety
 /// Interrupts are off.

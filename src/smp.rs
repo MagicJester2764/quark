@@ -15,8 +15,10 @@
 //!
 //! - **Look at what you are running, and at what is waiting**
 //!   (`idt::VEC_RESCHED`): to a processor asleep with nothing to do when a
-//!   task has been made ready ([`wake_idle`]), and to the processor running
-//!   a task that has just been ended or stopped ([`interrupt`]) — a task in
+//!   task has been put to wait there, or waits elsewhere for one that may
+//!   run it ([`wake`]); to a processor running worse than a task put to wait
+//!   there, and to the processor running a task that has just been ended or
+//!   stopped ([`interrupt`]) — a task in
 //!   ring 3 does not know, and goes on until something brings its processor
 //!   into the kernel; this is the something. An ordinary interrupt: whoever
 //!   takes it takes the kernel lock like any other way in.
@@ -305,26 +307,6 @@ extern "C" fn arrive(index: usize) -> ! {
     crate::klock::acquire();
     unsafe { crate::lapic::start_timer() };
     crate::scheduler::idle()
-}
-
-/// A task has been made ready: if a processor is asleep with nothing to
-/// do, wake one.
-///
-/// Interrupts must be off, and the kernel lock held.
-pub fn wake_idle() {
-    let count = percpu::count();
-    if count == 1 {
-        return;
-    }
-    let me = percpu::index();
-    for cpu in (0..count).filter(|&cpu| cpu != me) {
-        // Asleep, and nobody has woken it yet: this does, and that is
-        // taken, so that the next task made ready wakes another.
-        if percpu::wake_from_nap(cpu) {
-            crate::lapic::send(percpu::apic_id(cpu), crate::idt::VEC_RESCHED);
-            return;
-        }
-    }
 }
 
 /// Wake processor `cpu`, if it is asleep: something has been put in its

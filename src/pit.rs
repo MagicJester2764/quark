@@ -22,22 +22,17 @@ pub unsafe fn init(hz: u32) { unsafe {
 /// charge the running task for its turn.
 ///
 /// What time it is, is the clock's to say (`clock.rs`), and so is what is
-/// due; the tick is when everything is looked at whether or not anything
-/// asked to be.
+/// due — fired by the first processor's own timer when it is due, so the
+/// tick looks at it only in case something was not said. A processor with
+/// nothing to run takes no tick at all (`scheduler::idle`).
 ///
-/// The order is that of what may not come back. Raising an alarm may end
-/// the program this interrupted, and so may hanging up on a group a death
-/// left stopped: what follows either is then left for the next tick, which
-/// is why each is something that can wait for one.
+/// Seeing to what is due may not come back — an alarm or a hang-up can end
+/// the program this interrupted — and then the turn is not charged: the
+/// program has gone.
 pub fn tick() {
     TICKS.fetch_add(1, Ordering::Relaxed);
     crate::random::stir();
-    crate::ipc::check_signal_deadlines();
     crate::clock::expire(false);
-    // What the IOMMU stopped a device doing, said.
-    crate::iommu::poll();
-    // The groups a death left stopped with nobody to start them.
-    crate::job::hang_up();
     crate::scheduler::timer_tick();
 }
 

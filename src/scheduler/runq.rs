@@ -487,6 +487,53 @@ pub(super) unsafe fn waiting(cpu: usize) -> u32 {
     unsafe { (0..NUM_PRIORITIES).map(|p| queue(cpu, p).len).sum() }
 }
 
+/// Whether something waits on another processor than `me` for `me` to
+/// take (`pull`).
+///
+/// # Safety
+/// Interrupts off, the kernel lock held.
+pub(super) unsafe fn takeable(me: usize) -> bool {
+    unsafe { busiest(me, None).is_some() }
+}
+
+/// What waits first in processor `cpu`'s queues — the first of each band's
+/// real-time tasks, its front and its fair queue, looked at in that order —
+/// that a processor asleep may run, put to wait there instead: which
+/// processor, for it to be woken. Moved rather than left to be taken: a
+/// processor that wakes takes from the busiest (`pull`), which need not be
+/// this one, and what waits there need not be anything it may run.
+///
+/// # Safety
+/// Interrupts off, the kernel lock held.
+pub(super) unsafe fn hand_to_sleeper(cpu: usize) -> Option<usize> {
+    unsafe {
+        let count = crate::percpu::count();
+        if waiting(cpu) == 0 || !(0..count).any(|n| n != cpu && crate::percpu::napping(n)) {
+            return None;
+        }
+        for p in 0..NUM_PRIORITIES {
+            let q = queue(cpu, p);
+            if q.len == 0 {
+                continue;
+            }
+            for t in [q.rt, q.front.0, q.fair] {
+                if t == END || !ready(t as usize) {
+                    continue;
+                }
+                let t = t as usize;
+                if let Some(n) = (0..count).find(|&n| n != cpu && crate::percpu::napping(n) && super::may_run_on(t, n)) {
+                    let front = st(t).heap_in == IN_FRONT;
+                    unlink(t);
+                    moved(t, n, p);
+                    link(t, n, p, front);
+                    return Some(n);
+                }
+            }
+        }
+        None
+    }
+}
+
 /// The best real-time priority waiting in processor `cpu`'s queue of band
 /// `p`; 0 for none.
 ///
@@ -632,13 +679,15 @@ unsafe fn load(cpu: usize, p: Option<usize>) -> u64 {
 
 /// The processor other than `me` with the most to run of band `p` — or of
 /// every band, for `None` — of those with any of it waiting: of `me`'s
-/// package if one there has; `None` if none has.
+/// package if one there has; `None` if none has. Not one running nothing:
+/// what waits there was put there for it, and it has been woken to run it
+/// (`enqueue`) — taken from under it, it woke to nothing.
 unsafe fn busiest(me: usize, p: Option<usize>) -> Option<usize> {
     unsafe {
         let count = crate::percpu::count();
         let package = crate::percpu::place(me).package;
         let mut best: Option<((bool, u64), usize)> = None;
-        for cpu in (0..count).filter(|&cpu| cpu != me) {
+        for cpu in (0..count).filter(|&cpu| cpu != me && crate::percpu::current_of(cpu) != 0) {
             let any = match p {
                 Some(p) => queue(cpu, p).len > 0,
                 None => waiting(cpu) > 0,

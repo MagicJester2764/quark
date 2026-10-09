@@ -1170,13 +1170,14 @@ background job that ignores what its terminal raises.
   a child of it — its parent in another program, so not a thread — dies. A
   program that waits for a child *or* a time, whichever comes first, is
   woken by the one that came; before, GNU `timeout` sat in `sigsuspend` for
-  ever. The alarm is raised by the clock (`clock::expire`, from the tick
-  and from the timer between ticks), one program at a time, each alarm put
-  away before its signal is raised: for a program that has said nothing the
-  signal is the end of it, and if that is the program the clock interrupted,
-  `signal::alarms` does not return. So it is the last thing the clock does,
-  and what it does before — setting the timer for what is due next — counts
-  the alarms as they will stand afterwards (`fdtable::alarm_after`).
+  ever. The alarm is raised by the clock (`clock::expire`, from the first
+  processor's timer when it is due, and from the tick in case nobody said),
+  one program at a time, each alarm put away before its signal is raised:
+  for a program that has said nothing the signal is the end of it, and if
+  that is the program the clock interrupted, `signal::alarms` does not
+  return. So it is raised with the clock's timer set a tick ahead, which is
+  when the rest is looked at if it does not, and the timer is set for what
+  is due next only once it has (`fdtable::alarm_after`).
 
 ## Jobs
 
@@ -1212,7 +1213,8 @@ stopped is one the scheduler does not run.
 - **A job left stopped by the death that orphans it is hung up on**: SIGHUP
   and SIGCONT. Not from inside the death — that is somebody in the middle
   of ending a program, and a hangup can end the caller's own — but from the
-  next tick (`job::hang_up`), which is already where an alarm may end
+  clock, which the death asks to look at once (`clock::due`; `job::hang_up`
+  from `clock::expire`), and which is already where an alarm may end
   whatever was running. A stopped program nobody can start is a task slot
   gone for good, and its program's allowance with it.
 - **A terminal knows its session and who is in front** (`pty.rs`). Its
@@ -1444,16 +1446,20 @@ The rules it leaves behind:
   span — that is why no call's number had to change, and why a program
   written for ticks still means what it meant.
 - **Whoever writes a deadline down says so** (`clock::due`), after it has.
-  Nothing else sets the timer between two ticks: a deadline nobody
-  mentioned is seen to at the next tick, which is every test passing and
-  every wait ten milliseconds long. `dtest clock` asks that most of twenty
-  waits end on time, not that one does — a wait that ends on a tick is on
-  time once in a while, by where in the tick it began.
+  Nothing else sets the first processor's timer, and a processor with
+  nothing to run takes no tick: a deadline nobody mentioned is seen to when
+  the first processor next runs something, which on a machine with nothing
+  to do is never. Seen to at the next tick, as it was, it was every test
+  passing and every wait ten milliseconds long. `dtest clock` asks that
+  most of twenty waits end on time, not that one does — a wait that ends on
+  a tick is on time once in a while, by where in the tick it began.
 - **Everything about time passing is `clock::expire`.** A new kind of
   deadline is looked at there and answers with its earliest still to come,
-  so that the timer is set for it. Alarms and a program's timers
-  (`ptimer.rs`) last, each re-armed before its signal is raised: raising
-  one may not return.
+  so that the timer is set for it — however far off: there may be no tick
+  to set it nearer. What may not return goes first — a signal's deadline,
+  alarms, a program's timers, hang-ups — with the timer set a tick ahead in
+  case it does not, each put away before its signal is raised; and what is
+  due next is worked out after it.
 - **A wait never ends early.** The timer is set a thousandth late on
   purpose (`lapic::one_shot`): an interrupt before the time finds nothing
   due and has to be taken again.
@@ -1557,7 +1563,8 @@ breaking any of them is quiet until it is a machine that stops.
   last pairing heaps linked through the tasks' records. A task made ready
   waits where it last ran if it would run there at once, and on a sleeping
   processor, or the one running the worst, if not; a processor with
-  nothing of its own takes from the busiest, cold tasks first; and every
+  nothing of its own takes from the busiest of those running something,
+  cold tasks first; and every
   fourth tick one with less to run than the busiest takes a task light
   enough that the two end nearer even. What a processor has to run is
   weighed, not counted (`usage::weight`, a queue's `load`): counted, two
@@ -1590,13 +1597,35 @@ breaking any of them is quiet until it is a machine that stops.
   only if something ran (`run_ready`): what waits elsewhere may be
   nothing it may run, and the loop holds the kernel's lock.
 - **The clock and every device interrupt the first processor.** The others
-  have a tick of their own from their local APIC, and it does one thing:
-  `scheduler::timer_tick`. What is due — timeouts, timers, alarms — is seen
-  to in one place, by the first processor (`clock::expire`): on its tick,
-  and between ticks from its own local APIC's timer, which it has no other
-  use for. A deadline written down on another processor that is due before
-  the next tick is said to the first with an interrupt (`idt::VEC_CLOCK`),
-  an ordinary one, which takes the lock.
+  have a tick of their own from their local APIC while they run something,
+  and it does one thing: `scheduler::timer_tick`. What is due — timeouts,
+  timers, alarms — is seen to in one place, by the first processor
+  (`clock::expire`): from its own local APIC's timer, set for the soonest
+  thing due however far off, and on its tick in case something was not
+  said. A deadline written down on another processor that is sooner than
+  that timer is set for is said to the first with an interrupt
+  (`idt::VEC_CLOCK`), an ordinary one, which takes the lock.
+- **A processor with nothing to run takes no tick** (`scheduler::stop_tick`
+  before it naps, `start_tick` as it leaves its idle loop for a task). The
+  first masks the 8254's line, where the clock is the counter and its own
+  timer is there to fire what is due (`clock::tick_may_stop`); the others
+  stop their local APIC's. So nothing may wait for a tick to be seen to: a
+  deadline is said to the clock (`clock::due`); a task put to wait on a
+  sleeping processor wakes it (`smp::wake`); one left waiting on a busy
+  processor that a sleeping one may run goes to wait there from the busy
+  one's tick (`runq::hand_to_sleeper`) — not as it is left there, which is
+  nearly always a driver or a server preempting for a moment, and woke a
+  processor to nothing every time; and an idle processor does not take
+  what another idle one was woken to run (`runq::busiest`). What the first processor's
+  tick did besides is the clock's (a signal's deadline, a hang-up) or an
+  interrupt's: an IOMMU says what it stops (`idt::VEC_IOMMU`). And
+  `pit::ticks` stops with it: nothing but the boot may wait on that count.
+  A machine with nothing to do takes what its programs have due, and a
+  wake for each: `dtest idle` asks for fewer than five hundred interrupts
+  in ten seconds, where each processor's tick was a thousand. (ExplOSion's
+  console looked at its pipe, its terminal and the keyboard a hundred times
+  a second, and the machine was never idle; its network stack still wakes
+  five times a second.)
 - **Every processor's counter reads the same, or the counter is not the
   clock.** Time is one counter read on whichever processor is asked. Each
   processor's is compared with the first's as it is started (`smp::start`),
@@ -1692,8 +1721,13 @@ breaking any of them is quiet until it is a machine that stops.
   processor; a system call, a fault or an interrupt waits for the kernel to
   be empty. So `IrqSpinLock` still panics on contention, and rightly: under
   the kernel lock, contention can still only mean re-entrancy. Taking the
-  lock apart is its own project. With it goes an idle processor that
-  takes no ticks.
+  lock apart is its own project.
+- Every deadline on the machine is the first processor's to fire and to be
+  told of: a program on another processor that sets one sooner than the
+  first's timer is set for interrupts it to say so, and each wakes it when
+  it is due, wherever its task runs. A processor asleep is still asked to
+  forget its translations when a kernel stack is given back
+  (`tlb::stale_everywhere`), which every task's end does.
 - Every device interrupts the first processor, a message included. The
   I/O APIC's lines above the sixteen ISA interrupts are not used: which
   device is on which is in the firmware's bytecode, not its tables. A

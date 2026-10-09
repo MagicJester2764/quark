@@ -448,7 +448,8 @@ static mut HANGUPS: bool = false;
 /// being ended, by whoever is ending it, and a hangup ends programs: one of
 /// them may be the caller's own, and then nothing after it would be done —
 /// the rest of the program it was ending included. The group is written
-/// down, and the next tick sees to it ([`hang_up`]).
+/// down, and the clock is asked to look at once (`clock::due`): its next
+/// interrupt sees to it ([`hang_up`]).
 ///
 /// Interrupts are off.
 pub fn process_ended(tid: usize) {
@@ -470,6 +471,7 @@ pub fn process_ended(tid: usize) {
                 st(t).hang_up = true;
             }
             *core::ptr::addr_of_mut!(HANGUPS) = true;
+            crate::clock::due(crate::clock::now());
         }
     };
     if let Some((_, _, _, parent)) = scheduler::task_info(tid) {
@@ -489,12 +491,14 @@ pub fn process_ended(tid: usize) {
 }
 
 /// Hang up on the groups written down for it: SIGHUP for every process in
-/// one, and SIGCONT, so that a stopped one hears it. Called on every tick.
+/// one, and SIGCONT, so that a stopped one hears it. From the clock
+/// (`clock::expire`), which a death that writes one down asks to look.
 ///
 /// One group at a time, each taken off the list before anything is raised,
 /// and the running program's own signal last — for the reason an alarm is
 /// seen to before it is raised: this may be the last thing that is done
-/// here. What is still on the list is still there at the next tick.
+/// here. What is still on the list is still there when the clock next
+/// looks, a tick later at most.
 pub fn hang_up() {
     if !unsafe { *core::ptr::addr_of!(HANGUPS) } {
         return;
