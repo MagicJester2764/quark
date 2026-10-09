@@ -96,6 +96,37 @@ fn irq_restore(flags: u64) {
     }
 }
 
+/// Interrupts off for as long as it is held: a walk of a program's tables
+/// is one step.
+///
+/// A system call is preempted wherever a tick finds it, and another thread
+/// of the program can be run in between — on this processor, or on another
+/// once this one has left the kernel for the task it switched to. An unmap
+/// gives back a table it leaves empty, and the directory above it if that
+/// is empty too ([`reclaim_empty_tables`]); a walk that had read its way
+/// down to one went on from where it had got to. A map filled in a
+/// directory that was no longer anybody's — its page was in no table the
+/// program could reach, and the program faulted on the page it had just
+/// been given — and wrote into a frame that may by then have been somebody
+/// else's. Every walk here takes one of these, or is only ever called from
+/// one that has (`back`, `own`, `unshare`, the fork's copy and reclaim's
+/// takes do it themselves).
+struct OneStep(u64);
+
+impl OneStep {
+    #[inline(always)]
+    fn new() -> Self {
+        OneStep(irq_save())
+    }
+}
+
+impl Drop for OneStep {
+    #[inline(always)]
+    fn drop(&mut self) {
+        irq_restore(self.0);
+    }
+}
+
 /// Why a page could not be backed.
 #[derive(Debug)]
 pub enum Fault {
@@ -474,6 +505,7 @@ pub unsafe fn map_page(
     phys_addr: usize,
     flags: u64,
 ) -> Result<(), PagingError> { unsafe {
+    let _step = OneStep::new();
     let (_, _, _, pti) = table_indices(virt_addr);
     let pt = walk_create(pml4_phys, virt_addr, flags & USER)?;
 
@@ -516,6 +548,8 @@ pub unsafe fn reserve_range(
     let end = virt + pages * PAGE_SIZE;
     let mut va = virt;
     while va < end {
+        // A step an entry: each starts again from the top.
+        let _step = OneStep::new();
         let (_, _, pdi, pti) = table_indices(va);
         if va & (TWO_MIB - 1) == 0 && end - va >= TWO_MIB {
             // The whole page-directory entry, which must be unused.
@@ -555,6 +589,7 @@ pub unsafe fn reserve_object(
     exec: bool,
 ) -> Result<(), PagingError> { unsafe {
     for i in 0..pages {
+        let _step = OneStep::new();
         let va = virt + i * PAGE_SIZE;
         let (_, _, _, pti) = table_indices(va);
         let pt = walk_create(pml4_phys, va, USER)?;
@@ -572,6 +607,7 @@ pub unsafe fn reserve_object(
 /// # Safety
 /// `pml4_phys` must point to a valid, identity-mapped PML4 table.
 pub unsafe fn marker(pml4_phys: usize, virt: usize) -> Option<u64> { unsafe {
+    let _step = OneStep::new();
     let (pml4i, pdpti, pdi, pti) = table_indices(virt);
     let e = table_at(pml4_phys).entries[pml4i];
     if !e.is_present() {
@@ -727,6 +763,7 @@ unsafe fn back_object(pml4_phys: usize, virt: usize, raw: u64, may_block: bool) 
 /// a table — a reservation is a non-present entry with `MARKER` at either.
 /// Noughts where there is nothing.
 pub unsafe fn entries_of(pml4_phys: usize, virt: usize) -> (u64, u64) { unsafe {
+    let _step = OneStep::new();
     let (pml4i, pdpti, pdi, pti) = table_indices(virt);
     let e = table_at(pml4_phys).entries[pml4i];
     if !e.is_present() {
@@ -751,6 +788,9 @@ pub unsafe fn peek_user(pml4_phys: usize, virt: usize) -> Option<u64> { unsafe {
     if virt & 7 != 0 || !user_range_ok(virt & !0xFFF, 1) || !user_range_ok(end & !0xFFF, 1) {
         return None;
     }
+    // The entry looked at and the word read in one step: the page cannot
+    // go between the two.
+    let _step = OneStep::new();
     let (_, pte) = entries_of(pml4_phys, virt);
     if pte & (PRESENT | USER) != PRESENT | USER {
         return None;
@@ -1102,6 +1142,7 @@ pub unsafe fn shared_objects_in(pml4_phys: usize, virt: usize, pages: usize, out
     let mut va = virt;
     let mut n = 0;
     while va < end {
+        let _step = OneStep::new();
         let Some(pt) = leaf_table(pml4_phys, va) else {
             va = next_boundary(va, 1 << 21);
             continue;
@@ -1135,6 +1176,7 @@ pub unsafe fn range_is_free(pml4_phys: usize, virt: usize, pages: usize) -> bool
     let end = virt + pages * PAGE_SIZE;
     let mut va = virt;
     while va < end {
+        let _step = OneStep::new();
         let (pml4i, pdpti, pdi, pti) = table_indices(va);
         let e4 = table_at(pml4_phys).entries[pml4i];
         if e4.raw() == 0 {
@@ -1183,6 +1225,9 @@ pub unsafe fn clear_range(pml4_phys: usize, virt: usize, pages: usize) -> usize 
     let mut va = virt;
     let mut freed = 0;
     while va < end {
+        // A step a table: each looks from the top again, and what it
+        // clears, frees and gives back is done before anything else runs.
+        let _step = OneStep::new();
         let (pml4i, pdpti, pdi, _) = table_indices(va);
         let e4 = table_at(pml4_phys).entries[pml4i];
         if !e4.is_present() {
@@ -1251,6 +1296,7 @@ pub unsafe fn clear_range(pml4_phys: usize, virt: usize, pages: usize) -> usize 
 /// # Safety
 /// `pml4_phys` must point to a valid, identity-mapped PML4 table.
 pub unsafe fn walk_flags(pml4_phys: usize, virt: usize) -> Option<u64> { unsafe {
+    let _step = OneStep::new();
     let (pml4i, pdpti, pdi, pti) = table_indices(virt);
 
     // A page is user-accessible only if USER is set at *every* level of the
@@ -1304,6 +1350,7 @@ pub unsafe fn permits(pml4_phys: usize, virt: usize, write: bool, exec: bool) ->
     if (virt as u64) < USER_MIN_ADDR || (virt as u64) >= USER_ADDR_LIMIT {
         return false;
     }
+    let _step = OneStep::new();
     let (pml4i, pdpti, pdi, pti) = table_indices(virt);
     // Every level has to agree: present, for ring 3, writable if it is a
     // write, and not marked as data if it is being run.
@@ -1352,6 +1399,7 @@ fn synth_flags(user: bool, writable: bool) -> u64 {
 /// # Safety
 /// `pml4_phys` must point to a valid, identity-mapped PML4 table.
 pub unsafe fn leaf_flags(pml4_phys: usize, virt: usize) -> Option<u64> { unsafe {
+    let _step = OneStep::new();
     let (pml4i, pdpti, pdi, pti) = table_indices(virt);
 
     let e = table_at(pml4_phys).entries[pml4i];
@@ -1382,6 +1430,7 @@ pub unsafe fn leaf_flags(pml4_phys: usize, virt: usize) -> Option<u64> { unsafe 
 /// # Safety
 /// `pml4_phys` must point to a valid, identity-mapped PML4 table.
 pub unsafe fn translate(pml4_phys: usize, virt: usize) -> Option<usize> { unsafe {
+    let _step = OneStep::new();
     let (pml4i, pdpti, pdi, pti) = table_indices(virt);
 
     let e = table_at(pml4_phys).entries[pml4i];
@@ -1551,6 +1600,7 @@ pub unsafe fn unmap_page(
     pml4_phys: usize,
     virt_addr: usize,
 ) -> Result<(usize, u64), PagingError> { unsafe {
+    let _step = OneStep::new();
     let (pml4i, pdpti, pdi, pti) = table_indices(virt_addr);
 
     let pml4 = table_at(pml4_phys);

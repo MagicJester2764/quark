@@ -397,6 +397,22 @@ may keep — are in `../quarkutils/CLAUDE.md`; these are the kernel's.
   and free tables still in use. The kernel backs a reserved page before it
   touches it (`validate_user_range`, the futex path), and a page fault on one
   is served, so the first touch from anywhere gives it its frame.
+- **A walk of a program's tables is one step** (`paging::OneStep`): from
+  the first entry it reads to the last it writes, with interrupts off. An
+  unmap gives back a table it leaves empty, and the directory above it if
+  that is empty too (`reclaim_empty_tables`), and a system call is
+  preempted wherever a tick finds it — so a walk that had read its way down
+  and was preempted went on in a table another thread of the program had
+  since given back. A map filled in a directory that was nobody's: the page
+  was in no table the program could reach, and the program faulted on the
+  page it had just been given; and the entry was written into a frame that
+  may by then have been somebody else's. `kstress mix` met it within
+  seconds on eight processors, and `dtest tables` — two threads kept to one
+  processor, each mapping and unmapping a page under one directory — meets
+  it every time on one. A new walk takes a `OneStep`, or is only called
+  from one that has (`back`, `own`, `unshare`, the fork's copy and
+  reclaim's takes take their own); one that has to wait in the middle
+  walks again afterwards, as `back_object` does.
 - **A fault in ring 3 ends the program, never the machine.** Every task of
   the program that faulted exits with the negated Linux signal number
   (`idt.rs`), and only a fault taken in ring 0 halts. musl's `abort()` is a
