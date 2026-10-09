@@ -181,7 +181,9 @@ if it would run there at once: that one has nothing to do, or runs
 something the task outranks. If not, it waits on one that is asleep, which
 is woken — one whose core has nothing else to run first, then one in the
 same package — or, if it outranks something running and none sleeps, on
-the processor running the worst. A task preempted waits where it was.
+the processor running the worst. Put to wait on another processor running
+something worse, it interrupts that one, which switches to it at once
+rather than at its tick. A task preempted waits where it was.
 
 Not a reply to a call, though: the caller goes to the front of the queue
 of the processor answering, which is about to wait for the next call, and
@@ -222,8 +224,6 @@ uses them well, and the difference is a list:
   that does not stop a third — and an order to take them in, written down,
   because a kernel with more than one lock has a way to deadlock that a
   kernel with one has not.
-- **A better task waking that interrupts the processor running the worst**,
-  instead of waiting for a tick.
 - **A processor that takes no ticks while it has nothing to do.**
 - **Interrupts from devices on any processor.** The I/O APIC can send one
   anywhere; every one still goes to the first.

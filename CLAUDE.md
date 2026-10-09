@@ -1328,14 +1328,18 @@ What follows from that, and breaking any of it is quiet:
   twentieth of a second in each to stop it with.
 - **What outranks the running task runs when it is made ready, where the
   kernel can say so**: at the end of the system call that made it ready
-  (`note_ready`, `preempt_if_asked` in `syscall_dispatch`), and when the
-  clock wakes it between ticks (`woken`). Outranking is one question
-  (`outranked`: a better band, or a higher real-time priority in the same
-  one while the processor's share lasts), and a hand-over asks it too: a
-  direct switch to an ordinary callee must not skip a real-time task any
-  more than a worse band may skip a better. Anywhere else a wake waits for
-  the tick: a FIFO thread woken through a futex by one that goes on
-  computing would wait out the rest of that one's turn.
+  (`note_ready`, `preempt_if_asked` in `syscall_dispatch`), when the
+  clock wakes it between ticks (`woken`), and — put to wait on another
+  processor running something worse — by interrupting that one, which
+  switches in the handler (`enqueue`, `kicked`): a FIFO thread woken while
+  every processor computed waited half a tick there, eight milliseconds
+  at worst, and runs within ten microseconds (`wakelatency` in
+  `../quarkutils`). Not for a reply: the caller runs where its answerer
+  waits. Outranking is one question (`outranked`: a better band, or a
+  higher real-time priority in the same one while the processor's share
+  lasts), and a hand-over asks it too: a direct switch to an ordinary
+  callee must not skip a real-time task any more than a worse band may
+  skip a better.
 
 A system call runs with interrupts on, so anything the scheduler does in more
 than one step is a tick away from being done in half. Three of these were
@@ -1668,9 +1672,7 @@ breaking any of them is quiet until it is a machine that stops.
 - A task woken on time runs at once only if it is of a better band than what
   the first processor is running, or of a higher real-time priority in the
   same band, or a processor is idle: one of the same band waits its turn, as
-  any woken task does. On several processors a real-time task made ready
-  runs at once only on the processor that made it ready, or one that is
-  idle; elsewhere it waits for a tick. A FIFO task that is preempted goes
+  any woken task does. A FIFO task that is preempted goes
   behind its equals rather than ahead of them, as POSIX would have it, and
   `SCHED_BATCH`, `SCHED_IDLE`, `SCHED_DEADLINE` and `SCHED_RESET_ON_FORK`
   are refused.
@@ -1690,9 +1692,8 @@ breaking any of them is quiet until it is a machine that stops.
   processor; a system call, a fault or an interrupt waits for the kernel to
   be empty. So `IrqSpinLock` still panics on contention, and rightly: under
   the kernel lock, contention can still only mean re-entrancy. Taking the
-  lock apart is its own project. With it go: a better task waking that
-  interrupts whichever processor is running the worst rather than waiting
-  for its tick, and an idle processor that takes no ticks.
+  lock apart is its own project. With it goes an idle processor that
+  takes no ticks.
 - Every device interrupts the first processor, a message included. The
   I/O APIC's lines above the sixteen ISA interrupts are not used: which
   device is on which is in the firmware's bytecode, not its tables. A

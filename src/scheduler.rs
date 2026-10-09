@@ -1307,7 +1307,17 @@ unsafe fn enqueue(tid: usize) { unsafe {
     runq::join(tid, cpu, p);
     runq::link(tid, cpu, p, false);
     note_ready(tid);
-    crate::smp::wake(cpu);
+    // Another processor: woken if it sleeps, and interrupted if what it
+    // runs is worse — it runs this now, not at its tick, which was half a
+    // tick on average for a real-time thread woken while every processor
+    // computed. This one gives way at the end of the call (`note_ready`).
+    if cpu != crate::percpu::index() {
+        if crate::percpu::napping(cpu) {
+            crate::smp::wake(cpu);
+        } else if better(place_of(tid), place_of(crate::percpu::current_of(cpu))) {
+            crate::smp::interrupt(cpu);
+        }
+    }
 }}
 
 /// Put the task this processor was running back in its queue here: its
@@ -1451,13 +1461,21 @@ pub fn arrived() {
 /// Another processor has interrupted this one to have it look at what it
 /// is doing. For a task in ring 3 the looking is [`arrived`], on the way
 /// back there. For a processor with nothing to do, it is this: something
-/// has been made ready.
+/// has been made ready. And for one running something worse than a task
+/// just put to wait here (`enqueue`), it is the switch to that task.
 pub fn kicked() {
     if !INITIALIZED.load(Ordering::SeqCst) {
         return;
     }
     unsafe {
-        if crate::percpu::current() == 0 && anything_to_run() {
+        let current = crate::percpu::current();
+        if current == 0 {
+            if anything_to_run() {
+                schedule_inner(true);
+            }
+        } else if outranked(current) {
+            // Something better has been put to wait here: it runs now.
+            st(current).slice_left = 0;
             schedule_inner(true);
         }
     }
