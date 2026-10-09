@@ -1,6 +1,6 @@
 # Quark syscall ABI
 
-**Version 4.7.** Query the running kernel with `SYS_ABI_VERSION` (240), which
+**Version 4.8.** Query the running kernel with `SYS_ABI_VERSION` (240), which
 returns `(major << 16) | minor`.
 
 This document is the contract between the Quark kernel and everything above it.
@@ -282,6 +282,7 @@ numbers, and only 64 could name it before, through a range check.
 | 4.5 | **A program's own FS and GS bases, and the ways into the kernel and out made safe for them.** No new number. Where the processor has FSGSBASE (CPUID leaf 7, EBX bit 0) it is on: a program reads and writes its FS and GS bases itself (`rdfsbase`, `wrfsbase`, `rdgsbase`, `wrgsbase`), where each was refused as an invalid instruction. A task's two are its own — kept across a switch, copied by `SYS_FORK`, cleared by `SYS_EXEC_SPACE` — and `SYS_SET_FS_BASE` still sets the first. A userland that builds a program's auxiliary vector says so with `AT_HWCAP2` bit 1 (`HWCAP2_FSGSBASE`), for a kernel of 4.5 or later on such a processor. And three ways for any program to halt the machine are gone, each of which FSGSBASE would have let it make worse by choosing the GS base the kernel then ran on: the page below 2^47 is nobody's (`USER_ADDR_LIMIT` is 0x7FFF_FFFF_F000, where it was 2^47: a `syscall` in its last two bytes went back to 2^47, which is no address, and Intel's `sysret` faults on that in ring 0); `SYS_EXEC_SPACE` refuses an entry or a stack outside the program's half, where it looked only at the bottom (the `iretq` into one at 2^47 faulted in ring 0, on any processor); and a `syscall` clears TF and NT of its caller's flags (with TF set the call trapped at the kernel's first instruction, on the program's stack; with NT the return from a signal handler faulted). |
 | 4.6 | **What a program is told about processors.** `SYS_CPU_INFO` (218): which processors are online, how each has spent its time — running programs, running the kernel, with nothing to do and taking interrupts, with the interrupts it took and the switches it made — where each sits (its APIC id, package, core and thread), and which processor a task last ran on. And each processor's number is in its TSC_AUX, where it has one, for `RDPID` and `RDTSCP` in ring 3. |
 | 4.7 | **Which processors a task may run on.** `SYS_AFFINITY` (219): a set of 256 processors for each task, read and given — Linux's `sched_setaffinity` and `sched_getaffinity`. All of them unless said otherwise; given to the threads and children a task makes, and kept by `SYS_EXEC_SPACE`. A task waits, runs and is taken only where its set allows. |
+| 4.8 | **A processor offline, and back.** `SYS_CPU_ONLINE` (220) takes a processor offline and brings it back, with the new right `Processors` (capability 17), which the first task holds; the first processor is never taken offline. Offline, a processor runs nothing: what it was running and what waited for it go on elsewhere — a task that may run nowhere else is let run anywhere online — and it is not among the online processors `SYS_CPU_INFO` names, nor in a set `SYS_AFFINITY` reads. Its number stays its own: `SYS_CPUS` says how many processors the machine has started, online or not. Up to 256 processors, where there were sixteen. |
 
 ### Deprecated
 
@@ -336,6 +337,7 @@ slot's number never moves, and a slot past the room a space has is empty:
 | 14 | `PciDevice` | a PCI device, `bus << 8 \| device << 3 \| function` (`0xFFFF_FFFF` = every one) | — |
 | 15 | `NetAdmin` | — | — |
 | 16 | `RealTime` | — | — |
+| 17 | `Processors` | — | — |
 
 Delegation may narrow a capability but never widen it; delegating at equal
 breadth is allowed, since a set is a subset of itself.
@@ -1316,9 +1318,12 @@ timing alone, which is guessable, and the kernel says so on the serial line
 block function against the RFC's test vector at boot and will not start if it
 is wrong.
 
-**Processors.** `SYS_CPUS` says how many processors are running the system:
+**Processors.** `SYS_CPUS` says how many processors the system has started:
 the ones the firmware listed that could be started, 256 at most, and 1
-on a machine with no ACPI tables or no local APIC. They are numbered from 0,
+on a machine with no ACPI tables or no local APIC — those taken offline
+since among them (`SYS_CPU_ONLINE`), so that a processor's number is below
+it whether it is online or not. Which are online is `SYS_CPU_INFO`'s to say.
+They are numbered from 0,
 and the upper half of the answer is the one the caller was on when it asked
 — which is true of that instant and no other, since a task is run by
 whichever processor takes it next and nothing yet says which.
@@ -1998,10 +2003,12 @@ set together or not at all.
 |---|---|---|---|---|
 | 218 | `SYS_CPU_INFO` | arg0 = op: 0, which processors are online — arg1 = where, arg2 = its length (32 bytes at least); 1, how a processor has spent its time — arg1 = the processor, or `u64::MAX` for all of them, arg2 = where eight words go; 2, where a processor sits — arg1 = the processor, arg2 = where four words go; 3, the processor a task last ran on — arg1 = the task, 0 for the caller | op 0: how many are online; ops 1 and 2: 0; op 3: the processor; `u64::MAX` for a processor or a task there is not, or a buffer that is not the caller's | — |
 | 219 | `SYS_AFFINITY` | arg0 = op: 0 read, 1 set; arg1 = a task, 0 for the caller; arg2 = where the set is, or goes: 256 bits, a processor each, from bit 0 of the first of four words | 0 / `u64::MAX` for no such task, a buffer that is not the caller's, or a set with no processor that is online; `u64::MAX - 1` for a task the caller may not say this of | — |
+| 220 | `SYS_CPU_ONLINE` | arg0 = 0 take offline, 1 bring back; arg1 = which processor, not 0 | 0, once it has been done / `u64::MAX - 1` when the caller may not / `u64::MAX` | `Processors` |
 
 Processors are numbered from 0, the first processor 0, and the number is the
 one `SYS_CPUS` says a caller is on. Op 0 writes a set of 256 bits, one for
-each processor that is online, from bit 0 of the first word.
+each processor that is online, from bit 0 of the first word, and answers
+how many there are: those started and not taken offline.
 
 Op 1's eight words: the nanoseconds the processor has spent running
 programs, running the kernel, with nothing to do and taking interrupts, by
@@ -2037,6 +2044,20 @@ own program, or one it may say how it runs of, as for `SYS_NICE`. A set with
 no processor that is online in it is refused; one that leaves out where the
 task waits or runs moves it — a task running on another processor moves
 when that processor next comes into the kernel, the caller at once.
+
+`SYS_CPU_ONLINE` (from 4.8) takes a processor offline, and brings it back:
+for a holder of `Processors` (capability 17), which the first task holds,
+and never the first processor, which the clock and every device interrupt.
+Taken offline, a processor runs nothing: what it was running moves to
+another as it next comes into the kernel, what was waiting to run there is
+put to wait elsewhere, and it stops — taking no tick, asked nothing. A task
+that may run on no processor online — kept to that one — may run on any,
+as Linux lets it (and reads its affinity as what is online); one waiting
+in a call when its processor went runs elsewhere when the call is done.
+The call comes back once the processor has stopped, or, brought back, is
+running again; a processor's time while it is offline is none of the
+four, and its idle time grows again from when it is back. Its number stays
+its own, and `/proc` leaves it out until then.
 
 From 4.6 each processor's number is in its TSC_AUX too, where it has one
 (RDTSCP, CPUID 0x8000_0001 EDX bit 27; RDPID, leaf 7 ECX bit 22): a program

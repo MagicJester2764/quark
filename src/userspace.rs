@@ -469,8 +469,9 @@ pub fn spawn_init(elf_data: &[u8], fb: Option<crate::multiboot2::FramebufferInfo
             // And every PCI device, to hand each driver its own.
             crate::cap::insert_last(cs, crate::cap::CapType::PciDevice, crate::pci::ANY);
             // And the right to run a task in a real-time class, for whoever
-            // it decides may.
+            // it decides may; and to take a processor offline.
             crate::cap::insert_last(cs, crate::cap::CapType::RealTime, 0);
+            crate::cap::insert_last(cs, crate::cap::CapType::Processors, 0);
         });
         task.context.rip = enter_user_trampoline as *const () as u64;
         task.context.r12 = entry;

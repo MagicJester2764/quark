@@ -122,7 +122,9 @@ fn settle() {
         let me = percpu::index();
         let count = percpu::count();
         let mut asked = [0u64; percpu::MAX_CPUS / 64];
-        for cpu in (0..count).filter(|&cpu| cpu != me) {
+        // Not one that is stopped, taken offline: it forgets everything as
+        // it comes back (`smp::park`).
+        for cpu in (0..count).filter(|&cpu| cpu != me && !percpu::parked(cpu)) {
             if every || known[..n].contains(&percpu::cr3_of(cpu)) {
                 percpu::ask_flush(cpu);
                 crate::lapic::send(percpu::apic_id(cpu), crate::idt::VEC_FLUSH);

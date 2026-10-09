@@ -1655,6 +1655,23 @@ breaking any of them is quiet until it is a machine that stops.
   and the kernel tells the new driver: a stray, which a driver has to
   expect. `SYS_IRQ_REGISTER` is for the sixteen and refuses the rest, or a
   driver with the capability for any line could take another's.
+- **A processor taken offline runs nothing, and nothing asks it anything**
+  (`smp::set_online`, `park`). It is said to be offline at once
+  (`percpu::set_offline`), and from then every way a task comes to a
+  processor asks whether it is online (`may_run_on`): placement, a pull,
+  balancing, a hand-over, a task put back after its turn. What it runs
+  moves at its next door, as for an affinity that no longer has it; what
+  waits there is given to the others from its idle loop
+  (`runq::give_away`); then it parks — no lock, no tick, an interrupt
+  answered and nothing more (`idt::irq_handler`) — and a shootdown skips
+  it (`tlb::settle`), so it forgets every translation as it comes back,
+  before it touches anything that may have changed: no page is global, and
+  loading CR3 is all of it. A task kept only to processors that are offline
+  may run on any (`runq::place_for`), as on Linux, or it would never run
+  again. The first processor is never taken offline: the clock and every
+  device are its. A new walk of the processors asks `percpu::online`, and a
+  new way to ask one to do something asks it of online ones, or is
+  answered by a parked one without the kernel.
 - **The other processors are started before there is a task** (`smp::start`
   in `kernel_main`), with what the first processor has turned on: CR0, CR4,
   EFER, the `syscall` MSRs, x2APIC mode (`lapic::init_other`: one that has

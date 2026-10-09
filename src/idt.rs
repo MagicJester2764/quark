@@ -1083,6 +1083,13 @@ extern "C" fn irq_handler(frame: &mut InterruptFrame) {
         VEC_SPURIOUS => return,
         _ => {}
     }
+    // A processor taken offline answers nothing but being brought back,
+    // which it looks for itself, and takes nothing from the kernel to do it
+    // (`smp::park`).
+    if crate::percpu::parked(crate::percpu::index()) {
+        crate::lapic::eoi();
+        return;
+    }
     let took = crate::klock::enter();
     if frame.cs & 3 != 0 {
         unsafe { crate::usage::entered(scheduler::current_tid()) };

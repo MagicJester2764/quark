@@ -129,19 +129,21 @@ pub const IN_PROGRAM: u8 = 0;
 pub const IN_KERNEL: u8 = 1;
 pub const IDLE: u8 = 2;
 pub const IN_INTERRUPT: u8 = 3;
+/// Taken offline: counted as none of the four, and said nowhere.
+pub const OFFLINE: u8 = 4;
 
 /// What a processor has spent its time on, by the clock, and what it has
 /// done: nanoseconds at each of the four, the interrupts it took, and the
 /// times it went from one task to another.
 #[derive(Clone, Copy)]
 struct Spent {
-    ns: [u64; 4],
+    ns: [u64; 5],
     interrupts: u64,
     switches: u64,
 }
 
 impl Spent {
-    const ZERO: Spent = Spent { ns: [0; 4], interrupts: 0, switches: 0 };
+    const ZERO: Spent = Spent { ns: [0; 5], interrupts: 0, switches: 0 };
 }
 
 /// Each processor's, counted to its last change — which its next door, its
@@ -439,13 +441,10 @@ pub fn cpu_info(caller: usize, op: u64, a: u64, b: u64) -> u64 {
             if b < 32 || !crate::syscall::validate_user_ptr_mut(a, 32) {
                 return u64::MAX;
             }
-            let mut set = [0u64; 4];
-            for i in 0..count.min(256) {
-                set[i / 64] |= 1 << (i % 64);
-            }
+            let (set, online) = crate::percpu::online_set();
             let _ua = crate::cpu::UserAccess::begin();
             unsafe { core::ptr::write_unaligned(a as *mut [u64; 4], set) };
-            count as u64
+            online as u64
         }
         1 => {
             if (a != u64::MAX && a as usize >= count) || !crate::syscall::validate_user_ptr_mut(b, 64) {
@@ -658,13 +657,8 @@ pub fn affinity(caller: usize, op: u64, tid: u64, buf: u64) -> u64 {
             // and a C library that counts the bits to say how many processors
             // there are said 256.
             let mut set = crate::scheduler::affinity_of(target);
-            let count = crate::percpu::count().min(256);
-            for (i, word) in set.iter_mut().enumerate() {
-                let online = match count.saturating_sub(i * 64) {
-                    0 => 0,
-                    n if n >= 64 => u64::MAX,
-                    n => (1u64 << n) - 1,
-                };
+            let (online, _) = crate::percpu::online_set();
+            for (word, online) in set.iter_mut().zip(online) {
                 *word &= online;
             }
             let _ua = crate::cpu::UserAccess::begin();
@@ -683,7 +677,8 @@ pub fn affinity(caller: usize, op: u64, tid: u64, buf: u64) -> u64 {
                 let _ua = crate::cpu::UserAccess::begin();
                 unsafe { core::ptr::read_unaligned(buf as *const [u64; 4]) }
             };
-            if !(0..crate::percpu::count().min(256)).any(|cpu| set[cpu / 64] >> (cpu % 64) & 1 == 1) {
+            let (online, _) = crate::percpu::online_set();
+            if !set.iter().zip(online).any(|(word, online)| word & online != 0) {
                 return u64::MAX;
             }
             crate::scheduler::set_affinity(target, set);

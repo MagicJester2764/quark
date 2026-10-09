@@ -154,6 +154,10 @@ pub enum CapType {
     /// its band. No parameters. Leaving one takes nothing. The first task
     /// holds it, and a session whose account has the right.
     RealTime = 16,
+    /// Permission to take a processor offline and to bring it back
+    /// (`SYS_CPU_ONLINE`). No parameters. The first task holds it, and a
+    /// session whose account has the right.
+    Processors = 17,
 }
 
 /// A `MemObject`'s access bits.
@@ -793,6 +797,17 @@ pub fn task_has_realtime(tid: usize) -> bool {
     }
 }
 
+/// Check if a task has the Processors capability.
+pub fn task_has_processors(tid: usize) -> bool {
+    if tid >= MAX_TASKS { return false; }
+    unsafe {
+        match task_cspace(tid) {
+            Some(cs) => cs.iter().any(|cap| cap.cap_type as u8 == CapType::Processors as u8 && is_valid(cap)),
+            None => false,
+        }
+    }
+}
+
 /// Check if a task has the Power capability.
 pub fn task_has_power(tid: usize) -> bool {
     if tid >= MAX_TASKS { return false; }
@@ -1039,7 +1054,8 @@ pub fn insert_kernel_range(cspace: &mut CSpace, base: usize, len: usize) -> bool
 /// right to keep what is written out of memory ([`CapType::Swap`]), the
 /// right to run its network ([`CapType::NetAdmin`]), every
 /// PCI device ([`CapType::PciDevice`], `pci::ANY`), the right to run a task
-/// in a real-time class ([`CapType::RealTime`]) — in its last free
+/// in a real-time class ([`CapType::RealTime`]), the right to take a
+/// processor offline ([`CapType::Processors`]) — in its last free
 /// slot of the first [`FIRST_CAPS`]. The first task names its
 /// low slots itself — where it keeps the nameserver's endpoint, where it
 /// mints what it hands on — and counts on the ones it has not filled being
@@ -1126,6 +1142,7 @@ pub fn validate_attenuation(source: &CapSlot, new_type: CapType, new_p0: u64, ne
         CapType::Swap => true,
         CapType::NetAdmin => true,
         CapType::RealTime => true,
+        CapType::Processors => true,
         // Every device covers each one; one covers itself.
         CapType::PciDevice => {
             (new_p0 <= 0xFFFF || new_p0 == crate::pci::ANY)

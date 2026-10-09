@@ -269,6 +269,8 @@ pub const SYS_TASK_NAME: u64 = 215;
 pub const SYS_CPU_INFO: u64 = 218;
 /// Which processors a task may run on (`usage::affinity`).
 pub const SYS_AFFINITY: u64 = 219;
+/// A processor taken offline, and brought back: needs `Processors`.
+pub const SYS_CPU_ONLINE: u64 = 220;
 /// Timers, in the time block.
 pub const SYS_TIMER_CREATE: u64 = 146;
 pub const SYS_TIMER_SET: u64 = 147;
@@ -515,7 +517,7 @@ pub const SYS_ABI_VERSION: u64 = 240;
 /// minor when calls are added. User space can refuse to run against a major it
 /// does not know, which is the point of exposing it at all.
 pub const ABI_VERSION_MAJOR: u64 = 4;
-pub const ABI_VERSION_MINOR: u64 = 7;
+pub const ABI_VERSION_MINOR: u64 = 8;
 
 /// How many tasks a program may have with no capability at all: its own, and
 /// the children it has made and not collected, by `SYS_TASK_CREATE`,
@@ -4297,6 +4299,10 @@ fn dispatch(
         }
         SYS_CPU_INFO => crate::usage::cpu_info(scheduler::current_tid(), arg0, arg1, arg2),
         SYS_AFFINITY => crate::usage::affinity(scheduler::current_tid(), arg0, arg1, arg2),
+        SYS_CPU_ONLINE => match arg0 {
+            0 | 1 => crate::smp::set_online(scheduler::current_tid(), arg1 as usize, arg0 == 1),
+            _ => u64::MAX,
+        },
         SYS_GETRANDOM => {
             // arg0 = buffer, arg1 = length, arg2 = flags (none yet). No
             // capability: a random number is nobody's secret until it has
@@ -4894,6 +4900,7 @@ fn dispatch(
                 14 => crate::cap::CapType::PciDevice,
                 15 => crate::cap::CapType::NetAdmin,
                 16 => crate::cap::CapType::RealTime,
+                17 => crate::cap::CapType::Processors,
                 _ => return u64::MAX,
             };
             let tid = scheduler::current_tid();

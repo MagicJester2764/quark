@@ -325,6 +325,83 @@ extern "C" fn arrive(index: usize) -> ! {
     crate::scheduler::idle()
 }
 
+/// `SYS_CPU_ONLINE`: take processor `cpu` offline, or bring it back
+/// (`online`), for a caller with the right to (`Processors`). Not the
+/// first: the clock and every device are its. Comes back once it has been
+/// done — taken offline, the processor has moved what it was running and
+/// given away what waited for it, and stopped (`park`); brought back, it
+/// is in the kernel again.
+///
+/// Taken offline, it is said to be at once (`percpu::set_offline`), which
+/// is what keeps everything off it from then: placement, pulls, balancing
+/// and a task's affinity all ask `percpu::online`. Then it is interrupted,
+/// and moves itself what it is running at its door (`arrived`), as for a
+/// task whose affinity no longer has it.
+pub fn set_online(caller: usize, cpu: usize, online: bool) -> u64 {
+    if !crate::cap::task_has_processors(caller) {
+        return u64::MAX - 1;
+    }
+    if cpu == 0 || cpu >= percpu::count() {
+        return u64::MAX;
+    }
+    let flags: u64;
+    unsafe { core::arch::asm!("pushfq; pop {}; cli", out(reg) flags, options(nostack)) };
+    if online {
+        if !percpu::online(cpu) {
+            percpu::set_back(cpu, true);
+            interrupt(cpu);
+        }
+    } else if percpu::online(cpu) {
+        percpu::set_offline(cpu, true);
+        interrupt(cpu);
+    }
+    if flags & (1 << 9) != 0 {
+        unsafe { core::arch::asm!("sti", options(nostack, nomem)) };
+    }
+    // Asleep a millisecond at a time until it has: in no hurry, and a
+    // caller that was on that processor is moved off it by sleeping.
+    let began = crate::clock::now();
+    loop {
+        let done = if online { percpu::online(cpu) && !percpu::parked(cpu) } else { percpu::parked(cpu) };
+        if done {
+            return 0;
+        }
+        if crate::clock::now() - began > 10_000_000_000 {
+            return u64::MAX;
+        }
+        let _ = crate::ipc::sys_recv_timeout(caller, 1_000_000);
+    }
+}
+
+/// Stop this processor, taken offline, until it is brought back: from its
+/// idle loop, its queues given away, holding the lock with interrupts off
+/// — and back in it the same way.
+///
+/// Stopped, it holds no lock, takes no tick, and runs nothing; an
+/// interrupt it takes is answered and nothing more (`idt::irq_handler`),
+/// but for being halted. Nobody asks it to forget a translation
+/// (`tlb::settle`), so it forgets all of them as it comes back, before it
+/// touches anything that may have changed: no page is global, and loading
+/// CR3 again is all of it.
+///
+/// # Safety
+/// As said; on a processor that is not the first.
+pub unsafe fn park() {
+    let me = percpu::index();
+    unsafe { crate::usage::now_doing(crate::usage::OFFLINE) };
+    percpu::set_parked(me, true);
+    crate::klock::release();
+    while !percpu::back_asked(me) {
+        unsafe { core::arch::asm!("sti; hlt; cli", options(nostack, nomem)) };
+    }
+    crate::klock::acquire();
+    unsafe { crate::paging::write_cr3(crate::paging::read_cr3()) };
+    percpu::set_back(me, false);
+    percpu::set_parked(me, false);
+    percpu::set_offline(me, false);
+    unsafe { crate::usage::now_doing(crate::usage::IDLE) };
+}
+
 /// Wake processor `cpu`, if it is asleep: something has been put in its
 /// queue for it to run.
 pub fn wake(cpu: usize) {

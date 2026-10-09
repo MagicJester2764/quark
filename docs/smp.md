@@ -96,6 +96,19 @@ brought online — those are counted, and said.
 A machine with no ACPI tables, one processor, or no usable local APIC is one
 processor with an 8259, as every machine was.
 
+## Offline and back
+
+Any processor but the first can be taken offline and brought back while
+the machine runs (`SYS_CPU_ONLINE`, by a holder of `Processors`). Offline,
+it is no place a task may run (`percpu::online`, which `may_run_on` asks),
+so nothing new comes to it; what it was running moves at its next door,
+and its idle loop gives what waited for it to the others and parks it
+(`smp::park`): in `hlt`, holding nothing, taking no tick, answering an
+interrupt with nothing more than its end, and left out of shootdowns — it
+forgets every translation as it comes back. Brought back, it takes the
+kernel lock again and is a processor like any other. A task that may run
+only where nothing is online is let run anywhere.
+
 ## Interrupts
 
 Devices and the clock interrupt the first processor. What time it is, is a

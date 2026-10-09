@@ -510,6 +510,27 @@ pub(super) unsafe fn takeable(me: usize) -> bool {
     unsafe { busiest(me, None).is_some() }
 }
 
+/// Everything waiting in processor `cpu`'s queues, put to wait where it may
+/// run: for a processor taken offline, which may run nothing.
+///
+/// # Safety
+/// Interrupts off, the kernel lock held.
+pub(super) unsafe fn give_away(cpu: usize) {
+    unsafe {
+        for p in 0..NUM_PRIORITIES {
+            loop {
+                let q = queue(cpu, p);
+                let t = [q.rt, q.front.0, q.fair].into_iter().find(|&t| t != END);
+                let Some(t) = t else { break };
+                unlink(t as usize);
+                if ready(t as usize) {
+                    super::enqueue(t as usize);
+                }
+            }
+        }
+    }
+}
+
 /// What waits first in processor `cpu`'s queues — the first of each band's
 /// real-time tasks, its front and its fair queue, looked at in that order —
 /// that a processor asleep may run, put to wait there instead: which
@@ -626,6 +647,12 @@ pub(super) unsafe fn moved(tid: usize, to: usize, p: usize) {
 pub(super) unsafe fn place_for(tid: usize) -> usize {
     unsafe {
         let count = crate::percpu::count();
+        // Kept to processors none of which is online — taken offline since
+        // — it is let run on any, as Linux lets it: a task that may run
+        // nowhere is a task that never runs again.
+        if !(0..count).any(|cpu| super::may_run_on(tid, cpu)) {
+            st(tid).allowed = [u64::MAX; 4];
+        }
         let may = |cpu: usize| super::may_run_on(tid, cpu);
         let last = (st(tid).last_cpu as usize).min(count - 1);
         // Where it may run at all, if not its last.

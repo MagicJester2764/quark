@@ -117,6 +117,15 @@ pub struct PerCpu {
     /// Another processor has taken mappings away and asks this one to
     /// forget what it has cached. Cleared by this one when it has.
     flush: AtomicBool,
+    /// Taken offline (`smp::set_online`): from when it is asked until it is
+    /// back, nothing is to run here, and what is here goes elsewhere.
+    offline: AtomicBool,
+    /// Stopped (`smp::park`): it has given the others what it had, holds no
+    /// translation anybody need tell it to forget, and answers nothing but
+    /// being brought back and being halted.
+    parked: AtomicBool,
+    /// Asked to come back.
+    back: AtomicBool,
 }
 
 const USER_RSP: usize = offset_of!(PerCpu, user_rsp);
@@ -244,6 +253,49 @@ pub fn idle_stack() -> (usize, usize) {
 #[inline]
 pub fn count() -> usize {
     ONLINE.load(Ordering::Relaxed)
+}
+
+/// Whether processor `cpu` is one of those started and not taken offline:
+/// one a task may be put to run on.
+#[inline]
+pub fn online(cpu: usize) -> bool {
+    cpu < count() && !unsafe { (*(&raw const CPUS[cpu].offline)).load(Ordering::Acquire) }
+}
+
+/// The processors online, a bit each, and how many.
+pub fn online_set() -> ([u64; 4], usize) {
+    let mut set = [0u64; 4];
+    let mut n = 0;
+    for cpu in (0..count().min(256)).filter(|&cpu| online(cpu)) {
+        set[cpu / 64] |= 1 << (cpu % 64);
+        n += 1;
+    }
+    (set, n)
+}
+
+/// Say whether processor `cpu` is taken offline.
+pub fn set_offline(cpu: usize, offline: bool) {
+    unsafe { (*(&raw const CPUS[cpu].offline)).store(offline, Ordering::Release) };
+}
+
+/// Whether processor `cpu` has stopped, taken offline (`smp::park`).
+#[inline]
+pub fn parked(cpu: usize) -> bool {
+    unsafe { (*(&raw const CPUS[cpu].parked)).load(Ordering::Acquire) }
+}
+
+/// Say whether processor `cpu` has stopped.
+pub fn set_parked(cpu: usize, parked: bool) {
+    unsafe { (*(&raw const CPUS[cpu].parked)).store(parked, Ordering::Release) };
+}
+
+/// Whether processor `cpu` has been asked to come back; and ask it, or say
+/// it has.
+pub fn back_asked(cpu: usize) -> bool {
+    unsafe { (*(&raw const CPUS[cpu].back)).load(Ordering::Acquire) }
+}
+pub fn set_back(cpu: usize, back: bool) {
+    unsafe { (*(&raw const CPUS[cpu].back)).store(back, Ordering::Release) };
 }
 
 /// Processor `index` has arrived, and its local APIC answers to `apic_id`.

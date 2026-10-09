@@ -2348,7 +2348,7 @@ pub fn task_is_live(tid: usize) -> bool {
 /// # Safety
 /// Interrupts off.
 unsafe fn may_run_on(tid: usize, cpu: usize) -> bool { unsafe {
-    cpu < 256 && st(tid).allowed[cpu / 64] >> (cpu % 64) & 1 == 1
+    cpu < 256 && st(tid).allowed[cpu / 64] >> (cpu % 64) & 1 == 1 && crate::percpu::online(cpu)
 }}
 
 /// The processors task `tid` may run on, a bit each.
@@ -2468,6 +2468,16 @@ pub fn idle() -> ! {
         // here wakes this processor (`smp::wake`). Started again when it
         // runs something (`switch_to`).
         unsafe { stop_tick() };
+        // Taken offline: what waits here goes to the others, and this one
+        // stops until it is brought back (`smp::park`).
+        let me = crate::percpu::index();
+        if !crate::percpu::online(me) {
+            unsafe {
+                runq::give_away(me);
+                crate::smp::park();
+            }
+            continue;
+        }
         // Said before the lock goes, so that whoever makes a task ready
         // next — which takes the lock — knows there is a processor to wake
         // for it (`smp::wake`).
