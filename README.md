@@ -208,8 +208,8 @@ make run
 ## Testing
 
 The kernel is tested from outside, through the ABI, by a program: `dtest` in
-quarkutils makes 1072 checks from user space, and more where the machine has
-more to ask about: 1109 on the machine ExplOSion tests on, and 1127 on it with
+quarkutils makes 1073 checks from user space, and more where the machine has
+more to ask about: 1110 on the machine ExplOSion tests on, and 1128 on it with
 four processors. A kernel change is verified by
 booting an image and running it — `tools/boot-test.sh` in ExplOSion — on one
 processor and on four.

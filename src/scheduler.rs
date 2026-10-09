@@ -3245,6 +3245,30 @@ pub fn pinned(space: u64, va: u64) -> bool {
     false
 }
 
+/// Whether a system call another task of program `space` is in has checked
+/// any of `[from, to)`. Interrupts must be off, and stay off until what is
+/// decided by it is done: that is what refuses an unmap of a buffer a call
+/// is waiting to copy into (`SYS_MUNMAP`, `SYS_ADDRSPACE_GIVE`,
+/// `shmem::unmap`).
+pub fn pinned_by_another(space: u64, from: u64, to: u64) -> bool {
+    let me = current_tid();
+    unsafe {
+        for tid in tids().filter(|&t| t >= 1 && t != me) {
+            let n = st(tid).npinned as usize;
+            if n == 0 {
+                continue;
+            }
+            if !matches!(*slot(tid), Some(ref t) if t.space == space && t.state != TaskState::Dead) {
+                continue;
+            }
+            if n > PINS || st(tid).pinned[..n].iter().any(|&(lo, hi)| lo < to && from <= hi) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Every task of program `space`, ended or not, until it is taken apart —
 /// the idle task aside — to `f`, with interrupts off.
 pub fn each_task_of(space: u64, mut f: impl FnMut(usize)) {

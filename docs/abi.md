@@ -823,7 +823,7 @@ call to a task that never reaches `SYS_RECV` blocks forever.
 |---|---|---|---|---|
 | 32 | `SYS_MMAP` | arg0 = vaddr, arg1 = pages | 0 / `u64::MAX` | — (quota enforced) |
 | 42 | `SYS_MMAP_FD` | arg0 = fd naming memory, arg1 = vaddr | bytes mapped / `u64::MAX` | — |
-| 33 | `SYS_MUNMAP` | arg0 = vaddr, arg1 = pages | 0 / `u64::MAX` | — |
+| 33 | `SYS_MUNMAP` | arg0 = vaddr, arg1 = pages | pages of the caller's own it had there / `u64::MAX` | — |
 | 34 | `SYS_PHYS_ALLOC` | arg0 = pages, arg1 = 1 for frames below four gigabytes | physical address / `u64::MAX` | `PhysAlloc` |
 | 35 | `SYS_PHYS_FREE` | arg0 = phys, arg1 = count | 0 / `u64::MAX` | `PhysAlloc` + frame ownership |
 | 36 | `SYS_ADDRSPACE_CREATE` | — | CR3 / `u64::MAX` | — |
@@ -874,6 +874,15 @@ a program.
 `SYS_ADDRSPACE_MAP` lends frames instead. They stay the caller's, so they are
 freed when the *caller* exits, even under a child still running on them, and
 never when the child does.
+
+**What a call has checked stays until it returns.** A call that waits — a
+read of a pipe, a wait on a futex — checks the memory it will copy to or
+from before it waits, and copies when it is woken. So `SYS_MUNMAP`,
+`SYS_ADDRSPACE_GIVE` and `SYS_SHMEM_UNMAP` are refused (`u64::MAX`) where
+a call another thread of the program is in has checked any of the range,
+and go through once it has returned. Unmapping a buffer another thread is
+reading into is a mistake in the program, and it is told so; the read
+goes on into the buffer it was given.
 
 Physical addresses are page aligned; a request that is not is rejected.
 

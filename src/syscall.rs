@@ -699,18 +699,18 @@ fn validate_user_range(addr: u64, len: u64, write: bool) -> bool {
         _ => return false,
     }
     let cr3 = paging::read_cr3();
+    // What is checked stays, until this call returns: it may wait, and then
+    // copy with interrupts off, where a page that had gone in the meantime
+    // could not be waited for — taken by reclaim (`reclaim.rs`), or
+    // unmapped by another thread of the program, which a pinned range
+    // refuses (`scheduler::pinned_by_another`). Pinned before it is looked
+    // at, so that what the look found is what stays: pinned after, an
+    // unmap between the two went through and left the call to write to
+    // nothing.
+    scheduler::pin(addr, len);
     // Reserved pages are given their memory before the kernel touches them,
     // and pages that were written out are brought back.
-    let ok = unsafe {
-        paging::back_range(cr3, addr, len, write).is_ok() && paging::user_range_accessible(cr3, addr, len, write)
-    };
-    if ok {
-        // And they stay, until this call returns: it may wait, and then
-        // copy with a lock held, where a page that had gone in the
-        // meantime could not be waited for (`reclaim.rs`).
-        scheduler::pin(addr, len);
-    }
-    ok
+    unsafe { paging::back_range(cr3, addr, len, write).is_ok() && paging::user_range_accessible(cr3, addr, len, write) }
 }
 
 /// Read-only user buffer check.
@@ -2478,8 +2478,17 @@ fn dispatch(
             // What was written out since the caller filled it comes back
             // first, and stays until this is done: it is the page that is
             // given, not a promise of one.
-            if unsafe { paging::back_range(own, from as u64, (pages * 4096) as u64, false) }.is_ok() {
-                scheduler::pin(from as u64, (pages * 4096) as u64);
+            scheduler::pin(from as u64, (pages * 4096) as u64);
+            let _ = unsafe { paging::back_range(own, from as u64, (pages * 4096) as u64, false) };
+            // From here to the last page moved, one step: nothing else of the
+            // program's can change what is checked before it goes. And not a
+            // page a call another thread of the program is in has checked —
+            // it may be waiting to copy to it, as for SYS_MUNMAP.
+            let flags = irq_save();
+            let space = crate::userspace::space_of(own);
+            if scheduler::pinned_by_another(space, from as u64, (from + pages * 4096) as u64) {
+                irq_restore(flags);
+                return u64::MAX;
             }
             // All of it is checked before any of it moves. Only memory the
             // caller owns may go — not a device, not shared memory, not a
@@ -2489,6 +2498,7 @@ fn dispatch(
                 let ours = unsafe { paging::leaf_flags(own, from + i * 4096) }
                     .is_some_and(|f| f & (paging::OWNED | paging::USER) == paging::OWNED | paging::USER);
                 if !ours || unsafe { paging::translate(cr3, virt + i * 4096) }.is_some() {
+                    irq_restore(flags);
                     return u64::MAX;
                 }
             }
@@ -2515,6 +2525,7 @@ fn dispatch(
                 let _ = unsafe { paging::unmap_page(own, here) };
                 moved += 1;
             }
+            irq_restore(flags);
             // No longer in the caller's address space, so no longer on its
             // account — as for SYS_MUNMAP.
             scheduler::current_task_uncharge_mem(moved);
@@ -3799,12 +3810,24 @@ fn dispatch(
                 return u64::MAX;
             }
             let cr3 = paging::read_cr3();
+            let space = crate::userspace::space_of(cr3);
+            // Not a page a call another thread of the program is in has
+            // checked: it may be waiting to copy to it with interrupts off,
+            // and would fault in the kernel on a page that is not there —
+            // the machine's end, not the program's. Asked and cleared in one
+            // step, so that no call checks the range in between.
+            let flags = irq_save();
+            if scheduler::pinned_by_another(space, vaddr as u64, (vaddr + pages * 4096) as u64) {
+                irq_restore(flags);
+                return u64::MAX;
+            }
             // Mappings and reservations alike. Only frames this address space
             // owns are returned to the PMM: shared-memory pages and device
             // MMIO are unmapped but never freed — otherwise munmap
             // double-frees a shmem region or hands the allocator a device
             // physical address.
             let freed = unsafe { paging::clear_range(cr3, vaddr, pages) };
+            irq_restore(flags);
             if freed > 0 {
                 scheduler::current_task_uncharge_mem(freed);
             }

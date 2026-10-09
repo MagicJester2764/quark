@@ -610,6 +610,13 @@ pub fn unmap(handle: usize, vaddr: usize) -> u64 {
             irq_restore(flags);
             return u64::MAX;
         }
+        // Not under a call another thread of the program is in and has
+        // checked, which may be waiting to copy to it (`SYS_MUNMAP`).
+        let end = (vaddr + region.page_count * 4096) as u64;
+        if scheduler::pinned_by_another(crate::userspace::space_of(cr3), vaddr as u64, end) {
+            irq_restore(flags);
+            return u64::MAX;
+        }
 
         for i in 0..region.page_count {
             // Ignore NotMapped errors — idempotent unmap. Never free the

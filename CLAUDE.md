@@ -138,7 +138,7 @@ system hung.
 
 There are no tests in this tree, and that is the shape of a microkernel rather
 than an omission: the kernel is tested from outside, through the ABI, by a
-program. `dtest` in `../quarkutils` makes 1072 checks — capabilities, IPC,
+program. `dtest` in `../quarkutils` makes 1073 checks — capabilities, IPC,
 memory, descriptors, signals, scheduling, users and terminals, `dtest calls`
 with three million calls in three seconds, `dtest smp` for what a second
 processor changes, `dtest turns` for whose turn a call runs on, `dtest idle`
@@ -154,8 +154,8 @@ twelve (`dtest msi`, `dtest devices`) with a device that interrupts by
 message and its driver running, eight (`dtest iommu`) where an IOMMU stands
 between that device and memory, eleven (`dtest usb`) with a keyboard, a
 mouse and a disk on USB, three (`dtest display`) where the display can be
-had another size, and seventeen (`dtest sound`) with a sound card: 1109 on
-the machine ExplOSion tests on, and 1127 on it with four processors — and
+had another size, and seventeen (`dtest sound`) with a sound card: 1110 on
+the machine ExplOSion tests on, and 1128 on it with four processors — and
 `qfuzz` throws random requests at every service. `callbench` says how many
 calls a second pairs of threads make, a pair to a processor, and `kstress`
 has every processor making calls, taking faults, waking and writing at
@@ -549,6 +549,16 @@ may keep — are in `../quarkutils/CLAUDE.md`; these are the kernel's.
   the call validated — or pins it itself, as the futex wait does its word.
   A fault in the kernel where interrupts were *on* may wait like one from
   ring 3 (`may_wait` in `idt.rs`): it could have been preempted there.
+  **Nor is it unmapped by the program's other threads**: `SYS_MUNMAP`,
+  `SYS_ADDRSPACE_GIVE` and an unmap of shared memory are refused where a
+  call another task of the program is in has checked any of the range
+  (`scheduler::pinned_by_another`), asked and done in one step. A thread
+  waiting to read a pipe into a page another thread unmapped was copied
+  into nothing when the write came — a fault in the kernel with interrupts
+  off, and any program's way to stop the machine (`dtest tables`, `dchild
+  unmapread`). And the pin is made before the check, not after it: an
+  unmap between the two went through. A new way to take a program's
+  mapping away asks too.
 - **Memory is taken only from what can do without it, and given up only
   when it is somewhere else.** `reclaim.rs` is the whole of it and says
   what and why; the rules it leaves:

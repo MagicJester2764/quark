@@ -274,6 +274,9 @@ fn word_ok(addr: u64) -> bool {
 /// faulting on it there would be a fault in the kernel with interrupts off,
 /// and a page written out and brought back is not the frame it was.
 fn held_word(cr3: usize, addr: u64) -> Option<Key> {
+    // Pinned before it is looked at, as `validate_user_range` pins: what
+    // the look finds is then what stays.
+    scheduler::pin(addr, 4);
     let usable = unsafe {
         crate::paging::back_range(cr3, addr, 4, false).is_ok()
             && crate::paging::user_range_accessible(cr3, addr, 4, false)
@@ -281,7 +284,6 @@ fn held_word(cr3: usize, addr: u64) -> Option<Key> {
     if !usable {
         return None;
     }
-    scheduler::pin(addr, 4);
     key_of(cr3, addr)
 }
 
@@ -609,6 +611,7 @@ pub unsafe fn word_at(cr3: usize, addr: u64) -> Option<&'static AtomicU32> {
 /// present, its own and kept so for the rest of the call — it is written —
 /// and its key.
 fn pi_word(cr3: usize, addr: u64) -> Option<Key> {
+    scheduler::pin(addr, 4);
     let usable = unsafe {
         crate::paging::back_range(cr3, addr, 4, true).is_ok()
             && crate::paging::user_range_accessible(cr3, addr, 4, true)
@@ -616,7 +619,6 @@ fn pi_word(cr3: usize, addr: u64) -> Option<Key> {
     if !usable {
         return None;
     }
-    scheduler::pin(addr, 4);
     key_of(cr3, addr)
 }
 
