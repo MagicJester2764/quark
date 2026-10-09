@@ -285,6 +285,23 @@ pub unsafe fn set_apic_id(apic_id: u32) {
     unsafe { (*(&raw const (*this()).apic_id)).store(apic_id, Ordering::Relaxed) };
 }
 
+/// Where each processor sits, as it said when it was started.
+static mut PLACES: [crate::cpu::Place; MAX_CPUS] = [crate::cpu::Place::NOWHERE; MAX_CPUS];
+
+/// Say where processor `index` — the one this runs on — sits.
+///
+/// # Safety
+/// On that processor, as it is started: before it is said to be online,
+/// after which it is read from anywhere.
+pub unsafe fn set_place(index: usize, place: crate::cpu::Place) {
+    unsafe { (*(&raw mut PLACES))[index] = place };
+}
+
+/// Where processor `cpu`, one that is online, sits.
+pub fn place(cpu: usize) -> crate::cpu::Place {
+    unsafe { (*(&raw const PLACES))[cpu] }
+}
+
 /// What processor `cpu`'s local APIC answers to.
 pub fn apic_id(cpu: usize) -> u32 {
     unsafe { (*(&raw const CPUS[cpu].apic_id)).load(Ordering::Relaxed) }

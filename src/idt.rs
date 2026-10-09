@@ -1060,6 +1060,9 @@ fn exception(frame: &mut InterruptFrame, cr2: u64) {
 /// stopped it, and sent this interrupt to say so.
 #[unsafe(no_mangle)]
 extern "C" fn irq_handler(frame: &mut InterruptFrame) {
+    // Every interrupt is counted, those that take nothing from the kernel
+    // too: `/proc/stat`'s `intr`.
+    unsafe { crate::usage::interrupt_taken() };
     match frame.vector as u8 {
         VEC_FLUSH => {
             crate::tlb::answer();
@@ -1081,7 +1084,11 @@ extern "C" fn irq_handler(frame: &mut InterruptFrame) {
     if frame.cs & 3 != 0 {
         unsafe { crate::usage::entered(scheduler::current_tid()) };
     }
+    // The processor's time is the interrupt's while it is handled, not
+    // whatever it interrupted: a program's, the kernel's, or nobody's.
+    let was = unsafe { crate::usage::now_doing(crate::usage::IN_INTERRUPT) };
     irq(frame);
+    unsafe { crate::usage::now_doing(was) };
     if frame.cs & 3 != 0 {
         scheduler::arrived();
         // A handler the kernel runs is run on the way back: this is what

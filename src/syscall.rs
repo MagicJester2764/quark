@@ -263,6 +263,10 @@ const NAME_GET: u64 = 1;
 /// What a task is called — a thread's name, Linux's `comm` — set and read,
 /// with `SYS_PROGRAM_NAME`'s operations.
 pub const SYS_TASK_NAME: u64 = 215;
+/// What each processor is, has done and is doing: which are online, how
+/// each has spent its time, where each sits, and which a task last ran on
+/// (`usage::cpu_info`).
+pub const SYS_CPU_INFO: u64 = 218;
 /// Timers, in the time block.
 pub const SYS_TIMER_CREATE: u64 = 146;
 pub const SYS_TIMER_SET: u64 = 147;
@@ -509,7 +513,7 @@ pub const SYS_ABI_VERSION: u64 = 240;
 /// minor when calls are added. User space can refuse to run against a major it
 /// does not know, which is the point of exposing it at all.
 pub const ABI_VERSION_MAJOR: u64 = 4;
-pub const ABI_VERSION_MINOR: u64 = 5;
+pub const ABI_VERSION_MINOR: u64 = 6;
 
 /// How many tasks a program may have with no capability at all: its own, and
 /// the children it has made and not collected, by `SYS_TASK_CREATE`,
@@ -4289,6 +4293,7 @@ fn dispatch(
             let on = crate::percpu::index() as u64;
             (on << 32) | crate::percpu::count() as u64
         }
+        SYS_CPU_INFO => crate::usage::cpu_info(scheduler::current_tid(), arg0, arg1, arg2),
         SYS_GETRANDOM => {
             // arg0 = buffer, arg1 = length, arg2 = flags (none yet). No
             // capability: a random number is nobody's secret until it has

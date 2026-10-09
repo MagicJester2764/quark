@@ -277,3 +277,114 @@ pub fn set_fs_base(base: u64) {
         );
     }
 }
+
+/// Where a processor keeps a number for a program to read: RDTSCP puts it
+/// in ECX beside the counter, and RDPID in a register of the program's
+/// choosing. The kernel keeps each processor's index there (`SYS_CPU_INFO`),
+/// so that a program can ask the processor it is on which one it is, which
+/// is the question `sched_getcpu` asks — without a call.
+const MSR_TSC_AUX: u32 = 0xC000_0103;
+
+/// Whether this processor has a TSC_AUX for a program to read: RDTSCP
+/// (CPUID 0x8000_0001 EDX bit 27) or RDPID (leaf 7 ECX bit 22).
+fn has_tsc_aux() -> bool {
+    use core::arch::x86_64::{__cpuid, __cpuid_count};
+    let rdtscp = __cpuid(0x8000_0000).eax >= 0x8000_0001 && __cpuid(0x8000_0001).edx & (1 << 27) != 0;
+    let rdpid = __cpuid(0).eax >= 7 && __cpuid_count(7, 0).ecx & (1 << 22) != 0;
+    rdtscp || rdpid
+}
+
+/// Put this processor's index where a program can ask the processor for it.
+/// TSC_AUX is each processor's own, so each says its own.
+///
+/// # Safety
+/// On the processor numbered `index`, as it is started.
+pub unsafe fn say_processor_index(index: usize) {
+    if has_tsc_aux() {
+        unsafe { wrmsr(MSR_TSC_AUX, index as u64) };
+    }
+}
+
+/// Where a processor sits: its APIC id, and the package, core and thread
+/// within the core that the id is made of.
+#[derive(Clone, Copy)]
+pub struct Place {
+    pub apic: u32,
+    pub package: u32,
+    pub core: u32,
+    pub thread: u32,
+}
+
+impl Place {
+    pub const NOWHERE: Place = Place { apic: 0, package: 0, core: 0, thread: 0 };
+}
+
+/// The low `bits` bits.
+fn low(bits: u32) -> u32 {
+    if bits >= 32 { u32::MAX } else { (1 << bits) - 1 }
+}
+
+/// Where the processor this runs on sits, as it says itself. An APIC id is
+/// made of fields — thread, core, package, from the bottom — and CPUID says
+/// how wide each is: Intel's extended topology (leaf 0x1F, or 0xB before
+/// it), which AMD's later processors and QEMU's answer too, giving the
+/// shift to each level's id; else AMD's own (leaf 0x8000_0008, how many bits
+/// number the core, and 0x8000_001E, how many threads a core has); else one
+/// package, a core for each APIC id.
+pub fn place() -> Place {
+    use core::arch::x86_64::{__cpuid, __cpuid_count};
+    let max = __cpuid(0).eax;
+    for leaf in [0x1F, 0xB] {
+        if max < leaf || __cpuid_count(leaf, 0).ebx & 0xFFFF == 0 {
+            continue;
+        }
+        let apic = __cpuid_count(leaf, 0).edx;
+        // Each level's type (1 a thread, 2 a core, more above those on
+        // Intel's newer leaf) and the shift past it; the last is the package's.
+        let (mut smt, mut package) = (0, 0);
+        for sub in 0..8 {
+            let r = __cpuid_count(leaf, sub);
+            let kind = (r.ecx >> 8) & 0xFF;
+            if kind == 0 {
+                break;
+            }
+            let shift = r.eax & 0x1F;
+            if kind == 1 {
+                smt = shift;
+            }
+            package = shift;
+        }
+        let package = package.max(smt);
+        return Place {
+            apic,
+            package: apic.checked_shr(package).unwrap_or(0),
+            core: apic.checked_shr(smt).unwrap_or(0) & low(package - smt),
+            thread: apic & low(smt),
+        };
+    }
+    let apic = __cpuid(1).ebx >> 24;
+    let ext = __cpuid(0x8000_0000).eax;
+    if ext >= 0x8000_0008 {
+        let ecx = __cpuid(0x8000_0008).ecx;
+        // Bits of the APIC id below the package's: said, or as many as the
+        // cores it has need.
+        let size = match (ecx >> 12) & 0xF {
+            0 => 32 - (ecx & 0xFF).leading_zeros(),
+            n => n,
+        };
+        let topology = ext >= 0x8000_0001 && __cpuid(0x8000_0001).ecx & (1 << 22) != 0;
+        let threads = if topology && ext >= 0x8000_001E {
+            ((__cpuid(0x8000_001E).ebx >> 8) & 0xFF) + 1
+        } else {
+            1
+        };
+        let smt = (32 - (threads - 1).leading_zeros()).min(size);
+        return Place {
+            apic,
+            package: apic.checked_shr(size).unwrap_or(0),
+            core: (apic & low(size)) >> smt,
+            thread: apic & low(smt),
+        };
+    }
+    Place { apic, package: 0, core: apic, thread: 0 }
+}

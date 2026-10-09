@@ -84,6 +84,8 @@ pub extern "C" fn kernel_main(multiboot_info: usize) -> ! {
             static boot_stack_top: u8;
         }
         percpu::init(0, (&raw const boot_stack_bottom as usize, &raw const boot_stack_top as usize));
+        cpu::say_processor_index(0);
+        percpu::set_place(0, cpu::place());
     }
     // This processor is in the kernel, and until it has nothing to do it
     // stays there.
@@ -148,6 +150,7 @@ pub extern "C" fn kernel_main(multiboot_info: usize) -> ! {
         // The clock, started before the first tick is counted, so that the
         // two count from the same moment.
         clock::init();
+        usage::processor_up();
         pit::init(100); // 100 Hz timer
         intc::enable(0); // timer
         intc::enable(1); // keyboard

@@ -162,6 +162,10 @@ pub struct PerTask {
     /// tells its processor arrives, on its own kernel stack and in its own
     /// address space. Neither may be freed under it.
     on_cpu: u8,
+    /// The processor it last ran on — or runs on — as `SYS_CPU_INFO` says
+    /// it: Linux's thirty-ninth field of `/proc/PID/stat`. Kept when it
+    /// leaves, where `on_cpu` is not.
+    last_cpu: u16,
     /// Dead, ended from another processor while it ran, and still on its own:
     /// what is said when a task dies — its parent woken to collect it, SIGCHLD
     /// — has not been said yet, and is said by its processor when it leaves
@@ -209,6 +213,7 @@ impl PerTask {
             front: false,
             yielded: false,
             on_cpu: NO_CPU,
+            last_cpu: 0,
             unannounced: false,
             unwaited: false,
             pinned: [(0, 0); PINS],
@@ -889,6 +894,7 @@ unsafe fn switch_to(current_tid: usize, next_tid: usize, flags: u64) { unsafe {
             task.state = TaskState::Running;
         }
         st(next_tid).on_cpu = crate::percpu::index() as u8;
+        st(next_tid).last_cpu = crate::percpu::index() as u16;
     }
     if current_tid != 0 {
         st(current_tid).on_cpu = NO_CPU;
@@ -2302,6 +2308,30 @@ pub fn task_is_live(tid: usize) -> bool {
             .as_ref()
             .is_some_and(|t| t.state != TaskState::Dead)
     }
+}
+
+/// The processor task `tid` last ran on, or runs on; `None` if there is no
+/// such task.
+pub fn last_cpu(tid: usize) -> Option<usize> {
+    if tid >= MAX_TASKS {
+        return None;
+    }
+    let flags = irq_save();
+    let cpu = unsafe { (*slot(tid)).as_ref().map(|_| st(tid).last_cpu as usize) };
+    irq_restore(flags);
+    cpu
+}
+
+/// How many tasks are running or ready to: Linux's `procs_running`.
+pub fn runnable() -> usize {
+    let flags = irq_save();
+    let n = unsafe {
+        tids()
+            .filter(|&i| matches!(*slot(i), Some(ref t) if matches!(t.state, TaskState::Ready | TaskState::Running)))
+            .count()
+    };
+    irq_restore(flags);
+    n
 }
 
 /// Get task info for enumeration. Returns (state, uid, gid, parent_tid) or None.

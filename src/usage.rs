@@ -123,8 +123,81 @@ static mut NO_TASK: PerTask = PerTask::new();
 /// When each processor began running what it is running.
 static mut SINCE: [u64; MAX_CPUS] = [0; MAX_CPUS];
 
+/// What a processor does with its time, as it is counted: runs a program,
+/// runs the kernel, has nothing to do, or takes an interrupt.
+pub const IN_PROGRAM: u8 = 0;
+pub const IN_KERNEL: u8 = 1;
+pub const IDLE: u8 = 2;
+pub const IN_INTERRUPT: u8 = 3;
+
+/// What a processor has spent its time on, by the clock, and what it has
+/// done: nanoseconds at each of the four, the interrupts it took, and the
+/// times it went from one task to another.
+#[derive(Clone, Copy)]
+struct Spent {
+    ns: [u64; 4],
+    interrupts: u64,
+    switches: u64,
+}
+
+impl Spent {
+    const ZERO: Spent = Spent { ns: [0; 4], interrupts: 0, switches: 0 };
+}
+
+/// Each processor's, counted to its last change — which its next door, its
+/// next switch to or from the idle loop and its next interrupt each are: a
+/// processor with nothing to do still takes its tick. Idle time was thrown
+/// away; a machine could not say how busy it was.
+static mut SPENT: [Spent; MAX_CPUS] = [Spent::ZERO; MAX_CPUS];
+/// What each processor is doing, of the four, and since when.
+static mut DOING: [u8; MAX_CPUS] = [IN_KERNEL; MAX_CPUS];
+static mut MARK: [u64; MAX_CPUS] = [0; MAX_CPUS];
+/// How many tasks the machine has made since it started: Linux's
+/// `processes`, which counts its threads as well.
+static MADE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// This processor's time is counted from now, as the kernel's.
+///
+/// # Safety
+/// Interrupts off; once, on the processor, as it is started, with the clock
+/// running.
+pub unsafe fn processor_up() {
+    unsafe {
+        let cpu = crate::percpu::index();
+        MARK[cpu] = crate::clock::now_here();
+        DOING[cpu] = IN_KERNEL;
+    }
+}
+
+/// This processor goes over to `doing`: the time since it last changed is
+/// counted as what it was doing then, which is returned.
+///
+/// # Safety
+/// Interrupts off.
+pub unsafe fn now_doing(doing: u8) -> u8 {
+    unsafe {
+        let cpu = crate::percpu::index();
+        let now = crate::clock::now_here();
+        let was = DOING[cpu];
+        SPENT[cpu].ns[was as usize] += now.saturating_sub(MARK[cpu]);
+        MARK[cpu] = now;
+        DOING[cpu] = doing;
+        was
+    }
+}
+
+/// This processor has taken an interrupt: any, the ones that take nothing
+/// from the kernel included.
+///
+/// # Safety
+/// Interrupts off.
+pub unsafe fn interrupt_taken() {
+    unsafe { SPENT[crate::percpu::index()].interrupts += 1 };
+}
+
 /// A task has been made: it has used nothing.
 pub fn task_made(tid: usize) {
+    MADE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     if tid < MAX_TASKS {
         let flags = irq_save();
         unsafe {
@@ -167,6 +240,13 @@ pub unsafe fn charge(tid: usize) -> u64 {
 /// Interrupts off, after [`charge`] for whatever this processor ran.
 pub unsafe fn resumed(tid: usize) {
     unsafe {
+        // Going to the idle loop, the processor has nothing to do; leaving
+        // it, it is in the kernel again.
+        if tid == 0 {
+            now_doing(IDLE);
+        } else if DOING[crate::percpu::index()] == IDLE {
+            now_doing(IN_KERNEL);
+        }
         if tid != 0 && tid < MAX_TASKS && st(tid).in_kernel {
             st(tid).kernel_since = SINCE[crate::percpu::index()];
         }
@@ -182,6 +262,7 @@ pub unsafe fn resumed(tid: usize) {
 /// # Safety
 /// Interrupts off.
 pub unsafe fn entered(tid: usize) {
+    unsafe { now_doing(IN_KERNEL) };
     if tid == 0 || tid >= MAX_TASKS {
         return;
     }
@@ -197,6 +278,7 @@ pub unsafe fn entered(tid: usize) {
 /// # Safety
 /// Interrupts off.
 pub unsafe fn leaving(tid: usize) {
+    unsafe { now_doing(IN_PROGRAM) };
     if tid == 0 || tid >= MAX_TASKS {
         return;
     }
@@ -215,6 +297,7 @@ pub unsafe fn leaving(tid: usize) {
 /// Interrupts off.
 pub unsafe fn switched(from: usize, gave_up: bool) {
     unsafe {
+        SPENT[crate::percpu::index()].switches += 1;
         if from != 0 && from < MAX_TASKS {
             if gave_up {
                 st(from).raw.voluntary += 1;
@@ -324,6 +407,80 @@ pub fn usage(tid: usize, whose: u64, out: u64, of: u64) -> u64 {
     let _ua = crate::cpu::UserAccess::begin();
     unsafe { core::ptr::write_unaligned(out as *mut [u64; 4], words) };
     0
+}
+
+/// `SYS_CPU_INFO`, by `op`:
+///
+/// - 0: which processors are online, a bit each of 256, written at `a` (`b`
+///   bytes, at least 32). Answers how many there are.
+/// - 1: how processor `a` — or every one together, for `u64::MAX` — has
+///   spent its time, eight words at `b`: nanoseconds in programs, in the
+///   kernel, with nothing to do and taking interrupts; the interrupts it
+///   took and the switches it made; and the machine's tasks made since it
+///   started and those ready or running now.
+/// - 2: where processor `a` sits, four words at `b`: its APIC id, package,
+///   core and thread, as it said when it started.
+/// - 3: the processor task `a` (0, the caller) last ran on.
+///
+/// No capability: what a machine is made of and how busy it is are every
+/// program's to know, as they are on Linux.
+pub fn cpu_info(caller: usize, op: u64, a: u64, b: u64) -> u64 {
+    let count = crate::percpu::count();
+    match op {
+        0 => {
+            if b < 32 || !crate::syscall::validate_user_ptr_mut(a, 32) {
+                return u64::MAX;
+            }
+            let mut set = [0u64; 4];
+            for i in 0..count.min(256) {
+                set[i / 64] |= 1 << (i % 64);
+            }
+            let _ua = crate::cpu::UserAccess::begin();
+            unsafe { core::ptr::write_unaligned(a as *mut [u64; 4], set) };
+            count as u64
+        }
+        1 => {
+            if (a != u64::MAX && a as usize >= count) || !crate::syscall::validate_user_ptr_mut(b, 64) {
+                return u64::MAX;
+            }
+            let flags = irq_save();
+            let now = crate::clock::now();
+            let mut sum = Spent::ZERO;
+            for cpu in (0..count).filter(|&cpu| a == u64::MAX || a as usize == cpu) {
+                let (spent, doing, mark) = unsafe { (SPENT[cpu], DOING[cpu], MARK[cpu]) };
+                for (total, ns) in sum.ns.iter_mut().zip(spent.ns) {
+                    *total += ns;
+                }
+                // And what it is doing now, since it began: a processor
+                // asleep says nothing until something wakes it.
+                sum.ns[doing as usize] += now.saturating_sub(mark);
+                sum.interrupts += spent.interrupts;
+                sum.switches += spent.switches;
+            }
+            let ready = crate::scheduler::runnable() as u64;
+            irq_restore(flags);
+            let made = MADE.load(core::sync::atomic::Ordering::Relaxed);
+            let words = [sum.ns[0], sum.ns[1], sum.ns[2], sum.ns[3], sum.interrupts, sum.switches, made, ready];
+            let _ua = crate::cpu::UserAccess::begin();
+            unsafe { core::ptr::write_unaligned(b as *mut [u64; 8], words) };
+            0
+        }
+        2 => {
+            if a as usize >= count || !crate::syscall::validate_user_ptr_mut(b, 32) {
+                return u64::MAX;
+            }
+            let place = crate::percpu::place(a as usize);
+            let words = [place.apic as u64, place.package as u64, place.core as u64, place.thread as u64];
+            let _ua = crate::cpu::UserAccess::begin();
+            unsafe { core::ptr::write_unaligned(b as *mut [u64; 4], words) };
+            0
+        }
+        3 => {
+            let tid = if a == 0 { caller } else { a as usize };
+            crate::scheduler::last_cpu(tid).map_or(u64::MAX, |cpu| cpu as u64)
+        }
+        _ => u64::MAX,
+    }
 }
 
 /// How much of its band a program is owed, by how nice it is, against 1024

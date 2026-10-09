@@ -275,6 +275,9 @@ extern "C" fn arrive(index: usize) -> ! {
     unsafe {
         crate::cpu::set_control_registers(*(&raw const CONTROL));
         percpu::init(index, *(&raw const ARRIVING_STACK));
+        // Its number where a program can ask it, and where it sits.
+        crate::cpu::say_processor_index(index);
+        percpu::set_place(index, crate::cpu::place());
         percpu::load_tables();
         crate::idt::load();
         crate::fpu::init_processor();
@@ -295,6 +298,8 @@ extern "C" fn arrive(index: usize) -> ! {
         halt_here();
     }
     COUNTER_READ.store(crate::clock::raw().max(1), Ordering::Release);
+    // Its time is counted from here.
+    unsafe { crate::usage::processor_up() };
     // The first processor is still starting the system and has the lock;
     // this waits here until it has nothing to do, or goes to ring 3.
     crate::klock::acquire();

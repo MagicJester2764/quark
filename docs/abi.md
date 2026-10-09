@@ -1,6 +1,6 @@
 # Quark syscall ABI
 
-**Version 4.5.** Query the running kernel with `SYS_ABI_VERSION` (240), which
+**Version 4.6.** Query the running kernel with `SYS_ABI_VERSION` (240), which
 returns `(major << 16) | minor`.
 
 This document is the contract between the Quark kernel and everything above it.
@@ -280,6 +280,7 @@ numbers, and only 64 could name it before, through a range check.
 | 4.3 | **How one task is scheduled.** Nice is a task's, given to the threads and children it makes, where it was a program's: `SYS_NICE` says it of every task of a program, and `SYS_SCHED` (238) of one — and puts a task in a real-time class, Linux's `SCHED_FIFO` or `SCHED_RR` at a priority from 1 to 99, which takes the new right `RealTime` (capability 16) to enter. Within its band a real-time task runs before every ordinary one, the best priority first: FIFO until it blocks, yields or something better is ready, round-robin for a turn of 100 ms among its equals; one woken by a call runs as the call returns. A processor's real-time tasks have at most 950 ms of each second, and past that wait for whatever ordinary task is ready. A task waited on runs at the place — band, then real-time priority — of the best of its waiters. |
 | 4.4 | **A lock that lends its holder its waiter's place.** `SYS_FUTEX_PI` (239) locks, tries to lock and unlocks a priority-inheriting word — Linux's `FUTEX_LOCK_PI`, `FUTEX_TRYLOCK_PI` and `FUTEX_UNLOCK_PI`: nought when nobody holds it, its holder's task id when somebody does, with `FUTEX_WAITERS` (bit 31) and `FUTEX_OWNER_DIED` (bit 30). A task waiting to lock one lends the holder its place, band and real-time priority, through holders waiting for holders 32 deep; one that would wait for itself is answered at once. An unlock hands the word to the best placed waiter. A holder that dies or execs holding one on its robust list hands it to its best waiter told `FUTEX_OWNER_DIED`; one held otherwise is lent nothing by its waiters from then on. |
 | 4.5 | **A program's own FS and GS bases, and the ways into the kernel and out made safe for them.** No new number. Where the processor has FSGSBASE (CPUID leaf 7, EBX bit 0) it is on: a program reads and writes its FS and GS bases itself (`rdfsbase`, `wrfsbase`, `rdgsbase`, `wrgsbase`), where each was refused as an invalid instruction. A task's two are its own — kept across a switch, copied by `SYS_FORK`, cleared by `SYS_EXEC_SPACE` — and `SYS_SET_FS_BASE` still sets the first. A userland that builds a program's auxiliary vector says so with `AT_HWCAP2` bit 1 (`HWCAP2_FSGSBASE`), for a kernel of 4.5 or later on such a processor. And three ways for any program to halt the machine are gone, each of which FSGSBASE would have let it make worse by choosing the GS base the kernel then ran on: the page below 2^47 is nobody's (`USER_ADDR_LIMIT` is 0x7FFF_FFFF_F000, where it was 2^47: a `syscall` in its last two bytes went back to 2^47, which is no address, and Intel's `sysret` faults on that in ring 0); `SYS_EXEC_SPACE` refuses an entry or a stack outside the program's half, where it looked only at the bottom (the `iretq` into one at 2^47 faulted in ring 0, on any processor); and a `syscall` clears TF and NT of its caller's flags (with TF set the call trapped at the kernel's first instruction, on the program's stack; with NT the return from a signal handler faulted). |
+| 4.6 | **What a program is told about processors.** `SYS_CPU_INFO` (218): which processors are online, how each has spent its time — running programs, running the kernel, with nothing to do and taking interrupts, with the interrupts it took and the switches it made — where each sits (its APIC id, package, core and thread), and which processor a task last ran on. And each processor's number is in its TSC_AUX, where it has one, for `RDPID` and `RDTSCP` in ring 3. |
 
 ### Deprecated
 
@@ -1989,6 +1990,45 @@ has not started — and the kernel checks which at the moment it acts. A server
 that checked first and called `SYS_SET_UID` after would be naming a TID, and
 a TID is given to another task once its owner has been reaped. The three are
 set together or not at all.
+
+### Processors (0xDA)
+
+| # | Name | Arguments | Returns | Cap |
+|---|---|---|---|---|
+| 218 | `SYS_CPU_INFO` | arg0 = op: 0, which processors are online — arg1 = where, arg2 = its length (32 bytes at least); 1, how a processor has spent its time — arg1 = the processor, or `u64::MAX` for all of them, arg2 = where eight words go; 2, where a processor sits — arg1 = the processor, arg2 = where four words go; 3, the processor a task last ran on — arg1 = the task, 0 for the caller | op 0: how many are online; ops 1 and 2: 0; op 3: the processor; `u64::MAX` for a processor or a task there is not, or a buffer that is not the caller's | — |
+
+Processors are numbered from 0, the first processor 0, and the number is the
+one `SYS_CPUS` says a caller is on. Op 0 writes a set of 256 bits, one for
+each processor that is online, from bit 0 of the first word.
+
+Op 1's eight words: the nanoseconds the processor has spent running
+programs, running the kernel, with nothing to do and taking interrupts, by
+the clock, up to the call; the interrupts it has taken, those answered
+without the kernel's lock included; the times it has gone from one task to
+another; and — the same whichever processor is asked — the tasks the
+machine has made since it started (Linux's `processes`, threads included)
+and those running or ready to (`procs_running`). For `u64::MAX` the first
+six are every processor's together. A processor's time is divided where it
+changes: at a door into the kernel and on the way back, going to the idle
+loop and leaving it, and around each interrupt's handling. One with nothing
+to do still takes its tick, and what any is doing at the moment of the call
+is counted up to it.
+
+Op 2's four words are what the processor said of itself when it was
+started: its APIC id — the x2APIC id, where its extended topology leaf
+(CPUID 0x1F, or 0xB) gives one — and the package, the core within the
+package and the thread within the core that the id is made of; where the
+processor says nothing of its topology, every processor is the core its
+APIC id names, in package 0.
+
+Op 3 is where the task last ran, or runs, and is a moment out of date as
+soon as it is said. Any task may be asked about.
+
+From 4.6 each processor's number is in its TSC_AUX too, where it has one
+(RDTSCP, CPUID 0x8000_0001 EDX bit 27; RDPID, leaf 7 ECX bit 22): a program
+asks the processor it is on which it is without a call — `RDPID`, or
+`RDTSCP`'s ECX. The answer is true of the instant the instruction ran, as
+`SYS_CPUS`'s is.
 
 ### Descriptors, continued (0xE0)
 

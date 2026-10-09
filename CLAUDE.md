@@ -1379,6 +1379,16 @@ closed:
   thread could be nicer than its siblings.
 - **A limit is looked at on the tick, last** (`usage::limits`), as an alarm
   is: SIGXCPU, or the end of the program, may not return.
+- **A processor's time is counted where what it does changes**
+  (`usage::now_doing`, `SYS_CPU_INFO`): running a program, running the
+  kernel, with nothing to do, or taking an interrupt — at each door and on
+  the way back, going to the idle loop and leaving it (`resumed`), and
+  around each interrupt's handling — with the interrupts it took and the
+  switches it made. A new door, a new way to the idle loop, or a new place
+  an interrupt is handled says what the processor does now, or that time
+  is counted as whatever it did before. Idle time was thrown away, and
+  `/proc/stat`, `/proc/uptime` and every program that asks how busy the
+  machine is had nothing to read.
 
 ## Power
 
@@ -1561,7 +1571,11 @@ breaking any of them is quiet until it is a machine that stops.
   in `kernel_main`), with what the first processor has turned on: CR0, CR4,
   EFER, the `syscall` MSRs. Something turned on later on the first — a CR4
   bit, an MSR — has to be turned on on the others, or a task that moves
-  finds it gone.
+  finds it gone. And what is a processor's own each says as it starts:
+  its index in TSC_AUX (`cpu::say_processor_index`), where a program's
+  `RDPID` and `RDTSCP` find it — left at nought, every processor said it
+  was the first — and where it sits (`cpu::place`), which only CPUID on
+  that processor can say.
 
 ## Known gaps
 
