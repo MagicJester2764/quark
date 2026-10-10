@@ -70,7 +70,7 @@ after its kind's, which is its alone.
 | Rank | Lock | Keeps |
 |---|---|---|
 | 0 | the kernel (`klock.rs`) | what has not come out from under it; taken first or not at all |
-| 2 | a program's descriptor table | its descriptors, their flags, its signals' state |
+| 2 | the descriptor tables (`fdtable.rs`) | every program's descriptors, their marks and limits, and which tasks use which table |
 | 4 | the poll sets (`pollset.rs`) | the sets, what each watches and who is parked on each; a set asks each thing it watches whether it is ready |
 | 6 | the local sockets (`local.rs`) | the sockets and those waiting to accept; a connection makes a stream |
 | 7 | the streams (`stream.rs`) | the streams and the descriptors in flight with them |
@@ -84,6 +84,7 @@ after its kind's, which is its alone.
 | 16, 17 | the futex's waiters (`futex.rs`) | a list of waiters, of 256; a requeue takes two |
 | 18, 19 | a task's record | its calls, its wait, what others change of how it is scheduled; a call takes the caller's and the callee's |
 | 20, 21 | a capability space | its slots; a transfer takes two |
+| 22 | the programs' records (`fdtable.rs`) | a program's signals and what waits with them, its alarm and timers, what it has used, its name and limits: asked about under whatever a wait holds |
 | 24, 25 | an address space | its tables and reservations; a fork or a move takes two |
 | 28, 29 | a processor's run queues (`runq.rs`) | what waits to run there, and the links of the tasks waiting; a move is two steps, never two held |
 | 32 | the clock | what is due, and when the timer is set to look |
@@ -104,8 +105,8 @@ a run queue; a pipe's read takes the pipe, then a waiter's record. What a
 program makes has a lock for each kind — its table and every one of it —
 rather than one for each thing: a lock for each pipe would want another
 for the table's slots, and nothing yet says two programs' pipes contend.
-Of these, the descriptor tables', the tasks', the capability spaces', the
-address spaces' and the clock's have their ranks here before their locks.
+Of these, the tasks', the capability spaces', the address spaces' and the
+clock's have their ranks here before their locks.
 
 A processor that has waited thirty seconds for a lock says which, and
 which processor has it, and the machine stops; each processor that was

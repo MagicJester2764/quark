@@ -640,10 +640,17 @@ may keep — are in `../quarkutils/CLAUDE.md`; these are the kernel's.
 - **A descriptor is its program's, and every change to the table is one
   step.** Every task of a program uses one table (`fdtable.rs`), so a sibling
   can be preempted half way through anything. "Find a free number and fill
-  it" is `fdtable::install`, with interrupts off across both halves; reading a
-  descriptor and taking a reference for a copy of it is `get_retained`. A call
-  that looks a descriptor up and then acts on it in two steps has a window in
-  which a sibling closes it and somebody else is given the slot.
+  it" is `fdtable::install`, with the descriptor tables' lock held across
+  both halves (`sync::RANK_FDTABLE`, before what a descriptor names);
+  reading a descriptor and taking a reference for a copy of it is
+  `get_retained`. A call that looks a descriptor up and then acts on it in
+  two steps has a window in which a sibling closes it and somebody else is
+  given the slot. The rest of a program's record — its signals, alarm,
+  timers, use, name, limits, umask and trap — has a lock of its own
+  (`fdtable::PROGRAMS`, `RANK_PROGRAM`), after the things a wait holds, so
+  that a wait asks about signals under its own lock; which tasks use a
+  table changes with both held, and a fork copies the two halves a step
+  each.
 - **A task waits on one thing at a time, and where is a link in its own
   record** (`waitlist.rs`): a counter's, a timer's, a pipe's, a terminal's
   and a listener's waiters, and those parked on a poll set, are a list

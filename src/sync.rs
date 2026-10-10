@@ -71,6 +71,10 @@ pub const RANK_FUTEX: u8 = 16;
 pub const RANK_TASK: u8 = 18;
 /// A capability space. Two, for a transfer.
 pub const RANK_CSPACE: u8 = 20;
+/// A program's record besides its descriptors (`fdtable.rs`): its signals,
+/// its alarm, what it has used, its name and limits — asked about under
+/// whatever a wait holds, so after the things waited on.
+pub const RANK_PROGRAM: u8 = 22;
 /// An address space's tables and reservations. Two, for a fork or a move.
 pub const RANK_SPACE: u8 = 24;
 /// A processor's run queues. Two, for a move between processors.

@@ -242,6 +242,20 @@ static PROGRAM_TEMPLATE: crate::table::Template<Program> =
 /// Every program's record, by its table's number (`table.rs`): as many as
 /// there can be tasks, since each task uses exactly one.
 static mut TABLES: crate::table::Table<Program> = crate::table::Table::new(MAX_TASKS);
+
+/// The descriptor tables' lock (`sync::RANK_FDTABLE`): every program's
+/// descriptors, its working directory, their marks and limits, which tasks
+/// use which table, and what each task holds while it waits. Taken before
+/// what a descriptor names, so that one is looked up and a reference taken
+/// in one step (`get_retained`, `hold`).
+static TABLES_LOCK: crate::sync::IrqSpinLock<()> = crate::sync::IrqSpinLock::new(crate::sync::RANK_FDTABLE, "the descriptor tables", ());
+
+/// The programs' lock (`sync::RANK_PROGRAM`): the rest of a program's record
+/// — its signals and what waits with them, its alarm, its timers, what it
+/// has used, its name, its limits of time, its umask and where its calls
+/// may come from. Asked about under whatever a wait holds, so it comes after
+/// the things waited on. Which tasks use a table changes with both held.
+pub(crate) static PROGRAMS: crate::sync::IrqSpinLock<()> = crate::sync::IrqSpinLock::new(crate::sync::RANK_PROGRAM, "the programs' records", ());
 /// What this module keeps about a task, in its record (`TaskRec::fd`):
 /// each field was an array of `MAX_TASKS`, and an id with no task reads as
 /// `PerTask::new()` — what an empty slot of those arrays held.
@@ -298,7 +312,7 @@ fn irq_restore(flags: u64) {
 }
 
 /// # Safety
-/// Interrupts are off.
+/// [`TABLES_LOCK`] or [`PROGRAMS`] held, as what is reached through it says.
 #[inline(always)]
 unsafe fn tables() -> &'static mut crate::table::Table<Program> {
     unsafe { &mut *core::ptr::addr_of_mut!(TABLES) }
@@ -307,7 +321,7 @@ unsafe fn tables() -> &'static mut crate::table::Table<Program> {
 /// Table number `i`, if a program has it.
 ///
 /// # Safety
-/// Interrupts are off.
+/// [`TABLES_LOCK`] or [`PROGRAMS`] held, as what is used of it says.
 unsafe fn table_at(i: usize) -> Option<&'static mut Table> {
     unsafe { tables().get(i).map(|p| &mut p.table) }
 }
@@ -315,7 +329,7 @@ unsafe fn table_at(i: usize) -> Option<&'static mut Table> {
 /// Every program's record, with its table's number.
 ///
 /// # Safety
-/// Interrupts are off for as long as the records are used.
+/// [`PROGRAMS`] held for as long as the records are used.
 pub unsafe fn programs() -> impl Iterator<Item = (usize, &'static mut Program)> {
     unsafe { (0..tables().high()).filter_map(|i| tables().get(i).map(|p| (i, p))) }
 }
@@ -323,7 +337,7 @@ pub unsafe fn programs() -> impl Iterator<Item = (usize, &'static mut Program)> 
 /// Put `tid` first in table `i`'s list of the tasks using it.
 ///
 /// # Safety
-/// Interrupts are off.
+/// [`TABLES_LOCK`] and [`PROGRAMS`] held.
 unsafe fn link(i: usize, tid: usize) {
     unsafe {
         let Some(p) = tables().get(i) else { return };
@@ -340,7 +354,7 @@ unsafe fn link(i: usize, tid: usize) {
 /// Take `tid` off table `i`'s list.
 ///
 /// # Safety
-/// Interrupts are off.
+/// [`TABLES_LOCK`] and [`PROGRAMS`] held.
 unsafe fn unlink(i: usize, tid: usize) {
     unsafe {
         let (next, prev) = (st(tid).next, st(tid).prev);
@@ -387,21 +401,21 @@ pub fn next_holder(from: usize, wanted: impl Fn(&FdKind) -> bool) -> Option<(usi
 }
 
 fn next_where(from: usize, take: impl Fn(&Table) -> bool) -> Option<(usize, usize)> {
-    let flags = irq_save();
+    let held = TABLES_LOCK.lock();
     let found = unsafe {
         (from..tables().high()).find_map(|i| {
             let p = tables().get(i)?;
             (p.first != END && take(&p.table)).then_some((i, p.first as usize))
         })
     };
-    irq_restore(flags);
+    drop(held);
     found
 }
 
 /// The table `tid` uses.
 ///
 /// # Safety
-/// Interrupts are off.
+/// [`TABLES_LOCK`] or [`PROGRAMS`] held, as what is used of it says.
 unsafe fn table_mut(tid: usize) -> Option<&'static mut Table> {
     unsafe {
         if tid >= MAX_TASKS {
@@ -415,7 +429,7 @@ unsafe fn table_mut(tid: usize) -> Option<&'static mut Table> {
 /// The table `tid` uses, and what came with the signals waiting for it.
 ///
 /// # Safety
-/// Interrupts are off.
+/// [`PROGRAMS`] held.
 unsafe fn signals_mut(tid: usize) -> Option<(&'static mut Table, &'static mut Waiting<{ crate::signal::QUEUE }>)> {
     unsafe {
         if tid >= MAX_TASKS {
@@ -431,7 +445,8 @@ pub fn attach_new(tid: usize) -> bool {
     if tid >= MAX_TASKS {
         return false;
     }
-    let flags = irq_save();
+    // Which tasks use which table changes with both held.
+    let held = (TABLES_LOCK.lock(), PROGRAMS.lock());
     let ok = unsafe {
         if st(tid).table != NONE {
             false
@@ -449,21 +464,22 @@ pub fn attach_new(tid: usize) -> bool {
             }
         }
     };
-    irq_restore(flags);
+    drop(held);
     ok
 }
 
 /// The word program `space` is told of signals through, or 0 if it has
-/// named none. Interrupts must be off.
+/// named none.
 pub fn sig_word_of_space(space: u64) -> usize {
     let Some(tid) = crate::scheduler::task_of_space(space) else { return 0 };
+    let _held = PROGRAMS.lock();
     unsafe { table_mut(tid).map_or(0, |t| t.sig_word) }
 }
 
 /// The record of the program `tid` is a task of.
 ///
 /// # Safety
-/// Interrupts are off for as long as the record is used.
+/// [`PROGRAMS`] held for as long as the record is used.
 pub unsafe fn table_of(tid: usize) -> Option<&'static mut Program> {
     unsafe {
         let i = st(tid).table;
@@ -477,29 +493,38 @@ pub fn table_index(tid: usize) -> usize {
     if tid >= MAX_TASKS {
         return usize::MAX;
     }
-    let flags = irq_save();
+    let held = TABLES_LOCK.lock();
     let i = unsafe { st(tid).table };
-    irq_restore(flags);
+    drop(held);
     if i == NONE { usize::MAX } else { i as usize }
 }
 
 /// A task using table `table`, if any does.
 pub fn a_task_of(table: usize) -> Option<usize> {
-    let flags = irq_save();
-    let found = unsafe { tables().get(table).filter(|p| p.first != END).map(|p| p.first as usize) };
-    irq_restore(flags);
+    let held = TABLES_LOCK.lock();
+    let found = unsafe { a_task_of_held(table) };
+    drop(held);
     found
+}
+
+/// [`a_task_of`], for whoever holds either lock: which tasks use a table
+/// changes with both held.
+///
+/// # Safety
+/// [`TABLES_LOCK`] or [`PROGRAMS`] held.
+pub unsafe fn a_task_of_held(table: usize) -> Option<usize> {
+    unsafe { tables().get(table).filter(|p| p.first != END).map(|p| p.first as usize) }
 }
 
 /// Timer `id`'s `signo` is still waiting for `tid`'s program: it counts
 /// `by` more overruns. False if it is not.
 pub fn sig_timer_bump(tid: usize, signo: u8, id: u64, by: u64) -> bool {
     let bit = sig_bit(signo);
-    let flags = irq_save();
+    let held = PROGRAMS.lock();
     let bumped = unsafe {
         signals_mut(tid).is_some_and(|(t, w)| w.bump_timer(signo, id, (t.sig_pending | t.sig_held) & bit != 0, by))
     };
-    irq_restore(flags);
+    drop(held);
     bumped
 }
 
@@ -510,8 +535,18 @@ fn leave(tid: usize) -> Option<(Grow<Fd>, FdKind)> {
     if tid >= MAX_TASKS {
         return None;
     }
-    let flags = irq_save();
-    let out = unsafe {
+    let held = (TABLES_LOCK.lock(), PROGRAMS.lock());
+    let out = unsafe { leave_held(tid) };
+    drop(held);
+    out
+}
+
+/// [`leave`], with both locks held.
+///
+/// # Safety
+/// [`TABLES_LOCK`] and [`PROGRAMS`] held.
+unsafe fn leave_held(tid: usize) -> Option<(Grow<Fd>, FdKind)> {
+    unsafe {
         let i = st(tid).table;
         if i == NONE {
             None
@@ -534,9 +569,7 @@ fn leave(tid: usize) -> Option<(Grow<Fd>, FdKind)> {
                 None => None,
             }
         }
-    };
-    irq_restore(flags);
-    out
+    }
 }
 
 fn release_all((fds, cwd): &(Grow<Fd>, FdKind)) {
@@ -554,12 +587,12 @@ pub fn task_gone(tid: usize) {
     // If it died where it was waiting, it is still on that list, under an id
     // the next task will be given. Off it before the reference goes.
     if tid < MAX_TASKS {
-        let flags = irq_save();
+        let lock = TABLES_LOCK.lock();
         let held = unsafe { st(tid).held };
         // And off whatever list its own link names (`waitlist.rs`): a named
         // pipe's other end, say, which it holds nothing for.
         unsafe { crate::waitlist::forget(tid) };
-        irq_restore(flags);
+        drop(lock);
         if !held.is_empty() {
             crate::pipe::forget_waiter(&held, tid);
         }
@@ -578,14 +611,12 @@ pub fn share(tid: usize, with: usize) -> bool {
     if tid >= MAX_TASKS || with >= MAX_TASKS || tid == with {
         return false;
     }
-    let flags = irq_save();
+    let held = (TABLES_LOCK.lock(), PROGRAMS.lock());
     let target = unsafe { st(with).table };
     if target == NONE {
-        irq_restore(flags);
         return false;
     }
     if unsafe { st(tid).table } == target {
-        irq_restore(flags);
         return true;
     }
     // Joined before the old one is left, with the lock held across both, so
@@ -595,14 +626,14 @@ pub fn share(tid: usize, with: usize) -> bool {
             t.tasks += 1;
         }
     }
-    let old = leave(tid);
+    let old = unsafe { leave_held(tid) };
     unsafe {
         st(tid).table = target;
         link(target as usize, tid);
     }
-    irq_restore(flags);
-    if let Some(held) = old {
-        release_all(&held);
+    drop(held);
+    if let Some(gone) = old {
+        release_all(&gone);
     }
     true
 }
@@ -616,40 +647,54 @@ pub fn copy_into(child: usize, parent: usize) -> bool {
     if child >= MAX_TASKS || parent >= MAX_TASKS {
         return false;
     }
-    // One step: a sibling of the parent closing a descriptor between its being
-    // read and its being retained would have this retain something freed.
-    let flags = irq_save();
+    // The descriptors in one step: a sibling of the parent closing one
+    // between its being read and its being retained would have this retain
+    // something freed. Under the descriptors' lock, which comes before what
+    // they name.
+    let held = TABLES_LOCK.lock();
     unsafe {
-        let src: *const Table = match table_mut(parent) {
-            Some(t) => t,
-            None => {
-                irq_restore(flags);
-                return false;
-            }
+        let Some(src) = table_mut(parent) else {
+            return false;
         };
-        let (src_umask, src_signals, src_run, src_name, src_trap) = match table_mut(parent) {
-            Some(t) => (
-                t.umask,
-                (t.sig_ignore, t.sig_catch, t.sig_word),
-                (t.sig_run, t.sig_masks, t.sig_flags, t.sig_cookies, t.sig_entry, t.sig_unix),
-                (t.cmdline, t.cmdline_len),
-                (t.trap_from, t.trap_to),
-            ),
-            None => {
-                irq_restore(flags);
-                return false;
-            }
+        let src: *const Table = src;
+        // A child with no table has nothing to copy into.
+        let Some(dst) = table_mut(child) else {
+            return true;
         };
+        // Room first, as much as the parent has, so a copy either has
+        // every descriptor or none of them.
+        let room = (*src).fds.len();
+        if room > 0 && dst.fds.ensure(room - 1, room, FD_MOST).is_err() {
+            return false;
+        }
+        dst.fd_soft = (*src).fd_soft;
+        dst.fd_hard = (*src).fd_hard;
+        for (i, from) in (*src).fds.iter().enumerate() {
+            let Some(to) = dst.fds.get_mut(i) else { break };
+            if from.kind.is_empty() || !to.kind.is_empty() {
+                continue;
+            }
+            if crate::pipe::retain_fd(&from.kind).is_ok() {
+                *to = *from;
+            }
+        }
+        if !(*src).cwd.is_empty() && dst.cwd.is_empty() && crate::pipe::retain_fd(&(*src).cwd).is_ok() {
+            dst.cwd = (*src).cwd;
+        }
+    }
+    drop(held);
+    // And the rest of the program, under its own lock.
+    let held = PROGRAMS.lock();
+    unsafe {
+        let Some(t) = table_mut(parent) else { return true };
+        let (src_umask, src_signals, src_run, src_name, src_trap) = (
+            t.umask,
+            (t.sig_ignore, t.sig_catch, t.sig_word),
+            (t.sig_run, t.sig_masks, t.sig_flags, t.sig_cookies, t.sig_entry, t.sig_unix),
+            (t.cmdline, t.cmdline_len),
+            (t.trap_from, t.trap_to),
+        );
         if let Some((dst, dst_waiting)) = signals_mut(child) {
-            // Room first, as much as the parent has, so a copy either has
-            // every descriptor or none of them.
-            let room = (*src).fds.len();
-            if room > 0 && dst.fds.ensure(room - 1, room, FD_MOST).is_err() {
-                irq_restore(flags);
-                return false;
-            }
-            dst.fd_soft = (*src).fd_soft;
-            dst.fd_hard = (*src).fd_hard;
             dst.umask = src_umask;
             (dst.cmdline, dst.cmdline_len) = src_name;
             // The child is a copy of the program, handlers and the word they
@@ -662,29 +707,17 @@ pub fn copy_into(child: usize, parent: usize) -> bool {
             dst.sig_held = 0;
             dst_waiting.clear();
             dst.sig_interrupt = false;
-            for (i, from) in (*src).fds.iter().enumerate() {
-                let Some(to) = dst.fds.get_mut(i) else { break };
-                if from.kind.is_empty() || !to.kind.is_empty() {
-                    continue;
-                }
-                if crate::pipe::retain_fd(&from.kind).is_ok() {
-                    *to = *from;
-                }
-            }
-            if !(*src).cwd.is_empty() && dst.cwd.is_empty() && crate::pipe::retain_fd(&(*src).cwd).is_ok() {
-                dst.cwd = (*src).cwd;
-            }
         }
     }
-    irq_restore(flags);
+    drop(held);
     true
 }
 
 /// What descriptor `fd` of `tid`'s program names. `FD_CWD` is one too.
 pub fn get(tid: usize, fd: usize) -> FdKind {
-    let flags = irq_save();
+    let held = TABLES_LOCK.lock();
     let kind = unsafe { table_mut(tid).map_or(FdKind::Empty, |t| t.kind(fd)) };
-    irq_restore(flags);
+    drop(held);
     kind
 }
 
@@ -692,14 +725,14 @@ pub fn get(tid: usize, fd: usize) -> FdKind {
 /// descriptor and retaining what it names are one step, so a sibling closing
 /// it in between cannot leave the caller retaining something freed.
 pub fn get_retained(tid: usize, fd: usize) -> Option<FdKind> {
-    let flags = irq_save();
+    let held = TABLES_LOCK.lock();
     let out = unsafe {
         match table_mut(tid).map(|t| t.kind(fd)) {
             Some(kind) if !kind.is_empty() => crate::pipe::retain_fd(&kind).is_ok().then_some(kind),
             _ => None,
         }
     };
-    irq_restore(flags);
+    drop(held);
     out
 }
 
@@ -707,9 +740,9 @@ pub fn get_retained(tid: usize, fd: usize) -> Option<FdKind> {
 /// The slot's close-on-exec mark is cleared: it belonged to what was there.
 /// Refused at or above the program's limit, or with no memory for the room.
 pub fn replace(tid: usize, fd: usize, kind: FdKind) -> Result<FdKind, ()> {
-    let flags = irq_save();
+    let held = TABLES_LOCK.lock();
     let out = unsafe { table_mut(tid).map_or(Err(()), |t| t.put(fd, kind)) };
-    irq_restore(flags);
+    drop(held);
     out
 }
 
@@ -718,7 +751,7 @@ pub fn replace(tid: usize, fd: usize, kind: FdKind) -> Result<FdKind, ()> {
 /// What was there is the caller's to release. False, and nothing changed,
 /// if the slot holds something else.
 pub fn swap_if(tid: usize, fd: usize, expected: FdKind, new: FdKind) -> bool {
-    let flags = irq_save();
+    let held = TABLES_LOCK.lock();
     let swapped = unsafe {
         table_mut(tid).is_some_and(|t| {
             let slot = if fd == FD_CWD { Some(&mut t.cwd) } else { t.fds.get_mut(fd).map(|s| &mut s.kind) };
@@ -731,7 +764,7 @@ pub fn swap_if(tid: usize, fd: usize, expected: FdKind, new: FdKind) -> bool {
             }
         })
     };
-    irq_restore(flags);
+    drop(held);
     swapped
 }
 
@@ -743,14 +776,14 @@ pub fn take(tid: usize, fd: usize) -> FdKind {
 /// Put `kind` in the lowest free descriptor at or above `floor`, and say
 /// which. Finding the slot and filling it are one step.
 pub fn install(tid: usize, kind: FdKind, floor: usize) -> Option<usize> {
-    let flags = irq_save();
+    let held = TABLES_LOCK.lock();
     let out = unsafe {
         table_mut(tid).and_then(|t| {
             let fd = t.lowest_free(floor)?;
             t.put(fd, kind).ok().map(|_| fd)
         })
     };
-    irq_restore(flags);
+    drop(held);
     out
 }
 
@@ -758,24 +791,24 @@ pub fn install(tid: usize, kind: FdKind, floor: usize) -> Option<usize> {
 /// know the number before it has the object. Somebody else may take it before
 /// the caller does; `replace` then closes what they put there, as `dup2` would.
 pub fn free_at_or_above(tid: usize, floor: usize) -> Option<usize> {
-    let flags = irq_save();
+    let held = TABLES_LOCK.lock();
     let out = unsafe { table_mut(tid).and_then(|t| t.lowest_free(floor)) };
-    irq_restore(flags);
+    drop(held);
     out
 }
 
 /// `tid`'s program's descriptor limits: what it may have, and how far it may
 /// raise that.
 pub fn limit_of(tid: usize) -> Option<(usize, usize)> {
-    let flags = irq_save();
+    let held = TABLES_LOCK.lock();
     let out = unsafe { table_mut(tid).map(|t| (t.fd_soft as usize, t.fd_hard as usize)) };
-    irq_restore(flags);
+    drop(held);
     out
 }
 
 /// Set what `tid`'s program may have, no higher than how far it may raise it.
 pub fn set_soft_limit(tid: usize, n: usize) -> bool {
-    let flags = irq_save();
+    let held = TABLES_LOCK.lock();
     let ok = unsafe {
         table_mut(tid).is_some_and(|t| {
             let ok = n <= t.fd_hard as usize;
@@ -785,13 +818,13 @@ pub fn set_soft_limit(tid: usize, n: usize) -> bool {
             ok
         })
     };
-    irq_restore(flags);
+    drop(held);
     ok
 }
 
 /// Lower how far `tid`'s program may raise its limit, never below the limit.
 pub fn lower_hard_limit(tid: usize, n: usize) -> bool {
-    let flags = irq_save();
+    let held = TABLES_LOCK.lock();
     let ok = unsafe {
         table_mut(tid).is_some_and(|t| {
             let ok = n >= t.fd_soft as usize && n <= t.fd_hard as usize;
@@ -801,20 +834,20 @@ pub fn lower_hard_limit(tid: usize, n: usize) -> bool {
             ok
         })
     };
-    irq_restore(flags);
+    drop(held);
     ok
 }
 
 /// Whether any descriptor of `tid`'s program — the working directory
 /// included — is one `wanted` says yes to.
 pub fn any(tid: usize, wanted: impl Fn(&FdKind) -> bool) -> bool {
-    let flags = irq_save();
+    let held = TABLES_LOCK.lock();
     let found = unsafe {
         table_mut(tid).is_some_and(|t| {
             t.fds.iter().map(|s| &s.kind).chain(core::iter::once(&t.cwd)).any(|k| !k.is_empty() && wanted(k))
         })
     };
-    irq_restore(flags);
+    drop(held);
     found
 }
 
@@ -857,7 +890,7 @@ pub fn sig_action(tid: usize, signo: u8, new: Option<Disposition>) -> Option<Dis
         return None;
     }
     let bit = sig_bit(signo);
-    let flags = irq_save();
+    let held = PROGRAMS.lock();
     let old = unsafe {
         signals_mut(tid).map(|(t, w)| {
             let old = said(t, bit);
@@ -894,37 +927,37 @@ pub fn sig_action(tid: usize, signo: u8, new: Option<Disposition>) -> Option<Dis
             old
         })
     };
-    irq_restore(flags);
+    drop(held);
     old
 }
 
 /// `tid`'s program enters its handlers at `entry`, and — with `unix` — a
 /// call a signal cuts short answers it as Unix would have it.
 pub fn sig_enter_at(tid: usize, entry: usize, unix: bool) -> bool {
-    let flags = irq_save();
+    let held = PROGRAMS.lock();
     let done = unsafe {
         table_mut(tid).map(|t| {
             t.sig_entry = entry;
             t.sig_unix = unix;
         })
     };
-    irq_restore(flags);
+    drop(held);
     done.is_some()
 }
 
 /// Whether `tid`'s program has said where its handlers are entered.
 pub fn sig_has_entry(tid: usize) -> bool {
-    let flags = irq_save();
+    let held = PROGRAMS.lock();
     let has = unsafe { table_mut(tid).is_some_and(|t| t.sig_entry != 0) };
-    irq_restore(flags);
+    drop(held);
     has
 }
 
 /// Whether `tid`'s program has said so.
 pub fn sig_unix(tid: usize) -> bool {
-    let flags = irq_save();
+    let held = PROGRAMS.lock();
     let unix = unsafe { table_mut(tid).is_some_and(|t| t.sig_unix) };
-    irq_restore(flags);
+    drop(held);
     unix
 }
 
@@ -948,7 +981,7 @@ pub fn sig_handle(tid: usize, signo: u8, how: Handler) -> Option<Disposition> {
         return None;
     }
     let bit = sig_bit(signo);
-    let flags = irq_save();
+    let held = PROGRAMS.lock();
     let old = unsafe {
         table_mut(tid).map(|t| {
             let old = said(t, bit);
@@ -967,7 +1000,7 @@ pub fn sig_handle(tid: usize, signo: u8, how: Handler) -> Option<Disposition> {
             old
         })
     };
-    irq_restore(flags);
+    drop(held);
     old
 }
 
@@ -975,11 +1008,11 @@ pub fn sig_handle(tid: usize, signo: u8, how: Handler) -> Option<Disposition> {
 /// doing something about on its way out of the kernel: a handler to be run,
 /// or a signal that was held back and is not by this task.
 pub fn sig_ready(tid: usize, mask: u64) -> bool {
-    let flags = irq_save();
+    let held = PROGRAMS.lock();
     let ready = unsafe {
         table_mut(tid).is_some_and(|t| ((t.sig_pending & t.sig_run) | t.sig_held) & !mask != 0)
     };
-    irq_restore(flags);
+    drop(held);
     ready
 }
 
@@ -988,7 +1021,7 @@ pub fn sig_ready(tid: usize, mask: u64) -> bool {
 /// with it. It is no longer waiting, unless another of its number was
 /// behind it.
 pub fn sig_run_take(tid: usize, mask: u64) -> Option<(u8, Handler, Info)> {
-    let flags = irq_save();
+    let held = PROGRAMS.lock();
     let out = unsafe {
         signals_mut(tid).and_then(|(t, w)| {
             let ready = t.sig_pending & t.sig_run & !mask;
@@ -1003,7 +1036,7 @@ pub fn sig_run_take(tid: usize, mask: u64) -> Option<(u8, Handler, Info)> {
             Some((signo, begin(t, signo), info))
         })
     };
-    irq_restore(flags);
+    drop(held);
     out
 }
 
@@ -1024,20 +1057,20 @@ pub fn sig_run_begin(tid: usize, signo: u8) -> Option<Handler> {
     if signo == 0 || signo > 64 {
         return None;
     }
-    let flags = irq_save();
+    let held = PROGRAMS.lock();
     let out = unsafe {
         table_mut(tid).and_then(|t| {
             (t.sig_run & sig_bit(signo) != 0 && t.sig_entry != 0).then(|| begin(t, signo))
         })
     };
-    irq_restore(flags);
+    drop(held);
     out
 }
 
 /// Take the lowest signal that was held back with nothing said about it and
 /// that `mask` does not hold back.
 pub fn sig_held_take(tid: usize, mask: u64) -> Option<u8> {
-    let flags = irq_save();
+    let held = PROGRAMS.lock();
     let out = unsafe {
         signals_mut(tid).and_then(|(t, w)| {
             let ready = t.sig_held & !mask;
@@ -1051,7 +1084,7 @@ pub fn sig_held_take(tid: usize, mask: u64) -> Option<u8> {
             Some(signo)
         })
     };
-    irq_restore(flags);
+    drop(held);
     out
 }
 
@@ -1061,7 +1094,7 @@ pub fn sig_held_take(tid: usize, mask: u64) -> Option<u8> {
 /// waiting as can.
 pub fn sig_hold(tid: usize, signo: u8, info: Info) -> bool {
     let bit = sig_bit(signo);
-    let flags = irq_save();
+    let lock = PROGRAMS.lock();
     let held = unsafe {
         signals_mut(tid).is_none_or(|(t, w)| {
             let ok = w.put(signo, info, (t.sig_held | t.sig_pending) & bit != 0);
@@ -1071,13 +1104,13 @@ pub fn sig_hold(tid: usize, signo: u8, info: Info) -> bool {
             ok
         })
     };
-    irq_restore(flags);
+    drop(lock);
     held
 }
 
 /// `signo` is no longer held for `tid`'s program.
 pub fn sig_unhold(tid: usize, signo: u8) {
-    let flags = irq_save();
+    let held = PROGRAMS.lock();
     unsafe {
         if let Some((t, w)) = signals_mut(tid) {
             t.sig_held &= !sig_bit(signo);
@@ -1086,15 +1119,15 @@ pub fn sig_unhold(tid: usize, signo: u8) {
             }
         }
     }
-    irq_restore(flags);
+    drop(held);
 }
 
 /// Every signal waiting for `tid`'s program: to be told of, to be run, or
 /// held back with nothing said.
 pub fn sig_pending_set(tid: usize) -> u64 {
-    let flags = irq_save();
+    let held = PROGRAMS.lock();
     let set = unsafe { table_mut(tid).map_or(0, |t| (t.sig_pending & (t.sig_run | t.sig_catch)) | t.sig_held) };
-    irq_restore(flags);
+    drop(held);
     set
 }
 
@@ -1102,7 +1135,7 @@ pub fn sig_pending_set(tid: usize) -> u64 {
 /// about it, without anything being done about it: the signal and what came
 /// with it.
 pub fn sig_take_one(tid: usize, set: u64) -> Option<(u8, Info)> {
-    let flags = irq_save();
+    let held = PROGRAMS.lock();
     let out = unsafe {
         signals_mut(tid).and_then(|(t, w)| {
             let waiting = ((t.sig_pending & (t.sig_run | t.sig_catch)) | t.sig_held) & set;
@@ -1118,7 +1151,7 @@ pub fn sig_take_one(tid: usize, set: u64) -> Option<(u8, Info)> {
             Some((signo, info))
         })
     };
-    irq_restore(flags);
+    drop(held);
     out
 }
 
@@ -1131,7 +1164,7 @@ pub fn sig_post(tid: usize, signo: u8, info: Info) -> Option<Result<(Disposition
         return None;
     }
     let bit = sig_bit(signo);
-    let flags = irq_save();
+    let held = PROGRAMS.lock();
     let out = unsafe {
         signals_mut(tid).map(|(t, w)| {
             if t.sig_run & bit != 0 || t.sig_catch & bit != 0 {
@@ -1152,7 +1185,7 @@ pub fn sig_post(tid: usize, signo: u8, info: Info) -> Option<Result<(Disposition
             })
         })
     };
-    irq_restore(flags);
+    drop(held);
     out
 }
 
@@ -1162,7 +1195,7 @@ pub fn sig_post(tid: usize, signo: u8, info: Info) -> Option<Result<(Disposition
 /// the word this answers with. `word`, if not 0, is where it wants to be
 /// told of the next.
 pub fn sig_take(tid: usize, word: usize) -> (u64, Option<usize>) {
-    let flags = irq_save();
+    let held = PROGRAMS.lock();
     let taken = unsafe {
         match signals_mut(tid) {
             Some((t, w)) => {
@@ -1191,7 +1224,7 @@ pub fn sig_take(tid: usize, word: usize) -> (u64, Option<usize>) {
             None => (0, None),
         }
     };
-    irq_restore(flags);
+    drop(held);
     taken
 }
 
@@ -1199,14 +1232,14 @@ pub fn sig_take(tid: usize, word: usize) -> (u64, Option<usize>) {
 /// wait yet? A task about to wait asks, and if so does not wait; asking is
 /// what uses the answer up.
 pub fn sig_interrupted(tid: usize) -> bool {
-    let flags = irq_save();
+    let held = PROGRAMS.lock();
     let was = unsafe {
         match table_mut(tid) {
             Some(t) => core::mem::replace(&mut t.sig_interrupt, false),
             None => false,
         }
     };
-    irq_restore(flags);
+    drop(held);
     was
 }
 
@@ -1215,7 +1248,7 @@ pub fn sig_interrupted(tid: usize) -> bool {
 /// `new` it is then set to that — `(nanoseconds from now, repeat)`, 0 from
 /// now for no alarm. `None` for a task in no program.
 pub fn alarm(tid: usize, now: u64, new: Option<(u64, u64)>) -> Option<(u64, u64)> {
-    let flags = irq_save();
+    let held = PROGRAMS.lock();
     let was = unsafe {
         table_mut(tid).map(|t| {
             let left = match t.alarm_at {
@@ -1230,7 +1263,7 @@ pub fn alarm(tid: usize, now: u64, new: Option<(u64, u64)>) -> Option<(u64, u64)
             was
         })
     };
-    irq_restore(flags);
+    drop(held);
     was
 }
 
@@ -1247,7 +1280,7 @@ fn alarm_next(at: u64, every: u64, now: u64) -> u64 {
 /// A task of a program whose alarm is due at `now`, the alarm having been
 /// set for its next time or turned off. `None` when no program's is.
 pub fn alarm_due(now: u64) -> Option<usize> {
-    let flags = irq_save();
+    let held = PROGRAMS.lock();
     let due = unsafe {
         let mut found = None;
         for i in 0..tables().high() {
@@ -1264,14 +1297,14 @@ pub fn alarm_due(now: u64) -> Option<usize> {
         }
         found
     };
-    irq_restore(flags);
+    drop(held);
     due
 }
 
 /// When the earliest alarm will be due once those due at `now` have been
 /// seen to ([`alarm_due`]), or `u64::MAX` if no program will have one.
 pub fn alarm_after(now: u64) -> u64 {
-    let flags = irq_save();
+    let held = PROGRAMS.lock();
     let mut next = u64::MAX;
     unsafe {
         for i in 0..tables().high() {
@@ -1285,53 +1318,53 @@ pub fn alarm_after(now: u64) -> u64 {
             }
         }
     }
-    irq_restore(flags);
+    drop(held);
     next
 }
 
 /// What the ended tasks of `tid`'s program used.
 pub fn usage_gone(tid: usize) -> crate::usage::Usage {
-    let flags = irq_save();
+    let held = PROGRAMS.lock();
     let used = unsafe { table_mut(tid).map_or(crate::usage::Usage::ZERO, |t| t.used_gone) };
-    irq_restore(flags);
+    drop(held);
     used
 }
 
 /// A task of `tid`'s program has ended, having used `used`.
 pub fn usage_gone_add(tid: usize, used: &crate::usage::Usage) {
-    let flags = irq_save();
+    let held = PROGRAMS.lock();
     unsafe {
         if let Some(t) = table_mut(tid) {
             t.used_gone.add(used);
         }
     }
-    irq_restore(flags);
+    drop(held);
 }
 
 /// What the children `tid`'s program collected used.
 pub fn usage_children(tid: usize) -> crate::usage::Usage {
-    let flags = irq_save();
+    let held = PROGRAMS.lock();
     let used = unsafe { table_mut(tid).map_or(crate::usage::Usage::ZERO, |t| t.used_children) };
-    irq_restore(flags);
+    drop(held);
     used
 }
 
 /// `tid`'s program has collected a child that used `used`.
 pub fn usage_children_add(tid: usize, used: &crate::usage::Usage) {
-    let flags = irq_save();
+    let held = PROGRAMS.lock();
     unsafe {
         if let Some(t) = table_mut(tid) {
             t.used_children.add(used);
         }
     }
-    irq_restore(flags);
+    drop(held);
 }
 
 /// `tid`'s program runs as `from`'s does: with the same limit on how long.
 /// Not what it has used, which for a new program is nothing. How nice it is
 /// is its task's, and a task made is given its maker's (`scheduler`).
 pub fn runs_like(tid: usize, from: usize) {
-    let flags = irq_save();
+    let held = PROGRAMS.lock();
     unsafe {
         if let Some((soft, hard)) = table_mut(from).map(|t| (t.cpu_soft, t.cpu_hard)) {
             if let Some(t) = table_mut(tid) {
@@ -1339,12 +1372,12 @@ pub fn runs_like(tid: usize, from: usize) {
             }
         }
     }
-    irq_restore(flags);
+    drop(held);
 }
 
 /// Say what `tid`'s program was started as: `cmdline`, as much as fits.
 pub fn set_cmdline(tid: usize, cmdline: &[u8]) -> bool {
-    let flags = irq_save();
+    let held = PROGRAMS.lock();
     let done = unsafe {
         match table_mut(tid) {
             Some(t) => {
@@ -1357,46 +1390,46 @@ pub fn set_cmdline(tid: usize, cmdline: &[u8]) -> bool {
             None => false,
         }
     };
-    irq_restore(flags);
+    drop(held);
     done
 }
 
 /// What `tid`'s program was started as, into `out`: how long it is.
 pub fn cmdline_of(tid: usize, out: &mut [u8; CMDLINE]) -> Option<usize> {
-    let flags = irq_save();
+    let held = PROGRAMS.lock();
     let len = unsafe {
         table_mut(tid).map(|t| {
             *out = t.cmdline;
             t.cmdline_len as usize
         })
     };
-    irq_restore(flags);
+    drop(held);
     len
 }
 
 /// How many seconds of processor time `tid`'s program may have: SIGXCPU past
 /// the first, the end at the second.
 pub fn cpu_limit_of(tid: usize) -> (u64, u64) {
-    let flags = irq_save();
+    let held = PROGRAMS.lock();
     let limit = unsafe { table_mut(tid).map_or((u64::MAX, u64::MAX), |t| (t.cpu_soft, t.cpu_hard)) };
-    irq_restore(flags);
+    drop(held);
     limit
 }
 
 pub fn set_cpu_limit(tid: usize, soft: u64, hard: u64) {
-    let flags = irq_save();
+    let held = PROGRAMS.lock();
     unsafe {
         if let Some(t) = table_mut(tid) {
             (t.cpu_soft, t.cpu_hard) = (soft, hard);
         }
     }
-    irq_restore(flags);
+    drop(held);
 }
 
 /// Whether `tid`'s program, having used `seconds`, is owed a SIGXCPU it has
 /// not been sent: one a second. Taken if it is.
 pub fn xcpu_due(tid: usize, seconds: u64) -> bool {
-    let flags = irq_save();
+    let held = PROGRAMS.lock();
     let due = unsafe {
         table_mut(tid).is_some_and(|t| {
             let due = t.xcpu_sent == u64::MAX || seconds > t.xcpu_sent;
@@ -1406,13 +1439,13 @@ pub fn xcpu_due(tid: usize, seconds: u64) -> bool {
             due
         })
     };
-    irq_restore(flags);
+    drop(held);
     due
 }
 
 /// Set the program's umask and return what it was; `None` only reads it.
 pub fn umask(tid: usize, new: Option<u16>) -> u16 {
-    let flags = irq_save();
+    let held = PROGRAMS.lock();
     let old = unsafe {
         match table_mut(tid) {
             Some(t) => {
@@ -1425,49 +1458,49 @@ pub fn umask(tid: usize, new: Option<u16>) -> u16 {
             None => DEFAULT_UMASK,
         }
     };
-    irq_restore(flags);
+    drop(held);
     old
 }
 
 /// Calls made by `tid`'s program from outside `from..to` raise SIGSYS
 /// rather than being made; `from == to` for none (`signal::trap_call`).
 pub fn set_trap(tid: usize, from: usize, to: usize) -> bool {
-    let flags = irq_save();
+    let held = PROGRAMS.lock();
     let set = unsafe {
         table_mut(tid).map(|t| {
             t.trap_from = from;
             t.trap_to = to;
         })
     };
-    irq_restore(flags);
+    drop(held);
     set.is_some()
 }
 
 /// Where `tid`'s program has said its calls are made from, if it has.
 pub fn trap_of(tid: usize) -> Option<(usize, usize)> {
-    let flags = irq_save();
+    let held = PROGRAMS.lock();
     let range = unsafe {
         table_mut(tid).and_then(|t| (t.trap_from != t.trap_to).then_some((t.trap_from, t.trap_to)))
     };
-    irq_restore(flags);
+    drop(held);
     range
 }
 
 /// Whether `fd` is closed when the program becomes another.
 pub fn cloexec(tid: usize, fd: usize) -> Option<bool> {
-    let flags = irq_save();
+    let held = TABLES_LOCK.lock();
     let out = unsafe {
         match table_mut(tid).and_then(|t| t.fds.get(fd)) {
             Some(s) if !s.kind.is_empty() => Some(s.cloexec),
             _ => None,
         }
     };
-    irq_restore(flags);
+    drop(held);
     out
 }
 
 pub fn set_cloexec(tid: usize, fd: usize, on: bool) -> bool {
-    let flags = irq_save();
+    let held = TABLES_LOCK.lock();
     let ok = unsafe {
         match table_mut(tid).and_then(|t| t.fds.get_mut(fd)) {
             Some(s) if !s.kind.is_empty() => {
@@ -1477,19 +1510,20 @@ pub fn set_cloexec(tid: usize, fd: usize, on: bool) -> bool {
             _ => false,
         }
     };
-    irq_restore(flags);
+    drop(held);
     ok
 }
 
 /// The program is becoming another: close every descriptor marked for it.
 pub fn close_on_exec(tid: usize) {
     // What is closed, released once the lock is given up, as `leave`'s is.
-    // Room for it is the heap's; where there is none, it is released here.
+    // Room for it is the heap's; where there is none, it is released here,
+    // under the descriptors' lock, which comes before what they name.
     let mut gone = Grow::new(FdKind::Empty);
     let mut n = 0;
-    let flags = irq_save();
+    let held = TABLES_LOCK.lock();
     unsafe {
-        if let Some((t, w)) = signals_mut(tid) {
+        if let Some(t) = table_mut(tid) {
             for s in t.fds.iter_mut().filter(|s| s.cloexec) {
                 let kind = core::mem::replace(s, NO_FD).kind;
                 match gone.ensure(n, FIRST, FD_MOST) {
@@ -1501,6 +1535,12 @@ pub fn close_on_exec(tid: usize) {
                     Err(_) => {}
                 }
             }
+        }
+    }
+    drop(held);
+    let held = PROGRAMS.lock();
+    unsafe {
+        if let Some((t, w)) = signals_mut(tid) {
             // A handler is an address in the program that has just gone, and
             // so is the word it was told through. What was ignored still is.
             t.sig_catch = 0;
@@ -1520,7 +1560,7 @@ pub fn close_on_exec(tid: usize) {
             p.timers.clear();
         }
     }
-    irq_restore(flags);
+    drop(held);
     for kind in gone.iter().take(n).filter(|k| !k.is_empty()) {
         crate::pipe::release_fd(kind);
     }
@@ -1533,13 +1573,15 @@ pub fn interrupt(tid: usize) -> bool {
     if tid >= MAX_TASKS {
         return false;
     }
-    let flags = irq_save();
+    // What it holds, read under the descriptors' lock; off its list through
+    // its kind's own lock (`waitlist::forget`), with interrupts off.
+    let lock = TABLES_LOCK.lock();
     let held = unsafe { st(tid).held };
     let found = !held.is_empty() && crate::pipe::forget_waiter(&held, tid);
     if found {
         crate::scheduler::unblock_task(tid);
     }
-    irq_restore(flags);
+    drop(lock);
     found
 }
 
@@ -1553,7 +1595,7 @@ pub fn hold(tid: usize, fd: usize) -> FdKind {
     if tid >= MAX_TASKS || fd >= FD_MOST {
         return FdKind::Empty;
     }
-    let flags = irq_save();
+    let held = TABLES_LOCK.lock();
     let kind = unsafe { table_mut(tid).map_or(FdKind::Empty, |t| t.kind(fd)) };
     // Only what a task can be parked on. Memory and poll sets are never
     // waited on through a read or a write, and an endpoint has no object.
@@ -1572,7 +1614,7 @@ pub fn hold(tid: usize, fd: usize) -> FdKind {
     if waits && crate::pipe::retain_fd(&kind).is_ok() {
         unsafe { st(tid).held = kind };
     }
-    irq_restore(flags);
+    drop(held);
     kind
 }
 
@@ -1581,11 +1623,11 @@ pub fn unhold(tid: usize) {
     if tid >= MAX_TASKS {
         return;
     }
-    let flags = irq_save();
+    let held = TABLES_LOCK.lock();
     let kind = unsafe {
         core::mem::replace(&mut st(tid).held, FdKind::Empty)
     };
-    irq_restore(flags);
+    drop(held);
     if !kind.is_empty() {
         crate::pipe::release_fd(&kind);
     }

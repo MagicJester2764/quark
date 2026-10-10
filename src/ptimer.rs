@@ -88,22 +88,12 @@ impl Drop for Timers {
     }
 }
 
-#[inline(always)]
-fn irq_save() -> u64 {
-    let flags: u64;
-    unsafe { core::arch::asm!("pushfq; pop {}; cli", out(reg) flags, options(nostack)) };
-    flags
-}
 
-#[inline(always)]
-fn irq_restore(flags: u64) {
-    unsafe { core::arch::asm!("push {}; popfq", in(reg) flags, options(nostack)) };
-}
 
 /// The timer `id` of `tid`'s program, if it has made one.
 ///
 /// # Safety
-/// Interrupts are off.
+/// `fdtable::PROGRAMS` held.
 unsafe fn timer(tid: usize, id: usize) -> Option<&'static mut Timer> {
     if id >= PER_PROGRAM {
         return None;
@@ -153,11 +143,11 @@ pub fn create(tid: usize, clock: u64, signo: u64, own: bool, value: u64, task: u
     } else {
         return None;
     };
-    let flags = irq_save();
+    let held = crate::fdtable::PROGRAMS.lock();
     let made = unsafe {
         // The room for its timers is made with its first.
         let Some(mine) = crate::fdtable::table_of(tid).and_then(|p| p.timers.make()) else {
-            irq_restore(flags);
+            drop(held);
             return None;
         };
         mine.iter().position(|t| !t.used).map(|id| {
@@ -174,7 +164,7 @@ pub fn create(tid: usize, clock: u64, signo: u64, own: bool, value: u64, task: u
             id
         })
     };
-    irq_restore(flags);
+    drop(held);
     made
 }
 
@@ -184,7 +174,7 @@ pub fn create(tid: usize, clock: u64, signo: u64, own: bool, value: u64, task: u
 /// before, nanoseconds left and between, and when it is now due (0 for
 /// never), for the caller to tell the clock.
 pub fn set(tid: usize, id: usize, absolute: bool, first: u64, every: u64, now: u64) -> Option<((u64, u64), u64)> {
-    let flags = irq_save();
+    let held = crate::fdtable::PROGRAMS.lock();
     let out = unsafe {
         timer(tid, id).map(|t| {
             let was = (left(t, now), t.every);
@@ -202,25 +192,25 @@ pub fn set(tid: usize, id: usize, absolute: bool, first: u64, every: u64, now: u
             (was, t.at)
         })
     };
-    irq_restore(flags);
+    drop(held);
     out
 }
 
 /// `SYS_PTIMER` 2: how timer `id` of `tid`'s program stands at `now`:
 /// nanoseconds left, and between firings.
 pub fn get(tid: usize, id: usize, now: u64) -> Option<(u64, u64)> {
-    let flags = irq_save();
+    let held = crate::fdtable::PROGRAMS.lock();
     let out = unsafe { timer(tid, id).map(|t| (left(t, now), t.every)) };
-    irq_restore(flags);
+    drop(held);
     out
 }
 
 /// `SYS_PTIMER` 3: timer `id` of `tid`'s program is no more. A signal of
 /// its that is waiting stays waiting.
 pub fn delete(tid: usize, id: usize) -> bool {
-    let flags = irq_save();
+    let held = crate::fdtable::PROGRAMS.lock();
     let done = unsafe { timer(tid, id).map(|t| *t = UNUSED).is_some() };
-    irq_restore(flags);
+    drop(held);
     done
 }
 
@@ -241,7 +231,7 @@ pub struct Due {
 /// `None` when no more is due. A timer that raises nothing is re-armed and
 /// passed over, and so is one for a task that has gone.
 pub fn due(now: u64) -> Option<Due> {
-    let flags = irq_save();
+    let held = crate::fdtable::PROGRAMS.lock();
     let mut found = None;
     unsafe {
         'tables: for (table, p) in crate::fdtable::programs() {
@@ -255,20 +245,20 @@ pub fn due(now: u64) -> Option<Due> {
                 if t.signo == 0 || (t.task != 0 && crate::cap::endpoint_of(t.task) != t.endpoint) {
                     continue;
                 }
-                let Some(tid) = crate::fdtable::a_task_of(table) else { continue };
+                let Some(tid) = crate::fdtable::a_task_of_held(table) else { continue };
                 found = Some(Due { tid, task: t.task, signo: t.signo, id, value: t.value, missed });
                 break 'tables;
             }
         }
     }
-    irq_restore(flags);
+    drop(held);
     found
 }
 
 /// When the earliest timer will be due once those due at `now` have been
 /// seen to ([`due`]), or `u64::MAX` if none will be.
 pub fn after(now: u64) -> u64 {
-    let flags = irq_save();
+    let held = crate::fdtable::PROGRAMS.lock();
     let mut next = u64::MAX;
     unsafe {
         for t in crate::fdtable::programs().filter_map(|(_, p)| p.timers.get()).flatten() {
@@ -281,6 +271,6 @@ pub fn after(now: u64) -> u64 {
             }
         }
     }
-    irq_restore(flags);
+    drop(held);
     next
 }
