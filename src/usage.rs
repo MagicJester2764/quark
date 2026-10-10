@@ -455,7 +455,7 @@ pub fn cpu_info(caller: usize, op: u64, a: u64, b: u64) -> u64 {
                 return u64::MAX;
             }
             let flags = irq_save();
-            let now = crate::clock::now();
+            let now = crate::clock::now_here();
             let mut sum = Spent::ZERO;
             for cpu in (0..count).filter(|&cpu| a == u64::MAX || a as usize == cpu) {
                 let (spent, doing, mark) = unsafe { (SPENT[cpu].0, DOING[cpu].0, MARK[cpu].0) };
@@ -468,8 +468,10 @@ pub fn cpu_info(caller: usize, op: u64, a: u64, b: u64) -> u64 {
                 sum.interrupts += spent.interrupts;
                 sum.switches += spent.switches;
             }
-            let ready = crate::scheduler::runnable() as u64;
             irq_restore(flags);
+            // How many are ready is a look at every task, which only the one
+            // lock keeps from being taken apart under it.
+            let ready = crate::scheduler::with_kernel(crate::scheduler::runnable) as u64;
             let made = MADE.load(core::sync::atomic::Ordering::Relaxed);
             let words = [sum.ns[0], sum.ns[1], sum.ns[2], sum.ns[3], sum.interrupts, sum.switches, made, ready];
             let _ua = crate::cpu::UserAccess::begin();
@@ -488,7 +490,11 @@ pub fn cpu_info(caller: usize, op: u64, a: u64, b: u64) -> u64 {
         }
         3 => {
             let tid = if a == 0 { caller } else { a as usize };
-            crate::scheduler::last_cpu(tid).map_or(u64::MAX, |cpu| cpu as u64)
+            // Another task's, under its record's lock.
+            let held = crate::scheduler::lock_record(tid);
+            let cpu = crate::scheduler::last_cpu(tid);
+            drop(held);
+            cpu.map_or(u64::MAX, |cpu| cpu as u64)
         }
         _ => u64::MAX,
     }

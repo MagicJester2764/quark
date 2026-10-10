@@ -970,11 +970,24 @@ pub fn due(tid: usize) -> bool {
     (unsafe { st(tid).restore.is_some() }) || ready(tid)
 }
 
+/// [`due`], for a call made without the one lock on its way out, its
+/// program's half read with no lock (`fdtable::sig_ready_hint`): a hint,
+/// which [`leaving_call`] asks again under the lock if it says yes. The
+/// programs' records have one lock, and a door that took it twice on every
+/// call was where every call on every processor met.
+fn due_hint(tid: usize) -> bool {
+    let mask = unsafe { st(tid).mask };
+    (unsafe { st(tid).restore.is_some() })
+        || (unsafe { st(tid).tpending } & !mask) != 0
+        || fdtable::sig_ready_hint(tid, mask)
+}
+
 /// Whether `tid`'s program has said where its calls are made from
 /// (`SYS_SYSCALL_TRAP`): a call from anywhere else is SIGSYS at once, which
-/// is the one lock's to raise.
+/// is the one lock's to raise. Read with no lock, as a hint: `trap_call`
+/// asks again under it.
 pub fn traps_calls(tid: usize) -> bool {
-    tid != 0 && tid < MAX_TASKS && fdtable::trap_of(tid).is_some()
+    tid != 0 && tid < MAX_TASKS && fdtable::traps(tid)
 }
 
 /// The signals task `tid` holds back.
@@ -1517,8 +1530,11 @@ pub fn leaving_call(answer: u64) -> u64 {
     let unix = answer == INTERRUPTED && fdtable::sig_unix(tid);
     loop {
         cli();
-        // Nearly always nothing: asked first, and cheaply.
-        if !due(tid) {
+        // Nearly always nothing: asked first, and cheaply — by a call made
+        // without the one lock with no lock at all, and again with it if
+        // that says there is something.
+        let nothing = if crate::klock::held() { !due(tid) } else { !due_hint(tid) };
+        if nothing {
             if first && unix {
                 answer = AGAIN;
             }

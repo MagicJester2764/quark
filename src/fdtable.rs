@@ -1007,6 +1007,34 @@ pub fn sig_handle(tid: usize, signo: u8, how: Handler) -> Option<Disposition> {
 /// Whether `tid`'s program has anything a task of it with `mask` should be
 /// doing something about on its way out of the kernel: a handler to be run,
 /// or a signal that was held back and is not by this task.
+/// [`sig_ready`], read with no lock by a task of the program on its way out
+/// of a call made without the one lock — the program's record stays while
+/// the task is in it — as a hint. A signal raised for the program after the
+/// read interrupts the task's processor and comes to its next door; one
+/// raised while it waited woke it under its record's lock, which its wake
+/// took after the signal was written.
+pub fn sig_ready_hint(tid: usize, mask: u64) -> bool {
+    unsafe {
+        table_mut(tid).is_some_and(|t| {
+            let pending = core::ptr::read_volatile(&raw const t.sig_pending);
+            let run = core::ptr::read_volatile(&raw const t.sig_run);
+            let held = core::ptr::read_volatile(&raw const t.sig_held);
+            ((pending & run) | held) & !mask != 0
+        })
+    }
+}
+
+/// Whether `tid`'s program traps the calls made outside a range of its own
+/// ([`trap_of`]): read with no lock by a task of the program at its door, as
+/// a hint, which `signal::trap_call` asks again under the lock.
+pub fn traps(tid: usize) -> bool {
+    unsafe {
+        table_mut(tid).is_some_and(|t| {
+            core::ptr::read_volatile(&raw const t.trap_from) != core::ptr::read_volatile(&raw const t.trap_to)
+        })
+    }
+}
+
 pub fn sig_ready(tid: usize, mask: u64) -> bool {
     let held = PROGRAMS.lock();
     let ready = unsafe {

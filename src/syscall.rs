@@ -1008,13 +1008,17 @@ extern "C" fn syscall_dispatch(
 /// program traps its calls (`SYS_SYSCALL_TRAP`, which may be SIGSYS at
 /// once): those are the one lock's (`docs/smp.md`), as is a futex word that
 /// lends its holder a place (`SYS_FUTEX_PI`), whose lending looks at every
-/// task.
+/// task. And the calls about the caller itself and the time — a yield, the
+/// clock, who it is, how many processors there are — which read its own
+/// record, another's under that one's lock, or nothing that changes.
 fn unlocked(nr: u64, me: usize) -> bool {
     matches!(
         nr,
         SYS_SEND | SYS_CALL | SYS_REPLY | SYS_CALL_TIMEOUT | SYS_NOTIFY | SYS_RECV | SYS_RECV_TIMEOUT
             | SYS_CALL_LEND | SYS_CALL_OFFER | SYS_CALL_WITH
             | SYS_FUTEX_WAIT | SYS_FUTEX_WAIT_TIMEOUT | SYS_FUTEX_WAKE | SYS_FUTEX_REQUEUE
+            | SYS_YIELD | SYS_CLOCK | SYS_TICKS | SYS_BOOT_TIME | SYS_ABI_VERSION | SYS_GETPID | SYS_PID
+            | SYS_CPUS | SYS_CPU_INFO | SYS_GET_UID | SYS_GET_TUID
     )
         && !scheduler::door_has_news(me)
         && !crate::signal::traps_calls(me)
@@ -4431,11 +4435,15 @@ fn dispatch(
             // own number, which is its program's process id when it is the
             // task the program began as.
             let tid = if arg0 == 0 { scheduler::current_tid() } else { arg0 as usize };
+            // Another task's record, read under its lock: a call made
+            // without the one lock may meet it being taken apart.
+            let held = scheduler::lock_record(tid);
             let number = if arg1 == 1 && scheduler::task_is_live(tid) {
                 crate::cap::endpoint_of(tid)
             } else {
                 scheduler::pid_of(tid)
             };
+            drop(held);
             match number {
                 0 => u64::MAX,
                 n => n,
@@ -4782,7 +4790,11 @@ fn dispatch(
         }
         SYS_GET_TUID => {
             let tid = arg0 as usize;
-            match scheduler::task_uid_gid(tid) {
+            // Read under its record's lock, as `SYS_PID` reads one.
+            let held = scheduler::lock_record(tid);
+            let ids = scheduler::task_uid_gid(tid);
+            drop(held);
+            match ids {
                 Ok((uid, gid)) => ((uid as u64) << 32) | (gid as u64),
                 Err(()) => u64::MAX,
             }

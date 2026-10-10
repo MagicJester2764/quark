@@ -1621,15 +1621,22 @@ breaking any of them is quiet until it is a machine that stops.
   nothing else is in here, but them. The lock is taken at the kernel's three doors — `syscall_dispatch`,
   `exception_handler`, `irq_handler` — and nowhere else but where a call
   made without it finds something that is the lock's (`with_kernel`). A
-  send, a receive, a call, a reply and a notice, every form, and a
-  futex's wait, wake and requeue (`syscall::unlocked`), are made without
-  it, under the locks of what they touch — the tasks' records, the
-  caller's capability space, a futex's lists, the pages checked, the
-  processor's queues — by a task the door has nothing to say
+  send, a receive, a call, a reply and a notice, every form, a futex's
+  wait, wake and requeue, and the calls about the caller and the time — a
+  yield, the clock, who it is, how many processors (`syscall::unlocked`)
+  — are made without it, under the locks of what they touch — the tasks'
+  records, the caller's capability space, a futex's lists, the pages
+  checked, the processor's queues — by a task the door has nothing to say
   to: one ended, stopped or barred from its processor while it ran, or one
   whose program traps its calls, comes in under the lock, and a call made
   without it looks again on its way out (`door_has_news`), as
-  `leaving_call` does before it runs a handler. It is given across a switch
+  `leaving_call` does before it runs a handler. Its program's trap and its
+  program's signals are asked there with no lock at all, as hints
+  (`fdtable::traps`, `sig_ready_hint`): what they say is asked again under
+  the one lock before anything is done about it, and a signal raised after
+  the look interrupts the task's processor and comes to its next door. The
+  programs' records have one lock, and a door that took it twice a call
+  was where every call on every processor met. It is given across a switch
   as the task switched to expects it: one switched out holding it is
   switched back to holding it, one switched out without it without it
   (`kl_held`), and the idle loop always with it; and it is given up on
@@ -1938,9 +1945,9 @@ breaking any of them is quiet until it is a machine that stops.
   closing the set while another thread waits on it leaves that thread to its
   timeout. A one-shot `SYS_POLL` makes a set of its own and is not affected.
 - **The kernel is one processor's at a time, but for calls between two
-  tasks and a futex's waits and wakes.** Programs run on every processor;
-  every other system call, a fault or an interrupt waits for the kernel
-  to be empty. What comes out
+  tasks, a futex's waits and wakes, and the calls about the caller and the
+  time.** Programs run on every processor; every other system call, a
+  fault or an interrupt waits for the kernel to be empty. What comes out
   from under the one lock does so a path at a time, each measured; a
   pager's receive takes the lock when one of its objects has gone idle,
   and a call that lends a place to a task better placed than its callee
