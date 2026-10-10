@@ -1295,8 +1295,15 @@ stopped is one the scheduler does not run.
   run queue and never switched to. `enqueue` — with `requeue_here` and
   `enqueue_front` — and `donate_to` are where a task becomes runnable, and
   each asks. What would have woken it
-  leaves it `Ready` and in no queue; continuing queues every task that is.
-  A new way to make a task run has to ask too.
+  leaves it `Ready` and in no queue; continuing queues every task that is,
+  one a processor is still leaving included (the claim waits for it).
+  A new way to make a task run has to ask too. **And whether it is held
+  and whether it is queued are changed under its record's lock**
+  (`hold_task`, `release_task`), as a wake and a switch's put-back change
+  them: a wake is made without the one lock, and a continue that looked
+  with no lock met one coming the other way — each found the task the
+  other's to queue, and a thread of a continued program never ran again
+  (`dtest smp`, stopped and continued three hundred times).
 - **The running task can be the one stopped** — a program that stops
   itself, or reads a terminal from behind. It is held with the rest and
   stops at `scheduler::stop_here`, which whoever raised the signal calls

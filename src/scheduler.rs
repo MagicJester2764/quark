@@ -1059,7 +1059,10 @@ unsafe fn schedule_inner(from_irq: bool) { unsafe {
     // another processor may be ending it (`end_other`). Asked before the
     // lock and answered after it, a task ended in between was put back in a
     // queue as ready — its descriptors closed and its death told — and ran
-    // on.
+    // on. And it is put back under that lock too, which a stop and a
+    // continue take (`hold_task`, `release_task`): put back after it, a task
+    // stopped in between was queued though held, or left in no queue by a
+    // continue that came while it was still being left.
     if current_tid != 0 {
         let held = lock_record(current_tid);
         let state = (*slot(current_tid)).as_ref().map(|t| t.state);
@@ -1067,11 +1070,10 @@ unsafe fn schedule_inner(from_irq: bool) { unsafe {
             if let Some(ref mut task) = *slot(current_tid) {
                 task.state = TaskState::Ready;
             }
+            requeue_here(current_tid);
         }
         drop(held);
-        if state == Some(TaskState::Running) {
-            requeue_here(current_tid);
-        } else if state == Some(TaskState::Dead) && st(current_tid).unannounced {
+        if state == Some(TaskState::Dead) && st(current_tid).unannounced {
             // Ended from another processor, and this is the one it was
             // running on, leaving it: now its parent may be told — under the
             // one lock, which a task in a call made without it has not got,
@@ -1695,6 +1697,10 @@ unsafe fn count_turn(tid: usize) { unsafe {
 ///
 /// One already waiting in its band stays where it is; one waiting in
 /// another, which it has since left, goes to this one.
+///
+/// With the task's record held, wherever it can be woken, stopped or
+/// continued at the same moment: that is what makes "is it held" and "is
+/// it queued" one answer.
 unsafe fn enqueue(tid: usize) { unsafe {
     if tid == 0 || st(tid).held {
         return;
@@ -1777,11 +1783,18 @@ unsafe fn unqueue(tid: usize) { unsafe {
 ///
 /// The running task can be held too. It goes on until it next gives up the
 /// processor — [`stop_here`] — and is not given it back.
+///
+/// Under its record's lock, as everything that puts a task in a queue is
+/// (`unblock_task`, a reply's `unblock_task_next`, a switch putting back
+/// the task it leaves), so that whether it is held and whether it is queued
+/// are one question: a wake made without the one lock that read it not
+/// held a moment before, queued it held.
 pub fn hold_task(tid: usize) {
     if tid == 0 || tid >= MAX_TASKS {
         return;
     }
     let flags = irq_save();
+    let held = lock_record(tid);
     unsafe {
         st(tid).held = true;
         unqueue(tid);
@@ -1789,6 +1802,7 @@ pub fn hold_task(tid: usize) {
         // brought into the kernel to look.
         interrupt_if_elsewhere(tid);
     }
+    drop(held);
     irq_restore(flags);
 }
 
@@ -1914,22 +1928,34 @@ pub fn woken() {
 
 /// Let a held task run again: at once if it is ready to, and otherwise when
 /// whatever it is blocked on lets it.
+///
+/// Under its record's lock, as [`hold_task`]: a wake made without the one
+/// lock makes it ready and queues it — or finds it held and does not —
+/// under that lock, and so does a switch putting it back. Looked at with no
+/// lock, a continue and a wake that came together could each find the task
+/// the other's to queue, and it waited in no queue for good; or both queue
+/// it, in two.
 pub fn release_task(tid: usize) {
     if tid >= MAX_TASKS {
         return;
     }
     let flags = irq_save();
+    let held = lock_record(tid);
     unsafe {
         if st(tid).held {
             st(tid).held = false;
-            // Ready, and not running: one that was stopped from another
-            // processor and has not been reached yet is still running, and
-            // simply goes on.
-            if matches!(*slot(tid), Some(ref t) if t.state == TaskState::Ready) && st(tid).on_cpu == NO_CPU {
+            // Ready: queued, whether or not a processor is still leaving it.
+            // One still running there — stopped from another processor and
+            // not reached yet — is Running, and simply goes on. One being
+            // left is Ready, and was put back while it was held, which is to
+            // say not at all: queued now, it is run once its registers are
+            // saved (the claim waits, or leaves it for later).
+            if matches!(*slot(tid), Some(ref t) if t.state == TaskState::Ready) {
                 enqueue(tid);
             }
         }
     }
+    drop(held);
     irq_restore(flags);
 }
 
@@ -2785,6 +2811,9 @@ pub fn affinity_of(tid: usize) -> [u64; 4] {
 /// (`arrived`) — at once, if that is this one.
 pub fn set_affinity(tid: usize, set: [u64; 4]) {
     let flags = irq_save();
+    // Moved between queues under its record's lock, as anything that queues
+    // it is (`hold_task`).
+    let record = lock_record(tid);
     let here = unsafe {
         st(tid).allowed = set;
         if st(tid).queued != NOT_QUEUED && !may_run_on(tid, st(tid).queued_on as usize) {
@@ -2803,6 +2832,7 @@ pub fn set_affinity(tid: usize, set: [u64; 4]) {
             false
         }
     };
+    drop(record);
     irq_restore(flags);
     if here {
         yield_now();

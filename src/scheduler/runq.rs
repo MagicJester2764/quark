@@ -595,9 +595,14 @@ pub(super) unsafe fn give_away(cpu: usize) {
                     unlink_held(t as usize);
                     t as usize
                 };
+                // Queued again under its record's lock, as everything that
+                // queues a task is: a wake or a continue meanwhile has
+                // queued it already, or finds it queued.
+                let record = super::lock_record(t);
                 if ready(t) {
                     super::enqueue(t);
                 }
+                drop(record);
             }
         }
     }
