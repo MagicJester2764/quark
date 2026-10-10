@@ -343,15 +343,16 @@ uses them well, and the difference is a list:
 
 - **The one lock.** A call between two tasks is made without it, and
   `callbench sweep 10` — pairs of threads calling each other, a pair to a
-  processor — makes 670,000 calls a second with one pair on eight
-  processors under KVM, 1,268,000 with two, 2,455,000 with four and
-  4,675,000 with eight, where with every call under the one lock it made
+  processor — makes 674,000 calls a second with one pair on eight
+  processors under KVM, 1,290,000 with two, 2,468,000 with four and
+  4,789,000 with eight, where with every call under the one lock it made
   591,000, 505,000, 450,000 and 387,000: fewer the more there were, each
   waiting at the door for the rest. Made without the one lock, four made
   2.8 times what one made and eight no more than four, until the door
   stopped taking the programs' records' one lock to ask about the caller's
-  program (it asks under the caller's own record's lock now, as a hint)
-  and nothing written per processor shared a cache line: four make 3.7 times what one makes, and
+  program, three times a call (it asks under the caller's own record's
+  lock now, as a hint) and nothing written per processor shared a cache
+  line: four make 3.7 times what one makes, and
   eight 7. A futex's waits and wakes
   are made without the one lock too; `kstress futex` hands a word on about
   as often as it did under it (261 million times in ten minutes on eight

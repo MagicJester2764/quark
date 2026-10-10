@@ -971,10 +971,11 @@ pub fn due(tid: usize) -> bool {
 }
 
 /// [`due`], for a call made without the one lock on its way out, its
-/// program's half read with no lock (`fdtable::sig_ready_hint`): a hint,
-/// which [`leaving_call`] asks again under the lock if it says yes. The
-/// programs' records have one lock, and a door that took it twice on every
-/// call was where every call on every processor met.
+/// program's half read under the caller's own record's lock and not the
+/// programs' records' one (`fdtable::sig_ready_hint`): a hint, which
+/// [`leaving_call`] asks again under the one lock if it says yes. A call
+/// that took the programs' records' lock on its way in and out was where
+/// every call on every processor met.
 fn due_hint(tid: usize) -> bool {
     let mask = unsafe { st(tid).mask };
     (unsafe { st(tid).restore.is_some() })
@@ -984,8 +985,8 @@ fn due_hint(tid: usize) -> bool {
 
 /// Whether `tid`'s program has said where its calls are made from
 /// (`SYS_SYSCALL_TRAP`): a call from anywhere else is SIGSYS at once, which
-/// is the one lock's to raise. Read with no lock, as a hint: `trap_call`
-/// asks again under it.
+/// is the one lock's to raise. Read under the caller's own record's lock,
+/// as a hint (`fdtable::traps`): `trap_call` asks again under the one lock.
 pub fn traps_calls(tid: usize) -> bool {
     tid != 0 && tid < MAX_TASKS && fdtable::traps(tid)
 }
@@ -1392,6 +1393,13 @@ pub fn trap_call(nr: u64, args: [u64; 6]) -> Option<u64> {
     if tid == 0 || tid >= MAX_TASKS {
         return None;
     }
+    // Nearly every program traps nothing: asked first as the door asks it,
+    // under the caller's own record's lock (`fdtable::traps`). Asked of the
+    // programs' records' one lock on every call, every call on every
+    // processor met there.
+    if !fdtable::traps(tid) {
+        return None;
+    }
     let (from, to) = fdtable::trap_of(tid)?;
     let frame = scheduler::current_user_frame_mut()?;
     let at = frame.rip as usize;
@@ -1531,8 +1539,8 @@ pub fn leaving_call(answer: u64) -> u64 {
     loop {
         cli();
         // Nearly always nothing: asked first, and cheaply — by a call made
-        // without the one lock with no lock at all, and again with it if
-        // that says there is something.
+        // without the one lock under its own record's lock alone, and again
+        // with the one lock if that says there is something.
         let nothing = if crate::klock::held() { !due(tid) } else { !due_hint(tid) };
         if nothing {
             if first && unix {
