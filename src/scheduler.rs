@@ -1055,14 +1055,21 @@ unsafe fn schedule_inner(from_irq: bool) { unsafe {
 
     // Put current task back in ready queue if it's still runnable. Not the
     // idle loop: that is what runs when the queues are empty, and is in none.
+    // Whether it is, is asked under its record's lock, where it is changed:
+    // another processor may be ending it (`end_other`). Asked before the
+    // lock and answered after it, a task ended in between was put back in a
+    // queue as ready — its descriptors closed and its death told — and ran
+    // on.
     if current_tid != 0 {
+        let held = lock_record(current_tid);
         let state = (*slot(current_tid)).as_ref().map(|t| t.state);
         if state == Some(TaskState::Running) {
-            let held = lock_record(current_tid);
             if let Some(ref mut task) = *slot(current_tid) {
                 task.state = TaskState::Ready;
             }
-            drop(held);
+        }
+        drop(held);
+        if state == Some(TaskState::Running) {
             requeue_here(current_tid);
         } else if state == Some(TaskState::Dead) && st(current_tid).unannounced {
             // Ended from another processor, and this is the one it was

@@ -1714,7 +1714,11 @@ breaking any of them is quiet until it is a machine that stops.
   processor, while the kernel ends it or stops it. So: it is marked, its
   processor is interrupted (`smp::interrupt`), and every task is looked at
   again at each door, with the lock held (`scheduler::arrived`) — one that
-  was ended goes no further. A new door calls it.
+  was ended goes no further. A new door calls it. And a switch away from a
+  task asks whether it was ended under its record's lock, where the ending
+  is written (`schedule_inner`): asked before the lock and answered after
+  it, a thread ended as it yielded was put back in a queue, its descriptors
+  closed and its death told, and ran on (`dtest smp`).
 - **A dead task's state does not say it has stopped running;
   `scheduler::ON_CPU` does.** Ended from another processor, a task is on its
   kernel stack and in its address space until its processor leaves it. Its
