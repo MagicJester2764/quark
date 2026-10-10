@@ -543,10 +543,15 @@ fn leave(tid: usize) -> Option<(Grow<Fd>, FdKind)> {
 
 /// [`leave`], with both locks held.
 ///
+/// The task's own record's lock is taken too: a task ended from another
+/// processor may be on its way out of a call, reading its program's record
+/// under that lock and no other ([`own_program`]).
+///
 /// # Safety
 /// [`TABLES_LOCK`] and [`PROGRAMS`] held.
 unsafe fn leave_held(tid: usize) -> Option<(Grow<Fd>, FdKind)> {
-    unsafe {
+    let own = crate::scheduler::lock_record(tid);
+    let out = unsafe {
         let i = st(tid).table;
         if i == NONE {
             None
@@ -569,7 +574,9 @@ unsafe fn leave_held(tid: usize) -> Option<(Grow<Fd>, FdKind)> {
                 None => None,
             }
         }
-    }
+    };
+    drop(own);
+    out
 }
 
 fn release_all((fds, cwd): &(Grow<Fd>, FdKind)) {
@@ -1007,32 +1014,57 @@ pub fn sig_handle(tid: usize, signo: u8, how: Handler) -> Option<Disposition> {
 /// Whether `tid`'s program has anything a task of it with `mask` should be
 /// doing something about on its way out of the kernel: a handler to be run,
 /// or a signal that was held back and is not by this task.
-/// [`sig_ready`], read with no lock by a task of the program on its way out
-/// of a call made without the one lock — the program's record stays while
-/// the task is in it — as a hint. A signal raised for the program after the
-/// read interrupts the task's processor and comes to its next door; one
-/// raised while it waited woke it under its record's lock, which its wake
-/// took after the signal was written.
-pub fn sig_ready_hint(tid: usize, mask: u64) -> bool {
+/// The record of the program `tid` is in, for `tid` itself to read without
+/// [`PROGRAMS`], with its own task record's lock held: a task leaves its
+/// program's record under that lock ([`leave_held`]), and the record is
+/// given back only once its last task has left, so it stays while the
+/// caller holds the lock and is in it. Ended from another processor, the
+/// caller is left out of its program while it is still on its way out of a
+/// call; without the lock, what it read could be a record given back to
+/// the heap.
+///
+/// # Safety
+/// `tid` is the caller, and its record's lock is held.
+unsafe fn own_program(tid: usize) -> Option<&'static Table> {
     unsafe {
-        table_mut(tid).is_some_and(|t| {
+        let i = st(tid).table;
+        if i == NONE { None } else { (*core::ptr::addr_of!(TABLES)).peek(i as usize).map(|p| &p.table) }
+    }
+}
+
+/// [`sig_ready`], read by a task of the program on its way out of a call
+/// made without the one lock, under its own record's lock and not the
+/// programs' records' one lock: a hint, which `signal::leaving_call` asks
+/// again under the one lock if it says yes. A signal raised for the program
+/// after the read interrupts the task's processor and comes to its next
+/// door.
+pub fn sig_ready_hint(tid: usize, mask: u64) -> bool {
+    let held = crate::scheduler::lock_record(tid);
+    let ready = unsafe {
+        own_program(tid).is_some_and(|t| {
             let pending = core::ptr::read_volatile(&raw const t.sig_pending);
             let run = core::ptr::read_volatile(&raw const t.sig_run);
             let held = core::ptr::read_volatile(&raw const t.sig_held);
             ((pending & run) | held) & !mask != 0
         })
-    }
+    };
+    drop(held);
+    ready
 }
 
 /// Whether `tid`'s program traps the calls made outside a range of its own
-/// ([`trap_of`]): read with no lock by a task of the program at its door, as
-/// a hint, which `signal::trap_call` asks again under the lock.
+/// ([`trap_of`]), read by a task of the program at its door as
+/// [`sig_ready_hint`] is read: a hint, which `signal::trap_call` asks again
+/// under the one lock.
 pub fn traps(tid: usize) -> bool {
-    unsafe {
-        table_mut(tid).is_some_and(|t| {
+    let held = crate::scheduler::lock_record(tid);
+    let traps = unsafe {
+        own_program(tid).is_some_and(|t| {
             core::ptr::read_volatile(&raw const t.trap_from) != core::ptr::read_volatile(&raw const t.trap_to)
         })
-    }
+    };
+    drop(held);
+    traps
 }
 
 pub fn sig_ready(tid: usize, mask: u64) -> bool {

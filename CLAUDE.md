@@ -1616,10 +1616,12 @@ The rules it leaves behind:
 breaking any of them is quiet until it is a machine that stops.
 
 - **One processor is in the kernel at a time, but for calls between two
-  tasks and a futex's waits and wakes** (`klock.rs`), and that is what
-  keeps every other rule in this file true: "interrupts off" still means
-  nothing else is in here, but them. The lock is taken at the kernel's three doors — `syscall_dispatch`,
-  `exception_handler`, `irq_handler` — and nowhere else but where a call
+  tasks, a futex's waits and wakes, and the calls about the caller and the
+  time** (`klock.rs`), and that is what keeps every other rule in this
+  file true: "interrupts off" still means nothing else is in here, but
+  them. The lock is taken at the kernel's three doors —
+  `syscall_dispatch`, `exception_handler`, `irq_handler` — and nowhere
+  else but where a call
   made without it finds something that is the lock's (`with_kernel`). A
   send, a receive, a call, a reply and a notice, every form, a futex's
   wait, wake and requeue, and the calls about the caller and the time — a
@@ -1631,12 +1633,17 @@ breaking any of them is quiet until it is a machine that stops.
   whose program traps its calls, comes in under the lock, and a call made
   without it looks again on its way out (`door_has_news`), as
   `leaving_call` does before it runs a handler. Its program's trap and its
-  program's signals are asked there with no lock at all, as hints
-  (`fdtable::traps`, `sig_ready_hint`): what they say is asked again under
-  the one lock before anything is done about it, and a signal raised after
-  the look interrupts the task's processor and comes to its next door. The
-  programs' records have one lock, and a door that took it twice a call
-  was where every call on every processor met. It is given across a switch
+  program's signals are asked there under the task's own record's lock and
+  not the programs' records' one lock, as hints (`fdtable::traps`,
+  `sig_ready_hint`): what they say is asked again under the one lock before
+  anything is done about it, and a signal raised after the look interrupts
+  the task's processor and comes to its next door. The programs' records
+  have one lock, and a door that took it twice a call was where every call
+  on every processor met. The task's own lock is what keeps the record
+  there: a task leaves its program under it (`fdtable::leave_held`), and
+  one ended from another processor is left out while it is still on its
+  way out of a call — read with no lock, its program's record could have
+  been given back to the heap under it. It is given across a switch
   as the task switched to expects it: one switched out holding it is
   switched back to holding it, one switched out without it without it
   (`kl_held`), and the idle loop always with it; and it is given up on
