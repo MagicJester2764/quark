@@ -293,8 +293,8 @@ unsafe fn holdings() -> &'static mut crate::table::Table<Holding> {
 /// given up, under whoever was waiting for it.
 const SPACE_LOCKS: usize = 64;
 
-static SPACE_LOCK: [IrqSpinLock<()>; SPACE_LOCKS] =
-    [const { IrqSpinLock::new(crate::sync::RANK_CSPACE, "a capability space", ()) }; SPACE_LOCKS];
+static SPACE_LOCK: [crate::sync::Padded<IrqSpinLock<()>>; SPACE_LOCKS] =
+    [const { crate::sync::Padded(IrqSpinLock::new(crate::sync::RANK_CSPACE, "a capability space", ())) }; SPACE_LOCKS];
 
 /// Which numbers have a space — [`HOLDINGS`]'s slots, not what is in them —
 /// and the making of a number's counts of revocations ([`Counts`]).
@@ -302,7 +302,7 @@ static TABLE: IrqSpinLock<()> = IrqSpinLock::new(crate::sync::RANK_CAP_TABLE, "t
 
 /// The lock of space `i`: its slots, its bits, and how many tasks use it.
 fn lock_of(i: u16) -> &'static IrqSpinLock<()> {
-    &SPACE_LOCK[i as usize % SPACE_LOCKS]
+    &SPACE_LOCK[i as usize % SPACE_LOCKS].0
 }
 
 /// The number of the space `tid` uses, or [`NO_HOLDING`], read without the

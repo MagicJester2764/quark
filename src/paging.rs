@@ -150,14 +150,14 @@ impl Drop for OneStep {
 /// record for each space would be found by a walk of them, at every step.
 const SPACE_LOCKS: usize = 64;
 
-static SPACES: [crate::sync::IrqSpinLock<()>; SPACE_LOCKS] =
-    [const { crate::sync::IrqSpinLock::new(crate::sync::RANK_SPACE, "an address space's tables", ()) }; SPACE_LOCKS];
+static SPACES: [crate::sync::Padded<crate::sync::IrqSpinLock<()>>; SPACE_LOCKS] =
+    [const { crate::sync::Padded(crate::sync::IrqSpinLock::new(crate::sync::RANK_SPACE, "an address space's tables", ())) }; SPACE_LOCKS];
 
 /// The lock of the address space rooted at `pml4_phys`: its tables, its
 /// reservations, and what is forgotten of them (`tlb::stale`).
 pub fn space_lock(pml4_phys: usize) -> &'static crate::sync::IrqSpinLock<()> {
     let mixed = ((pml4_phys >> 12) as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-    &SPACES[(mixed >> 58) as usize % SPACE_LOCKS]
+    &SPACES[(mixed >> 58) as usize % SPACE_LOCKS].0
 }
 
 /// The locks of two address spaces, in the order of where they are — or

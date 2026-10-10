@@ -27,10 +27,11 @@ serialised is what is left — page tables, the scheduler, everything a
 program makes. Two programs computing run in parallel.
 
 And two programs making calls do too. A call between two tasks — a send, a
-receive, a call, a reply and a notice, in every form (`syscall::unlocked`)
-— is made without the one lock, under the locks of what it touches (the
-table below): the two tasks' records, the caller's capability space, the
-pages it checks and its processor's queues. A task the door has something
+receive, a call, a reply and a notice, in every form — and a futex's wait,
+wake and requeue (`syscall::unlocked`) are made without the one lock, under
+the locks of what they touch (the table below): the two tasks' records,
+the caller's capability space, a futex's lists, the pages checked and the
+processor's queues. A task the door has something
 to say to — ended, stopped or barred from its processor while it ran — and
 a program that traps its calls come in under the one lock as before, and a
 call made without it looks again on its way out. What such a call finds is
@@ -340,16 +341,22 @@ uses them well, and the difference is a list:
 
 - **The one lock.** A call between two tasks is made without it, and
   `callbench sweep 10` — pairs of threads calling each other, a pair to a
-  processor — makes 646,000 calls a second with one pair on eight
-  processors under KVM, 1,082,000 with two, 1,780,000 with four and
-  1,795,000 with eight, where with every call under the one lock it made
+  processor — makes 693,000 calls a second with one pair on eight
+  processors under KVM, 1,275,000 with two, 2,371,000 with four and
+  1,994,000 with eight, where with every call under the one lock it made
   591,000, 505,000, 450,000 and 387,000: fewer the more there were, each
-  waiting at the door for the rest. Four making 2.8 times what one makes,
-  and eight no more than four, is a lock every call still takes: the
+  waiting at the door for the rest. Four making 3.4 times what one makes,
+  and eight less than four, is what every call still shares: the
   programs' records' one lock, at the door and on the way out, and the
-  capability space a program's threads share. Everything else — a futex,
-  a fault, a pipe, a poll, the clock's expiry — is still made under the
-  one lock, a path at a time to come out from under it.
+  capability space a program's threads share. A futex's waits and wakes
+  are made without the one lock too; `kstress futex` hands a word on about
+  as often as it did under it (261 million times in ten minutes on eight
+  processors, against 271), since every wait walks its program's tables
+  under the one lock its address space has, which every thread of a
+  program shares. A word that lends a place to its holder is still the
+  one lock's. Everything else — a fault, a pipe, a poll, the clock's
+  expiry — is still made under the one lock, a path at a time to come out
+  from under it.
 - **Interrupts from devices on any processor.** The I/O APIC can send one
   anywhere; every one still goes to the first.
 - **A device's interrupt for a processor above 255**, which needs the

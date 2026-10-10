@@ -1002,15 +1002,19 @@ extern "C" fn syscall_dispatch(
 /// notice, their forms with a deadline, and a call that lends a buffer or
 /// offers a capability — which take the two tasks' records' locks, the
 /// caller's capability space's, the pages it checks' and their processors'
-/// queues', and touch nothing the one lock keeps. Not for a task the door
-/// has news for (`door_has_news`), nor one whose program traps its calls
-/// (`SYS_SYSCALL_TRAP`, which may be SIGSYS at once): those are the one
-/// lock's (`docs/smp.md`).
+/// queues'; or a futex's wait, wake or requeue, which take its lists' locks
+/// and the waiters' records'. None touches anything the one lock keeps. Not
+/// for a task the door has news for (`door_has_news`), nor one whose
+/// program traps its calls (`SYS_SYSCALL_TRAP`, which may be SIGSYS at
+/// once): those are the one lock's (`docs/smp.md`), as is a futex word that
+/// lends its holder a place (`SYS_FUTEX_PI`), whose lending looks at every
+/// task.
 fn unlocked(nr: u64, me: usize) -> bool {
     matches!(
         nr,
         SYS_SEND | SYS_CALL | SYS_REPLY | SYS_CALL_TIMEOUT | SYS_NOTIFY | SYS_RECV | SYS_RECV_TIMEOUT
             | SYS_CALL_LEND | SYS_CALL_OFFER | SYS_CALL_WITH
+            | SYS_FUTEX_WAIT | SYS_FUTEX_WAIT_TIMEOUT | SYS_FUTEX_WAKE | SYS_FUTEX_REQUEUE
     )
         && !scheduler::door_has_news(me)
         && !crate::signal::traps_calls(me)

@@ -121,7 +121,7 @@ unsafe fn st(tid: usize) -> &'static mut PerTask {
 static mut NO_TASK: PerTask = PerTask::new();
 
 /// When each processor began running what it is running.
-static mut SINCE: [u64; MAX_CPUS] = [0; MAX_CPUS];
+static mut SINCE: [crate::sync::Padded<u64>; MAX_CPUS] = [const { crate::sync::Padded(0) }; MAX_CPUS];
 
 /// What a processor does with its time, as it is counted: runs a program,
 /// runs the kernel, has nothing to do, or takes an interrupt.
@@ -150,10 +150,10 @@ impl Spent {
 /// next switch to or from the idle loop and its next interrupt each are: a
 /// processor with nothing to do still takes its tick. Idle time was thrown
 /// away; a machine could not say how busy it was.
-static mut SPENT: [Spent; MAX_CPUS] = [Spent::ZERO; MAX_CPUS];
+static mut SPENT: [crate::sync::Padded<Spent>; MAX_CPUS] = [const { crate::sync::Padded(Spent::ZERO) }; MAX_CPUS];
 /// What each processor is doing, of the four, and since when.
-static mut DOING: [u8; MAX_CPUS] = [IN_KERNEL; MAX_CPUS];
-static mut MARK: [u64; MAX_CPUS] = [0; MAX_CPUS];
+static mut DOING: [crate::sync::Padded<u8>; MAX_CPUS] = [const { crate::sync::Padded(IN_KERNEL) }; MAX_CPUS];
+static mut MARK: [crate::sync::Padded<u64>; MAX_CPUS] = [const { crate::sync::Padded(0) }; MAX_CPUS];
 /// How many tasks the machine has made since it started: Linux's
 /// `processes`, which counts its threads as well.
 static MADE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
@@ -166,8 +166,8 @@ static MADE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(
 pub unsafe fn processor_up() {
     unsafe {
         let cpu = crate::percpu::index();
-        MARK[cpu] = crate::clock::now_here();
-        DOING[cpu] = IN_KERNEL;
+        MARK[cpu].0 = crate::clock::now_here();
+        DOING[cpu].0 = IN_KERNEL;
     }
 }
 
@@ -180,10 +180,10 @@ pub unsafe fn now_doing(doing: u8) -> u8 {
     unsafe {
         let cpu = crate::percpu::index();
         let now = crate::clock::now_here();
-        let was = DOING[cpu];
-        SPENT[cpu].ns[was as usize] += now.saturating_sub(MARK[cpu]);
-        MARK[cpu] = now;
-        DOING[cpu] = doing;
+        let was = DOING[cpu].0;
+        SPENT[cpu].0.ns[was as usize] += now.saturating_sub(MARK[cpu].0);
+        MARK[cpu].0 = now;
+        DOING[cpu].0 = doing;
         was
     }
 }
@@ -193,7 +193,7 @@ pub unsafe fn now_doing(doing: u8) -> u8 {
 /// # Safety
 /// Interrupts off.
 pub unsafe fn switches_here() -> u64 {
-    unsafe { SPENT[crate::percpu::index()].switches }
+    unsafe { SPENT[crate::percpu::index()].0.switches }
 }
 
 /// This processor has taken an interrupt: any, the ones that take nothing
@@ -202,7 +202,7 @@ pub unsafe fn switches_here() -> u64 {
 /// # Safety
 /// Interrupts off.
 pub unsafe fn interrupt_taken() {
-    unsafe { SPENT[crate::percpu::index()].interrupts += 1 };
+    unsafe { SPENT[crate::percpu::index()].0.interrupts += 1 };
 }
 
 /// A task has been made: it has used nothing.
@@ -227,10 +227,14 @@ pub fn task_made(tid: usize) {
 /// Interrupts off, and `tid` is what this processor is running.
 pub unsafe fn charge(tid: usize) -> u64 {
     unsafe {
-        let now = crate::clock::now();
+        // This processor's reading, as the doors take theirs (`entered`):
+        // the clock's own step, which keeps a time from going back between
+        // two processors, is one word every processor writes, and this is
+        // at every switch.
+        let now = crate::clock::now_here();
         let cpu = crate::percpu::index();
-        let ran = now.saturating_sub(SINCE[cpu]);
-        SINCE[cpu] = now;
+        let ran = now.saturating_sub(SINCE[cpu].0);
+        SINCE[cpu].0 = now;
         if tid == 0 || tid >= MAX_TASKS {
             return 0;
         }
@@ -254,11 +258,11 @@ pub unsafe fn resumed(tid: usize) {
         // it, it is in the kernel again.
         if tid == 0 {
             now_doing(IDLE);
-        } else if DOING[crate::percpu::index()] == IDLE {
+        } else if DOING[crate::percpu::index()].0 == IDLE {
             now_doing(IN_KERNEL);
         }
         if tid != 0 && tid < MAX_TASKS && st(tid).in_kernel {
-            st(tid).kernel_since = SINCE[crate::percpu::index()];
+            st(tid).kernel_since = SINCE[crate::percpu::index()].0;
         }
     }
 }
@@ -307,7 +311,7 @@ pub unsafe fn leaving(tid: usize) {
 /// Interrupts off.
 pub unsafe fn switched(from: usize, gave_up: bool) {
     unsafe {
-        SPENT[crate::percpu::index()].switches += 1;
+        SPENT[crate::percpu::index()].0.switches += 1;
         if from != 0 && from < MAX_TASKS {
             if gave_up {
                 st(from).raw.voluntary += 1;
@@ -329,7 +333,7 @@ pub fn of_task(tid: usize) -> Usage {
         let (mut run, mut sys) = (raw.run_ns, raw.sys_ns);
         if let Some(cpu) = crate::scheduler::running_on(tid) {
             let now = crate::clock::now();
-            run += now.saturating_sub(SINCE[cpu]);
+            run += now.saturating_sub(SINCE[cpu].0);
             if st(tid).in_kernel {
                 sys += now.saturating_sub(st(tid).kernel_since);
             }
@@ -454,7 +458,7 @@ pub fn cpu_info(caller: usize, op: u64, a: u64, b: u64) -> u64 {
             let now = crate::clock::now();
             let mut sum = Spent::ZERO;
             for cpu in (0..count).filter(|&cpu| a == u64::MAX || a as usize == cpu) {
-                let (spent, doing, mark) = unsafe { (SPENT[cpu], DOING[cpu], MARK[cpu]) };
+                let (spent, doing, mark) = unsafe { (SPENT[cpu].0, DOING[cpu].0, MARK[cpu].0) };
                 for (total, ns) in sum.ns.iter_mut().zip(spent.ns) {
                     *total += ns;
                 }

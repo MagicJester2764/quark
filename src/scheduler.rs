@@ -318,13 +318,13 @@ static mut NO_TASK: PerTask = PerTask::new();
 /// whoever was waiting for it.
 const RECORD_LOCKS: usize = 256;
 
-static RECORDS: [crate::sync::IrqSpinLock<()>; RECORD_LOCKS] =
-    [const { crate::sync::IrqSpinLock::new(crate::sync::RANK_TASK, "a task's record", ()) }; RECORD_LOCKS];
+static RECORDS: [crate::sync::Padded<crate::sync::IrqSpinLock<()>>; RECORD_LOCKS] =
+    [const { crate::sync::Padded(crate::sync::IrqSpinLock::new(crate::sync::RANK_TASK, "a task's record", ())) }; RECORD_LOCKS];
 
 /// The lock of `tid`'s record: its IPC state (`ipc.rs`), its state as the
 /// scheduler has it — blocked, ready, dead — and the place it is lent.
 pub fn record_lock(tid: usize) -> &'static crate::sync::IrqSpinLock<()> {
-    &RECORDS[tid % RECORD_LOCKS]
+    &RECORDS[tid % RECORD_LOCKS].0
 }
 
 /// `tid`'s record's lock, unless this processor holds it already: what a
@@ -432,7 +432,8 @@ static mut RT_USE: [(u64, u64, u64); crate::percpu::MAX_CPUS] = [(0, 0, 0); crat
 /// has been made ready on it, and the call it is in is to give way before it
 /// returns (`preempt_if_asked`). A task woken in an ordinary band still
 /// waits for the tick, which is a known gap; a real-time one is woken to run.
-static RESCHED: [AtomicBool; crate::percpu::MAX_CPUS] = [const { AtomicBool::new(false) }; crate::percpu::MAX_CPUS];
+static RESCHED: [crate::sync::Padded<AtomicBool>; crate::percpu::MAX_CPUS] =
+    [const { crate::sync::Padded(AtomicBool::new(false)) }; crate::percpu::MAX_CPUS];
 
 /// Each processor that is choosing what to run next — from taking a task
 /// out of a queue, or deciding to hand over to one, to claiming it under
@@ -443,7 +444,8 @@ static RESCHED: [AtomicBool; crate::percpu::MAX_CPUS] = [const { AtomicBool::new
 /// processor choosing began after that (`reap_one`): none can have it in
 /// hand. A processor's choosing is short, and a task waits a moment at
 /// most; one not taken apart now is tried again.
-static CHOOSING: [AtomicU64; crate::percpu::MAX_CPUS] = [const { AtomicU64::new(u64::MAX) }; crate::percpu::MAX_CPUS];
+static CHOOSING: [crate::sync::Padded<AtomicU64>; crate::percpu::MAX_CPUS] =
+    [const { crate::sync::Padded(AtomicU64::new(u64::MAX)) }; crate::percpu::MAX_CPUS];
 
 /// The reaping epoch: moved on by each task made ready to be taken apart.
 static REAP_EPOCH: AtomicU64 = AtomicU64::new(1);
@@ -503,7 +505,7 @@ pub fn lends(waiter: usize, on: usize) -> bool {
 /// Interrupts off.
 unsafe fn throttled() -> bool { unsafe {
     let (start, used, _) = (*core::ptr::addr_of!(RT_USE))[crate::percpu::index()];
-    used >= RT_RUNTIME_NS && crate::clock::now().saturating_sub(start) < RT_WINDOW_NS
+    used >= RT_RUNTIME_NS && crate::clock::now_here().saturating_sub(start) < RT_WINDOW_NS
 }}
 
 /// `ran` nanoseconds of a real-time task's, to now, against this processor's
@@ -519,7 +521,7 @@ unsafe fn throttled() -> bool { unsafe {
 /// # Safety
 /// Interrupts off.
 unsafe fn charge_rt(ran: u64) { unsafe {
-    let now = crate::clock::now();
+    let now = crate::clock::now_here();
     let began = now.saturating_sub(ran);
     let u = &mut (*core::ptr::addr_of_mut!(RT_USE))[crate::percpu::index()];
     if now.saturating_sub(u.0) >= RT_WINDOW_NS || began.saturating_sub(u.2) >= RT_WINDOW_NS - RT_RUNTIME_NS {
@@ -1230,7 +1232,7 @@ unsafe fn switch_to(current_tid: usize, next_tid: usize, flags: u64) { unsafe {
         // Said to be on no processor by the switch itself, once it is saved.
         // When it left: a processor that takes it soon after takes it warm
         // from this one's cache (`runq::pull`).
-        st(current_tid).ran_at = crate::clock::now();
+        st(current_tid).ran_at = crate::clock::now_here();
     }
     crate::percpu::set_current(next_tid);
 

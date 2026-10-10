@@ -698,7 +698,16 @@ may keep — are in `../quarkutils/CLAUDE.md`; these are the kernel's.
   deadline and a signal each take the waiter off its list and say why in
   its record, for it to read when it runs; and a task that dies waiting is
   taken off where it dies (`close_descriptors`), not at its reap — a wake
-  counted for it would be one a waiter that runs again was not given. Each
+  counted for it would be one a waiter that runs again was not given.
+  **A wait, a wake and a requeue are made without the one lock**
+  (`syscall::unlocked`), under the lists' locks and the waiters' records:
+  asking whether to wait and parking are one step under the word's list,
+  and the word is read through its frame under its address space's lock
+  (`futex::read_word`) — a sibling's write to a page shared since a fork
+  takes the entry away while it puts the copy in (`own`), and a read
+  through the program's own mapping then was a fault in the kernel with a
+  lock held. A word that lends its holder a place (below) is still the
+  one lock's: its lending looks at every task. Each
   list has a lock of its own (`sync::RANK_FUTEX`), which a waiter's links,
   and its record while it waits, are kept under: the word is read, the
   waiter linked and its task blocked with its list's lock held, and a wake
@@ -1607,15 +1616,16 @@ The rules it leaves behind:
 breaking any of them is quiet until it is a machine that stops.
 
 - **One processor is in the kernel at a time, but for calls between two
-  tasks** (`klock.rs`), and that is what keeps every other rule in this
-  file true: "interrupts off" still means nothing else is in here, but
-  them. The lock is taken at the kernel's three doors — `syscall_dispatch`,
+  tasks and a futex's waits and wakes** (`klock.rs`), and that is what
+  keeps every other rule in this file true: "interrupts off" still means
+  nothing else is in here, but them. The lock is taken at the kernel's three doors — `syscall_dispatch`,
   `exception_handler`, `irq_handler` — and nowhere else but where a call
   made without it finds something that is the lock's (`with_kernel`). A
-  send, a receive, a call, a reply and a notice, every form
-  (`syscall::unlocked`), are made without it, under the locks of what they
-  touch — the tasks' records, the caller's capability space, the pages
-  checked, the processor's queues — by a task the door has nothing to say
+  send, a receive, a call, a reply and a notice, every form, and a
+  futex's wait, wake and requeue (`syscall::unlocked`), are made without
+  it, under the locks of what they touch — the tasks' records, the
+  caller's capability space, a futex's lists, the pages checked, the
+  processor's queues — by a task the door has nothing to say
   to: one ended, stopped or barred from its processor while it ran, or one
   whose program traps its calls, comes in under the lock, and a call made
   without it looks again on its way out (`door_has_news`), as
@@ -1663,6 +1673,23 @@ breaking any of them is quiet until it is a machine that stops.
   processor that waits thirty seconds names the one that has the kernel,
   that one says where it is (`[KSTUCK ...]`, if its interrupts are on),
   and the machine stops (`klock::waited`).
+- **What one processor writes for itself is on a cache line of its own**
+  (`sync::Padded`): a stripe of locks of one kind — the tasks' records',
+  the address spaces', the capability spaces', a futex's lists, the
+  processors' queues — and every per-processor word (`CHOOSING`,
+  `RESCHED`, usage's `SINCE`, `SPENT`, `DOING`, `MARK`). Side by side they
+  shared lines, and a line one processor writes and then another goes
+  back and forth between them at every write; which ones shared was where
+  the array happened to fall, so that a change in the futex, which no call
+  ran, cost eight pairs of callers a quarter of their calls. Padded,
+  `callbench` on eight processors made 2.13 million calls a second with
+  eight pairs where it had made 1.32, and 2.26 with four where it had made
+  1.89. A new array of locks or of per-processor words is padded.
+  And the clock is read as this processor reads it (`clock::now_here`)
+  wherever what is measured is this processor's or a deadline: `now`'s
+  step, which no time a program is told ever goes back past, is one word
+  every processor writes, and a switch and a call with a deadline read
+  the clock several times each.
 - **"Which processor is this" has an answer only with interrupts off.** A
   task in a system call is moved wherever it can be preempted. Nothing reads
   `percpu::index()` and acts on it later. `percpu::current()` is one
@@ -1911,8 +1938,9 @@ breaking any of them is quiet until it is a machine that stops.
   closing the set while another thread waits on it leaves that thread to its
   timeout. A one-shot `SYS_POLL` makes a set of its own and is not affected.
 - **The kernel is one processor's at a time, but for calls between two
-  tasks.** Programs run on every processor; every other system call, a
-  fault or an interrupt waits for the kernel to be empty. What comes out
+  tasks and a futex's waits and wakes.** Programs run on every processor;
+  every other system call, a fault or an interrupt waits for the kernel
+  to be empty. What comes out
   from under the one lock does so a path at a time, each measured; a
   pager's receive takes the lock when one of its objects has gone idle,
   and a call that lends a place to a task better placed than its callee

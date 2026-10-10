@@ -367,6 +367,30 @@ pub struct IrqSpinLock<T> {
     data: UnsafeCell<T>,
 }
 
+/// A thing on a cache line of its own. Locks of one kind side by side —
+/// the tasks' records', the processors' queues' — and words each processor
+/// writes for itself would otherwise share lines, and a line written by one
+/// processor and then another goes back and forth between them at every
+/// write: two pairs of tasks calling, each on its own processor, wrote one
+/// line between them. Which entries shared one was where the array fell,
+/// and a change elsewhere in the kernel moved it — eight pairs of callers
+/// lost a quarter of their calls to a change in the futex.
+#[repr(align(64))]
+pub struct Padded<T>(pub T);
+
+impl<T> core::ops::Deref for Padded<T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        &self.0
+    }
+}
+
+impl<T> core::ops::DerefMut for Padded<T> {
+    fn deref_mut(&mut self) -> &mut T {
+        &mut self.0
+    }
+}
+
 unsafe impl<T: Send> Send for IrqSpinLock<T> {}
 unsafe impl<T: Send> Sync for IrqSpinLock<T> {}
 

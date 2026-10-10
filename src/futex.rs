@@ -151,8 +151,8 @@ struct Bucket {
 /// The lists, a lock each (`sync::RANK_FUTEX`): a list's links, and what
 /// this module keeps of a task while it is on one, are its list's lock's.
 /// A requeue takes two, in the order of where they are (`lock_second`).
-static LISTS: [IrqSpinLock<Bucket>; BUCKETS] =
-    [const { IrqSpinLock::new(crate::sync::RANK_FUTEX, "a futex's waiters", Bucket { first: END, last: END }) }; BUCKETS];
+static LISTS: [crate::sync::Padded<IrqSpinLock<Bucket>>; BUCKETS] =
+    [const { crate::sync::Padded(IrqSpinLock::new(crate::sync::RANK_FUTEX, "a futex's waiters", Bucket { first: END, last: END })) }; BUCKETS];
 
 type Held = crate::sync::IrqSpinLockGuard<'static, Bucket>;
 
@@ -314,6 +314,21 @@ fn held_word(cr3: usize, addr: u64) -> Option<Key> {
     key_of(cr3, addr)
 }
 
+/// The word at `addr` in `cr3`, read through its frame under its address
+/// space's lock: a wait reads it with its list held, and a sibling's write
+/// to a page shared since a fork takes the entry away while it puts the
+/// copy in (`paging::own`) — read through the program's own mapping then,
+/// it would be a fault in the kernel with a lock held. None with no page
+/// there now.
+fn read_word(cr3: usize, addr: u64) -> Option<u32> {
+    let held = crate::paging::space_lock(cr3).lock();
+    let word = unsafe { crate::paging::translate(cr3, addr as usize) }
+        .filter(|&at| at + 4 <= crate::paging::identity_end())
+        .map(|at| unsafe { core::ptr::read_volatile(at as *const u32) });
+    drop(held);
+    word
+}
+
 fn wait(addr: u64, expected: u32, timeout_ns: Option<u64>) -> u64 {
     if !word_ok(addr) {
         return u64::MAX;
@@ -326,10 +341,10 @@ fn wait(addr: u64, expected: u32, timeout_ns: Option<u64>) -> u64 {
 
     let mut list = list_of(key);
 
-    // Read the user word — we're in the same address space (syscall context)
-    let current_val = {
-        let _ua = crate::cpu::UserAccess::begin();
-        unsafe { *(addr as *const u32) }
+    // The word, read with the list held: a wake that comes after the write
+    // that changed it finds this on the list, or this finds the change.
+    let Some(current_val) = read_word(cr3, addr) else {
+        return u64::MAX;
     };
     if current_val != expected {
         return 1;
@@ -487,11 +502,7 @@ pub fn requeue(first: u64, second: u64, nr_wake: u64, nr_requeue: u64, expected:
     let mut first_held = LISTS[at.min(there)].lock();
     let mut second_held = (at != there).then(|| LISTS[at.max(there)].lock_second());
     if let Some(expected) = expected {
-        let now = {
-            let _ua = crate::cpu::UserAccess::begin();
-            unsafe { *(first as *const u32) }
-        };
-        if now != expected {
+        if read_word(cr3, first) != Some(expected) {
             return NOT_AS_SAID;
         }
     }

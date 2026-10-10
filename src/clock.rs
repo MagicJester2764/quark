@@ -148,7 +148,11 @@ pub fn ticks_of(ns: u64) -> u64 {
 /// written everywhere a deadline is kept, and never wrapping: a time too far
 /// off to count is as far off as can be.
 pub fn after(span_ns: u64) -> u64 {
-    now().saturating_add(span_ns).max(1)
+    // This processor's reading: a deadline is a deadline a few counts either
+    // way, and the timer is set late on purpose (`lapic::one_shot`). `now`'s
+    // step, which no time given out ever goes back past, is a word every
+    // processor writes, and a call with a deadline is made on every one.
+    now_here().saturating_add(span_ns).max(1)
 }
 
 /// Nanoseconds since 1970, or 0 on a machine that has no clock to say.
@@ -402,7 +406,7 @@ pub fn due(at: u64) {
     if at < SAID.load(Ordering::Relaxed) {
         SAID.fetch_min(at, Ordering::SeqCst);
     }
-    let now = now();
+    let now = now_here();
     if at < SET_FOR.load(Ordering::SeqCst) {
         if crate::percpu::index() == 0 {
             set(at, now);

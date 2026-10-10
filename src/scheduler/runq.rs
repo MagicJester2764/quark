@@ -103,7 +103,7 @@ impl Queue {
 
 /// Every processor's, empty from [`init`]: noughts until then, rather than
 /// forty kilobytes of empty queues in the kernel's image.
-static mut QUEUES: [[Queue; NUM_PRIORITIES]; MAX_CPUS] = unsafe { core::mem::zeroed() };
+static mut QUEUES: [crate::sync::Padded<[Queue; NUM_PRIORITIES]>; MAX_CPUS] = unsafe { core::mem::zeroed() };
 
 /// Make every processor's queues empty: before the first task is made.
 ///
@@ -112,13 +112,13 @@ static mut QUEUES: [[Queue; NUM_PRIORITIES]; MAX_CPUS] = unsafe { core::mem::zer
 pub(super) unsafe fn init() {
     unsafe {
         for queues in (*(&raw mut QUEUES)).iter_mut() {
-            *queues = [Queue::EMPTY; NUM_PRIORITIES];
+            queues.0 = [Queue::EMPTY; NUM_PRIORITIES];
         }
     }
 }
 /// Each processor's queues' lock (above).
-static LOCKS: [IrqSpinLock<()>; MAX_CPUS] =
-    [const { IrqSpinLock::new(crate::sync::RANK_RUNQ, "a processor's run queues", ()) }; MAX_CPUS];
+static LOCKS: [crate::sync::Padded<IrqSpinLock<()>>; MAX_CPUS] =
+    [const { crate::sync::Padded(IrqSpinLock::new(crate::sync::RANK_RUNQ, "a processor's run queues", ())) }; MAX_CPUS];
 
 /// Processor `cpu`'s queues, held.
 fn held(cpu: usize) -> crate::sync::IrqSpinLockGuard<'static, ()> {
@@ -139,7 +139,7 @@ const WARM_NS: u64 = 2_000_000;
 /// Interrupts off, and its lock held — or, for a hint, read and not
 /// changed.
 unsafe fn queue(cpu: usize, p: usize) -> &'static mut Queue {
-    unsafe { &mut (*(&raw mut QUEUES))[cpu][p] }
+    unsafe { &mut (*(&raw mut QUEUES))[cpu].0[p] }
 }
 
 /// How the tasks of a heap are ordered: whether the first goes before the
