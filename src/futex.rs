@@ -148,19 +148,43 @@ struct Bucket {
     last: u16,
 }
 
-struct FutexState {
-    buckets: [Bucket; BUCKETS],
+/// The lists, a lock each (`sync::RANK_FUTEX`): a list's links, and what
+/// this module keeps of a task while it is on one, are its list's lock's.
+/// A requeue takes two, in the order of where they are (`lock_second`).
+static LISTS: [IrqSpinLock<Bucket>; BUCKETS] =
+    [const { IrqSpinLock::new(crate::sync::RANK_FUTEX, "a futex's waiters", Bucket { first: END, last: END }) }; BUCKETS];
+
+type Held = crate::sync::IrqSpinLockGuard<'static, Bucket>;
+
+/// The list `key`'s waiters are on, held.
+fn list_of(key: Key) -> Held {
+    LISTS[key.bucket()].lock()
 }
 
-/// The lists, and through them every waiter's record: whoever changes
-/// either holds this.
-static FUTEX: IrqSpinLock<FutexState> =
-    IrqSpinLock::new(crate::sync::RANK_FUTEX, "the futex's waiters", FutexState { buckets: [Bucket { first: END, last: END }; BUCKETS] });
+/// The list `tid` waits on, held, if it waits on one — found by its key and
+/// looked at again once held, since a requeue may have moved it meanwhile.
+///
+/// # Safety
+/// Interrupts off.
+unsafe fn list_of_waiter(tid: usize) -> Option<Held> {
+    unsafe {
+        loop {
+            let at = rec(tid as u16).filter(|me| me.waiting)?.key.bucket();
+            let held = LISTS[at].lock();
+            match rec(tid as u16) {
+                Some(me) if me.waiting && me.key.bucket() == at => return Some(held),
+                Some(me) if me.waiting => continue,
+                _ => return None,
+            }
+        }
+    }
+}
 
 /// Task `t`'s record, unless it is the end of a list or no task.
 ///
 /// # Safety
-/// `FUTEX` is held, and with it interrupts are off.
+/// The lock of the list it is on is held, if it is on one; and with it
+/// interrupts are off.
 unsafe fn rec(t: u16) -> Option<&'static mut PerTask> {
     if t == END {
         return None;
@@ -168,13 +192,12 @@ unsafe fn rec(t: u16) -> Option<&'static mut PerTask> {
     unsafe { scheduler::rec(t as usize).map(|r| &mut r.futex) }
 }
 
-/// `tid` waits on `key`, last on its list.
+/// `tid` waits on `key`, last on its list, `b`.
 ///
 /// # Safety
-/// `FUTEX` is held, and `tid` is on no list.
-unsafe fn link(state: &mut FutexState, tid: usize, key: Key) {
+/// `b` is `key`'s list, held, and `tid` is on no list.
+unsafe fn link(b: &mut Bucket, tid: usize, key: Key) {
     unsafe {
-        let b = &mut state.buckets[key.bucket()];
         let Some(me) = rec(tid as u16) else { return };
         me.waiting = true;
         me.key = key;
@@ -188,14 +211,13 @@ unsafe fn link(state: &mut FutexState, tid: usize, key: Key) {
     }
 }
 
-/// `tid` is off its list, and waits on nothing.
+/// `tid` is off its list, `b`, and waits on nothing.
 ///
 /// # Safety
-/// `FUTEX` is held.
-unsafe fn unlink(state: &mut FutexState, tid: usize) {
+/// `b` is the list `tid` is on, held.
+unsafe fn unlink(b: &mut Bucket, tid: usize) {
     unsafe {
         let Some(me) = rec(tid as u16).filter(|me| me.waiting) else { return };
-        let b = &mut state.buckets[me.key.bucket()];
         let (next, prev) = (me.next, me.prev);
         match rec(prev) {
             Some(p) => p.next = next,
@@ -218,22 +240,22 @@ unsafe fn unlink(state: &mut FutexState, tid: usize) {
 /// the holder it lends to.
 ///
 /// # Safety
-/// `FUTEX` is held.
+/// `b` is `key`'s list, held.
 unsafe fn each_on(
-    state: &mut FutexState,
+    b: &mut Bucket,
     key: Key,
     pi: bool,
     most: u64,
-    mut each: impl FnMut(&mut FutexState, usize),
+    mut each: impl FnMut(&mut Bucket, usize),
 ) -> u64 {
     unsafe {
-        let mut t = state.buckets[key.bucket()].first;
+        let mut t = b.first;
         let mut done = 0u64;
         while done < most {
             let Some(r) = rec(t) else { break };
             let (next, mine) = (r.next, r.key == key && r.pi == pi);
             if mine {
-                each(state, t as usize);
+                each(b, t as usize);
                 done += 1;
             }
             t = next;
@@ -297,7 +319,7 @@ fn wait(addr: u64, expected: u32, timeout_ns: Option<u64>) -> u64 {
         return u64::MAX;
     };
 
-    let mut state = FUTEX.lock();
+    let mut list = list_of(key);
 
     // Read the user word — we're in the same address space (syscall context)
     let current_val = {
@@ -337,7 +359,7 @@ fn wait(addr: u64, expected: u32, timeout_ns: Option<u64>) -> u64 {
         me.deadline = deadline;
         me.expired = false;
         me.interrupted = false;
-        link(&mut state, tid, key);
+        link(&mut list, tid, key);
     }
 
     // Block the task while holding the lock to prevent wake races
@@ -345,17 +367,21 @@ fn wait(addr: u64, expected: u32, timeout_ns: Option<u64>) -> u64 {
     if deadline != 0 {
         crate::clock::due(deadline);
     }
-    drop(state);
+    drop(list);
 
     // Yield to let the scheduler pick another task
     scheduler::yield_now();
 
     // Woken: by a wake, which took it off its list; by its deadline or a
     // signal, which did too and said so; or by something else entirely,
-    // which did not — it is taken off now, either way.
-    let mut state = FUTEX.lock();
+    // which did not — it is taken off now, either way, from whichever list
+    // it is on (a requeue may have moved it). Off a list, what the module
+    // keeps of it is its own: nobody writes it.
+    let flags = irq_save();
     let (timed_out, interrupted) = unsafe {
-        unlink(&mut state, tid);
+        if let Some(mut list) = list_of_waiter(tid) {
+            unlink(&mut list, tid);
+        }
         match rec(tid as u16) {
             Some(me) => {
                 let why = (me.expired, me.interrupted);
@@ -367,7 +393,7 @@ fn wait(addr: u64, expected: u32, timeout_ns: Option<u64>) -> u64 {
             None => (false, false),
         }
     };
-    drop(state);
+    irq_restore(flags);
 
     if timed_out {
         TIMED_OUT
@@ -381,13 +407,14 @@ fn wait(addr: u64, expected: u32, timeout_ns: Option<u64>) -> u64 {
 /// A signal has arrived for `tid`, which may be waiting on a futex: if it
 /// is, it is woken to say so. True if it was.
 pub fn interrupt(tid: usize) -> bool {
-    let mut state = FUTEX.lock();
+    let flags = irq_save();
     unsafe {
-        if !rec(tid as u16).is_some_and(|me| me.waiting) {
+        let Some(mut list) = list_of_waiter(tid) else {
+            irq_restore(flags);
             return false;
-        }
+        };
         let lent_to = lends_to(tid);
-        unlink(&mut state, tid);
+        unlink(&mut list, tid);
         if let Some(me) = rec(tid as u16) {
             me.interrupted = true;
         }
@@ -396,8 +423,9 @@ pub fn interrupt(tid: usize) -> bool {
         if let Some(owner) = lent_to {
             scheduler::refresh_priority(owner);
         }
+        scheduler::unblock_task(tid);
     }
-    scheduler::unblock_task(tid);
+    irq_restore(flags);
     true
 }
 
@@ -421,10 +449,10 @@ pub fn wake_in(cr3: usize, addr: u64, max_wake: u64) -> u64 {
     let Some(key) = key_of(cr3, addr) else {
         return 0;
     };
-    let mut state = FUTEX.lock();
+    let mut list = list_of(key);
     unsafe {
-        each_on(&mut state, key, false, max_wake, |state, t| {
-            unlink(state, t);
+        each_on(&mut list, key, false, max_wake, |list, t| {
+            unlink(list, t);
             scheduler::unblock_task(t);
         })
     }
@@ -449,7 +477,10 @@ pub fn requeue(first: u64, second: u64, nr_wake: u64, nr_requeue: u64, expected:
     let (Some(from), Some(to)) = (held_word(cr3, first), held_word(cr3, second)) else {
         return u64::MAX;
     };
-    let mut state = FUTEX.lock();
+    // Both lists, in the order of where they are, or the one if they are one.
+    let (at, there) = (from.bucket(), to.bucket());
+    let mut first_held = LISTS[at.min(there)].lock();
+    let mut second_held = (at != there).then(|| LISTS[at.max(there)].lock_second());
     if let Some(expected) = expected {
         let now = {
             let _ua = crate::cpu::UserAccess::begin();
@@ -459,18 +490,29 @@ pub fn requeue(first: u64, second: u64, nr_wake: u64, nr_requeue: u64, expected:
             return NOT_AS_SAID;
         }
     }
+    let (from_list, to_list): (&mut Bucket, Option<&mut Bucket>) = match second_held.as_deref_mut() {
+        None => (&mut *first_held, None),
+        Some(second) if at < there => (&mut *first_held, Some(second)),
+        Some(second) => (second, Some(&mut *first_held)),
+    };
     unsafe {
-        let woken = each_on(&mut state, from, false, nr_wake, |state, t| {
-            unlink(state, t);
+        let woken = each_on(from_list, from, false, nr_wake, |list, t| {
+            unlink(list, t);
             scheduler::unblock_task(t);
         });
         if from == to {
             return woken;
         }
-        let moved = each_on(&mut state, from, false, nr_requeue, |state, t| {
-            unlink(state, t);
-            link(state, t, to);
-        });
+        let moved = match to_list {
+            None => each_on(from_list, from, false, nr_requeue, |list, t| {
+                unlink(list, t);
+                link(list, t, to);
+            }),
+            Some(to_list) => each_on(from_list, from, false, nr_requeue, |list, t| {
+                unlink(list, t);
+                link(to_list, t, to);
+            }),
+        };
         woken + moved
     }
 }
@@ -484,15 +526,15 @@ pub fn requeue(first: u64, second: u64, nr_wake: u64, nr_requeue: u64, expected:
 pub fn check_timeouts(now: u64) -> u64 {
     // Interrupt context, so interrupts are already off.
     let mut next = u64::MAX;
-    let mut state = FUTEX.lock();
     unsafe {
         for b in 0..BUCKETS {
-            let mut t = state.buckets[b].first;
+            let mut list = LISTS[b].lock();
+            let mut t = list.first;
             while let Some(r) = rec(t) {
                 let (here, after, deadline) = (t as usize, r.next, r.deadline);
                 if deadline != 0 && now >= deadline {
                     let lent_to = lends_to(here);
-                    unlink(&mut state, here);
+                    unlink(&mut list, here);
                     if let Some(me) = rec(here as u16) {
                         me.expired = true;
                         me.deadline = 0;
@@ -516,10 +558,12 @@ pub fn check_timeouts(now: u64) -> u64 {
 /// never run again is one a waiter that would have was not given. What it
 /// lent a holder, it lends no more; and what it held, nobody lends it.
 pub fn cleanup_task(tid: usize) {
-    let mut state = FUTEX.lock();
+    let flags = irq_save();
     unsafe {
         let lent_to = lends_to(tid);
-        unlink(&mut state, tid);
+        if let Some(mut list) = list_of_waiter(tid) {
+            unlink(&mut list, tid);
+        }
         if let Some(me) = rec(tid as u16) {
             *me = PerTask::new();
         }
@@ -527,7 +571,7 @@ pub fn cleanup_task(tid: usize) {
             scheduler::refresh_priority(owner);
         }
     }
-    drop(state);
+    irq_restore(flags);
     owner_gone(tid);
 }
 
@@ -546,7 +590,7 @@ pub fn pi_waits_on(t: usize) -> Option<usize> {
 /// [`pi_waits_on`], for a task about to stop waiting.
 ///
 /// # Safety
-/// `FUTEX` is held.
+/// Interrupts off.
 unsafe fn lends_to(t: usize) -> Option<usize> {
     pi_waits_on(t)
 }
@@ -572,11 +616,11 @@ unsafe fn leads_to(from: usize, to: usize) -> bool {
 /// many there are.
 ///
 /// # Safety
-/// `FUTEX` is held.
-unsafe fn pi_waiters(state: &mut FutexState, key: Key) -> (Option<usize>, u64) {
+/// `b` is `key`'s list, held.
+unsafe fn pi_waiters(b: &mut Bucket, key: Key) -> (Option<usize>, u64) {
     let mut best: Option<(usize, (u8, u8))> = None;
     let n = unsafe {
-        each_on(state, key, true, u64::MAX, |_, t| {
+        each_on(b, key, true, u64::MAX, |_, t| {
             let place = scheduler::place_of(t);
             if best.is_none_or(|(_, b)| scheduler::better(place, b)) {
                 best = Some((t, place));
@@ -632,10 +676,10 @@ fn pi_word(cr3: usize, addr: u64) -> Option<Key> {
 /// `was` any more.
 ///
 /// # Safety
-/// `FUTEX` is held.
-unsafe fn hand_on(state: &mut FutexState, key: Key, word: &AtomicU32, was: u32, from: usize, died: bool) -> bool {
+/// `b` is `key`'s list, held.
+unsafe fn hand_on(b: &mut Bucket, key: Key, word: &AtomicU32, was: u32, from: usize, died: bool) -> bool {
     unsafe {
-        let (best, n) = pi_waiters(state, key);
+        let (best, n) = pi_waiters(b, key);
         let dead = if died { PI_OWNER_DIED } else { 0 };
         let now = match best {
             Some(w) => w as u32 | dead | if n > 1 { PI_WAITERS } else { 0 },
@@ -645,12 +689,12 @@ unsafe fn hand_on(state: &mut FutexState, key: Key, word: &AtomicU32, was: u32, 
             return false;
         }
         if let Some(w) = best {
-            unlink(state, w);
+            unlink(b, w);
             if let Some(r) = rec(w as u16) {
                 r.pi_got = true;
                 r.pi_owner = END;
             }
-            each_on(state, key, true, u64::MAX, |_, t| {
+            each_on(b, key, true, u64::MAX, |_, t| {
                 if let Some(r) = rec(t as u16) {
                     r.pi_owner = w as u16;
                 }
@@ -687,7 +731,7 @@ pub fn lock_pi(addr: u64, span: u64, only_try: bool) -> u64 {
     };
     let deadline = if span == 0 { 0 } else { crate::clock::after(crate::clock::span(span)) };
     loop {
-        let mut state = FUTEX.lock();
+        let mut list = list_of(key);
         let Some(word) = (unsafe { word_at(cr3, addr) }) else {
             return u64::MAX;
         };
@@ -696,7 +740,7 @@ pub fn lock_pi(addr: u64, span: u64, only_try: bool) -> u64 {
         if owner == 0 {
             // Nobody's, or its holder died: the caller's, keeping that it
             // died, and saying whether others still wait.
-            let (_, n) = unsafe { pi_waiters(&mut state, key) };
+            let (_, n) = unsafe { pi_waiters(&mut list, key) };
             let now = me as u32 | (was & PI_OWNER_DIED) | if n > 0 { PI_WAITERS } else { 0 };
             if word.compare_exchange(was, now, SeqCst, SeqCst).is_ok() {
                 return 0;
@@ -735,7 +779,7 @@ pub fn lock_pi(addr: u64, span: u64, only_try: bool) -> u64 {
             r.pi = true;
             r.pi_owner = owner as u16;
             r.pi_got = false;
-            link(&mut state, me, key);
+            link(&mut list, me, key);
         }
         scheduler::block_task(me);
         if deadline != 0 {
@@ -744,15 +788,17 @@ pub fn lock_pi(addr: u64, span: u64, only_try: bool) -> u64 {
         // The holder runs at the caller's place while it waits, where that
         // is better than its own, and so does whatever it waits for.
         scheduler::refresh_priority(owner);
-        drop(state);
+        drop(list);
         scheduler::yield_now();
 
         // Handed the word; or its deadline or a signal, each of which took it
         // off its list and said so; or woken for nothing, and it looks again.
-        let mut state = FUTEX.lock();
+        let flags = irq_save();
         let (got, expired, interrupted) = unsafe {
             let lent_to = lends_to(me);
-            unlink(&mut state, me);
+            if let Some(mut list) = list_of_waiter(me) {
+                unlink(&mut list, me);
+            }
             let why = match rec(me as u16) {
                 Some(r) => {
                     let why = (r.pi_got, r.expired, r.interrupted);
@@ -766,7 +812,7 @@ pub fn lock_pi(addr: u64, span: u64, only_try: bool) -> u64 {
             }
             why
         };
-        drop(state);
+        irq_restore(flags);
         if got {
             return 0;
         }
@@ -793,7 +839,7 @@ pub fn unlock_pi(addr: u64) -> u64 {
         return u64::MAX;
     };
     loop {
-        let mut state = FUTEX.lock();
+        let mut list = list_of(key);
         let Some(word) = (unsafe { word_at(cr3, addr) }) else {
             return u64::MAX;
         };
@@ -801,7 +847,7 @@ pub fn unlock_pi(addr: u64) -> u64 {
         if (was & PI_OWNER) as usize != me {
             return PI_NOT_YOURS;
         }
-        if unsafe { hand_on(&mut state, key, word, was, me, false) } {
+        if unsafe { hand_on(&mut list, key, word, was, me, false) } {
             return 0;
         }
     }
@@ -815,9 +861,9 @@ pub fn pi_owner_died(cr3: usize, at: u64, tid: usize) -> bool {
     let Some(key) = key_of(cr3, at) else {
         return false;
     };
-    let mut state = FUTEX.lock();
+    let mut list = list_of(key);
     unsafe {
-        if pi_waiters(&mut state, key).1 == 0 {
+        if pi_waiters(&mut list, key).1 == 0 {
             return false;
         }
         loop {
@@ -828,7 +874,7 @@ pub fn pi_owner_died(cr3: usize, at: u64, tid: usize) -> bool {
             if (was & PI_OWNER) as usize != tid {
                 return false;
             }
-            if hand_on(&mut state, key, word, was, tid, true) {
+            if hand_on(&mut list, key, word, was, tid, true) {
                 return true;
             }
         }
@@ -840,11 +886,11 @@ pub fn pi_owner_died(cr3: usize, at: u64, tid: usize) -> bool {
 /// lends it nothing more, since its number may be somebody else's by the time
 /// they stop waiting; and it runs at no place it was lent for one.
 pub fn owner_gone(tid: usize) {
-    let state = FUTEX.lock();
     let mut lent = false;
     unsafe {
         for b in 0..BUCKETS {
-            let mut t = state.buckets[b].first;
+            let list = LISTS[b].lock();
+            let mut t = list.first;
             while let Some(r) = rec(t) {
                 if r.pi && r.pi_owner == tid as u16 {
                     r.pi_owner = END;
@@ -857,5 +903,20 @@ pub fn owner_gone(tid: usize) {
             scheduler::refresh_priority(tid);
         }
     }
-    drop(state);
+}
+
+#[inline(always)]
+fn irq_save() -> u64 {
+    let flags: u64;
+    unsafe {
+        core::arch::asm!("pushfq; pop {}; cli", out(reg) flags, options(nostack));
+    }
+    flags
+}
+
+#[inline(always)]
+fn irq_restore(flags: u64) {
+    unsafe {
+        core::arch::asm!("push {}; popfq", in(reg) flags, options(nostack));
+    }
 }

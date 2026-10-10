@@ -665,7 +665,14 @@ may keep — are in `../quarkutils/CLAUDE.md`; these are the kernel's.
   deadline and a signal each take the waiter off its list and say why in
   its record, for it to read when it runs; and a task that dies waiting is
   taken off where it dies (`close_descriptors`), not at its reap — a wake
-  counted for it would be one a waiter that runs again was not given.
+  counted for it would be one a waiter that runs again was not given. Each
+  list has a lock of its own (`sync::RANK_FUTEX`), which a waiter's links,
+  and its record while it waits, are kept under: the word is read, the
+  waiter linked and its task blocked with its list's lock held, and a wake
+  looks with the same lock; a requeue takes both lists, in the order of
+  where they are; and whatever finds a waiter by its task — its own wake, a
+  signal, its death — takes the list its key names and looks again once it
+  holds it, since a requeue may have moved it meanwhile.
 - **A word whose holder is lent its waiters' places is the kernel's to hand
   on** (`futex::lock_pi`, `SYS_FUTEX_PI`; Linux's FUTEX_LOCK_PI, a word that
   holds its holder's task id). A waiter for one is a futex waiter that knows
