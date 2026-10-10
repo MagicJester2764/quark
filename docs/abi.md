@@ -1364,10 +1364,15 @@ differences, all of which are a matter of *when*:
   processors, the four best tasks run, and a driver that spins takes one
   processor and not the machine.
 
-The kernel itself runs on one processor at a time: a system call, a fault
-or an interrupt on a second processor waits for the first to leave. Two
-programs computing run side by side; two programs making calls take turns
-at the calls.
+The kernel itself runs on one processor at a time, but for a call between
+two tasks — a send, a receive, a call, a reply and a notice, in every form
+— a futex's wait, wake and requeue, and the calls about the caller and the
+time: a yield, the clock, who it is, how many processors there are. Those
+are made on every processor at once; anything else a program asks of the
+kernel — a fault, a pipe, a poll, a fork, a mapping — waits for it to be
+empty. Two programs computing run side by side, and so do two pairs of
+programs calling each other: four pairs on four processors make three and
+a half times the calls one pair makes, or more.
 
 ### Signals, continued (0x78)
 
@@ -2029,9 +2034,11 @@ machine has made since it started (Linux's `processes`, threads included)
 and those running or ready to (`procs_running`). For `u64::MAX` the first
 six are every processor's together. A processor's time is divided where it
 changes: at a door into the kernel and on the way back, going to the idle
-loop and leaving it, and around each interrupt's handling. One with nothing
-to do takes no tick, and what any is doing at the moment of the call is
-counted up to it.
+loop, sleeping there and leaving it, and around each interrupt's handling.
+One with nothing to do takes no tick, and is counted as having nothing to
+do from the moment it sleeps, whether or not it has run anything since it
+was started; what any is doing at the moment of the call is counted up to
+it.
 
 Op 2's four words are what the processor said of itself when it was
 started: its APIC id — the x2APIC id, where its extended topology leaf
