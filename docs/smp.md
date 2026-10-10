@@ -85,7 +85,7 @@ after its kind's, which is its alone.
 | 18, 19 | a task's record | its calls, its wait, what others change of how it is scheduled; a call takes the caller's and the callee's |
 | 20, 21 | a capability space | its slots; a transfer takes two |
 | 22 | the programs' records (`fdtable.rs`) | a program's signals and what waits with them, its alarm and timers, what it has used, its name and limits: asked about under whatever a wait holds |
-| 24, 25 | an address space | its tables and reservations; a fork or a move takes two |
+| 24, 25 | an address space (`paging::space_lock`) | its tables and reservations, and what is forgotten of them: one of 64 locks, the one its root hashes to; a fork's copy or a move between two takes both |
 | 28, 29 | a processor's run queues (`runq.rs`) | what waits to run there, and the links of the tasks waiting; a move is two steps, never two held |
 | 32 | the clock | what is due, and when the timer is set to look |
 | 36 | interrupts (`irq_dispatch.rs`) | who is told of which |
@@ -105,8 +105,8 @@ a run queue; a pipe's read takes the pipe, then a waiter's record. What a
 program makes has a lock for each kind — its table and every one of it —
 rather than one for each thing: a lock for each pipe would want another
 for the table's slots, and nothing yet says two programs' pipes contend.
-Of these, the tasks', the capability spaces', the address spaces' and the
-clock's have their ranks here before their locks.
+Of these, the tasks', the capability spaces' and the clock's have their
+ranks here before their locks.
 
 A processor that has waited thirty seconds for a lock says which, and
 which processor has it, and the machine stops; each processor that was

@@ -599,8 +599,10 @@ pub fn unmap(handle: usize, vaddr: usize) -> u64 {
             return u64::MAX;
         }
         // Not under a call another thread of the program is in and has
-        // checked, which may be waiting to copy to it (`SYS_MUNMAP`).
+        // checked, which may be waiting to copy to it (`SYS_MUNMAP`): asked,
+        // and the pages unmapped, under the space's lock.
         let end = (vaddr + region.page_count * 4096) as u64;
+        let _space = paging::space_lock(cr3).lock();
         if scheduler::pinned_by_another(crate::userspace::space_of(cr3), vaddr as u64, end) {
             drop(held);
             return u64::MAX;

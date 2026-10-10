@@ -3508,19 +3508,19 @@ pub fn fork_current() -> Option<usize> {
     // The address space first: it is the part that can run out, and it is the
     // part that is worth doing before a task slot is taken.
     let child_cr3 = crate::userspace::create_address_space()?;
-    // In one step, with interrupts off. The parent's own tables are walked
-    // and changed — what it could write it cannot, until it has a copy —
-    // and another thread of it, run half way through, could unmap what is
-    // being walked. And before anything else happens, every processor is
-    // made to forget what it remembers of the parent: this one, and any
-    // that is running another of its threads, which would otherwise go on
-    // writing to pages the child now has too.
-    let flags = irq_save();
+    // In one step, with both spaces' locks held. The parent's own tables
+    // are walked and changed — what it could write it cannot, until it has
+    // a copy — and another thread of it, run half way through, could unmap
+    // what is being walked. And before anything else happens, every
+    // processor is made to forget what it remembers of the parent: this
+    // one, and any that is running another of its threads, which would
+    // otherwise go on writing to pages the child now has too.
+    let held = crate::paging::lock_two_spaces(parent_cr3, child_cr3);
     let copied = unsafe { crate::paging::copy_user_space(parent_cr3, child_cr3) };
     crate::tlb::stale(parent_cr3);
     crate::tlb::sync();
     unsafe { crate::paging::write_cr3(crate::paging::read_cr3()) };
-    irq_restore(flags);
+    drop(held);
     let pages = match copied {
         Some(n) => n,
         None => {

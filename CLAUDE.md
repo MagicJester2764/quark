@@ -316,8 +316,8 @@ may keep — are in `../quarkutils/CLAUDE.md`; these are the kernel's.
     parent's thread; and the program that then wrote the word — which is
     what a wake follows — had it in another frame, and woke nobody: a
     semaphore two threads shared stopped working the moment a third forked.
-  - *One step.* Looking at an entry and changing it are done with
-    interrupts off (`back`, `own`): a system call is preempted wherever a
+  - *One step.* Looking at an entry and changing it are done with the
+    space's lock held (`back`, `own`): a system call is preempted wherever a
     tick finds it, and a thread of the same program doing the same to the
     same page in between has the frame given back twice — the second time
     from under whoever still shares it. `fork` itself walks and changes
@@ -405,7 +405,12 @@ may keep — are in `../quarkutils/CLAUDE.md`; these are the kernel's.
   touches it (`validate_user_range`, the futex path), and a page fault on one
   is served, so the first touch from anywhere gives it its frame.
 - **A walk of a program's tables is one step** (`paging::OneStep`): from
-  the first entry it reads to the last it writes, with interrupts off. An
+  the first entry it reads to the last it writes, with the address space's
+  lock held (`paging::space_lock`, `sync::RANK_SPACE`: one of 64, the one
+  its root hashes to, the same every time; a step inside another of the
+  same space's takes nothing more). The kernel's own tables, changed only
+  as the heap grows under the heap's lock, are a step with interrupts off
+  alone. An
   unmap gives back a table it leaves empty, and the directory above it if
   that is empty too (`reclaim_empty_tables`), and a system call is
   preempted wherever a tick finds it — so a walk that had read its way down
@@ -417,9 +422,11 @@ may keep — are in `../quarkutils/CLAUDE.md`; these are the kernel's.
   seconds on eight processors, and `dtest tables` — two threads kept to one
   processor, each mapping and unmapping a page under one directory — meets
   it every time on one. A new walk takes a `OneStep`, or is only called
-  from one that has (`back`, `own`, `unshare`, the fork's copy and
-  reclaim's takes take their own); one that has to wait in the middle
-  walks again afterwards, as `back_object` does.
+  from one that has (`back`, `own` and `unshare` take one; the fork's copy
+  holds both spaces' locks, `paging::lock_two_spaces`, and reclaim's takes
+  the space's); one that has to wait in the middle gives its step up and
+  walks again afterwards, as `back_object` does for a pager — nothing is
+  held across a wait.
 - **A fault in ring 3 ends the program, never the machine.** Every task of
   the program that faulted exits with the negated Linux signal number
   (`idt.rs`), and only a fault taken in ring 0 halts. musl's `abort()` is a
@@ -552,7 +559,8 @@ may keep — are in `../quarkutils/CLAUDE.md`; these are the kernel's.
   **Nor is it unmapped by the program's other threads**: `SYS_MUNMAP`,
   `SYS_ADDRSPACE_GIVE` and an unmap of shared memory are refused where a
   call another task of the program is in has checked any of the range
-  (`scheduler::pinned_by_another`), asked and done in one step. A thread
+  (`scheduler::pinned_by_another`), asked and done under the space's lock,
+  which the check's own walk takes too. A thread
   waiting to read a pipe into a page another thread unmapped was copied
   into nothing when the write came — a fault in the kernel with interrupts
   off, and any program's way to stop the machine (`dtest tables`, `dchild

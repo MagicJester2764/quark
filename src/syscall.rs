@@ -2480,14 +2480,14 @@ fn dispatch(
             // given, not a promise of one.
             scheduler::pin(from as u64, (pages * 4096) as u64);
             let _ = unsafe { paging::back_range(own, from as u64, (pages * 4096) as u64, false) };
-            // From here to the last page moved, one step: nothing else of the
-            // program's can change what is checked before it goes. And not a
-            // page a call another thread of the program is in has checked —
-            // it may be waiting to copy to it, as for SYS_MUNMAP.
-            let flags = irq_save();
+            // From here to the last page moved, one step under both spaces'
+            // locks: nothing else of the program's can change what is
+            // checked before it goes. And not a page a call another thread
+            // of the program is in has checked — it may be waiting to copy
+            // to it, as for SYS_MUNMAP.
             let space = crate::userspace::space_of(own);
+            let held = paging::lock_two_spaces(own, cr3);
             if scheduler::pinned_by_another(space, from as u64, (from + pages * 4096) as u64) {
-                irq_restore(flags);
                 return u64::MAX;
             }
             // All of it is checked before any of it moves. Only memory the
@@ -2498,7 +2498,6 @@ fn dispatch(
                 let ours = unsafe { paging::leaf_flags(own, from + i * 4096) }
                     .is_some_and(|f| f & (paging::OWNED | paging::USER) == paging::OWNED | paging::USER);
                 if !ours || unsafe { paging::translate(cr3, virt + i * 4096) }.is_some() {
-                    irq_restore(flags);
                     return u64::MAX;
                 }
             }
@@ -2525,7 +2524,7 @@ fn dispatch(
                 let _ = unsafe { paging::unmap_page(own, here) };
                 moved += 1;
             }
-            irq_restore(flags);
+            drop(held);
             // No longer in the caller's address space, so no longer on its
             // account — as for SYS_MUNMAP.
             scheduler::current_task_uncharge_mem(moved);
@@ -3815,10 +3814,10 @@ fn dispatch(
             // checked: it may be waiting to copy to it with interrupts off,
             // and would fault in the kernel on a page that is not there —
             // the machine's end, not the program's. Asked and cleared in one
-            // step, so that no call checks the range in between.
-            let flags = irq_save();
+            // step, under the space's lock, which a check takes too, so that
+            // no call checks the range in between.
+            let held = paging::space_lock(cr3).lock();
             if scheduler::pinned_by_another(space, vaddr as u64, (vaddr + pages * 4096) as u64) {
-                irq_restore(flags);
                 return u64::MAX;
             }
             // Mappings and reservations alike. Only frames this address space
@@ -3827,7 +3826,7 @@ fn dispatch(
             // double-frees a shmem region or hands the allocator a device
             // physical address.
             let freed = unsafe { paging::clear_range(cr3, vaddr, pages) };
-            irq_restore(flags);
+            drop(held);
             if freed > 0 {
                 scheduler::current_task_uncharge_mem(freed);
             }

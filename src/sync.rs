@@ -376,6 +376,19 @@ impl<T> IrqSpinLock<T> {
         IrqSpinLockGuard { lock: self, rank: self.head.rank }
     }
 
+    /// Take it, unless this processor holds it already — at its kind's rank
+    /// or as a second — in which case nothing is taken: for a step that may
+    /// be begun inside another that has it (a walk of an address space's
+    /// tables inside another of the same space's).
+    pub fn lock_unless_held(&self) -> Option<IrqSpinLockGuard<'_, T>> {
+        let flags = irq_save();
+        let rank = self.head.rank;
+        let mine = crate::percpu::lock_held(rank) == self.head.at()
+            || (rank < 63 && crate::percpu::lock_held(rank + 1) == self.head.at());
+        irq_restore(flags);
+        if mine { None } else { Some(self.lock()) }
+    }
+
     /// The second lock of a kind its processor holds one of: after that one
     /// in memory, so that every processor takes any two of the kind in the
     /// same order, and at the rank after the kind's. Anything else is the

@@ -157,6 +157,8 @@ fn make_room(want: usize, take: usize) -> Found {
                 continue;
             }
             let word = crate::fdtable::sig_word_of_space(space) & !0xFFF;
+            // Its tables are walked and changed under its lock.
+            let held = paging::space_lock(cr3).lock();
             let (next, got) = unsafe { paging::take_unused(cr3, space, word, va, budget, want - taken) };
             // Entries were taken away, or marks cleared that a processor
             // sets again only once it has forgotten the page.
@@ -164,6 +166,7 @@ fn make_room(want: usize, take: usize) -> Found {
             if cr3 == paging::read_cr3() {
                 unsafe { paging::write_cr3(cr3) };
             }
+            drop(held);
             taken += got;
             match next {
                 Some(at) => {
@@ -211,14 +214,14 @@ pub fn page_out(addr: usize, pages: usize) -> u64 {
     // is taken passes through a cache that holds only so many — each part
     // is written, and its frames given up, before the next is taken.
     while let Some(from) = at {
-        let flags = irq_save();
         let word = crate::fdtable::sig_word_of_space(space) & !0xFFF;
+        let held = paging::space_lock(cr3).lock();
         let (next, got) = unsafe { paging::take_range(cr3, space, word, from, end, PART) };
         if got != 0 {
             crate::tlb::stale(cr3);
             unsafe { paging::write_cr3(cr3) };
         }
-        irq_restore(flags);
+        drop(held);
         at = next;
         taken += got;
         if got == 0 {
