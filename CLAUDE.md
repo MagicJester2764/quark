@@ -480,7 +480,14 @@ may keep — are in `../quarkutils/CLAUDE.md`; these are the kernel's.
   of revocations is made when one is first minted, granted or taken from it
   (`cap::generation_for`), and that is refused with no memory for it. A
   revoke cannot fail for want of memory, and does nothing to a slot with no
-  count: nothing was derived from it.
+  count: nothing was derived from it. **A space is read and changed with
+  its lock held** (`cap::locked`, one of 64 by the space's number,
+  `sync::RANK_CSPACE`), a task's number read again once it is — whoever
+  moves a task between spaces holds both — and **a count is read with no
+  lock at all**: a call's check of an endpoint reads one on every call, so
+  counts are words that only go on, in chunks that never move
+  (`cap::Counts`), made under the table's lock (`RANK_CAP_TABLE`). A new
+  look at a space goes through `locked`, `with_cspace` or `holds`.
 - **Every descriptor has a form that answers instead of waiting.**
   `SYS_FD_READ_NB` and `SYS_FD_WRITE_NB` return "would block" where
   `SYS_FD_READ` and `SYS_FD_WRITE` park, and `SYS_FUTEX_WAIT_TIMEOUT` gives up

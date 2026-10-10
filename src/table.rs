@@ -77,6 +77,14 @@ impl<T> Table<T> {
         if cell.is_null() { None } else { unsafe { (*cell).as_mut() } }
     }
 
+    /// The record in slot `i`, to read, by whoever may while other slots are
+    /// filled and emptied: a slot's room, once made, stays where it is until
+    /// the slot is emptied, and the words that find it only grow.
+    pub fn peek(&self, i: usize) -> Option<&'static T> {
+        let cell = self.cell(i);
+        if cell.is_null() { None } else { unsafe { (*cell).as_ref() } }
+    }
+
     /// Slot `i` as an `Option`: the record's own, or for a slot never made the
     /// table's `None`. Filling and emptying a slot are [`fill_at`] and
     /// [`empty`]; nothing else writes a whole slot.

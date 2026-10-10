@@ -69,12 +69,17 @@ pub const RANK_SHMEM: u8 = 14;
 pub const RANK_FUTEX: u8 = 16;
 /// A task's record. Two, for a call.
 pub const RANK_TASK: u8 = 18;
-/// A capability space. Two, for a transfer.
+/// A capability space (`cap.rs`: one of 64, the one its number picks). Two,
+/// for a thread joining its program's or a fork's copy.
 pub const RANK_CSPACE: u8 = 20;
 /// A program's record besides its descriptors (`fdtable.rs`): its signals,
 /// its alarm, what it has used, its name and limits — asked about under
 /// whatever a wait holds, so after the things waited on.
 pub const RANK_PROGRAM: u8 = 22;
+/// Which numbers have a capability space, and the making of a number's
+/// counts of revocations (`cap.rs`): after a space's lock, which is held
+/// when a space is given up or a capability first minted from a slot.
+pub const RANK_CAP_TABLE: u8 = 23;
 /// An address space's tables and reservations. Two, for a fork or a move.
 pub const RANK_SPACE: u8 = 24;
 /// A processor's run queues. Two, for a move between processors.
