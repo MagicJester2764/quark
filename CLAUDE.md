@@ -1525,11 +1525,13 @@ closed:
 - **A processor's time is counted where what it does changes**
   (`usage::now_doing`, `SYS_CPU_INFO`): running a program, running the
   kernel, with nothing to do, or taking an interrupt — at each door and on
-  the way back, going to the idle loop and leaving it (`resumed`), and
-  around each interrupt's handling — with the interrupts it took and the
-  switches it made. A new door, a new way to the idle loop, or a new place
-  an interrupt is handled says what the processor does now, or that time
-  is counted as whatever it did before. Idle time was thrown away, and
+  the way back, going to the idle loop and leaving it (`resumed`), as it
+  sleeps there (`idling`: a processor started into its idle loop never
+  switched to it, and one that ran nothing was counted as in the kernel
+  for as long as it slept), and around each interrupt's handling — with
+  the interrupts it took and the switches it made. A new door, a new way
+  to the idle loop, or a new place an interrupt is handled says what the
+  processor does now, or that time is counted as whatever it did before. Idle time was thrown away, and
   `/proc/stat`, `/proc/uptime` and every program that asks how busy the
   machine is had nothing to read.
 

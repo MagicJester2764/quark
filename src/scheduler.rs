@@ -2797,8 +2797,11 @@ pub fn idle() -> ! {
         }
         // Said before the lock goes, so that whoever makes a task ready
         // next — which takes the lock — knows there is a processor to wake
-        // for it (`smp::wake`).
-        unsafe { crate::percpu::nap() };
+        // for it (`smp::wake`). And what it does from here is nothing.
+        unsafe {
+            crate::usage::idling();
+            crate::percpu::nap();
+        }
         crate::klock::release();
         // An interrupt is not taken between `sti` and the instruction after
         // it, so nothing can arrive after the look above and before the

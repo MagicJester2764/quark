@@ -188,6 +188,23 @@ pub unsafe fn now_doing(doing: u8) -> u8 {
     }
 }
 
+/// This processor has nothing to do, and is about to wait for something:
+/// from here it is counted so. A switch to the idle loop says it
+/// ([`resumed`]); a processor that went from being started into its idle
+/// loop, and has run nothing since, never switched to it, and was counted
+/// as in the kernel for as long as it slept — on a quiet machine of
+/// sixteen, six of them from start to finish.
+///
+/// # Safety
+/// Interrupts off.
+pub unsafe fn idling() {
+    unsafe {
+        if DOING[crate::percpu::index()].0 != IDLE {
+            now_doing(IDLE);
+        }
+    }
+}
+
 /// How many times this processor has gone from one task to another.
 ///
 /// # Safety
