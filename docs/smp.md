@@ -239,7 +239,11 @@ held, and one that was ended is switched away from there and then
 In between, it is dead and still standing on its kernel stack and in its
 address space. So "this task is not running" is not something its state can
 say, and the scheduler keeps which processor each task is on
-(`scheduler::ON_CPU`). Two things wait for a dead task to be on none: its
+(`scheduler::ON_CPU`). That is also what keeps a task to one processor: it
+is run by the processor that claims it, under its record's lock and only
+while it is ready and on none (`switch_to`), and two that each chose it — a
+task taken from a queue as another processor is handed it with a call —
+do not both run it. Two things wait for a dead task to be on none: its
 parent being told, so that it is not collected while it runs; and its being
 taken apart. The second is why throwing away an address space asks whether
 any task is *on a processor* in it, and not only whether any is alive.

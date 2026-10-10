@@ -1126,6 +1126,14 @@ unsafe fn switch_to(current_tid: usize, next_tid: usize, flags: u64) { unsafe {
         panic!("a lock held across a switch");
     }
     let me = crate::percpu::index();
+    // On the stack of what it is leaving: the context saved below is that
+    // task's, and is where it will be resumed.
+    let rsp: usize;
+    core::arch::asm!("mov {}, rsp", out(reg) rsp, options(nomem, nostack, preserves_flags));
+    let (base, top) = stack_of(current_tid);
+    if !(base..top).contains(&rsp) {
+        wrong(b"a switch away from a task on a stack that is not its own", current_tid, rsp);
+    }
     if next_tid == current_tid {
         // Same task, just mark running again
         let held = lock_record(current_tid);
@@ -1174,34 +1182,55 @@ unsafe fn switch_to(current_tid: usize, next_tid: usize, flags: u64) { unsafe {
     // being left puts it back where it can be found, and the idle loop runs
     // here instead.
     let mut next_tid = next_tid;
+    // Whether the idle loop gave up the one lock to wait, which it has back
+    // if it runs nothing after all.
+    let mut gave_up = false;
     if next_tid != 0 && core::ptr::read_volatile(&raw const st(next_tid).on_cpu) != NO_CPU {
         if current_tid == 0 {
             if crate::klock::held() {
                 crate::klock::release();
+                gave_up = true;
             }
-            while core::ptr::read_volatile(&raw const st(next_tid).on_cpu) != NO_CPU {
+            // For as long as it is ready: one another processor has claimed,
+            // or that has blocked, is not this one's to wait for — the claim
+            // below says so — and may run for as long as it likes.
+            while core::ptr::read_volatile(&raw const st(next_tid).on_cpu) != NO_CPU && ready_now(next_tid) {
                 crate::smp::while_waiting();
                 core::hint::spin_loop();
             }
         } else {
+            // Ready and being left there: put back where it can be found.
+            // Not one another processor has claimed, or that is not ready:
+            // that is the other processor's to run, or nobody's yet.
             let held = lock_record(next_tid);
-            enqueue(next_tid);
+            if matches!(*slot(next_tid), Some(ref t) if t.state == TaskState::Ready) {
+                enqueue(next_tid);
+            }
             drop(held);
             next_tid = 0;
         }
     }
-    // Claimed under its record's lock: running, and here — unless it was
-    // ended meanwhile, or taken apart, when this processor's idle loop runs
-    // instead. A task ended goes no further than its next door, and one
-    // ended before it is claimed has none; one claimed first is ended by
-    // whoever ended it as a task running elsewhere (`end_other`). The one
-    // being left is said to be on no processor by the switch, once its
-    // registers are saved: said any sooner, another processor could run it
-    // from what was saved before.
+    // Claimed under its record's lock, and only if it is ready and on no
+    // processor: running, and here. Otherwise this processor's idle loop runs
+    // instead. A task ended meanwhile is not run — it goes no further than
+    // its next door, and one ended before it is claimed has none; one
+    // claimed first is ended by whoever ended it as a task running elsewhere
+    // (`end_other`). Nor is one another processor has claimed, or that has
+    // blocked since it was chosen: a task can be chosen by two — taken from
+    // a queue it was put in while it was being handed a call, or by a
+    // processor that took it from there as its program was continued — and
+    // two that each ran it were two processors on one stack, and a return
+    // to nothing (`[KFAULT ... rip=0x1029 ...]`). And it is out of any queue
+    // it is still in, for no other to take it from there. The one being
+    // left is said to be on no processor by the switch, once its registers
+    // are saved: said any sooner, another processor could run it from what
+    // was saved before.
     if next_tid != 0 {
         let held = lock_record(next_tid);
-        let alive = matches!(*slot(next_tid), Some(ref t) if t.state != TaskState::Dead);
-        if alive {
+        let claimed = matches!(*slot(next_tid), Some(ref t) if t.state == TaskState::Ready)
+            && st(next_tid).on_cpu == NO_CPU;
+        if claimed {
+            unlink_ready(next_tid);
             if let Some(ref mut task) = *slot(next_tid) {
                 task.state = TaskState::Running;
             }
@@ -1209,13 +1238,17 @@ unsafe fn switch_to(current_tid: usize, next_tid: usize, flags: u64) { unsafe {
             st(next_tid).last_cpu = me as u16;
         }
         drop(held);
-        if !alive {
+        if !claimed {
             next_tid = 0;
         }
     }
     end_choosing(me);
     if next_tid == current_tid {
-        // The idle loop, which chose a task that was ended: it goes on.
+        // The idle loop, which chose a task it could not have: it goes on,
+        // with the one lock it gave up to wait.
+        if gave_up {
+            crate::klock::acquire();
+        }
         restore_flags(flags);
         return;
     }
@@ -1297,6 +1330,12 @@ unsafe fn switch_to(current_tid: usize, next_tid: usize, flags: u64) { unsafe {
     // Get raw pointers to contexts. The idle loop's is this processor's.
     let old_ctx = context_of(current_tid);
     let new_ctx = context_of(next_tid) as *const context::CpuContext;
+    // And what is switched to was saved on its own stack.
+    let (base, top) = stack_of(next_tid);
+    let saved = (*new_ctx).rsp as usize;
+    if !(base..=top).contains(&saved) {
+        wrong(b"a switch to a context saved on a stack that is not its own", next_tid, saved);
+    }
 
     // Do NOT restore interrupts here — context_switch restores RFLAGS from
     // the new context, which atomically re-enables interrupts with the switch.
@@ -1307,6 +1346,66 @@ unsafe fn switch_to(current_tid: usize, next_tid: usize, flags: u64) { unsafe {
     // says the task left is on no processor once it has saved it.
     let left = if current_tid != 0 { &raw mut st(current_tid).on_cpu } else { core::ptr::null_mut() };
     context::context_switch(old_ctx, new_ctx, left);
+}}
+
+/// What the scheduler found its records saying that cannot be: a
+/// processor not on the stack of the task it is leaving, a context saved
+/// on a stack not its task's, a task put in a queue while it is in one.
+/// Each is two processors on one stack, or a moment from it, and the fault
+/// that comes of that names nothing — a return to address nought, on a
+/// stack that was not the task's (`[KFAULT ... rip=0x1029 ...]`). So the
+/// machine stops here instead, saying which task, the word that is wrong,
+/// and the calls that brought this processor here.
+#[cold]
+pub(crate) fn wrong(what: &[u8], tid: usize, word: usize) -> ! {
+    unsafe { core::arch::asm!("cli", options(nostack, nomem)) };
+    crate::smp::halt_others();
+    let rsp: usize;
+    unsafe { core::arch::asm!("mov {}, rsp", out(reg) rsp, options(nomem, nostack, preserves_flags)) };
+    crate::serial::puts(b"\n[KSCHED ");
+    crate::serial::puts(what);
+    crate::serial::puts(b": cpu=");
+    crate::serial::put_usize(crate::percpu::index());
+    crate::serial::puts(b" current=");
+    crate::serial::put_usize(crate::percpu::current());
+    crate::serial::puts(b" task=");
+    crate::serial::put_usize(tid);
+    crate::serial::puts(b" word=0x");
+    crate::serial::put_hex_usize(word);
+    crate::serial::puts(b" rsp=0x");
+    crate::serial::put_hex_usize(rsp);
+    crate::serial::puts(b"]\n");
+    if let Some((_, top)) = crate::kstack::around(rsp) {
+        crate::idt::say_stack(b"[KSCHED", rsp, top);
+    }
+    panic!("the scheduler's records said what cannot be")
+}
+
+/// Whether `tid` is ready, read as it is — a hint, for a wait that the
+/// claim after it answers properly.
+///
+/// # Safety
+/// Interrupts off, and the task cannot be taken apart meanwhile: this
+/// processor is choosing (`CHOOSING`).
+unsafe fn ready_now(tid: usize) -> bool { unsafe {
+    match *slot(tid) {
+        Some(ref t) => core::ptr::read_volatile(&raw const t.state) == TaskState::Ready,
+        None => false,
+    }
+}}
+
+/// The stack task `tid` runs the kernel on: its own, or for the idle loop
+/// this processor's.
+///
+/// # Safety
+/// Interrupts off, and the task exists.
+unsafe fn stack_of(tid: usize) -> (usize, usize) { unsafe {
+    match *slot(tid) {
+        Some(ref t) if tid != 0 && !t.kernel_stack_base.is_null() => {
+            (t.kernel_stack_base as usize, t.kernel_stack_base as usize + t.kernel_stack_size)
+        }
+        _ => crate::percpu::idle_stack(),
+    }
 }}
 
 /// Where a task's registers are kept while it is not running: in the task,

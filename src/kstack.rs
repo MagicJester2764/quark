@@ -237,6 +237,26 @@ pub fn say_deepest() {
     say(deepest(), KSTACK_SIZE);
 }
 
+/// The kernel stack `addr` is on, as `(base, top)`: a slot's that holds a
+/// stack, or the first processor's boot stack. `None` for an address on
+/// none, on the page below one, or in a slot given back — which is not
+/// mapped, and read would be a fault in the report of one.
+pub fn around(addr: usize) -> Option<(usize, usize)> {
+    let (bottom, top) = (&raw const boot_stack_bottom as usize, &raw const boot_stack_top as usize);
+    if (bottom..top).contains(&addr) {
+        return Some((bottom, top));
+    }
+    if !(REGION..REGION_END).contains(&addr) || is_guard(addr) {
+        return None;
+    }
+    let slot = (addr - REGION) / SLOT;
+    if unsafe { (*(&raw const USED))[slot / 64] } & (1 << (slot % 64)) == 0 {
+        return None;
+    }
+    let base = REGION + slot * SLOT + PAGE;
+    Some((base, base + KSTACK_SIZE))
+}
+
 /// Whether `addr` is in a page left unmapped below a kernel stack: a fault
 /// there is a stack that has run out.
 pub fn is_guard(addr: usize) -> bool {

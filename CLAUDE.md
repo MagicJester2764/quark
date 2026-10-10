@@ -198,7 +198,11 @@ so a failed assert in its malloc is a `[UFAULT vec=13 ...]`). A
 failed check prints to the screen. Look at both. `[KSTUCK ...]` is the third
 thing serial can say, and is read as a kernel fault is: one processor has had
 the kernel for half a minute, the rest have been waiting at its door, and
-this is where the one that had it was.
+this is where the one that had it was. `[KSCHED ...]` is a fourth, read the
+same way: the scheduler found its records saying what cannot be — a switch
+on a stack that is not its task's, a context saved on another's, a task put
+in a queue it is in already — which is two processors on one stack, or a
+moment from it, and `calls` is how this one got there.
 
 A kernel fault says three things: where (`rip`, `rsp`, the task and its kernel
 stack), the registers, and `calls` — every word on the kernel stack that is an
@@ -208,7 +212,11 @@ with the odd stale entry from a frame since left;
 `nm -n target/x86_64-unknown-none/release/quark` says which function each is
 in. It is what turned `rip=0x1029`, which names nothing, into "in
 `timerfd::tick`, from the timer interrupt, with the direction flag set".
-It says how much of the stack the task had used (`used=`), and a stack that
+It says how much of the stack the task had used (`used=`); one taken on a
+kernel stack that is not its task's says so, and reads that one: it is what
+a processor running a task that another runs too looks like, and the fault
+that came of two running the network card's driver, which said only that
+the stack was not the task's, named nothing else. A stack that
 ran out says so — `kernel stack overflow, task T name=...` — with its
 `calls` read from the stack's bottom, where the calls that did it are.
 `[kstack] deepest N of M bytes` on serial is the deepest any kernel stack has
@@ -1360,7 +1368,12 @@ What follows from that, and breaking any of it is quiet:
 - **A hand-over keeps interrupts off from waking the callee to switching to
   it.** `make_ready` leaves the callee runnable but in no queue, since it is
   about to run, so `donate_to` takes the flags `call_inner` saved instead of
-  saving its own. With a gap between the two, a tick preempted the caller,
+  saving its own. Nor is it in one already: nothing that wakes a receiver
+  leaves it receiving, a device's interrupt included
+  (`ipc::wake_for_interrupt`). Left receiving, the network card's driver,
+  woken by its card, was handed the network server's next call and the
+  processor while it waited in a run queue, and the processor that took it
+  from there ran it as well. With a gap between the two, a tick preempted the caller,
   already blocked, and nothing ever ran either task again: fontconfig hung
   about once a minute scanning fonts. `dtest calls` makes three million calls
   in three seconds and caught it on its first run. **And a task's IPC state
@@ -1734,7 +1747,16 @@ breaking any of them is quiet until it is a machine that stops.
   swapping tasks would each be waiting for the other's — and without the one
   lock, which the one leaving may need to finish; anything else puts the
   task back and goes to its idle loop. A task taken to run is claimed under
-  its record's lock, and one ended meanwhile is not run; and none is taken
+  its record's lock, and only if it is ready and on no processor — taken
+  out of any queue it is still in as it is: one ended meanwhile is not run,
+  nor one another processor has, nor one that has blocked since. Two can
+  choose one task — one taking it from a queue as another is handed it, or
+  as a continued program's tasks are queued again — and when both ran it,
+  an idle loop's registers were saved on another task's stack and later
+  returned to nothing. The switch checks what it can of that, and stops the
+  machine if it is not so (`scheduler::wrong`): that it is on the stack of
+  the task it leaves, that what it switches to was saved on its own, and
+  that nothing is put in a queue it is in. And none is taken
   apart while a processor that may have it in hand, chosen and not yet
   claimed, is still choosing: `reap_one` takes it out of every queue,
   stamps it with the reaping epoch, and takes it apart once every

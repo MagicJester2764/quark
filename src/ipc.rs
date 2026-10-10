@@ -880,6 +880,26 @@ pub fn wake_sleeper(tid: usize) -> bool {
     woke
 }
 
+/// Wake `tid` for an interrupt of its, whatever it waits on — a driver's
+/// device has said something. A receive is ended as every waker of one ends
+/// it: no longer receiving, so that a message sent before it runs again
+/// waits for its next receive. Left receiving, it was handed a call and the
+/// processor (`donate_to`) while it waited in a run queue for the
+/// interrupt, and a processor that took it from there ran it too.
+pub fn wake_for_interrupt(tid: usize) {
+    if tid >= MAX_TASKS {
+        return;
+    }
+    let held = scheduler::lock_record(tid);
+    unsafe {
+        if matches!(st(tid).task_ipc.state, IpcState::RecvBlocked(_)) {
+            st(tid).task_ipc.state = IpcState::None;
+        }
+    }
+    scheduler::unblock_task(tid);
+    drop(held);
+}
+
 /// Asynchronous notification: OR `badge` into dest's notification word.
 /// Non-blocking. Wakes the dest task if it is RecvBlocked(0) or RecvBlocked(TID_ANY).
 pub fn sys_notify(dest: usize, number: u64, badge: u64) -> Result<(), IpcError> {
@@ -1534,7 +1554,9 @@ fn call_as(
                 st(dest).task_ipc.state = IpcState::None;
                 // Runnable, but deliberately not queued: it is about to be
                 // switched to, and an entry left behind is a turn it has
-                // already had.
+                // already had. (Nor is it in a queue already: whatever else
+                // wakes a receiver ends its receive, an interrupt too, and
+                // the switch takes out of a queue whatever it claims.)
                 scheduler::make_ready(dest);
                 scheduler::block_task(caller);
                 hand_over_to = Some(dest);

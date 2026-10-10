@@ -561,14 +561,36 @@ fn report_kernel_state(tag: &[u8], frame: &InterruptFrame, kbase: usize, ktop: u
     if kbase == 0 || rsp < kbase || rsp >= ktop {
         puts(tag);
         puts(b" stack: rsp is not in the task's kernel stack]\n");
+        // On another kernel stack, which is read all the same: a processor
+        // on a stack that is not its task's is the fault, and what is on it
+        // is how it got there. A switch to the idle loop with a stack
+        // somebody else's task then had, and a return to nothing on it,
+        // said only this.
+        if let Some((base, top)) = crate::kstack::around(rsp) {
+            puts(tag);
+            puts(b" stack: it is on the one at 0x");
+            put_hex_usize(base);
+            puts(b"..0x");
+            put_hex_usize(top);
+            puts(b"]\n");
+            say_stack(tag, rsp, top);
+        }
         return;
     }
+    say_stack(tag, rsp, ktop);
+}
+
+/// What is on the kernel stack from `rsp` to its `top`: the eight words at
+/// the top, and every word that is an address in the kernel's code — the
+/// calls, innermost first, as offsets from `rsp`.
+pub fn say_stack(tag: &[u8], rsp: usize, top: usize) {
+    use crate::serial::{put_hex_usize, puts};
     let text = core::ptr::addr_of!(__text_start) as usize..core::ptr::addr_of!(__text_end) as usize;
     puts(tag);
     puts(b" stack top:");
     for i in 0..8 {
         let at = rsp + i * 8;
-        if at >= ktop {
+        if at >= top {
             break;
         }
         puts(b" 0x");
@@ -579,7 +601,7 @@ fn report_kernel_state(tag: &[u8], frame: &InterruptFrame, kbase: usize, ktop: u
     puts(b" calls:");
     let mut at = rsp;
     let mut shown = 0;
-    while at < ktop && shown < 48 {
+    while at < top && shown < 48 {
         let word = unsafe { core::ptr::read_volatile(at as *const usize) };
         if text.contains(&word) {
             puts(b" +0x");

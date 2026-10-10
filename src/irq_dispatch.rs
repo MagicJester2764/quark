@@ -4,7 +4,6 @@
 /// into a per-IRQ ring buffer and unblocks the handler task.
 
 use crate::ipc::Message;
-use crate::scheduler;
 use crate::sync::IrqSpinLock;
 
 /// The sixteen ISA interrupts, and after them the ones a device sends for
@@ -115,7 +114,7 @@ pub fn dispatch_irq(irq: u8) -> bool {
     };
 
     let queued = state.rings[idx].push(msg);
-    // Drop lock before calling scheduler (avoids potential ordering issues)
+    // Drop lock before waking its task (avoids potential ordering issues)
     drop(state);
     if queued {
         crate::intc::held(irq);
@@ -132,7 +131,7 @@ pub fn dispatch_irq(irq: u8) -> bool {
         // interrupt is not, so it is said here.
         crate::intc::dropped(irq);
     }
-    scheduler::unblock_task(tid);
+    crate::ipc::wake_for_interrupt(tid);
 
     true
 }

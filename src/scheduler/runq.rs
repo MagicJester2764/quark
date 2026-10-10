@@ -301,6 +301,11 @@ pub(super) unsafe fn link(tid: usize, cpu: usize, p: usize, front: bool) {
 /// [`link`], with `cpu`'s queues held.
 unsafe fn link_held(tid: usize, cpu: usize, p: usize, front: bool) {
     unsafe {
+        // In no queue: one in another processor's is a task two processors
+        // may take, and run at once.
+        if st(tid).queued != NOT_QUEUED {
+            super::wrong(b"a task put in a queue while it is in one", tid, st(tid).queued_on as usize);
+        }
         st(tid).seq = SEQ.fetch_add(1, Ordering::Relaxed) + 1;
         st(tid).queued = p as u8;
         st(tid).queued_on = cpu as u16;
