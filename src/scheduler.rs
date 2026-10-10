@@ -29,7 +29,7 @@
 
 use crate::context;
 use crate::task::{Task, TaskRec, TaskState, KERNEL_STACK_SIZE, MAX_TASKS};
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 mod runq;
 
@@ -193,6 +193,9 @@ pub struct PerTask {
     /// took it is still in it. A task made, or forked, starts in a
     /// trampoline that gives it up, and expects it too.
     kl_held: bool,
+    /// The reaping epoch it was stamped with once it was ready to be taken
+    /// apart and in no queue, or 0 (`reap_one`, `CHOOSING`).
+    reap_stamp: u64,
     /// Dead, and nobody is going to wait for it: a thread that is joined
     /// through the word it asked to have cleared ([`joined_by_word`]). Decided
     /// as it dies, when the word is forgotten.
@@ -267,6 +270,7 @@ impl PerTask {
             last_cpu: 0,
             unannounced: false,
             kl_held: true,
+            reap_stamp: 0,
             unwaited: false,
             pinned: [(0, 0); PINS],
             npinned: 0,
@@ -430,17 +434,34 @@ static mut RT_USE: [(u64, u64, u64); crate::percpu::MAX_CPUS] = [(0, 0, 0); crat
 /// waits for the tick, which is a known gap; a real-time one is woken to run.
 static RESCHED: [AtomicBool; crate::percpu::MAX_CPUS] = [const { AtomicBool::new(false) }; crate::percpu::MAX_CPUS];
 
-/// Each processor that is choosing what to run next: from taking a task
+/// Each processor that is choosing what to run next — from taking a task
 /// out of a queue, or deciding to hand over to one, to claiming it under
-/// its record's lock (`switch_to`). Until the claim it is on no processor
-/// and in no queue, and its record is read and written here — so a task is
-/// not taken apart while any processor is choosing (`reap_one`), which does
-/// not wait for it: it tries again.
-static CHOOSING: [AtomicBool; crate::percpu::MAX_CPUS] = [const { AtomicBool::new(false) }; crate::percpu::MAX_CPUS];
+/// its record's lock (`switch_to`) — by the reaping epoch it began in
+/// (`REAP_EPOCH`), or `u64::MAX` while it is not. Until the claim the task
+/// is on no processor and in no queue, and its record is read and written
+/// here. So a task is taken apart only once it is in no queue and every
+/// processor choosing began after that (`reap_one`): none can have it in
+/// hand. A processor's choosing is short, and a task waits a moment at
+/// most; one not taken apart now is tried again.
+static CHOOSING: [AtomicU64; crate::percpu::MAX_CPUS] = [const { AtomicU64::new(u64::MAX) }; crate::percpu::MAX_CPUS];
 
-/// Whether any processor is choosing what to run next.
-fn any_choosing() -> bool {
-    (0..crate::percpu::count()).any(|cpu| CHOOSING[cpu].load(Ordering::SeqCst))
+/// The reaping epoch: moved on by each task made ready to be taken apart.
+static REAP_EPOCH: AtomicU64 = AtomicU64::new(1);
+
+/// This processor begins choosing what to run next.
+fn begin_choosing(me: usize) {
+    CHOOSING[me].store(REAP_EPOCH.load(Ordering::SeqCst), Ordering::SeqCst);
+}
+
+/// This processor has chosen, and claimed what it chose or nothing.
+fn end_choosing(me: usize) {
+    CHOOSING[me].store(u64::MAX, Ordering::Release);
+}
+
+/// Whether every processor choosing now began after `stamp`: none can have
+/// in hand a task that was in no queue by then.
+fn chosen_since(stamp: u64) -> bool {
+    (0..crate::percpu::count()).all(|cpu| CHOOSING[cpu].load(Ordering::SeqCst) > stamp)
 }
 
 /// Where `tid` stands to be chosen: the band it runs in and its real-time
@@ -633,14 +654,14 @@ static ANNOUNCE_WANTED: AtomicBool = AtomicBool::new(false);
 
 /// Whether the door has something to say to `tid`, coming into the kernel
 /// or leaving it without the one lock (`syscall_dispatch`): it was ended,
-/// stopped, or barred from this processor while it ran, or there is a dead
-/// task to take apart or tell of. Read as it is: what is said after the look
-/// is said at the next door — a task ended or stopped from elsewhere has its
-/// processor interrupted, and comes to one.
+/// stopped, or barred from this processor while it ran. Read as it is: what
+/// is said after the look is said at the next door — a task ended or
+/// stopped from elsewhere has its processor interrupted, and comes to one.
+/// A dead task to take apart or to tell of is not this task's news: the
+/// next door under the one lock, or the next idle loop, sees to it — a
+/// reap waiting out a processor's choosing would otherwise send every call
+/// on every processor to the one lock until it was done.
 pub fn door_has_news(tid: usize) -> bool {
-    if REAP_WANTED.load(Ordering::Relaxed) || ANNOUNCE_WANTED.load(Ordering::Relaxed) {
-        return true;
-    }
     if tid == 0 || tid >= MAX_TASKS {
         return false;
     }
@@ -656,14 +677,18 @@ pub fn door_has_news(tid: usize) -> bool {
 
 /// Run `f` under the one lock: taken for it if this processor has it not —
 /// which is right only with no other lock held, as for any taking of it —
-/// and given back after.
+/// and given back after. `f` runs with interrupts as the caller had them,
+/// as a call under the one lock runs: it may wait, and be moved, and a
+/// processor that runs it again holds the lock for it (`kl_held`).
 pub fn with_kernel<R>(f: impl FnOnce() -> R) -> R {
     let flags = irq_save();
     let took = !crate::klock::held();
     if took {
         crate::klock::acquire();
     }
+    irq_restore(flags);
     let out = f();
+    let _ = irq_save();
     if took {
         crate::klock::release();
     }
@@ -1021,7 +1046,7 @@ unsafe fn schedule_inner(from_irq: bool) { unsafe {
     core::arch::asm!("pushfq; pop {}; cli", out(reg) flags, options(nostack));
 
     let current_tid = crate::percpu::current();
-    CHOOSING[crate::percpu::index()].store(true, Ordering::SeqCst);
+    begin_choosing(crate::percpu::index());
     // Its turn so far is counted before anything is chosen, so that what it
     // has just run counts against it.
     count_turn(current_tid);
@@ -1054,7 +1079,7 @@ unsafe fn schedule_inner(from_irq: bool) { unsafe {
     let next_tid = dequeue_ready().unwrap_or(0);
     if next_tid == 0 && current_tid == 0 {
         // Already idle, restore flags and return
-        CHOOSING[crate::percpu::index()].store(false, Ordering::Release);
+        end_choosing(crate::percpu::index());
         restore_flags(flags);
         return;
     }
@@ -1101,7 +1126,7 @@ unsafe fn switch_to(current_tid: usize, next_tid: usize, flags: u64) { unsafe {
             }
         }
         drop(held);
-        CHOOSING[me].store(false, Ordering::Release);
+        end_choosing(me);
         restore_flags(flags);
         return;
     }
@@ -1117,6 +1142,19 @@ unsafe fn switch_to(current_tid: usize, next_tid: usize, flags: u64) { unsafe {
     // back to: what this processor holds now.
     if current_tid != 0 {
         st(current_tid).kl_held = crate::klock::held();
+    } else {
+        // Leaving the idle loop — from an interrupt it was woken by, as
+        // often as not, and so before the loop itself can say it is awake.
+        // Left saying it slept, this processor would be "woken" for the
+        // next task made ready, while it ran this one, and that task would
+        // wait for a tick.
+        crate::percpu::woke();
+        // And it has something to run, which a tick shares out. Here, while
+        // the idle loop's hold on the one lock is this processor's: the
+        // first processor's tick is a line of the interrupt controller,
+        // which is the one lock's, and the lock may be given up below for a
+        // task that does not hold it.
+        start_tick();
     }
     // The task to run may still be on another processor, switching away
     // from it: its registers are not saved until that one's switch says so
@@ -1166,7 +1204,7 @@ unsafe fn switch_to(current_tid: usize, next_tid: usize, flags: u64) { unsafe {
             next_tid = 0;
         }
     }
-    CHOOSING[me].store(false, Ordering::Release);
+    end_choosing(me);
     if next_tid == current_tid {
         // The idle loop, which chose a task that was ended: it goes on.
         restore_flags(flags);
@@ -1193,15 +1231,6 @@ unsafe fn switch_to(current_tid: usize, next_tid: usize, flags: u64) { unsafe {
         // When it left: a processor that takes it soon after takes it warm
         // from this one's cache (`runq::pull`).
         st(current_tid).ran_at = crate::clock::now();
-    } else {
-        // Leaving the idle loop — from an interrupt it was woken by, as
-        // often as not, and so before the loop itself can say it is awake.
-        // Left saying it slept, this processor would be "woken" for the
-        // next task made ready, while it ran this one, and that task would
-        // wait for a tick.
-        crate::percpu::woke();
-        // And it has something to run, which a tick shares out.
-        start_tick();
     }
     crate::percpu::set_current(next_tid);
 
@@ -1426,7 +1455,7 @@ pub fn donate_to(tid: usize, flags: u64) {
         // Choosing from here to the claim (`switch_to`): its record is not
         // taken apart meanwhile, and is looked at under its lock.
         let me = crate::percpu::index();
-        CHOOSING[me].store(true, Ordering::SeqCst);
+        begin_choosing(me);
         let held = if tid < MAX_TASKS { lock_record(tid) } else { None };
 
         // A task of a stopped program is not handed the processor: it is
@@ -1453,7 +1482,7 @@ pub fn donate_to(tid: usize, flags: u64) {
         }
         drop(held);
         if !takeable {
-            CHOOSING[me].store(false, Ordering::Release);
+            end_choosing(me);
             restore_flags(flags);
             yield_now();
             return;
@@ -2935,12 +2964,16 @@ unsafe fn reap_one(i: usize) -> bool { unsafe {
         return false;
     }
     // Out of whatever queue it is in first, so that no processor takes it
-    // from here on; then not while any processor is choosing, which may have
-    // taken it already and not yet claimed it (`CHOOSING`), its record in
-    // hand. Whoever next comes into the kernel, or has nothing to do, tries
-    // again.
+    // from here on; stamped then with the reaping epoch; and taken apart
+    // once every processor choosing began after that (`CHOOSING`) — one
+    // that began before may have taken it already and not yet claimed it,
+    // its record in hand. Whoever next comes into the kernel under the one
+    // lock, or has nothing to do, tries again.
     unlink_ready(i);
-    if any_choosing() {
+    if st(i).reap_stamp == 0 {
+        st(i).reap_stamp = REAP_EPOCH.fetch_add(1, Ordering::SeqCst);
+    }
+    if !chosen_since(st(i).reap_stamp) {
         REAP_WANTED.store(true, Ordering::Relaxed);
         return false;
     }

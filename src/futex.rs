@@ -299,9 +299,14 @@ fn held_word(cr3: usize, addr: u64) -> Option<Key> {
     // Pinned before it is looked at, as `validate_user_range` pins: what
     // the look finds is then what stays.
     scheduler::pin(addr, 4);
+    // Given its memory under the one lock, as a call's buffer is
+    // (`syscall::validate_user_range`), if it has none.
     let usable = unsafe {
-        crate::paging::back_range(cr3, addr, 4, false).is_ok()
-            && crate::paging::user_range_accessible(cr3, addr, 4, false)
+        crate::paging::user_range_accessible(cr3, addr, 4, false)
+            || scheduler::with_kernel(|| {
+                crate::paging::back_range(cr3, addr, 4, false).is_ok()
+                    && crate::paging::user_range_accessible(cr3, addr, 4, false)
+            })
     };
     if !usable {
         return None;

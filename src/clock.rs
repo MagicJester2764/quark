@@ -72,6 +72,10 @@ static LAST: AtomicU64 = AtomicU64::new(0);
 static TIMER: AtomicBool = AtomicBool::new(false);
 /// The time that timer is set for, or `u64::MAX` when it is not set.
 static SET_FOR: AtomicU64 = AtomicU64::new(u64::MAX);
+/// The soonest deadline said (`due`) since the clock last began to look
+/// for what is due (`expire`): one written down after the look passed it
+/// is not missed. Only ever lowered, but by `expire`.
+static SAID: AtomicU64 = AtomicU64::new(u64::MAX);
 /// When it last interrupted.
 static LAST_SHOT: AtomicU64 = AtomicU64::new(0);
 
@@ -379,13 +383,27 @@ pub fn raw() -> u64 {
 /// (`idt::VEC_CLOCK`): it will find the deadline, and set its timer itself.
 /// Whatever is not said here is not seen to while the first processor
 /// sleeps: it takes no tick then to find it by.
+///
+/// Said whatever the timer is set for (`SAID`), and then the timer asked
+/// after: a deadline is said by a call made without the one lock while the
+/// clock looks, and the look may have passed it. The clock sets its timer
+/// and then asks what was said (`expire`), so between the two, one of them
+/// sees the other.
 pub fn due(at: u64) {
     if !TIMER.load(Ordering::Relaxed) {
         return;
     }
     let flags = irq_save();
+    // Written only where it lowers what was said: a call with a deadline
+    // a second off, made again and again on every processor, would
+    // otherwise write one word they all share on every call. One said
+    // already that is no later is a look at least as soon, and one after
+    // this deadline was written.
+    if at < SAID.load(Ordering::Relaxed) {
+        SAID.fetch_min(at, Ordering::SeqCst);
+    }
     let now = now();
-    if at < SET_FOR.load(Ordering::Relaxed) {
+    if at < SET_FOR.load(Ordering::SeqCst) {
         if crate::percpu::index() == 0 {
             set(at, now);
         } else {
@@ -402,7 +420,7 @@ pub fn due(at: u64) {
 /// timer may interrupt again. On the first processor, interrupts off.
 fn set(at: u64, now: u64) {
     let at = at.max(LAST_SHOT.load(Ordering::Relaxed).saturating_add(MIN_GAP_NS));
-    SET_FOR.store(at, Ordering::Relaxed);
+    SET_FOR.store(at, Ordering::SeqCst);
     crate::lapic::one_shot(at.saturating_sub(now));
 }
 
@@ -431,6 +449,8 @@ pub fn expire(shot: bool) {
     if timer {
         set(now.saturating_add(TICK_NS), now);
     }
+    // What is said from here on is looked at below, if the look misses it.
+    SAID.store(u64::MAX, Ordering::SeqCst);
     crate::ipc::check_signal_deadlines(now);
     crate::signal::alarms(now);
     crate::signal::timers(now);
@@ -443,10 +463,19 @@ pub fn expire(shot: bool) {
         .min(crate::ptimer::after(now));
     if timer {
         if next == u64::MAX {
-            SET_FOR.store(u64::MAX, Ordering::Relaxed);
+            SET_FOR.store(u64::MAX, Ordering::SeqCst);
             crate::lapic::cancel_one_shot();
         } else {
             set(next, now);
+        }
+        // A deadline said while this looked — after the look passed whoever
+        // said it — and later than the timer was then set for, asked
+        // nothing of this processor: it is set for it now. Asked after the
+        // timer is set, as `due` asks the timer after it says, so that one
+        // of the two sees the other.
+        let said = SAID.load(Ordering::SeqCst);
+        if said < next {
+            set(said, now);
         }
     }
 }

@@ -709,8 +709,17 @@ fn validate_user_range(addr: u64, len: u64, write: bool) -> bool {
     // nothing.
     scheduler::pin(addr, len);
     // Reserved pages are given their memory before the kernel touches them,
-    // and pages that were written out are brought back.
-    unsafe { paging::back_range(cr3, addr, len, write).is_ok() && paging::user_range_accessible(cr3, addr, len, write) }
+    // and pages that were written out are brought back — under the one
+    // lock, which a call between two tasks made without it takes for that:
+    // a page given its memory may be a frame taken from a program, or a
+    // file's page asked of its pager, and both are the one lock's. A range
+    // there already, as the call wants it, needs nothing.
+    unsafe {
+        paging::user_range_accessible(cr3, addr, len, write)
+            || scheduler::with_kernel(|| {
+                paging::back_range(cr3, addr, len, write).is_ok() && paging::user_range_accessible(cr3, addr, len, write)
+            })
+    }
 }
 
 /// Read-only user buffer check.

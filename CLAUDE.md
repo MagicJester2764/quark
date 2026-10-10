@@ -564,6 +564,11 @@ may keep — are in `../quarkutils/CLAUDE.md`; these are the kernel's.
   the call validated — or pins it itself, as the futex wait does its word.
   A fault in the kernel where interrupts were *on* may wait like one from
   ring 3 (`may_wait` in `idt.rs`): it could have been preempted there.
+  **A page a call checks that has no memory yet is given it under the one
+  lock**, which a call made without it takes for that
+  (`validate_user_range`, a futex's word): the memory may be a frame taken
+  from a program, or a file's page asked of its pager, and both are the
+  one lock's. A range there already, as the call wants it, needs nothing.
   **Nor is it unmapped by the program's other threads**: `SYS_MUNMAP`,
   `SYS_ADDRSPACE_GIVE` and an unmap of shared memory are refused where a
   call another task of the program is in has checked any of the range
@@ -1560,7 +1565,13 @@ The rules it leaves behind:
   to do is never. Seen to at the next tick, as it was, it was every test
   passing and every wait ten milliseconds long. `dtest clock` asks that
   most of twenty waits end on time, not that one does — a wait that ends on
-  a tick is on time once in a while, by where in the tick it began.
+  a tick is on time once in a while, by where in the tick it began. **And
+  what is said while the clock is looking is not missed**: a call made
+  without the one lock writes its deadline while `expire` may be looking
+  through everybody's, and its look may have passed it. So `due` says
+  every deadline sooner than any said since the clock began to look
+  (`SAID`) before it asks what the timer is set for, and `expire` sets its
+  timer before it asks what was said — whichever is second sees the other.
 - **Everything about time passing is `clock::expire`.** A new kind of
   deadline is looked at there and answers with its earliest still to come,
   so that the timer is set for it — however far off: there may be no tick
@@ -1677,9 +1688,13 @@ breaking any of them is quiet until it is a machine that stops.
   lock, which the one leaving may need to finish; anything else puts the
   task back and goes to its idle loop. A task taken to run is claimed under
   its record's lock, and one ended meanwhile is not run; and none is taken
-  apart while a processor is choosing what to run (`CHOOSING`), which may
-  have it in hand and not yet claimed — `reap_one` takes it out of every
-  queue first, then waits for nobody and tries again later.
+  apart while a processor that may have it in hand, chosen and not yet
+  claimed, is still choosing: `reap_one` takes it out of every queue,
+  stamps it with the reaping epoch, and takes it apart once every
+  processor choosing began after the stamp (`CHOOSING`) — a moment later,
+  at the next door under the one lock or the next idle loop. Waiting
+  instead for nobody to be choosing at all, a reap on busy processors
+  would wait for as long as they were busy.
 - **A mapping taken away is taken away on every processor** (`tlb.rs`),
   before its frame can be anybody else's (`pmm::alloc` settles first) and
   before the kernel lock is given up (`klock::release` does). The three
