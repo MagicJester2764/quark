@@ -43,24 +43,7 @@ use crate::scheduler;
 use crate::task::{FdKind, FD_MOST};
 use crate::waitlist::{self, On, Waiters};
 
-/// Save RFLAGS and disable interrupts, as `pipe.rs` does and for the same
-/// reason: a timer interrupt in the middle of a ring's bookkeeping is another
-/// task in the middle of the same ring's bookkeeping.
-#[inline(always)]
-fn irq_save() -> u64 {
-    let flags: u64;
-    unsafe {
-        core::arch::asm!("pushfq; pop {}; cli", out(reg) flags, options(nostack));
-    }
-    flags
-}
 
-#[inline(always)]
-fn irq_restore(flags: u64) {
-    unsafe {
-        core::arch::asm!("push {}; popfq", in(reg) flags, options(nostack));
-    }
-}
 
 const BUF: usize = 4096;
 /// A line being gathered in canonical mode. Longer than this and the line is
@@ -140,7 +123,7 @@ impl Ring {
     /// Everybody parked on this ring, either way round, woken to look again.
     ///
     /// # Safety
-    /// Interrupts off.
+    /// [`LOCK`] held.
     unsafe fn wake_all(&mut self) {
         unsafe {
             waitlist::wake_all(&mut self.readers);
@@ -244,13 +227,17 @@ const NO_PTY: Pty = Pty {
 /// There were eight, each spent up front.
 static mut PTYS: crate::table::Table<Pty> = crate::table::Table::new(crate::table::MOST);
 
+/// The terminals' lock (`sync::RANK_PTY`): the table, every terminal in it
+/// and the lists of those waiting on them.
+static LOCK: crate::sync::IrqSpinLock<()> = crate::sync::IrqSpinLock::new(crate::sync::RANK_PTY, "the terminals", ());
+
 /// What a new pair is made from, in its room: nine kilobytes is not a
 /// record to build on a kernel stack.
 static PTY_TEMPLATE: crate::table::Template<Pty> = crate::table::Template(Some(NO_PTY));
 
 /// Pair `pty`, if there is one.
 ///
-/// Interrupts are off: every caller holds them off from asking to finishing.
+/// The terminals' lock is held: every caller holds it from asking to finishing.
 fn pty_at(pty: usize) -> Option<&'static mut Pty> {
     unsafe { (*core::ptr::addr_of_mut!(PTYS)).get(pty) }
 }
@@ -266,7 +253,7 @@ pub fn create(creator: usize) -> Option<usize> {
         return None;
     }
     let uid = scheduler::task_uid_gid(creator).map_or(0, |(uid, _)| uid);
-    let flags = irq_save();
+    let held = LOCK.lock();
     let out = ptys().lowest_free(0).filter(|&i| {
         ptys()
             .fill_from(i, &PTY_TEMPLATE, |p| {
@@ -275,7 +262,7 @@ pub fn create(creator: usize) -> Option<usize> {
             })
             .is_ok()
     });
-    irq_restore(flags);
+    drop(held);
     out
 }
 
@@ -284,22 +271,22 @@ pub fn retain(pty: usize, end: u8) {
     if end > 1 {
         return;
     }
-    let flags = irq_save();
+    let held = LOCK.lock();
     if let Some(p) = pty_at(pty) {
         p.refs[end as usize] += 1;
         if end == 1 {
             p.slave_opened = true;
         }
     }
-    irq_restore(flags);
+    drop(held);
 }
 
 /// Does this pty exist, and is its master still held? Asked by the open of a
 /// slave, which must not resurrect a pair nobody has.
 pub fn slave_openable(pty: usize) -> bool {
-    let flags = irq_save();
+    let held = LOCK.lock();
     let ok = pty_at(pty).is_some_and(|p| p.refs[0] > 0);
-    irq_restore(flags);
+    drop(held);
     ok
 }
 
@@ -330,9 +317,9 @@ pub fn slave_is_for(pty: usize, tid: usize) -> bool {
         return false;
     };
     let session = crate::job::sid_of(tid);
-    let flags = irq_save();
+    let held = LOCK.lock();
     let ok = pty_at(pty).is_some_and(|p| if p.session != 0 { p.session == session } else { p.creator_uid == uid });
-    irq_restore(flags);
+    drop(held);
     ok
 }
 
@@ -343,10 +330,10 @@ pub fn release(pty: usize, end: u8) {
     if end > 1 {
         return;
     }
-    let flags = irq_save();
+    let held = LOCK.lock();
     {
         let Some(p) = pty_at(pty) else {
-            irq_restore(flags);
+            drop(held);
             return;
         };
         let e = end as usize;
@@ -363,7 +350,7 @@ pub fn release(pty: usize, end: u8) {
             gone(pty);
         }
     }
-    irq_restore(flags);
+    drop(held);
     // An end going is a hangup, which a set is waiting to hear about.
     crate::pollset::note_pty(pty);
 }
@@ -382,7 +369,7 @@ fn gone(pty: usize) {
 
 /// Throw away pairs a task made and never wired to a descriptor.
 pub fn cleanup_orphans(creator: usize) {
-    let flags = irq_save();
+    let held = LOCK.lock();
     let mut at = 0;
     while let Some(i) = ptys().next_used(at) {
         at = i + 1;
@@ -390,7 +377,7 @@ pub fn cleanup_orphans(creator: usize) {
             gone(i);
         }
     }
-    irq_restore(flags);
+    drop(held);
 }
 
 /// Is the other end still held? A read with nobody to write it is over.
@@ -410,10 +397,10 @@ pub fn write(pty: usize, end: u8, bytes: &[u8]) -> usize {
     if end > 1 {
         return 0;
     }
-    let flags = irq_save();
+    let held = LOCK.lock();
     let written = {
         let Some(p) = pty_at(pty) else {
-            irq_restore(flags);
+            drop(held);
             return 0;
         };
         let done = if end == 0 { input(p, bytes) } else { output(p, bytes) };
@@ -426,7 +413,7 @@ pub fn write(pty: usize, end: u8, bytes: &[u8]) -> usize {
         }
         done
     };
-    irq_restore(flags);
+    drop(held);
     // And whoever is waiting on a set rather than on a read.
     crate::pollset::note_pty(pty);
     written
@@ -636,9 +623,9 @@ pub fn readable(pty: usize, end: u8) -> Pending {
     if end > 1 {
         return Pending::Gone;
     }
-    let flags = irq_save();
+    let held = LOCK.lock();
     let out = pty_at(pty).map_or(Pending::Gone, |p| pending(p, end));
-    irq_restore(flags);
+    drop(held);
     out
 }
 
@@ -649,7 +636,7 @@ pub fn read(pty: usize, end: u8, buf: &mut [u8]) -> Result<usize, ()> {
         return Ok(0);
     }
     let mut woke = false;
-    let flags = irq_save();
+    let held = LOCK.lock();
     let out = {
         if let Some(p) = pty_at(pty) {
             let found = pending(p, end);
@@ -681,7 +668,7 @@ pub fn read(pty: usize, end: u8, buf: &mut [u8]) -> Result<usize, ()> {
             Ok(0)
         }
     };
-    irq_restore(flags);
+    drop(held);
     if woke {
         // And a set waiting for this end to be writable.
         crate::pollset::note_pty(pty);
@@ -714,7 +701,7 @@ pub fn wait_readable(pty: usize, end: u8) -> Waited {
         return Waited::NoRoom;
     }
     let tid = scheduler::current_tid();
-    let flags = irq_save();
+    let held = LOCK.lock();
     let (out, parked) = match pty_at(pty) {
         None => (Waited::NoRoom, false),
         Some(p) if pending(p, end) != Pending::Bytes(0) => (Waited::Look, false),
@@ -728,7 +715,7 @@ pub fn wait_readable(pty: usize, end: u8) -> Waited {
             (Waited::Look, true)
         }
     };
-    irq_restore(flags);
+    drop(held);
     if parked {
         scheduler::yield_now();
     }
@@ -759,7 +746,7 @@ pub fn wait_readable(pty: usize, end: u8) -> Waited {
 /// because a write of nothing is what a full disk looks like.
 pub fn wait_writable(pty: usize, next: u8) -> Waited {
     let tid = scheduler::current_tid();
-    let flags = irq_save();
+    let held = LOCK.lock();
     let (ok, parked) = match pty_at(pty) {
         None => (Waited::NoRoom, false),
         Some(p) if peer_gone(p, 1) => (Waited::NoRoom, false),
@@ -772,7 +759,7 @@ pub fn wait_writable(pty: usize, next: u8) -> Waited {
             (Waited::Look, true)
         }
     };
-    irq_restore(flags);
+    drop(held);
     if parked {
         scheduler::yield_now();
     }
@@ -785,6 +772,7 @@ pub fn wait_writable(pty: usize, next: u8) -> Waited {
 /// and one the kernel runs ends a write through what the writer holds
 /// (`fdtable::interrupt`).
 pub fn interrupt(tid: usize) -> bool {
+    // Not under the terminals' lock: `forget` takes it.
     let flags = irq_save();
     let found = unsafe {
         matches!(waitlist::on(tid), On::Pty(_, MASTER_READS | SLAVE_READS)) && waitlist::forget(tid)
@@ -796,6 +784,22 @@ pub fn interrupt(tid: usize) -> bool {
     found
 }
 
+#[inline(always)]
+fn irq_save() -> u64 {
+    let flags: u64;
+    unsafe {
+        core::arch::asm!("pushfq; pop {}; cli", out(reg) flags, options(nostack));
+    }
+    flags
+}
+
+#[inline(always)]
+fn irq_restore(flags: u64) {
+    unsafe {
+        core::arch::asm!("push {}; popfq", in(reg) flags, options(nostack));
+    }
+}
+
 /// Which of a pair's lists a task waits on, as `On::Pty` says it: reading
 /// at the slave what was typed, reading at the master what was printed, and
 /// waiting for room to print.
@@ -803,16 +807,23 @@ const SLAVE_READS: u8 = 0;
 const MASTER_READS: u8 = 1;
 const SLAVE_WRITES: u8 = 2;
 
-/// Pair `pty`'s list `which`. For `waitlist::forget`.
+/// `tid` off the list of the pair it waits on, if it waits on one: under
+/// the terminals' lock (`waitlist::forget`).
 ///
 /// # Safety
-/// Interrupts off.
-pub unsafe fn waiters(pty: usize, which: u8) -> Option<&'static mut Waiters> {
-    pty_at(pty).map(|p| match which {
-        SLAVE_READS => &mut p.to_slave.readers,
-        MASTER_READS => &mut p.to_master.readers,
-        _ => &mut p.to_master.writers,
-    })
+/// Interrupts off, and [`LOCK`] not held.
+pub unsafe fn forget(tid: usize) -> bool {
+    let _held = LOCK.lock();
+    unsafe {
+        waitlist::forget_held(tid, |on| match on {
+            On::Pty(pty, which) => Some(pty_at(pty as usize).map(|p| match which {
+                SLAVE_READS => &mut p.to_slave.readers,
+                MASTER_READS => &mut p.to_master.readers,
+                _ => &mut p.to_master.writers,
+            })),
+            _ => None,
+        })
+    }
 }
 
 /// Is the other end of this one gone for good?
@@ -820,9 +831,9 @@ pub fn other_end_gone(pty: usize, end: u8) -> bool {
     if end > 1 {
         return true;
     }
-    let flags = irq_save();
+    let held = LOCK.lock();
     let gone = pty_at(pty).is_none_or(|p| peer_gone(p, end));
-    irq_restore(flags);
+    drop(held);
     gone
 }
 
@@ -837,13 +848,13 @@ pub fn writable(pty: usize, end: u8) -> bool {
     if end > 1 {
         return false;
     }
-    let flags = irq_save();
+    let held = LOCK.lock();
     // Room for whatever comes next, which for what a program prints may be
     // a newline: an end that said it could be written to and then took
     // nothing is a program that asks again at once, for ever.
     let out = pty_at(pty)
         .is_some_and(|p| if end == 0 { p.to_slave.room() > 0 } else { p.to_master.room() >= takes(p, b'\n') });
-    irq_restore(flags);
+    drop(held);
     out
 }
 
@@ -851,18 +862,18 @@ pub fn writable(pty: usize, end: u8) -> bool {
 /// nobody has collected it. Collected by whoever wrote the character: the
 /// write is where it is noticed, and the caller decides who it is for.
 pub fn take_signal(pty: usize) -> Option<u8> {
-    let flags = irq_save();
+    let held = LOCK.lock();
     let sig = pty_at(pty).map_or(0, |p| core::mem::replace(&mut p.signal, 0));
-    irq_restore(flags);
+    drop(held);
     (sig != 0).then_some(sig)
 }
 
 /// The session this terminal is the controlling terminal of, and the group
 /// in front of it; `None` for no such terminal.
 pub fn job(pty: usize) -> Option<(u64, u64)> {
-    let flags = irq_save();
+    let held = LOCK.lock();
     let out = pty_at(pty).map(|p| (p.session, p.front));
-    irq_restore(flags);
+    drop(held);
     out
 }
 
@@ -875,7 +886,7 @@ pub fn set_session(pty: usize, session: u64, group: u64) -> bool {
     if session == 0 {
         return false;
     }
-    let flags = irq_save();
+    let held = LOCK.lock();
     let free = pty_at(pty).is_some_and(|p| p.session == 0 || p.session == session);
     let mut elsewhere = false;
     let mut at = 0;
@@ -888,19 +899,19 @@ pub fn set_session(pty: usize, session: u64, group: u64) -> bool {
         p.session = session;
         p.front = group;
     }
-    irq_restore(flags);
+    drop(held);
     ok
 }
 
 /// Put `group` in front of this terminal.
 pub fn set_front(pty: usize, group: u64) -> bool {
-    let flags = irq_save();
+    let held = LOCK.lock();
     let p = pty_at(pty);
     let ok = p.is_some();
     if let Some(p) = p {
         p.front = group;
     }
-    irq_restore(flags);
+    drop(held);
     ok
 }
 
@@ -910,7 +921,7 @@ pub fn session_gone(session: u64) {
     if session == 0 {
         return;
     }
-    let flags = irq_save();
+    let held = LOCK.lock();
     let mut at = 0;
     while let Some(i) = ptys().next_used(at) {
         at = i + 1;
@@ -919,18 +930,18 @@ pub fn session_gone(session: u64) {
             p.front = 0;
         }
     }
-    irq_restore(flags);
+    drop(held);
 }
 
 pub fn get_termios(pty: usize) -> Option<Termios> {
-    let flags = irq_save();
+    let held = LOCK.lock();
     let out = pty_at(pty).map(|p| p.termios);
-    irq_restore(flags);
+    drop(held);
     out
 }
 
 pub fn set_termios(pty: usize, t: &Termios) -> bool {
-    let flags = irq_save();
+    let held = LOCK.lock();
     let found = pty_at(pty);
     let ok = found.is_some();
     if let Some(p) = found {
@@ -947,25 +958,25 @@ pub fn set_termios(pty: usize, t: &Termios) -> bool {
             p.line_len = 0;
         }
     }
-    irq_restore(flags);
+    drop(held);
     ok
 }
 
 pub fn get_winsize(pty: usize) -> Option<WinSize> {
-    let flags = irq_save();
+    let held = LOCK.lock();
     let out = pty_at(pty).map(|p| p.size);
-    irq_restore(flags);
+    drop(held);
     out
 }
 
 pub fn set_winsize(pty: usize, size: &WinSize) -> bool {
-    let flags = irq_save();
+    let held = LOCK.lock();
     let found = pty_at(pty);
     let ok = found.is_some();
     if let Some(p) = found {
         p.size = *size;
     }
-    irq_restore(flags);
+    drop(held);
     ok
 }
 

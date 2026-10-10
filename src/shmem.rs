@@ -154,25 +154,13 @@ impl ShmemRegion {
 /// There were 256, a fixed array of them spent whether used or not.
 static mut REGIONS: crate::table::Table<ShmemRegion> = crate::table::Table::new(crate::table::MOST);
 
-/// Save RFLAGS and disable interrupts. Returns saved flags.
-#[inline(always)]
-fn irq_save() -> u64 {
-    let flags: u64;
-    unsafe {
-        core::arch::asm!("pushfq; pop {}; cli", out(reg) flags, options(nostack));
-    }
-    flags
-}
+/// The shared regions' lock (`sync::RANK_SHMEM`): the table and every region
+/// in it.
+static LOCK: crate::sync::IrqSpinLock<()> = crate::sync::IrqSpinLock::new(crate::sync::RANK_SHMEM, "the shared regions", ());
 
-/// Restore RFLAGS (re-enabling interrupts if they were enabled before).
-#[inline(always)]
-fn irq_restore(flags: u64) {
-    unsafe {
-        core::arch::asm!("push {}; popfq", in(reg) flags, options(nostack));
-    }
-}
 
-/// Borrow the region table. Callers must already hold interrupts off.
+
+/// Borrow the region table. Callers hold [`LOCK`].
 #[inline(always)]
 unsafe fn regions() -> &'static mut crate::table::Table<ShmemRegion> { unsafe {
     &mut *core::ptr::addr_of_mut!(REGIONS)
@@ -181,7 +169,7 @@ unsafe fn regions() -> &'static mut crate::table::Table<ShmemRegion> { unsafe {
 /// Region `handle`, if there is one.
 ///
 /// # Safety
-/// Interrupts off.
+/// [`LOCK`] held.
 unsafe fn region(handle: usize) -> Option<&'static mut ShmemRegion> {
     unsafe { regions().get(handle) }
 }
@@ -269,15 +257,15 @@ fn create_inner(pages: usize, by_fd: bool) -> u64 {
     // Claim the slot before allocating. pmm::alloc takes a lock that re-enables
     // interrupts on release, so a preempting task used to be able to pick the
     // same "free" handle and scribble over this region.
-    let flags = irq_save();
+    let held = LOCK.lock();
     let handle = unsafe { regions().lowest_free(0).filter(|&h| regions().fill_at(h, ShmemRegion::empty()).is_ok()) };
     let Some(handle) = handle else {
-        irq_restore(flags);
+        drop(held);
         return u64::MAX;
     };
     unsafe {
         let Some(region) = region(handle) else {
-            irq_restore(flags);
+            drop(held);
             return u64::MAX;
         };
         region.creator = tid;
@@ -286,12 +274,12 @@ fn create_inner(pages: usize, by_fd: bool) -> u64 {
             region.fd_refs = 1;
         } else if !region.access.add(tid) {
             regions().empty(handle);
-            irq_restore(flags);
+            drop(held);
             return u64::MAX;
         }
         region.page_count = pages;
     }
-    irq_restore(flags);
+    drop(held);
 
     if !fill(handle, pages) {
         return u64::MAX;
@@ -328,7 +316,7 @@ fn fill(handle: usize, pages: usize) -> bool {
     if got < pages {
         // Hand back what was taken. `release` frees by the run list, so give
         // it the partial one rather than leaking it.
-        let flags = irq_save();
+        let held = LOCK.lock();
         unsafe {
             if let Some(region) = region(handle) {
                 region.runs = runs;
@@ -336,14 +324,14 @@ fn fill(handle: usize, pages: usize) -> bool {
             }
             release(handle);
         }
-        irq_restore(flags);
+        drop(held);
         return false;
     }
     // Zero every run (identity-mapped) so nothing leaks from a previous owner.
     for r in &runs[..run_count] {
         unsafe { core::ptr::write_bytes(r.base as *mut u8, 0, r.pages * 4096) };
     }
-    let flags = irq_save();
+    let held = LOCK.lock();
     unsafe {
         if let Some(region) = region(handle) {
             region.runs = runs;
@@ -351,7 +339,7 @@ fn fill(handle: usize, pages: usize) -> bool {
             region.page_count = pages;
         }
     }
-    irq_restore(flags);
+    drop(held);
     true
 }
 
@@ -372,10 +360,10 @@ pub fn resize(handle: usize, pages: usize) -> u64 {
         return u64::MAX;
     }
 
-    let flags = irq_save();
+    let held = LOCK.lock();
     let old_pages = unsafe {
         let Some(region) = region(handle) else {
-            irq_restore(flags);
+            drop(held);
             return u64::MAX;
         };
         // One descriptor names it — the caller's, which the system call
@@ -386,11 +374,11 @@ pub fn resize(handle: usize, pages: usize) -> u64 {
             || !region.by_fd
             || region.fd_refs != 1
         {
-            irq_restore(flags);
+            drop(held);
             return u64::MAX;
         }
         if region.page_count == pages {
-            irq_restore(flags);
+            drop(held);
             return pages as u64;
         }
         let old = region.page_count;
@@ -405,20 +393,20 @@ pub fn resize(handle: usize, pages: usize) -> u64 {
         region.creator = tid;
         (old, was)
     };
-    irq_restore(flags);
+    drop(held);
     let (old_pages, was) = old_pages;
     scheduler::uncharge_task_mem(was, old_pages);
 
     if !scheduler::current_task_check_mem(pages) {
         // Put it back the way it was found, so a refused resize does not also
         // destroy the memory the caller already had.
-        let flags = irq_save();
+        let held = LOCK.lock();
         unsafe {
             if let Some(region) = region(handle) {
                 region.page_count = 0;
             }
         }
-        irq_restore(flags);
+        drop(held);
         let _ = fill(handle, old_pages);
         return u64::MAX;
     }
@@ -449,27 +437,27 @@ fn map_inner(handle: usize, vaddr: usize, held: bool) -> u64 {
     }
     let cr3 = paging::read_cr3();
 
-    let flags = irq_save();
+    let lock = LOCK.lock();
     let result = unsafe {
         let Some(region) = region(handle).filter(|r| !r.pending_destroy) else {
-            irq_restore(flags);
+            drop(lock);
             return u64::MAX;
         };
 
         // Check access, and that there is room to say it is mapped.
         if !held && !region.access.contains(tid) {
-            irq_restore(flags);
+            drop(lock);
             return u64::MAX;
         }
         let was = region.mapped.contains(tid);
         if !region.mapped.add(tid) {
-            irq_restore(flags);
+            drop(lock);
             return u64::MAX;
         }
 
         let page_count = region.page_count;
         if !paging::user_range_ok(vaddr, page_count) {
-            irq_restore(flags);
+            drop(lock);
             return u64::MAX;
         }
 
@@ -487,7 +475,7 @@ fn map_inner(handle: usize, vaddr: usize, held: bool) -> u64 {
                     if !was {
                         region.mapped.remove(tid);
                     }
-                    irq_restore(flags);
+                    drop(lock);
                     return u64::MAX;
                 }
             };
@@ -498,13 +486,13 @@ fn map_inner(handle: usize, vaddr: usize, held: bool) -> u64 {
                 if !was {
                     region.mapped.remove(tid);
                 }
-                irq_restore(flags);
+                drop(lock);
                 return u64::MAX;
             }
         }
         page_count as u64
     };
-    irq_restore(flags);
+    drop(lock);
     result
 }
 
@@ -516,7 +504,7 @@ fn unreachable(r: &ShmemRegion) -> bool {
 
 /// One more descriptor names this region.
 pub fn fd_retain(handle: usize) -> bool {
-    let flags = irq_save();
+    let held = LOCK.lock();
     let ok = unsafe {
         match region(handle) {
             Some(r) if !r.pending_destroy => {
@@ -526,7 +514,7 @@ pub fn fd_retain(handle: usize) -> bool {
             _ => false,
         }
     };
-    irq_restore(flags);
+    drop(held);
     ok
 }
 
@@ -534,7 +522,7 @@ pub fn fd_retain(handle: usize) -> bool {
 /// closing a descriptor governs the right to map, not mappings that already
 /// exist, so the frames then go when the last mapper unmaps.
 pub fn fd_release(handle: usize) {
-    let flags = irq_save();
+    let held = LOCK.lock();
     unsafe {
         if let Some(r) = region(handle).filter(|r| r.fd_refs > 0) {
             r.fd_refs -= 1;
@@ -547,7 +535,7 @@ pub fn fd_release(handle: usize) {
             }
         }
     }
-    irq_restore(flags);
+    drop(held);
 }
 
 /// Grant access to a shared memory region to another task.
@@ -560,10 +548,10 @@ pub fn grant(handle: usize, target_tid: usize) -> u64 {
     let tid = scheduler::current_tid();
     let has_mgmt = crate::cap::task_has_task_mgmt(tid, 0);
 
-    let flags = irq_save();
+    let held = LOCK.lock();
     let result = unsafe {
         let Some(region) = region(handle) else {
-            irq_restore(flags);
+            drop(held);
             return u64::MAX;
         };
         if region.pending_destroy || region.by_fd {
@@ -579,7 +567,7 @@ pub fn grant(handle: usize, target_tid: usize) -> u64 {
             u64::MAX
         }
     };
-    irq_restore(flags);
+    drop(held);
     result
 }
 
@@ -594,27 +582,27 @@ pub fn unmap(handle: usize, vaddr: usize) -> u64 {
     }
     let cr3 = paging::read_cr3();
 
-    let flags = irq_save();
+    let held = LOCK.lock();
     let result = unsafe {
         let Some(region) = region(handle) else {
-            irq_restore(flags);
+            drop(held);
             return u64::MAX;
         };
         // Whoever may map it may unmap it, and so may whoever has it mapped:
         // the right to map can have gone since.
         if !region.access.contains(tid) && !region.mapped.contains(tid) {
-            irq_restore(flags);
+            drop(held);
             return u64::MAX;
         }
         if !paging::user_range_ok(vaddr, region.page_count) {
-            irq_restore(flags);
+            drop(held);
             return u64::MAX;
         }
         // Not under a call another thread of the program is in and has
         // checked, which may be waiting to copy to it (`SYS_MUNMAP`).
         let end = (vaddr + region.page_count * 4096) as u64;
         if scheduler::pinned_by_another(crate::userspace::space_of(cr3), vaddr as u64, end) {
-            irq_restore(flags);
+            drop(held);
             return u64::MAX;
         }
 
@@ -630,7 +618,7 @@ pub fn unmap(handle: usize, vaddr: usize) -> u64 {
         }
         0
     };
-    irq_restore(flags);
+    drop(held);
     result
 }
 
@@ -646,7 +634,7 @@ pub fn destroy(handle: usize) -> u64 {
     }
     let has_mgmt = crate::cap::task_has_task_mgmt(tid, 0);
 
-    let flags = irq_save();
+    let held = LOCK.lock();
     let result = unsafe {
         match region(handle) {
             None => u64::MAX,
@@ -664,7 +652,7 @@ pub fn destroy(handle: usize) -> u64 {
             }
         }
     };
-    irq_restore(flags);
+    drop(held);
     result
 }
 
@@ -683,7 +671,7 @@ pub fn cleanup_task(tid: usize, survivor: Option<usize>) {
     if tid >= MAX_TASKS {
         return;
     }
-    let flags = irq_save();
+    let held = LOCK.lock();
     unsafe {
         let mut at = 0;
         while let Some(handle) = regions().next_used(at) {
@@ -714,5 +702,5 @@ pub fn cleanup_task(tid: usize, survivor: Option<usize>) {
             }
         }
     }
-    irq_restore(flags);
+    drop(held);
 }

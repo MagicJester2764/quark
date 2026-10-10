@@ -37,55 +37,42 @@ struct Event {
 /// were, and four waiting on each.
 static mut EVENTS: crate::table::Table<Event> = crate::table::Table::new(crate::table::MOST);
 
+/// The counters' lock (`sync::RANK_EVENT`): the table, every counter in it
+/// and the lists of those waiting on them.
+static LOCK: crate::sync::IrqSpinLock<()> = crate::sync::IrqSpinLock::new(crate::sync::RANK_EVENT, "the counters", ());
+
 /// # Safety
-/// Interrupts off.
+/// [`LOCK`] held.
 #[inline(always)]
 unsafe fn events() -> &'static mut crate::table::Table<Event> {
     unsafe { &mut *core::ptr::addr_of_mut!(EVENTS) }
-}
-
-#[inline(always)]
-fn irq_save() -> u64 {
-    let flags: u64;
-    unsafe {
-        core::arch::asm!("pushfq; pop {}; cli", out(reg) flags, options(nostack));
-    }
-    flags
-}
-
-#[inline(always)]
-fn irq_restore(flags: u64) {
-    unsafe {
-        core::arch::asm!("push {}; popfq", in(reg) flags, options(nostack));
-    }
 }
 
 pub fn create(creator: usize, initial: u64, semaphore: bool) -> Option<usize> {
     if initial > MAX_COUNT || !crate::reclaim::may_make() {
         return None;
     }
-    let flags = irq_save();
+    let held = LOCK.lock();
     let made = unsafe {
         events().lowest_free(0).filter(|&i| {
             events().fill_at(i, Event { creator, refs: 0, count: initial, semaphore, waiters: Waiters::NONE }).is_ok()
         })
     };
-    irq_restore(flags);
+    drop(held);
     made
 }
 
 pub fn retain(ev: usize) {
-    let flags = irq_save();
+    let _held = LOCK.lock();
     unsafe {
         if let Some(e) = events().get(ev) {
             e.refs += 1;
         }
     }
-    irq_restore(flags);
 }
 
 pub fn release(ev: usize) {
-    let flags = irq_save();
+    let _held = LOCK.lock();
     unsafe {
         if let Some(e) = events().get(ev) {
             e.refs = e.refs.saturating_sub(1);
@@ -94,14 +81,13 @@ pub fn release(ev: usize) {
             }
         }
     }
-    irq_restore(flags);
 }
 
 /// Counter `ev` goes: anybody still on its list — which a waiter's own
 /// reference should have made nobody — looks again, and finds nothing.
 ///
 /// # Safety
-/// Interrupts off.
+/// [`LOCK`] held.
 unsafe fn gone(ev: usize) {
     unsafe {
         if let Some(e) = events().get(ev) {
@@ -113,7 +99,7 @@ unsafe fn gone(ev: usize) {
 
 /// Throw away counters a task made and never installed anywhere.
 pub fn cleanup_orphans(creator: usize) {
-    let flags = irq_save();
+    let _held = LOCK.lock();
     unsafe {
         let mut at = 0;
         while let Some(ev) = events().next_used(at) {
@@ -123,29 +109,24 @@ pub fn cleanup_orphans(creator: usize) {
             }
         }
     }
-    irq_restore(flags);
 }
 
 pub fn readable(ev: usize) -> bool {
-    let flags = irq_save();
-    let r = unsafe { events().get(ev).is_some_and(|e| e.count > 0) };
-    irq_restore(flags);
-    r
+    let _held = LOCK.lock();
+    unsafe { events().get(ev).is_some_and(|e| e.count > 0) }
 }
 
 /// Writable while there is room for one more, which is every counter that is
 /// not at its ceiling — so, in practice, always.
 pub fn writable(ev: usize) -> bool {
-    let flags = irq_save();
-    let w = unsafe { events().get(ev).is_some_and(|e| e.count < MAX_COUNT) };
-    irq_restore(flags);
-    w
+    let _held = LOCK.lock();
+    unsafe { events().get(ev).is_some_and(|e| e.count < MAX_COUNT) }
 }
 
 /// Take what is there. `None` when the counter is zero, which is what the
 /// caller turns into a wait or into `EAGAIN`.
 pub fn take(ev: usize) -> Option<u64> {
-    let flags = irq_save();
+    let held = LOCK.lock();
     let out = unsafe {
         match events().get(ev) {
             Some(e) if e.count > 0 && e.semaphore => {
@@ -156,7 +137,7 @@ pub fn take(ev: usize) -> Option<u64> {
             _ => None,
         }
     };
-    irq_restore(flags);
+    drop(held);
     if out.is_some() {
         crate::pollset::note_event();
     }
@@ -169,7 +150,7 @@ pub fn add(ev: usize, n: u64) -> bool {
     if n == 0 {
         return false;
     }
-    let flags = irq_save();
+    let held = LOCK.lock();
     let ok = unsafe {
         match events().get(ev) {
             Some(e) if MAX_COUNT - e.count >= n => {
@@ -180,26 +161,33 @@ pub fn add(ev: usize, n: u64) -> bool {
             _ => false,
         }
     };
-    irq_restore(flags);
+    drop(held);
     if ok {
         crate::pollset::note_event();
     }
     ok
 }
 
-/// Counter `ev`'s list of waiters, for `waitlist::forget`.
+/// `tid` off the list of the counter it waits on, if it waits on one: under
+/// the counters' lock (`waitlist::forget`).
 ///
 /// # Safety
-/// Interrupts off.
-pub unsafe fn waiters(ev: usize) -> Option<&'static mut Waiters> {
-    unsafe { events().get(ev).map(|e| &mut e.waiters) }
+/// Interrupts off, and [`LOCK`] not held.
+pub unsafe fn forget(tid: usize) -> bool {
+    let _held = LOCK.lock();
+    unsafe {
+        waitlist::forget_held(tid, |on| match on {
+            On::Event(ev) => Some(events().get(ev as usize).map(|e| &mut e.waiters)),
+            _ => None,
+        })
+    }
 }
 
 /// Park until the counter is not zero. `false` when there is no need, or a
 /// signal has ended the wait before it began.
 pub fn wait(ev: usize) -> bool {
     let tid = scheduler::current_tid();
-    let flags = irq_save();
+    let held = LOCK.lock();
     let parked = unsafe {
         match events().get(ev) {
             Some(e) if e.count == 0 && !crate::signal::ends_wait(tid) => {
@@ -210,7 +198,7 @@ pub fn wait(ev: usize) -> bool {
             _ => false,
         }
     };
-    irq_restore(flags);
+    drop(held);
     if parked {
         scheduler::yield_now();
     }

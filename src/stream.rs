@@ -147,22 +147,16 @@ struct Stream {
 /// others makes to hear how each start went. There were sixty-four.
 static mut STREAMS: crate::table::Table<Stream> = crate::table::Table::new(crate::table::MOST);
 
-#[inline(always)]
-fn irq_save() -> u64 {
-    let flags: u64;
-    unsafe { core::arch::asm!("pushfq; pop {}; cli", out(reg) flags, options(nostack)) };
-    flags
-}
+/// The streams' lock (`sync::RANK_STREAM`): the table and every stream in it,
+/// the descriptors in flight with them.
+static LOCK: crate::sync::IrqSpinLock<()> = crate::sync::IrqSpinLock::new(crate::sync::RANK_STREAM, "the streams", ());
 
-#[inline(always)]
-fn irq_restore(flags: u64) {
-    unsafe { core::arch::asm!("push {}; popfq", in(reg) flags, options(nostack)) };
-}
+
 
 /// Stream `stream`, if there is one.
 ///
 /// # Safety
-/// Interrupts off.
+/// [`LOCK`] held.
 #[inline(always)]
 unsafe fn stream_at(stream: usize) -> Option<&'static mut Stream> {
     unsafe { (*core::ptr::addr_of_mut!(STREAMS)).get(stream) }
@@ -173,11 +167,11 @@ pub fn pipes_for(stream: usize, end: u8) -> Option<(usize, usize)> {
     if end > 1 {
         return None;
     }
-    let flags = irq_save();
+    let held = LOCK.lock();
     let out = unsafe {
         stream_at(stream).map(|s| if end == 0 { (s.one_to_zero, s.zero_to_one) } else { (s.zero_to_one, s.one_to_zero) })
     };
-    irq_restore(flags);
+    drop(held);
     out
 }
 
@@ -203,7 +197,7 @@ pub fn create(tid: usize, packets: bool) -> Option<usize> {
     let _ = pipe::add_ref(b, true);
 
     let me = Creds::of(tid);
-    let flags = irq_save();
+    let held = LOCK.lock();
     let made = unsafe {
         let streams = &mut *core::ptr::addr_of_mut!(STREAMS);
         streams.lowest_free(0).filter(|&i| {
@@ -218,7 +212,7 @@ pub fn create(tid: usize, packets: bool) -> Option<usize> {
             streams.fill_at(i, s).is_ok()
         })
     };
-    irq_restore(flags);
+    drop(held);
     if made.is_none() {
         pipe::drop_ref(a, false);
         pipe::drop_ref(a, true);
@@ -233,7 +227,7 @@ pub fn retain_end(stream: usize, end: u8) -> Result<(), ()> {
     if end > 1 {
         return Err(());
     }
-    let flags = irq_save();
+    let held = LOCK.lock();
     let ok = unsafe {
         match stream_at(stream) {
             Some(s) if s.refs[end as usize] > 0 => {
@@ -243,7 +237,7 @@ pub fn retain_end(stream: usize, end: u8) -> Result<(), ()> {
             _ => false,
         }
     };
-    irq_restore(flags);
+    drop(held);
     if ok { Ok(()) } else { Err(()) }
 }
 
@@ -252,16 +246,16 @@ pub fn close_end(stream: usize, end: u8) {
     if end > 1 {
         return;
     }
-    let flags = irq_save();
+    let held = LOCK.lock();
     let gone = unsafe {
         let Some(s) = stream_at(stream).filter(|s| s.refs[end as usize] > 0) else {
-            irq_restore(flags);
+            drop(held);
             return;
         };
         s.refs[end as usize] -= 1;
         if s.refs[end as usize] > 0 {
             // Somebody else still holds this end; nothing observable happens.
-            irq_restore(flags);
+            drop(held);
             return;
         }
         let both = s.refs[0] == 0 && s.refs[1] == 0;
@@ -290,7 +284,7 @@ pub fn close_end(stream: usize, end: u8) {
         }
         (pipes, orphans)
     };
-    irq_restore(flags);
+    drop(held);
 
     let (gone, orphans) = gone;
     for q in &orphans {
@@ -318,7 +312,7 @@ pub fn push_fds(stream: usize, end: u8, kinds: &[FdKind], most: usize) -> bool {
         return false;
     }
     let to = 1 - end as usize;
-    let flags = irq_save();
+    let held = LOCK.lock();
     let ok = unsafe {
         match stream_at(stream) {
             Some(s) if s.refs[to] > 0 && s.q[to].len + kinds.len() <= most => {
@@ -334,7 +328,7 @@ pub fn push_fds(stream: usize, end: u8, kinds: &[FdKind], most: usize) -> bool {
             _ => false,
         }
     };
-    irq_restore(flags);
+    drop(held);
     ok
 }
 
@@ -347,9 +341,9 @@ pub fn take_back_fds(stream: usize, end: u8, kinds: &[FdKind]) -> bool {
         return false;
     }
     let to = 1 - end as usize;
-    let flags = irq_save();
+    let held = LOCK.lock();
     let taken = unsafe { stream_at(stream).is_some_and(|s| s.q[to].take_back(kinds)) };
-    irq_restore(flags);
+    drop(held);
     taken
 }
 
@@ -358,23 +352,23 @@ pub fn peer_of(stream: usize, end: u8) -> Option<Creds> {
     if end > 1 {
         return None;
     }
-    let flags = irq_save();
+    let held = LOCK.lock();
     let out = unsafe { stream_at(stream).map(|s| s.peer[end as usize]) };
-    irq_restore(flags);
+    drop(held);
     out
 }
 
 /// A connection made by a name: end 0's peer is `of_zero`'s and end 1's is
 /// `of_one`'s; and end 1 has asked to be told who sent what, if `passcred`.
 pub fn connected(stream: usize, of_zero: Creds, of_one: Creds, passcred: bool) {
-    let flags = irq_save();
+    let held = LOCK.lock();
     unsafe {
         if let Some(s) = stream_at(stream) {
             s.peer = [of_zero, of_one];
             s.passcred[1] = passcred;
         }
     }
-    irq_restore(flags);
+    drop(held);
 }
 
 /// Whether `end` has asked to be told who sent what it receives; and, with
@@ -383,7 +377,7 @@ pub fn passcred(stream: usize, end: u8, set: Option<bool>) -> Option<bool> {
     if end > 1 {
         return None;
     }
-    let flags = irq_save();
+    let held = LOCK.lock();
     let out = unsafe {
         stream_at(stream).map(|s| {
             let was = s.passcred[end as usize];
@@ -393,7 +387,7 @@ pub fn passcred(stream: usize, end: u8, set: Option<bool>) -> Option<bool> {
             was
         })
     };
-    irq_restore(flags);
+    drop(held);
     out
 }
 
@@ -405,9 +399,9 @@ pub fn pop_fd(stream: usize, end: u8) -> Option<FdKind> {
     if end > 1 {
         return None;
     }
-    let flags = irq_save();
+    let held = LOCK.lock();
     let out = unsafe { stream_at(stream).and_then(|s| s.q[end as usize].pop()) };
-    irq_restore(flags);
+    drop(held);
     out
 }
 
@@ -432,8 +426,8 @@ pub fn peer_gone(stream: usize, end: u8) -> bool {
     if end > 1 {
         return true;
     }
-    let flags = irq_save();
+    let held = LOCK.lock();
     let out = unsafe { stream_at(stream).is_none_or(|s| s.refs[1 - end as usize] == 0) };
-    irq_restore(flags);
+    drop(held);
     out
 }

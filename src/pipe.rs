@@ -80,7 +80,7 @@ impl Pipe {
     /// the reader was given.
     ///
     /// # Safety
-    /// Interrupts off, something to take, and `buf` a user range the call
+    /// [`LOCK`] held, something to take, and `buf` a user range the call
     /// has checked.
     unsafe fn take(&mut self, buf: *mut u8, max_len: usize) -> usize {
         unsafe {
@@ -120,7 +120,7 @@ impl Pipe {
     /// stream of records.
     ///
     /// # Safety
-    /// Interrupts off, room for them ([`Pipe::room_for`]), and `buf` a user
+    /// [`LOCK`] held, room for them ([`Pipe::room_for`]), and `buf` a user
     /// range the call has checked.
     unsafe fn put(&mut self, buf: *const u8, n: usize) {
         unsafe {
@@ -166,8 +166,13 @@ struct Named {
 /// the pipe (`table.rs`). There were thirty-two.
 static mut NAMED: crate::table::Table<Named> = crate::table::Table::new(crate::table::MOST);
 
+/// The pipes' lock (`sync::RANK_PIPE`): both tables — the pipes and their
+/// names — every pipe and name in them, and the lists of those waiting on
+/// them.
+static LOCK: crate::sync::IrqSpinLock<()> = crate::sync::IrqSpinLock::new(crate::sync::RANK_PIPE, "the pipes", ());
+
 /// # Safety
-/// Interrupts off.
+/// [`LOCK`] held.
 #[inline(always)]
 unsafe fn named() -> &'static mut crate::table::Table<Named> {
     unsafe { &mut *core::ptr::addr_of_mut!(NAMED) }
@@ -176,7 +181,7 @@ unsafe fn named() -> &'static mut crate::table::Table<Named> {
 /// The pipe `key` names for `server`, if it names one.
 ///
 /// # Safety
-/// Interrupts off.
+/// [`LOCK`] held.
 unsafe fn named_pipe(server: u64, key: u64) -> Option<usize> {
     unsafe {
         let mut at = 0;
@@ -215,7 +220,7 @@ pub fn open_named(server: u64, key: u64, write: bool, only_with_peer: bool) -> O
         return Opened::Full;
     }
     let mut spare = make(scheduler::current_tid(), false);
-    let flags = irq_save();
+    let held = LOCK.lock();
     let out = unsafe {
         let known = named_pipe(server, key);
         let held = |i: usize| pipes().get(i).is_some_and(|p| if write { p.readers > 0 } else { p.writers > 0 });
@@ -258,11 +263,11 @@ pub fn open_named(server: u64, key: u64, write: bool, only_with_peer: bool) -> O
     if let Some(i) = spare {
         unsafe { gone(i) };
     }
-    irq_restore(flags);
+    drop(held);
     out
 }
 
-/// A pipe has gone: whatever key named it names nothing. Interrupts are off.
+/// A pipe has gone: whatever key named it names nothing. [`LOCK`] held.
 unsafe fn forget_name(handle: usize) {
     unsafe {
         let mut at = 0;
@@ -304,10 +309,10 @@ pub fn wait_peer(handle: usize, is_write: bool, since: u64) -> Peer {
     }
     let tid = scheduler::current_tid();
     loop {
-        let flags = irq_save();
+        let held = LOCK.lock();
         unsafe {
             let Some(pipe) = pipes().get(handle) else {
-                irq_restore(flags);
+                drop(held);
                 return Peer::Failed;
             };
             let (others, opens) = if is_write {
@@ -316,19 +321,19 @@ pub fn wait_peer(handle: usize, is_write: bool, since: u64) -> Peer {
                 (pipe.writers, pipe.opens[1])
             };
             if others > 0 || self::since(opens) != since {
-                irq_restore(flags);
+                drop(held);
                 return Peer::There;
             }
             // Asking whether to wait and parking are one step, as for every
             // wait a signal ends.
             if crate::signal::interrupted(tid) {
-                irq_restore(flags);
+                drop(held);
                 return Peer::Interrupted;
             }
             waitlist::add(&mut pipe.peer_waiters, tid, On::PipePeer(handle as u32));
             scheduler::block_task(tid);
         }
-        irq_restore(flags);
+        drop(held);
         scheduler::yield_now();
     }
 }
@@ -336,6 +341,7 @@ pub fn wait_peer(handle: usize, is_write: bool, since: u64) -> Peer {
 /// A signal has arrived for a task that may be waiting for the other end of
 /// a pipe: if it is, it stops waiting and goes to see.
 pub fn interrupt(tid: usize) -> bool {
+    // Not under the pipes' lock: `forget` takes it.
     let flags = irq_save();
     let found = unsafe { matches!(waitlist::on(tid), On::PipePeer(_)) && waitlist::forget(tid) };
     if found {
@@ -352,7 +358,7 @@ pub fn interrupt(tid: usize) -> bool {
 static mut PIPES: crate::table::Table<Pipe> = crate::table::Table::new(crate::table::MOST);
 
 /// # Safety
-/// Interrupts off.
+/// [`LOCK`] held.
 #[inline(always)]
 unsafe fn pipes() -> &'static mut crate::table::Table<Pipe> {
     unsafe { &mut *core::ptr::addr_of_mut!(PIPES) }
@@ -384,7 +390,7 @@ fn make(creator: usize, packets: bool) -> Option<usize> {
         return None;
     }
     let frame = crate::reclaim::frame()?;
-    let flags = irq_save();
+    let held = LOCK.lock();
     let made = unsafe {
         pipes().lowest_free(1).filter(|&i| {
             let mut pipe = Pipe::new(creator, frame as *mut u8);
@@ -392,7 +398,7 @@ fn make(creator: usize, packets: bool) -> Option<usize> {
             pipes().fill_at(i, pipe).is_ok()
         })
     };
-    irq_restore(flags);
+    drop(held);
     if made.is_none() {
         crate::pmm::free(crate::pmm::PhysFrame::from_address(frame));
     }
@@ -403,7 +409,7 @@ fn make(creator: usize, packets: bool) -> Option<usize> {
 /// finds nothing, its name names nothing, and its buffer goes back.
 ///
 /// # Safety
-/// Interrupts off.
+/// [`LOCK`] held.
 unsafe fn gone(handle: usize) {
     unsafe {
         let Some(pipe) = pipes().get(handle) else { return };
@@ -424,17 +430,17 @@ pub fn create_for_stream(packets: bool) -> Option<usize> {
 
 /// No writer remains, so a read will never block again.
 pub fn no_writers(handle: usize) -> bool {
-    let flags = irq_save();
+    let held = LOCK.lock();
     let out = unsafe { pipes().get(handle).is_some_and(|p| p.writers == 0) };
-    irq_restore(flags);
+    drop(held);
     out
 }
 
 /// No reader remains, so a write has nowhere to go.
 pub fn no_readers(handle: usize) -> bool {
-    let flags = irq_save();
+    let held = LOCK.lock();
     let out = unsafe { pipes().get(handle).is_some_and(|p| p.readers == 0) };
-    irq_restore(flags);
+    drop(held);
     out
 }
 
@@ -444,38 +450,38 @@ pub fn no_readers(handle: usize) -> bool {
 /// writer's first word would otherwise be told there was something to read,
 /// read nothing, and ask again as fast as it could.
 pub fn ended(handle: usize) -> bool {
-    let flags = irq_save();
+    let held = LOCK.lock();
     let out = unsafe { pipes().get(handle).is_some_and(|p| p.writers == 0 && (p.opens[1] > 0 || !p.named)) };
-    irq_restore(flags);
+    drop(held);
     out
 }
 
 /// Is a read able to return now — with bytes, or with the end-of-file a
 /// departed writer means?
 pub fn readable(handle: usize) -> bool {
-    let flags = irq_save();
+    let held = LOCK.lock();
     let out = unsafe { pipes().get(handle).is_some_and(|p| p.len > 0) };
-    irq_restore(flags);
+    drop(held);
     out || ended(handle)
 }
 
 /// Is there room to write?
 pub fn writable(handle: usize) -> bool {
-    let flags = irq_save();
+    let held = LOCK.lock();
     let out = unsafe { pipes().get(handle).is_some_and(|p| p.room_for(1) > 0) };
-    irq_restore(flags);
+    drop(held);
     out
 }
 
 /// Free a pipe that was created and never wired to anything.
 pub fn drop_unreferenced(handle: usize) {
-    let flags = irq_save();
+    let held = LOCK.lock();
     unsafe {
         if pipes().get(handle).is_some_and(|p| p.readers == 0 && p.writers == 0) {
             gone(handle);
         }
     }
-    irq_restore(flags);
+    drop(held);
 }
 
 /// Create a new pipe. Returns the pipe handle index, from 1.
@@ -493,7 +499,7 @@ pub fn create() -> Option<usize> {
 /// Pipes with live endpoints are refcounted through `cleanup_task_fds`; this
 /// only reclaims the ones that never got a reference at all.
 pub fn cleanup_orphans(tid: usize) {
-    let flags = irq_save();
+    let held = LOCK.lock();
     unsafe {
         let mut at = 1;
         while let Some(i) = pipes().next_used(at) {
@@ -503,12 +509,12 @@ pub fn cleanup_orphans(tid: usize) {
             }
         }
     }
-    irq_restore(flags);
+    drop(held);
 }
 
 /// Increment the reader or writer refcount for a pipe.
 pub fn add_ref(handle: usize, is_write: bool) -> Result<(), ()> {
-    let flags = irq_save();
+    let held = LOCK.lock();
     let result = unsafe {
         match pipes().get(handle) {
             Some(p) => {
@@ -522,7 +528,7 @@ pub fn add_ref(handle: usize, is_write: bool) -> Result<(), ()> {
             None => Err(()),
         }
     };
-    irq_restore(flags);
+    drop(held);
     result
 }
 
@@ -541,10 +547,10 @@ pub fn read(handle: usize, buf: *mut u8, max_len: usize) -> u64 {
 fn read_inner(handle: usize, buf: *mut u8, max_len: usize) -> u64 {
     unsafe {
         loop {
-            let flags = irq_save();
+            let held = LOCK.lock();
 
             let Some(pipe) = pipes().get(handle) else {
-                irq_restore(flags);
+                drop(held);
                 return u64::MAX;
             };
 
@@ -553,13 +559,13 @@ fn read_inner(handle: usize, buf: *mut u8, max_len: usize) -> u64 {
                 let to_copy = pipe.take(buf, max_len);
                 // Wake one blocked writer if any
                 waitlist::wake_one(&mut pipe.write_waiters);
-                irq_restore(flags);
+                drop(held);
                 return to_copy as u64;
             }
 
             // Buffer empty
             if pipe.writers == 0 {
-                irq_restore(flags);
+                drop(held);
                 return 0; // EOF
             }
 
@@ -567,7 +573,7 @@ fn read_inner(handle: usize, buf: *mut u8, max_len: usize) -> u64 {
             // or stops it beginning: looked for here, with interrupts off.
             let tid = scheduler::current_tid();
             if crate::signal::ends_wait(tid) {
-                irq_restore(flags);
+                drop(held);
                 return crate::signal::INTERRUPTED;
             }
 
@@ -575,7 +581,7 @@ fn read_inner(handle: usize, buf: *mut u8, max_len: usize) -> u64 {
             waitlist::add(&mut pipe.read_waiters, tid, On::PipeRead(handle as u32));
             scheduler::block_task(tid);
 
-            irq_restore(flags);
+            drop(held);
             scheduler::yield_now();
             // Loop back to retry (will re-acquire irq_save at top)
         }
@@ -602,7 +608,7 @@ pub fn read_nonblock(handle: usize, buf: *mut u8, max_len: usize) -> u64 {
 }
 
 fn read_nonblock_inner(handle: usize, buf: *mut u8, max_len: usize) -> u64 {
-    let flags = irq_save();
+    let held = LOCK.lock();
     let result = unsafe {
         match pipes().get(handle) {
             None => u64::MAX,
@@ -615,7 +621,7 @@ fn read_nonblock_inner(handle: usize, buf: *mut u8, max_len: usize) -> u64 {
             Some(_) => WOULD_BLOCK,
         }
     };
-    irq_restore(flags);
+    drop(held);
     result
 }
 
@@ -626,7 +632,7 @@ fn read_nonblock_inner(handle: usize, buf: *mut u8, max_len: usize) -> u64 {
 /// bytes that fitted are as much progress as waiting would have made in the
 /// same instant.
 pub fn write_nonblock(handle: usize, buf: *const u8, len: usize) -> u64 {
-    let flags = irq_save();
+    let held = LOCK.lock();
     let result = unsafe {
         match pipes().get(handle) {
             None => u64::MAX,
@@ -645,7 +651,7 @@ pub fn write_nonblock(handle: usize, buf: *const u8, len: usize) -> u64 {
             }
         }
     };
-    irq_restore(flags);
+    drop(held);
     if result != WOULD_BLOCK && result != u64::MAX {
         crate::pollset::note_pipe(handle);
     }
@@ -668,21 +674,21 @@ fn write_inner(handle: usize, buf: *const u8, len: usize) -> u64 {
         let mut offset = 0usize;
 
         while offset < len {
-            let flags = irq_save();
+            let held = LOCK.lock();
 
             let Some(pipe) = pipes().get(handle) else {
-                irq_restore(flags);
+                drop(held);
                 return u64::MAX;
             };
 
             // Broken pipe — no readers
             if pipe.readers == 0 {
-                irq_restore(flags);
+                drop(held);
                 return if offset > 0 { offset as u64 } else { u64::MAX };
             }
             // A record bigger than the buffer never fits.
             if pipe.packets && len + 2 > PIPE_BUF_SIZE {
-                irq_restore(flags);
+                drop(held);
                 return u64::MAX;
             }
 
@@ -697,7 +703,7 @@ fn write_inner(handle: usize, buf: *const u8, len: usize) -> u64 {
                 // Wake one blocked reader if any
                 waitlist::wake_one(&mut pipe.read_waiters);
 
-                irq_restore(flags);
+                drop(held);
                 // And whoever is polling for it, now, if there is more to
                 // write: what is left may wait for room, and room comes only
                 // from a reader who knows there is something to read. Told
@@ -714,13 +720,13 @@ fn write_inner(handle: usize, buf: *const u8, len: usize) -> u64 {
                 // that is the answer.
                 let tid = scheduler::current_tid();
                 if crate::signal::ends_wait(tid) {
-                    irq_restore(flags);
+                    drop(held);
                     return if offset > 0 { offset as u64 } else { crate::signal::INTERRUPTED };
                 }
                 waitlist::add(&mut pipe.write_waiters, tid, On::PipeWrite(handle as u32));
                 scheduler::block_task(tid);
 
-                irq_restore(flags);
+                drop(held);
                 scheduler::yield_now();
                 // Loop back to retry (will re-acquire irq_save at top)
             }
@@ -771,6 +777,7 @@ pub fn forget_waiter(kind: &FdKind, tid: usize) -> bool {
         | FdKind::Event { .. }
         | FdKind::PtyEnd { .. }
         | FdKind::Local { .. } => {
+            // Not under any kind's lock: `forget` takes the one it needs.
             let flags = irq_save();
             let found = unsafe { waitlist::forget(tid) };
             irq_restore(flags);
@@ -780,17 +787,27 @@ pub fn forget_waiter(kind: &FdKind, tid: usize) -> bool {
     }
 }
 
-/// Pipe `handle`'s list of waiters: 0 its readers, 1 its writers, 2 those
-/// waiting for its other end. For `waitlist::forget`.
+/// `tid` off the list of the pipe it waits on, if it waits on one — its
+/// readers, its writers, or those waiting for its other end: under the
+/// pipes' lock (`waitlist::forget`).
 ///
 /// # Safety
-/// Interrupts off.
-pub unsafe fn waiters(handle: usize, which: u8) -> Option<&'static mut Waiters> {
+/// Interrupts off, and [`LOCK`] not held.
+pub unsafe fn forget(tid: usize) -> bool {
+    let _held = LOCK.lock();
     unsafe {
-        pipes().get(handle).map(|p| match which {
-            0 => &mut p.read_waiters,
-            1 => &mut p.write_waiters,
-            _ => &mut p.peer_waiters,
+        waitlist::forget_held(tid, |on| {
+            let (handle, list) = match on {
+                On::PipeRead(h) => (h, 0),
+                On::PipeWrite(h) => (h, 1),
+                On::PipePeer(h) => (h, 2),
+                _ => return None,
+            };
+            Some(pipes().get(handle as usize).map(|p| match list {
+                0 => &mut p.read_waiters,
+                1 => &mut p.write_waiters,
+                _ => &mut p.peer_waiters,
+            }))
         })
     }
 }
@@ -853,10 +870,10 @@ pub fn drop_ref(handle: usize, is_write: bool) {
 }
 
 fn drop_ref_inner(handle: usize, is_write: bool) {
-    let flags = irq_save();
+    let held = LOCK.lock();
     unsafe {
         let Some(pipe) = pipes().get(handle) else {
-            irq_restore(flags);
+            drop(held);
             return;
         };
         if is_write {
@@ -877,5 +894,5 @@ fn drop_ref_inner(handle: usize, is_write: bool) {
             gone(handle);
         }
     }
-    irq_restore(flags);
+    drop(held);
 }

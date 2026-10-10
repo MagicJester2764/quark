@@ -654,8 +654,13 @@ may keep — are in `../quarkutils/CLAUDE.md`; these are the kernel's.
   ends its wait, when it dies, and at the reap before its record is freed;
   and a set that goes takes everybody off its list first, or a set made
   with its number would be handed their links. A new kind's waiters go the
-  same way: an `On`, its lists' ends in the object, and a `waiters()` that
-  `waitlist::forget` finds them by.
+  same way: an `On`, its lists' ends in the object, and a `forget` that
+  `waitlist::forget` finds them by. A list, and the links of the tasks on
+  it, are kept under the lock of the kind of thing it belongs to (each
+  kind a program makes has one, `sync::RANK_POLLSET` to `RANK_SHMEM`):
+  whoever adds, takes off or wakes holds it, and the kind's `forget` takes
+  it and looks again once it holds it — so nothing calls
+  `waitlist::forget` with that lock held.
 - **A futex waiter is its task's record too** (`futex.rs`): the word's key,
   its deadline, why it woke, and a link into one of 256 lists by the key's
   hash — so no wait is refused for room (there were sixty-four, and the
@@ -1050,7 +1055,12 @@ every Unix program assumes:
   read and answered where the program has them. A memory object is a
   record made when it is, but its slot is written into page-table entries
   in eleven bits, so there are at most 2,047 (`memobj::MAX_OBJECTS`), 1,024
-  a pager.
+  a pager. Each kind is kept under a lock of its own (`sync.rs`'s ranks,
+  the poll sets' outermost and the shared regions' innermost): its table,
+  every one of it and its waiters — where every look at one and change to
+  it is made, in the one step it was made in with interrupts off. One kind
+  calls into another only in the ranks' order: a poll set asks what it
+  watches, a local socket makes a stream, a stream has pipes.
 - **Descriptors are released when a task dies, not when it is reaped.** Its
   memory waits for a parent to collect it, which is where the exit status
   lives; a descriptor is something another task can be *waiting on*, and the
@@ -1165,9 +1175,10 @@ background job that ignores what its terminal raises.
   out, and the level is gone; each of the three loops returns to the
   program when its sleep says it was interrupted, and has to.
 - **Asking whether to wait and parking are one step**, with interrupts off
-  (`pty::wait_readable`, `ipc::sys_recv_timeout`, and `signal::ends_wait`
-  beside every wait's own question). A signal raised between the two finds
-  nobody parked, and the wait outlasts it.
+  and the lock of what is waited on held (`pty::wait_readable`,
+  `ipc::sys_recv_timeout`, and `signal::ends_wait` beside every wait's own
+  question). A signal raised between the two finds nobody parked, and the
+  wait outlasts it.
 - **A signal ends only a wait that looks again when it is woken.** One the
   program is told of ends a read of a terminal, a poll, a sleep and an open
   of a named pipe. One the kernel runs ends those and a read or write of a

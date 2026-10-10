@@ -22,17 +22,11 @@ struct SigFd {
 /// were.
 static mut SIGFDS: crate::table::Table<SigFd> = crate::table::Table::new(crate::table::MOST);
 
-#[inline(always)]
-fn irq_save() -> u64 {
-    let flags: u64;
-    unsafe { core::arch::asm!("pushfq; pop {}; cli", out(reg) flags, options(nostack)) };
-    flags
-}
+/// The signal descriptors' lock (`sync::RANK_SIGFD`): the table and every
+/// descriptor in it.
+static LOCK: crate::sync::IrqSpinLock<()> = crate::sync::IrqSpinLock::new(crate::sync::RANK_SIGFD, "the signal descriptors", ());
 
-#[inline(always)]
-fn irq_restore(flags: u64) {
-    unsafe { core::arch::asm!("push {}; popfq", in(reg) flags, options(nostack)) };
-}
+
 
 /// # Safety
 /// Interrupts are off.
@@ -46,45 +40,45 @@ pub fn create(mask: u64) -> Option<usize> {
     if !crate::reclaim::may_make() {
         return None;
     }
-    let flags = irq_save();
+    let held = LOCK.lock();
     let made = unsafe { sigfds().lowest_free(0).filter(|&s| sigfds().fill_at(s, SigFd { refs: 1, mask }).is_ok()) };
-    irq_restore(flags);
+    drop(held);
     made
 }
 
 /// What `s` is read for.
 pub fn mask(s: usize) -> u64 {
-    let flags = irq_save();
+    let held = LOCK.lock();
     let mask = unsafe { sigfds().get(s).map_or(0, |it| it.mask) };
-    irq_restore(flags);
+    drop(held);
     mask
 }
 
 /// `s` is read for `mask` from now on.
 pub fn set_mask(s: usize, mask: u64) {
-    let flags = irq_save();
+    let held = LOCK.lock();
     unsafe {
         if let Some(it) = sigfds().get(s) {
             it.mask = mask;
         }
     }
-    irq_restore(flags);
+    drop(held);
 }
 
 /// Another descriptor names `s`.
 pub fn retain(s: usize) {
-    let flags = irq_save();
+    let held = LOCK.lock();
     unsafe {
         if let Some(it) = sigfds().get(s) {
             it.refs += 1;
         }
     }
-    irq_restore(flags);
+    drop(held);
 }
 
 /// A descriptor for `s` is gone; the last takes it with it.
 pub fn release(s: usize) {
-    let flags = irq_save();
+    let held = LOCK.lock();
     unsafe {
         if let Some(it) = sigfds().get(s) {
             it.refs = it.refs.saturating_sub(1);
@@ -93,5 +87,5 @@ pub fn release(s: usize) {
             }
         }
     }
-    irq_restore(flags);
+    drop(held);
 }

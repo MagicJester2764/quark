@@ -74,17 +74,11 @@ impl Local {
 /// (`table.rs`). There were thirty-two, named or not.
 static mut LOCALS: crate::table::Table<Local> = crate::table::Table::new(crate::table::MOST);
 
-#[inline(always)]
-fn irq_save() -> u64 {
-    let flags: u64;
-    unsafe { core::arch::asm!("pushfq; pop {}; cli", out(reg) flags, options(nostack)) };
-    flags
-}
+/// The local sockets' lock (`sync::RANK_LOCAL`): the table, every socket in it
+/// and the lists of those waiting to accept.
+static LOCK: crate::sync::IrqSpinLock<()> = crate::sync::IrqSpinLock::new(crate::sync::RANK_LOCAL, "the local sockets", ());
 
-#[inline(always)]
-fn irq_restore(flags: u64) {
-    unsafe { core::arch::asm!("push {}; popfq", in(reg) flags, options(nostack)) };
-}
+
 
 /// # Safety
 /// Interrupts are off.
@@ -124,28 +118,28 @@ pub fn create() -> Option<usize> {
     if !crate::reclaim::may_make() {
         return None;
     }
-    let flags = irq_save();
+    let held = LOCK.lock();
     let made = unsafe { locals().lowest_free(0).filter(|&l| locals().fill_at(l, Local::new()).is_ok()) };
-    irq_restore(flags);
+    drop(held);
     made
 }
 
 /// Another descriptor names `l`.
 pub fn retain(l: usize) {
-    let flags = irq_save();
+    let held = LOCK.lock();
     unsafe {
         if let Some(it) = local(l) {
             it.refs += 1;
         }
     }
-    irq_restore(flags);
+    drop(held);
 }
 
 /// A descriptor for `l` is gone. The last takes it with it, and with it
 /// every connection still waiting to be accepted: each connector finds the
 /// other end gone.
 pub fn release(l: usize) {
-    let flags = irq_save();
+    let held = LOCK.lock();
     let pending = unsafe {
         match local(l) {
             Some(it) => {
@@ -165,7 +159,7 @@ pub fn release(l: usize) {
             None => None,
         }
     };
-    irq_restore(flags);
+    drop(held);
     if let Some((pending, n)) = pending {
         for &stream in pending.iter().take(n) {
             crate::stream::close_end(stream, 1);
@@ -188,7 +182,7 @@ pub enum Refused {
 
 /// `l` is named `key` by the server whose endpoint is `server`.
 pub fn bind(l: usize, server: u64, key: u64) -> Result<(), Refused> {
-    let flags = irq_save();
+    let held = LOCK.lock();
     let out = unsafe {
         if !local(l).is_some_and(|it| it.state == State::Unbound) {
             Err(Refused::NotOne)
@@ -203,7 +197,7 @@ pub fn bind(l: usize, server: u64, key: u64) -> Result<(), Refused> {
             Err(Refused::NotOne)
         }
     };
-    irq_restore(flags);
+    drop(held);
     out
 }
 
@@ -211,7 +205,7 @@ pub fn bind(l: usize, server: u64, key: u64) -> Result<(), Refused> {
 /// waiting (and never more than [`QUEUE`]); `creds` is who it is, which
 /// every connector is told. Listening again changes the room.
 pub fn listen(l: usize, backlog: usize, creds: Creds) -> bool {
-    let flags = irq_save();
+    let held = LOCK.lock();
     let ok = unsafe {
         match local(l) {
             Some(it) if matches!(it.state, State::Bound | State::Listening) => {
@@ -223,7 +217,7 @@ pub fn listen(l: usize, backlog: usize, creds: Creds) -> bool {
             _ => false,
         }
     };
-    irq_restore(flags);
+    drop(held);
     ok
 }
 
@@ -244,16 +238,16 @@ unsafe fn listener(server: u64, key: u64) -> Option<(usize, bool)> {
 /// whose end 0 is the connector's — `creds` — and whose end 1 waits to be
 /// accepted. The stream.
 pub fn connect(server: u64, key: u64, creds: Creds, tid: usize) -> Result<usize, Refused> {
-    let flags = irq_save();
+    let held = LOCK.lock();
     let found = unsafe { listener(server, key) };
-    irq_restore(flags);
+    drop(held);
     let l = match found {
         None => return Err(Refused::Nobody),
         Some((_, false)) => return Err(Refused::Full),
         Some((l, true)) => l,
     };
     let stream = crate::stream::create(tid, false).ok_or(Refused::Full)?;
-    let flags = irq_save();
+    let held = LOCK.lock();
     let queued = unsafe {
         match local(l) {
             Some(it) if it.state == State::Listening && it.server == server && it.key == key && it.npending < it.backlog => {
@@ -272,7 +266,7 @@ pub fn connect(server: u64, key: u64, creds: Creds, tid: usize) -> Result<usize,
             _ => Err(Refused::Nobody),
         }
     };
-    irq_restore(flags);
+    drop(held);
     if let Err(why) = queued {
         // It went, or filled, in between; or there was no memory to queue it.
         crate::stream::close_end(stream, 0);
@@ -287,7 +281,7 @@ pub fn connect(server: u64, key: u64, creds: Creds, tid: usize) -> Result<usize,
 /// whose end 1 is the caller's to install. `None` if none is waiting, or
 /// `l` does not listen.
 pub fn take(l: usize) -> Option<usize> {
-    let flags = irq_save();
+    let held = LOCK.lock();
     let out = unsafe {
         match local(l) {
             Some(it) if it.state == State::Listening && it.npending > 0 => {
@@ -304,7 +298,7 @@ pub fn take(l: usize) -> Option<usize> {
             _ => None,
         }
     };
-    irq_restore(flags);
+    drop(held);
     out
 }
 
@@ -313,7 +307,7 @@ pub fn take(l: usize) -> Option<usize> {
 /// run is waiting.
 pub fn wait(l: usize) -> bool {
     let tid = crate::scheduler::current_tid();
-    let flags = irq_save();
+    let held = LOCK.lock();
     let parked = unsafe {
         match local(l) {
             Some(it) if it.state == State::Listening && it.npending == 0 && !crate::signal::ends_wait(tid) => {
@@ -324,42 +318,49 @@ pub fn wait(l: usize) -> bool {
             _ => false,
         }
     };
-    irq_restore(flags);
+    drop(held);
     if parked {
         crate::scheduler::yield_now();
     }
     parked
 }
 
-/// Listener `l`'s waiters. For `waitlist::forget`.
+/// `tid` off the list of the listener it waits on, if it waits on one:
+/// under the local sockets' lock (`waitlist::forget`).
 ///
 /// # Safety
-/// Interrupts off.
-pub unsafe fn waiters(l: usize) -> Option<&'static mut Waiters> {
-    unsafe { local(l).map(|it| &mut it.waiters) }
+/// Interrupts off, and [`LOCK`] not held.
+pub unsafe fn forget(tid: usize) -> bool {
+    let _held = LOCK.lock();
+    unsafe {
+        waitlist::forget_held(tid, |on| match on {
+            On::Local(l) => Some(local(l as usize).map(|it| &mut it.waiters)),
+            _ => None,
+        })
+    }
 }
 
 /// Whether `l` is a socket that is nothing yet: one a name can be given to,
 /// or a connection made with.
 pub fn unbound(l: usize) -> bool {
-    let flags = irq_save();
+    let held = LOCK.lock();
     let is = unsafe { local(l).is_some_and(|it| it.state == State::Unbound) };
-    irq_restore(flags);
+    drop(held);
     is
 }
 
 /// Whether a connection waits on `l` to be accepted.
 pub fn readable(l: usize) -> bool {
-    let flags = irq_save();
+    let held = LOCK.lock();
     let ready = unsafe { local(l).is_some_and(|it| it.state == State::Listening && it.npending > 0) };
-    irq_restore(flags);
+    drop(held);
     ready
 }
 
 /// Whether `l` has asked to be told who sent what it receives; and, with
 /// `set`, that it has or has not.
 pub fn passcred(l: usize, set: Option<bool>) -> Option<bool> {
-    let flags = irq_save();
+    let held = LOCK.lock();
     let out = unsafe {
         local(l).map(|it| {
             let was = it.passcred;
@@ -369,6 +370,6 @@ pub fn passcred(l: usize, set: Option<bool>) -> Option<bool> {
             was
         })
     };
-    irq_restore(flags);
+    drop(held);
     out
 }

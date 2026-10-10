@@ -50,16 +50,25 @@ use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 /// The one lock (`klock.rs`): outermost, taken first or not at all.
 pub const RANK_KERNEL: u8 = 0;
 /// A program's descriptor table.
-pub const RANK_FDTABLE: u8 = 4;
-/// A poll set, which asks what it watches whether it is ready.
-pub const RANK_POLLSET: u8 = 6;
-/// What a program makes: a pipe, a counter, a timer, a signal descriptor,
-/// a terminal, a stream, a local socket, a served descriptor. Two.
-pub const RANK_OBJECT: u8 = 8;
+pub const RANK_FDTABLE: u8 = 2;
+/// The poll sets, which ask what they watch whether it is ready.
+pub const RANK_POLLSET: u8 = 4;
+/// What a program makes, a lock for each kind — its table and every one
+/// of it — in the order one kind's may be taken under another's: a local
+/// socket's connection makes a stream.
+pub const RANK_LOCAL: u8 = 6;
+pub const RANK_STREAM: u8 = 7;
+pub const RANK_PTY: u8 = 8;
+pub const RANK_PIPE: u8 = 9;
+pub const RANK_EVENT: u8 = 10;
+pub const RANK_TIMER: u8 = 11;
+pub const RANK_SIGFD: u8 = 12;
+pub const RANK_SERVED: u8 = 13;
+pub const RANK_SHMEM: u8 = 14;
 /// The futex's waiters, a bucket at a time. Two, for a requeue.
-pub const RANK_FUTEX: u8 = 12;
+pub const RANK_FUTEX: u8 = 16;
 /// A task's record. Two, for a call.
-pub const RANK_TASK: u8 = 16;
+pub const RANK_TASK: u8 = 18;
 /// A capability space. Two, for a transfer.
 pub const RANK_CSPACE: u8 = 20;
 /// An address space's tables and reservations. Two, for a fork or a move.

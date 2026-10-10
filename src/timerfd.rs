@@ -35,56 +35,46 @@ struct Timer {
 /// were, and four waiting on each.
 static mut TIMERS: crate::table::Table<Timer> = crate::table::Table::new(crate::table::MOST);
 
+/// The timers' lock (`sync::RANK_TIMER`): the table, every timer in it and
+/// the lists of those waiting on them.
+static LOCK: crate::sync::IrqSpinLock<()> = crate::sync::IrqSpinLock::new(crate::sync::RANK_TIMER, "the timers", ());
+
 /// # Safety
-/// Interrupts off.
+/// [`LOCK`] held.
 #[inline(always)]
 unsafe fn timers() -> &'static mut crate::table::Table<Timer> {
     unsafe { &mut *core::ptr::addr_of_mut!(TIMERS) }
 }
 
-#[inline(always)]
-fn irq_save() -> u64 {
-    let flags: u64;
-    unsafe {
-        core::arch::asm!("pushfq; pop {}; cli", out(reg) flags, options(nostack));
-    }
-    flags
-}
 
-#[inline(always)]
-fn irq_restore(flags: u64) {
-    unsafe {
-        core::arch::asm!("push {}; popfq", in(reg) flags, options(nostack));
-    }
-}
 
 pub fn create(creator: usize) -> Option<usize> {
     if !crate::reclaim::may_make() {
         return None;
     }
-    let flags = irq_save();
+    let held = LOCK.lock();
     let made = unsafe {
         timers().lowest_free(0).filter(|&i| {
             let t = Timer { creator, refs: 0, deadline: 0, interval: 0, count: 0, waiters: Waiters::NONE };
             timers().fill_at(i, t).is_ok()
         })
     };
-    irq_restore(flags);
+    drop(held);
     made
 }
 
 pub fn retain(timer: usize) {
-    let flags = irq_save();
+    let held = LOCK.lock();
     unsafe {
         if let Some(t) = timers().get(timer) {
             t.refs += 1;
         }
     }
-    irq_restore(flags);
+    drop(held);
 }
 
 pub fn release(timer: usize) {
-    let flags = irq_save();
+    let held = LOCK.lock();
     unsafe {
         if let Some(t) = timers().get(timer) {
             t.refs = t.refs.saturating_sub(1);
@@ -93,14 +83,14 @@ pub fn release(timer: usize) {
             }
         }
     }
-    irq_restore(flags);
+    drop(held);
 }
 
 /// Timer `timer` goes: anybody still on its list looks again, and finds
 /// nothing.
 ///
 /// # Safety
-/// Interrupts off.
+/// [`LOCK`] held.
 unsafe fn gone(timer: usize) {
     unsafe {
         if let Some(t) = timers().get(timer) {
@@ -111,7 +101,7 @@ unsafe fn gone(timer: usize) {
 }
 
 pub fn cleanup_orphans(creator: usize) {
-    let flags = irq_save();
+    let held = LOCK.lock();
     unsafe {
         let mut at = 0;
         while let Some(i) = timers().next_used(at) {
@@ -121,13 +111,13 @@ pub fn cleanup_orphans(creator: usize) {
             }
         }
     }
-    irq_restore(flags);
+    drop(held);
 }
 
 /// Arm or disarm. `first` is nanoseconds from now (0 disarms), `interval`
 /// nanoseconds between expirations after that.
 pub fn set(timer: usize, first: u64, interval: u64) -> bool {
-    let flags = irq_save();
+    let held = LOCK.lock();
     let ok = unsafe {
         match timers().get(timer) {
             Some(t) => {
@@ -142,16 +132,16 @@ pub fn set(timer: usize, first: u64, interval: u64) -> bool {
             None => false,
         }
     };
-    irq_restore(flags);
+    drop(held);
     ok
 }
 
 /// What is left: nanoseconds until the next expiration, and the interval.
 pub fn get(timer: usize) -> Option<(u64, u64)> {
     let now = crate::clock::now();
-    let flags = irq_save();
+    let held = LOCK.lock();
     let out = unsafe { timers().get(timer).map(|t| (t.deadline.saturating_sub(now), t.interval)) };
-    irq_restore(flags);
+    drop(held);
     out
 }
 
@@ -185,16 +175,16 @@ fn catch_up(t: &mut Timer, now: u64) -> bool {
 
 /// How many times it has fired since the last read.
 pub fn pending(timer: usize) -> u64 {
-    let flags = irq_save();
+    let held = LOCK.lock();
     let n = unsafe { timers().get(timer).map_or(0, |t| t.count) };
-    irq_restore(flags);
+    drop(held);
     n
 }
 
 /// Take the count, or `None` if it has not fired yet.
 pub fn take(timer: usize) -> Option<u64> {
     let now = crate::clock::now();
-    let flags = irq_save();
+    let held = LOCK.lock();
     let out = unsafe {
         match timers().get(timer) {
             Some(t) => {
@@ -204,23 +194,30 @@ pub fn take(timer: usize) -> Option<u64> {
             None => None,
         }
     };
-    irq_restore(flags);
+    drop(held);
     out
 }
 
-/// Timer `timer`'s list of waiters, for `waitlist::forget`.
+/// `tid` off the list of the timer it waits on, if it waits on one: under
+/// the timers' lock (`waitlist::forget`).
 ///
 /// # Safety
-/// Interrupts off.
-pub unsafe fn waiters(timer: usize) -> Option<&'static mut Waiters> {
-    unsafe { timers().get(timer).map(|t| &mut t.waiters) }
+/// Interrupts off, and [`LOCK`] not held.
+pub unsafe fn forget(tid: usize) -> bool {
+    let _held = LOCK.lock();
+    unsafe {
+        waitlist::forget_held(tid, |on| match on {
+            On::Timer(timer) => Some(timers().get(timer as usize).map(|t| &mut t.waiters)),
+            _ => None,
+        })
+    }
 }
 
 /// Wait for it to fire. False when there is no need, it is gone, or a
 /// signal has ended the wait before it began.
 pub fn wait(timer: usize) -> bool {
     let tid = scheduler::current_tid();
-    let flags = irq_save();
+    let held = LOCK.lock();
     let parked = unsafe {
         match timers().get(timer) {
             Some(t) if t.count == 0 && !crate::signal::ends_wait(tid) => {
@@ -231,7 +228,7 @@ pub fn wait(timer: usize) -> bool {
             _ => false,
         }
     };
-    irq_restore(flags);
+    drop(held);
     if parked {
         scheduler::yield_now();
     }
@@ -245,6 +242,7 @@ pub fn wait(timer: usize) -> bool {
 pub fn expire(now: u64) -> u64 {
     let mut fired = false;
     let mut next = u64::MAX;
+    let held = LOCK.lock();
     unsafe {
         let mut at = 0;
         while let Some(i) = timers().next_used(at) {
@@ -259,6 +257,7 @@ pub fn expire(now: u64) -> u64 {
             }
         }
     }
+    drop(held);
     if fired {
         crate::pollset::note_timer();
     }

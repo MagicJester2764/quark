@@ -11,7 +11,12 @@
 //! were arrays of four and of eight, which refused the fifth or the ninth,
 //! and a refused waiter's read came back at once.
 //!
-//! Everything here is done with interrupts off.
+//! A list, and the links of the tasks on it, are kept under the lock of the
+//! kind of thing it belongs to (`sync::RANK_EVENT` and its neighbours):
+//! whoever adds, takes off or wakes holds it. [`forget`], which finds a
+//! task's list from the task, takes that kind's lock itself (through the
+//! kind's own `forget`), and looks again once it holds it: so it is never
+//! called with that lock held.
 
 use crate::scheduler;
 
@@ -86,8 +91,16 @@ unsafe fn link(t: u16) -> Option<&'static mut WaitLink> {
 /// Interrupts off, and `list` is the list `on` names.
 pub unsafe fn add(list: &mut Waiters, tid: usize, on: On) {
     unsafe {
-        if link(tid as u16).is_some_and(|l| l.on != On::Nothing) {
-            forget(tid);
+        // On this list still, it comes off it here, under the lock already
+        // held; on another, through that one's kind (`forget`).
+        match link(tid as u16).map(|l| l.on) {
+            Some(was) if was == on => {
+                remove(list, tid, on);
+            }
+            Some(was) if was != On::Nothing => {
+                forget(tid);
+            }
+            _ => {}
         }
         let Some(l) = link(tid as u16) else { return };
         *l = WaitLink { on, next: END, prev: list.last };
@@ -197,29 +210,43 @@ pub unsafe fn each(list: &Waiters, mut each: impl FnMut(usize)) {
 }
 
 /// `tid` waits on nothing now: it is off the list its link names, if it is
-/// on one. True if it was.
+/// on one. True if it was. Through the kind's own `forget`, which takes its
+/// lock: never called with that lock held.
 ///
 /// # Safety
 /// Interrupts off.
 pub unsafe fn forget(tid: usize) -> bool {
     unsafe {
         let Some(l) = link(tid as u16) else { return false };
+        match l.on {
+            On::Nothing => false,
+            On::Event(_) => crate::eventfd::forget(tid),
+            On::Timer(_) => crate::timerfd::forget(tid),
+            On::PipeRead(_) | On::PipeWrite(_) | On::PipePeer(_) => crate::pipe::forget(tid),
+            On::Pty(..) => crate::pty::forget(tid),
+            On::Local(_) => crate::local::forget(tid),
+            On::PollSet(_) => crate::pollset::forget(tid),
+        }
+    }
+}
+
+/// [`forget`]'s second half, for a kind whose lock is held: `tid` off the
+/// list its link names, which `list_of` finds among the kind's — looked at
+/// again now that the lock is held. A link naming a list that has gone is
+/// cleared.
+///
+/// # Safety
+/// The lock of the kind `list_of` finds lists of is held.
+pub unsafe fn forget_held(tid: usize, list_of: impl FnOnce(On) -> Option<Option<&'static mut Waiters>>) -> bool {
+    unsafe {
+        let Some(l) = link(tid as u16) else { return false };
         let on = l.on;
-        let list = match on {
-            On::Nothing => return false,
-            On::Event(i) => crate::eventfd::waiters(i as usize),
-            On::Timer(i) => crate::timerfd::waiters(i as usize),
-            On::PipeRead(i) => crate::pipe::waiters(i as usize, 0),
-            On::PipeWrite(i) => crate::pipe::waiters(i as usize, 1),
-            On::PipePeer(i) => crate::pipe::waiters(i as usize, 2),
-            On::Pty(i, which) => crate::pty::waiters(i as usize, which),
-            On::Local(i) => crate::local::waiters(i as usize),
-            On::PollSet(i) => crate::pollset::waiters(i as usize),
-        };
-        match list {
-            Some(list) => remove(list, tid, on),
+        match list_of(on) {
+            // Not a list of this kind's any more.
+            None => false,
+            Some(Some(list)) => remove(list, tid, on),
             // What it was on has gone; there is no list to be off.
-            None => {
+            Some(None) => {
                 *l = WaitLink::NONE;
                 true
             }

@@ -90,17 +90,11 @@ struct PollSet {
 /// `poll` that made it (`table.rs`). There were sixty-four.
 static mut SETS: crate::table::Table<PollSet> = crate::table::Table::new(crate::table::MOST);
 
-#[inline(always)]
-fn irq_save() -> u64 {
-    let flags: u64;
-    unsafe { core::arch::asm!("pushfq; pop {}; cli", out(reg) flags, options(nostack)) };
-    flags
-}
+/// The poll sets' lock (`sync::RANK_POLLSET`): the table, every set in it,
+/// what each watches and who is parked on it.
+static LOCK: crate::sync::IrqSpinLock<()> = crate::sync::IrqSpinLock::new(crate::sync::RANK_POLLSET, "the poll sets", ());
 
-#[inline(always)]
-fn irq_restore(flags: u64) {
-    unsafe { core::arch::asm!("push {}; popfq", in(reg) flags, options(nostack)) };
-}
+
 
 #[inline(always)]
 unsafe fn sets() -> &'static mut crate::table::Table<PollSet> { unsafe {
@@ -110,7 +104,7 @@ unsafe fn sets() -> &'static mut crate::table::Table<PollSet> { unsafe {
 /// Set `set`, if there is one.
 ///
 /// # Safety
-/// Interrupts off.
+/// [`LOCK`] held.
 #[inline(always)]
 unsafe fn set_at(set: usize) -> Option<&'static mut PollSet> {
     unsafe { sets().get(set) }
@@ -125,21 +119,21 @@ pub fn create(tid: usize, for_a_call: bool) -> Option<usize> {
     if table == usize::MAX || (!for_a_call && !crate::reclaim::may_make()) {
         return None;
     }
-    let flags = irq_save();
+    let held = LOCK.lock();
     let out = unsafe {
         sets().lowest_free(0).filter(|&i| {
             let s = PollSet { owner: table, edges: false, watches: Grow::new(UNUSED), waiters: Waiters::NONE };
             sets().fill_at(i, s).is_ok()
         })
     };
-    irq_restore(flags);
+    drop(held);
     out
 }
 
 /// The set goes, with its watches. Whoever is parked on it — a thread whose
 /// sibling closed it — is woken to look again, and finds it gone.
 pub fn destroy(set: usize) {
-    let flags = irq_save();
+    let held = LOCK.lock();
     unsafe {
         if let Some(s) = set_at(set) {
             waitlist::take_each(&mut s.waiters, |t| {
@@ -148,7 +142,7 @@ pub fn destroy(set: usize) {
             sets().empty(set);
         }
     }
-    irq_restore(flags);
+    drop(held);
 }
 
 /// Can this descriptor ever become ready?
@@ -197,24 +191,24 @@ pub enum Refused {
 
 /// Watch `i` of `set`, as it is now: unused, past the end or with no set.
 fn watch(set: usize, i: usize) -> Watch {
-    let flags = irq_save();
+    let held = LOCK.lock();
     let w = unsafe { set_at(set).and_then(|s| s.watches.get(i).copied()).unwrap_or(UNUSED) };
-    irq_restore(flags);
+    drop(held);
     w
 }
 
 /// How much room `set` has for watches: one past the last there can be.
 fn room(set: usize) -> usize {
-    let flags = irq_save();
+    let held = LOCK.lock();
     let n = unsafe { set_at(set).map_or(0, |s| s.watches.len()) };
-    irq_restore(flags);
+    drop(held);
     n
 }
 
 /// Change watch `i` of `set`, if it is still the one `was` was: what a scan
 /// found may have been changed by another thread of the program since.
 fn update(set: usize, i: usize, was: &Watch, change: impl FnOnce(&mut Watch)) {
-    let flags = irq_save();
+    let held = LOCK.lock();
     unsafe {
         if let Some(w) = set_at(set).and_then(|s| s.watches.get_mut(i)) {
             if w.used && w.fd == was.fd && w.token == was.token {
@@ -222,14 +216,14 @@ fn update(set: usize, i: usize, was: &Watch, change: impl FnOnce(&mut Watch)) {
             }
         }
     }
-    irq_restore(flags);
+    drop(held);
 }
 
 /// A task whose table `set`'s watches are numbers in.
 fn owner_task(set: usize) -> Option<usize> {
-    let flags = irq_save();
+    let held = LOCK.lock();
     let owner = unsafe { set_at(set).map(|s| s.owner) };
-    irq_restore(flags);
+    drop(held);
     crate::fdtable::a_task_of(owner?)
 }
 
@@ -277,7 +271,7 @@ pub fn ctl(set: usize, tid: usize, op: u64, fd: usize, events: u32, token: u64) 
         }
     }
     let table = crate::fdtable::table_index(tid);
-    let flags = irq_save();
+    let held = LOCK.lock();
     let out = unsafe {
         match set_at(set) {
             Some(s) if s.owner == table => {
@@ -320,7 +314,7 @@ pub fn ctl(set: usize, tid: usize, op: u64, fd: usize, events: u32, token: u64) 
             _ => Err(Refused::NotOne),
         }
     };
-    irq_restore(flags);
+    drop(held);
     out
 }
 
@@ -456,37 +450,44 @@ pub fn readiness_of(tid: usize, fd: usize) -> u32 {
 /// waiting on it took the first one's place, which was then woken by
 /// nothing.
 pub fn park(set: usize, tid: usize) {
-    let flags = irq_save();
+    let held = LOCK.lock();
     unsafe {
         if let Some(s) = set_at(set) {
             waitlist::add(&mut s.waiters, tid, On::PollSet(set as u32));
         }
     }
-    irq_restore(flags);
+    drop(held);
 }
 
 pub fn unpark(set: usize, tid: usize) {
-    let flags = irq_save();
+    let held = LOCK.lock();
     unsafe {
         if let Some(s) = set_at(set) {
             waitlist::remove(&mut s.waiters, tid, On::PollSet(set as u32));
         }
     }
-    irq_restore(flags);
+    drop(held);
 }
 
-/// Set `set`'s waiters. For `waitlist::forget`.
+/// `tid` off the list of the set it is parked on, if it is: under the poll
+/// sets' lock (`waitlist::forget`).
 ///
 /// # Safety
-/// Interrupts off.
-pub unsafe fn waiters(set: usize) -> Option<&'static mut Waiters> {
-    unsafe { set_at(set).map(|s| &mut s.waiters) }
+/// Interrupts off, and [`LOCK`] not held.
+pub unsafe fn forget(tid: usize) -> bool {
+    let _held = LOCK.lock();
+    unsafe {
+        waitlist::forget_held(tid, |on| match on {
+            On::PollSet(set) => Some(set_at(set as usize).map(|s| &mut s.waiters)),
+            _ => None,
+        })
+    }
 }
 
 /// Wake everybody parked on `set`, to look again. They stay on its list:
 /// each takes itself off when it has looked.
 fn wake_parked(set: usize) {
-    let flags = irq_save();
+    let held = LOCK.lock();
     unsafe {
         if let Some(s) = set_at(set) {
             waitlist::each(&s.waiters, |t| {
@@ -494,7 +495,7 @@ fn wake_parked(set: usize) {
             });
         }
     }
-    irq_restore(flags);
+    drop(held);
 }
 
 /// Does this task's descriptor `fd` name pipe `handle`?
@@ -555,7 +556,7 @@ fn note(names: impl Fn(usize, usize) -> bool) {
     // those with an edge.
     let mut at = 0;
     loop {
-        let flags = irq_save();
+        let held = LOCK.lock();
         let next = unsafe {
             let mut found = None;
             while let Some(i) = sets().next_used(at) {
@@ -567,7 +568,7 @@ fn note(names: impl Fn(usize, usize) -> bool) {
             }
             found
         };
-        irq_restore(flags);
+        drop(held);
         let Some(set) = next else { break };
 
         let Some(tid) = owner_task(set) else { continue };
@@ -590,7 +591,7 @@ fn note(names: impl Fn(usize, usize) -> bool) {
 
 /// Wake whoever is parked on any set, to look again.
 fn wake_all() {
-    let flags = irq_save();
+    let held = LOCK.lock();
     unsafe {
         let mut at = 0;
         while let Some(i) = sets().next_used(at) {
@@ -602,7 +603,7 @@ fn wake_all() {
             }
         }
     }
-    irq_restore(flags);
+    drop(held);
 }
 
 /// Something changed at one end of a pty: wake whoever is waiting on a set
@@ -668,9 +669,9 @@ fn names_pty(tid: usize, fd: usize, pty: usize) -> bool {
 /// One there was no room for is left as it was, for the next wait.
 pub fn scan(set: usize, tid: usize, most: usize, mut out: impl FnMut(u64, u32)) -> usize {
     let table = crate::fdtable::table_index(tid);
-    let flags = irq_save();
+    let held = LOCK.lock();
     let mine = unsafe { set_at(set).is_some_and(|s| s.owner == table) };
-    irq_restore(flags);
+    drop(held);
     if !mine {
         return 0;
     }
