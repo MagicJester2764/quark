@@ -3,10 +3,13 @@
 /// Tasks communicate by sending/receiving fixed-size messages.
 /// Messages fit in registers for zero-copy small transfers.
 ///
-/// All IPC operations disable interrupts around critical sections to prevent
-/// races: the timer interrupt can preempt syscall handlers and context-switch
-/// to another task that accesses the same IPC state.
+/// A task's IPC state is changed with its record's lock held
+/// (`scheduler::lock_record`) — both tasks' for a call, a send, or a receive
+/// that takes a sender's message — and the watches with [`NOTICES`]'s.
+/// A wait asks what it waits for and blocks in one step under the lock of
+/// the record it blocks in; whoever ends the wait takes that lock too.
 
+use crate::sync::{IrqSpinLock, IrqSpinLockGuard};
 use crate::task::MAX_TASKS;
 use crate::scheduler;
 
@@ -73,14 +76,14 @@ pub fn is_calling(tid: usize, dest: usize) -> bool {
     if tid >= MAX_TASKS || dest >= MAX_TASKS {
         return false;
     }
-    let flags = irq_save();
+    let held = scheduler::lock_record(tid);
     let out = unsafe {
         matches!(
             st(tid).task_ipc.state,
             IpcState::CallBlocked(d) | IpcState::CallSendBlocked(d) if d == dest
         )
     };
-    irq_restore(flags);
+    drop(held);
     out
 }
 
@@ -218,7 +221,7 @@ pub fn lent_to(client: usize, server: usize) -> Option<(Lent, usize)> {
     if client >= MAX_TASKS {
         return None;
     }
-    let flags = irq_save();
+    let held = scheduler::lock_record(client);
     let out = unsafe {
         match (st(client).task_ipc.state, st(client).task_ipc.lent) {
             (IpcState::CallBlocked(s), Some(lent)) if s == server => {
@@ -228,7 +231,7 @@ pub fn lent_to(client: usize, server: usize) -> Option<(Lent, usize)> {
             _ => None,
         }
     };
-    irq_restore(flags);
+    drop(held);
     out
 }
 
@@ -240,23 +243,23 @@ pub fn offered_to(client: usize, server: usize) -> Option<usize> {
     if client >= MAX_TASKS {
         return None;
     }
-    let flags = irq_save();
+    let held = scheduler::lock_record(client);
     let out = unsafe {
         match st(client).task_ipc.state {
             IpcState::CallBlocked(s) if s == server => st(client).task_ipc.offer,
             _ => None,
         }
     };
-    irq_restore(flags);
+    drop(held);
     out
 }
 
 /// `client`'s offer has been taken, and is not there to take again.
 pub fn withdraw_offer(client: usize) {
     if client < MAX_TASKS {
-        let flags = irq_save();
+        let held = scheduler::lock_record(client);
         unsafe { st(client).task_ipc.offer = None };
-        irq_restore(flags);
+        drop(held);
     }
 }
 
@@ -295,6 +298,11 @@ struct Watch {
 const END: u16 = u16::MAX;
 
 static mut WATCHES: crate::table::Table<Watch> = crate::table::Table::new(crate::table::MOST);
+
+/// The watches: [`WATCHES`], and each task's lists of them (`PerTask`'s
+/// `watching`, `owed`, `watched`). Waking a watcher takes its record, after
+/// it; what a receive collects of them is taken before its own record's.
+static NOTICES: IrqSpinLock<()> = IrqSpinLock::new(crate::sync::RANK_NOTICES, "the watches", ());
 
 /// The tasks with a signal deadline, linked through their records: what the
 /// tick looks at.
@@ -375,7 +383,7 @@ pub fn sys_task_watch(watcher: usize, target: usize) -> Result<(), IpcError> {
         // left waiting for a notification cannot.
         return Err(IpcError::DeadTask);
     }
-    let flags = irq_save();
+    let held = NOTICES.lock();
     let result = unsafe {
         // A death it is owed under this number and has not collected is of
         // whoever had the number before, and it has just said it knows
@@ -395,7 +403,7 @@ pub fn sys_task_watch(watcher: usize, target: usize) -> Result<(), IpcError> {
             make_watch(watcher, target as u16, 0)
         }
     };
-    irq_restore(flags);
+    drop(held);
     result
 }
 
@@ -407,7 +415,7 @@ pub fn sys_space_watch(watcher: usize, space: u64) -> Result<(), IpcError> {
     if !scheduler::space_is_live(space) {
         return Err(IpcError::DeadTask);
     }
-    let flags = irq_save();
+    let held = NOTICES.lock();
     let result = unsafe {
         if watching(watcher, |x| x.task == END && x.space == space) {
             Ok(())
@@ -415,12 +423,12 @@ pub fn sys_space_watch(watcher: usize, space: u64) -> Result<(), IpcError> {
             make_watch(watcher, END, space)
         }
     };
-    irq_restore(flags);
+    drop(held);
     result
 }
 
 /// # Safety
-/// Interrupts are off.
+/// [`NOTICES`] held.
 #[inline(always)]
 unsafe fn watches() -> &'static mut crate::table::Table<Watch> {
     unsafe { &mut *core::ptr::addr_of_mut!(WATCHES) }
@@ -429,7 +437,7 @@ unsafe fn watches() -> &'static mut crate::table::Table<Watch> {
 /// Watch `w`, unless it is the end of a list.
 ///
 /// # Safety
-/// Interrupts are off.
+/// [`NOTICES`] held.
 unsafe fn watch(w: u16) -> Option<&'static mut Watch> {
     unsafe { if w == END { None } else { watches().get(w as usize) } }
 }
@@ -437,7 +445,7 @@ unsafe fn watch(w: u16) -> Option<&'static mut Watch> {
 /// Whether `watcher` is waiting for something `wanted` says yes to.
 ///
 /// # Safety
-/// Interrupts are off.
+/// [`NOTICES`] held.
 unsafe fn watching(watcher: usize, wanted: impl Fn(&Watch) -> bool) -> bool {
     unsafe {
         let mut w = st(watcher).watching;
@@ -455,7 +463,7 @@ unsafe fn watching(watcher: usize, wanted: impl Fn(&Watch) -> bool) -> bool {
 /// `WouldBlock` if there is no room for it.
 ///
 /// # Safety
-/// Interrupts are off.
+/// [`NOTICES`] held.
 unsafe fn make_watch(watcher: usize, task: u16, space: u64) -> Result<(), IpcError> {
     unsafe {
         let made = Watch { watcher: watcher as u16, task, space, owed: false, next: END, prev: END, next_on: END, prev_on: END };
@@ -475,7 +483,7 @@ unsafe fn make_watch(watcher: usize, task: u16, space: u64) -> Result<(), IpcErr
 /// Put watch `w` first on the watcher's list `head`.
 ///
 /// # Safety
-/// Interrupts are off.
+/// [`NOTICES`] held.
 unsafe fn push(head: &mut u16, w: u16) {
     unsafe {
         let Some(x) = watch(w) else { return };
@@ -491,7 +499,7 @@ unsafe fn push(head: &mut u16, w: u16) {
 /// Take watch `w` off the watcher's list `head`, which it is on.
 ///
 /// # Safety
-/// Interrupts are off.
+/// [`NOTICES`] held.
 unsafe fn remove(head: &mut u16, w: u16) {
     unsafe {
         let Some(x) = watch(w) else { return };
@@ -510,7 +518,7 @@ unsafe fn remove(head: &mut u16, w: u16) {
 /// Put watch `w` first on the watched task's list `head`.
 ///
 /// # Safety
-/// Interrupts are off.
+/// [`NOTICES`] held.
 unsafe fn push_on(head: &mut u16, w: u16) {
     unsafe {
         let Some(x) = watch(w) else { return };
@@ -526,7 +534,7 @@ unsafe fn push_on(head: &mut u16, w: u16) {
 /// Take watch `w` off the watched task's list `head`, which it is on.
 ///
 /// # Safety
-/// Interrupts are off.
+/// [`NOTICES`] held.
 unsafe fn remove_on(head: &mut u16, w: u16) {
     unsafe {
         let Some(x) = watch(w) else { return };
@@ -546,7 +554,7 @@ unsafe fn remove_on(head: &mut u16, w: u16) {
 /// False if there is no such watch.
 ///
 /// # Safety
-/// Interrupts are off.
+/// [`NOTICES`] held.
 unsafe fn drop_watch(w: u16) -> bool {
     unsafe {
         let Some(x) = watch(w) else { return false };
@@ -569,7 +577,7 @@ unsafe fn drop_watch(w: u16) -> bool {
 /// is no such watch.
 ///
 /// # Safety
-/// Interrupts are off.
+/// [`NOTICES`] held.
 unsafe fn owe(w: u16) -> bool {
     unsafe {
         let Some(x) = watch(w) else { return false };
@@ -586,12 +594,13 @@ unsafe fn owe(w: u16) -> bool {
 }
 
 /// Wake `t` if it is sitting in a receive that would take a notice: from
-/// anybody, or from the kernel.
+/// anybody, or from the kernel. Takes its record's lock.
 ///
 /// # Safety
 /// Interrupts are off.
 unsafe fn wake_receiving(t: usize) {
     unsafe {
+        let held = scheduler::lock_record(t);
         match st(t).task_ipc.state {
             IpcState::RecvBlocked(from) if from == 0 || from == TID_ANY => {
                 st(t).task_ipc.state = IpcState::None;
@@ -599,15 +608,17 @@ unsafe fn wake_receiving(t: usize) {
             }
             _ => {}
         }
+        drop(held);
     }
 }
 
 /// Tell everyone watching program `space` that its last task has died.
 ///
-/// Interrupts are off: this is called from the scheduler as a task dies. A
+/// Called from the scheduler as a task dies, holding no task's record. A
 /// program has no record here to keep its watchers on, and a program ends
 /// once: they are found among the watches.
 pub fn notify_space_watchers(space: u64) {
+    let held = NOTICES.lock();
     unsafe {
         let mut at = 0;
         while let Some(w) = watches().next_used(at) {
@@ -619,6 +630,7 @@ pub fn notify_space_watchers(space: u64) {
             }
         }
     }
+    drop(held);
 }
 
 /// Tell everyone watching `dead` that it has gone.
@@ -631,19 +643,19 @@ pub fn notify_watchers(dead: usize) {
     if dead >= MAX_TASKS {
         return;
     }
-    let flags = irq_save();
+    let held = NOTICES.lock();
     unsafe {
         while st(dead).watched != END && owe(st(dead).watched) {}
         st(dead).watched = END;
     }
-    irq_restore(flags);
+    drop(held);
 }
 
 /// Take one owed notice of a kind `wanted` says yes to — a task's death or a
 /// program's — as the message that says it.
 ///
 /// # Safety
-/// The caller holds interrupts off.
+/// [`NOTICES`] held.
 unsafe fn take_owed(receiver: usize, wanted: impl Fn(&Watch) -> bool) -> Option<Message> {
     unsafe {
         let mut w = st(receiver).owed;
@@ -666,7 +678,7 @@ unsafe fn take_owed(receiver: usize, wanted: impl Fn(&Watch) -> bool) -> Option<
 /// Take one pending death notification, if there is one.
 ///
 /// # Safety
-/// The caller holds interrupts off.
+/// [`NOTICES`] held.
 unsafe fn take_death(receiver: usize) -> Option<Message> {
     unsafe { take_owed(receiver, |x| x.task != END) }
 }
@@ -682,13 +694,13 @@ pub fn notify_object_idle(pager: usize) {
     unsafe { wake_receiving(pager) }
 }
 
-/// Ask `pager` to write what it has that is dirty (`TAG_OBJECT_CLEAN`).
-///
-/// Interrupts are off.
+/// Ask `pager` to write what it has that is dirty (`TAG_OBJECT_CLEAN`): a
+/// flag in its record, under its record's lock.
 pub fn notify_clean(pager: usize) {
     if pager >= MAX_TASKS {
         return;
     }
+    let held = scheduler::lock_record(pager);
     unsafe {
         st(pager).clean_wanted = true;
         match st(pager).task_ipc.state {
@@ -700,6 +712,7 @@ pub fn notify_clean(pager: usize) {
             _ => {}
         }
     }
+    drop(held);
 }
 
 /// Stop the current task for `ns`, for a reason of the kernel's own: it is
@@ -711,7 +724,7 @@ pub fn pause(ns: u64) {
     if me >= MAX_TASKS {
         return;
     }
-    let flags = irq_save();
+    let held = scheduler::lock_record(me);
     let parked = unsafe {
         if matches!(st(me).task_ipc.state, IpcState::None) {
             st(me).timeout = crate::clock::after(ns);
@@ -723,19 +736,19 @@ pub fn pause(ns: u64) {
             false
         }
     };
-    irq_restore(flags);
+    drop(held);
     if !parked {
         return;
     }
     scheduler::yield_now();
-    let flags = irq_save();
+    let held = scheduler::lock_record(me);
     unsafe {
         st(me).timeout = 0;
         if matches!(st(me).task_ipc.state, IpcState::RecvBlocked(t) if t == me) {
             st(me).task_ipc.state = IpcState::None;
         }
     }
-    irq_restore(flags);
+    drop(held);
 }
 
 /// Wake a server that is waiting to receive, because the kernel has a notice
@@ -744,7 +757,7 @@ pub fn wake_for_notice(server: usize) {
     if server >= MAX_TASKS {
         return;
     }
-    let flags = irq_save();
+    let held = scheduler::lock_record(server);
     unsafe {
         match st(server).task_ipc.state {
             IpcState::RecvBlocked(from) if from == 0 || from == TID_ANY => {
@@ -755,18 +768,24 @@ pub fn wake_for_notice(server: usize) {
             _ => {}
         }
     }
-    irq_restore(flags);
+    drop(held);
 }
 
 /// Take one pending notice from the kernel: a task's death, a program's, an
 /// object gone idle, or a served descriptor's last close.
 ///
+/// Each is asked under its own lock, and the watches and a served
+/// descriptor's rank before a task's record.
+///
 /// # Safety
-/// The caller holds interrupts off.
+/// No task's record held.
 unsafe fn take_any_death(receiver: usize) -> Option<Message> {
     unsafe {
-        if let Some(msg) = take_death(receiver) {
-            return Some(msg);
+        let held = NOTICES.lock();
+        let death = take_death(receiver);
+        drop(held);
+        if death.is_some() {
+            return death;
         }
         // An object this task serves has no descriptors left. One notice
         // however many there are: the server collects until there are none.
@@ -780,11 +799,16 @@ unsafe fn take_any_death(receiver: usize) -> Option<Message> {
         if let Some((cookie, id)) = crate::memobj::take_idle(receiver) {
             return Some(Message { sender: 0, tag: TAG_OBJECT_IDLE, data: [cookie, id, 0, 0, 0, 0] });
         }
-        if st(receiver).clean_wanted {
-            st(receiver).clean_wanted = false;
+        let held = scheduler::lock_record(receiver);
+        let clean = core::mem::replace(&mut st(receiver).clean_wanted, false);
+        drop(held);
+        if clean {
             return Some(Message { sender: 0, tag: TAG_OBJECT_CLEAN, data: [0; 6] });
         }
-        take_owed(receiver, |x| x.task == END)
+        let held = NOTICES.lock();
+        let gone = take_owed(receiver, |x| x.task == END);
+        drop(held);
+        gone
     }
 }
 
@@ -799,7 +823,7 @@ pub fn wake_sleeper(tid: usize) -> bool {
     if tid >= MAX_TASKS {
         return false;
     }
-    let flags = irq_save();
+    let held = scheduler::lock_record(tid);
     let woke = unsafe {
         if matches!(st(tid).task_ipc.state, IpcState::RecvBlocked(t) if t == tid) {
             st(tid).task_ipc.state = IpcState::None;
@@ -810,7 +834,7 @@ pub fn wake_sleeper(tid: usize) -> bool {
             false
         }
     };
-    irq_restore(flags);
+    drop(held);
     woke
 }
 
@@ -830,7 +854,7 @@ pub fn sys_notify(dest: usize, badge: u64) -> Result<(), IpcError> {
         return Err(IpcError::DeadTask);
     }
 
-    let flags = irq_save();
+    let held = scheduler::lock_record(dest);
     unsafe {
         st(dest).notify |= badge;
 
@@ -843,7 +867,7 @@ pub fn sys_notify(dest: usize, badge: u64) -> Result<(), IpcError> {
             _ => {}
         }
     }
-    irq_restore(flags);
+    drop(held);
 
     Ok(())
 }
@@ -855,7 +879,7 @@ fn notify_raw(dest: usize, badge: u64) -> Result<(), IpcError> {
         return Err(IpcError::InvalidTid);
     }
 
-    let flags = irq_save();
+    let held = scheduler::lock_record(dest);
     unsafe {
         st(dest).notify |= badge;
 
@@ -867,7 +891,7 @@ fn notify_raw(dest: usize, badge: u64) -> Result<(), IpcError> {
             _ => {}
         }
     }
-    irq_restore(flags);
+    drop(held);
 
     Ok(())
 }
@@ -900,7 +924,7 @@ pub fn sys_signal(dest: usize, sig: u64) -> Result<(), IpcError> {
     notify_raw(dest, sig)?;
 
     // Force-unblock from IPC states that sys_notify doesn't handle.
-    let flags = irq_save();
+    let held = scheduler::lock_record(dest);
     unsafe {
         match st(dest).task_ipc.state {
             IpcState::CallBlocked(_) | IpcState::CallSendBlocked(_) | IpcState::SendBlocked(_) => {
@@ -916,7 +940,7 @@ pub fn sys_signal(dest: usize, sig: u64) -> Result<(), IpcError> {
             _ => {} // None or RecvBlocked(0|TID_ANY) already handled by sys_notify
         }
     }
-    irq_restore(flags);
+    drop(held);
 
     // Set force-kill deadline (only if not already set — don't extend)
     let flags = irq_save();
@@ -1019,7 +1043,7 @@ pub fn sys_send(dest: usize, msg: &Message) -> Result<(), IpcError> {
     }
     let sender = scheduler::current_tid();
 
-    let flags = irq_save();
+    let held = scheduler::lock_records(sender, dest);
     unsafe {
         // Check if dest is blocked waiting to receive from us (or from ANY)
         let dest_state = st(dest).task_ipc.state;
@@ -1031,7 +1055,7 @@ pub fn sys_send(dest: usize, msg: &Message) -> Result<(), IpcError> {
                 st(dest).task_ipc.pending_msg = Some(delivered);
                 st(dest).task_ipc.state = IpcState::None;
                 scheduler::unblock_task(dest);
-                irq_restore(flags);
+                drop(held);
                 return Ok(());
             }
             _ => {}
@@ -1044,10 +1068,10 @@ pub fn sys_send(dest: usize, msg: &Message) -> Result<(), IpcError> {
         st(sender).task_ipc.state = IpcState::SendBlocked(dest);
         scheduler::block_task(sender);
     }
-    irq_restore(flags);
+    drop(held);
     scheduler::yield_now();
 
-    let flags = irq_save();
+    let held = scheduler::lock_record(sender);
     let result = unsafe {
         // Woken. If our message is still queued, nobody took it — the receiver
         // died or we were interrupted by a signal, so report failure rather
@@ -1060,7 +1084,7 @@ pub fn sys_send(dest: usize, msg: &Message) -> Result<(), IpcError> {
             Ok(())
         }
     };
-    irq_restore(flags);
+    drop(held);
     result
 }
 
@@ -1068,76 +1092,48 @@ pub fn sys_send(dest: usize, msg: &Message) -> Result<(), IpcError> {
 /// `from` is the expected sender TID, or TID_ANY for any sender.
 pub fn sys_recv(from: usize) -> Result<Message, IpcError> {
     let receiver = scheduler::current_tid();
+    let notices = from == 0 || from == TID_ANY;
 
+    // From the first look to blocking, interrupts are off: what is looked at
+    // under one lock and what under another are one step, under the one lock.
     let flags = irq_save();
+    // Notices first. A notice was queued when its task died, before anything
+    // could take the TID again; a call waiting behind it may be from
+    // whatever did, and must not be served as the dead task's. Asked before
+    // this task's record is locked: what keeps them ranks before it. Nothing
+    // can be owed between this look and the block below — under the one lock
+    // with interrupts off, nobody else is in the kernel — so there is no
+    // second look before blocking.
+    if notices {
+        if let Some(msg) = unsafe { take_any_death(receiver) } {
+            irq_restore(flags);
+            return Ok(msg);
+        }
+    }
+    let held = match take_sender(receiver, from) {
+        Ok(msg) => {
+            irq_restore(flags);
+            return Ok(msg);
+        }
+        Err(held) => held,
+    };
     unsafe {
-        // Notices first. A notice was queued when its task died, before
-        // anything could take the TID again; a call waiting behind it may be
-        // from whatever did, and must not be served as the dead task's.
-        if from == 0 || from == TID_ANY {
-            if let Some(msg) = take_any_death(receiver) {
-                irq_restore(flags);
-                return Ok(msg);
-            }
-        }
-        // Check if any sender is blocked waiting to send to us, starting one
-        // past the last one served so that no sender can monopolise us.
-        for tid in scheduler::tids_from(st(receiver).recv_rotor) {
-            if tid == receiver {
-                continue;
-            }
-            let dest = match st(tid).task_ipc.state {
-                IpcState::SendBlocked(d) => d,
-                IpcState::CallSendBlocked(d) => d,
-                _ => continue,
-            };
-            if dest == receiver && (from == TID_ANY || from == tid) {
-                st(receiver).recv_rotor = (tid + 1) % MAX_TASKS;
-                let was_call = matches!(st(tid).task_ipc.state, IpcState::CallSendBlocked(_));
-                let msg = match st(tid).task_ipc.pending_msg.take() {
-                    Some(m) => m,
-                    None => {
-                        // Inconsistent state: reset sender and skip
-                        st(tid).task_ipc.state = IpcState::None;
-                        scheduler::unblock_task(tid);
-                        continue;
-                    }
-                };
-                if was_call {
-                    // Transition to CallBlocked — keep blocked, waiting for reply
-                    st(tid).task_ipc.state = IpcState::CallBlocked(receiver);
-                } else {
-                    // Plain send — unblock sender
-                    st(tid).task_ipc.state = IpcState::None;
-                    scheduler::unblock_task(tid);
-                }
-                irq_restore(flags);
-                return Ok(msg);
-            }
-        }
-
         // Before blocking, check for pending IRQ messages
         // (from=0 means kernel, TID_ANY matches any)
-        if from == 0 || from == TID_ANY {
+        if notices {
             if let Some(msg) = crate::irq_dispatch::poll_irq_message(receiver) {
-                irq_restore(flags);
-                return Ok(msg);
-            }
-        }
-
-        // A task this one was watching has died.
-        if from == 0 || from == TID_ANY {
-            if let Some(msg) = take_any_death(receiver) {
+                drop(held);
                 irq_restore(flags);
                 return Ok(msg);
             }
         }
 
         // Check for pending notifications (from=0 or TID_ANY)
-        if from == 0 || from == TID_ANY {
+        if notices {
             let word = st(receiver).notify;
             if word != 0 {
                 st(receiver).notify = 0;
+                drop(held);
                 irq_restore(flags);
                 return Ok(Message {
                     sender: 0,
@@ -1151,60 +1147,116 @@ pub fn sys_recv(from: usize) -> Result<Message, IpcError> {
         st(receiver).task_ipc.state = IpcState::RecvBlocked(from);
         scheduler::block_task(receiver);
     }
+    drop(held);
     irq_restore(flags);
     scheduler::yield_now();
+    woken(receiver, from)
+}
 
-    let flags = irq_save();
-    let result = unsafe {
-        // When we wake up, check if an IPC message was delivered first.
-        // This must come before IRQ polling — otherwise an IRQ arriving
-        // between the IPC delivery and our resume would cause us to
-        // return the IRQ message and orphan the IPC message.
+/// What a receive that blocked was woken by: a message delivered, first —
+/// otherwise an IRQ arriving between the delivery and the resume would be
+/// returned and the message orphaned — then an IRQ, a notice, and the
+/// notification word. Whoever woke it set its state to `None`, so nothing is
+/// delivered to it from here on. Its record is held for what is its own, and
+/// not for the notices, which rank before it.
+fn woken(receiver: usize, from: usize) -> Result<Message, IpcError> {
+    let notices = from == 0 || from == TID_ANY;
+    let held = scheduler::lock_record(receiver);
+    unsafe {
         if let Some(msg) = st(receiver).task_ipc.pending_msg.take() {
             st(receiver).task_ipc.state = IpcState::None;
-            irq_restore(flags);
+            drop(held);
             return Ok(msg);
         }
-
-        // No IPC message — check IRQ
-        if from == 0 || from == TID_ANY {
+        if notices {
             if let Some(msg) = crate::irq_dispatch::poll_irq_message(receiver) {
                 st(receiver).task_ipc.state = IpcState::None;
-                irq_restore(flags);
+                drop(held);
                 return Ok(msg);
             }
         }
-
-        // A task this one was watching has died.
-        if from == 0 || from == TID_ANY {
-            if let Some(msg) = take_any_death(receiver) {
-                st(receiver).task_ipc.state = IpcState::None;
-                irq_restore(flags);
-                return Ok(msg);
-            }
+    }
+    drop(held);
+    // A task this one was watching has died.
+    if notices {
+        if let Some(msg) = unsafe { take_any_death(receiver) } {
+            let held = scheduler::lock_record(receiver);
+            unsafe { st(receiver).task_ipc.state = IpcState::None };
+            drop(held);
+            return Ok(msg);
         }
-
-        // Check notification word
-        if from == 0 || from == TID_ANY {
-            let word = st(receiver).notify;
-            if word != 0 {
-                st(receiver).notify = 0;
-                st(receiver).task_ipc.state = IpcState::None;
-                irq_restore(flags);
-                return Ok(Message {
-                    sender: 0,
-                    tag: TAG_NOTIFICATION,
-                    data: [word, 0, 0, 0, 0, 0],
-                });
-            }
-        }
-
-        // Should not reach here — either IPC, IRQ, or notification should have woken us
+    }
+    let held = scheduler::lock_record(receiver);
+    let result = unsafe {
+        let word = if notices { core::mem::replace(&mut st(receiver).notify, 0) } else { 0 };
         st(receiver).task_ipc.state = IpcState::None;
-        Err(IpcError::WouldBlock)
+        if word != 0 {
+            Ok(Message { sender: 0, tag: TAG_NOTIFICATION, data: [word, 0, 0, 0, 0, 0] })
+        } else {
+            Err(IpcError::WouldBlock)
+        }
     };
-    irq_restore(flags);
+    drop(held);
     result
+}
+
+/// Take a message from a task blocked sending to `receiver` — from `from`,
+/// or from anybody for `TID_ANY` — beginning one past whoever was served
+/// last, so that no sender can monopolise it. A caller is left waiting for
+/// its answer, and a sender is woken. With nobody there, `Err` with
+/// `receiver`'s record's lock held: what it asks next, and its blocking, are
+/// one step with this look.
+///
+/// Who is blocked sending here is read without the senders' locks: a task
+/// becomes so with this one's lock held as well as its own, so one that is
+/// there now is found, and one found is looked at again with its own lock
+/// held, which whatever else ends its wait holds too.
+fn take_sender(receiver: usize, from: usize) -> Result<Message, Option<IrqSpinLockGuard<'static, ()>>> {
+    loop {
+        let held = scheduler::lock_record(receiver);
+        let found = unsafe {
+            scheduler::tids_from(st(receiver).recv_rotor).find(|&tid| {
+                tid != receiver
+                    && (from == TID_ANY || from == tid)
+                    && matches!(
+                        st(tid).task_ipc.state,
+                        IpcState::SendBlocked(d) | IpcState::CallSendBlocked(d) if d == receiver
+                    )
+            })
+        };
+        let Some(tid) = found else { return Err(held) };
+        drop(held);
+        let both = scheduler::lock_records(receiver, tid);
+        unsafe {
+            let was_call = match st(tid).task_ipc.state {
+                IpcState::CallSendBlocked(d) if d == receiver => true,
+                IpcState::SendBlocked(d) if d == receiver => false,
+                // Its wait ended in between: look again.
+                _ => continue,
+            };
+            st(receiver).recv_rotor = (tid + 1) % MAX_TASKS;
+            match st(tid).task_ipc.pending_msg.take() {
+                Some(msg) => {
+                    if was_call {
+                        // Transition to CallBlocked — keep blocked, waiting for reply
+                        st(tid).task_ipc.state = IpcState::CallBlocked(receiver);
+                    } else {
+                        // Plain send — unblock sender
+                        st(tid).task_ipc.state = IpcState::None;
+                        scheduler::unblock_task(tid);
+                    }
+                    drop(both);
+                    return Ok(msg);
+                }
+                None => {
+                    // Inconsistent state: reset sender and skip
+                    st(tid).task_ipc.state = IpcState::None;
+                    scheduler::unblock_task(tid);
+                }
+            }
+        }
+        drop(both);
+    }
 }
 
 /// Synchronous RPC: send a message and wait for a reply.
@@ -1303,6 +1355,7 @@ fn call_as(
     let mut hand_over_to: Option<usize> = None;
 
     let flags = irq_save();
+    let held = scheduler::lock_records(caller, dest);
     unsafe {
         let mut to_send = *msg;
         to_send.sender = caller | sender_bits as usize;
@@ -1335,12 +1388,6 @@ fn call_as(
             }
         };
 
-        // The caller is now waiting on `dest`, so `dest` is working on its
-        // behalf and runs at its urgency until it answers. Done before
-        // anything decides who runs next, so the decision sees the raised
-        // band rather than the one it will have a moment later.
-        scheduler::refresh_priority(dest);
-
         st(caller).timed_out = false;
         st(caller).timeout = if timeout_ns == 0 {
             0
@@ -1351,6 +1398,13 @@ fn call_as(
             crate::clock::due(st(caller).timeout);
         }
     }
+    drop(held);
+    // The caller is now waiting on `dest`, so `dest` is working on its
+    // behalf and runs at its urgency until it answers. Done before anything
+    // decides who runs next, so the decision sees the raised band rather than
+    // the one it will have a moment later — and with no record held, since it
+    // takes each one it changes.
+    scheduler::refresh_priority(dest);
     match hand_over_to {
         // Straight across, on what is left of this task's slice, with
         // interrupts still off. `dest` is runnable but in no queue, so a tick
@@ -1366,7 +1420,7 @@ fn call_as(
     }
 
     // Reply arrived
-    let flags = irq_save();
+    let held = scheduler::lock_record(caller);
     let result = unsafe {
         st(caller).timeout = 0;
         // However the call ended, nothing is lent or offered any more.
@@ -1378,14 +1432,14 @@ fn call_as(
                 st(caller).task_ipc.state = IpcState::None;
                 let timed_out = st(caller).timed_out;
                 st(caller).timed_out = false;
-                irq_restore(flags);
+                drop(held);
                 return Err(if timed_out { IpcError::Timeout } else { IpcError::DeadTask });
             }
         };
         st(caller).task_ipc.state = IpcState::None;
         Ok(reply)
     };
-    irq_restore(flags);
+    drop(held);
     result
 }
 
@@ -1399,6 +1453,7 @@ pub fn sys_reply(dest: usize, msg: &Message) -> Result<(), IpcError> {
     let replier = scheduler::current_tid();
 
     let flags = irq_save();
+    let held = scheduler::lock_record(dest);
     let result = unsafe {
         match st(dest).task_ipc.state {
             IpcState::CallBlocked(expected_replier) if expected_replier == replier => {
@@ -1410,9 +1465,6 @@ pub fn sys_reply(dest: usize, msg: &Message) -> Result<(), IpcError> {
                 // runs as soon as this server blocks again, rather than after
                 // everything else that became ready in the meantime.
                 scheduler::unblock_task_next(dest);
-                // It is no longer waiting on us, so whatever urgency it lent
-                // goes back with it.
-                scheduler::refresh_priority(replier);
                 Ok(())
             }
             _ => {
@@ -1420,6 +1472,12 @@ pub fn sys_reply(dest: usize, msg: &Message) -> Result<(), IpcError> {
             }
         }
     };
+    drop(held);
+    // It is no longer waiting on us, so whatever urgency it lent goes back
+    // with it.
+    if result.is_ok() {
+        scheduler::refresh_priority(replier);
+    }
     irq_restore(flags);
     result
 }
@@ -1429,70 +1487,40 @@ pub fn sys_reply(dest: usize, msg: &Message) -> Result<(), IpcError> {
 /// `timeout_ns` is how long to wait, in nanoseconds (0 = non-blocking poll).
 pub fn sys_recv_timeout(from: usize, timeout_ns: u64) -> Result<Message, IpcError> {
     let receiver = scheduler::current_tid();
+    let notices = from == 0 || from == TID_ANY;
 
+    // One step from the first look to blocking, as in `sys_recv`.
     let flags = irq_save();
+    // Notices first, as in `sys_recv`.
+    if notices {
+        if let Some(msg) = unsafe { take_any_death(receiver) } {
+            irq_restore(flags);
+            return Ok(msg);
+        }
+    }
+    let held = match take_sender(receiver, from) {
+        Ok(msg) => {
+            irq_restore(flags);
+            return Ok(msg);
+        }
+        Err(held) => held,
+    };
     unsafe {
-        // Notices first, as in `sys_recv`.
-        if from == 0 || from == TID_ANY {
-            if let Some(msg) = take_any_death(receiver) {
-                irq_restore(flags);
-                return Ok(msg);
-            }
-        }
-        // Check if any sender is blocked waiting to send to us (same as
-        // sys_recv, round robin included).
-        for tid in scheduler::tids_from(st(receiver).recv_rotor) {
-            if tid == receiver {
-                continue;
-            }
-            let dest = match st(tid).task_ipc.state {
-                IpcState::SendBlocked(d) => d,
-                IpcState::CallSendBlocked(d) => d,
-                _ => continue,
-            };
-            if dest == receiver && (from == TID_ANY || from == tid) {
-                st(receiver).recv_rotor = (tid + 1) % MAX_TASKS;
-                let was_call = matches!(st(tid).task_ipc.state, IpcState::CallSendBlocked(_));
-                let msg = match st(tid).task_ipc.pending_msg.take() {
-                    Some(m) => m,
-                    None => {
-                        st(tid).task_ipc.state = IpcState::None;
-                        scheduler::unblock_task(tid);
-                        continue;
-                    }
-                };
-                if was_call {
-                    st(tid).task_ipc.state = IpcState::CallBlocked(receiver);
-                } else {
-                    st(tid).task_ipc.state = IpcState::None;
-                    scheduler::unblock_task(tid);
-                }
-                irq_restore(flags);
-                return Ok(msg);
-            }
-        }
-
         // Check for pending IRQ messages
-        if from == 0 || from == TID_ANY {
+        if notices {
             if let Some(msg) = crate::irq_dispatch::poll_irq_message(receiver) {
-                irq_restore(flags);
-                return Ok(msg);
-            }
-        }
-
-        // A task this one was watching has died.
-        if from == 0 || from == TID_ANY {
-            if let Some(msg) = take_any_death(receiver) {
+                drop(held);
                 irq_restore(flags);
                 return Ok(msg);
             }
         }
 
         // Check for pending notifications
-        if from == 0 || from == TID_ANY {
+        if notices {
             let word = st(receiver).notify;
             if word != 0 {
                 st(receiver).notify = 0;
+                drop(held);
                 irq_restore(flags);
                 return Ok(Message {
                     sender: 0,
@@ -1501,80 +1529,46 @@ pub fn sys_recv_timeout(from: usize, timeout_ns: u64) -> Result<Message, IpcErro
                 });
             }
         }
+    }
+    drop(held);
 
-        // Non-blocking poll: return immediately if timeout is 0
-        if timeout_ns == 0 {
-            irq_restore(flags);
-            return Err(IpcError::Timeout);
-        }
+    // Non-blocking poll: return immediately if timeout is 0
+    if timeout_ns == 0 {
+        irq_restore(flags);
+        return Err(IpcError::Timeout);
+    }
 
-        // A receive from oneself is a sleep, and a sleep is one of the waits
-        // a signal ends. One already waiting for a handler means there is no
-        // sleep to begin: looked at here, with interrupts off, so that one
-        // raised a moment from now finds a sleeper to wake.
-        if from == receiver && crate::signal::interrupted(receiver) {
-            irq_restore(flags);
-            return Err(IpcError::Interrupted);
-        }
+    // A receive from oneself is a sleep, and a sleep is one of the waits a
+    // signal ends. One already waiting for a handler means there is no sleep
+    // to begin: looked at here, with interrupts off, so that one raised a
+    // moment from now finds a sleeper to wake — and before the record is
+    // held again, since a program's signals rank before it.
+    if from == receiver && crate::signal::interrupted(receiver) {
+        irq_restore(flags);
+        return Err(IpcError::Interrupted);
+    }
 
-        // Set deadline and block
+    // Set deadline and block
+    let held = scheduler::lock_record(receiver);
+    unsafe {
         st(receiver).timeout = crate::clock::after(timeout_ns);
         crate::clock::due(st(receiver).timeout);
         st(receiver).task_ipc.state = IpcState::RecvBlocked(from);
         scheduler::block_task(receiver);
     }
+    drop(held);
     irq_restore(flags);
     scheduler::yield_now();
 
-    let flags = irq_save();
-    unsafe {
-        // Clear timeout (may already be 0 if expired)
-        st(receiver).timeout = 0;
-
-        // Check if an IPC message was delivered
-        if let Some(msg) = st(receiver).task_ipc.pending_msg.take() {
-            st(receiver).task_ipc.state = IpcState::None;
-            irq_restore(flags);
-            return Ok(msg);
-        }
-
-        // Check IRQ messages
-        if from == 0 || from == TID_ANY {
-            if let Some(msg) = crate::irq_dispatch::poll_irq_message(receiver) {
-                st(receiver).task_ipc.state = IpcState::None;
-                irq_restore(flags);
-                return Ok(msg);
-            }
-        }
-
-        // A task this one was watching has died.
-        if from == 0 || from == TID_ANY {
-            if let Some(msg) = take_any_death(receiver) {
-                st(receiver).task_ipc.state = IpcState::None;
-                irq_restore(flags);
-                return Ok(msg);
-            }
-        }
-
-        // Check notification word
-        if from == 0 || from == TID_ANY {
-            let word = st(receiver).notify;
-            if word != 0 {
-                st(receiver).notify = 0;
-                st(receiver).task_ipc.state = IpcState::None;
-                irq_restore(flags);
-                return Ok(Message {
-                    sender: 0,
-                    tag: TAG_NOTIFICATION,
-                    data: [word, 0, 0, 0, 0, 0],
-                });
-            }
-        }
-
-        // No message — a timeout, or a sleeper woken for a signal.
-        st(receiver).task_ipc.state = IpcState::None;
+    // Clear timeout (may already be 0 if expired)
+    let held = scheduler::lock_record(receiver);
+    unsafe { st(receiver).timeout = 0 };
+    drop(held);
+    let result = woken(receiver, from);
+    if result.is_ok() {
+        return result;
     }
-    irq_restore(flags);
+    // No message — a timeout, or a sleeper woken for a signal.
     if from == receiver && crate::signal::interrupted(receiver) {
         return Err(IpcError::Interrupted);
     }
@@ -1591,7 +1585,7 @@ pub fn fault_call(faulting_tid: usize, pager_tid: usize, msg: Message) {
     if faulting_tid >= MAX_TASKS || pager_tid >= MAX_TASKS {
         return;
     }
-    let flags = irq_save();
+    let held = scheduler::lock_records(faulting_tid, pager_tid);
     unsafe {
         // Check if pager is recv-blocked waiting for us (or TID_ANY)
         let pager_state = st(pager_tid).task_ipc.state;
@@ -1614,16 +1608,16 @@ pub fn fault_call(faulting_tid: usize, pager_tid: usize, msg: Message) {
         }
         scheduler::block_task(faulting_tid);
     }
-    irq_restore(flags);
+    drop(held);
     scheduler::yield_now();
 
     // Resumed — pager replied. Clean up.
-    let flags = irq_save();
+    let held = scheduler::lock_record(faulting_tid);
     unsafe {
         st(faulting_tid).task_ipc.pending_msg = None;
         st(faulting_tid).task_ipc.state = IpcState::None;
     }
-    irq_restore(flags);
+    drop(held);
 }
 
 /// Check all task timeouts at `now` and unblock expired ones; say when the
@@ -1632,8 +1626,17 @@ pub fn fault_call(faulting_tid: usize, pager_tid: usize, msg: Message) {
 pub fn check_timeouts(now: u64) -> u64 {
     // Already in interrupt context (IRQ handler), interrupts are implicitly off.
     let mut next = u64::MAX;
-    unsafe {
-        for tid in scheduler::tids() {
+    for tid in scheduler::tids() {
+        // Most have no deadline, which is looked at first without the lock:
+        // a task writes its own and then says so to the clock, which comes
+        // back here. One that has is looked at under its record's lock, and
+        // the urgency it lent given back with none held.
+        if unsafe { st(tid).timeout } == 0 {
+            continue;
+        }
+        let held = scheduler::lock_record(tid);
+        let mut lent_to = None;
+        unsafe {
             let deadline = st(tid).timeout;
             if deadline != 0 && now < deadline {
                 next = next.min(deadline);
@@ -1654,13 +1657,17 @@ pub fn check_timeouts(now: u64) -> u64 {
                         st(tid).task_ipc.state = IpcState::None;
                         st(tid).timed_out = true;
                         scheduler::unblock_task(tid);
-                        // Giving up on the reply takes back the urgency lent
-                        // to whoever was going to send it.
-                        scheduler::refresh_priority(dest);
+                        lent_to = Some(dest);
                     }
                     _ => {}
                 }
             }
+        }
+        drop(held);
+        // Giving up on the reply takes back the urgency lent to whoever was
+        // going to send it.
+        if let Some(dest) = lent_to {
+            scheduler::refresh_priority(dest);
         }
     }
     next
@@ -1679,17 +1686,29 @@ pub fn check_timeouts(now: u64) -> u64 {
 /// be alive when its parent called. Anybody else's caller waited on a
 /// parent that might never look.
 ///
-/// The caller has interrupts off.
+/// The caller has interrupts off, and holds no task's record: each is taken
+/// in turn.
 pub fn fail_waiters(dead_tid: usize) {
     if dead_tid >= MAX_TASKS {
         return;
     }
     let error_msg = Message { sender: dead_tid, tag: u64::MAX, data: [0; 6] };
-    unsafe {
-        for tid in scheduler::tids() {
-            if tid == dead_tid {
-                continue;
-            }
+    for tid in scheduler::tids() {
+        // Who is blocked on it is looked for without the locks — becoming so
+        // takes its record's lock and the dead task's — and whoever is, is
+        // looked at again under its own.
+        let on_it = unsafe {
+            matches!(
+                st(tid).task_ipc.state,
+                IpcState::SendBlocked(d) | IpcState::CallSendBlocked(d) | IpcState::CallBlocked(d) | IpcState::RecvBlocked(d)
+                    if d == dead_tid
+            )
+        };
+        if tid == dead_tid || !on_it {
+            continue;
+        }
+        let held = scheduler::lock_record(tid);
+        unsafe {
             match st(tid).task_ipc.state {
                 IpcState::SendBlocked(dest) if dest == dead_tid => {
                     st(tid).task_ipc.state = IpcState::None;
@@ -1708,6 +1727,7 @@ pub fn fail_waiters(dead_tid: usize) {
                 _ => {}
             }
         }
+        drop(held);
     }
 }
 
@@ -1723,6 +1743,7 @@ pub fn cleanup_task_ipc(dead_tid: usize) {
     let waiting_on = blocked_on(dead_tid);
 
     let flags = irq_save();
+    let held = NOTICES.lock();
     unsafe {
         // Withdraw its watches and drop what it never collected, and the
         // watches of it its death did not already tell of. TIDs are
@@ -1734,6 +1755,10 @@ pub fn cleanup_task_ipc(dead_tid: usize) {
         st(dead_tid).watching = END;
         st(dead_tid).owed = END;
         st(dead_tid).watched = END;
+    }
+    drop(held);
+    let held = scheduler::lock_record(dead_tid);
+    unsafe {
         st(dead_tid).clean_wanted = false;
         // Clear the dead task's own IPC state, timeout, notifications, and signal deadline
         st(dead_tid).task_ipc.state = IpcState::None;
@@ -1743,10 +1768,11 @@ pub fn cleanup_task_ipc(dead_tid: usize) {
         st(dead_tid).timeout = 0;
         st(dead_tid).timed_out = false;
         st(dead_tid).notify = 0;
-        set_deadline(dead_tid, 0);
-
-        // And whoever is blocked on it, if its death did not already.
     }
+    drop(held);
+    // The deadlines' list is the one lock's, with interrupts off.
+    unsafe { set_deadline(dead_tid, 0) };
+    // And whoever is blocked on it, if its death did not already.
     fail_waiters(dead_tid);
     irq_restore(flags);
     if let Some(target) = waiting_on {

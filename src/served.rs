@@ -243,13 +243,13 @@ pub fn release(obj: usize) {
 /// # Safety
 /// Interrupts are off.
 pub unsafe fn take_notice(server: usize) -> bool {
-    unsafe {
-        if server >= MAX_TASKS {
-            return false;
-        }
-        let n = &mut st(server).notice;
-        core::mem::replace(n, false)
+    if server >= MAX_TASKS {
+        return false;
     }
+    let held = LOCK.lock();
+    let taken = unsafe { core::mem::replace(&mut st(server).notice, false) };
+    drop(held);
+    taken
 }
 
 /// One of `server`'s objects that no descriptor names, forgotten as it is

@@ -302,6 +302,46 @@ static mut NO_TASK: PerTask = PerTask::new();
 
 /// Every task's id, in order. Each step looks at the table afresh, so a
 /// walk's body may change it. Interrupts must be off.
+/// How many locks the tasks' records share: a task's is the one its number
+/// picks. A lock in each record would go with the record at its reap, under
+/// whoever was waiting for it.
+const RECORD_LOCKS: usize = 256;
+
+static RECORDS: [crate::sync::IrqSpinLock<()>; RECORD_LOCKS] =
+    [const { crate::sync::IrqSpinLock::new(crate::sync::RANK_TASK, "a task's record", ()) }; RECORD_LOCKS];
+
+/// The lock of `tid`'s record: its IPC state (`ipc.rs`), its state as the
+/// scheduler has it — blocked, ready, dead — and the place it is lent.
+pub fn record_lock(tid: usize) -> &'static crate::sync::IrqSpinLock<()> {
+    &RECORDS[tid % RECORD_LOCKS]
+}
+
+/// `tid`'s record's lock, unless this processor holds it already: what a
+/// step that changes another task's state takes.
+pub fn lock_record(tid: usize) -> Option<crate::sync::IrqSpinLockGuard<'static, ()>> {
+    record_lock(tid).lock_unless_held()
+}
+
+/// The records of `a` and `b`, in the order of where their locks are — or
+/// the one, if they share it: for what changes both, a call or a send, or a
+/// receive taking a sender's message.
+pub fn lock_records(
+    a: usize,
+    b: usize,
+) -> (crate::sync::IrqSpinLockGuard<'static, ()>, Option<crate::sync::IrqSpinLockGuard<'static, ()>>) {
+    let (la, lb) = (record_lock(a), record_lock(b));
+    if core::ptr::eq(la, lb) {
+        return (la.lock(), None);
+    }
+    let (first, second) = if (la as *const crate::sync::IrqSpinLock<()> as usize) < (lb as *const crate::sync::IrqSpinLock<()> as usize) {
+        (la, lb)
+    } else {
+        (lb, la)
+    };
+    let held = first.lock();
+    (held, Some(second.lock_second()))
+}
+
 pub(crate) fn tids() -> impl Iterator<Item = usize> {
     tids_from(0)
 }
@@ -728,10 +768,14 @@ pub fn exit_with(code: i32) -> ! {
         // off until the switch, which is the last thing this task does.
         let _ = irq_save();
         st(current).unwaited = joined_by_word(current);
+        let held = lock_record(current);
         if let Some(ref mut task) = *slot(current) {
             task.clear_child_tid = 0;
             task.state = TaskState::Dead;
             task.exit_code = code;
+        }
+        drop(held);
+        if (*slot(current)).is_some() {
             crate::ipc::clear_signal_deadline(current);
             // Whoever is in a call to it is answered now, with a failure. Its
             // parent may be one of them, and a parent waiting for an answer
@@ -874,9 +918,11 @@ unsafe fn schedule_inner(from_irq: bool) { unsafe {
     if current_tid != 0 {
         let state = (*slot(current_tid)).as_ref().map(|t| t.state);
         if state == Some(TaskState::Running) {
+            let held = lock_record(current_tid);
             if let Some(ref mut task) = *slot(current_tid) {
                 task.state = TaskState::Ready;
             }
+            drop(held);
             requeue_here(current_tid);
         } else if state == Some(TaskState::Dead) && st(current_tid).unannounced {
             // Ended from another processor, and this is the one it was
@@ -928,9 +974,11 @@ unsafe fn switch_to(current_tid: usize, next_tid: usize, flags: u64) { unsafe {
     }
     if next_tid == current_tid {
         // Same task, just mark running again
+        let held = lock_record(current_tid);
         if let Some(ref mut task) = *slot(current_tid) {
             task.state = TaskState::Running;
         }
+        drop(held);
         restore_flags(flags);
         return;
     }
@@ -946,9 +994,11 @@ unsafe fn switch_to(current_tid: usize, next_tid: usize, flags: u64) { unsafe {
     // processor. The lock is held until the switch is done, so nobody sees
     // the second said before it is true.
     if next_tid != 0 {
+        let held = lock_record(next_tid);
         if let Some(ref mut task) = *slot(next_tid) {
             task.state = TaskState::Running;
         }
+        drop(held);
         st(next_tid).on_cpu = crate::percpu::index() as u16;
         st(next_tid).last_cpu = crate::percpu::index() as u16;
         // What it runs here is counted as this processor counts it: one
@@ -1083,7 +1133,7 @@ pub fn set_priority(tid: usize, band: u8) -> Result<(), ()> {
 /// (`futex::lock_pi`): the same problem, between threads.
 ///
 /// Called whenever the set of tasks waiting on `tid` changes, with
-/// interrupts off.
+/// interrupts off and no task's record held: it takes each it changes.
 pub fn refresh_priority(tid: usize) {
     let mut cur = tid;
     // Chains of one server calling another are short. One of holders of
@@ -1096,6 +1146,9 @@ pub fn refresh_priority(tid: usize) {
             return;
         }
         unsafe {
+            // Its place is changed with its record's lock held; its
+            // waiters' are read as they are.
+            let _held = lock_record(cur);
             // Its own place, or the better of a waiter's: the band, and the
             // real-time priority in it.
             let base = match *slot(cur) {
@@ -1149,6 +1202,7 @@ pub fn make_ready(tid: usize) {
     if tid >= MAX_TASKS {
         return;
     }
+    let _held = lock_record(tid);
     unsafe {
         if let Some(ref mut task) = *slot(tid) {
             if task.state == TaskState::Blocked {
@@ -1678,9 +1732,14 @@ pub fn block_task(tid: usize) {
     if tid >= MAX_TASKS {
         return;
     }
+    // Not over a death: a task ended while it was on its way to waiting
+    // stays ended.
+    let _held = lock_record(tid);
     unsafe {
         if let Some(ref mut task) = *slot(tid) {
-            task.state = TaskState::Blocked;
+            if task.state != TaskState::Dead {
+                task.state = TaskState::Blocked;
+            }
         }
     }
 }
@@ -1693,6 +1752,7 @@ pub fn unblock_task(tid: usize) {
     if tid >= MAX_TASKS {
         return;
     }
+    let _held = lock_record(tid);
     unsafe {
         if let Some(ref mut task) = *slot(tid) {
             if task.state == TaskState::Blocked {
@@ -1731,6 +1791,7 @@ pub fn unblock_task_next(tid: usize) {
     if tid >= MAX_TASKS {
         return;
     }
+    let _held = lock_record(tid);
     unsafe {
         if let Some(ref mut task) = *slot(tid) {
             if task.state == TaskState::Blocked {
@@ -2157,20 +2218,27 @@ unsafe fn tell_parent(tid: usize) { unsafe {
 fn end_other(tid: usize, code: i32) -> Result<(), ()> {
     unsafe {
         let unwaited = joined_by_word(tid);
-        match (*slot(tid)).as_mut() {
+        // Marked under its record's lock, and the rest done after it.
+        let held = lock_record(tid);
+        let ended = match (*slot(tid)).as_mut() {
             Some(task) if task.state != TaskState::Dead => {
                 st(tid).unwaited = unwaited;
                 task.state = TaskState::Dead;
                 task.exit_code = code;
-                crate::ipc::clear_signal_deadline(tid);
-                // As in `exit_with`: what others wait on is let go now, and
-                // whoever is in a call to it is answered.
-                close_descriptors(tid);
-                crate::ipc::fail_waiters(tid);
-                note_death(tid);
+                true
             }
-            _ => return Err(()),
+            _ => false,
+        };
+        drop(held);
+        if !ended {
+            return Err(());
         }
+        crate::ipc::clear_signal_deadline(tid);
+        // As in `exit_with`: what others wait on is let go now, and whoever
+        // is in a call to it is answered.
+        close_descriptors(tid);
+        crate::ipc::fail_waiters(tid);
+        note_death(tid);
         if runs_elsewhere(tid) {
             // It is running, in ring 3, on another processor, and goes on
             // until that processor comes into the kernel: which this makes

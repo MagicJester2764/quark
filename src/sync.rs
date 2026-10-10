@@ -65,10 +65,11 @@ pub const RANK_TIMER: u8 = 11;
 pub const RANK_SIGFD: u8 = 12;
 pub const RANK_SERVED: u8 = 13;
 pub const RANK_SHMEM: u8 = 14;
+/// The watches (`ipc.rs`): who is to be told of which death, and what is
+/// owed. Waking a watcher takes its record, after.
+pub const RANK_NOTICES: u8 = 15;
 /// The futex's waiters, a bucket at a time. Two, for a requeue.
 pub const RANK_FUTEX: u8 = 16;
-/// A task's record. Two, for a call.
-pub const RANK_TASK: u8 = 18;
 /// A capability space (`cap.rs`: one of 64, the one its number picks). Two,
 /// for a thread joining its program's or a fork's copy.
 pub const RANK_CSPACE: u8 = 20;
@@ -82,6 +83,13 @@ pub const RANK_PROGRAM: u8 = 22;
 pub const RANK_CAP_TABLE: u8 = 23;
 /// An address space's tables and reservations. Two, for a fork or a move.
 pub const RANK_SPACE: u8 = 24;
+/// A task's record (`scheduler::record_lock`: one of 256, the one its number
+/// picks): its IPC state, and its state as the scheduler has it — blocked,
+/// ready, dead — and the place it is lent. After whatever parks or wakes a
+/// task, which does so holding its own lock — an object, a futex's list, an
+/// address space whose unmapping leaves an object to its pager — and before
+/// the run queues it is put on. Two, for a call.
+pub const RANK_TASK: u8 = 26;
 /// A processor's run queues. Two, for a move between processors.
 pub const RANK_RUNQ: u8 = 28;
 /// What is due, and when the clock is set to look.

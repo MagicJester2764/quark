@@ -1347,7 +1347,18 @@ What follows from that, and breaking any of it is quiet:
   saving its own. With a gap between the two, a tick preempted the caller,
   already blocked, and nothing ever ran either task again: fontconfig hung
   about once a minute scanning fonts. `dtest calls` makes three million calls
-  in three seconds and caught it on its first run.
+  in three seconds and caught it on its first run. **And a task's IPC state
+  is changed with its record's lock held** (`scheduler::lock_record`, one of
+  256 by its number, `sync::RANK_TASK`): both records for a call or a send
+  (`lock_records`), and for a receive taking a sender's message, which finds
+  the sender without its lock and looks again with it; a sender becomes
+  blocked on a receiver with the receiver's held, so a receiver's look and
+  its blocking are one step. The record ranks after whatever parks or wakes
+  a task — an object, a futex's list, an address space whose unmapping
+  leaves an object to its pager — and the watches (`ipc::NOTICES`) and a
+  served descriptor's notice rank before it, so a receive collects notices
+  before it takes its own record. Lending a place takes each record it
+  changes (`refresh_priority`), so it is done with none held.
 - **A task runs at the place of whoever is waiting on it** — the band, and
   the real-time priority in it (`place_of`) — for as long as that is true.
   Waiting on it is calling it, or waiting to lock a priority-inheriting word
