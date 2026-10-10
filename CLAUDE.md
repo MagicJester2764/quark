@@ -1164,8 +1164,9 @@ background job that ignores what its terminal raises.
   ring 3 asks too, or a program computing on that path is not interrupted.
 - **The record is written and read back in one step with the page it is
   on.** `back_range` brings the page in with interrupts on; whether it is
-  still there is asked, and the record copied, with them off — between
-  the two, a program short of memory could have it taken.
+  still there is asked, and the record copied, with the address space's
+  lock held (`paging::space_lock`) — between the two, a program short of
+  memory could have it taken, or a sibling unmap it.
 - **The kernel keeps no floating-point state for a handler.** The place a
   program is entered saves and restores it, in ring 3, where a state that
   is not one is the program's fault and not the kernel's: an `XRSTOR` in
@@ -1454,11 +1455,13 @@ closed:
   task, and a program just started exited with status 0 having run nothing.
   The RIP is pushed first now, so an interrupt in the window finds it on the
   stack.
-- **The ready queue is touched only with interrupts off.** Putting a task on
-  it is three writes; a tick between them queued the task it preempted in
-  the same place, and the one being queued was ready and in no queue.
-  `start_task` did that from a system call. Every caller of `unblock_task`
-  holds interrupts off, or is an interrupt.
+- **The ready queue is touched only with interrupts off**, and with its
+  processor's queues' lock held (`runq.rs`). Putting a task on it is three
+  writes; a tick between them queued the task it preempted in the same
+  place, and the one being queued was ready and in no queue. `start_task`
+  did that from a system call. Every caller of `unblock_task` holds
+  interrupts off, or is an interrupt; `unblock_task` takes the task's
+  record and then the queue.
 
 ## What a program uses
 

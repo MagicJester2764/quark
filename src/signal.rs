@@ -1288,7 +1288,9 @@ fn push(tid: usize, regs: &mut Regs, signo: u8, code: u64, value: u64, before: u
         if unsafe { crate::paging::back_range(cr3, rsp as u64, (size + 8) as u64, true) }.is_err() {
             return false;
         }
-        let flags = irq_save();
+        // Under the address space's lock: nothing takes the page, unmaps it
+        // or shares it again while it is looked at and written.
+        let held = crate::paging::space_lock(cr3).lock();
         if unsafe { crate::paging::user_range_accessible(cr3, rsp as u64, (size + 8) as u64, true) } {
             {
                 let _ua = crate::cpu::UserAccess::begin();
@@ -1304,7 +1306,7 @@ fn push(tid: usize, regs: &mut Regs, signo: u8, code: u64, value: u64, before: u
             unsafe { st(tid).mask = (st(tid).mask | how.mask | own) & !UNBLOCKABLE };
             written = true;
         }
-        irq_restore(flags);
+        drop(held);
         if written {
             break;
         }
@@ -1434,12 +1436,12 @@ pub fn ret(at: u64) -> ! {
         if at % 8 != 0 || unsafe { crate::paging::back_range(cr3, at, size, false) }.is_err() {
             break;
         }
-        let flags = irq_save();
+        let held = crate::paging::space_lock(cr3).lock();
         if unsafe { crate::paging::user_range_accessible(cr3, at, size, false) } {
             let _ua = crate::cpu::UserAccess::begin();
             read = Some(unsafe { core::ptr::read_volatile(at as *const Frame) });
         }
-        irq_restore(flags);
+        drop(held);
         if read.is_some() {
             break;
         }
