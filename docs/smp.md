@@ -23,9 +23,20 @@ an interrupt or faults waits at the door until the kernel is empty.
 It is the oldest way to put a kernel on a second processor, and it costs a
 microkernel less than most: the file server, the network stack, the
 compositor and every driver are programs, and run side by side. What is
-serialised is what is left — message passing, page tables, the scheduler.
-Two programs computing run in parallel. Two programs making calls take turns
-at the calls.
+serialised is what is left — page tables, the scheduler, everything a
+program makes. Two programs computing run in parallel.
+
+And two programs making calls do too. A call between two tasks — a send, a
+receive, a call, a reply and a notice, in every form (`syscall::unlocked`)
+— is made without the one lock, under the locks of what it touches (the
+table below): the two tasks' records, the caller's capability space, the
+pages it checks and its processor's queues. A task the door has something
+to say to — ended, stopped or barred from its processor while it ran — and
+a program that traps its calls come in under the one lock as before, and a
+call made without it looks again on its way out. What such a call finds is
+the one lock's — a place to lend that means working out every waiter's, an
+object gone idle, a signal to run — it takes the lock for, with nothing
+else held (`scheduler::with_kernel`, `signal::leaving_call`).
 
 The rules, each of which is kept in one place:
 
@@ -34,12 +45,13 @@ The rules, each of which is kept in one place:
   interrupted the kernel itself finds the lock held by its own processor and
   takes nothing. Each remembers, in its own frame, whether it took the lock,
   and gives back exactly that.
-- **Carried across a switch.** The lock is the processor's and not the
-  task's. A processor that switches tasks in the kernel goes on holding it,
-  and the frames of the task it switches *to* say what to give back on the
-  way out — they were written when that task came in. A task that is
-  switched back in on another processor is switched in by one that holds the
-  lock, so its frames are still right.
+- **Given to whatever is switched to as it expects it.** A task switched
+  out holding it — inside a call that took it, or an interrupt that did —
+  expects it back, and gives it back on its way out, as the frames written
+  when it came in say; one switched out without it — a receive made without
+  the lock — does not, and would never give it back. So each task says which
+  as it is switched out (`kl_held`), and `switch_to` takes the lock or gives
+  it up to match what it switches to. The idle loop always expects it.
 - **Given up before ring 3**, every way there is to get there, and by a
   processor with nothing to do, around its `hlt`.
 
@@ -326,16 +338,18 @@ the kernel choosing, and its own first thread waited minutes to run.
 This is a kernel that runs on several processors. It is not yet one that
 uses them well, and the difference is a list:
 
-- **The one lock.** Four programs making calls make no more calls than one.
+- **The one lock.** A call between two tasks is made without it, and
   `callbench sweep 10` — pairs of threads calling each other, a pair to a
-  processor — made 653,000 calls a second with one pair on eight
-  processors under KVM, 563,000 with two, 506,000 with four and 421,000
-  with eight: fewer the more there are, each waiting at the door for the
-  rest. Taking it apart means a lock for the scheduler, one for each address
-  space's tables, one for the frame allocator, and a call between two tasks
-  that does not stop a third — and an order to take them in, written down,
-  because a kernel with more than one lock has a way to deadlock that a
-  kernel with one has not.
+  processor — makes 646,000 calls a second with one pair on eight
+  processors under KVM, 1,082,000 with two, 1,780,000 with four and
+  1,795,000 with eight, where with every call under the one lock it made
+  591,000, 505,000, 450,000 and 387,000: fewer the more there were, each
+  waiting at the door for the rest. Four making 2.8 times what one makes,
+  and eight no more than four, is a lock every call still takes: the
+  programs' records' one lock, at the door and on the way out, and the
+  capability space a program's threads share. Everything else — a futex,
+  a fault, a pipe, a poll, the clock's expiry — is still made under the
+  one lock, a path at a time to come out from under it.
 - **Interrupts from devices on any processor.** The I/O APIC can send one
   anywhere; every one still goes to the first.
 - **A device's interrupt for a processor above 255**, which needs the

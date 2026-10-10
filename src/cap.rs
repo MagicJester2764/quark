@@ -788,6 +788,21 @@ pub fn task_has_endpoint(tid: usize, dest: usize) -> bool {
     holds(tid, |cap| cap.cap_type == CapType::Endpoint && cap.param0 == number)
 }
 
+/// The number of `dest`'s endpoint, if `tid` may originate IPC to it: read
+/// under `dest`'s record's lock, and looked for in `tid`'s space under that
+/// space's. The call finds the number again under `dest`'s
+/// (`ipc::reaches`): a task's number is never another's, so a task made
+/// since in the slot is not reached on another's capability.
+pub fn endpoint_held(tid: usize, dest: usize) -> Option<u64> {
+    if tid >= MAX_TASKS || dest >= MAX_TASKS {
+        return None;
+    }
+    let held = crate::scheduler::lock_record(dest);
+    let number = endpoint_of(dest);
+    drop(held);
+    (number != 0 && holds(tid, |cap| cap.cap_type == CapType::Endpoint && cap.param0 == number)).then_some(number)
+}
+
 /// The number an `Endpoint` to `target` would record, if `caller` may mint
 /// one: `caller` is `target`, created it, or already holds a capability to it.
 ///

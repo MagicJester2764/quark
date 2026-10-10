@@ -146,16 +146,17 @@ for a machine with nothing to do, `dtest clock` for what time it is and
 whether a wait ends when it should, `dtest fork` for what a fork shares and
 who a write is seen by, `dtest handlers` for a handler the kernel runs,
 `dtest usage` for what a program has used and its share of the processor,
-`dtest devices` for who holds which device; eighteen more on four
+`dtest devices` for who holds which device; twenty more on four
 processors (`dtest placement` for where a task is put to wait, `dtest
-offline` for a processor taken away and brought back); twenty-five more
+offline` for a processor taken away and brought back, `dtest scale` for
+four pairs of tasks calling at once); twenty-five more
 (`dtest pressure`) on a machine with somewhere to write memory out to,
 twelve (`dtest msi`, `dtest devices`) with a device that interrupts by
 message and its driver running, eight (`dtest iommu`) where an IOMMU stands
 between that device and memory, eleven (`dtest usb`) with a keyboard, a
 mouse and a disk on USB, three (`dtest display`) where the display can be
 had another size, and seventeen (`dtest sound`) with a sound card: 1110 on
-the machine ExplOSion tests on, and 1128 on it with four processors — and
+the machine ExplOSion tests on, and 1130 on it with four processors — and
 `qfuzz` throws random requests at every service. `callbench` says how many
 calls a second pairs of threads make, a pair to a processor, and `kstress`
 has every processor making calls, taking faults, waking and writing at
@@ -1358,8 +1359,22 @@ What follows from that, and breaking any of it is quiet:
   a task — an object, a futex's list, an address space whose unmapping
   leaves an object to its pager — and the watches (`ipc::NOTICES`) and a
   served descriptor's notice rank before it, so a receive collects notices
-  before it takes its own record. Lending a place takes each record it
-  changes (`refresh_priority`), so it is done with none held.
+  before it takes its own record — and blocks only if nothing was said
+  since it looked (`noticed`, set under its record by whoever says one).
+  Lending a place takes each record it changes (`refresh_priority`), so it
+  is done with none held, and under the one lock, since it looks at every
+  waiter: a call lends only if it changes the place (`lends`), a reply
+  takes back only from a task that runs lent (`runs_lent`). **Who is waiting
+  to send to a task is a queue in its record** (`ipc::PerTask::queue_*`),
+  in the order they came: a task is on it exactly while it is blocked
+  sending or calling there, and whatever ends that wait takes it off with
+  both records held — the receive, a deadline, a signal, a death, a reap,
+  and a wake that was not the receive's (a driver's interrupt wakes it
+  whatever it waits on). It was a scan of every task, which a receive made
+  without the one lock could not make: a record may be taken apart under
+  it. **And a call reaches the task its capability was for**: the
+  endpoint number checked is checked again under the callee's record
+  (`ipc::reaches`), since a task made since in the slot has another.
 - **A task runs at the place of whoever is waiting on it** — the band, and
   the real-time priority in it (`place_of`) — for as long as that is true.
   Waiting on it is calling it, or waiting to lock a priority-inheriting word
@@ -1580,16 +1595,29 @@ The rules it leaves behind:
 `docs/smp.md` is the design. These are the rules it leaves behind, and
 breaking any of them is quiet until it is a machine that stops.
 
-- **One processor is in the kernel at a time** (`klock.rs`), and that is
-  what keeps every other rule in this file true: "interrupts off" still
-  means nothing else is in here. The lock is taken at the kernel's three
-  doors — `syscall_dispatch`, `exception_handler`, `irq_handler` — and by
-  nothing else; it is the *processor's*, carried across a switch; and it is
-  given up on every way out to ring 3 and by the idle loop around its `hlt`.
-  A handler remembers in its own frame whether it took the lock
-  (`klock::enter`, `leave`) and gives back exactly that. A new way into the
-  kernel takes it; a new way out — a new trampoline to ring 3 — gives it
-  up. Either mistake panics rather than hangs: the lock knows who has it.
+- **One processor is in the kernel at a time, but for calls between two
+  tasks** (`klock.rs`), and that is what keeps every other rule in this
+  file true: "interrupts off" still means nothing else is in here, but
+  them. The lock is taken at the kernel's three doors — `syscall_dispatch`,
+  `exception_handler`, `irq_handler` — and nowhere else but where a call
+  made without it finds something that is the lock's (`with_kernel`). A
+  send, a receive, a call, a reply and a notice, every form
+  (`syscall::unlocked`), are made without it, under the locks of what they
+  touch — the tasks' records, the caller's capability space, the pages
+  checked, the processor's queues — by a task the door has nothing to say
+  to: one ended, stopped or barred from its processor while it ran, or one
+  whose program traps its calls, comes in under the lock, and a call made
+  without it looks again on its way out (`door_has_news`), as
+  `leaving_call` does before it runs a handler. It is given across a switch
+  as the task switched to expects it: one switched out holding it is
+  switched back to holding it, one switched out without it without it
+  (`kl_held`), and the idle loop always with it; and it is given up on
+  every way out to ring 3 and by the idle loop around its `hlt`. A handler
+  remembers in its own frame whether it took the lock (`klock::enter`,
+  `leave`) and gives back exactly that. A new way into the kernel takes it,
+  or is a call between two tasks and takes the locks those take; a new way
+  out — a new trampoline to ring 3 — gives it up. Either mistake panics
+  rather than hangs: the lock knows who has it.
 - **The kernel's locks are taken in the order of their ranks**
   (`sync.rs`; the table is in `docs/smp.md`). Each lock has a rank, the
   one lock's 0, and a processor takes a lock only above every rank it
@@ -1636,11 +1664,22 @@ breaking any of them is quiet until it is a machine that stops.
 - **A dead task's state does not say it has stopped running;
   `scheduler::ON_CPU` does.** Ended from another processor, a task is on its
   kernel stack and in its address space until its processor leaves it. Its
-  parent is told only then (`UNANNOUNCED`, `announce`), `reap_one` will not
+  parent is told only then (`UNANNOUNCED`, `announce`, or by the next door
+  for one caught as its processor was leaving it), `reap_one` will not
   take it apart before, and `space_in_use` — what is asked before an address
   space is thrown away — counts it. Anything new that frees what a task
   stands on asks `ON_CPU`, not `TaskState::Dead`. `SYS_ADDRSPACE_DESTROY`
-  asked only whether a task was alive.
+  asked only whether a task was alive. **And it says a task has left only
+  once its registers are saved**: `context_switch` clears it, after them, so
+  a processor that takes a task another is still leaving waits for it. Only
+  the idle loop waits — nothing waits for the idle loop, and two processors
+  swapping tasks would each be waiting for the other's — and without the one
+  lock, which the one leaving may need to finish; anything else puts the
+  task back and goes to its idle loop. A task taken to run is claimed under
+  its record's lock, and one ended meanwhile is not run; and none is taken
+  apart while a processor is choosing what to run (`CHOOSING`), which may
+  have it in hand and not yet claimed — `reap_one` takes it out of every
+  queue first, then waits for nobody and tries again later.
 - **A mapping taken away is taken away on every processor** (`tlb.rs`),
   before its frame can be anybody else's (`pmm::alloc` settles first) and
   before the kernel lock is given up (`klock::release` does). The three
@@ -1856,11 +1895,13 @@ breaking any of them is quiet until it is a machine that stops.
 - A poll set a task is parked on is not held the way a pipe is: a sibling
   closing the set while another thread waits on it leaves that thread to its
   timeout. A one-shot `SYS_POLL` makes a set of its own and is not affected.
-- **The kernel is one processor's at a time.** Programs run on every
-  processor; a system call, a fault or an interrupt waits for the kernel to
-  be empty. The locks under the one lock wait now and are taken in order
-  (`sync.rs`), but almost nothing is kept under them alone yet: what comes
-  out from under the one lock does so a path at a time, each measured.
+- **The kernel is one processor's at a time, but for calls between two
+  tasks.** Programs run on every processor; every other system call, a
+  fault or an interrupt waits for the kernel to be empty. What comes out
+  from under the one lock does so a path at a time, each measured; a
+  pager's receive takes the lock when one of its objects has gone idle,
+  and a call that lends a place to a task better placed than its callee
+  takes it to work the places out.
 - Every deadline on the machine is the first processor's to fire and to be
   told of: a program on another processor that sets one sooner than the
   first's timer is set for interrupts it to say so, and each wakes it when

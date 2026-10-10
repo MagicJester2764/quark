@@ -38,11 +38,16 @@ impl CpuContext {
 /// Saves callee-saved registers into `old`, loads from `new`, swaps RSP,
 /// and "returns" into the new task by pushing RIP and using `ret`.
 ///
+/// `left`, unless it is null, is the task left's word for the processor it
+/// is on (`scheduler`'s `on_cpu`), which says none once its registers are
+/// saved: from then on this processor touches nothing of the task's, its
+/// stack included, and another may run it.
+///
 /// # Safety
 /// Both pointers must point to valid CpuContext structs.
 /// The new context's RSP must point to a valid stack.
 #[unsafe(naked)]
-pub unsafe extern "C" fn context_switch(old: *mut CpuContext, new: *const CpuContext) {
+pub unsafe extern "C" fn context_switch(old: *mut CpuContext, new: *const CpuContext, left: *mut u16) {
     core::arch::naked_asm!(
         // Save callee-saved registers into old context
         // old is in rdi, new is in rsi
@@ -60,6 +65,14 @@ pub unsafe extern "C" fn context_switch(old: *mut CpuContext, new: *const CpuCon
         "pushfq",
         "pop rax",
         "mov [rdi + 0x40], rax",
+
+        // The task left is on no processor now. What is left to do reads the
+        // new context and uses no stack until it has the new one; and x86
+        // keeps stores in order, so whoever sees this sees the saves above.
+        "test rdx, rdx",
+        "jz 3f",
+        "mov word ptr [rdx], 0xFFFF",
+        "3:",
 
         // Load callee-saved registers from new context
         "mov rbx, [rsi + 0x00]",

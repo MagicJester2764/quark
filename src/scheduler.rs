@@ -187,6 +187,12 @@ pub struct PerTask {
     /// the task ([`schedule_inner`]). A parent told sooner would collect a
     /// child that is still running.
     unannounced: bool,
+    /// Whether its processor held the one lock (`klock`) when it was switched
+    /// out: what it expects again when it is switched back to, and gives
+    /// back on its way out — a system call, a fault or an interrupt that
+    /// took it is still in it. A task made, or forked, starts in a
+    /// trampoline that gives it up, and expects it too.
+    kl_held: bool,
     /// Dead, and nobody is going to wait for it: a thread that is joined
     /// through the word it asked to have cleared ([`joined_by_word`]). Decided
     /// as it dies, when the word is forgotten.
@@ -260,6 +266,7 @@ impl PerTask {
             on_cpu: NO_CPU,
             last_cpu: 0,
             unannounced: false,
+            kl_held: true,
             unwaited: false,
             pinned: [(0, 0); PINS],
             npinned: 0,
@@ -423,6 +430,19 @@ static mut RT_USE: [(u64, u64, u64); crate::percpu::MAX_CPUS] = [(0, 0, 0); crat
 /// waits for the tick, which is a known gap; a real-time one is woken to run.
 static RESCHED: [AtomicBool; crate::percpu::MAX_CPUS] = [const { AtomicBool::new(false) }; crate::percpu::MAX_CPUS];
 
+/// Each processor that is choosing what to run next: from taking a task
+/// out of a queue, or deciding to hand over to one, to claiming it under
+/// its record's lock (`switch_to`). Until the claim it is on no processor
+/// and in no queue, and its record is read and written here — so a task is
+/// not taken apart while any processor is choosing (`reap_one`), which does
+/// not wait for it: it tries again.
+static CHOOSING: [AtomicBool; crate::percpu::MAX_CPUS] = [const { AtomicBool::new(false) }; crate::percpu::MAX_CPUS];
+
+/// Whether any processor is choosing what to run next.
+fn any_choosing() -> bool {
+    (0..crate::percpu::count()).any(|cpu| CHOOSING[cpu].load(Ordering::SeqCst))
+}
+
 /// Where `tid` stands to be chosen: the band it runs in and its real-time
 /// priority there, 0 for none. The lower band is better, and in one band the
 /// higher priority.
@@ -433,6 +453,26 @@ pub fn place_of(tid: usize) -> (u8, u8) {
 /// Whether place `a` is better than place `b`.
 pub fn better(a: (u8, u8), b: (u8, u8)) -> bool {
     a.0 < b.0 || (a.0 == b.0 && a.1 > b.1)
+}
+
+/// Whether `tid` runs at a place other than its own: lent one by somebody
+/// waiting on it.
+pub fn runs_lent(tid: usize) -> bool {
+    unsafe {
+        match *slot(tid) {
+            Some(ref t) => (t.priority, st(tid).rt) != (t.base_priority, st(tid).rt_base),
+            None => false,
+        }
+    }
+}
+
+/// Whether `waiter` coming to wait on `on` is a change to the place `on`
+/// runs at, for [`refresh_priority`] to work out: its own is better, or what
+/// `on` runs at is lent already and is worked out again whoever waits. A
+/// call between two tasks of one band changes nothing, and is not made to
+/// look at every task to find that out.
+pub fn lends(waiter: usize, on: usize) -> bool {
+    better(place_of(waiter), place_of(on)) || runs_lent(on)
 }
 
 /// Whether this processor's real-time tasks have had their share of the
@@ -583,6 +623,75 @@ const NO_CPU: u16 = u16::MAX;
 /// ring 3, or has nothing to do, does it.
 static REAP_WANTED: AtomicBool = AtomicBool::new(false);
 
+/// A task ended from another processor was still on its own when it was
+/// ended (`end_other`), and its parent is told — woken to collect it — by
+/// whoever next finds it on none: the processor leaving it, as it chooses
+/// what to run next, or failing that the next door or idle loop
+/// (`announce_due`). A switch made without the one lock can be leaving it
+/// already when it is ended, and has chosen by then.
+static ANNOUNCE_WANTED: AtomicBool = AtomicBool::new(false);
+
+/// Whether the door has something to say to `tid`, coming into the kernel
+/// or leaving it without the one lock (`syscall_dispatch`): it was ended,
+/// stopped, or barred from this processor while it ran, or there is a dead
+/// task to take apart or tell of. Read as it is: what is said after the look
+/// is said at the next door — a task ended or stopped from elsewhere has its
+/// processor interrupted, and comes to one.
+pub fn door_has_news(tid: usize) -> bool {
+    if REAP_WANTED.load(Ordering::Relaxed) || ANNOUNCE_WANTED.load(Ordering::Relaxed) {
+        return true;
+    }
+    if tid == 0 || tid >= MAX_TASKS {
+        return false;
+    }
+    let flags = irq_save();
+    let news = unsafe {
+        matches!(*slot(tid), Some(ref t) if t.state == TaskState::Dead)
+            || st(tid).held
+            || !may_run_on(tid, crate::percpu::index())
+    };
+    irq_restore(flags);
+    news
+}
+
+/// Run `f` under the one lock: taken for it if this processor has it not —
+/// which is right only with no other lock held, as for any taking of it —
+/// and given back after.
+pub fn with_kernel<R>(f: impl FnOnce() -> R) -> R {
+    let flags = irq_save();
+    let took = !crate::klock::held();
+    if took {
+        crate::klock::acquire();
+    }
+    let out = f();
+    if took {
+        crate::klock::release();
+    }
+    irq_restore(flags);
+    out
+}
+
+/// Tell of every task ended from another processor that is on none now.
+///
+/// # Safety
+/// Interrupts off, the one lock held.
+unsafe fn announce_due() { unsafe {
+    let mut more = false;
+    for t in tids() {
+        if st(t).unannounced {
+            if core::ptr::read_volatile(&raw const st(t).on_cpu) == NO_CPU {
+                st(t).unannounced = false;
+                announce(t);
+            } else {
+                more = true;
+            }
+        }
+    }
+    if more {
+        ANNOUNCE_WANTED.store(true, Ordering::Relaxed);
+    }
+}}
+
 /// Initialize the scheduler. Creates the idle task (TID 0) which represents
 /// the current execution context (kernel_main's continuation).
 pub fn init() {
@@ -661,7 +770,10 @@ pub fn spawn(entry_fn: fn()) -> usize {
 
         let flags = irq_save();
         unsafe {
-            if let Err(rec) = table().fill_at(tid, TaskRec::new(task)) {
+            let held = record_lock(tid).lock();
+            let filled = table().fill_at(tid, TaskRec::new(task));
+            drop(held);
+            if let Err(rec) = filled {
                 irq_restore(flags);
                 let mut task = rec.task;
                 task.free_stack();
@@ -909,6 +1021,7 @@ unsafe fn schedule_inner(from_irq: bool) { unsafe {
     core::arch::asm!("pushfq; pop {}; cli", out(reg) flags, options(nostack));
 
     let current_tid = crate::percpu::current();
+    CHOOSING[crate::percpu::index()].store(true, Ordering::SeqCst);
     // Its turn so far is counted before anything is chosen, so that what it
     // has just run counts against it.
     count_turn(current_tid);
@@ -926,7 +1039,12 @@ unsafe fn schedule_inner(from_irq: bool) { unsafe {
             requeue_here(current_tid);
         } else if state == Some(TaskState::Dead) && st(current_tid).unannounced {
             // Ended from another processor, and this is the one it was
-            // running on, leaving it: now its parent may be told.
+            // running on, leaving it: now its parent may be told — under the
+            // one lock, which a task in a call made without it has not got,
+            // and has no other lock held here.
+            if !crate::klock::held() {
+                crate::klock::acquire();
+            }
             st(current_tid).unannounced = false;
             announce(current_tid);
         }
@@ -936,6 +1054,7 @@ unsafe fn schedule_inner(from_irq: bool) { unsafe {
     let next_tid = dequeue_ready().unwrap_or(0);
     if next_tid == 0 && current_tid == 0 {
         // Already idle, restore flags and return
+        CHOOSING[crate::percpu::index()].store(false, Ordering::Release);
         restore_flags(flags);
         return;
     }
@@ -972,13 +1091,17 @@ unsafe fn switch_to(current_tid: usize, next_tid: usize, flags: u64) { unsafe {
         crate::serial::puts(b"\n[KLOCK a lock held across a switch]\n");
         panic!("a lock held across a switch");
     }
+    let me = crate::percpu::index();
     if next_tid == current_tid {
         // Same task, just mark running again
         let held = lock_record(current_tid);
         if let Some(ref mut task) = *slot(current_tid) {
-            task.state = TaskState::Running;
+            if task.state != TaskState::Dead {
+                task.state = TaskState::Running;
+            }
         }
         drop(held);
+        CHOOSING[me].store(false, Ordering::Release);
         restore_flags(flags);
         return;
     }
@@ -990,23 +1113,83 @@ unsafe fn switch_to(current_tid: usize, next_tid: usize, flags: u64) { unsafe {
     crate::usage::switched(current_tid, gave_up);
     crate::usage::resumed(next_tid);
 
-    // Mark next task as running, and here; and the one being left as on no
-    // processor. The lock is held until the switch is done, so nobody sees
-    // the second said before it is true.
+    // What the task being left expects of the one lock when it is switched
+    // back to: what this processor holds now.
+    if current_tid != 0 {
+        st(current_tid).kl_held = crate::klock::held();
+    }
+    // The task to run may still be on another processor, switching away
+    // from it: its registers are not saved until that one's switch says so
+    // (`context_switch`). Only the idle loop waits for that — nothing waits
+    // for the idle loop, so no two processors can each be waiting for the
+    // other's — and without the one lock, which the processor leaving it may
+    // need to finish, answering what other processors ask meanwhile. A task
+    // being left puts it back where it can be found, and the idle loop runs
+    // here instead.
+    let mut next_tid = next_tid;
+    if next_tid != 0 && core::ptr::read_volatile(&raw const st(next_tid).on_cpu) != NO_CPU {
+        if current_tid == 0 {
+            if crate::klock::held() {
+                crate::klock::release();
+            }
+            while core::ptr::read_volatile(&raw const st(next_tid).on_cpu) != NO_CPU {
+                crate::smp::while_waiting();
+                core::hint::spin_loop();
+            }
+        } else {
+            let held = lock_record(next_tid);
+            enqueue(next_tid);
+            drop(held);
+            next_tid = 0;
+        }
+    }
+    // Claimed under its record's lock: running, and here — unless it was
+    // ended meanwhile, or taken apart, when this processor's idle loop runs
+    // instead. A task ended goes no further than its next door, and one
+    // ended before it is claimed has none; one claimed first is ended by
+    // whoever ended it as a task running elsewhere (`end_other`). The one
+    // being left is said to be on no processor by the switch, once its
+    // registers are saved: said any sooner, another processor could run it
+    // from what was saved before.
     if next_tid != 0 {
         let held = lock_record(next_tid);
-        if let Some(ref mut task) = *slot(next_tid) {
-            task.state = TaskState::Running;
+        let alive = matches!(*slot(next_tid), Some(ref t) if t.state != TaskState::Dead);
+        if alive {
+            if let Some(ref mut task) = *slot(next_tid) {
+                task.state = TaskState::Running;
+            }
+            st(next_tid).on_cpu = me as u16;
+            st(next_tid).last_cpu = me as u16;
         }
         drop(held);
-        st(next_tid).on_cpu = crate::percpu::index() as u16;
-        st(next_tid).last_cpu = crate::percpu::index() as u16;
+        if !alive {
+            next_tid = 0;
+        }
+    }
+    CHOOSING[me].store(false, Ordering::Release);
+    if next_tid == current_tid {
+        // The idle loop, which chose a task that was ended: it goes on.
+        restore_flags(flags);
+        return;
+    }
+
+    // And the one lock as the task switched to expects it: held for one
+    // switched out holding it, and for the idle loop; not for one that was
+    // not, which would never give it back.
+    let wants = next_tid == 0 || st(next_tid).kl_held;
+    if wants && !crate::klock::held() {
+        crate::klock::acquire();
+    } else if !wants && crate::klock::held() {
+        crate::klock::release();
+    }
+
+    if next_tid != 0 {
         // What it runs here is counted as this processor counts it: one
         // handed a call, or taken from another, comes from another's.
-        runq::moved(next_tid, crate::percpu::index(), priority_of(next_tid));
+        runq::moved(next_tid, me, priority_of(next_tid));
     }
     if current_tid != 0 {
-        st(current_tid).on_cpu = NO_CPU;
+        // Said to be on no processor by the switch itself, once it is saved.
         // When it left: a processor that takes it soon after takes it warm
         // from this one's cache (`runq::pull`).
         st(current_tid).ran_at = crate::clock::now();
@@ -1082,8 +1265,10 @@ unsafe fn switch_to(current_tid: usize, next_tid: usize, flags: u64) { unsafe {
     // Enabling interrupts before context_switch creates a race where a nested
     // timer interrupt can re-enter schedule_inner with stale old_ctx/new_ctx.
 
-    // Perform the context switch (restores RFLAGS from new context)
-    context::context_switch(old_ctx, new_ctx);
+    // Perform the context switch (restores RFLAGS from new context), which
+    // says the task left is on no processor once it has saved it.
+    let left = if current_tid != 0 { &raw mut st(current_tid).on_cpu } else { core::ptr::null_mut() };
+    context::context_switch(old_ctx, new_ctx, left);
 }}
 
 /// Where a task's registers are kept while it is not running: in the task,
@@ -1238,6 +1423,11 @@ pub fn donate_to(tid: usize, flags: u64) {
             return;
         }
         let current_tid = crate::percpu::current();
+        // Choosing from here to the claim (`switch_to`): its record is not
+        // taken apart meanwhile, and is looked at under its lock.
+        let me = crate::percpu::index();
+        CHOOSING[me].store(true, Ordering::SeqCst);
+        let held = if tid < MAX_TASKS { lock_record(tid) } else { None };
 
         // A task of a stopped program is not handed the processor: it is
         // ready, in no queue, and stays so until the program is continued.
@@ -1250,20 +1440,24 @@ pub fn donate_to(tid: usize, flags: u64) {
         // ordinary task ahead of a real-time one. When something better is
         // waiting, go through the queue instead — the callee is ready and
         // will be picked in its turn.
-        if takeable && (outranked(tid) || !may_run_on(tid, crate::percpu::index())) {
+        if takeable && (outranked(tid) || !may_run_on(tid, me)) {
             enqueue(tid);
             takeable = false;
         }
+        if takeable {
+            // At least one tick, so a caller whose slice was already spent
+            // still makes progress rather than handing over a turn that
+            // ends at once.
+            st(tid).slice_left = st(current_tid).slice_left.max(1);
+            st(current_tid).slice_left = 0;
+        }
+        drop(held);
         if !takeable {
+            CHOOSING[me].store(false, Ordering::Release);
             restore_flags(flags);
             yield_now();
             return;
         }
-
-        // At least one tick, so a caller whose slice was already spent still
-        // makes progress rather than handing over a turn that ends at once.
-        st(tid).slice_left = st(current_tid).slice_left.max(1);
-        st(current_tid).slice_left = 0;
         switch_to(current_tid, tid, flags);
     }
 }
@@ -1502,6 +1696,11 @@ pub fn arrived() {
     // call, and taking it is a write every processor would wait its turn at.
     if REAP_WANTED.load(Ordering::Relaxed) && REAP_WANTED.swap(false, Ordering::Relaxed) {
         reap_dead();
+    }
+    if ANNOUNCE_WANTED.load(Ordering::Relaxed) && ANNOUNCE_WANTED.swap(false, Ordering::Relaxed) {
+        let flags = irq_save();
+        unsafe { announce_due() };
+        irq_restore(flags);
     }
     let me = crate::percpu::current();
     if me == 0 {
@@ -2246,6 +2445,7 @@ fn end_other(tid: usize, code: i32) -> Result<(), ()> {
             // kernel stack and in its address space — so its parent is
             // told by that processor as it leaves ([`schedule_inner`]).
             st(tid).unannounced = true;
+            ANNOUNCE_WANTED.store(true, Ordering::Relaxed);
             interrupt_if_elsewhere(tid);
         } else {
             announce(tid);
@@ -2542,6 +2742,9 @@ pub fn idle() -> ! {
         loop {
             REAP_WANTED.store(false, Ordering::Relaxed);
             reap_dead();
+            if ANNOUNCE_WANTED.swap(false, Ordering::Relaxed) {
+                unsafe { announce_due() };
+            }
             if !run_ready() {
                 break;
             }
@@ -2731,11 +2934,21 @@ unsafe fn reap_one(i: usize) -> bool { unsafe {
     if parent != 0 && st(parent).wait_result == i {
         return false;
     }
+    // Out of whatever queue it is in first, so that no processor takes it
+    // from here on; then not while any processor is choosing, which may have
+    // taken it already and not yet claimed it (`CHOOSING`), its record in
+    // hand. Whoever next comes into the kernel, or has nothing to do, tries
+    // again.
+    unlink_ready(i);
+    if any_choosing() {
+        REAP_WANTED.store(true, Ordering::Relaxed);
+        return false;
+    }
     // Ended from another processor, and still running there: what is freed
     // below is what it is standing on. That processor has been interrupted
     // and will leave it; whoever next comes into the kernel, or has nothing
     // to do, tries again.
-    if st(i).on_cpu != NO_CPU {
+    if core::ptr::read_volatile(&raw const st(i).on_cpu) != NO_CPU {
         REAP_WANTED.store(true, Ordering::Relaxed);
         return false;
     }
@@ -2797,7 +3010,11 @@ unsafe fn reap_one(i: usize) -> bool { unsafe {
     // which goes through its record.
     unlink_ready(i);
     crate::waitlist::forget(i);
+    // Given back under its lock: whoever looks at another task's record does
+    // so holding it, and finds a record or none, never one being freed.
+    let held = record_lock(i).lock();
     table().empty(i);
+    drop(held);
 
     // Left naming this TID, its children would wait on a parent that is gone,
     // and whatever took the slot next would find them its own — collected by
@@ -3027,6 +3244,9 @@ pub fn create_empty_task() -> Option<usize> {
     unsafe {
         // Made in its room, from what every task starts as: built here and
         // moved, the record took six kilobytes of the caller's kernel stack.
+        // Under its lock, so that one who looks at it holding that finds it
+        // whole or not at all.
+        let held = record_lock(tid).lock();
         let made = table().fill_from(tid, &TASK_TEMPLATE, |r| {
             let t = &mut r.task;
             t.tid = tid;
@@ -3043,6 +3263,7 @@ pub fn create_empty_task() -> Option<usize> {
             // stranger: it can already read the memory, but not the moment.
             crate::fpu::clean_into(&raw mut t.fpu);
         });
+        drop(held);
         if made.is_err() {
             // No memory for its record: nothing was made.
             irq_restore(flags);

@@ -966,8 +966,15 @@ fn pending_for(tid: usize) -> u64 {
 }
 
 /// Whether the way out of the kernel has anything to do for task `tid`.
-fn due(tid: usize) -> bool {
+pub fn due(tid: usize) -> bool {
     (unsafe { st(tid).restore.is_some() }) || ready(tid)
+}
+
+/// Whether `tid`'s program has said where its calls are made from
+/// (`SYS_SYSCALL_TRAP`): a call from anywhere else is SIGSYS at once, which
+/// is the one lock's to raise.
+pub fn traps_calls(tid: usize) -> bool {
+    tid != 0 && tid < MAX_TASKS && fdtable::trap_of(tid).is_some()
 }
 
 /// The signals task `tid` holds back.
@@ -1378,6 +1385,15 @@ pub fn trap_call(nr: u64, args: [u64; 6]) -> Option<u64> {
     if at >= from && at < to {
         return None;
     }
+    // Acted on under the one lock. A call made without it was let in by a
+    // door that saw no trap (`syscall::unlocked`), and a sibling has set one
+    // since: it takes the lock now, with nothing else held, and the door
+    // gives it back on the way out.
+    if !crate::klock::held() {
+        unsafe { core::arch::asm!("cli", options(nostack, nomem)) };
+        crate::klock::acquire();
+        unsafe { core::arch::asm!("sti", options(nostack, nomem)) };
+    }
     let mut regs: Regs = [0; 18];
     regs[RAX] = nr;
     regs[RBX] = frame.rbx;
@@ -1507,6 +1523,12 @@ pub fn leaving_call(answer: u64) -> u64 {
                 answer = AGAIN;
             }
             return answer;
+        }
+        // Something to run or to act on: under the one lock, which a call
+        // made without it takes now — nothing else is held here, and what
+        // it takes is given back on the way out (`syscall_dispatch`).
+        if !crate::klock::held() {
+            crate::klock::acquire();
         }
         sti();
         let Some(frame) = scheduler::current_user_frame_mut() else {

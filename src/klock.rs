@@ -14,17 +14,20 @@
 //! The rules, which are few and each of which is kept in one place:
 //!
 //! - **Taken on the way in from ring 3**, by whoever arrives: the system
-//!   call's dispatch, and the interrupt and exception handlers. A handler
-//!   that interrupted the kernel itself finds the lock held by its own
-//!   processor and takes nothing. Each remembers in its own frame whether it
-//!   took the lock ([`enter`]), and gives back exactly that on the way out
+//!   call's dispatch, and the interrupt and exception handlers — but for a
+//!   call between two tasks (`syscall::unlocked`), which is made without it
+//!   and takes it only for what it finds to be the lock's. A handler that
+//!   interrupted the kernel itself finds the lock held by its own processor
+//!   and takes nothing. Each remembers in its own frame whether it took the
+//!   lock ([`enter`]), and gives back exactly that on the way out
 //!   ([`leave`]).
-//! - **Carried across a switch.** A processor that switches tasks in the
-//!   kernel goes on holding the lock; the lock is the processor's and not
-//!   the task's. The frames of the task it switches *to* say what to give
-//!   back on the way out, and they were written when that task came in. A
-//!   task that is switched back in on another processor is switched in by a
-//!   processor that holds the lock, so its frames are still right.
+//! - **Given across a switch as the task switched to expects it.** A task
+//!   switched out holding the lock — in a call that took it, or an
+//!   interrupt that did — expects it back, and its frames give it back on
+//!   the way out; one switched out without it does not. Each says which as
+//!   it is switched out (`scheduler`'s `kl_held`), and the switch takes the
+//!   lock or gives it up to match what it switches to. The idle loop always
+//!   expects it.
 //! - **Given up before ring 3**, every way there is to get there: the end
 //!   of a system call, the end of an interrupt or a fault taken in ring 3,
 //!   and the first entry of a new task, a forked child and an `exec`.
@@ -33,7 +36,7 @@
 //!   handler that interrupted the kernel and still has the lock to take.
 //!
 //! So a processor holds the lock exactly while it runs kernel code, the
-//! `hlt` aside, and every context switch happens with it held.
+//! `hlt` aside, but for a call between two tasks.
 //!
 //! Waiting for it is spinning with interrupts off. Whoever waits has
 //! nothing else it may do: it is on its way into the kernel. Two things

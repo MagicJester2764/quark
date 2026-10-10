@@ -862,7 +862,7 @@ fn fd_write_ipc(target_tid: usize, endpoint: u64, tag: u64, ptr: *const u8, len:
             tag,
             data,
         };
-        match crate::ipc::sys_call(target_tid, &msg) {
+        match crate::ipc::sys_call(target_tid, endpoint, &msg) {
             Ok(_) => {}
             Err(_) => return offset as u64,
         }
@@ -883,7 +883,7 @@ fn fd_read_ipc(target_tid: usize, endpoint: u64, tag: u64, ptr: *mut u8, max_len
         tag,
         data: [request_len as u64, 0, 0, 0, 0, 0],
     };
-    match crate::ipc::sys_call(target_tid, &msg) {
+    match crate::ipc::sys_call(target_tid, endpoint, &msg) {
         Ok(reply) => {
             let actual = (reply.data[0] as usize).min(request_len);
             // Unpack bytes from reply.data[1..6] into a staging buffer, then
@@ -933,11 +933,19 @@ extern "C" fn syscall_dispatch(
     // What the caller had in R9, which the stub kept: interrupts have been
     // off since, so it is this call's.
     let r9 = crate::percpu::syscall_r9();
-    crate::klock::acquire();
-    unsafe { crate::usage::entered(scheduler::current_tid()) };
+    let me = scheduler::current_tid();
+    // A call between two tasks is made without the one lock (`unlocked`),
+    // by a task the door has nothing to say to, in a program that does not
+    // trap its calls; every other call, and every other task, waits for it.
+    if !unlocked(nr, me) {
+        crate::klock::acquire();
+    }
+    unsafe { crate::usage::entered(me) };
     // It may have waited at the door for that, and whoever had the lock may
     // have ended this task or stopped it. One that was ended makes no call.
-    scheduler::arrived();
+    if crate::klock::held() {
+        scheduler::arrived();
+    }
     unsafe { core::arch::asm!("sti", options(nostack, nomem)) };
     // A call made from where its program has said none is made is not made:
     // the task goes to its handler for SIGSYS instead (`SYS_SYSCALL_TRAP`).
@@ -951,8 +959,16 @@ extern "C" fn syscall_dispatch(
     // A real-time task it made ready, better placed than itself: it runs
     // now, not at the next tick.
     scheduler::preempt_if_asked();
+    // A call made without the one lock looks on its way out at what the
+    // door would have said coming in, under the lock if there is anything:
+    // it may have been ended or stopped while it waited.
+    if !crate::klock::held() && scheduler::door_has_news(me) {
+        crate::klock::acquire();
+        scheduler::arrived();
+    }
     // A handler the kernel runs is run on the way out: the task goes back
-    // to the handler, with where it was going on its stack.
+    // to the handler, with where it was going on its stack. Under the one
+    // lock if there is one to run, which it takes for itself.
     let answer = crate::signal::leaving_call(answer);
     unsafe { core::arch::asm!("cli", options(nostack, nomem)) };
     // Never a `sysret` to what is not a program's address. Every way the
@@ -960,11 +976,35 @@ extern "C" fn syscall_dispatch(
     // entry, a program's start — and this is where a new one that forgot
     // would make Intel's `sysret` fault in ring 0 on the program's stack.
     if scheduler::current_user_frame_mut().is_some_and(|f| f.rip >= USER_ADDR_LIMIT) {
+        if !crate::klock::held() {
+            crate::klock::acquire();
+        }
         scheduler::exit_program(-11);
     }
-    unsafe { crate::usage::leaving(scheduler::current_tid()) };
-    crate::klock::release();
+    unsafe { crate::usage::leaving(me) };
+    if crate::klock::held() {
+        crate::klock::release();
+    }
     answer
+}
+
+/// Whether call `nr` of task `me` is made without the one lock: one of the
+/// calls between two tasks — a send, a receive, a call, a reply and a
+/// notice, their forms with a deadline, and a call that lends a buffer or
+/// offers a capability — which take the two tasks' records' locks, the
+/// caller's capability space's, the pages it checks' and their processors'
+/// queues', and touch nothing the one lock keeps. Not for a task the door
+/// has news for (`door_has_news`), nor one whose program traps its calls
+/// (`SYS_SYSCALL_TRAP`, which may be SIGSYS at once): those are the one
+/// lock's (`docs/smp.md`).
+fn unlocked(nr: u64, me: usize) -> bool {
+    matches!(
+        nr,
+        SYS_SEND | SYS_CALL | SYS_REPLY | SYS_CALL_TIMEOUT | SYS_NOTIFY | SYS_RECV | SYS_RECV_TIMEOUT
+            | SYS_CALL_LEND | SYS_CALL_OFFER | SYS_CALL_WITH
+    )
+        && !scheduler::door_has_news(me)
+        && !crate::signal::traps_calls(me)
 }
 
 /// The system calls.
@@ -1474,9 +1514,9 @@ fn dispatch(
         SYS_GETPID => scheduler::current_tid() as u64,
         SYS_SEND => {
             let dest = arg0 as usize;
-            if !crate::cap::task_has_endpoint(scheduler::current_tid(), dest) {
+            let Some(number) = crate::cap::endpoint_held(scheduler::current_tid(), dest) else {
                 return deny_ipc(scheduler::current_tid(), dest, b"send");
-            }
+            };
             let msg_ptr = arg1 as *const crate::ipc::Message;
             let msg_size = core::mem::size_of::<crate::ipc::Message>() as u64;
             if !validate_user_ptr(arg1, msg_size) { return u64::MAX; }
@@ -1484,7 +1524,7 @@ fn dispatch(
                 let _ua = crate::cpu::UserAccess::begin();
                 unsafe { *msg_ptr }
             };
-            match crate::ipc::sys_send(dest, &msg) {
+            match crate::ipc::sys_send(dest, number, &msg) {
                 Ok(()) => 0,
                 Err(_) => u64::MAX,
             }
@@ -1508,9 +1548,9 @@ fn dispatch(
             // Returns 0 on reply, 1 on timeout, u64::MAX on error — a timeout
             // is an answer ("nobody responded"), not a failure to ask.
             let dest = arg0 as usize;
-            if !crate::cap::task_has_endpoint(scheduler::current_tid(), dest) {
+            let Some(number) = crate::cap::endpoint_held(scheduler::current_tid(), dest) else {
                 return deny_ipc(scheduler::current_tid(), dest, b"call");
-            }
+            };
             let msg_ptr = arg1 as *const crate::ipc::Message;
             let reply_ptr = arg2 as *mut crate::ipc::Message;
             let msg_size = core::mem::size_of::<crate::ipc::Message>() as u64;
@@ -1520,7 +1560,7 @@ fn dispatch(
                 let _ua = crate::cpu::UserAccess::begin();
                 unsafe { *msg_ptr }
             };
-            match crate::ipc::sys_call_timeout(dest, &msg, crate::clock::span(arg3)) {
+            match crate::ipc::sys_call_timeout(dest, number, &msg, crate::clock::span(arg3)) {
                 Ok(reply) => {
                     let _ua = crate::cpu::UserAccess::begin();
                     unsafe { *reply_ptr = reply };
@@ -1532,9 +1572,9 @@ fn dispatch(
         }
         SYS_CALL => {
             let dest = arg0 as usize;
-            if !crate::cap::task_has_endpoint(scheduler::current_tid(), dest) {
+            let Some(number) = crate::cap::endpoint_held(scheduler::current_tid(), dest) else {
                 return deny_ipc(scheduler::current_tid(), dest, b"call");
-            }
+            };
             let msg_ptr = arg1 as *const crate::ipc::Message;
             let reply_ptr = arg2 as *mut crate::ipc::Message;
             let msg_size = core::mem::size_of::<crate::ipc::Message>() as u64;
@@ -1544,7 +1584,7 @@ fn dispatch(
                 let _ua = crate::cpu::UserAccess::begin();
                 unsafe { *msg_ptr }
             };
-            match crate::ipc::sys_call(dest, &msg) {
+            match crate::ipc::sys_call(dest, number, &msg) {
                 Ok(reply) => {
                     let _ua = crate::cpu::UserAccess::begin();
                     unsafe { *reply_ptr = reply };
@@ -1558,9 +1598,9 @@ fn dispatch(
             // arg4 = length | LEND_READ | LEND_WRITE
             let caller = scheduler::current_tid();
             let dest = arg0 as usize;
-            if !crate::cap::task_has_endpoint(caller, dest) {
+            let Some(number) = crate::cap::endpoint_held(caller, dest) else {
                 return deny_ipc(caller, dest, b"call");
-            }
+            };
             let access = arg4 & (crate::lend::LEND_READ | crate::lend::LEND_WRITE);
             let len = (arg4 & crate::lend::LEND_LEN_MASK) as usize;
             if access == 0 || len == 0 || len > crate::lend::LEND_MAX {
@@ -1582,7 +1622,7 @@ fn dispatch(
                 unsafe { *msg_ptr }
             };
             let lent = crate::ipc::Lent { addr: arg3 as usize, len, access, frame: false };
-            match crate::ipc::sys_call_lend(dest, &msg, lent) {
+            match crate::ipc::sys_call_lend(dest, number, &msg, lent) {
                 Ok(reply) => {
                     let _ua = crate::cpu::UserAccess::begin();
                     unsafe { *reply_ptr = reply };
@@ -1595,9 +1635,9 @@ fn dispatch(
             // arg0 = dest, arg1 = msg, arg2 = reply out, arg3 = slot offered
             let caller = scheduler::current_tid();
             let dest = arg0 as usize;
-            if !crate::cap::task_has_endpoint(caller, dest) {
+            let Some(number) = crate::cap::endpoint_held(caller, dest) else {
                 return deny_ipc(caller, dest, b"call");
-            }
+            };
             // Checked now, so that offering nothing is the caller's error and
             // never reaches the server. The take checks again: the capability
             // can be revoked while the call waits.
@@ -1616,7 +1656,7 @@ fn dispatch(
                 let _ua = crate::cpu::UserAccess::begin();
                 unsafe { *msg_ptr }
             };
-            match crate::ipc::sys_call_offer(dest, &msg, slot) {
+            match crate::ipc::sys_call_offer(dest, number, &msg, slot) {
                 Ok(reply) => {
                     let _ua = crate::cpu::UserAccess::begin();
                     unsafe { *reply_ptr = reply };
@@ -1631,9 +1671,9 @@ fn dispatch(
             // it, and the result is SYS_CALL_TIMEOUT's.
             let caller = scheduler::current_tid();
             let dest = arg0 as usize;
-            if !crate::cap::task_has_endpoint(caller, dest) {
+            let Some(number) = crate::cap::endpoint_held(caller, dest) else {
                 return deny_ipc(caller, dest, b"call");
-            }
+            };
             let msg_size = core::mem::size_of::<crate::ipc::Message>() as u64;
             let with_size = core::mem::size_of::<CallWith>() as u64;
             if !validate_user_ptr(arg1, msg_size)
@@ -1669,7 +1709,7 @@ fn dispatch(
                 }
                 Some(slot)
             };
-            match crate::ipc::sys_call_with(dest, &msg, crate::clock::span(with.ticks), lent, offer) {
+            match crate::ipc::sys_call_with(dest, number, &msg, crate::clock::span(with.ticks), lent, offer) {
                 Ok(reply) => {
                     let _ua = crate::cpu::UserAccess::begin();
                     unsafe { *(arg2 as *mut crate::ipc::Message) = reply };
@@ -4680,10 +4720,10 @@ fn dispatch(
             // arg0 = dest tid, arg1 = badge (bits to OR into notification word)
             let dest = arg0 as usize;
             let badge = arg1;
-            if !crate::cap::task_has_endpoint(scheduler::current_tid(), dest) {
+            let Some(number) = crate::cap::endpoint_held(scheduler::current_tid(), dest) else {
                 return deny_ipc(scheduler::current_tid(), dest, b"notify");
-            }
-            match crate::ipc::sys_notify(dest, badge) {
+            };
+            match crate::ipc::sys_notify(dest, number, badge) {
                 Ok(()) => 0,
                 Err(_) => u64::MAX,
             }
