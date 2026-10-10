@@ -146,7 +146,7 @@ src/
   display.rs          A display device's screen: memory nobody owns
   iommu.rs            Where a device may copy memory: Intel's VT-d
   percpu.rs           What each processor has of its own
-  klock.rs            The kernel lock: one processor in the kernel at a time
+  klock.rs            The one lock: what has no lock of its own, one processor at a time
   lapic.rs            The local APIC: a tick, a timer, a word to another processor
   smp.rs  ap_boot.s   Starting the other processors
   tlb.rs              A mapping taken away, on every processor

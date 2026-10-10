@@ -1955,12 +1955,26 @@ breaking any of them is quiet until it is a machine that stops.
   timeout. A one-shot `SYS_POLL` makes a set of its own and is not affected.
 - **The kernel is one processor's at a time, but for calls between two
   tasks, a futex's waits and wakes, and the calls about the caller and the
-  time.** Programs run on every processor; every other system call, a
-  fault or an interrupt waits for the kernel to be empty. What comes out
-  from under the one lock does so a path at a time, each measured; a
-  pager's receive takes the lock when one of its objects has gone idle,
-  and a call that lends a place to a task better placed than its callee
-  takes it to work the places out.
+  time** (`syscall::unlocked`). Programs run on every processor; whatever
+  else they ask of the kernel waits for it to be empty: a fault, a pipe's
+  read or write, a poll, a counter, a timer, a signal descriptor, a served
+  descriptor, a terminal and a socket; a fork, an exec, an exit and a
+  kill; a mapping made or taken away; a capability given or taken; a
+  pager's work; mounts, PCI, power and every device's interrupt; the
+  clock's expiry; signals; and a futex word that lends its holder a place.
+  The conversion stopped where what it was for was met — four pairs of
+  callers on four processors make 3.7 times what one pair makes, where
+  under the one lock they made what one made — and nothing comes out from
+  under it for its own sake: a program whose threads fault or use pipes on
+  many processors at once still meets there. Each of those has the lock
+  it would be under (`sync.rs`, the table in `docs/smp.md`), and
+  `docs/smp.md` says what taking a fault and a pipe out would mean. A
+  pager's receive takes the one lock when one of its objects has gone
+  idle, and a call that lends a place to a task better placed than its
+  callee takes it to work the places out. And every call of a program's
+  threads checks its endpoint in the program's capability space, under
+  that space's lock: eight pairs of one program's threads make seven times
+  what one pair makes, not eight.
 - Every deadline on the machine is the first processor's to fire and to be
   told of: a program on another processor that sets one sooner than the
   first's timer is set for interrupts it to say so, and each wakes it when

@@ -14,9 +14,10 @@
 //! The rules, which are few and each of which is kept in one place:
 //!
 //! - **Taken on the way in from ring 3**, by whoever arrives: the system
-//!   call's dispatch, and the interrupt and exception handlers — but for a
-//!   call between two tasks (`syscall::unlocked`), which is made without it
-//!   and takes it only for what it finds to be the lock's. A handler that
+//!   call's dispatch, and the interrupt and exception handlers — but for
+//!   the calls `syscall::unlocked` names (between two tasks, a futex's wait
+//!   and wake, and the caller's own state and the time), which are made
+//!   without it and take it only for what they find to be the lock's. A handler that
 //!   interrupted the kernel itself finds the lock held by its own processor
 //!   and takes nothing. Each remembers in its own frame whether it took the
 //!   lock ([`enter`]), and gives back exactly that on the way out
@@ -36,7 +37,7 @@
 //!   handler that interrupted the kernel and still has the lock to take.
 //!
 //! So a processor holds the lock exactly while it runs kernel code, the
-//! `hlt` aside, but for a call between two tasks.
+//! `hlt` aside, but for those calls.
 //!
 //! Waiting for it is spinning with interrupts off. Whoever waits has
 //! nothing else it may do: it is on its way into the kernel. Two things

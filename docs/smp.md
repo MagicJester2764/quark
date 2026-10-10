@@ -102,7 +102,7 @@ after its kind's, which is its alone.
 | 22 | the programs' records (`fdtable.rs`) | a program's signals and what waits with them, its alarm and timers, what it has used, its name and limits: asked about under whatever a wait holds |
 | 23 | the capability spaces' table (`cap.rs`) | which numbers have a space, and the making of a number's counts of revocations; the counts are read and moved on with no lock |
 | 24, 25 | an address space (`paging::space_lock`) | its tables and reservations, and what is forgotten of them: one of 64 locks, the one its root hashes to; a fork's copy or a move between two takes both |
-| 26, 27 | a task's record (`scheduler::record_lock`: one of 256, the one its number picks) | its IPC state, its state as the scheduler has it, the place it is lent: after whatever parks or wakes it, before the run queue it goes on; a call takes the caller's and the callee's |
+| 26, 27 | a task's record (`scheduler::record_lock`: one of 256, the one its number picks) | its IPC state, its state as the scheduler has it, the place it is lent, and which program's record it is in — which it reads under this lock alone, its trap and its signals as the door asks them (`fdtable::own_program`): after whatever parks or wakes it, before the run queue it goes on; a call takes the caller's and the callee's |
 | 28, 29 | a processor's run queues (`runq.rs`) | what waits to run there, and the links of the tasks waiting; a move is two steps, never two held |
 | 32 | the clock | what is due, and when the timer is set to look |
 | 36 | interrupts (`irq_dispatch.rs`) | who is told of which |
@@ -359,9 +359,27 @@ uses them well, and the difference is a list:
   processors, against 271), since every wait walks its program's tables
   under the one lock its address space has, which every thread of a
   program shares. A word that lends a place to its holder is still the
-  one lock's. Everything else — a fault, a pipe, a poll, the clock's
-  expiry — is still made under the one lock, a path at a time to come out
-  from under it.
+  one lock's. It stops there: four pairs making 3.5 times what one pair
+  makes was what it was for, and nothing comes out from under the one lock
+  for its own sake. Everything else — a fault, a pipe, a poll, the clock's
+  expiry — is still made under it, and what would come out next is:
+  - *A program's own page faults* — on a page with nothing yet, a
+    reservation, a page shared since a fork — under its address space's
+    lock and the frames', a fault that needs a pager staying with the one
+    lock. Whoever clears or replaces a present entry would have every
+    processor with the space loaded forget it before it gives up the
+    space's lock, answering what others ask while it waits —
+    `klock::release`'s `tlb::sync` staying for what is still the one
+    lock's — so that a frame is still nobody else's until every processor
+    has forgotten it, kept by the space's lock where the one lock keeps it
+    now.
+  - *Pipes, counters, timers, signal descriptors and polls*: a read or a
+    write under its object's lock and its waiter's record, with what a
+    poll is told (`pollset::note_*`) said under the object's lock before
+    anybody waits.
+  - *The capability space a program's threads share*, which every call
+    looks its endpoint up in under one lock for the program: eight pairs
+    of one program make seven times what one pair makes, not eight.
 - **Interrupts from devices on any processor.** The I/O APIC can send one
   anywhere; every one still goes to the first.
 - **A device's interrupt for a processor above 255**, which needs the
