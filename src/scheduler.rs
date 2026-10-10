@@ -1115,19 +1115,14 @@ pub fn refresh_priority(tid: usize) {
                 return; // unchanged, so nothing downstream changes either
             }
             // A task waiting in a run queue is where its place put it: taken
-            // out first, and put back by its new one, on the same processor.
-            let queued = (st(cur).queued != NOT_QUEUED).then_some(st(cur).queued_on as usize);
-            if queued.is_some() {
-                unlink_ready(cur);
-            }
-            if let Some(ref mut t) = *slot(cur) {
-                t.priority = best.0;
-            }
-            st(cur).rt = best.1;
-            if let Some(cpu) = queued {
-                runq::moved(cur, cpu, priority_of(cur));
-                runq::link(cur, cpu, priority_of(cur), false);
-            }
+            // out first, and put back by its new one, on the same processor,
+            // in one step.
+            runq::replace(cur, || {
+                if let Some(ref mut t) = *slot(cur) {
+                    t.priority = best.0;
+                }
+                st(cur).rt = best.1;
+            });
         }
         // Whatever `cur` is itself waiting on inherits this too.
         match waits_on(cur) {
@@ -1301,16 +1296,8 @@ unsafe fn count_turn(tid: usize) { unsafe {
             // switch away counts the last of its turn, or made ready by an
             // interrupt after it blocked and before it gave the processor
             // up. Changed in a heap, it would be out of its order there;
-            // so out while it changes, and back where it was.
-            let queued = st(tid).queued;
-            let at = (st(tid).queued_on as usize, st(tid).heap_in == runq::IN_FRONT);
-            if queued != NOT_QUEUED {
-                unlink_ready(tid);
-            }
-            st(tid).vrun = st(tid).vrun.saturating_add(crate::usage::weighted(ran, st(tid).nice));
-            if queued != NOT_QUEUED {
-                runq::link(tid, at.0, queued as usize, at.1);
-            }
+            // so out while it changes, and back where it was, in one step.
+            runq::recount(tid, || st(tid).vrun = st(tid).vrun.saturating_add(crate::usage::weighted(ran, st(tid).nice)));
             // Where its band has got to here, now that it has run further.
             runq::settle(crate::percpu::index(), priority_of(tid), tid);
         }

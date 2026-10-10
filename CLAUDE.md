@@ -1638,8 +1638,16 @@ breaking any of them is quiet until it is a machine that stops.
   no reason for a task of a worse one to move — weighed together, a
   server's turn on a processor at the tick sent computing programs
   elsewhere, and the nice ones had a third of the machine in a full dtest
-  run. Whoever holds the kernel lock may
-  touch any processor's queues. What asks whether something better is
+  run. Any processor may put a task in another's queues or take one out,
+  under that processor's queues' lock (`sync::RANK_RUNQ`), which keeps the
+  queues and the links of the tasks in them, and what a heap orders them
+  by — so how far a task has run, or its place, changes only while it is
+  out of its queue, in one step with taking it out and putting it back
+  (`runq::recount`, `replace`). A move between processors is two steps,
+  never two of these locks held: out under one, in under the other. What
+  a queue reads of a task's own record — whether it is still ready, where
+  it may run — and what placement reads of other processors' queues are
+  read without their locks, as hints. What asks whether something better is
   waiting — a tick, a wake between ticks, a call's hand-over — asks the
   queues of the processor it is on, in one step (`runq::best_band`,
   `best_rt`). With one list for the machine, walked at every choice, a

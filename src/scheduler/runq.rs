@@ -37,11 +37,29 @@
 //! task weighs less, and two processors each running one task at nought
 //! and one at ten give the nicer a tenth of each, where one running both at
 //! nought and the other both at ten gave the nicer half of the machine.
-//! Each processor's queues are its own to choose from, but whoever holds
-//! the kernel lock may look at and change any of them.
+//! Each processor's queues are its own to choose from, but any processor
+//! may put a task in them or take one out.
+//!
+//! **A processor's queues have a lock** (`sync::RANK_RUNQ`), and so do the
+//! links of the tasks waiting in them — which queue and part a task is in,
+//! its heap's and its list's links, the order it was queued in, what it
+//! weighed as it went in — and what a heap orders its tasks by, how far
+//! they have run and their real-time priority, which changes only while a
+//! task is out of its queue ([`recount`], [`replace`]). A task moves
+//! between processors in two steps, never holding two of these locks: out
+//! of one queue under its lock, and into the other under its own, belonging
+//! in between to whoever moves it. What a queue reads of a task that is
+//! not its own — whether it is still ready, where it may run, how nice it
+//! is — is read without the task's lock, which comes before this one in
+//! the order; and where a task should wait, and which processor is
+//! busiest, are worked out from other processors' queues without their
+//! locks, as hints: their lengths, loads and floors are words, and one a
+//! moment out of date places a task a little worse, never wrongly.
 
 use super::{better, place_of, slot, st, TaskState, END, NOT_QUEUED, NUM_PRIORITIES, SLEEPER_LEAD};
 use crate::percpu::MAX_CPUS;
+use crate::sync::IrqSpinLock;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 
 /// Which part of its queue a task is in.
@@ -98,8 +116,18 @@ pub(super) unsafe fn init() {
         }
     }
 }
-/// The order tasks were queued in, for those otherwise equal.
-static mut SEQ: u64 = 0;
+/// Each processor's queues' lock (above).
+static LOCKS: [IrqSpinLock<()>; MAX_CPUS] =
+    [const { IrqSpinLock::new(crate::sync::RANK_RUNQ, "a processor's run queues", ()) }; MAX_CPUS];
+
+/// Processor `cpu`'s queues, held.
+fn held(cpu: usize) -> crate::sync::IrqSpinLockGuard<'static, ()> {
+    LOCKS[cpu].lock()
+}
+
+/// The order tasks were queued in, for those otherwise equal: any
+/// processor's queues count from it.
+static SEQ: AtomicU64 = AtomicU64::new(0);
 /// A task that ran on a processor less than this long ago is warm there:
 /// what it uses is still in that processor's cache, and another processor
 /// takes it last.
@@ -108,7 +136,8 @@ const WARM_NS: u64 = 2_000_000;
 /// Processor `cpu`'s queue of band `p`.
 ///
 /// # Safety
-/// Interrupts off, the kernel lock held.
+/// Interrupts off, and its lock held — or, for a hint, read and not
+/// changed.
 unsafe fn queue(cpu: usize, p: usize) -> &'static mut Queue {
     unsafe { &mut (*(&raw mut QUEUES))[cpu][p] }
 }
@@ -265,9 +294,14 @@ unsafe fn out(q: &mut Queue, tid: usize) {
 /// # Safety
 /// Interrupts off, the kernel lock held.
 pub(super) unsafe fn link(tid: usize, cpu: usize, p: usize, front: bool) {
+    let _queues = held(cpu);
+    unsafe { link_held(tid, cpu, p, front) }
+}
+
+/// [`link`], with `cpu`'s queues held.
+unsafe fn link_held(tid: usize, cpu: usize, p: usize, front: bool) {
     unsafe {
-        SEQ += 1;
-        st(tid).seq = SEQ;
+        st(tid).seq = SEQ.fetch_add(1, Ordering::Relaxed) + 1;
         st(tid).queued = p as u8;
         st(tid).queued_on = cpu as u16;
         st(tid).measured_on = cpu as u16;
@@ -300,11 +334,30 @@ pub(super) unsafe fn link(tid: usize, cpu: usize, p: usize, front: bool) {
     }
 }
 
-/// Take `tid` out of the queue it is in, if it is in one.
+/// Take `tid` out of the queue it is in, if it is in one: that processor's,
+/// held, and looked at again once it is, since the task may have been
+/// moved meanwhile.
 ///
 /// # Safety
 /// Interrupts off, the kernel lock held.
 pub(super) unsafe fn unlink(tid: usize) {
+    unsafe {
+        loop {
+            if st(tid).queued == NOT_QUEUED {
+                return;
+            }
+            let cpu = st(tid).queued_on as usize;
+            let _queues = held(cpu);
+            if st(tid).queued != NOT_QUEUED && st(tid).queued_on as usize == cpu {
+                unlink_held(tid);
+                return;
+            }
+        }
+    }
+}
+
+/// [`unlink`], with the queues `tid` is in held.
+unsafe fn unlink_held(tid: usize) {
     unsafe {
         let p = st(tid).queued;
         if p == NOT_QUEUED {
@@ -380,9 +433,9 @@ unsafe fn take_ordinary(cpu: usize, p: usize, cold: bool, for_cpu: usize) -> Opt
         while t != END {
             let next = st(t as usize).run_next;
             if !ready(t as usize) {
-                unlink(t as usize);
+                unlink_held(t as usize);
             } else if super::may_run_on(t as usize, for_cpu) {
-                unlink(t as usize);
+                unlink_held(t as usize);
                 return Some(t as usize);
             }
             t = next;
@@ -434,12 +487,12 @@ unsafe fn take_ordinary(cpu: usize, p: usize, cold: bool, for_cpu: usize) -> Opt
 }
 
 /// `tid` has been chosen from processor `cpu`'s queue of band `p`: a turn
-/// of the queue, and where its band has got to there.
+/// of the queue, and where its band has got to there. `cpu`'s queues held.
 unsafe fn chosen_from(cpu: usize, p: usize, tid: usize) {
     unsafe {
         queue(cpu, p).turns += 1;
         st(tid).yielded = false;
-        settle(cpu, p, tid);
+        settle_held(cpu, p, tid);
     }
 }
 
@@ -451,6 +504,12 @@ unsafe fn chosen_from(cpu: usize, p: usize, tid: usize) {
 /// # Safety
 /// Interrupts off, the kernel lock held.
 pub(super) unsafe fn settle(cpu: usize, p: usize, running: usize) {
+    let _queues = held(cpu);
+    unsafe { settle_held(cpu, p, running) }
+}
+
+/// [`settle`], with `cpu`'s queues held.
+unsafe fn settle_held(cpu: usize, p: usize, running: usize) {
     unsafe {
         let q = queue(cpu, p);
         let mut least = u64::MAX;
@@ -474,6 +533,7 @@ pub(super) unsafe fn settle(cpu: usize, p: usize, running: usize) {
 /// # Safety
 /// Interrupts off, the kernel lock held.
 pub(super) unsafe fn take(cpu: usize, p: usize, throttled: bool) -> Option<usize> {
+    let _queues = held(cpu);
     unsafe {
         let chosen = if throttled {
             take_ordinary(cpu, p, false, cpu).or_else(|| take_rt(cpu, p, cpu))
@@ -490,10 +550,12 @@ pub(super) unsafe fn take(cpu: usize, p: usize, throttled: bool) -> Option<usize
 /// # Safety
 /// Interrupts off, the kernel lock held.
 pub(super) unsafe fn best_band(cpu: usize) -> Option<usize> {
+    let _queues = held(cpu);
     unsafe { (0..NUM_PRIORITIES).find(|&p| queue(cpu, p).len > 0) }
 }
 
-/// How many tasks wait in processor `cpu`'s queues.
+/// How many tasks wait in processor `cpu`'s queues: as a hint, read
+/// without their lock.
 ///
 /// # Safety
 /// Interrupts off, the kernel lock held.
@@ -519,12 +581,17 @@ pub(super) unsafe fn give_away(cpu: usize) {
     unsafe {
         for p in 0..NUM_PRIORITIES {
             loop {
-                let q = queue(cpu, p);
-                let t = [q.rt, q.front.0, q.fair].into_iter().find(|&t| t != END);
-                let Some(t) = t else { break };
-                unlink(t as usize);
-                if ready(t as usize) {
-                    super::enqueue(t as usize);
+                // Out under this processor's lock, and to wherever it goes
+                // under that one's: one at a time.
+                let t = {
+                    let _queues = held(cpu);
+                    let q = queue(cpu, p);
+                    let Some(t) = [q.rt, q.front.0, q.fair].into_iter().find(|&t| t != END) else { break };
+                    unlink_held(t as usize);
+                    t as usize
+                };
+                if ready(t) {
+                    super::enqueue(t);
                 }
             }
         }
@@ -546,26 +613,35 @@ pub(super) unsafe fn hand_to_sleeper(cpu: usize) -> Option<usize> {
         if waiting(cpu) == 0 || !(0..count).any(|n| n != cpu && crate::percpu::napping(n)) {
             return None;
         }
-        for p in 0..NUM_PRIORITIES {
-            let q = queue(cpu, p);
-            if q.len == 0 {
-                continue;
-            }
-            for t in [q.rt, q.front.0, q.fair] {
-                if t == END || !ready(t as usize) {
+        // Out of this processor's queue under its lock; into the sleeper's
+        // under that one's.
+        let found = {
+            let _queues = held(cpu);
+            let mut found = None;
+            'bands: for p in 0..NUM_PRIORITIES {
+                let q = queue(cpu, p);
+                if q.len == 0 {
                     continue;
                 }
-                let t = t as usize;
-                if let Some(n) = (0..count).find(|&n| n != cpu && crate::percpu::napping(n) && super::may_run_on(t, n)) {
-                    let front = st(t).heap_in == IN_FRONT;
-                    unlink(t);
-                    moved(t, n, p);
-                    link(t, n, p, front);
-                    return Some(n);
+                for t in [q.rt, q.front.0, q.fair] {
+                    if t == END || !ready(t as usize) {
+                        continue;
+                    }
+                    let t = t as usize;
+                    if let Some(n) = (0..count).find(|&n| n != cpu && crate::percpu::napping(n) && super::may_run_on(t, n)) {
+                        let front = st(t).heap_in == IN_FRONT;
+                        unlink_held(t);
+                        found = Some((t, n, p, front));
+                        break 'bands;
+                    }
                 }
             }
-        }
-        None
+            found
+        };
+        let (t, n, p, front) = found?;
+        moved(t, n, p);
+        link(t, n, p, front);
+        Some(n)
     }
 }
 
@@ -575,6 +651,7 @@ pub(super) unsafe fn hand_to_sleeper(cpu: usize) -> Option<usize> {
 /// # Safety
 /// Interrupts off, the kernel lock held.
 pub(super) unsafe fn best_rt(cpu: usize, p: usize) -> u8 {
+    let _queues = held(cpu);
     unsafe {
         let q = queue(cpu, p);
         if q.rt == END { 0 } else { st(q.rt as usize).rt }
@@ -586,6 +663,7 @@ pub(super) unsafe fn best_rt(cpu: usize, p: usize) -> u8 {
 /// # Safety
 /// Interrupts off, the kernel lock held.
 pub(super) unsafe fn has_ordinary(cpu: usize, p: usize) -> bool {
+    let _queues = held(cpu);
     unsafe {
         let q = queue(cpu, p);
         q.front.0 != END || q.fair != END
@@ -595,6 +673,9 @@ pub(super) unsafe fn has_ordinary(cpu: usize, p: usize) -> bool {
 /// A task joining processor `cpu`'s queue of band `p` that may have been
 /// away from it: no further back than a little behind where the band has
 /// got to there. A program that slept for a minute is not owed the minute.
+/// The floor is read without the queue's lock: a word that only grows,
+/// a moment out of date at worst. The task is in no queue, and its run
+/// time is whoever is putting it in one's.
 ///
 /// # Safety
 /// Interrupts off, the kernel lock held.
@@ -613,7 +694,7 @@ pub(super) unsafe fn join(tid: usize, cpu: usize, p: usize) {
 /// otherwise wait behind everything on a quiet one, or go before it all.
 /// Every way a task comes to a processor or a band says so: a call handed
 /// over to a server on the caller's processor, a server lent its caller's
-/// band.
+/// band. The floors are read as [`join`] reads one.
 ///
 /// # Safety
 /// Interrupts off, the kernel lock held.
@@ -701,7 +782,8 @@ pub(super) unsafe fn place_for(tid: usize) -> usize {
 }
 
 /// What processor `cpu` has to run of band `p` — or of every band, for
-/// `None` — weighed: what waits in its queues and what it is running.
+/// `None` — weighed: what waits in its queues and what it is running. A
+/// hint, read without the queues' lock.
 unsafe fn load(cpu: usize, p: Option<usize>) -> u64 {
     unsafe {
         let running = crate::percpu::current_of(cpu);
@@ -755,13 +837,19 @@ pub(super) unsafe fn pull(me: usize, throttled: bool) -> Option<usize> {
     unsafe {
         let from = busiest(me, None)?;
         for p in 0..NUM_PRIORITIES {
-            let taken = if throttled {
-                take_ordinary(from, p, true, me).or_else(|| take_rt(from, p, me))
-            } else {
-                take_rt(from, p, me).or_else(|| take_ordinary(from, p, true, me))
+            // Out of the busiest's queue under its lock; chosen here under
+            // this one's.
+            let taken = {
+                let _queues = held(from);
+                if throttled {
+                    take_ordinary(from, p, true, me).or_else(|| take_rt(from, p, me))
+                } else {
+                    take_rt(from, p, me).or_else(|| take_ordinary(from, p, true, me))
+                }
             };
             if let Some(t) = taken {
                 moved(t, me, p);
+                let _queues = held(me);
                 chosen_from(me, p, t);
                 return Some(t);
             }
@@ -834,11 +922,73 @@ pub(super) unsafe fn balance(me: usize) {
             if theirs <= mine {
                 continue;
             }
-            if let Some(t) = take_lighter(from, p, theirs - mine, me) {
+            let taken = {
+                let _queues = held(from);
+                take_lighter(from, p, theirs - mine, me)
+            };
+            if let Some(t) = taken {
                 moved(t, me, p);
                 link(t, me, p, false);
                 return;
             }
+        }
+    }
+}
+
+/// `change` made to `tid` while it is out of the queue it is in, if it is
+/// in one, and the task put back where it was — the same processor, band
+/// and part — in one step under that processor's lock: how far a task has
+/// run is what a heap orders it by, and changed in a heap it would be out
+/// of its order there.
+///
+/// # Safety
+/// Interrupts off, the kernel lock held.
+pub(super) unsafe fn recount(tid: usize, change: impl FnOnce()) {
+    unsafe {
+        loop {
+            if st(tid).queued == NOT_QUEUED {
+                change();
+                return;
+            }
+            let cpu = st(tid).queued_on as usize;
+            let _queues = held(cpu);
+            if st(tid).queued == NOT_QUEUED || st(tid).queued_on as usize != cpu {
+                continue;
+            }
+            let (band, front) = (st(tid).queued as usize, st(tid).heap_in == IN_FRONT);
+            unlink_held(tid);
+            change();
+            link_held(tid, cpu, band, front);
+            return;
+        }
+    }
+}
+
+/// `change` made to `tid`'s place while it is out of the queue it is in,
+/// if it is in one, and the task put back on the same processor where its
+/// place says now, by what it has run — in one step under that processor's
+/// lock, as [`recount`]. Whether it was in one.
+///
+/// # Safety
+/// Interrupts off, the kernel lock held.
+pub(super) unsafe fn replace(tid: usize, change: impl FnOnce()) -> bool {
+    unsafe {
+        loop {
+            if st(tid).queued == NOT_QUEUED {
+                change();
+                return false;
+            }
+            let cpu = st(tid).queued_on as usize;
+            let _queues = held(cpu);
+            if st(tid).queued == NOT_QUEUED || st(tid).queued_on as usize != cpu {
+                continue;
+            }
+            unlink_held(tid);
+            change();
+            let band = super::priority_of(tid);
+            moved(tid, cpu, band);
+            link_held(tid, cpu, band, false);
+            return true;
         }
     }
 }
