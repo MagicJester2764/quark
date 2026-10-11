@@ -1460,7 +1460,12 @@ What follows from that, and breaking any of it is quiet:
   time is not counted where its band's ordinary tasks' is (`count_turn`, and
   a queue's floor moves only for an ordinary task): counted there, three seconds of
   FIFO would put the floor three seconds on, and every ordinary task that
-  woke would join that far behind those that had not slept.
+  woke would join that far behind those that had not slept. So a task that
+  leaves its class, or is lent a real-time place no more, joins its band
+  where the band has got to (`refresh_priority`), as a task back from away
+  does: one that never waited while it was real-time was never joined, and
+  went before every ordinary task of its band until it had run alone for as
+  long as they had meanwhile (`rtsched`).
 - **A processor's real-time tasks have 950 ms of each second**, and past
   that its ordinary tasks of their band go first (`RT_USE`, `throttled`) —
   or, with none ready, the real-time one runs on. The time is counted at

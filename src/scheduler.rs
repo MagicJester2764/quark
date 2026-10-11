@@ -1495,10 +1495,24 @@ pub fn refresh_priority(tid: usize) {
             // out first, and put back by its new one, on the same processor,
             // in one step.
             runq::replace(cur, || {
+                // Out of a real-time place — its own class left, or a lent
+                // one taken back — it joins its band where the band has got
+                // to, as a task back from away does: what it ran meanwhile
+                // was not counted where the band's ordinary tasks' is
+                // (`count_turn`), and a task that never waited was never
+                // joined. Left with the run time it had, it went before
+                // every ordinary task of its band until it had run alone
+                // for as long as they had.
+                let leaves = st(cur).rt != 0 && best.1 == 0;
                 if let Some(ref mut t) = *slot(cur) {
                     t.priority = best.0;
                 }
                 st(cur).rt = best.1;
+                if leaves {
+                    let on = (st(cur).measured_on as usize).min(crate::percpu::MAX_CPUS - 1);
+                    let band = (st(cur).measured_in as usize).min(NUM_PRIORITIES - 1);
+                    runq::join(cur, on, band);
+                }
             });
         }
         // Whatever `cur` is itself waiting on inherits this too.
