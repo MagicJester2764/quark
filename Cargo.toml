@@ -15,7 +15,8 @@ stacktest = []
 lockcheck = []
 # A kernel for testing what it makes when there is no memory to make it
 # with: SYS_MEM_INFO 7 and 8 refuse the next program records and capability
-# spaces, as many as asked (failtest.rs).
+# spaces, as many as asked; 9 has the caller made nothing more; 10 says what
+# the heap has in use (failtest.rs).
 failtest = []
 
 [profile.dev]

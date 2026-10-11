@@ -1113,7 +1113,12 @@ every Unix program assumes:
   sixteen, thirty-two, sixty-four, 256 and 1,024. What is in them grows
   too: a set's watches, a listener's queue (to 4,096, `somaxconn`), a
   stream's descriptors in flight (as many as the sender may have) — and
-  nothing that grows is gathered on a kernel stack: a `poll`'s entries are
+  grows as what is made is made (`grow::Grow::ensure` asks `may_make`), as
+  do a program's descriptors and its capability space: the heap takes its
+  frames from what is free, and a program that filled memory and then grew
+  its descriptors and its space to 65,536 each took both out of what was
+  kept back for drivers and servers (`dtest fork`, in a `failtest` kernel).
+  And nothing that grows is gathered on a kernel stack: a `poll`'s entries are
   read and answered where the program has them. A memory object is a
   record made when it is, but its slot is written into page-table entries
   in eleven bits, so there are at most 2,047 (`memobj::MAX_OBJECTS`), 1,024
@@ -1966,6 +1971,11 @@ breaking any of them is quiet until it is a machine that stops.
 
 - Memory past 510 GiB is not used: the kernel's map of it is PML4[0] less
   the gigabytes its stacks and its heap are in.
+- The kernel's heap grows and does not shrink: a frame it takes is its own
+  for as long as the machine is up, and what a program made and gave back
+  is room for the next thing the kernel makes, not memory for programs.
+  What a program makes or grows is asked for first (`reclaim::may_make`),
+  so the heap does not take what is kept back for drivers and servers.
 - Memory is written out only where a system starts a pager for it
   (`swapd` in `../quarkutils`), and only as fast as that pager's disk: it
   writes through the file server, a page a call. With none, or with it

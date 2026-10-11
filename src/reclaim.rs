@@ -104,6 +104,10 @@ pub fn frame() -> Option<usize> {
 /// back. A program making them without end is refused while the kernel can
 /// still work.
 pub fn may_make() -> bool {
+    #[cfg(feature = "failtest")]
+    if crate::failtest::makes_nothing(scheduler::current_tid()) {
+        return false;
+    }
     scheduler::current_is_privileged() || pmm::free_count() > reserve()
 }
 

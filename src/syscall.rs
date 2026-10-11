@@ -4108,6 +4108,16 @@ fn dispatch(
                     crate::failtest::refuse(crate::failtest::HOLDING, arg1 as usize);
                     0
                 }
+                // And have the caller made nothing more it asks for, as if
+                // what is free were what is kept back (`arg1` 1), or let it
+                // again (0); and what the kernel's heap has in use.
+                #[cfg(feature = "failtest")]
+                9 => {
+                    crate::failtest::make_nothing(scheduler::current_tid(), arg1 != 0);
+                    0
+                }
+                #[cfg(feature = "failtest")]
+                10 => crate::heap::usage().0 as u64,
                 _ => u64::MAX,
             }
         }

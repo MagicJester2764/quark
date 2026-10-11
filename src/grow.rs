@@ -46,11 +46,17 @@ impl<T: Copy> Grow<T> {
 
     /// Entry `i`, room made for it if there is none: the room doubles, from
     /// `first`, until it holds `i`, and never past `most`.
+    ///
+    /// Room is made as anything a program makes is (`reclaim::may_make`):
+    /// not while what is free is what is kept back for drivers and servers.
+    /// The heap takes its frames from what is free, and gives none back — a
+    /// program that filled memory and then grew its descriptors and its
+    /// capability space to 65,536 each took both out of what was kept back.
     pub fn ensure(&mut self, i: usize, first: usize, most: usize) -> Result<&mut T, NoRoom> {
         if i < self.len {
             return Ok(unsafe { &mut *self.ptr.add(i) });
         }
-        if i >= most {
+        if i >= most || !crate::reclaim::may_make() {
             return Err(NoRoom);
         }
         let mut want = self.len.max(first).max(1);
