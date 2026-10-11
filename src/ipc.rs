@@ -885,11 +885,18 @@ pub fn wake_sleeper(tid: usize) -> bool {
 /// it: no longer receiving, so that a message sent before it runs again
 /// waits for its next receive. Left receiving, it was handed a call and the
 /// processor (`donate_to`) while it waited in a run queue for the
-/// interrupt, and a processor that took it from there ran it too.
+/// interrupt, and a processor that took it from there ran it too. And a
+/// wait on a list is ended as a signal ends one: off the list first. Left
+/// on a pipe's, a driver that then read a byte the pipe had woken another
+/// reader for went back to ring 3 still on it — the pipe's next wake was
+/// spent on it — and its next wait, on a counter, reached for the pipes'
+/// lock under the counters', which stopped the machine.
 pub fn wake_for_interrupt(tid: usize) {
     if tid >= MAX_TASKS {
         return;
     }
+    // The kind's lock, then the record's: in their ranks' order.
+    unsafe { crate::waitlist::forget(tid) };
     let held = scheduler::lock_record(tid);
     unsafe {
         if matches!(st(tid).task_ipc.state, IpcState::RecvBlocked(_)) {

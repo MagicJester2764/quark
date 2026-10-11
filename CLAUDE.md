@@ -687,7 +687,11 @@ may keep — are in `../quarkutils/CLAUDE.md`; these are the kernel's.
   eight they were refused the fifth or the ninth, whose read came back at
   once, and a set had one, which a second thread waiting on it took from the
   first. A task comes off by its own link: when it is woken, when a signal
-  ends its wait, when it dies, and at the reap before its record is freed;
+  ends its wait, when its device's interrupt wakes it — whatever it waits
+  on, `ipc::wake_for_interrupt`: left on a pipe's list, a driver that read
+  a byte the pipe had woken another for went on holding a link into it, and
+  its next wait on a counter took the pipes' lock under the counters' —
+  when it dies, and at the reap before its record is freed;
   and a set that goes takes everybody off its list first, or a set made
   with its number would be handed their links. A new kind's waiters go the
   same way: an `On`, its lists' ends in the object, and a `forget` that
