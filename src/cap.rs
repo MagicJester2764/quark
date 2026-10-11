@@ -459,29 +459,40 @@ pub fn add_bits(tid: usize, bits: u32) -> bool {
 }
 
 /// A task has been made: a space of its own, empty, until it is given
-/// things or joins its program's.
-pub fn task_made(tid: usize) {
+/// things or joins its program's. Whether it has one: with no memory for
+/// it, the task is not to be made (`scheduler::create_empty_task`).
+pub fn task_made(tid: usize) -> bool {
     if tid >= MAX_TASKS {
-        return;
+        return false;
     }
     leave(tid);
+    #[cfg(feature = "failtest")]
+    if crate::failtest::refused(crate::failtest::HOLDING) {
+        return false;
+    }
     // The space is new, and the task nobody's to ask about yet: its number
     // is set with the table's lock alone.
     let table = TABLE.lock();
-    unsafe {
+    let made = unsafe {
         // Its own number first: nothing else is using it, unless a program
         // whose first task had it is still running. The number's count of
         // revocations is made with its first holding and kept for good
         // (`GENERATIONS`); with no memory for either, it holds nothing.
         let free = if holdings().used(tid) { holdings().lowest_free(0) } else { Some(tid) };
-        if let Some(i) = free {
-            let counted = generations().used(i) || generations().fill_from(i, &NO_REVOCATIONS, |_| {}).is_ok();
-            if counted && holdings().fill_from(i, &EMPTY_HOLDING, |h| h.users = 1).is_ok() {
-                st(tid).holding = i as u16;
+        match free {
+            Some(i) => {
+                let counted = generations().used(i) || generations().fill_from(i, &NO_REVOCATIONS, |_| {}).is_ok();
+                let held = counted && holdings().fill_from(i, &EMPTY_HOLDING, |h| h.users = 1).is_ok();
+                if held {
+                    st(tid).holding = i as u16;
+                }
+                held
             }
+            None => false,
         }
-    }
+    };
     drop(table);
+    made
 }
 
 /// `tid` has gone: it uses no space now, and one nobody uses is emptied.

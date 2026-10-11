@@ -445,6 +445,10 @@ pub fn attach_new(tid: usize) -> bool {
     if tid >= MAX_TASKS {
         return false;
     }
+    #[cfg(feature = "failtest")]
+    if crate::failtest::refused(crate::failtest::PROGRAM) {
+        return false;
+    }
     // Which tasks use which table changes with both held.
     let held = (TABLES_LOCK.lock(), PROGRAMS.lock());
     let ok = unsafe {
@@ -664,9 +668,9 @@ pub fn copy_into(child: usize, parent: usize) -> bool {
             return false;
         };
         let src: *const Table = src;
-        // A child with no table has nothing to copy into.
+        // A child with no table is not a whole one: no copy, and no fork.
         let Some(dst) = table_mut(child) else {
-            return true;
+            return false;
         };
         // Room first, as much as the parent has, so a copy either has
         // every descriptor or none of them.

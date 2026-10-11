@@ -1062,7 +1062,13 @@ every Unix program assumes:
   them.** The child gets a second descriptor for everything the parent has
   open, the working directory included, and a copy of the capability space —
   all of each, or the fork fails: a table and a space grow as they are
-  written, and their copies can want memory there is not;
+  written, and their copies can want memory there is not. And a task is
+  made with a table and a space of its own or not at all
+  (`create_empty_task`): made without its program's record, a forked
+  child had no descriptors, no working directory and no signal
+  dispositions, and the fork said it had worked. Running out at that moment
+  is arranged by a kernel built with `failtest` (`SYS_MEM_INFO` 7 and 8,
+  `dtest fork`);
   `exec` closes what was marked for it (`SYS_FD_FLAGS`) and nothing else. A
   thread does neither: it uses its program's table and its program's space
   (`cap::share`), so what one thread is given the others have. A thread used

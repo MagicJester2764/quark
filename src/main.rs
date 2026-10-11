@@ -64,6 +64,8 @@ mod tlb;
 mod usage;
 mod eventfd;
 mod fdtable;
+#[cfg(feature = "failtest")]
+mod failtest;
 mod grow;
 mod table;
 pub mod serial;

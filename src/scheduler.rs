@@ -3477,8 +3477,22 @@ pub fn create_empty_task() -> Option<usize> {
         crate::cap::open_endpoint(tid);
         // A process id of its own, a table of its own and a capability space
         // of its own, empty. A task started as a thread gives them up for its
-        // program's; a task started as a program keeps them.
-        crate::cap::task_made(tid);
+        // program's; a task started as a program keeps them. The two that
+        // take memory are made first, and the task is made with both or not
+        // at all: made without its program's record, a forked child had no
+        // descriptors, no working directory and no signal dispositions — no
+        // signal could end it — and the fork said it had worked; made
+        // without a space, it was given nothing it was granted.
+        if !(crate::cap::task_made(tid) && crate::fdtable::attach_new(tid)) {
+            crate::cap::task_gone(tid);
+            crate::fdtable::task_gone(tid);
+            let held = record_lock(tid).lock();
+            table().empty(tid);
+            drop(held);
+            irq_restore(flags);
+            crate::kstack::free(stack_base as usize);
+            return None;
+        }
         crate::usage::task_made(tid);
         crate::threads::task_made(tid, parent);
         st(tid).process_id = crate::cap::endpoint_of(tid);
@@ -3503,7 +3517,6 @@ pub fn create_empty_task() -> Option<usize> {
         st(tid).last_cpu = crate::percpu::index() as u16;
         st(tid).measured_on = crate::percpu::index() as u16;
         crate::job::born(tid, parent, st(tid).process_id);
-        crate::fdtable::attach_new(tid);
         // Limited as its creator's program is: a child forked or spawned
         // runs as its parent was told to.
         crate::fdtable::runs_like(tid, parent);

@@ -4095,6 +4095,19 @@ fn dispatch(
                 // that it was not built.
                 #[cfg(feature = "stacktest")]
                 6 => run_out_of_stack(0),
+                // In a kernel built to test what it makes with no memory to
+                // make it (`failtest`): refuse the next `arg1` program
+                // records, or capability spaces.
+                #[cfg(feature = "failtest")]
+                7 => {
+                    crate::failtest::refuse(crate::failtest::PROGRAM, arg1 as usize);
+                    0
+                }
+                #[cfg(feature = "failtest")]
+                8 => {
+                    crate::failtest::refuse(crate::failtest::HOLDING, arg1 as usize);
+                    0
+                }
                 _ => u64::MAX,
             }
         }
