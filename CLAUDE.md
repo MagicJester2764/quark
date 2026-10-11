@@ -487,7 +487,10 @@ may keep — are in `../quarkutils/CLAUDE.md`; these are the kernel's.
   layer's `setuid` gave up `SetUid` in the first sixty-four slots of 256).
   **And a capability is made only where it can be revoked**: a slot's count
   of revocations is made when one is first minted, granted or taken from it
-  (`cap::generation_for`), and that is refused with no memory for it. A
+  (`cap::generation_for`), and that is refused with no memory for it, or
+  while the program may make nothing more (`reclaim::may_make`). It is made
+  once the mint is known to be one: made first, a mint refused for its kind
+  left a count for good in whatever chunk of slots it named. A
   revoke cannot fail for want of memory, and does nothing to a slot with no
   count: nothing was derived from it. **A space is read and changed with
   its lock held** (`cap::locked`, one of 64 by the space's number,
@@ -1976,6 +1979,13 @@ breaking any of them is quiet until it is a machine that stops.
   is room for the next thing the kernel makes, not memory for programs.
   What a program makes or grows is asked for first (`reclaim::may_make`),
   so the heap does not take what is kept back for drivers and servers.
+- A slot's count of revocations is kept for as long as the machine is up,
+  by its space's number (`cap::GENERATIONS`): two kilobytes for a number,
+  and one for each 256 slots its spaces have minted, granted or taken from
+  — a number whose spaces once used all 65,536 keeps 258 KiB. Kept so that
+  a capability derived from a slot is never good again after a revoke,
+  whoever has the number since; freed with the space, a program's grants
+  to others would go with it.
 - Memory is written out only where a system starts a pager for it
   (`swapd` in `../quarkutils`), and only as fast as that pager's disk: it
   writes through the file server, a page a call. With none, or with it

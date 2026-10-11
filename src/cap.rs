@@ -657,19 +657,27 @@ impl Counts {
     }
 
     /// Slot `slot`'s count, made at nought if it has none: `None` with no
-    /// memory for it.
+    /// memory for it — or while the program asking may make nothing more
+    /// (`reclaim::may_make`): a count is kept for good, and made, it was
+    /// heap that what is kept back for drivers and servers went into.
     ///
     /// # Safety
     /// [`TABLE`]'s lock held: two makers of one chunk would lose one.
     unsafe fn ensure(&self, slot: usize) -> Option<&AtomicU32> {
         let mut dir = self.dir.load(Ordering::Acquire);
         if dir.is_null() {
+            if !crate::reclaim::may_make() {
+                return None;
+            }
             dir = zeroed::<[AtomicPtr<Chunk>; CHUNKS]>()?;
             self.dir.store(dir, Ordering::Release);
         }
         let place = unsafe { &(*dir)[slot / PER_CHUNK] };
         let mut chunk = place.load(Ordering::Acquire);
         if chunk.is_null() {
+            if !crate::reclaim::may_make() {
+                return None;
+            }
             chunk = zeroed::<Chunk>()?;
             place.store(chunk, Ordering::Release);
         }

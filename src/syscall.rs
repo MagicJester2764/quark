@@ -5015,12 +5015,6 @@ fn dispatch(
             };
             let tid = scheduler::current_tid();
             let root = crate::cap::root_of(tid);
-            // The slot's *current* count of revocations, made if it has none:
-            // hardcoding 0 meant that after a single sys_cap_revoke on this
-            // slot every capability minted there was born already invalid.
-            let Some(generation) = crate::cap::generation_for(root, slot) else {
-                return u64::MAX;
-            };
             let minted = crate::cap::with_cspace(tid, |cs| {
                 let (param0, param1) = if cap_type == crate::cap::CapType::Endpoint {
                     // Asked for by TID, recorded by the endpoint's number, and
@@ -5037,6 +5031,13 @@ fn dispatch(
                 if cs.get(slot).cap_type != crate::cap::CapType::Empty {
                     return None;
                 }
+                // The slot's *current* count of revocations, made if it has
+                // none, once the mint is known to be one: hardcoding 0 meant
+                // that after a single sys_cap_revoke on this slot every
+                // capability minted there was born already invalid, and made
+                // before the mint was looked at, a mint refused for its kind
+                // left a count for good, in any chunk of slots it named.
+                let generation = crate::cap::generation_for(root, slot)?;
                 let cap = crate::cap::CapSlot { cap_type, generation, root_slot: slot as u16, root, param0, param1 };
                 cs.set(slot, cap).then_some(())
             });
