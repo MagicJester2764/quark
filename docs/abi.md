@@ -1467,7 +1467,9 @@ taken keeping the bit, which is how a robust mutex's next holder is told.
 When a holder dies or becomes another program, the robust list's walk hands
 each word on it somebody waits in the kernel for to the best of them, with
 `FUTEX_OWNER_DIED`; a word it held that was not on its list keeps its
-waiters, who lend it nothing from then on.
+waiters, who lend it nothing from then on. A word in memory the caller's
+program owns names a thread of that program or nobody: one naming a task
+of another program is answered 4, as one whose holder is not there.
 
 **Event counters.** `SYS_EVENT_CREATE` makes a 64-bit counter and returns a
 descriptor for it. A write is eight bytes and adds them; a read is eight bytes

@@ -737,7 +737,14 @@ may keep — are in `../quarkutils/CLAUDE.md`; these are the kernel's.
   robust list's walk to the best waiter with FUTEX_OWNER_DIED
   (`pi_owner_died`); a holder that dies or execs holding one that was not on
   its list is lent nothing more (`owner_gone`) — its task id will be
-  somebody else's. The word is written through its frame after
+  somebody else's. And a word in memory a program owns is its own threads'
+  to hold: one naming a task of another program is answered as held by
+  nobody there (ESRCH), and lends that task nothing — a lock of a word a
+  thread ended holding found its id given to a task of another program, and
+  lent it a real-time place for as long as it waited (`pimutex`). A word in
+  shared memory may name any program's task, and one whose holder has gone
+  and whose id has come round again still lends to the task that has it.
+  The word is written through its frame after
   `paging::own` (`word_at`), so nothing faults with the futex lock held.
   And wakes and requeues never touch a PI waiter (`each_on`'s `pi`): one
   woken without the word would look again, and one moved would lend to a

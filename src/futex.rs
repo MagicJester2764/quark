@@ -772,6 +772,15 @@ pub fn lock_pi(addr: u64, span: u64, only_try: bool) -> u64 {
         if !scheduler::task_is_live(owner) {
             return PI_NO_OWNER;
         }
+        // A word in memory the program owns is its own threads' to hold.
+        // One that names a task of another program names a number its
+        // holder had: a thread that ended holding a lock that was not
+        // robust leaves its id in the word, and an id comes round again.
+        // Lent to, that task was given this one's place, in whatever program
+        // it was, for as long as this waited — which was for good.
+        if key.space != 0 && scheduler::task_cr3(owner) != cr3 {
+            return PI_NO_OWNER;
+        }
         if unsafe { leads_to(owner, me) } {
             return PI_DEADLOCK;
         }
