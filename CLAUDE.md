@@ -1911,7 +1911,13 @@ breaking any of them is quiet until it is a machine that stops.
   balancing, a hand-over, a task put back after its turn. What it runs
   moves at its next door, as for an affinity that no longer has it; what
   waits there is given to the others from its idle loop
-  (`runq::give_away`); then it parks — no lock, no tick, an interrupt
+  (`runq::give_away`), under its queues' lock; and a wake made without the
+  one lock that chose it a moment before it went asks again once it has
+  linked the task there, under that lock, and places the task again if it
+  is offline (`enqueue`) — one or the other sees the task. Asked only
+  before, a thread a futex woke from another processor waited in the queue
+  of a parked processor until it was brought back (`dtest offline`). Then
+  it parks — no lock, no tick, an interrupt
   answered and nothing more (`idt::irq_handler`) — and a shootdown skips
   it (`tlb::settle`), so it forgets every translation as it comes back,
   before it touches anything that may have changed: no page is global, and

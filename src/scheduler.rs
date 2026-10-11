@@ -1710,10 +1710,24 @@ unsafe fn enqueue(tid: usize) { unsafe {
         return;
     }
     unlink_ready(tid);
-    let cpu = runq::place_for(tid);
-    runq::moved(tid, cpu, p);
-    runq::join(tid, cpu, p);
-    runq::link(tid, cpu, p, false);
+    // Placed on a processor taken offline as it was chosen, it is placed
+    // again. A processor going offline gives away what waits in its queues
+    // (`runq::give_away`) once it has seen it is offline, under its queues'
+    // lock, and parks without looking again; a wake made without the one
+    // lock may have chosen it a moment before. Linked under the same lock
+    // and asked after, one or the other sees the task: give_away takes it,
+    // or this finds the processor offline. Left there, it waited until the
+    // processor was brought back.
+    let cpu = loop {
+        let cpu = runq::place_for(tid);
+        runq::moved(tid, cpu, p);
+        runq::join(tid, cpu, p);
+        runq::link(tid, cpu, p, false);
+        if crate::percpu::online(cpu) {
+            break cpu;
+        }
+        unlink_ready(tid);
+    };
     note_ready(tid);
     // Another processor: woken if it sleeps, and interrupted if what it
     // runs is worse — it runs this now, not at its tick, which was half a

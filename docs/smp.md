@@ -180,8 +180,12 @@ Any processor but the first can be taken offline and brought back while
 the machine runs (`SYS_CPU_ONLINE`, by a holder of `Processors`). Offline,
 it is no place a task may run (`percpu::online`, which `may_run_on` asks),
 so nothing new comes to it; what it was running moves at its next door,
-and its idle loop gives what waited for it to the others and parks it
-(`smp::park`): in `hlt`, holding nothing, taking no tick, answering an
+and its idle loop gives what waited for it to the others, under its
+queues' lock, and parks it. A wake made without the one lock may have
+chosen it just before it went: that one links the task under the same
+lock and then asks again, and places it again if the processor is offline
+(`enqueue`), so that either the giving away or the asking sees the task.
+Parked (`smp::park`): in `hlt`, holding nothing, taking no tick, answering an
 interrupt with nothing more than its end, and left out of shootdowns — it
 forgets every translation as it comes back. Brought back, it takes the
 kernel lock again and is a processor like any other. A task that may run
