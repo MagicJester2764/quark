@@ -22,8 +22,13 @@
 
 use core::alloc::Layout;
 
-/// The most slots a table can have.
-pub const MOST: usize = 32_768;
+/// The most slots a table can have: what programs make — pipes, counters,
+/// timers, sockets, sets, served objects — past the 65,536 descriptors one
+/// program may have, so that no one program holds all of a kind. At
+/// 32,768 a program that raised its limit made the machine's last counter.
+/// The tasks' tables, and what is kept by a task's number, have
+/// `task::MAX_TASKS`.
+pub const MOST: usize = 131_072;
 
 const PER_BLOCK: usize = 256;
 const BLOCKS: usize = MOST / PER_BLOCK;

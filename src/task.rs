@@ -5,10 +5,11 @@
 
 use crate::context::CpuContext;
 
-/// How many tasks there can be: as many as a table has slots (`table.rs`).
-/// A task's record is made when it is, so this is a ceiling and not a cost.
-/// It was sixty-four, a desktop's limit and a fixed array's.
-pub const MAX_TASKS: usize = crate::table::MOST;
+/// How many tasks there can be. A task's record is made when it is, so this
+/// is a ceiling and not a cost. It was sixty-four, a desktop's limit and a
+/// fixed array's. A task's number is kept in sixteen bits, in the links of
+/// the lists it is on.
+pub const MAX_TASKS: usize = 32_768;
 /// A task's kernel stack (`kstack.rs`): with a page below it that faults.
 pub const KERNEL_STACK_SIZE: usize = crate::kstack::KSTACK_SIZE;
 /// The most descriptors a program can have: the highest its limit goes.

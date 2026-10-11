@@ -20,6 +20,11 @@ struct Pipe {
     /// Without this, sys_pipe_create leaked a slot permanently on every
     /// failed spawn and the 31 slots could be exhausted for good.
     creator: usize,
+    /// Counted to its creator as made with no end held
+    /// (`fdtable::Charge::Unwired`), until it has one or goes. Its
+    /// creator's record is there until then: a task's pipes with no end
+    /// held go when it does (`cleanup_orphans`).
+    charged: bool,
     /// The ring the bytes go round: a frame, given back with the pipe.
     buf: *mut u8,
     read_pos: usize,
@@ -52,6 +57,7 @@ impl Pipe {
     const fn new(creator: usize, buf: *mut u8) -> Self {
         Pipe {
             creator,
+            charged: false,
             buf,
             read_pos: 0,
             write_pos: 0,
@@ -219,7 +225,7 @@ pub fn open_named(server: u64, key: u64, write: bool, only_with_peer: bool) -> O
     if server == 0 {
         return Opened::Full;
     }
-    let mut spare = make(scheduler::current_tid(), false);
+    let mut spare = make(scheduler::current_tid(), false, false);
     let held = LOCK.lock();
     let out = unsafe {
         let known = named_pipe(server, key);
@@ -385,7 +391,7 @@ fn irq_restore(flags: u64) {
 /// A new pipe, made by `creator`: its number, or `None` if there is no room
 /// for it — no frame for its buffer, as `reclaim` gives a program frames,
 /// or no number left.
-fn make(creator: usize, packets: bool) -> Option<usize> {
+fn make(creator: usize, packets: bool, charged: bool) -> Option<usize> {
     if !crate::reclaim::may_make() {
         return None;
     }
@@ -395,6 +401,7 @@ fn make(creator: usize, packets: bool) -> Option<usize> {
         pipes().lowest_free(1).filter(|&i| {
             let mut pipe = Pipe::new(creator, frame as *mut u8);
             pipe.packets = packets;
+            pipe.charged = charged;
             pipes().fill_at(i, pipe).is_ok()
         })
     };
@@ -413,6 +420,9 @@ fn make(creator: usize, packets: bool) -> Option<usize> {
 unsafe fn gone(handle: usize) {
     unsafe {
         let Some(pipe) = pipes().get(handle) else { return };
+        if pipe.charged {
+            crate::fdtable::uncharge(pipe.creator, crate::fdtable::Charge::Unwired);
+        }
         waitlist::wake_all(&mut pipe.read_waiters);
         waitlist::wake_all(&mut pipe.write_waiters);
         waitlist::wake_all(&mut pipe.peer_waiters);
@@ -425,7 +435,7 @@ unsafe fn gone(handle: usize) {
 
 /// A pipe for a stream, bounded as every pipe is by what the machine has.
 pub fn create_for_stream(packets: bool) -> Option<usize> {
-    make(scheduler::current_tid(), packets)
+    make(scheduler::current_tid(), packets, false)
 }
 
 /// No writer remains, so a read will never block again.
@@ -491,7 +501,18 @@ pub fn drop_unreferenced(handle: usize) {
 /// keep by its descriptors. It was 64 a program, counted by space id, and a
 /// build running four jobs at once came close to it.
 pub fn create() -> Option<usize> {
-    make(scheduler::current_tid(), false)
+    // With no end given out it is no descriptor of anybody's, and counted
+    // as if it were one of its maker's (`fdtable::Charge::Unwired`): made
+    // without end, they were every pipe the machine had.
+    let tid = scheduler::current_tid();
+    if !crate::fdtable::charge(tid, crate::fdtable::Charge::Unwired) {
+        return None;
+    }
+    let made = make(tid, false, true);
+    if made.is_none() {
+        crate::fdtable::uncharge(tid, crate::fdtable::Charge::Unwired);
+    }
+    made
 }
 
 /// Release pipes created by a dying task that were never wired to an fd.
@@ -522,6 +543,12 @@ pub fn add_ref(handle: usize, is_write: bool) -> Result<(), ()> {
                     p.writers += 1;
                 } else {
                     p.readers += 1;
+                }
+                // An end held: its maker has a descriptor for it now, or
+                // has given it to somebody who has.
+                if p.charged {
+                    p.charged = false;
+                    crate::fdtable::uncharge(p.creator, crate::fdtable::Charge::Unwired);
                 }
                 Ok(())
             }

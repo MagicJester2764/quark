@@ -1113,7 +1113,15 @@ every Unix program assumes:
   through `reclaim::may_make` so that a program making them without end is
   refused while the kernel can still work, and given back with the last
   thing that names it. They were tables for the whole machine, of eight,
-  sixteen, thirty-two, sixty-four, 256 and 1,024. What is in them grows
+  sixteen, thirty-two, sixty-four, 256 and 1,024; each has 131,072 now
+  (`table::MOST`), past the 65,536 descriptors one program may have — at
+  32,768, a program that raised its limit held the machine's last counter.
+  What a program holds that is no descriptor is counted as one would be, to
+  the task that made it and summed over its program (`fdtable::charge`): a
+  watch (4,096 a program, in a table of 32,768) and a pipe made with no end
+  given out yet (1,024). Neither was counted, and one program held every
+  watch — no server heard of a client going — or every pipe (`dtest
+  objects`). A driver or a server is counted and never refused. What is in them grows
   too: a set's watches, a listener's queue (to 4,096, `somaxconn`), a
   stream's descriptors in flight (as many as the sender may have) — and
   grows as what is made is made (`grow::Grow::ensure` asks `may_make`), as
@@ -1986,6 +1994,10 @@ breaking any of them is quiet until it is a machine that stops.
   a capability derived from a slot is never good again after a revoke,
   whoever has the number since; freed with the space, a program's grants
   to others would go with it.
+- What programs make is in tables for the machine, of 131,072 each kind
+  (32,768 watches): no one program holds a kind's all, but two at their
+  limits of descriptors can, as enough of them can hold the watches. What
+  bounds them together is memory (`reclaim::may_make`).
 - Memory is written out only where a system starts a pager for it
   (`swapd` in `../quarkutils`), and only as fast as that pager's disk: it
   writes through the file server, a page a call. With none, or with it

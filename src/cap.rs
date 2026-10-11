@@ -35,8 +35,8 @@ pub const MAX_USERS: usize = 64;
 /// This must not collide with a real space. It used to be 0, but the idle
 /// task's is the first — so any cap it minted was silently unrevocable, and
 /// `sys_cap_grant` mistook its caps for kernel-minted ones and re-rooted them
-/// at the granter. Spaces are numbered below `table::MOST`, so `u16::MAX`
-/// names none.
+/// at the granter. Spaces are numbered below `task::MAX_TASKS`, so
+/// `u16::MAX` names none.
 pub const KERNEL_ROOT: u16 = u16::MAX;
 
 /// Per-user default capability bitmask table.

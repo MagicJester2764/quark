@@ -267,6 +267,11 @@ pub struct PerTask {
     /// The tasks either side of it in its program's list (`Program::first`).
     next: u16,
     prev: u16,
+    /// What it holds that is no descriptor and is counted as one would be
+    /// ([`charge`]): its watches, and the pipes it has made and given no
+    /// end of out. Its program's are the sum over its tasks.
+    watches: u32,
+    unwired: u32,
 }
 
 impl PerTask {
@@ -276,6 +281,8 @@ impl PerTask {
             held: FdKind::Empty,
             next: END,
             prev: END,
+            watches: 0,
+            unwired: 0,
         }
     }
 }
@@ -1427,6 +1434,77 @@ pub fn usage_children_add(tid: usize, used: &crate::usage::Usage) {
 /// `tid`'s program runs as `from`'s does: with the same limit on how long.
 /// Not what it has used, which for a new program is nothing. How nice it is
 /// is its task's, and a task made is given its maker's (`scheduler`).
+/// What a program holds that is no descriptor, and is counted as one would
+/// be: in tables for the machine, a program that made them without end
+/// held all there were. One whose threads watched each other all they
+/// could filled the watches, and no server heard of a program going; one
+/// that made pipes and gave no end of them out filled the pipes, and no
+/// shell could make a pipeline (`dtest objects`).
+#[derive(Clone, Copy)]
+pub enum Charge {
+    /// A watch of a task or a program (`ipc::sys_task_watch`,
+    /// `sys_space_watch`): 4,096, as many as a program may have tasks.
+    Watch,
+    /// A pipe made and no end of it given out yet (`pipe::create`):
+    /// 1,024, the descriptors a program starts with.
+    Unwired,
+}
+
+impl Charge {
+    const fn most(self) -> u32 {
+        match self {
+            Charge::Watch => 4_096,
+            Charge::Unwired => 1_024,
+        }
+    }
+}
+
+/// Task `tid`'s count of `what`.
+///
+/// # Safety
+/// [`PROGRAMS`] held.
+unsafe fn count(tid: usize, what: Charge) -> &'static mut u32 {
+    unsafe {
+        match what {
+            Charge::Watch => &mut st(tid).watches,
+            Charge::Unwired => &mut st(tid).unwired,
+        }
+    }
+}
+
+/// One more `what` for task `tid`, the caller: whether its program may
+/// have it, counted over the program's tasks. A driver or a server always
+/// may, as it may always make (`reclaim::may_make`), and is counted all
+/// the same. Counted to the task and not the program: a thread's watches
+/// go when it is reaped, after it has left its program.
+pub fn charge(tid: usize, what: Charge) -> bool {
+    let always = crate::scheduler::current_is_privileged();
+    let held = PROGRAMS.lock();
+    let may = unsafe {
+        let mut n = 0u32;
+        if !always {
+            each_task(tid, |t| n = n.saturating_add(*count(t, what)));
+        }
+        let may = always || n < what.most();
+        if may {
+            *count(tid, what) += 1;
+        }
+        may
+    };
+    drop(held);
+    may
+}
+
+/// One `what` fewer for task `tid`, which was charged it.
+pub fn uncharge(tid: usize, what: Charge) {
+    let held = PROGRAMS.lock();
+    unsafe {
+        let n = count(tid, what);
+        *n = n.saturating_sub(1);
+    }
+    drop(held);
+}
+
 pub fn runs_like(tid: usize, from: usize) {
     let held = PROGRAMS.lock();
     unsafe {

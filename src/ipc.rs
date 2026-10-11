@@ -315,7 +315,12 @@ struct Watch {
 /// The end of a list through records: of watches, or of tasks.
 const END: u16 = u16::MAX;
 
-static mut WATCHES: crate::table::Table<Watch> = crate::table::Table::new(crate::table::MOST);
+/// As many as there can be tasks: a watch is linked to the others of its
+/// watcher's and its task's by its number in sixteen bits. A program that
+/// is not a driver or a server may have 4,096 of them, counted to the
+/// watcher (`fdtable::charge`).
+const MAX_WATCHES: usize = crate::task::MAX_TASKS;
+static mut WATCHES: crate::table::Table<Watch> = crate::table::Table::new(MAX_WATCHES);
 
 /// The watches: [`WATCHES`], and each task's lists of them (`PerTask`'s
 /// `watching`, `owed`, `watched`). Waking a watcher takes its record, after
@@ -484,11 +489,17 @@ unsafe fn watching(watcher: usize, wanted: impl Fn(&Watch) -> bool) -> bool {
 /// [`NOTICES`] held.
 unsafe fn make_watch(watcher: usize, task: u16, space: u64) -> Result<(), IpcError> {
     unsafe {
-        let made = Watch { watcher: watcher as u16, task, space, owed: false, next: END, prev: END, next_on: END, prev_on: END };
-        let Some(w) = watches().lowest_free(0) else { return Err(IpcError::WouldBlock) };
-        if watches().fill_at(w, made).is_err() {
+        // Counted to the watcher, and its program may have so many: the
+        // watches are the machine's, and a server's are among them.
+        if !crate::fdtable::charge(watcher, crate::fdtable::Charge::Watch) {
             return Err(IpcError::WouldBlock);
         }
+        let made = Watch { watcher: watcher as u16, task, space, owed: false, next: END, prev: END, next_on: END, prev_on: END };
+        let made = watches().lowest_free(0).filter(|&w| watches().fill_at(w, made).is_ok());
+        let Some(w) = made else {
+            crate::fdtable::uncharge(watcher, crate::fdtable::Charge::Watch);
+            return Err(IpcError::WouldBlock);
+        };
         let w = w as u16;
         push(&mut st(watcher).watching, w);
         if task != END {
@@ -586,6 +597,7 @@ unsafe fn drop_watch(w: u16) -> bool {
             }
         }
         watches().empty(w as usize);
+        crate::fdtable::uncharge(watcher, crate::fdtable::Charge::Watch);
         true
     }
 }
