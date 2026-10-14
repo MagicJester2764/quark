@@ -59,7 +59,7 @@
 use super::{better, place_of, slot, st, TaskState, END, NOT_QUEUED, NUM_PRIORITIES, SLEEPER_LEAD};
 use crate::percpu::MAX_CPUS;
 use crate::sync::IrqSpinLock;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{compiler_fence, AtomicU64, Ordering};
 
 
 /// Which part of its queue a task is in.
@@ -278,12 +278,54 @@ unsafe fn ready(tid: usize) -> bool {
     unsafe { matches!(*slot(tid), Some(ref t) if t.state == TaskState::Ready) }
 }
 
+/// Whether `tid` is in `q`, where its record says: in the list at the front,
+/// whose first its links back come to, or in a heap, whose root its links
+/// up — each to its elder sibling, the first child's to its parent — come
+/// to. No further than the queue is long.
+unsafe fn is_in(q: &Queue, tid: usize) -> bool {
+    unsafe {
+        let (mut t, mut steps) = (tid as u16, 0u32);
+        if st(tid).heap_in == IN_FRONT {
+            while st(t as usize).run_prev != END {
+                t = st(t as usize).run_prev;
+                steps += 1;
+                if steps > q.len {
+                    return false;
+                }
+            }
+            return t == q.front.0;
+        }
+        while st(t as usize).heap_prev != END {
+            t = st(t as usize).heap_prev;
+            steps += 1;
+            if steps > q.len {
+                return false;
+            }
+        }
+        t == if st(tid).heap_in == IN_RT { q.rt } else { q.fair }
+    }
+}
+
 /// `tid` is out of its queue's count and its weight, and in no queue.
 unsafe fn out(q: &mut Queue, tid: usize) {
     unsafe {
+        uncount(q, tid);
+        st(tid).queued = NOT_QUEUED;
+    }
+}
+
+/// `tid` is out of its queue's count and its weight.
+unsafe fn uncount(q: &mut Queue, tid: usize) {
+    unsafe {
+        // What cannot be, and stops the machine: a task out of a count
+        // with nothing in it. A queue's count gone below nought says it has
+        // something when it has nothing, and one taken out of a queue it was
+        // not in leaves that queue counting one fewer than it has.
+        if q.len == 0 {
+            super::wrong(b"a task taken out of a queue that counts nothing", tid, st(tid).queued_on as usize);
+        }
         q.len -= 1;
         q.load -= st(tid).weight as u64;
-        st(tid).queued = NOT_QUEUED;
     }
 }
 
@@ -306,9 +348,26 @@ unsafe fn link_held(tid: usize, cpu: usize, p: usize, front: bool) {
         if st(tid).queued != NOT_QUEUED {
             super::wrong(b"a task put in a queue while it is in one", tid, st(tid).queued_on as usize);
         }
-        st(tid).seq = SEQ.fetch_add(1, Ordering::Relaxed) + 1;
-        st(tid).queued = p as u8;
         st(tid).queued_on = cpu as u16;
+        put(tid, cpu, p, front);
+        // Said to be queued last, once it is in the queue it names: whoever
+        // reads where a task is with no lock, to know whose lock to take
+        // ([`queued_at`]), reads that it is queued first and where after.
+        // Said first, as it was, a reader between the two took the lock of
+        // the queue the task had been in before and took it out of that one,
+        // which it was not in: the count went below nought there, and the
+        // queue it had been put in lost it, with whatever hung from it.
+        compiler_fence(Ordering::Release);
+        core::ptr::write_volatile(&raw mut st(tid).queued, p as u8);
+    }
+}
+
+/// `tid` in processor `cpu`'s queue of band `p`, and counted there, its
+/// record not yet saying so: [`link_held`], and a task put back where it
+/// was taken out ([`recount`], [`replace`]), which says so throughout.
+unsafe fn put(tid: usize, cpu: usize, p: usize, front: bool) {
+    unsafe {
+        st(tid).seq = SEQ.fetch_add(1, Ordering::Relaxed) + 1;
         st(tid).measured_on = cpu as u16;
         st(tid).measured_in = p as u8;
         // What it weighs as it is put in is what it takes out with it: how
@@ -339,6 +398,22 @@ unsafe fn link_held(tid: usize, cpu: usize, p: usize, front: bool) {
     }
 }
 
+/// Which processor's queue `tid` is in, or `None`, read with no lock: that
+/// it is queued and then where, in that order, as [`link_held`] says them
+/// in the other. Under the lock of the queue it names, it is in that one.
+///
+/// # Safety
+/// Interrupts off.
+unsafe fn queued_at(tid: usize) -> Option<usize> {
+    unsafe {
+        if core::ptr::read_volatile(&raw const st(tid).queued) == NOT_QUEUED {
+            return None;
+        }
+        compiler_fence(Ordering::Acquire);
+        Some(core::ptr::read_volatile(&raw const st(tid).queued_on) as usize)
+    }
+}
+
 /// Take `tid` out of the queue it is in, if it is in one: that processor's,
 /// held, and looked at again once it is, since the task may have been
 /// moved meanwhile.
@@ -347,13 +422,9 @@ unsafe fn link_held(tid: usize, cpu: usize, p: usize, front: bool) {
 /// Interrupts off, the kernel lock held.
 pub(super) unsafe fn unlink(tid: usize) {
     unsafe {
-        loop {
-            if st(tid).queued == NOT_QUEUED {
-                return;
-            }
-            let cpu = st(tid).queued_on as usize;
+        while let Some(cpu) = queued_at(tid) {
             let _queues = held(cpu);
-            if st(tid).queued != NOT_QUEUED && st(tid).queued_on as usize == cpu {
+            if queued_at(tid) == Some(cpu) {
                 unlink_held(tid);
                 return;
             }
@@ -364,12 +435,29 @@ pub(super) unsafe fn unlink(tid: usize) {
 /// [`unlink`], with the queues `tid` is in held.
 unsafe fn unlink_held(tid: usize) {
     unsafe {
-        let p = st(tid).queued;
-        if p == NOT_QUEUED {
+        if st(tid).queued == NOT_QUEUED {
             return;
         }
+        cut(tid);
+        st(tid).queued = NOT_QUEUED;
+    }
+}
+
+/// `tid`, in the queue its record names, out of it and its count, its
+/// record still saying so: [`unlink_held`], and a task to be put back
+/// where it was ([`recount`], [`replace`]).
+unsafe fn cut(tid: usize) {
+    unsafe {
+        let p = st(tid).queued;
         let q = queue(st(tid).queued_on as usize, p as usize);
         let t = tid as u16;
+        // What cannot be, and stops the machine: a task taken out of a queue
+        // it is not in. Its links are another queue's, or none: cut out by
+        // them here, it was lost from the queue it was in, with whatever
+        // hung from it there, and this one counted one fewer than it had.
+        if !is_in(q, tid) {
+            super::wrong(b"a task taken out of a queue it is not in", tid, (st(tid).queued_on as usize) << 8 | p as usize);
+        }
         match st(tid).heap_in {
             IN_RT => q.rt = h_remove(q.rt, t, rt_first),
             IN_FRONT => {
@@ -388,7 +476,7 @@ unsafe fn unlink_held(tid: usize) {
             }
             _ => q.fair = h_remove(q.fair, t, fair_first),
         }
-        out(q, tid);
+        uncount(q, tid);
     }
 }
 
@@ -956,19 +1044,20 @@ pub(super) unsafe fn balance(me: usize) {
 pub(super) unsafe fn recount(tid: usize, change: impl FnOnce()) {
     unsafe {
         loop {
-            if st(tid).queued == NOT_QUEUED {
+            let Some(cpu) = queued_at(tid) else {
                 change();
                 return;
-            }
-            let cpu = st(tid).queued_on as usize;
+            };
             let _queues = held(cpu);
-            if st(tid).queued == NOT_QUEUED || st(tid).queued_on as usize != cpu {
+            if queued_at(tid) != Some(cpu) {
                 continue;
             }
+            // Out and back in, said to be queued throughout: a reader with no
+            // lock finds it here, and waits for this lock.
             let (band, front) = (st(tid).queued as usize, st(tid).heap_in == IN_FRONT);
-            unlink_held(tid);
+            cut(tid);
             change();
-            link_held(tid, cpu, band, front);
+            put(tid, cpu, band, front);
             return;
         }
     }
@@ -984,20 +1073,23 @@ pub(super) unsafe fn recount(tid: usize, change: impl FnOnce()) {
 pub(super) unsafe fn replace(tid: usize, change: impl FnOnce()) -> bool {
     unsafe {
         loop {
-            if st(tid).queued == NOT_QUEUED {
+            let Some(cpu) = queued_at(tid) else {
                 change();
                 return false;
-            }
-            let cpu = st(tid).queued_on as usize;
+            };
             let _queues = held(cpu);
-            if st(tid).queued == NOT_QUEUED || st(tid).queued_on as usize != cpu {
+            if queued_at(tid) != Some(cpu) {
                 continue;
             }
-            unlink_held(tid);
+            // Out and back in, said to be queued throughout, as [`recount`]
+            // puts it back; in the band its place says now, said last.
+            cut(tid);
             change();
             let band = super::priority_of(tid);
             moved(tid, cpu, band);
-            link_held(tid, cpu, band, false);
+            put(tid, cpu, band, false);
+            compiler_fence(Ordering::Release);
+            core::ptr::write_volatile(&raw mut st(tid).queued, band as u8);
             return true;
         }
     }

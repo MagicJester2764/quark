@@ -103,7 +103,7 @@ after its kind's, which is its alone.
 | 23 | the capability spaces' table (`cap.rs`) | which numbers have a space, and the making of a number's counts of revocations; the counts are read and moved on with no lock |
 | 24, 25 | an address space (`paging::space_lock`) | its tables and reservations, and what is forgotten of them: one of 64 locks, the one its root hashes to; a fork's copy or a move between two takes both |
 | 26, 27 | a task's record (`scheduler::record_lock`: one of 256, the one its number picks) | its IPC state, its state as the scheduler has it, the place it is lent, and which program's record it is in — which it reads under this lock alone, its trap and its signals as the door asks them (`fdtable::own_program`): after whatever parks or wakes it, before the run queue it goes on; a call takes the caller's and the callee's |
-| 28, 29 | a processor's run queues (`runq.rs`) | what waits to run there, and the links of the tasks waiting; a move is two steps, never two held |
+| 28, 29 | a processor's run queues (`runq.rs`) | what waits to run there, and the links of the tasks waiting; a move is two steps, never two held. Which queue a task waits in is read with no lock, to know whose to take, and is said once the task is in it, and while it is put back there (`queued_at`) |
 | 32 | the clock | what is due, and when the timer is set to look |
 | 36 | interrupts (`irq_dispatch.rs`) | who is told of which |
 | 40 | the displays (`display.rs`) | memory given to display drivers, which takes frames |

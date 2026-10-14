@@ -1862,14 +1862,26 @@ breaking any of them is quiet until it is a machine that stops.
   never two of these locks held: out under one, in under the other. What
   a queue reads of a task's own record — whether it is still ready, where
   it may run — and what placement reads of other processors' queues are
-  read without their locks, as hints. What asks whether something better is
-  waiting — a tick, a wake between ticks, a call's hand-over — asks the
-  queues of the processor it is on, in one step (`runq::best_band`,
-  `best_rt`). With one list for the machine, walked at every choice, a
-  program of 4,095 threads waking ten times a second kept the kernel
-  choosing, and its own first thread waited minutes to run; and as many
-  computing threads as processors went round them, each going back into
-  the one list at the end of its turn for whichever processor looked
+  read without their locks, as hints. Where a task waits is read so too,
+  to know whose lock to take (`runq::queued_at`), and is no hint: a record
+  says its task is queued only once the task is in the queue it names
+  (`link_held` says so last), and goes on saying so while it is taken out
+  and put back where it was (`recount`, `replace`); the reader asks
+  whether before where. Said first, as it was, a wake on one processor had
+  said so of a task when the processor it was leaving, counting its turn,
+  read where it had waited before, took that queue's lock and took it out
+  of a queue it was not in: that queue counted below nought, and the one
+  it had been put in lost it, and whatever hung from it in the heap —
+  threads that waited in no queue anyone could reach, for seconds at a
+  time. A task taken out of a queue it is not in, and a count taken below
+  nought, stop the machine (`runq::is_in`, `uncount`). What asks whether
+  something better is waiting — a tick, a wake between ticks, a call's
+  hand-over — asks the queues of the processor it is on, in one step
+  (`runq::best_band`, `best_rt`). With one list for the machine, walked at
+  every choice, a program of 4,095 threads waking ten times a second kept
+  the kernel choosing, and its own first thread waited minutes to run; and
+  as many computing threads as processors went round them, each going back
+  into the one list at the end of its turn for whichever processor looked
   next. A new question about what is waiting is answered by the queues'
   own structure, not by looking through them.
 - **A task runs only where its affinity lets it** (`SYS_AFFINITY`,
